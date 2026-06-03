@@ -1,0 +1,38 @@
+# Build output
+build/
+out/
+_package/
+cmake-build-*/
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+compile_commands.json
+
+# FetchContent / deps cache
+_deps/
+third_party/**/build/
+
+# Worktrees
+.claude/worktrees/
+
+# vcpkg
+vcpkg_installed/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Media test assets (large; keep out of git unless tiny samples)
+assets/media/
+*.mp4
+*.mkv
+*.mov
