@@ -4,6 +4,8 @@
 #include "Log.h"
 #include "rhi/Shaders.h"
 
+#include <algorithm>  // std::max / std::min (scissor clamp)
+
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
@@ -502,6 +504,7 @@ bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t
 }
 
 bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* rects,
+                               const XrSession::ViewRect* clipRects,
                                const ViewUV* uvs, uint32_t viewCount) {
     if (imageIndex >= framebuffers_.size() || textureView_ == VK_NULL_HANDLE) return false;
 
@@ -537,9 +540,17 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         vp.maxDepth = 1.0f;
         vkCmdSetViewport(commandBuffer_, 0, 1, &vp);
 
+        // Scissor to the eye's tile (intersected with the content rect). The content
+        // rect may be convergence-shifted past the tile edge; clipping here truncates
+        // the overhang so it can't bleed into the adjacent eye's tile.
+        const XrSession::ViewRect& clip = clipRects[v];
+        const int32_t x0 = std::max(rects[v].x, clip.x);
+        const int32_t y0 = std::max(rects[v].y, clip.y);
+        const int32_t x1 = std::min(rects[v].x + (int32_t)rects[v].w, clip.x + (int32_t)clip.w);
+        const int32_t y1 = std::min(rects[v].y + (int32_t)rects[v].h, clip.y + (int32_t)clip.h);
         VkRect2D sc = {};
-        sc.offset = {rects[v].x, rects[v].y};
-        sc.extent = {rects[v].w, rects[v].h};
+        sc.offset = {x0, y0};
+        sc.extent = {(uint32_t)std::max(0, x1 - x0), (uint32_t)std::max(0, y1 - y0)};
         vkCmdSetScissor(commandBuffer_, 0, 1, &sc);
 
         const float pc[4] = {uvs[v].offX, uvs[v].offY, uvs[v].scaleX, uvs[v].scaleY};

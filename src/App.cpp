@@ -269,7 +269,9 @@ void App::RenderOneFrame() {
                 contentRects[v].w = (uint32_t)((float)viewFit.w * sx + 0.5f);
                 contentRects[v].h = (uint32_t)((float)viewFit.h * sy + 0.5f);
             }
-            renderer_.DrawViews(frame.imageIndex, contentRects, uvs, frame.viewCount);
+            // Pass the tile rects as scissor bounds so a convergence-shifted content
+            // rect is truncated at its tile edge, never spilling into the other eye.
+            renderer_.DrawViews(frame.imageIndex, contentRects, rects, uvs, frame.viewCount);
         } else if (hasMedia_) {
             const ClearColor black[XrSession::kMaxViews] = {};  // video warming up
             renderer_.ClearViews(frame.imageIndex, black, rects, frame.viewCount);

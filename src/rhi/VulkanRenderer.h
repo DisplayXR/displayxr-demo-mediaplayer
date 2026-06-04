@@ -74,7 +74,11 @@ public:
 
     // Draw the uploaded texture into each view's tile, sampling the UV sub-region in
     // `uvs[v]`. Clears the rest of the image to black. Blocks until the GPU finishes.
+    // `rects` are the per-view content rects (the viewport — may be convergence-
+    // shifted); `clipRects` are the per-view tile bounds the drawing is scissored to,
+    // so a shifted content rect can never spill into the neighbouring eye's tile.
     bool DrawViews(uint32_t imageIndex, const XrSession::ViewRect* rects,
+                   const XrSession::ViewRect* clipRects,
                    const ViewUV* uvs, uint32_t viewCount);
 
 private:
