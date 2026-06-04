@@ -138,10 +138,9 @@ resolve_ref() {
     esac
 }
 
-declare -A BUNDLED  # basename -> 1, to copy/recurse each lib at most once
-
 # Copy every non-system dependency of $1 into LIBDIR, rewrite the reference to
-# @rpath/<base>, and recurse into each newly-copied lib.
+# @rpath/<base>, and recurse into each newly-copied lib. Presence in LIBDIR is the
+# "already processed" guard (macOS ships Bash 3.2 — no associative arrays).
 bundle_deps() {
     local target="$1" target_dir ref base real
     target_dir="$(cd "$(dirname "$target")" && pwd)"
@@ -151,13 +150,14 @@ bundle_deps() {
         base="$(basename "$ref")"
         real="$(resolve_ref "$ref" "$target_dir")"
         if [ -z "$real" ] || [ ! -f "$real" ]; then
-            # Unresolvable (e.g. the target's own @rpath id) — just point at our copy
-            # if we have it; otherwise leave it (system fallback) and move on.
-            [ -f "$LIBDIR/$base" ] && install_name_tool -change "$ref" "@rpath/$base" "$target" 2>/dev/null || true
+            # Unresolvable (e.g. the target's own @rpath id) — point at our copy if
+            # we have one; otherwise leave it (system fallback) and move on.
+            if [ -f "$LIBDIR/$base" ]; then
+                install_name_tool -change "$ref" "@rpath/$base" "$target" 2>/dev/null || true
+            fi
             continue
         fi
-        if [ -z "${BUNDLED[$base]:-}" ]; then
-            BUNDLED[$base]=1
+        if [ ! -f "$LIBDIR/$base" ]; then
             cp -f "$real" "$LIBDIR/$base"
             chmod u+w "$LIBDIR/$base"
             install_name_tool -id "@rpath/$base" "$LIBDIR/$base" 2>/dev/null || true
@@ -167,8 +167,7 @@ bundle_deps() {
     done < <(otool -L "$target" | tail -n +2 | awk '{print $1}')
 }
 
-# MoltenVK is already copied (loaded via ICD, not linked) — register + relink it.
-BUNDLED[libMoltenVK.dylib]=1
+# MoltenVK is already copied (loaded via ICD, not linked) — relink it + its deps.
 install_name_tool -id "@rpath/libMoltenVK.dylib" "$LIBDIR/libMoltenVK.dylib" 2>/dev/null || true
 bundle_deps "$LIBDIR/libMoltenVK.dylib"
 
