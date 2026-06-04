@@ -11,6 +11,7 @@
 #include <openxr/openxr_platform.h>
 
 #include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_EXT_workspace_file_dialog.h>  // Tier-1 spatial file picker (Open)
 #if defined(__APPLE__)
 #  include <openxr/XR_EXT_cocoa_window_binding.h>
 #elif defined(_WIN32)

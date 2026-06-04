@@ -27,6 +27,7 @@ Pinned commit: `f1347340ea0dcc5d24da2f228b59d63441ca3ec7`
 | `openxr/XR_EXT_cocoa_window_binding.h` | macOS NSView/CAMetalLayer window binding (`XrCocoaWindowBindingCreateInfoEXT`) |
 | `openxr/XR_EXT_win32_window_binding.h` | Windows HWND window binding (`XrWin32WindowBindingCreateInfoEXT`) |
 | `openxr/XR_EXT_display_info.h` | Display pixel dims / metadata used to size the swapchain |
+| `openxr/XR_EXT_workspace_file_dialog.h` | Tier-1 spatial file picker (`xrRequestFilePickerEXT`) for Open; native dialog fallback when unsupported |
 
 ## Updating
 

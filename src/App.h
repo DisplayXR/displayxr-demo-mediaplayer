@@ -14,6 +14,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <mutex>
+#include <string>
 #include <vector>
 
 namespace mp {
@@ -34,6 +36,15 @@ private:
     void UpdateFps();
     void BuildTransportUI();   // ImGui transport bar (no-op without ImGui)
 
+    // Open-file. RequestOpenFile tries the workspace picker, else a native dialog.
+    // LoadMedia opens a path fresh; ReloadMedia tears down current media first.
+    void RequestOpenFile();
+    bool LoadMedia(const std::string& path);
+    void ReloadMedia(const std::string& path);
+    // SDL native-dialog callback (Tier-0 fallback). May fire on another thread, so it
+    // just hands the path to the main loop through the guarded slot below.
+    static void NativeFileCallback(void* userdata, const char* const* filelist, int filter);
+
     Window window_;
     XrSession xr_;
     VulkanRenderer renderer_;
@@ -50,6 +61,17 @@ private:
     // swapEyes_ flips which SBS half feeds each eye.
     float convergence_ = 0.0f;
     bool swapEyes_ = false;
+
+    // Scrubber: displayed position tracks playback except while the user drags it.
+    float scrubValue_ = 0.0f;
+    bool scrubActive_ = false;
+
+    // Open-file flow. openFilePending_ gates the Open button while a picker is up.
+    // The native-dialog callback may run off-thread; it parks the result here.
+    bool openFilePending_ = false;
+    std::mutex nativePathMutex_;
+    std::string nativePath_;
+    bool hasNativePath_ = false;
     int mediaW_ = 0;              // full frame dims, for the HUD label
     int mediaH_ = 0;
     std::vector<uint8_t> hudPixels_;  // CPU-rasterized HUD buffer
@@ -69,6 +91,8 @@ private:
     bool startModeRequested_ = false;
     const char* dumpPath_ = nullptr;
     bool dumped_ = false;
+    const char* openAfterPath_ = nullptr;  // ReloadMedia() this path after a few frames
+    bool openedAfter_ = false;
     const char* dumpHudPath_ = nullptr;   // dump the rendered ImGui HUD image once
     bool dumpedHud_ = false;
 };

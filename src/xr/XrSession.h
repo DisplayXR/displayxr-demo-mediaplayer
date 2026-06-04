@@ -15,6 +15,7 @@
 #include "XrCommon.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace mp {
@@ -88,6 +89,18 @@ public:
     const std::vector<VkImage>& HudImages() const { return hudVkImages_; }
     bool AcquireHudImage(uint32_t& imageIndex);
     bool ReleaseHudImage();
+
+    // --- Open-file (XR_EXT_workspace_file_dialog) ---
+    // Outcome of a RequestFilePicker call. Pending → a completion event will arrive
+    // (poll TakePickedFile); the others mean the caller should use a native dialog.
+    enum class PickerStatus { Pending, FallbackTier0, Unsupported, Error };
+    bool HasFilePicker() const { return pfnRequestFilePicker_ != nullptr; }
+    // Ask the workspace for a spatial open-file picker (image/video filters). Async:
+    // on Pending, the result arrives via TakePickedFile() once the user picks.
+    PickerStatus RequestFilePicker();
+    // True once when a file-picker completion landed since the last call; fills `path`
+    // (empty on cancel). Drains the latch.
+    bool TakePickedFile(std::string& path);
 
     // Vulkan handles the runtime selected for us — handed to the renderer.
     VkInstance VkInstanceHandle() const { return vkInstance_; }
@@ -182,6 +195,14 @@ private:
     uint32_t currentModeIndex_ = 0;  // modeIndex value of the active mode
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumModes_ = nullptr;
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestMode_ = nullptr;
+
+    // Open-file picker (XR_EXT_workspace_file_dialog). PFN is null when the runtime
+    // doesn't expose the extension (→ caller uses a native dialog).
+    bool hasFilePickerExt_ = false;
+    PFN_xrRequestFilePickerEXT pfnRequestFilePicker_ = nullptr;
+    XrAsyncRequestIdEXT pendingPickerId_ = XR_NULL_ASYNC_REQUEST_ID_EXT;
+    bool hasPickedFile_ = false;
+    std::string pickedFile_;
 
     // Capabilities discovered at instance creation.
     bool hasWindowBindingExt_ = false;
