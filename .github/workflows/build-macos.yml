@@ -22,6 +22,7 @@ permissions:
 jobs:
   Build:
     runs-on: macos-14
+    timeout-minutes: 30
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -29,10 +30,10 @@ jobs:
 
       - name: Install dependencies
         # OpenXR loader is built from source by scripts/build_macos.sh (no brew
-        # formula). FFmpeg via Homebrew (pkg-config). dylibbundler gathers the
-        # app's FFmpeg/Vulkan/OpenXR dylib closure into the .app.
+        # formula). FFmpeg via Homebrew (pkg-config). The app's dylib closure is
+        # bundled by a recursive otool/install_name_tool walk in create_app_bundle.sh.
         run: |
-          brew install cmake ninja ffmpeg pkg-config vulkan-headers vulkan-loader molten-vk dylibbundler
+          brew install cmake ninja ffmpeg pkg-config vulkan-headers vulkan-loader molten-vk
           echo "VULKAN_SDK=$(brew --prefix)" >> "$GITHUB_ENV"
 
       - name: Derive installer version
