@@ -23,6 +23,7 @@ permissions:
 jobs:
   Build:
     runs-on: windows-2022
+    timeout-minutes: 30
     env:
       GH_TOKEN: ${{ github.token }}
     steps:

@@ -3,9 +3,10 @@
 #
 # Adapted from the model/gauss demo bundles. The media player additionally links
 # FFmpeg (libav*/libsw*), whose Homebrew build drags in a deep tree of transitive
-# dylibs (x264-free LGPL still pulls lzma, bz2, etc.). We therefore use
-# `dylibbundler` to recursively gather + relink every non-system dependency into
-# Contents/Resources/lib with @rpath, rather than hand-copying a fixed list.
+# dylibs (x264-free LGPL still pulls lzma, bz2, etc.). We therefore recursively
+# walk `otool -L` and relink every non-system dependency into
+# Contents/Resources/lib with @rpath. (We deliberately do NOT use dylibbundler:
+# it prompts on stdin for any library it can't resolve, which hangs CI forever.)
 #
 # Not bundled: the DisplayXR runtime dylib — the app defers to the system-installed
 # runtime via /etc/xdg/openxr/1/active_runtime.json (registered by the runtime
@@ -35,7 +36,6 @@ if [ ! -x "$BIN_SRC" ]; then
     echo "Error: binary not found/executable at $BIN_SRC" >&2
     exit 1
 fi
-command -v dylibbundler >/dev/null 2>&1 || { echo "Error: dylibbundler not found — \`brew install dylibbundler\`" >&2; exit 1; }
 
 echo "Creating .app bundle: $APP_BUNDLE"
 rm -rf "$APP_BUNDLE"
@@ -115,26 +115,75 @@ cat > "$APP_BUNDLE/Contents/Resources/MoltenVK_icd.json" <<'EOF'
 }
 EOF
 
-# --- Gather + relink every linked non-system dependency (FFmpeg + transitive,
-#     Vulkan loader, OpenXR loader) into Resources/lib with @rpath. ---
+# --- Recursively gather + relink every non-system dependency into Resources/lib
+#     with @rpath (FFmpeg + transitive, Vulkan loader, OpenXR loader, MoltenVK). ---
+LIBDIR="$APP_BUNDLE/Contents/Resources/lib"
 BIN="$APP_BUNDLE/Contents/Resources/$BINARY_NAME"
-dylibbundler --overwrite-files --bundle-deps \
-    --fix-file "$BIN" \
-    --dest-dir "$APP_BUNDLE/Contents/Resources/lib" \
-    --install-path "@rpath/" \
-    --search-path "$OPENXR_DIR/lib" \
-    --search-path "$BREW_PREFIX/lib"
+SEARCH_DIRS=("$OPENXR_DIR/lib" "$BREW_PREFIX/lib")
 
-# dylibbundler relinks against @rpath/<name>; ensure the binary has an rpath that
-# resolves it (it copies libs next to itself under Resources/lib).
+# Resolve a Mach-O load-command reference ($1) seen from a consumer dir ($2) to an
+# absolute on-disk path, or "" if it can't be found / is our own already-copied lib.
+resolve_ref() {
+    local ref="$1" consumer_dir="$2" base d
+    base="$(basename "$ref")"
+    case "$ref" in
+        /*)                  echo "$ref" ;;
+        @loader_path/*)      echo "${consumer_dir}/${ref#@loader_path/}" ;;
+        @executable_path/*)  echo "${consumer_dir}/${ref#@executable_path/}" ;;
+        *)  # @rpath/<x> or a bare name — search known dirs, then brew opt kegs.
+            for d in "${SEARCH_DIRS[@]}" "$BREW_PREFIX"/opt/*/lib; do
+                if [ -f "$d/$base" ]; then echo "$d/$base"; return; fi
+            done
+            echo "" ;;
+    esac
+}
+
+declare -A BUNDLED  # basename -> 1, to copy/recurse each lib at most once
+
+# Copy every non-system dependency of $1 into LIBDIR, rewrite the reference to
+# @rpath/<base>, and recurse into each newly-copied lib.
+bundle_deps() {
+    local target="$1" target_dir ref base real
+    target_dir="$(cd "$(dirname "$target")" && pwd)"
+    while IFS= read -r ref; do
+        [ -z "$ref" ] && continue
+        case "$ref" in /usr/lib/*|/System/*) continue ;; esac
+        base="$(basename "$ref")"
+        real="$(resolve_ref "$ref" "$target_dir")"
+        if [ -z "$real" ] || [ ! -f "$real" ]; then
+            # Unresolvable (e.g. the target's own @rpath id) — just point at our copy
+            # if we have it; otherwise leave it (system fallback) and move on.
+            [ -f "$LIBDIR/$base" ] && install_name_tool -change "$ref" "@rpath/$base" "$target" 2>/dev/null || true
+            continue
+        fi
+        if [ -z "${BUNDLED[$base]:-}" ]; then
+            BUNDLED[$base]=1
+            cp -f "$real" "$LIBDIR/$base"
+            chmod u+w "$LIBDIR/$base"
+            install_name_tool -id "@rpath/$base" "$LIBDIR/$base" 2>/dev/null || true
+            bundle_deps "$LIBDIR/$base"
+        fi
+        install_name_tool -change "$ref" "@rpath/$base" "$target" 2>/dev/null || true
+    done < <(otool -L "$target" | tail -n +2 | awk '{print $1}')
+}
+
+# MoltenVK is already copied (loaded via ICD, not linked) — register + relink it.
+BUNDLED[libMoltenVK.dylib]=1
+install_name_tool -id "@rpath/libMoltenVK.dylib" "$LIBDIR/libMoltenVK.dylib" 2>/dev/null || true
+bundle_deps "$LIBDIR/libMoltenVK.dylib"
+
+# Walk the binary's dependency closure.
+bundle_deps "$BIN"
+
+# Give the binary an rpath rooted at the bundled libs.
 install_name_tool -add_rpath "@loader_path/lib" "$BIN" 2>/dev/null || true
 
-# --- Re-sign everything dylibbundler/install_name_tool touched ---
-# Apple Silicon SIGKILLs Mach-O whose signature was invalidated by relinking.
-for d in "$APP_BUNDLE/Contents/Resources/lib"/*.dylib; do
+# Re-sign everything install_name_tool touched — Apple Silicon SIGKILLs Mach-O
+# whose code signature was invalidated by relinking.
+for d in "$LIBDIR"/*.dylib; do
     [ -e "$d" ] || continue
     codesign --force --sign - "$d"
 done
 codesign --force --sign - "$BIN"
 
-echo ".app bundle created: $APP_BUNDLE"
+echo ".app bundle created: $APP_BUNDLE ($(ls "$LIBDIR" | wc -l | tr -d ' ') bundled dylibs)"
