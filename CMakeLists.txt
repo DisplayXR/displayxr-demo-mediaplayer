@@ -50,20 +50,54 @@ else()
     set(MP_OPENXR_LOADER openxr_loader)
 endif()
 
-# --- FFmpeg (libav*) for video decode (M2). Found via pkg-config (Homebrew/system).
-#     Optional: if absent, the app builds without video support.
+# --- FFmpeg (libav*) for video decode (M2/M3). Optional: if absent, the app builds
+#     without video support.
+#   * macOS / Linux: pkg-config (Homebrew / system).
+#   * Windows: no pkg-config in the usual MSVC toolchain, so fall back to a manual
+#     dev tree. Set -DFFMPEG_ROOT=<dir containing include/ + lib/> (e.g. a vcpkg
+#     'installed/x64-windows' prefix, or a BtbN/gyan.dev prebuilt — see README).
 find_package(PkgConfig QUIET)
 set(MP_HAVE_FFMPEG FALSE)
+set(MP_FFMPEG_LINK "")           # what the target links against (pkg-config target or libs)
+set(MP_FFMPEG_DLL_DIR "")        # Windows: dir holding the runtime DLLs to stage by the exe
 if(PkgConfig_FOUND)
     pkg_check_modules(FFMPEG IMPORTED_TARGET
         libavformat libavcodec libavutil libswscale)
     if(FFMPEG_FOUND)
         set(MP_HAVE_FFMPEG TRUE)
-        message(STATUS "FFmpeg: found (libavcodec ${FFMPEG_libavcodec_VERSION})")
+        set(MP_FFMPEG_LINK PkgConfig::FFMPEG)
+        message(STATUS "FFmpeg: found via pkg-config (libavcodec ${FFMPEG_libavcodec_VERSION})")
     endif()
 endif()
 if(NOT MP_HAVE_FFMPEG)
-    message(STATUS "FFmpeg: not found — video playback (M2) will be unavailable")
+    # Manual fallback. Honor FFMPEG_ROOT (cache or env); otherwise still let
+    # find_*/CMAKE_PREFIX_PATH (e.g. a vcpkg toolchain) resolve the libs.
+    if(NOT FFMPEG_ROOT AND DEFINED ENV{FFMPEG_ROOT})
+        set(FFMPEG_ROOT "$ENV{FFMPEG_ROOT}")
+    endif()
+    find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h HINTS "${FFMPEG_ROOT}/include")
+    find_library(FFMPEG_avcodec  avcodec  HINTS "${FFMPEG_ROOT}/lib")
+    find_library(FFMPEG_avformat avformat HINTS "${FFMPEG_ROOT}/lib")
+    find_library(FFMPEG_avutil   avutil   HINTS "${FFMPEG_ROOT}/lib")
+    find_library(FFMPEG_swscale  swscale  HINTS "${FFMPEG_ROOT}/lib")
+    if(FFMPEG_INCLUDE_DIR AND FFMPEG_avcodec AND FFMPEG_avformat AND FFMPEG_avutil AND FFMPEG_swscale)
+        add_library(mp_ffmpeg INTERFACE)
+        target_include_directories(mp_ffmpeg INTERFACE "${FFMPEG_INCLUDE_DIR}")
+        target_link_libraries(mp_ffmpeg INTERFACE
+            "${FFMPEG_avcodec}" "${FFMPEG_avformat}" "${FFMPEG_avutil}" "${FFMPEG_swscale}")
+        set(MP_HAVE_FFMPEG TRUE)
+        set(MP_FFMPEG_LINK mp_ffmpeg)
+        message(STATUS "FFmpeg: found via FFMPEG_ROOT='${FFMPEG_ROOT}' (${FFMPEG_INCLUDE_DIR})")
+        # For shared builds (the common Windows prebuilts), stage the DLLs next to
+        # the exe so it runs without PATH munging. Look beside the import libs.
+        if(WIN32 AND FFMPEG_ROOT AND EXISTS "${FFMPEG_ROOT}/bin")
+            set(MP_FFMPEG_DLL_DIR "${FFMPEG_ROOT}/bin")
+        endif()
+    endif()
+endif()
+if(NOT MP_HAVE_FFMPEG)
+    message(STATUS "FFmpeg: not found — video playback (M2/M3) will be unavailable "
+                   "(Windows: pass -DFFMPEG_ROOT=<ffmpeg dev tree>)")
 endif()
 
 # --- SDL3 (window + input + native handle). Pinned; uses an installed SDL3 if one
@@ -121,7 +155,17 @@ target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_IMGUI=1)
 
 if(MP_HAVE_FFMPEG)
     target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
-    target_link_libraries(${MP_TARGET} PRIVATE PkgConfig::FFMPEG)
+    target_link_libraries(${MP_TARGET} PRIVATE ${MP_FFMPEG_LINK})
+    # Windows shared FFmpeg: copy the runtime DLLs next to the binary post-build.
+    if(MP_FFMPEG_DLL_DIR)
+        file(GLOB _ffmpeg_dlls "${MP_FFMPEG_DLL_DIR}/*.dll")
+        foreach(_dll ${_ffmpeg_dlls})
+            add_custom_command(TARGET ${MP_TARGET} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_dll}" "$<TARGET_FILE_DIR:${MP_TARGET}>"
+                COMMENT "Staging FFmpeg DLL $<PATH:GET_FILENAME,${_dll}> next to ${MP_TARGET}")
+        endforeach()
+    endif()
 endif()
 
 target_include_directories(${MP_TARGET} BEFORE PRIVATE
@@ -149,6 +193,18 @@ if(TARGET OpenXR::openxr_loader)
                 "${_oxr_loc}" "$<TARGET_FILE_DIR:${MP_TARGET}>"
             COMMENT "Copying OpenXR loader next to ${MP_TARGET}")
     endif()
+endif()
+
+# Stage dependent shared-library DLLs (SDL3 when built shared, an OpenXR loader DLL
+# if the loader is dynamic, etc.) next to the binary so it runs in-place on Windows
+# without PATH munging. FFmpeg's DLLs come via MP_FFMPEG_DLL_DIR above (raw .lib
+# paths, not CMake targets, so they're not in TARGET_RUNTIME_DLLS).
+if(WIN32)
+    add_custom_command(TARGET ${MP_TARGET} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:${MP_TARGET}> "$<TARGET_FILE_DIR:${MP_TARGET}>"
+        COMMAND_EXPAND_LISTS
+        COMMENT "Staging dependent runtime DLLs next to ${MP_TARGET}")
 endif()
 
 message(STATUS "Configured target: ${MP_TARGET}")
