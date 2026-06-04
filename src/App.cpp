@@ -10,6 +10,32 @@
 
 namespace mp {
 
+namespace {
+// Aspect-fit `contentAspect` (width/height) inside `tile`, centered, with black bars
+// (letterbox if the content is wider than the tile, pillarbox if narrower). No stretch.
+XrSession::ViewRect FitRect(const XrSession::ViewRect& tile, float contentAspect) {
+    if (tile.w == 0 || tile.h == 0 || contentAspect <= 0.0f) return tile;
+    const float tileAspect = (float)tile.w / (float)tile.h;
+    XrSession::ViewRect r = tile;
+    if (contentAspect > tileAspect) {
+        // Content is wider: fit to tile width, bars top/bottom.
+        const uint32_t h = (uint32_t)((float)tile.w / contentAspect + 0.5f);
+        r.w = tile.w;
+        r.h = h;
+        r.x = tile.x;
+        r.y = tile.y + (int32_t)((tile.h - h) / 2);
+    } else {
+        // Content is narrower: fit to tile height, bars left/right.
+        const uint32_t w = (uint32_t)((float)tile.h * contentAspect + 0.5f);
+        r.w = w;
+        r.h = tile.h;
+        r.x = tile.x + (int32_t)((tile.w - w) / 2);
+        r.y = tile.y;
+    }
+    return r;
+}
+} // namespace
+
 bool App::Initialize(const char* mediaPath) {
     if (!window_.Create("DisplayXR Stereo Media Player", 1280, 720)) return false;
 
@@ -38,7 +64,13 @@ bool App::Initialize(const char* mediaPath) {
                                                (uint32_t)img.width, (uint32_t)img.height)) {
                 layout_ = info.layout;
                 hasImage_ = true;
-                LOG_INFO("Displaying %s image (%s)", MediaSource::LayoutName(info.layout), mediaPath);
+                // Per-eye display aspect: full SBS packs two eyes across the width,
+                // so each eye is half-width; half-SBS/mono use the full width.
+                const float eyeW = (info.layout == StereoLayout::SbsFull)
+                                       ? (float)img.width * 0.5f : (float)img.width;
+                contentAspect_ = eyeW / (float)img.height;
+                LOG_INFO("Displaying %s image (%s), per-eye aspect %.3f",
+                         MediaSource::LayoutName(info.layout), mediaPath, contentAspect_);
             }
         }
     }
@@ -67,7 +99,8 @@ int App::Run() {
     uint64_t frames = 0, rendered = 0;
     ClearColor colors[XrSession::kMaxViews];
     ViewUV uvs[XrSession::kMaxViews];
-    XrSession::ViewRect rects[XrSession::kMaxViews];
+    XrSession::ViewRect rects[XrSession::kMaxViews];          // full per-view tiles (submitted)
+    XrSession::ViewRect contentRects[XrSession::kMaxViews];   // aspect-fit content within each tile
     const char* prevMode = "";
     while (keepRunning && !xr_.ExitRequested()) {
         keepRunning = window_.PumpEvents();
@@ -134,7 +167,21 @@ int App::Run() {
             }
 
             if (hasImage_) {
-                renderer_.DrawViews(frame.imageIndex, rects, uvs, frame.viewCount);
+                // Letterbox in DISPLAY-VIEW space (the canvas), then map into each
+                // tile by the mode's view-scale — so non-uniform modes (e.g. Squeezed
+                // SBS, scaleX!=scaleY) that the runtime stretches back to the full view
+                // still show correct aspect. The render pass clears the rest to black.
+                const float sx = xr_.ActiveViewScaleX();
+                const float sy = xr_.ActiveViewScaleY();
+                const XrSession::ViewRect viewFit =
+                    FitRect({0, 0, canvasW, canvasH}, contentAspect_);
+                for (uint32_t v = 0; v < frame.viewCount; ++v) {
+                    contentRects[v].x = rects[v].x + (int32_t)((float)viewFit.x * sx + 0.5f);
+                    contentRects[v].y = rects[v].y + (int32_t)((float)viewFit.y * sy + 0.5f);
+                    contentRects[v].w = (uint32_t)((float)viewFit.w * sx + 0.5f);
+                    contentRects[v].h = (uint32_t)((float)viewFit.h * sy + 0.5f);
+                }
+                renderer_.DrawViews(frame.imageIndex, contentRects, uvs, frame.viewCount);
             } else {
                 renderer_.ClearViews(frame.imageIndex, colors, rects, frame.viewCount);
             }

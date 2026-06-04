@@ -27,6 +27,7 @@ private:
 
     bool hasImage_ = false;
     StereoLayout layout_ = StereoLayout::Mono;
+    float contentAspect_ = 1.0f;  // per-eye display aspect (width/height), for letterboxing
 };
 
 } // namespace mp

@@ -18,7 +18,9 @@ bool Window::Create(const char* title, int width, int height) {
 
     // The runtime presents into our view via Vulkan/MoltenVK; on macOS we still
     // request a Metal-capable window so SDL gives us a CAMetalLayer-backed NSView.
-    Uint32 flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    // Resizable from the start — the render path reads the live pixel size each
+    // frame, so tiles + letterboxing re-fit automatically.
+    Uint32 flags = SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE;
 #if defined(__APPLE__)
     flags |= SDL_WINDOW_METAL;
 #endif
