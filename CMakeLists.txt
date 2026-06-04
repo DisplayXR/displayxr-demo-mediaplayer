@@ -78,6 +78,22 @@ FetchContent_Declare(SDL3
     FIND_PACKAGE_ARGS NAMES SDL3)
 FetchContent_MakeAvailable(SDL3)
 
+# --- Dear ImGui (subtle 3D UI, M4). No upstream CMake target — compile the core
+#     plus the SDL3 + Vulkan backends straight into our target.
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.91.5
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(imgui)
+set(MP_IMGUI_DIR "${imgui_SOURCE_DIR}")
+set(MP_IMGUI_SOURCES
+    ${MP_IMGUI_DIR}/imgui.cpp
+    ${MP_IMGUI_DIR}/imgui_draw.cpp
+    ${MP_IMGUI_DIR}/imgui_tables.cpp
+    ${MP_IMGUI_DIR}/imgui_widgets.cpp
+    ${MP_IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
+    ${MP_IMGUI_DIR}/backends/imgui_impl_vulkan.cpp)
+
 # ---------------------------------------------------------------------------
 # Target
 # ---------------------------------------------------------------------------
@@ -92,10 +108,16 @@ add_executable(${MP_TARGET}
     src/media/MediaSource.cpp
     src/media/VideoDecoder.cpp
     src/ui/Hud.cpp
+    src/ui/ImGuiLayer.cpp
     src/media/FrameRing.h  # header-only triple buffer
     # Header-only stub (fleshed out in a later milestone):
     src/ui/Ui.h
+    ${MP_IMGUI_SOURCES}
 )
+
+target_include_directories(${MP_TARGET} PRIVATE
+    ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)
+target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_IMGUI=1)
 
 if(MP_HAVE_FFMPEG)
     target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)

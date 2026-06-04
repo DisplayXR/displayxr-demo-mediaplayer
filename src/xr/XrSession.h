@@ -84,6 +84,7 @@ public:
     bool HasHud() const { return hasHud_; }
     uint32_t HudWidth() const { return hudSwapchain_.width; }
     uint32_t HudHeight() const { return hudSwapchain_.height; }
+    int64_t HudFormat() const { return hudSwapchain_.format; }
     const std::vector<VkImage>& HudImages() const { return hudVkImages_; }
     bool AcquireHudImage(uint32_t& imageIndex);
     bool ReleaseHudImage();

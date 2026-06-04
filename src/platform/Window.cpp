@@ -76,8 +76,19 @@ void Window::PixelSize(uint32_t& width, uint32_t& height) const {
     height = (uint32_t)(h > 0 ? h : 0);
 }
 
+void Window::PointSize(uint32_t& width, uint32_t& height) const {
+    int w = 0, h = 0;
+    if (window_) SDL_GetWindowSize(window_, &w, &h);
+    width = (uint32_t)(w > 0 ? w : 0);
+    height = (uint32_t)(h > 0 ? h : 0);
+}
+
 void Window::SetTitle(const char* title) {
     if (window_) SDL_SetWindowTitle(window_, title);
+}
+
+void Window::SetEventHook(std::function<void(void*)> hook) {
+    eventHook_ = std::move(hook);
 }
 
 void Window::SetLiveResizeCallback(std::function<void()> cb) {
@@ -91,6 +102,7 @@ void Window::SetLiveResizeCallback(std::function<void()> cb) {
 bool Window::PumpEvents() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+        if (eventHook_) eventHook_(&e);   // feed ImGui first (it may want the input)
         if (e.type == SDL_EVENT_QUIT) return false;
         if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) return false;
         if (e.type == SDL_EVENT_KEY_DOWN) {
