@@ -8,6 +8,21 @@
 
 namespace mp {
 
+namespace {
+// SDL event watch — fires synchronously on the main thread as events are pumped,
+// INCLUDING during the macOS modal live-resize loop. We re-render from here so the
+// window keeps updating while the user drags, instead of freezing until mouse-up.
+bool SDLCALL ResizeEventWatch(void* userdata, SDL_Event* e) {
+    if (e->type == SDL_EVENT_WINDOW_RESIZED ||
+        e->type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
+        e->type == SDL_EVENT_WINDOW_EXPOSED) {
+        auto* cb = static_cast<std::function<void()>*>(userdata);
+        if (cb && *cb) (*cb)();
+    }
+    return true;  // keep the event in the queue for normal handling
+}
+} // namespace
+
 Window::~Window() { Destroy(); }
 
 bool Window::Create(const char* title, int width, int height) {
@@ -61,14 +76,27 @@ void Window::PixelSize(uint32_t& width, uint32_t& height) const {
     height = (uint32_t)(h > 0 ? h : 0);
 }
 
+void Window::SetTitle(const char* title) {
+    if (window_) SDL_SetWindowTitle(window_, title);
+}
+
+void Window::SetLiveResizeCallback(std::function<void()> cb) {
+    liveResizeCb_ = std::move(cb);
+    if (!eventWatchAdded_) {
+        SDL_AddEventWatch(ResizeEventWatch, &liveResizeCb_);
+        eventWatchAdded_ = true;
+    }
+}
+
 bool Window::PumpEvents() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) return false;
         if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) return false;
-        if (e.type == SDL_EVENT_KEY_DOWN) {
+        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
             if (e.key.key == SDLK_ESCAPE) return false;
-            if (e.key.key == SDLK_V && !e.key.repeat) cycleModeRequested_ = true;
+            if (e.key.key == SDLK_V) cycleModeRequested_ = true;
+            if (e.key.key == SDLK_TAB && (e.key.mod & SDL_KMOD_SHIFT)) toggleHudRequested_ = true;
         }
     }
     return true;
@@ -80,7 +108,17 @@ bool Window::TakeCycleModeRequest() {
     return v;
 }
 
+bool Window::TakeToggleHudRequest() {
+    bool v = toggleHudRequested_;
+    toggleHudRequested_ = false;
+    return v;
+}
+
 void Window::Destroy() {
+    if (eventWatchAdded_) {
+        SDL_RemoveEventWatch(ResizeEventWatch, &liveResizeCb_);
+        eventWatchAdded_ = false;
+    }
 #if defined(__APPLE__)
     if (metalView_) {
         SDL_Metal_DestroyView((SDL_MetalView)metalView_);

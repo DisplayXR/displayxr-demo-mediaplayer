@@ -359,38 +359,44 @@ bool VulkanRenderer::ClearViews(uint32_t imageIndex, const ClearColor* colors,
 
 bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t height) {
     if (!rgba || width == 0 || height == 0) return false;
-    DestroyTexture();
 
     const VkDeviceSize bytes = (VkDeviceSize)width * height * 4;
 
-    // GPU texture (sampled).
-    VkImageCreateInfo ici = {};
-    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
-    ici.extent = {width, height, 1};
-    ici.mipLevels = 1;
-    ici.arrayLayers = 1;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT;
-    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(device_, &ici, nullptr, &textureImage_) != VK_SUCCESS) {
-        LOG_ERROR("vkCreateImage (texture) failed");
-        return false;
+    // (Re)create the GPU image only when the size changes — video frames reuse it.
+    const bool recreate = (textureImage_ == VK_NULL_HANDLE || texW_ != width || texH_ != height);
+    if (recreate) {
+        DestroyTexture();
+        VkImageCreateInfo ici = {};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ici.extent = {width, height, 1};
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(device_, &ici, nullptr, &textureImage_) != VK_SUCCESS) {
+            LOG_ERROR("vkCreateImage (texture) failed");
+            return false;
+        }
+        VkMemoryRequirements ireq;
+        vkGetImageMemoryRequirements(device_, textureImage_, &ireq);
+        VkMemoryAllocateInfo iai = {};
+        iai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        iai.allocationSize = ireq.size;
+        iai.memoryTypeIndex = FindMemoryType(ireq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (iai.memoryTypeIndex == UINT32_MAX ||
+            vkAllocateMemory(device_, &iai, nullptr, &textureMemory_) != VK_SUCCESS) {
+            LOG_ERROR("texture memory alloc failed");
+            return false;
+        }
+        vkBindImageMemory(device_, textureImage_, textureMemory_, 0);
+        texW_ = width;
+        texH_ = height;
+        textureInitialized_ = false;
     }
-    VkMemoryRequirements ireq;
-    vkGetImageMemoryRequirements(device_, textureImage_, &ireq);
-    VkMemoryAllocateInfo iai = {};
-    iai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    iai.allocationSize = ireq.size;
-    iai.memoryTypeIndex = FindMemoryType(ireq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (iai.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(device_, &iai, nullptr, &textureMemory_) != VK_SUCCESS) {
-        LOG_ERROR("texture memory alloc failed");
-        return false;
-    }
-    vkBindImageMemory(device_, textureImage_, textureMemory_, 0);
 
     // Host-visible staging buffer with the pixels.
     VkBuffer staging = VK_NULL_HANDLE;
@@ -415,7 +421,8 @@ bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t
     memcpy(mapped, rgba, (size_t)bytes);
     vkUnmapMemory(device_, stagingMem);
 
-    // Upload: UNDEFINED -> TRANSFER_DST -> copy -> SHADER_READ_ONLY_OPTIMAL.
+    // Upload: (UNDEFINED first time | SHADER_READ since) -> TRANSFER_DST -> copy ->
+    // SHADER_READ_ONLY_OPTIMAL. Reused frames re-enter from SHADER_READ.
     vkResetCommandBuffer(commandBuffer_, 0);
     VkCommandBufferBeginInfo cbi = {};
     cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -424,13 +431,16 @@ bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t
 
     VkImageMemoryBarrier toDst = {};
     toDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toDst.oldLayout = textureInitialized_ ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                          : VK_IMAGE_LAYOUT_UNDEFINED;
     toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     toDst.image = textureImage_;
     toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    toDst.srcAccessMask = 0;
+    toDst.srcAccessMask = textureInitialized_ ? VK_ACCESS_SHADER_READ_BIT : 0;
     toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    const VkPipelineStageFlags srcStage = textureInitialized_
+        ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    vkCmdPipelineBarrier(commandBuffer_, srcStage,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDst);
 
     VkBufferImageCopy copy = {};
@@ -458,33 +468,36 @@ bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t
 
     vkDestroyBuffer(device_, staging, nullptr);
     vkFreeMemory(device_, stagingMem, nullptr);
+    textureInitialized_ = true;
 
-    // View + bind into the descriptor set.
-    VkImageViewCreateInfo vci = {};
-    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    vci.image = textureImage_;
-    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
-    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(device_, &vci, nullptr, &textureView_) != VK_SUCCESS) {
-        LOG_ERROR("texture image view failed");
-        return false;
+    // The view + descriptor only change when the image was (re)created.
+    if (recreate) {
+        VkImageViewCreateInfo vci = {};
+        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vci.image = textureImage_;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(device_, &vci, nullptr, &textureView_) != VK_SUCCESS) {
+            LOG_ERROR("texture image view failed");
+            return false;
+        }
+
+        VkDescriptorImageInfo dii = {};
+        dii.sampler = sampler_;
+        dii.imageView = textureView_;
+        dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet write = {};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = descSet_;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &dii;
+        vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+
+        LOG_INFO("VulkanRenderer: texture (re)created %ux%u", width, height);
     }
-
-    VkDescriptorImageInfo dii = {};
-    dii.sampler = sampler_;
-    dii.imageView = textureView_;
-    dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet write = {};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descSet_;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &dii;
-    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
-
-    LOG_INFO("VulkanRenderer: uploaded %ux%u texture", width, height);
     return true;
 }
 
@@ -555,6 +568,84 @@ void VulkanRenderer::DestroyTexture() {
     if (textureView_) { vkDestroyImageView(device_, textureView_, nullptr); textureView_ = VK_NULL_HANDLE; }
     if (textureImage_) { vkDestroyImage(device_, textureImage_, nullptr); textureImage_ = VK_NULL_HANDLE; }
     if (textureMemory_) { vkFreeMemory(device_, textureMemory_, nullptr); textureMemory_ = VK_NULL_HANDLE; }
+    texW_ = 0;
+    texH_ = 0;
+    textureInitialized_ = false;
+}
+
+bool VulkanRenderer::UploadToSwapchainImage(VkImage image, const uint8_t* rgba,
+                                            uint32_t width, uint32_t height) {
+    if (image == VK_NULL_HANDLE || !rgba) return false;
+    const VkDeviceSize bytes = (VkDeviceSize)width * height * 4;
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+    VkBufferCreateInfo bci = {};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vkCreateBuffer(device_, &bci, nullptr, &staging);
+    VkMemoryRequirements breq;
+    vkGetBufferMemoryRequirements(device_, staging, &breq);
+    VkMemoryAllocateInfo bai = {};
+    bai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    bai.allocationSize = breq.size;
+    bai.memoryTypeIndex = FindMemoryType(breq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vkAllocateMemory(device_, &bai, nullptr, &stagingMem);
+    vkBindBufferMemory(device_, staging, stagingMem, 0);
+    void* mapped = nullptr;
+    vkMapMemory(device_, stagingMem, 0, bytes, 0, &mapped);
+    memcpy(mapped, rgba, (size_t)bytes);
+    vkUnmapMemory(device_, stagingMem);
+
+    vkResetCommandBuffer(commandBuffer_, 0);
+    VkCommandBufferBeginInfo cbi = {};
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(commandBuffer_, &cbi);
+
+    // We overwrite the whole image, so UNDEFINED old layout is fine each frame.
+    VkImageMemoryBarrier toDst = {};
+    toDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toDst.image = image;
+    toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    toDst.srcAccessMask = 0;
+    toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+    VkBufferImageCopy copy = {};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {width, height, 1};
+    vkCmdCopyBufferToImage(commandBuffer_, staging, image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+    // Leave it in COLOR_ATTACHMENT_OPTIMAL for the runtime at release time.
+    VkImageMemoryBarrier toColor = toDst;
+    toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toColor.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr,
+                         0, nullptr, 1, &toColor);
+    vkEndCommandBuffer(commandBuffer_);
+
+    vkResetFences(device_, 1, &fence_);
+    VkSubmitInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &commandBuffer_;
+    vkQueueSubmit(queue_, 1, &si, fence_);
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+
+    vkDestroyBuffer(device_, staging, nullptr);
+    vkFreeMemory(device_, stagingMem, nullptr);
+    return true;
 }
 
 bool VulkanRenderer::DumpImage(uint32_t imageIndex, const char* path) {

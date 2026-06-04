@@ -15,21 +15,28 @@ vendor SR SDK, no weaving, no CUDA dependency.
 
 ## Status
 
-✅ **M1 complete** — stereo image playback. Loads a side-by-side JPG/PNG (stb_image),
-detects the SBS layout from the filename (`*_2x1` / `*_half_2x1`, aspect fallback),
-uploads it as a Vulkan texture, and samples the correct half into each display view
-(left-eye views ← left half, right-eye views ← right half) across all N views of the
-active rendering mode. Builds on the M0 skeleton (SDL3 window → OpenXR stereo session
-→ runtime weave). Verified on macOS (Apple Silicon, MoltenVK) against a local
-`displayxr-runtime` dev build; Windows scaffolded but unverified. Next: M2 (video).
+✅ **M2 complete** — stereo video playback (+ M1 stereo images). FFmpeg software-decodes
+a side-by-side video on a background thread, hands frames through a triple-buffered
+`FrameRing` to the render loop (decode rate decoupled from display rate), and samples
+the correct half into each display view with aspect-correct **letterboxing**. Stereo
+images (JPG/PNG via stb_image) work the same way. Builds on M0 (SDL3 window → OpenXR
+stereo session → runtime weave) and M1 (SBS routing). Verified on macOS (Apple Silicon,
+MoltenVK) against a local `displayxr-runtime` dev build; Windows scaffolded but unverified.
+Next: M3 (per-OS hardware decode).
+
+Also in: live (continuous) window resize, an FPS counter in the title bar, and a
+window-space stats **HUD** (toggle with **SHIFT+TAB**) showing fps / mode / source /
+canvas / per-view tile.
 
 ```bash
-# show a side-by-side stereo image (press V to cycle display modes, Esc to quit)
+# play a side-by-side stereo video or image
+scripts/run_mediaplayer_handle_vk_macos.sh /path/to/clip_2x1.mp4
 scripts/run_mediaplayer_handle_vk_macos.sh assets/test_LR_2x1.png
 ```
 
-With no file argument it falls back to a RED|BLUE left/right test pattern. See `PRD.md`
-§11 for the milestone map.
+Keys: **V** cycles display modes, **SHIFT+TAB** toggles the HUD, **Esc** quits. With no
+file argument it falls back to a RED|BLUE left/right test pattern. See `PRD.md` §11 for
+the milestone map.
 
 ## Requirements
 

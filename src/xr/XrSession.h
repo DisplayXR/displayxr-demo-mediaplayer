@@ -32,6 +32,20 @@ public:
         uint32_t w = 0, h = 0;
     };
 
+    // Optional window-space HUD overlay submitted alongside the projection layer.
+    // Placement is in window fractions [0..1]; disparity shifts it per-eye (negative
+    // = toward the viewer). Render into the HUD swapchain image before EndFrame.
+    struct HudSubmit {
+        bool enabled = false;
+        float x = 0.015f;
+        float y = 0.02f;
+        float width = 0.30f;
+        float height = 0.05f;
+        float disparity = 0.0f;  // 0 = zero-disparity plane (screen depth)
+        int32_t srcW = 0;  // sub-rect of the HUD swapchain to show (0 => full)
+        int32_t srcH = 0;
+    };
+
     // Per-frame state handed between BeginFrame/EndFrame.
     struct Frame {
         XrFrameState frameState{XR_TYPE_FRAME_STATE};
@@ -64,7 +78,15 @@ public:
     // locates the two eye views and acquires the swapchain image. The caller then
     // renders into `imageIndex` and calls EndFrame to submit the projection layer.
     bool BeginFrame(Frame& frame);
-    bool EndFrame(Frame& frame, const ViewRect* rects);
+    bool EndFrame(Frame& frame, const ViewRect* rects, const HudSubmit* hud = nullptr);
+
+    // Window-space HUD swapchain (created in Initialize if the runtime supports it).
+    bool HasHud() const { return hasHud_; }
+    uint32_t HudWidth() const { return hudSwapchain_.width; }
+    uint32_t HudHeight() const { return hudSwapchain_.height; }
+    const std::vector<VkImage>& HudImages() const { return hudVkImages_; }
+    bool AcquireHudImage(uint32_t& imageIndex);
+    bool ReleaseHudImage();
 
     // Vulkan handles the runtime selected for us — handed to the renderer.
     VkInstance VkInstanceHandle() const { return vkInstance_; }
@@ -111,6 +133,7 @@ private:
     void EnumerateRenderingModes();
     bool CreateLocalSpace();
     bool CreateSwapchain();
+    void CreateHudSwapchain(uint32_t width, uint32_t height);
 
     struct SwapchainInfo {
         XrSwapchain handle = XR_NULL_HANDLE;
@@ -146,6 +169,11 @@ private:
     uint32_t tileRows_ = 1;
     SwapchainInfo swapchain_;
     std::vector<VkImage> swapchainVkImages_;
+
+    // Window-space HUD swapchain (small; optional).
+    SwapchainInfo hudSwapchain_;
+    std::vector<VkImage> hudVkImages_;
+    bool hasHud_ = false;
 
     // Rendering modes (XR_EXT_display_info v8+). Empty when the runtime doesn't
     // expose them, in which case we fall back to the max view count + derived tiling.

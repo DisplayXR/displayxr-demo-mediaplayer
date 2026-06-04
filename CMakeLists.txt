@@ -50,6 +50,22 @@ else()
     set(MP_OPENXR_LOADER openxr_loader)
 endif()
 
+# --- FFmpeg (libav*) for video decode (M2). Found via pkg-config (Homebrew/system).
+#     Optional: if absent, the app builds without video support.
+find_package(PkgConfig QUIET)
+set(MP_HAVE_FFMPEG FALSE)
+if(PkgConfig_FOUND)
+    pkg_check_modules(FFMPEG IMPORTED_TARGET
+        libavformat libavcodec libavutil libswscale)
+    if(FFMPEG_FOUND)
+        set(MP_HAVE_FFMPEG TRUE)
+        message(STATUS "FFmpeg: found (libavcodec ${FFMPEG_libavcodec_VERSION})")
+    endif()
+endif()
+if(NOT MP_HAVE_FFMPEG)
+    message(STATUS "FFmpeg: not found — video playback (M2) will be unavailable")
+endif()
+
 # --- SDL3 (window + input + native handle). Pinned; uses an installed SDL3 if one
 #     is already present, else builds the pinned source.
 set(SDL_SHARED ON CACHE BOOL "" FORCE)
@@ -74,11 +90,17 @@ add_executable(${MP_TARGET}
     src/rhi/VulkanRenderer.cpp
     src/media/ImageDecoder.cpp
     src/media/MediaSource.cpp
-    # Header-only stubs (fleshed out in later milestones):
-    src/media/VideoDecoder.h
-    src/media/FrameRing.h
+    src/media/VideoDecoder.cpp
+    src/ui/Hud.cpp
+    src/media/FrameRing.h  # header-only triple buffer
+    # Header-only stub (fleshed out in a later milestone):
     src/ui/Ui.h
 )
+
+if(MP_HAVE_FFMPEG)
+    target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
+    target_link_libraries(${MP_TARGET} PRIVATE PkgConfig::FFMPEG)
+endif()
 
 target_include_directories(${MP_TARGET} BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 struct SDL_Window;
 
@@ -31,17 +32,28 @@ public:
     // Backing-store size in pixels (Retina-aware). This is the runtime's canvas.
     void PixelSize(uint32_t& width, uint32_t& height) const;
 
+    void SetTitle(const char* title);
+
     // Pump SDL events; returns false when the user asked to quit (close / Esc).
     bool PumpEvents();
 
     // True once per V keypress (cycle rendering mode). Clears the latch on read.
     bool TakeCycleModeRequest();
+    // True once per SHIFT+TAB (toggle HUD). Clears the latch on read.
+    bool TakeToggleHudRequest();
+
+    // Called to render a frame *during* the macOS modal resize loop (which would
+    // otherwise block our main loop), giving continuous live resize.
+    void SetLiveResizeCallback(std::function<void()> cb);
 
 private:
     SDL_Window* window_ = nullptr;
     void* metalView_ = nullptr;   // SDL_MetalView (macOS only); owned, destroyed on Destroy
     void* nativeHandle_ = nullptr;
     bool cycleModeRequested_ = false;
+    bool toggleHudRequested_ = false;
+    std::function<void()> liveResizeCb_;
+    bool eventWatchAdded_ = false;
 };
 
 } // namespace mp

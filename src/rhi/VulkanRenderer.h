@@ -45,6 +45,11 @@ public:
                     const std::vector<VkImage>& images);
     void Shutdown();
 
+    // Copy an RGBA8 buffer into an external (e.g. HUD swapchain) VkImage, leaving it
+    // in COLOR_ATTACHMENT_OPTIMAL (the layout the runtime expects at release).
+    bool UploadToSwapchainImage(VkImage image, const uint8_t* rgba, uint32_t width,
+                                uint32_t height);
+
     // Debug: read the given swapchain image back and write it to `path` as PNG.
     // Must be called after ClearViews and before the image is released. Proves
     // exactly what the app submitted to the runtime. Returns false on failure.
@@ -92,10 +97,14 @@ private:
     VkDescriptorSet descSet_ = VK_NULL_HANDLE;
     VkSampler sampler_ = VK_NULL_HANDLE;
 
-    // Source texture (the whole SBS frame; views sample sub-regions).
+    // Source texture (the whole SBS frame; views sample sub-regions). Reused across
+    // video frames — reallocated only when the dimensions change.
     VkImage textureImage_ = VK_NULL_HANDLE;
     VkDeviceMemory textureMemory_ = VK_NULL_HANDLE;
     VkImageView textureView_ = VK_NULL_HANDLE;
+    uint32_t texW_ = 0;
+    uint32_t texH_ = 0;
+    bool textureInitialized_ = false;  // false right after (re)create -> first barrier from UNDEFINED
 
     bool CreatePipeline();
     uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;

@@ -48,6 +48,7 @@ bool XrSession::Initialize(void* nativeWindowHandle) {
     EnumerateRenderingModes();   // needs the session; informs swapchain sizing
     if (!CreateLocalSpace()) return false;
     if (!CreateSwapchain()) return false;
+    CreateHudSwapchain(448, 96);  // sized to the 3-line stats text (window-space overlay)
     LOG_INFO("OpenXR session ready (swapchain %ux%u fmt=%lld, active mode '%s': %u views %ux%u)",
              swapchain_.width, swapchain_.height, (long long)swapchain_.format,
              ActiveModeName(), ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());
@@ -559,6 +560,68 @@ bool XrSession::CreateSwapchain() {
     return true;
 }
 
+void XrSession::CreateHudSwapchain(uint32_t width, uint32_t height) {
+    uint32_t formatCount = 0;
+    if (XR_FAILED(xrEnumerateSwapchainFormats(session_, 0, &formatCount, nullptr)) || !formatCount)
+        return;
+    std::vector<int64_t> formats(formatCount);
+    if (XR_FAILED(xrEnumerateSwapchainFormats(session_, formatCount, &formatCount, formats.data())))
+        return;
+    // Prefer R8G8B8A8_UNORM (VK=37) so the CPU RGBA upload maps 1:1.
+    int64_t fmt = formats[0];
+    for (int64_t f : formats) if (f == 37) { fmt = f; break; }
+
+    XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                    XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    ci.format = fmt;
+    ci.sampleCount = 1;
+    ci.width = width;
+    ci.height = height;
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(session_, &ci, &hudSwapchain_.handle))) {
+        LOG_WARN("HUD swapchain creation failed — HUD unavailable");
+        return;
+    }
+    hudSwapchain_.format = fmt;
+    hudSwapchain_.width = width;
+    hudSwapchain_.height = height;
+
+    uint32_t imageCount = 0;
+    xrEnumerateSwapchainImages(hudSwapchain_.handle, 0, &imageCount, nullptr);
+    std::vector<XrSwapchainImageVulkanKHR> images(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    xrEnumerateSwapchainImages(hudSwapchain_.handle, imageCount, &imageCount,
+                               (XrSwapchainImageBaseHeader*)images.data());
+    hudSwapchain_.imageCount = imageCount;
+    hudVkImages_.clear();
+    for (auto& im : images) hudVkImages_.push_back(im.image);
+    hasHud_ = true;
+    LOG_INFO("HUD swapchain: %ux%u, %u images, format=%lld", width, height, imageCount,
+             (long long)fmt);
+}
+
+bool XrSession::AcquireHudImage(uint32_t& imageIndex) {
+    if (!hasHud_) return false;
+    XrSwapchainImageAcquireInfo acq = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (XR_FAILED(xrAcquireSwapchainImage(hudSwapchain_.handle, &acq, &imageIndex))) return false;
+    XrSwapchainImageWaitInfo wait = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait.timeout = XR_INFINITE_DURATION;
+    if (XR_FAILED(xrWaitSwapchainImage(hudSwapchain_.handle, &wait))) {
+        XrSwapchainImageReleaseInfo rel = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(hudSwapchain_.handle, &rel);
+        return false;
+    }
+    return true;
+}
+
+bool XrSession::ReleaseHudImage() {
+    if (!hasHud_) return false;
+    XrSwapchainImageReleaseInfo rel = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    return XR_SUCCEEDED(xrReleaseSwapchainImage(hudSwapchain_.handle, &rel));
+}
+
 void XrSession::PollEvents() {
     XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
     while (xrPollEvent(instance_, &event) == XR_SUCCESS) {
@@ -661,7 +724,7 @@ bool XrSession::BeginFrame(Frame& frame) {
     return true;
 }
 
-bool XrSession::EndFrame(Frame& frame, const ViewRect* rects) {
+bool XrSession::EndFrame(Frame& frame, const ViewRect* rects, const HudSubmit* hud) {
     XrCompositionLayerProjectionView projViews[kMaxViews];
     XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
 
@@ -686,13 +749,33 @@ bool XrSession::EndFrame(Frame& frame, const ViewRect* rects) {
         layer.views = projViews;
     }
 
+    // Optional window-space HUD overlay on top of the projection layer.
+    XrCompositionLayerWindowSpaceEXT hudLayer = {};
+    const bool submitHud = frame.shouldRender && hud && hud->enabled && hasHud_;
+    if (submitHud) {
+        hudLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+        hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        hudLayer.subImage.swapchain = hudSwapchain_.handle;
+        hudLayer.subImage.imageRect.offset = {0, 0};
+        hudLayer.subImage.imageRect.extent = {
+            hud->srcW > 0 ? hud->srcW : (int32_t)hudSwapchain_.width,
+            hud->srcH > 0 ? hud->srcH : (int32_t)hudSwapchain_.height};
+        hudLayer.subImage.imageArrayIndex = 0;
+        hudLayer.x = hud->x;
+        hudLayer.y = hud->y;
+        hudLayer.width = hud->width;
+        hudLayer.height = hud->height;
+        hudLayer.disparity = hud->disparity;
+    }
+
     const XrCompositionLayerBaseHeader* layers[] = {
-        reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+        reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer),
+        reinterpret_cast<XrCompositionLayerBaseHeader*>(&hudLayer)};
 
     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime = frame.frameState.predictedDisplayTime;
     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    endInfo.layerCount = frame.shouldRender ? 1 : 0;
+    endInfo.layerCount = frame.shouldRender ? (submitHud ? 2u : 1u) : 0u;
     endInfo.layers = frame.shouldRender ? layers : nullptr;
 
     return XR_SUCCEEDED(xrEndFrame(session_, &endInfo));
@@ -700,6 +783,10 @@ bool XrSession::EndFrame(Frame& frame, const ViewRect* rects) {
 
 void XrSession::Shutdown() {
     if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    if (hudSwapchain_.handle != XR_NULL_HANDLE) {
+        xrDestroySwapchain(hudSwapchain_.handle);
+        hudSwapchain_.handle = XR_NULL_HANDLE;
+    }
     if (swapchain_.handle != XR_NULL_HANDLE) {
         xrDestroySwapchain(swapchain_.handle);
         swapchain_.handle = XR_NULL_HANDLE;
