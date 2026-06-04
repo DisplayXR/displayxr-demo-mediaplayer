@@ -1,0 +1,18 @@
+# Normalize line endings so cross-platform checkouts (e.g. the macOS CI runner)
+# get the right endings regardless of the committer's OS.
+* text=auto
+
+# Shell scripts MUST be LF — a CRLF shebang (`#!/usr/bin/env bash\r`) fails on
+# macOS/Linux with "bad interpreter".
+*.sh text eol=lf
+
+# Windows batch + NSIS scripts are CRLF.
+*.bat text eol=crlf
+*.nsi text eol=crlf
+
+# Binary assets — never munge.
+*.png binary
+*.jpg binary
+*.mp4 binary
+*.pkg binary
+*.exe binary

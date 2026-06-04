@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Stereo Media Player</title>
+    <organization>com.displayxr</organization>
+    <os-version min="13.0" />
+    <license file="LICENSE" />
+    <welcome file="welcome.html" />
+    <choices-outline>
+        <line choice="demo" />
+    </choices-outline>
+    <choice id="demo" visible="true" start_selected="true" enabled="false"
+        title="Stereo Media Player"
+        description="DisplayXR demo: a lightweight stereo media player for glasses-free 3D displays. Plays side-by-side stereo images (JPG/PNG) and video (H.264/H.265/AV1) via OpenXR + Vulkan. Requires the DisplayXR runtime to be installed.">
+        <pkg-ref id="com.displayxr.mediaplayer" />
+    </choice>
+    <pkg-ref id="com.displayxr.mediaplayer" version="1.0" onConclusion="none">mediaplayer.pkg</pkg-ref>
+</installer-gui-script>
