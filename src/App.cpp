@@ -17,6 +17,11 @@ namespace {
 constexpr ClearColor kLeftImage{0.85f, 0.10f, 0.10f, 1.0f};   // RED  = left
 constexpr ClearColor kRightImage{0.10f, 0.20f, 0.85f, 1.0f};  // BLUE = right
 
+// Convergence (horizontal image translation) budget: each '[' / ']' nudges by one
+// step, clamped to ±max — fractions of a view tile, kept small for "subtle" depth.
+constexpr float kConvergenceStep = 0.0025f;
+constexpr float kConvergenceMax = 0.05f;
+
 // Per-eye display aspect (width/height): full SBS packs two eyes across the width
 // (each eye half-width); half-SBS and mono use the full frame width.
 float PerEyeAspect(StereoLayout layout, int frameW, int frameH) {
@@ -112,6 +117,10 @@ int App::Run() {
     }();
     dumpPath_ = std::getenv("MEDIAPLAYER_DUMP_ATLAS");
     if (const char* h = std::getenv("MEDIAPLAYER_HUD")) showHud_ = (*h && *h != '0');
+    // Env-gated initial stereo state (test scaffolding: lets a headless atlas dump
+    // prove convergence/swap without keystrokes). Interactive keys still apply on top.
+    if (const char* c = std::getenv("MEDIAPLAYER_CONV")) convergence_ = (float)std::atof(c);
+    if (const char* s = std::getenv("MEDIAPLAYER_SWAP")) swapEyes_ = (*s && *s != '0');
     fpsWindowStart_ = std::chrono::steady_clock::now();
 
     // Render during the macOS modal resize loop too, for continuous live resize.
@@ -124,6 +133,25 @@ int App::Run() {
         if (window_.TakeToggleHudRequest()) {                        // SHIFT+TAB
             showHud_ = !showHud_;
             LOG_INFO("HUD %s", showHud_ ? "on" : "off");
+        }
+        // M4 transport / stereo controls.
+        if (const int steps = window_.TakeConvergenceSteps(); steps != 0) {  // '[' / ']'
+            convergence_ += steps * kConvergenceStep;
+            if (convergence_ > kConvergenceMax) convergence_ = kConvergenceMax;
+            if (convergence_ < -kConvergenceMax) convergence_ = -kConvergenceMax;
+            LOG_INFO("convergence=%+.3f", convergence_);
+        }
+        if (window_.TakeResetConvergence()) {                         // '\'
+            convergence_ = 0.0f;
+            LOG_INFO("convergence reset");
+        }
+        if (window_.TakeSwapEyesRequest()) {                          // 'X'
+            swapEyes_ = !swapEyes_;
+            LOG_INFO("swap eyes %s", swapEyes_ ? "on" : "off");
+        }
+        if (window_.TakeTogglePauseRequest() && isVideo_) {           // Space
+            video_.TogglePaused();
+            LOG_INFO("playback %s", video_.Paused() ? "paused" : "playing");
         }
         xr_.PollEvents();
         if (xr_.IsRunning()) RenderOneFrame();
@@ -180,8 +208,11 @@ void App::RenderOneFrame() {
 
         ClearColor colors[XrSession::kMaxViews];
         ViewUV uvs[XrSession::kMaxViews];
+        bool isLeftView[XrSession::kMaxViews];
         for (uint32_t v = 0; v < frame.viewCount; ++v) {
-            const bool isLeft = frame.views[v].pose.position.x <= centerX;
+            // 'X' swaps which SBS half each eye samples (XOR the geometric L/R).
+            const bool isLeft = (frame.views[v].pose.position.x <= centerX) != swapEyes_;
+            isLeftView[v] = isLeft;
             colors[v] = isLeft ? kLeftImage : kRightImage;  // RED|BLUE fallback
             if (layout_ == StereoLayout::Mono) {
                 uvs[v] = {0.0f, 0.0f, 1.0f, 1.0f};
@@ -206,7 +237,12 @@ void App::RenderOneFrame() {
             const float sy = xr_.ActiveViewScaleY();
             const XrSession::ViewRect viewFit = FitRect({0, 0, canvasW, canvasH}, contentAspect_);
             for (uint32_t v = 0; v < frame.viewCount; ++v) {
-                contentRects[v].x = rects[v].x + (int32_t)((float)viewFit.x * sx + 0.5f);
+                // Convergence = horizontal image translation: shift the two eyes'
+                // content oppositely within their tiles, moving the zero-disparity
+                // plane. Exposed edges fall on the black letterbox the renderer clears.
+                const int32_t cdx =
+                    (int32_t)(convergence_ * (float)rects[v].w * (isLeftView[v] ? 1.0f : -1.0f));
+                contentRects[v].x = rects[v].x + cdx + (int32_t)((float)viewFit.x * sx + 0.5f);
                 contentRects[v].y = rects[v].y + (int32_t)((float)viewFit.y * sy + 0.5f);
                 contentRects[v].w = (uint32_t)((float)viewFit.w * sx + 0.5f);
                 contentRects[v].h = (uint32_t)((float)viewFit.h * sy + 0.5f);
@@ -237,23 +273,29 @@ void App::RenderOneFrame() {
 
         // Line 1: fps + active mode. Line 2: source frame + layout. Line 3: window
         // canvas + per-view tile (the numbers that drive GPU cost / track resize).
-        char text[256];
+        // Last line: stereo controls — convergence, eye assignment, play state.
+        char stereo[64];
+        std::snprintf(stereo, sizeof(stereo), "conv %+.3f  eyes %s%s", convergence_,
+                      swapEyes_ ? "swapped" : "normal",
+                      (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "");
+
+        char text[320];
         if (isVideo_) {
             // Line 2 adds the decode backend (codec + hwaccel) so HW vs SW is visible.
             std::snprintf(text, sizeof(text),
-                          "%.0f FPS   %s\nsrc %dx%d  %s  %s/%s\nwin %ux%u  tile %ux%u", fps_,
+                          "%.0f FPS   %s\nsrc %dx%d  %s  %s/%s\nwin %ux%u  tile %ux%u\n%s", fps_,
                           xr_.ActiveModeName(), mediaW_, mediaH_,
                           MediaSource::LayoutName(layout_), video_.CodecName(),
-                          video_.BackendName(), cw, ch, tileW, tileH);
+                          video_.BackendName(), cw, ch, tileW, tileH, stereo);
         } else if (hasMedia_) {
             std::snprintf(text, sizeof(text),
-                          "%.0f FPS   %s\nsrc %dx%d  %s\nwin %ux%u  tile %ux%u", fps_,
+                          "%.0f FPS   %s\nsrc %dx%d  %s\nwin %ux%u  tile %ux%u\n%s", fps_,
                           xr_.ActiveModeName(), mediaW_, mediaH_,
-                          MediaSource::LayoutName(layout_), cw, ch, tileW, tileH);
+                          MediaSource::LayoutName(layout_), cw, ch, tileW, tileH, stereo);
         } else {
             std::snprintf(text, sizeof(text),
-                          "%.0f FPS   %s\nsrc RED|BLUE test\nwin %ux%u  tile %ux%u", fps_,
-                          xr_.ActiveModeName(), cw, ch, tileW, tileH);
+                          "%.0f FPS   %s\nsrc RED|BLUE test\nwin %ux%u  tile %ux%u\n%s", fps_,
+                          xr_.ActiveModeName(), cw, ch, tileW, tileH, stereo);
         }
         // Tight panel drawn into the top-left; the rest of the (content-sized) buffer
         // is transparent. We submit the full buffer and place it preserving the HUD
@@ -273,7 +315,7 @@ void App::RenderOneFrame() {
             hud.enabled = true;
             hud.x = 0.012f;
             hud.y = 0.018f;
-            hud.height = 0.095f;             // panel height as a fraction of window
+            hud.height = 0.125f;             // panel height as a fraction of window (4 lines)
             hud.width = hud.height * hudAR / winAR;
             hud.disparity = 0.0f;            // zero-disparity plane (screen depth)
         }

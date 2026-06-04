@@ -33,6 +33,12 @@ public:
     bool Open(const std::string& path);
     void Stop();
 
+    // Play/pause: when paused the decode thread holds the current frame and the
+    // presentation clock is frozen, so resume continues seamlessly (no fast-forward).
+    void SetPaused(bool p) { paused_.store(p); }
+    void TogglePaused() { paused_.store(!paused_.load()); }
+    bool Paused() const { return paused_.load(); }
+
     bool IsOpen() const { return open_; }
     int Width() const { return width_; }    // full SBS frame width
     int Height() const { return height_; }
@@ -57,6 +63,7 @@ private:
     FrameRing ring_;
     std::thread thread_;
     std::atomic<bool> stop_{false};
+    std::atomic<bool> paused_{false};
     bool open_ = false;
     int width_ = 0;
     int height_ = 0;

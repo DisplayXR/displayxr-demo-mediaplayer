@@ -93,13 +93,28 @@ bool Window::PumpEvents() {
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) return false;
         if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) return false;
-        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
-            if (e.key.key == SDLK_ESCAPE) return false;
-            if (e.key.key == SDLK_V) cycleModeRequested_ = true;
-            if (e.key.key == SDLK_TAB && (e.key.mod & SDL_KMOD_SHIFT)) toggleHudRequested_ = true;
+        if (e.type == SDL_EVENT_KEY_DOWN) {
+            // Convergence nudges repeat while held; everything else is one-shot.
+            if (e.key.key == SDLK_RIGHTBRACKET) ++convergenceSteps_;
+            else if (e.key.key == SDLK_LEFTBRACKET) --convergenceSteps_;
+            else if (!e.key.repeat) {
+                if (e.key.key == SDLK_ESCAPE) return false;
+                if (e.key.key == SDLK_V) cycleModeRequested_ = true;
+                if (e.key.key == SDLK_TAB && (e.key.mod & SDL_KMOD_SHIFT)) toggleHudRequested_ = true;
+                if (e.key.key == SDLK_BACKSLASH) resetConvergenceRequested_ = true;
+                if (e.key.key == SDLK_X) swapEyesRequested_ = true;
+                if (e.key.key == SDLK_SPACE) togglePauseRequested_ = true;
+                if (e.key.key == SDLK_F) ToggleFullscreen();
+            }
         }
     }
     return true;
+}
+
+void Window::ToggleFullscreen() {
+    fullscreen_ = !fullscreen_;
+    if (window_) SDL_SetWindowFullscreen(window_, fullscreen_);
+    LOG_INFO("Fullscreen %s", fullscreen_ ? "on" : "off");
 }
 
 bool Window::TakeCycleModeRequest() {
@@ -111,6 +126,30 @@ bool Window::TakeCycleModeRequest() {
 bool Window::TakeToggleHudRequest() {
     bool v = toggleHudRequested_;
     toggleHudRequested_ = false;
+    return v;
+}
+
+int Window::TakeConvergenceSteps() {
+    int v = convergenceSteps_;
+    convergenceSteps_ = 0;
+    return v;
+}
+
+bool Window::TakeResetConvergence() {
+    bool v = resetConvergenceRequested_;
+    resetConvergenceRequested_ = false;
+    return v;
+}
+
+bool Window::TakeSwapEyesRequest() {
+    bool v = swapEyesRequested_;
+    swapEyesRequested_ = false;
+    return v;
+}
+
+bool Window::TakeTogglePauseRequest() {
+    bool v = togglePauseRequested_;
+    togglePauseRequested_ = false;
     return v;
 }
 
