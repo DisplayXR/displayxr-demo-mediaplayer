@@ -178,15 +178,21 @@ void ImGuiLayer::BeginFrame(float winPointW, float winPointH,
     // We render into the HUD image, not the window — drive ImGui at HUD resolution.
     io.DisplaySize = ImVec2((float)hudWidth_, (float)hudHeight_);
     io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
-    ImGui::NewFrame();
-    // Remap the cursor (window points) into HUD pixels via the layer's placement rect,
-    // so a click in the window lands on the widget the runtime composited there.
-    if (rectW > 0.0f && rectH > 0.0f && winPointW > 0.0f && winPointH > 0.0f &&
-        io.MousePos.x > -FLT_MAX) {
-        const float u = ((io.MousePos.x / winPointW) - rectX) / rectW;
-        const float v = ((io.MousePos.y / winPointH) - rectY) / rectH;
-        io.MousePos = ImVec2(u * (float)hudWidth_, v * (float)hudHeight_);
+
+    // Remap the OS cursor (window points) into HUD pixels via the layer's placement
+    // rect, and queue it as the LAST mouse-position event before NewFrame. NewFrame
+    // applies the event queue in order, so ours overrides the SDL backend's window-
+    // space position — and because it's queued *before* NewFrame, a button press this
+    // frame latches its click position in HUD space (a post-NewFrame fixup would be
+    // too late: the click would have already been recorded at the window-space point).
+    if (rectW > 0.0f && rectH > 0.0f && winPointW > 0.0f && winPointH > 0.0f) {
+        float mx = 0.0f, my = 0.0f;
+        SDL_GetMouseState(&mx, &my);  // window-relative logical (point) coordinates
+        const float u = ((mx / winPointW) - rectX) / rectW;
+        const float v = ((my / winPointH) - rectY) / rectH;
+        io.AddMousePosEvent(u * (float)hudWidth_, v * (float)hudHeight_);
     }
+    ImGui::NewFrame();
 }
 
 void ImGuiLayer::RenderToHud(uint32_t imageIndex) {
