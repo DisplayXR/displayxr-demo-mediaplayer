@@ -23,6 +23,12 @@ struct ClearColor {
     float r, g, b, a;
 };
 
+// Per-view UV sub-region of the source texture to sample into that view's tile.
+// Left eye of an SBS frame = {0,0, 0.5,1}; right eye = {0.5,0, 0.5,1}; mono = {0,0,1,1}.
+struct ViewUV {
+    float offX, offY, scaleX, scaleY;
+};
+
 class VulkanRenderer {
 public:
     VulkanRenderer() = default;
@@ -51,6 +57,16 @@ public:
     bool ClearViews(uint32_t imageIndex, const ClearColor* colors,
                     const XrSession::ViewRect* rects, uint32_t viewCount);
 
+    // Upload an RGBA8 image as the source texture for DrawViews. Replaces any prior
+    // texture. Safe to call once at load time.
+    bool UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t height);
+    bool HasTexture() const { return textureView_ != VK_NULL_HANDLE; }
+
+    // Draw the uploaded texture into each view's tile, sampling the UV sub-region in
+    // `uvs[v]`. Clears the rest of the image to black. Blocks until the GPU finishes.
+    bool DrawViews(uint32_t imageIndex, const XrSession::ViewRect* rects,
+                   const ViewUV* uvs, uint32_t viewCount);
+
 private:
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
@@ -67,6 +83,23 @@ private:
 
     std::vector<VkImageView> imageViews_;
     std::vector<VkFramebuffer> framebuffers_;
+
+    // Textured-blit pipeline (M1: SBS image).
+    VkDescriptorSetLayout descSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool descPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet descSet_ = VK_NULL_HANDLE;
+    VkSampler sampler_ = VK_NULL_HANDLE;
+
+    // Source texture (the whole SBS frame; views sample sub-regions).
+    VkImage textureImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory textureMemory_ = VK_NULL_HANDLE;
+    VkImageView textureView_ = VK_NULL_HANDLE;
+
+    bool CreatePipeline();
+    uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
+    void DestroyTexture();
 };
 
 } // namespace mp

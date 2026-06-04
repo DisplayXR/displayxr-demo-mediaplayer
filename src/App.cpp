@@ -2,12 +2,15 @@
 #include "App.h"
 
 #include "Log.h"
+#include "media/ImageDecoder.h"
+#include "media/MediaSource.h"
 
 #include <cstdlib>
+#include <cstring>
 
 namespace mp {
 
-bool App::Initialize() {
+bool App::Initialize(const char* mediaPath) {
     if (!window_.Create("DisplayXR Stereo Media Player", 1280, 720)) return false;
 
     if (!xr_.Initialize(window_.NativeHandle())) {
@@ -21,6 +24,26 @@ bool App::Initialize() {
                               xr_.SwapchainImages())) {
         LOG_ERROR("Vulkan renderer initialization failed");
         return false;
+    }
+
+    // Load a stereo image if one was given; otherwise the loop falls back to the
+    // RED|BLUE L/R test pattern.
+    if (mediaPath && *mediaPath) {
+        DecodedImage img = ImageDecoder::Load(mediaPath);
+        if (img.Valid()) {
+            const MediaInfo info = MediaSource::Identify(mediaPath, img.width, img.height);
+            if (info.kind == MediaKind::Video) {
+                LOG_WARN("Video playback is M2 — '%s' will not display yet", mediaPath);
+            } else if (renderer_.UploadTexture(img.pixels.data(),
+                                               (uint32_t)img.width, (uint32_t)img.height)) {
+                layout_ = info.layout;
+                hasImage_ = true;
+                LOG_INFO("Displaying %s image (%s)", MediaSource::LayoutName(info.layout), mediaPath);
+            }
+        }
+    }
+    if (!hasImage_) {
+        LOG_INFO("No image loaded — showing RED|BLUE L/R test pattern");
     }
     return true;
 }
@@ -43,6 +66,7 @@ int App::Run() {
     bool keepRunning = true;
     uint64_t frames = 0, rendered = 0;
     ClearColor colors[XrSession::kMaxViews];
+    ViewUV uvs[XrSession::kMaxViews];
     XrSession::ViewRect rects[XrSession::kMaxViews];
     const char* prevMode = "";
     while (keepRunning && !xr_.ExitRequested()) {
@@ -83,7 +107,16 @@ int App::Run() {
             const float centerX = 0.5f * (minX + maxX);
             for (uint32_t v = 0; v < frame.viewCount; ++v) {
                 const bool isLeft = frame.views[v].pose.position.x <= centerX;
+                // RED|BLUE fallback colors:
                 colors[v] = isLeft ? kLeftImage : kRightImage;
+                // SBS texture sampling: left eye = left half, right eye = right half;
+                // mono = whole image to every view.
+                if (layout_ == StereoLayout::Mono) {
+                    uvs[v] = {0.0f, 0.0f, 1.0f, 1.0f};
+                } else {
+                    uvs[v] = isLeft ? ViewUV{0.0f, 0.0f, 0.5f, 1.0f}
+                                    : ViewUV{0.5f, 0.0f, 0.5f, 1.0f};
+                }
             }
 
             // Diagnostic: dump the per-view geometry + L/R assignment once per mode.
@@ -96,11 +129,15 @@ int App::Run() {
                     const auto& p = frame.views[v].pose.position;
                     LOG_INFO("  view %u pos=(%.4f, %.4f, %.4f) rect=(%d,%d %ux%u) -> %s", v,
                              p.x, p.y, p.z, rects[v].x, rects[v].y, rects[v].w, rects[v].h,
-                             (p.x <= centerX) ? "LEFT/red" : "RIGHT/blue");
+                             (p.x <= centerX) ? "LEFT" : "RIGHT");
                 }
             }
 
-            renderer_.ClearViews(frame.imageIndex, colors, rects, frame.viewCount);
+            if (hasImage_) {
+                renderer_.DrawViews(frame.imageIndex, rects, uvs, frame.viewCount);
+            } else {
+                renderer_.ClearViews(frame.imageIndex, colors, rects, frame.viewCount);
+            }
             ++rendered;
 
             // Dump the atlas once, after the requested mode has settled (~100 frames).

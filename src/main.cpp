@@ -10,9 +10,10 @@
 // portable (and is a no-op where not needed).
 #include <SDL3/SDL_main.h>
 
-int main(int /*argc*/, char* /*argv*/[]) {
+int main(int argc, char* argv[]) {
+    const char* mediaPath = (argc > 1) ? argv[1] : nullptr;
     mp::App app;
-    if (!app.Initialize()) {
+    if (!app.Initialize(mediaPath)) {
         LOG_ERROR("Initialization failed — is the DisplayXR runtime installed and "
                   "XR_RUNTIME_JSON pointed at it?");
         app.Shutdown();

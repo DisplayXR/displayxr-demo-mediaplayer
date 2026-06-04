@@ -15,13 +15,21 @@ vendor SR SDK, no weaving, no CUDA dependency.
 
 ## Status
 
-✅ **M0 complete** — buildable skeleton. Opens an SDL3 window, hands its native
-view to the DisplayXR runtime via the window-binding extension, brings up an
-OpenXR stereo session + swapchain, and each frame clears every view to a distinct
-color and submits a projection layer. No decode/UI yet (those are M1–M4). Verified
-on macOS (Apple Silicon, MoltenVK) against a local `displayxr-runtime` dev build;
-the Windows path is scaffolded but not yet verified. See `PRD.md` §11 for the
-milestone map and `docs/M0-KICKOFF.md` for the M0 spec.
+✅ **M1 complete** — stereo image playback. Loads a side-by-side JPG/PNG (stb_image),
+detects the SBS layout from the filename (`*_2x1` / `*_half_2x1`, aspect fallback),
+uploads it as a Vulkan texture, and samples the correct half into each display view
+(left-eye views ← left half, right-eye views ← right half) across all N views of the
+active rendering mode. Builds on the M0 skeleton (SDL3 window → OpenXR stereo session
+→ runtime weave). Verified on macOS (Apple Silicon, MoltenVK) against a local
+`displayxr-runtime` dev build; Windows scaffolded but unverified. Next: M2 (video).
+
+```bash
+# show a side-by-side stereo image (press V to cycle display modes, Esc to quit)
+scripts/run_mediaplayer_handle_vk_macos.sh assets/test_LR_2x1.png
+```
+
+With no file argument it falls back to a RED|BLUE left/right test pattern. See `PRD.md`
+§11 for the milestone map.
 
 ## Requirements
 

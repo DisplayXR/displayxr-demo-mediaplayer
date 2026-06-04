@@ -72,10 +72,10 @@ add_executable(${MP_TARGET}
     src/platform/Window.cpp
     src/xr/XrSession.cpp
     src/rhi/VulkanRenderer.cpp
-    # Header-only stubs (PRD module map; fleshed out in M1+):
-    src/media/MediaSource.h
+    src/media/ImageDecoder.cpp
+    src/media/MediaSource.cpp
+    # Header-only stubs (fleshed out in later milestones):
     src/media/VideoDecoder.h
-    src/media/ImageDecoder.h
     src/media/FrameRing.h
     src/ui/Ui.h
 )
