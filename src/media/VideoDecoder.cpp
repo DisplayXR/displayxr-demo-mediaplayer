@@ -222,24 +222,110 @@ void VideoDecoder::DecodeLoop() {
     auto wallStart = clock::now();
     double firstPtsSec = -1.0;
 
+    // Download a HW frame if needed, convert to RGBA into the ring's write buffer (no
+    // Publish yet), and return its PTS in seconds (-1 unknown, -2 = drop/HW fail). The
+    // caller decides when to Publish (paced playback vs. immediate seek result).
+    auto fillFrame = [&](AVFrame* f) -> double {
+        AVFrame* src = f;
+        if (impl_->hwPixFmt != AV_PIX_FMT_NONE && f->format == impl_->hwPixFmt) {
+            if (!impl_->swFrame) impl_->swFrame = av_frame_alloc();
+            av_frame_unref(impl_->swFrame);
+            if (av_hwframe_transfer_data(impl_->swFrame, f, 0) < 0) {
+                LOG_ERROR("VideoDecoder: hw frame download failed; dropping frame");
+                return -2.0;
+            }
+            impl_->swFrame->pts = f->pts;
+            impl_->swFrame->best_effort_timestamp = f->best_effort_timestamp;
+            src = impl_->swFrame;
+        }
+        if (!impl_->sws || impl_->swsW != src->width || impl_->swsH != src->height ||
+            impl_->swsFmt != src->format) {
+            if (impl_->sws) sws_freeContext(impl_->sws);
+            impl_->sws = sws_getContext(src->width, src->height, (AVPixelFormat)src->format,
+                                        src->width, src->height, AV_PIX_FMT_RGBA,
+                                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+            impl_->swsW = src->width;
+            impl_->swsH = src->height;
+            impl_->swsFmt = src->format;
+        }
+        FrameRing::Frame& dst = ring_.WriteBuffer();
+        dst.width = src->width;
+        dst.height = src->height;
+        dst.pixels.resize((size_t)src->width * src->height * 4);
+        uint8_t* dstData[4] = {dst.pixels.data(), nullptr, nullptr, nullptr};
+        int dstStride[4] = {src->width * 4, 0, 0, 0};
+        sws_scale(impl_->sws, src->data, src->linesize, 0, src->height, dstData, dstStride);
+        const int64_t ticks = (src->best_effort_timestamp != AV_NOPTS_VALUE)
+                                  ? src->best_effort_timestamp : src->pts;
+        return (ticks != AV_NOPTS_VALUE) ? (double)ticks * timeBase : -1.0;
+    };
+
     while (!stop_.load()) {
-        // Seek (serviced even while paused): jump to the keyframe at/before the target,
-        // flush the decoder, and re-anchor the presentation clock. After a seek we fall
-        // through once to decode + publish a frame at the new position, then re-pause.
+        // Seek (serviced even while paused). A decoder needs several packets after a
+        // flush to emit a frame, so we DECODE FORWARD from the keyframe to the exact
+        // target, then publish that one. This is the standard accurate-seek primitive;
+        // responsiveness comes from coalescing (latest-wins) + decoding on this thread.
+        //
+        // Future (web-smooth scrubbing on long-GOP / 4K, where exact-during-drag can't
+        // keep up): go adaptive — show the nearest keyframe (or a pre-generated low-res
+        // thumbnail/storyboard track) during the drag, and resolve to the exact frame on
+        // release. The keyframe-preview variant lived here briefly; see git history.
         const double sk = seekRequest_.exchange(-1.0);
-        bool justSought = false;
         if (sk >= 0.0) {
-            const int64_t ts = (int64_t)(sk / timeBase);
-            av_seek_frame(impl_->fmt, impl_->videoStream, ts, AVSEEK_FLAG_BACKWARD);
+            const auto seekT0 = clock::now();
+            av_seek_frame(impl_->fmt, impl_->videoStream, (int64_t)(sk / timeBase),
+                          AVSEEK_FLAG_BACKWARD);
             avcodec_flush_buffers(impl_->codec);
             firstPtsSec = -1.0;
+
+            // Decode forward to the EXACT target frame and display only that one. We do
+            // NOT bail to the keyframe or interrupt mid-decode for a newer scrub request:
+            // an exact seek is cheap now (only the displayed frame is downloaded), and the
+            // atomic seekRequest_ coalesces — each finished seek immediately re-targets the
+            // latest cursor position. The net effect is frame-exact previews that track the
+            // cursor at decode rate, instead of jumping between keyframes.
+            bool reached = false, filled = false;
+            double lastPts = sk;
+            while (!stop_.load() && !reached) {
+                if (av_read_frame(impl_->fmt, pkt) < 0) break;  // EOF before target
+                if (pkt->stream_index != impl_->videoStream) { av_packet_unref(pkt); continue; }
+                const int sent = avcodec_send_packet(impl_->codec, pkt);
+                av_packet_unref(pkt);
+                if (sent != 0) continue;
+                while (!stop_.load() && avcodec_receive_frame(impl_->codec, frame) == 0) {
+                    // Read the PTS off the raw decoded frame — cheap, no GPU download. Only
+                    // the frame we actually display is downloaded/converted (fillFrame);
+                    // decoding past intermediate frames is fast, downloading them is not.
+                    const int64_t ticks = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                                              ? frame->best_effort_timestamp : frame->pts;
+                    const double pts = (ticks != AV_NOPTS_VALUE) ? (double)ticks * timeBase : -1.0;
+                    if (pts < 0.0 || pts + 1e-3 >= sk) {
+                        const double fpts = fillFrame(frame);  // download + convert this one
+                        if (fpts > -2.0) { filled = true; lastPts = (fpts >= 0.0) ? fpts : sk; }
+                        reached = true;
+                        break;
+                    }
+                    // earlier than target → discard cheaply (no download), keep decoding
+                }
+            }
+            // Always publish the frame we landed on — during a drag this is the preview
+            // keyframe; when settled it's the exact target. The knob is held steady by
+            // the UI until the decoded position catches up (no snap-back on release).
+            if (filled) {
+                positionSec_.store(lastPts);
+                ring_.Publish();
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    clock::now() - seekT0).count();
+                LOG_DEBUG("VideoDecoder: seek %.2fs -> landed %.2fs in %lldms", sk, lastPts,
+                          (long long)ms);
+            }
             wallStart = clock::now();
-            justSought = true;
+            continue;
         }
 
         // Pause: hold here without consuming packets (but wake to service a seek), then
         // advance the wall clock by the paused duration so pacing resumes seamlessly.
-        if (paused_.load() && !justSought) {
+        if (paused_.load()) {
             const auto pauseBegin = clock::now();
             while (paused_.load() && seekRequest_.load() < 0.0 && !stop_.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(8));
@@ -264,61 +350,15 @@ void VideoDecoder::DecodeLoop() {
 
         if (avcodec_send_packet(impl_->codec, pkt) == 0) {
             while (!stop_.load() && avcodec_receive_frame(impl_->codec, frame) == 0) {
-                // Hardware decode leaves the frame on the GPU. Download it to system
-                // memory (the universal interop path); zero-copy GPU→Vulkan is later.
-                // swscale then runs on the downloaded surface (typically NV12/P010).
-                AVFrame* src = frame;
-                if (impl_->hwPixFmt != AV_PIX_FMT_NONE &&
-                    frame->format == impl_->hwPixFmt) {
-                    if (!impl_->swFrame) impl_->swFrame = av_frame_alloc();
-                    av_frame_unref(impl_->swFrame);
-                    if (av_hwframe_transfer_data(impl_->swFrame, frame, 0) < 0) {
-                        LOG_ERROR("VideoDecoder: hw frame download failed; dropping frame");
-                        continue;
-                    }
-                    impl_->swFrame->pts = frame->pts;
-                    impl_->swFrame->best_effort_timestamp = frame->best_effort_timestamp;
-                    src = impl_->swFrame;
-                }
-
-                // (Re)create the RGBA converter if the source format/size changed.
-                if (!impl_->sws || impl_->swsW != src->width ||
-                    impl_->swsH != src->height || impl_->swsFmt != src->format) {
-                    if (impl_->sws) sws_freeContext(impl_->sws);
-                    impl_->sws = sws_getContext(src->width, src->height,
-                                                (AVPixelFormat)src->format,
-                                                src->width, src->height, AV_PIX_FMT_RGBA,
-                                                SWS_BILINEAR, nullptr, nullptr, nullptr);
-                    impl_->swsW = src->width;
-                    impl_->swsH = src->height;
-                    impl_->swsFmt = src->format;
-                }
-
-                FrameRing::Frame& dst = ring_.WriteBuffer();
-                dst.width = src->width;
-                dst.height = src->height;
-                dst.pixels.resize((size_t)src->width * src->height * 4);
-                uint8_t* dstData[4] = {dst.pixels.data(), nullptr, nullptr, nullptr};
-                int dstStride[4] = {src->width * 4, 0, 0, 0};
-                sws_scale(impl_->sws, src->data, src->linesize, 0, src->height,
-                          dstData, dstStride);
-
-                // Pace to the presentation clock so playback runs at real speed; track
-                // the current position for the scrubber. A post-seek frame served while
-                // paused isn't paced (firstPtsSec just reset → target is now anyway).
-                int64_t ptsTicks = (src->best_effort_timestamp != AV_NOPTS_VALUE)
-                                       ? src->best_effort_timestamp : src->pts;
-                if (ptsTicks != AV_NOPTS_VALUE) {
-                    double ptsSec = (double)ptsTicks * timeBase;
+                const double ptsSec = fillFrame(frame);
+                if (ptsSec <= -2.0) continue;  // dropped
+                if (ptsSec >= 0.0) {
                     positionSec_.store(ptsSec);
                     if (firstPtsSec < 0.0) firstPtsSec = ptsSec;
-                    if (!paused_.load()) {
-                        auto target = wallStart + std::chrono::duration_cast<clock::duration>(
-                                                      std::chrono::duration<double>(ptsSec - firstPtsSec));
-                        std::this_thread::sleep_until(target);
-                    }
+                    auto target = wallStart + std::chrono::duration_cast<clock::duration>(
+                                                  std::chrono::duration<double>(ptsSec - firstPtsSec));
+                    std::this_thread::sleep_until(target);
                 }
-
                 ring_.Publish();
             }
         }
@@ -331,7 +371,11 @@ void VideoDecoder::DecodeLoop() {
 
 void VideoDecoder::Seek(double seconds) {
     if (seconds < 0.0) seconds = 0.0;
-    if (durationSec_ > 0.0 && seconds > durationSec_) seconds = durationSec_;
+    // Leave a little headroom before EOF so the forward-decode always finds a frame at
+    // or after the target (otherwise a seek to the very end lands nothing to display).
+    if (durationSec_ > 0.0 && seconds > durationSec_ - 0.1) seconds = durationSec_ - 0.1;
+    if (seconds < 0.0) seconds = 0.0;
+    LOG_DEBUG("VideoDecoder: seek request -> %.2fs (paused=%d)", seconds, (int)paused_.load());
     seekRequest_.store(seconds);
 }
 

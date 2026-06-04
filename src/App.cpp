@@ -6,6 +6,7 @@
 #include "media/MediaSource.h"
 #include "ui/Hud.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -386,7 +387,17 @@ void App::BuildTransportUI() {
         // Row 2: scrubber (video only). Position tracks playback except while dragging.
         if (isVideo_ && video_.DurationSeconds() > 0.0) {
             const float dur = (float)video_.DurationSeconds();
-            if (!scrubActive_) scrubValue_ = (float)video_.PositionSeconds();
+            const float pos = (float)video_.PositionSeconds();
+            // Track playback into the knob, but not while dragging, and not while a seek
+            // we issued is still landing — otherwise the knob snaps back to the stale
+            // position on release. scrubTarget_ clears once the decode reaches it.
+            if (!scrubActive_) {
+                if (scrubTarget_ >= 0.0f) {
+                    if (std::fabs(pos - scrubTarget_) < 0.3f) scrubTarget_ = -1.0f;
+                } else {
+                    scrubValue_ = pos;
+                }
+            }
             auto mmss = [](double s, char* out, size_t n) {
                 if (s < 0.0) s = 0.0;
                 const int t = (int)s;
@@ -400,7 +411,10 @@ void App::BuildTransportUI() {
             ImGui::SetNextItemWidth(-ImGui::CalcTextSize(tot).x - 16.0f);
             const bool changed = ImGui::SliderFloat("##scrub", &scrubValue_, 0.0f, dur, "");
             scrubActive_ = ImGui::IsItemActive();
-            if (changed) video_.Seek(scrubValue_);
+            if (changed) {
+                video_.Seek(scrubValue_);
+                scrubTarget_ = scrubValue_;  // hold the knob here until the decode lands
+            }
             ImGui::SameLine();
             ImGui::Text("%s", tot);
         }

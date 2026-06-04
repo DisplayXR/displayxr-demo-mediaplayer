@@ -62,9 +62,12 @@ private:
     float convergence_ = 0.0f;
     bool swapEyes_ = false;
 
-    // Scrubber: displayed position tracks playback except while the user drags it.
+    // Scrubber: displayed position tracks playback except while the user drags it, or
+    // while an issued seek hasn't landed yet (scrubTarget_ >= 0 holds the knob steady
+    // so it doesn't snap back to the stale position on mouse-release).
     float scrubValue_ = 0.0f;
     bool scrubActive_ = false;
+    float scrubTarget_ = -1.0f;
 
     // Open-file flow. openFilePending_ gates the Open button while a picker is up.
     // The native-dialog callback may run off-thread; it parks the result here.
