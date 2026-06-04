@@ -42,6 +42,16 @@ else()
     message(STATUS "OpenXR loader: not installed — fetching Khronos OpenXR-SDK")
     set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
+    # Link the loader against the system jsoncpp; its vendored copy is too old to
+    # compile against current SDKs.
+    set(BUILD_WITH_SYSTEM_JSONCPP ON CACHE BOOL "" FORCE)
+    # jsoncpp config-mapping shim. The loader's bundled FindJsonCpp.cmake stamps a
+    # MAP_IMPORTED_CONFIG_RELEASE onto jsoncpp's imported target, but Homebrew jsoncpp
+    # ≥1.9.6 ships only a config-LESS IMPORTED_LOCATION — so a Release build maps to no
+    # per-config location and links `jsoncpp_lib-NOTFOUND`. Seed the map (the module
+    # APPENDs to it, so the leading "" entry survives) so Release accepts the config-
+    # less location. Inherited by the loader subproject; read at generate time.
+    set(CMAKE_MAP_IMPORTED_CONFIG_RELEASE ";RELEASE;NOCONFIG")
     FetchContent_Declare(OpenXR
         GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git
         GIT_TAG release-1.1.43

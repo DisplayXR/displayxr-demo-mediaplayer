@@ -26,9 +26,10 @@ constexpr ClearColor kRightImage{0.10f, 0.20f, 0.85f, 1.0f};  // BLUE = right
 constexpr float kConvergenceStep = 0.0025f;
 constexpr float kConvergenceMax = 0.05f;
 
-// HUD layer disparity: small negative shift floats the transport bar a touch toward
-// the viewer (PRD §9 "just in front of the convergence plane"). Kept subtle.
-constexpr float kHudDisparity = -0.008f;
+// HUD layer disparity. 0 = zero-disparity plane (screen depth) so the UI sits exactly
+// where the cursor is and clicks align across both eyes. (A small negative value would
+// float it toward the viewer per PRD §9, but that offsets the perceived hit target.)
+constexpr float kHudDisparity = 0.0f;
 
 // Per-eye display aspect (width/height): full SBS packs two eyes across the width
 // (each eye half-width); half-SBS and mono use the full frame width.
