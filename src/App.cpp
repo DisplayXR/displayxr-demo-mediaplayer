@@ -238,7 +238,14 @@ void App::RenderOneFrame() {
         // Line 1: fps + active mode. Line 2: source frame + layout. Line 3: window
         // canvas + per-view tile (the numbers that drive GPU cost / track resize).
         char text[256];
-        if (hasMedia_) {
+        if (isVideo_) {
+            // Line 2 adds the decode backend (codec + hwaccel) so HW vs SW is visible.
+            std::snprintf(text, sizeof(text),
+                          "%.0f FPS   %s\nsrc %dx%d  %s  %s/%s\nwin %ux%u  tile %ux%u", fps_,
+                          xr_.ActiveModeName(), mediaW_, mediaH_,
+                          MediaSource::LayoutName(layout_), video_.CodecName(),
+                          video_.BackendName(), cw, ch, tileW, tileH);
+        } else if (hasMedia_) {
             std::snprintf(text, sizeof(text),
                           "%.0f FPS   %s\nsrc %dx%d  %s\nwin %ux%u  tile %ux%u", fps_,
                           xr_.ActiveModeName(), mediaW_, mediaH_,
