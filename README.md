@@ -15,19 +15,43 @@ vendor SR SDK, no weaving, no CUDA dependency.
 
 ## Status
 
-🚧 **Pre-M0** — design complete, implementation starting. See `PRD.md` for the
-full design and `docs/M0-KICKOFF.md` for the first build milestone.
+✅ **M0 complete** — buildable skeleton. Opens an SDL3 window, hands its native
+view to the DisplayXR runtime via the window-binding extension, brings up an
+OpenXR stereo session + swapchain, and each frame clears every view to a distinct
+color and submits a projection layer. No decode/UI yet (those are M1–M4). Verified
+on macOS (Apple Silicon, MoltenVK) against a local `displayxr-runtime` dev build;
+the Windows path is scaffolded but not yet verified. See `PRD.md` §11 for the
+milestone map and `docs/M0-KICKOFF.md` for the M0 spec.
 
-## Requirements (planned)
+## Requirements
 
 - A working DisplayXR runtime install (or dev build) — this app cannot run without it.
-- Vulkan SDK, CMake, a C++17 compiler. FFmpeg (vcpkg on Windows; system/Homebrew elsewhere).
+- Vulkan (SDK, or Homebrew `vulkan-loader` + `molten-vk` on macOS), an OpenXR loader,
+  CMake ≥ 3.24, a C++17 compiler. SDL3 is fetched and built automatically.
+- FFmpeg / Dear ImGui / stb arrive in M1–M4 (not needed for M0).
 
-## Build (planned — see `docs/M0-KICKOFF.md`)
+## Build & run (macOS — verified)
 
 ```bash
-cmake -S . -B build -G Ninja && cmake --build build
+# Configure + build. The OpenXR loader is auto-found via find_package; if you built
+# the Khronos OpenXR-SDK to a custom prefix, hint it with -DCMAKE_PREFIX_PATH.
+cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH=/tmp/openxr-install
+cmake --build build
+
+# Run against a local DisplayXR dev runtime (helper sets XR_RUNTIME_JSON to the
+# sibling checkout's dev manifest; override XR_RUNTIME_JSON to point elsewhere).
+scripts/run_mediaplayer_handle_vk_macos.sh
+# equivalently:
+XR_RUNTIME_JSON=/path/to/displayxr-runtime/build/openxr_displayxr-dev.json \
+    ./build/mediaplayer_handle_vk_macos
 ```
+
+Press **Esc** or close the window to exit. The two-plus eye views clear to distinct
+colors and weave on a 3D display (a single color shows on a 2D-fallback mode).
+Set `MEDIAPLAYER_LOG_DEBUG=1` for verbose logs.
+
+> If `find_package(OpenXR)` finds nothing, the build fetches and compiles the
+> pinned Khronos OpenXR-SDK loader automatically.
 
 ## Supported formats (v1 target)
 

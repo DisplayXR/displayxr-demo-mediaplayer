@@ -1,0 +1,176 @@
+// SPDX-License-Identifier: BSL-1.0
+//
+// XrSession — OpenXR lifecycle for a DisplayXR `_handle` Vulkan client.
+//
+// Owns the OpenXR instance/system/session, the Vulkan instance+device the runtime
+// asked us to create, the LOCAL reference space, and a single side-by-side (SBS)
+// stereo swapchain (both eyes packed into one image; eye 0 = left half, eye 1 =
+// right half). The app never weaves — it submits a plain stereo projection layer
+// and the runtime/display-processor does the weaving.
+//
+// Re-typed (not linked) from displayxr-runtime/test_apps (cube_handle_vk_*),
+// trimmed to what an M0 clear-both-eyes skeleton needs.
+#pragma once
+
+#include "XrCommon.h"
+
+#include <cstdint>
+#include <vector>
+
+namespace mp {
+
+class XrSession {
+public:
+    // PRIMARY_STEREO is 2 on a classic HMD, but a DisplayXR light-field display
+    // reports N views (e.g. a 4-view panel packed as a 2x2 atlas). We size for the
+    // runtime's actual count, up to this cap (matches the reference handle apps).
+    static constexpr uint32_t kMaxViews = 8;
+
+    // A view's tile within the swapchain image (clear target == submitted subImage).
+    struct ViewRect {
+        int32_t x = 0, y = 0;
+        uint32_t w = 0, h = 0;
+    };
+
+    // Per-frame state handed between BeginFrame/EndFrame.
+    struct Frame {
+        XrFrameState frameState{XR_TYPE_FRAME_STATE};
+        bool shouldRender = false;
+        uint32_t imageIndex = 0;       // acquired swapchain image
+        uint32_t viewCount = 0;        // == XrSession::ActiveViewCount()
+        XrView views[kMaxViews];       // per-view pose + fov from xrLocateViews
+    };
+
+    XrSession() = default;
+    ~XrSession();
+
+    XrSession(const XrSession&) = delete;
+    XrSession& operator=(const XrSession&) = delete;
+
+    // Full bring-up: instance + system + stereo view config + Vulkan device (per
+    // runtime requirements) + session (with window binding) + LOCAL space + SBS
+    // swapchain. `nativeWindowHandle` is an NSView* (macOS) or HWND (Windows).
+    bool Initialize(void* nativeWindowHandle);
+    void Shutdown();
+
+    // Drain the OpenXR event queue, driving the session state machine
+    // (READY→xrBeginSession, STOPPING→xrEndSession, EXITING→exit).
+    void PollEvents();
+
+    bool IsRunning() const { return sessionRunning_; }
+    bool ExitRequested() const { return exitRequested_; }
+
+    // Frame loop. BeginFrame does xrWaitFrame/xrBeginFrame and, when shouldRender,
+    // locates the two eye views and acquires the swapchain image. The caller then
+    // renders into `imageIndex` and calls EndFrame to submit the projection layer.
+    bool BeginFrame(Frame& frame);
+    bool EndFrame(Frame& frame, const ViewRect* rects);
+
+    // Vulkan handles the runtime selected for us — handed to the renderer.
+    VkInstance VkInstanceHandle() const { return vkInstance_; }
+    VkPhysicalDevice PhysicalDevice() const { return physicalDevice_; }
+    VkDevice Device() const { return device_; }
+    VkQueue GraphicsQueue() const { return graphicsQueue_; }
+    uint32_t GraphicsQueueFamily() const { return queueFamilyIndex_; }
+
+    // Swapchain + tile layout for the renderer. The active rendering mode's N views
+    // pack into a tileColumns x tileRows grid of equally-sized tiles within one
+    // swapchain image. The *active* counts come from the current rendering mode and
+    // change at runtime (e.g. mono passthrough <-> 4-view 3D); the located array is
+    // always sized to the max-over-all-modes count (see BeginFrame).
+    int64_t SwapchainFormat() const { return swapchain_.format; }
+    uint32_t SwapchainWidth() const { return swapchain_.width; }
+    uint32_t SwapchainHeight() const { return swapchain_.height; }
+    uint32_t MaxViewCount() const { return viewCount_; }
+    uint32_t ActiveViewCount() const;
+    uint32_t ActiveTileColumns() const;
+    uint32_t ActiveTileRows() const;
+    float ActiveViewScaleX() const;
+    float ActiveViewScaleY() const;
+    const char* ActiveModeName() const;
+
+    // Compute each active view's tile rect from the canvas (window) pixel size:
+    // per-view extent = canvas_px * viewScale, clamped to the max tile
+    // (swapchain / tileGrid), tiled row-major. The same rects are used to clear
+    // and to submit, so the runtime samples exactly what we wrote. Returns the
+    // active view count; fills rects[0..count).
+    uint32_t ComputeViewRects(uint32_t canvasPxWidth, uint32_t canvasPxHeight,
+                              ViewRect* rects) const;
+    // Cycle to the next requestable rendering mode (the 'V' key). No-op when the
+    // rendering-mode extension is unavailable or the mode is workspace-locked.
+    void RequestNextMode();
+    // Request a specific mode by index (used by MEDIAPLAYER_START_MODE for testing).
+    void RequestMode(uint32_t modeIndex);
+    // VkImage handles backing the swapchain (length == imageCount).
+    const std::vector<VkImage>& SwapchainImages() const { return swapchainVkImages_; }
+
+private:
+    bool InitInstanceAndSystem();
+    bool CreateVulkanDevice();
+    bool CreateSessionWithWindowBinding(void* nativeWindowHandle);
+    void EnumerateRenderingModes();
+    bool CreateLocalSpace();
+    bool CreateSwapchain();
+
+    struct SwapchainInfo {
+        XrSwapchain handle = XR_NULL_HANDLE;
+        int64_t format = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t imageCount = 0;
+    };
+
+    // One vendor-defined rendering mode (e.g. mono passthrough, 4-view 3D).
+    struct RenderingMode {
+        uint32_t modeIndex = 0;
+        uint32_t viewCount = 1;
+        uint32_t tileColumns = 1;
+        uint32_t tileRows = 1;
+        float viewScaleX = 1.0f;   // per-view atlas size = canvas_px * viewScale
+        float viewScaleY = 1.0f;
+        bool hardware3D = false;
+        bool requestable = false;
+        char name[XR_MAX_SYSTEM_NAME_SIZE] = {};
+    };
+    const RenderingMode* CurrentMode() const;
+
+    // OpenXR
+    XrInstance instance_ = XR_NULL_HANDLE;
+    XrSystemId systemId_ = XR_NULL_SYSTEM_ID;
+    ::XrSession session_ = XR_NULL_HANDLE;  // OpenXR handle (global scope: our class shadows the name)
+    XrSpace localSpace_ = XR_NULL_HANDLE;
+    XrViewConfigurationType viewConfigType_ = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    std::vector<XrViewConfigurationView> configViews_;
+    uint32_t viewCount_ = 0;       // max over all modes (xrLocateViews capacity)
+    uint32_t tileColumns_ = 1;     // fallback tiling when rendering-mode ext absent
+    uint32_t tileRows_ = 1;
+    SwapchainInfo swapchain_;
+    std::vector<VkImage> swapchainVkImages_;
+
+    // Rendering modes (XR_EXT_display_info v8+). Empty when the runtime doesn't
+    // expose them, in which case we fall back to the max view count + derived tiling.
+    std::vector<RenderingMode> modes_;
+    uint32_t currentModeIndex_ = 0;  // modeIndex value of the active mode
+    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumModes_ = nullptr;
+    PFN_xrRequestDisplayRenderingModeEXT pfnRequestMode_ = nullptr;
+
+    // Capabilities discovered at instance creation.
+    bool hasWindowBindingExt_ = false;
+    bool hasDisplayInfoExt_ = false;
+    uint32_t displayPixelWidth_ = 0;
+    uint32_t displayPixelHeight_ = 0;
+
+    // Session state machine.
+    XrSessionState sessionState_ = XR_SESSION_STATE_UNKNOWN;
+    bool sessionRunning_ = false;
+    bool exitRequested_ = false;
+
+    // Vulkan (created against the runtime's requirements).
+    VkInstance vkInstance_ = VK_NULL_HANDLE;
+    VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkQueue graphicsQueue_ = VK_NULL_HANDLE;
+    uint32_t queueFamilyIndex_ = 0;
+};
+
+} // namespace mp

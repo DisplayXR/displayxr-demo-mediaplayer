@@ -1,0 +1,729 @@
+// SPDX-License-Identifier: BSL-1.0
+#include "XrSession.h"
+
+#include <cstring>
+#include <string>
+
+namespace mp {
+
+namespace {
+
+// Split a space-separated extension list (as returned by the KHR_vulkan_enable
+// xrGetVulkan*ExtensionsKHR helpers) into individual names.
+std::vector<std::string> SplitSpaceSeparated(const std::string& s) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start < s.size()) {
+        size_t end = s.find(' ', start);
+        if (end == std::string::npos) end = s.size();
+        std::string name = s.substr(start, end - start);
+        if (!name.empty() && name[0] != '\0') out.push_back(name);
+        start = end + 1;
+    }
+    return out;
+}
+
+const char* SessionStateName(XrSessionState s) {
+    switch (s) {
+        case XR_SESSION_STATE_IDLE: return "IDLE";
+        case XR_SESSION_STATE_READY: return "READY";
+        case XR_SESSION_STATE_SYNCHRONIZED: return "SYNCHRONIZED";
+        case XR_SESSION_STATE_VISIBLE: return "VISIBLE";
+        case XR_SESSION_STATE_FOCUSED: return "FOCUSED";
+        case XR_SESSION_STATE_STOPPING: return "STOPPING";
+        case XR_SESSION_STATE_LOSS_PENDING: return "LOSS_PENDING";
+        case XR_SESSION_STATE_EXITING: return "EXITING";
+        default: return "UNKNOWN";
+    }
+}
+
+} // namespace
+
+XrSession::~XrSession() { Shutdown(); }
+
+bool XrSession::Initialize(void* nativeWindowHandle) {
+    if (!InitInstanceAndSystem()) return false;
+    if (!CreateVulkanDevice()) return false;
+    if (!CreateSessionWithWindowBinding(nativeWindowHandle)) return false;
+    EnumerateRenderingModes();   // needs the session; informs swapchain sizing
+    if (!CreateLocalSpace()) return false;
+    if (!CreateSwapchain()) return false;
+    LOG_INFO("OpenXR session ready (swapchain %ux%u fmt=%lld, active mode '%s': %u views %ux%u)",
+             swapchain_.width, swapchain_.height, (long long)swapchain_.format,
+             ActiveModeName(), ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());
+    return true;
+}
+
+bool XrSession::InitInstanceAndSystem() {
+    uint32_t extCount = 0;
+    XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr));
+    std::vector<XrExtensionProperties> exts(extCount, {XR_TYPE_EXTENSION_PROPERTIES});
+    XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, exts.data()));
+
+    bool hasVulkan = false;
+#if defined(__APPLE__)
+    const char* kWindowBindingExt = XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME;
+#elif defined(_WIN32)
+    const char* kWindowBindingExt = XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME;
+#else
+    const char* kWindowBindingExt = nullptr;
+#endif
+
+    for (const auto& e : exts) {
+        LOG_DEBUG("  instance ext: %s (v%u)", e.extensionName, e.extensionVersion);
+        if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
+        if (kWindowBindingExt && strcmp(e.extensionName, kWindowBindingExt) == 0) hasWindowBindingExt_ = true;
+        if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) hasDisplayInfoExt_ = true;
+    }
+
+    LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "yes" : "NO");
+    LOG_INFO("window binding (%s): %s",
+             kWindowBindingExt ? kWindowBindingExt : "<none>",
+             hasWindowBindingExt_ ? "yes" : "no");
+    LOG_INFO("XR_EXT_display_info: %s", hasDisplayInfoExt_ ? "yes" : "no");
+
+    if (!hasVulkan) {
+        LOG_ERROR("Runtime does not expose XR_KHR_vulkan_enable");
+        return false;
+    }
+
+    std::vector<const char*> enabled;
+    enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+    if (hasWindowBindingExt_) enabled.push_back(kWindowBindingExt);
+    if (hasDisplayInfoExt_) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+
+    XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
+    std::strncpy(ci.applicationInfo.applicationName, "DisplayXR Media Player",
+                 XR_MAX_APPLICATION_NAME_SIZE - 1);
+    ci.applicationInfo.applicationVersion = 1;
+    std::strncpy(ci.applicationInfo.engineName, "None", XR_MAX_ENGINE_NAME_SIZE - 1);
+    ci.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+    ci.enabledExtensionCount = (uint32_t)enabled.size();
+    ci.enabledExtensionNames = enabled.data();
+
+    XR_CHECK(xrCreateInstance(&ci, &instance_));
+    LOG_INFO("OpenXR instance created");
+
+    XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
+    sysInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    XR_CHECK(xrGetSystem(instance_, &sysInfo, &systemId_));
+
+    {
+        XrSystemProperties props = {XR_TYPE_SYSTEM_PROPERTIES};
+        if (XR_SUCCEEDED(xrGetSystemProperties(instance_, systemId_, &props))) {
+            LOG_INFO("System: %s", props.systemName);
+        }
+    }
+
+    // Optional: read display pixel dims so we can size the SBS swapchain to the panel.
+    if (hasDisplayInfoExt_) {
+        XrSystemProperties props = {XR_TYPE_SYSTEM_PROPERTIES};
+        XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+        props.next = &di;
+        if (XR_SUCCEEDED(xrGetSystemProperties(instance_, systemId_, &props))) {
+            displayPixelWidth_ = di.displayPixelWidth;
+            displayPixelHeight_ = di.displayPixelHeight;
+            LOG_INFO("Display: %ux%u px, %.3fx%.3f m",
+                     displayPixelWidth_, displayPixelHeight_,
+                     di.displaySizeMeters.width, di.displaySizeMeters.height);
+        }
+    }
+
+    uint32_t viewCount = 0;
+    XR_CHECK(xrEnumerateViewConfigurationViews(instance_, systemId_, viewConfigType_,
+                                               0, &viewCount, nullptr));
+    configViews_.resize(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    XR_CHECK(xrEnumerateViewConfigurationViews(instance_, systemId_, viewConfigType_,
+                                               viewCount, &viewCount, configViews_.data()));
+    if (viewCount > kMaxViews) {
+        LOG_WARN("Runtime reported %u views; clamping to %u", viewCount, kMaxViews);
+        viewCount = kMaxViews;
+        configViews_.resize(viewCount);
+    }
+    viewCount_ = viewCount;
+    LOG_INFO("View configuration: %u views", viewCount_);
+    for (uint32_t i = 0; i < viewCount; ++i) {
+        LOG_INFO("  view %u recommended %ux%u", i,
+                 configViews_[i].recommendedImageRectWidth,
+                 configViews_[i].recommendedImageRectHeight);
+    }
+    return true;
+}
+
+bool XrSession::CreateVulkanDevice() {
+    // Resolve the KHR_vulkan_enable entry points (extension functions, not exported).
+    PFN_xrGetVulkanGraphicsRequirementsKHR pfnGetReq = nullptr;
+    PFN_xrGetVulkanInstanceExtensionsKHR pfnInstExts = nullptr;
+    PFN_xrGetVulkanGraphicsDeviceKHR pfnGetDevice = nullptr;
+    PFN_xrGetVulkanDeviceExtensionsKHR pfnDevExts = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrGetVulkanGraphicsRequirementsKHR",
+                                   (PFN_xrVoidFunction*)&pfnGetReq));
+    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrGetVulkanInstanceExtensionsKHR",
+                                   (PFN_xrVoidFunction*)&pfnInstExts));
+    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrGetVulkanGraphicsDeviceKHR",
+                                   (PFN_xrVoidFunction*)&pfnGetDevice));
+    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrGetVulkanDeviceExtensionsKHR",
+                                   (PFN_xrVoidFunction*)&pfnDevExts));
+
+    XrGraphicsRequirementsVulkanKHR req = {XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
+    XR_CHECK(pfnGetReq(instance_, systemId_, &req));
+    LOG_INFO("Vulkan API range required: %u.%u - %u.%u",
+             XR_VERSION_MAJOR(req.minApiVersionSupported), XR_VERSION_MINOR(req.minApiVersionSupported),
+             XR_VERSION_MAJOR(req.maxApiVersionSupported), XR_VERSION_MINOR(req.maxApiVersionSupported));
+
+    // ---- VkInstance: runtime-required extensions + (macOS) portability enumeration.
+    uint32_t bufSize = 0;
+    pfnInstExts(instance_, systemId_, 0, &bufSize, nullptr);
+    std::string instExtStr(bufSize, '\0');
+    pfnInstExts(instance_, systemId_, bufSize, &bufSize, instExtStr.data());
+    std::vector<std::string> instExtNames = SplitSpaceSeparated(instExtStr);
+
+    bool hasPortabilityEnum = false;
+#if defined(__APPLE__)
+    {
+        // MoltenVK is a portability driver; the loader needs the enumeration ext +
+        // flag to surface it. (Re-typed from cube_handle_vk_macos.)
+        uint32_t availCount = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &availCount, nullptr);
+        std::vector<VkExtensionProperties> avail(availCount);
+        vkEnumerateInstanceExtensionProperties(nullptr, &availCount, avail.data());
+        for (const auto& e : avail) {
+            if (strcmp(e.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0) {
+                hasPortabilityEnum = true;
+                instExtNames.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+                break;
+            }
+        }
+    }
+#endif
+
+    std::vector<const char*> instExtPtrs;
+    for (auto& n : instExtNames) {
+        instExtPtrs.push_back(n.c_str());
+        LOG_INFO("  VkInstance ext: %s", n.c_str());
+    }
+
+    VkApplicationInfo appInfo = {};
+    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    appInfo.pApplicationName = "DisplayXR Media Player";
+    appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+    appInfo.pEngineName = "None";
+    appInfo.apiVersion = VK_API_VERSION_1_1;
+
+    VkInstanceCreateInfo ici = {};
+    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ici.pApplicationInfo = &appInfo;
+    ici.enabledExtensionCount = (uint32_t)instExtPtrs.size();
+    ici.ppEnabledExtensionNames = instExtPtrs.data();
+    if (hasPortabilityEnum) {
+        ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+
+    if (vkCreateInstance(&ici, nullptr, &vkInstance_) != VK_SUCCESS) {
+        LOG_ERROR("vkCreateInstance failed");
+        return false;
+    }
+
+    // ---- VkPhysicalDevice: the one the runtime is using.
+    XR_CHECK(pfnGetDevice(instance_, systemId_, vkInstance_, &physicalDevice_));
+    {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(physicalDevice_, &props);
+        LOG_INFO("Vulkan device: %s", props.deviceName);
+    }
+
+    // ---- Graphics queue family.
+    {
+        uint32_t qCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_, &qCount, nullptr);
+        std::vector<VkQueueFamilyProperties> qfams(qCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_, &qCount, qfams.data());
+        bool found = false;
+        for (uint32_t i = 0; i < qCount; ++i) {
+            if (qfams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                queueFamilyIndex_ = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            LOG_ERROR("No graphics queue family");
+            return false;
+        }
+    }
+
+    // ---- VkDevice: runtime-required device extensions, filtered to those the
+    // physical device actually exposes (promoted-to-core ones won't be listed),
+    // plus VK_KHR_portability_subset when present (mandatory on MoltenVK).
+    pfnDevExts(instance_, systemId_, 0, &bufSize, nullptr);
+    std::string devExtStr(bufSize, '\0');
+    pfnDevExts(instance_, systemId_, bufSize, &bufSize, devExtStr.data());
+    std::vector<std::string> requested = SplitSpaceSeparated(devExtStr);
+
+    uint32_t devAvailCount = 0;
+    vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &devAvailCount, nullptr);
+    std::vector<VkExtensionProperties> devAvail(devAvailCount);
+    vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &devAvailCount, devAvail.data());
+    auto deviceHas = [&](const char* name) {
+        for (auto& e : devAvail) if (strcmp(e.extensionName, name) == 0) return true;
+        return false;
+    };
+
+    std::vector<std::string> devExtStorage;
+    for (auto& n : requested) {
+        if (deviceHas(n.c_str())) devExtStorage.push_back(n);
+        else LOG_DEBUG("  skipping promoted-to-core device ext: %s", n.c_str());
+    }
+    if (deviceHas("VK_KHR_portability_subset")) {
+        devExtStorage.push_back("VK_KHR_portability_subset");
+    }
+
+    std::vector<const char*> devExtPtrs;
+    for (auto& n : devExtStorage) {
+        devExtPtrs.push_back(n.c_str());
+        LOG_INFO("  VkDevice ext: %s", n.c_str());
+    }
+
+    float priority = 1.0f;
+    VkDeviceQueueCreateInfo qci = {};
+    qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qci.queueFamilyIndex = queueFamilyIndex_;
+    qci.queueCount = 1;
+    qci.pQueuePriorities = &priority;
+
+    VkDeviceCreateInfo dci = {};
+    dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    dci.queueCreateInfoCount = 1;
+    dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = (uint32_t)devExtPtrs.size();
+    dci.ppEnabledExtensionNames = devExtPtrs.data();
+
+    if (vkCreateDevice(physicalDevice_, &dci, nullptr, &device_) != VK_SUCCESS) {
+        LOG_ERROR("vkCreateDevice failed");
+        return false;
+    }
+    vkGetDeviceQueue(device_, queueFamilyIndex_, 0, &graphicsQueue_);
+    LOG_INFO("Vulkan device + graphics queue created (family %u)", queueFamilyIndex_);
+    return true;
+}
+
+bool XrSession::CreateSessionWithWindowBinding(void* nativeWindowHandle) {
+    XrGraphicsBindingVulkanKHR vkBinding = {XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
+    vkBinding.instance = vkInstance_;
+    vkBinding.physicalDevice = physicalDevice_;
+    vkBinding.device = device_;
+    vkBinding.queueFamilyIndex = queueFamilyIndex_;
+    vkBinding.queueIndex = 0;
+
+#if defined(__APPLE__)
+    XrCocoaWindowBindingCreateInfoEXT windowBinding = {};
+    windowBinding.type = (XrStructureType)XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
+    windowBinding.viewHandle = nativeWindowHandle; // NSView* (CAMetalLayer-backed, from SDL)
+    if (hasWindowBindingExt_ && nativeWindowHandle) {
+        vkBinding.next = &windowBinding;
+        LOG_INFO("Using XR_EXT_cocoa_window_binding (NSView=%p)", nativeWindowHandle);
+    }
+#elif defined(_WIN32)
+    XrWin32WindowBindingCreateInfoEXT windowBinding = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+    windowBinding.windowHandle = nativeWindowHandle; // HWND
+    if (hasWindowBindingExt_ && nativeWindowHandle) {
+        vkBinding.next = &windowBinding;
+        LOG_INFO("Using XR_EXT_win32_window_binding (HWND=%p)", nativeWindowHandle);
+    }
+#else
+    (void)nativeWindowHandle;
+#endif
+
+    XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO};
+    sci.next = &vkBinding;
+    sci.systemId = systemId_;
+    XR_CHECK(xrCreateSession(instance_, &sci, &session_));
+    LOG_INFO("OpenXR session created");
+    return true;
+}
+
+void XrSession::EnumerateRenderingModes() {
+    if (!hasDisplayInfoExt_) {
+        LOG_INFO("No XR_EXT_display_info — using max view count + derived tiling");
+        return;
+    }
+    xrGetInstanceProcAddr(instance_, "xrEnumerateDisplayRenderingModesEXT",
+                          (PFN_xrVoidFunction*)&pfnEnumModes_);
+    xrGetInstanceProcAddr(instance_, "xrRequestDisplayRenderingModeEXT",
+                          (PFN_xrVoidFunction*)&pfnRequestMode_);
+    if (!pfnEnumModes_) {
+        LOG_WARN("xrEnumerateDisplayRenderingModesEXT unavailable");
+        return;
+    }
+
+    uint32_t count = 0;
+    if (XR_FAILED(pfnEnumModes_(session_, 0, &count, nullptr)) || count == 0) return;
+    std::vector<XrDisplayRenderingModeInfoEXT> raw(count, {XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT});
+    if (XR_FAILED(pfnEnumModes_(session_, count, &count, raw.data()))) return;
+
+    modes_.clear();
+    LOG_INFO("Rendering modes (%u):", count);
+    for (uint32_t i = 0; i < count; ++i) {
+        RenderingMode m;
+        m.modeIndex = raw[i].modeIndex;
+        m.viewCount = raw[i].viewCount;
+        m.tileColumns = raw[i].tileColumns ? raw[i].tileColumns : 1;
+        m.tileRows = raw[i].tileRows ? raw[i].tileRows : 1;
+        m.viewScaleX = raw[i].viewScaleX > 0.0f ? raw[i].viewScaleX : 1.0f;
+        m.viewScaleY = raw[i].viewScaleY > 0.0f ? raw[i].viewScaleY : 1.0f;
+        m.hardware3D = raw[i].hardwareDisplay3D == XR_TRUE;
+        m.requestable = raw[i].isRequestable == XR_TRUE;
+        std::strncpy(m.name, raw[i].modeName, sizeof(m.name) - 1);
+        modes_.push_back(m);
+        if (raw[i].isActive == XR_TRUE) currentModeIndex_ = m.modeIndex;
+        LOG_INFO("  [%u] '%s' views=%u tiles=%ux%u scale=%.3fx%.3f 3D=%d requestable=%d%s",
+                 m.modeIndex, m.name, m.viewCount, m.tileColumns, m.tileRows,
+                 m.viewScaleX, m.viewScaleY, m.hardware3D, m.requestable,
+                 raw[i].isActive == XR_TRUE ? " (active)" : "");
+    }
+}
+
+const XrSession::RenderingMode* XrSession::CurrentMode() const {
+    for (const auto& m : modes_) {
+        if (m.modeIndex == currentModeIndex_) return &m;
+    }
+    return nullptr;
+}
+
+uint32_t XrSession::ActiveViewCount() const {
+    const RenderingMode* m = CurrentMode();
+    uint32_t n = m ? m->viewCount : viewCount_;
+    if (n == 0) n = 1;
+    if (n > viewCount_ && viewCount_ > 0) n = viewCount_; // can't exceed located capacity
+    if (n > kMaxViews) n = kMaxViews;
+    return n;
+}
+
+uint32_t XrSession::ActiveTileColumns() const {
+    const RenderingMode* m = CurrentMode();
+    return m ? m->tileColumns : tileColumns_;
+}
+
+uint32_t XrSession::ActiveTileRows() const {
+    const RenderingMode* m = CurrentMode();
+    return m ? m->tileRows : tileRows_;
+}
+
+float XrSession::ActiveViewScaleX() const {
+    const RenderingMode* m = CurrentMode();
+    return m ? m->viewScaleX : 1.0f;
+}
+
+float XrSession::ActiveViewScaleY() const {
+    const RenderingMode* m = CurrentMode();
+    return m ? m->viewScaleY : 1.0f;
+}
+
+uint32_t XrSession::ComputeViewRects(uint32_t canvasPxWidth, uint32_t canvasPxHeight,
+                                     ViewRect* rects) const {
+    const uint32_t count = ActiveViewCount();
+    const uint32_t cols = ActiveTileColumns();
+    const uint32_t rows = ActiveTileRows();
+
+    // Per-view atlas size = canvas pixels * mode view-scale, clamped so the grid
+    // fits in the swapchain (matches the runtime's reference handle apps).
+    const uint32_t maxTileW = swapchain_.width / cols;
+    const uint32_t maxTileH = swapchain_.height / rows;
+    uint32_t tileW = (uint32_t)((float)canvasPxWidth * ActiveViewScaleX() + 0.5f);
+    uint32_t tileH = (uint32_t)((float)canvasPxHeight * ActiveViewScaleY() + 0.5f);
+    if (tileW == 0 || tileW > maxTileW) tileW = maxTileW;
+    if (tileH == 0 || tileH > maxTileH) tileH = maxTileH;
+
+    for (uint32_t v = 0; v < count; ++v) {
+        const uint32_t col = v % cols;
+        const uint32_t row = v / cols;
+        rects[v].x = (int32_t)(col * tileW);
+        rects[v].y = (int32_t)(row * tileH);
+        rects[v].w = tileW;
+        rects[v].h = tileH;
+    }
+    return count;
+}
+
+const char* XrSession::ActiveModeName() const {
+    const RenderingMode* m = CurrentMode();
+    return m ? m->name : "default";
+}
+
+void XrSession::RequestNextMode() {
+    if (!pfnRequestMode_ || modes_.empty()) {
+        LOG_INFO("Mode switch unavailable (no rendering-mode extension)");
+        return;
+    }
+    // Find the current mode's position, then advance to the next *requestable* one.
+    size_t cur = 0;
+    for (size_t i = 0; i < modes_.size(); ++i) {
+        if (modes_[i].modeIndex == currentModeIndex_) { cur = i; break; }
+    }
+    for (size_t step = 1; step <= modes_.size(); ++step) {
+        const RenderingMode& cand = modes_[(cur + step) % modes_.size()];
+        if (cand.requestable) {
+            LOG_INFO("Requesting rendering mode [%u] '%s'", cand.modeIndex, cand.name);
+            pfnRequestMode_(session_, cand.modeIndex);
+            return;
+        }
+    }
+    LOG_INFO("No other requestable rendering mode available");
+}
+
+void XrSession::RequestMode(uint32_t modeIndex) {
+    if (!pfnRequestMode_) return;
+    for (const auto& m : modes_) {
+        if (m.modeIndex == modeIndex && m.requestable) {
+            LOG_INFO("Requesting rendering mode [%u] '%s'", m.modeIndex, m.name);
+            pfnRequestMode_(session_, m.modeIndex);
+            return;
+        }
+    }
+    LOG_WARN("Rendering mode %u not found or not requestable", modeIndex);
+}
+
+bool XrSession::CreateLocalSpace() {
+    XrReferenceSpaceCreateInfo ci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    ci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    ci.poseInReferenceSpace.orientation.w = 1.0f; // identity
+    XR_CHECK(xrCreateReferenceSpace(session_, &ci, &localSpace_));
+    return true;
+}
+
+bool XrSession::CreateSwapchain() {
+    uint32_t formatCount = 0;
+    XR_CHECK(xrEnumerateSwapchainFormats(session_, 0, &formatCount, nullptr));
+    std::vector<int64_t> formats(formatCount);
+    XR_CHECK(xrEnumerateSwapchainFormats(session_, formatCount, &formatCount, formats.data()));
+    if (formats.empty()) {
+        LOG_ERROR("Runtime reported no swapchain formats");
+        return false;
+    }
+    // Runtime's preferred format is first per the OpenXR spec.
+    int64_t selectedFormat = formats[0];
+
+    // Size the swapchain to the display panel (the sim display's max atlas across
+    // modes). Each active mode then tiles it as swapchain/(tileColumns x tileRows);
+    // since every view's clear rect equals its declared projection rect, the runtime
+    // samples exactly what we wrote regardless of the per-mode tile size.
+    uint32_t width, height;
+    if (displayPixelWidth_ > 0 && displayPixelHeight_ > 0) {
+        width = displayPixelWidth_;
+        height = displayPixelHeight_;
+    } else {
+        width = configViews_[0].recommendedImageRectWidth * 2;
+        height = configViews_[0].recommendedImageRectHeight;
+    }
+
+    XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    ci.format = selectedFormat;
+    ci.sampleCount = configViews_[0].recommendedSwapchainSampleCount;
+    ci.width = width;
+    ci.height = height;
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+    XR_CHECK(xrCreateSwapchain(session_, &ci, &swapchain_.handle));
+    swapchain_.format = selectedFormat;
+    swapchain_.width = width;
+    swapchain_.height = height;
+
+    // Derive the tile grid the N views pack into: columns/rows = swapchain size
+    // divided by the per-view recommended size. For a 2-view HMD this is 2x1
+    // (classic SBS); for a 4-view light-field panel it's 2x2. Falls back so the
+    // tiles always cover the image and there are at least viewCount_ of them.
+    const uint32_t perViewW = configViews_[0].recommendedImageRectWidth;
+    const uint32_t perViewH = configViews_[0].recommendedImageRectHeight;
+    tileColumns_ = (perViewW > 0) ? (width / perViewW) : 1;
+    tileRows_ = (perViewH > 0) ? (height / perViewH) : 1;
+    if (tileColumns_ == 0) tileColumns_ = 1;
+    if (tileRows_ == 0) tileRows_ = 1;
+    while (tileColumns_ * tileRows_ < viewCount_) {
+        // Prefer growing columns (horizontal parallax) before rows.
+        if (tileColumns_ <= tileRows_) ++tileColumns_; else ++tileRows_;
+    }
+    LOG_INFO("Tile grid: %ux%u (%u views, per-view %ux%u)",
+             tileColumns_, tileRows_, viewCount_, perViewW, perViewH);
+
+    uint32_t imageCount = 0;
+    XR_CHECK(xrEnumerateSwapchainImages(swapchain_.handle, 0, &imageCount, nullptr));
+    std::vector<XrSwapchainImageVulkanKHR> images(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    XR_CHECK(xrEnumerateSwapchainImages(swapchain_.handle, imageCount, &imageCount,
+                                        (XrSwapchainImageBaseHeader*)images.data()));
+    swapchain_.imageCount = imageCount;
+    swapchainVkImages_.clear();
+    for (auto& img : images) swapchainVkImages_.push_back(img.image);
+    LOG_INFO("SBS swapchain: %u images", imageCount);
+    return true;
+}
+
+void XrSession::PollEvents() {
+    XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
+    while (xrPollEvent(instance_, &event) == XR_SUCCESS) {
+        switch (event.type) {
+            case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
+                auto* e = reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
+                LOG_INFO("Session state: %s -> %s",
+                         SessionStateName(sessionState_), SessionStateName(e->state));
+                sessionState_ = e->state;
+                switch (sessionState_) {
+                    case XR_SESSION_STATE_READY: {
+                        XrSessionBeginInfo bi = {XR_TYPE_SESSION_BEGIN_INFO};
+                        bi.primaryViewConfigurationType = viewConfigType_;
+                        if (XR_SUCCEEDED(xrBeginSession(session_, &bi))) {
+                            sessionRunning_ = true;
+                            LOG_INFO("Session running");
+                        }
+                        break;
+                    }
+                    case XR_SESSION_STATE_STOPPING:
+                        xrEndSession(session_);
+                        sessionRunning_ = false;
+                        break;
+                    case XR_SESSION_STATE_EXITING:
+                    case XR_SESSION_STATE_LOSS_PENDING:
+                        exitRequested_ = true;
+                        break;
+                    default:
+                        break;
+                }
+                break;
+            }
+            case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+                exitRequested_ = true;
+                break;
+            case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
+                auto* e = reinterpret_cast<XrEventDataRenderingModeChangedEXT*>(&event);
+                currentModeIndex_ = e->currentModeIndex;
+                LOG_INFO("Rendering mode changed: %u -> %u ('%s': %u views %ux%u)",
+                         e->previousModeIndex, e->currentModeIndex, ActiveModeName(),
+                         ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());
+                break;
+            }
+            default:
+                break;
+        }
+        event = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+}
+
+bool XrSession::BeginFrame(Frame& frame) {
+    frame.frameState = {XR_TYPE_FRAME_STATE};
+    XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
+    if (XR_FAILED(xrWaitFrame(session_, &waitInfo, &frame.frameState))) {
+        exitRequested_ = true;
+        return false;
+    }
+    XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
+    if (XR_FAILED(xrBeginFrame(session_, &beginInfo))) return false;
+
+    frame.shouldRender = frame.frameState.shouldRender == XR_TRUE;
+    // Only the active rendering mode's views are valid/used; the located array is
+    // always sized to the max-over-all-modes capacity.
+    frame.viewCount = ActiveViewCount();
+    if (!frame.shouldRender) return true;
+
+    // Locate with the *max* capacity (the runtime requires it); use [0, viewCount).
+    XrViewLocateInfo locate = {XR_TYPE_VIEW_LOCATE_INFO};
+    locate.viewConfigurationType = viewConfigType_;
+    locate.displayTime = frame.frameState.predictedDisplayTime;
+    locate.space = localSpace_;
+    XrViewState viewState = {XR_TYPE_VIEW_STATE};
+    for (uint32_t i = 0; i < kMaxViews; ++i) frame.views[i] = {XR_TYPE_VIEW};
+    uint32_t viewCountOut = 0;
+    if (XR_FAILED(xrLocateViews(session_, &locate, &viewState, viewCount_,
+                               &viewCountOut, frame.views))) {
+        frame.shouldRender = false;
+        return true;
+    }
+    if ((viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0 ||
+        (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
+        frame.shouldRender = false;
+        return true;
+    }
+
+    // Acquire + wait the SBS swapchain image the renderer will clear.
+    XrSwapchainImageAcquireInfo acq = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (XR_FAILED(xrAcquireSwapchainImage(swapchain_.handle, &acq, &frame.imageIndex))) {
+        frame.shouldRender = false;
+        return true;
+    }
+    XrSwapchainImageWaitInfo wait = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait.timeout = XR_INFINITE_DURATION;
+    if (XR_FAILED(xrWaitSwapchainImage(swapchain_.handle, &wait))) {
+        XrSwapchainImageReleaseInfo rel = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(swapchain_.handle, &rel);
+        frame.shouldRender = false;
+        return true;
+    }
+    return true;
+}
+
+bool XrSession::EndFrame(Frame& frame, const ViewRect* rects) {
+    XrCompositionLayerProjectionView projViews[kMaxViews];
+    XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+
+    if (frame.shouldRender) {
+        // Release the image we rendered into before submitting the layer.
+        XrSwapchainImageReleaseInfo rel = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(swapchain_.handle, &rel);
+
+        // Each active view declares the same tile rect the renderer cleared, so the
+        // runtime samples exactly what we wrote.
+        for (uint32_t v = 0; v < frame.viewCount; ++v) {
+            projViews[v] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+            projViews[v].pose = frame.views[v].pose;
+            projViews[v].fov = frame.views[v].fov;
+            projViews[v].subImage.swapchain = swapchain_.handle;
+            projViews[v].subImage.imageArrayIndex = 0;
+            projViews[v].subImage.imageRect.offset = {rects[v].x, rects[v].y};
+            projViews[v].subImage.imageRect.extent = {(int32_t)rects[v].w, (int32_t)rects[v].h};
+        }
+        layer.space = localSpace_;
+        layer.viewCount = frame.viewCount;
+        layer.views = projViews;
+    }
+
+    const XrCompositionLayerBaseHeader* layers[] = {
+        reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+
+    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+    endInfo.displayTime = frame.frameState.predictedDisplayTime;
+    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    endInfo.layerCount = frame.shouldRender ? 1 : 0;
+    endInfo.layers = frame.shouldRender ? layers : nullptr;
+
+    return XR_SUCCEEDED(xrEndFrame(session_, &endInfo));
+}
+
+void XrSession::Shutdown() {
+    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    if (swapchain_.handle != XR_NULL_HANDLE) {
+        xrDestroySwapchain(swapchain_.handle);
+        swapchain_.handle = XR_NULL_HANDLE;
+    }
+    if (localSpace_ != XR_NULL_HANDLE) {
+        xrDestroySpace(localSpace_);
+        localSpace_ = XR_NULL_HANDLE;
+    }
+    if (session_ != XR_NULL_HANDLE) {
+        xrDestroySession(session_);
+        session_ = XR_NULL_HANDLE;
+    }
+    if (device_ != VK_NULL_HANDLE) {
+        vkDestroyDevice(device_, nullptr);
+        device_ = VK_NULL_HANDLE;
+    }
+    if (vkInstance_ != VK_NULL_HANDLE) {
+        vkDestroyInstance(vkInstance_, nullptr);
+        vkInstance_ = VK_NULL_HANDLE;
+    }
+    if (instance_ != XR_NULL_HANDLE) {
+        xrDestroyInstance(instance_);
+        instance_ = XR_NULL_HANDLE;
+    }
+}
+
+} // namespace mp
