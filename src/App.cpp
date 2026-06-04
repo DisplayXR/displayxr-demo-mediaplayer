@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <SDL3/SDL.h>   // SDL_ShowOpenFileDialog (Tier-0 native file dialog)
+
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include "imgui.h"
 #endif
@@ -81,37 +83,9 @@ bool App::Initialize(const char* mediaPath) {
     }
 
     // Load a stereo image or video if one was given; otherwise the loop falls back
-    // to the RED|BLUE L/R test pattern.
+    // to the RED|BLUE L/R test pattern (and the user can Open one at runtime).
     if (mediaPath && *mediaPath) {
-        // Identify by name first so we know image vs video before touching pixels.
-        const MediaInfo info = MediaSource::Identify(mediaPath);
-        if (info.kind == MediaKind::Video) {
-            if (video_.Open(mediaPath)) {
-                isVideo_ = true;
-                hasMedia_ = true;
-                layout_ = info.layout;
-                mediaW_ = video_.Width();
-                mediaH_ = video_.Height();
-                contentAspect_ = PerEyeAspect(info.layout, video_.Width(), video_.Height());
-                LOG_INFO("Playing %s video (%s), per-eye aspect %.3f",
-                         MediaSource::LayoutName(info.layout), mediaPath, contentAspect_);
-            }
-        } else {
-            DecodedImage img = ImageDecoder::Load(mediaPath);
-            if (img.Valid()) {
-                const MediaInfo imgInfo = MediaSource::Identify(mediaPath, img.width, img.height);
-                if (renderer_.UploadTexture(img.pixels.data(),
-                                            (uint32_t)img.width, (uint32_t)img.height)) {
-                    layout_ = imgInfo.layout;
-                    hasMedia_ = true;
-                    mediaW_ = img.width;
-                    mediaH_ = img.height;
-                    contentAspect_ = PerEyeAspect(imgInfo.layout, img.width, img.height);
-                    LOG_INFO("Displaying %s image (%s), per-eye aspect %.3f",
-                             MediaSource::LayoutName(imgInfo.layout), mediaPath, contentAspect_);
-                }
-            }
-        }
+        LoadMedia(mediaPath);
     }
     if (!hasMedia_) {
         LOG_INFO("No media loaded — showing RED|BLUE L/R test pattern");
@@ -139,6 +113,7 @@ int App::Run() {
     }();
     dumpPath_ = std::getenv("MEDIAPLAYER_DUMP_ATLAS");
     dumpHudPath_ = std::getenv("MEDIAPLAYER_DUMP_HUD");
+    openAfterPath_ = std::getenv("MEDIAPLAYER_OPEN_AFTER");  // test: swap media mid-run
     if (const char* h = std::getenv("MEDIAPLAYER_HUD")) showHud_ = (*h && *h != '0');
     // Env-gated initial stereo state (test scaffolding: lets a headless atlas dump
     // prove convergence/swap without keystrokes). Interactive keys still apply on top.
@@ -177,6 +152,29 @@ int App::Run() {
             LOG_INFO("playback %s", video_.Paused() ? "paused" : "playing");
         }
         xr_.PollEvents();
+
+        // Open-file results: the workspace picker completion (drained by PollEvents)
+        // and the native dialog (parked off-thread). Either may yield a new path.
+        std::string picked;
+        if (xr_.TakePickedFile(picked)) {
+            openFilePending_ = false;
+            if (!picked.empty()) ReloadMedia(picked);
+        }
+        bool gotNative = false;
+        {
+            std::lock_guard<std::mutex> lk(nativePathMutex_);
+            if (hasNativePath_) { hasNativePath_ = false; picked = nativePath_; gotNative = true; }
+        }
+        if (gotNative) {
+            openFilePending_ = false;
+            if (!picked.empty()) ReloadMedia(picked);  // outside the lock
+        }
+        // Test hook: exercise the media-swap path without a dialog.
+        if (openAfterPath_ && !openedAfter_ && frames_ > 150) {
+            openedAfter_ = true;
+            ReloadMedia(openAfterPath_);
+        }
+
         if (xr_.IsRunning()) RenderOneFrame();
     }
 
@@ -369,7 +367,11 @@ void App::BuildTransportUI() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14.0f);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.06f, 0.08f, 0.70f));
     if (ImGui::Begin("##transport", nullptr, flags)) {
-        // Row 1: transport + stereo toggles.
+        // Row 1: open + transport + stereo toggles.
+        ImGui::BeginDisabled(openFilePending_);
+        if (ImGui::Button("Open", ImVec2(90, 0))) RequestOpenFile();
+        ImGui::EndDisabled();
+        ImGui::SameLine();
         if (isVideo_) {
             if (ImGui::Button(video_.Paused() ? "Play" : "Pause", ImVec2(120, 0)))
                 video_.TogglePaused();
@@ -381,12 +383,34 @@ void App::BuildTransportUI() {
         ImGui::SameLine();
         if (ImGui::Button("Reset conv", ImVec2(140, 0))) convergence_ = 0.0f;
 
-        // Row 2: convergence slider (full width).
+        // Row 2: scrubber (video only). Position tracks playback except while dragging.
+        if (isVideo_ && video_.DurationSeconds() > 0.0) {
+            const float dur = (float)video_.DurationSeconds();
+            if (!scrubActive_) scrubValue_ = (float)video_.PositionSeconds();
+            auto mmss = [](double s, char* out, size_t n) {
+                if (s < 0.0) s = 0.0;
+                const int t = (int)s;
+                std::snprintf(out, n, "%d:%02d", t / 60, t % 60);
+            };
+            char cur[16], tot[16];
+            mmss(scrubValue_, cur, sizeof(cur));
+            mmss(dur, tot, sizeof(tot));
+            ImGui::Text("%s", cur);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-ImGui::CalcTextSize(tot).x - 16.0f);
+            const bool changed = ImGui::SliderFloat("##scrub", &scrubValue_, 0.0f, dur, "");
+            scrubActive_ = ImGui::IsItemActive();
+            if (changed) video_.Seek(scrubValue_);
+            ImGui::SameLine();
+            ImGui::Text("%s", tot);
+        }
+
+        // Row 3: convergence slider (full width).
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::SliderFloat("##conv", &convergence_, -kConvergenceMax, kConvergenceMax,
                            "convergence  %+.3f");
 
-        // Row 3: format / stats.
+        // Row 4: format / stats.
         if (isVideo_) {
             ImGui::Text("%.0f FPS   %s   %dx%d %s   %s/%s", fps_, xr_.ActiveModeName(),
                         mediaW_, mediaH_, MediaSource::LayoutName(layout_),
@@ -429,6 +453,87 @@ void App::Shutdown() {
     renderer_.Shutdown();
     xr_.Shutdown();
     window_.Destroy();
+}
+
+// --- Open-file ------------------------------------------------------------------
+
+bool App::LoadMedia(const std::string& path) {
+    const MediaInfo info = MediaSource::Identify(path);
+    if (info.kind == MediaKind::Video) {
+        if (!video_.Open(path)) {
+            LOG_ERROR("Open: cannot decode video '%s'", path.c_str());
+            return false;
+        }
+        isVideo_ = true;
+        hasMedia_ = true;
+        layout_ = info.layout;
+        mediaW_ = video_.Width();
+        mediaH_ = video_.Height();
+        contentAspect_ = PerEyeAspect(info.layout, video_.Width(), video_.Height());
+        LOG_INFO("Playing %s video (%s), per-eye aspect %.3f",
+                 MediaSource::LayoutName(info.layout), path.c_str(), contentAspect_);
+        return true;
+    }
+    DecodedImage img = ImageDecoder::Load(path);
+    if (!img.Valid()) {
+        LOG_ERROR("Open: cannot load image '%s'", path.c_str());
+        return false;
+    }
+    const MediaInfo imgInfo = MediaSource::Identify(path, img.width, img.height);
+    if (!renderer_.UploadTexture(img.pixels.data(), (uint32_t)img.width, (uint32_t)img.height)) {
+        return false;
+    }
+    isVideo_ = false;
+    hasMedia_ = true;
+    layout_ = imgInfo.layout;
+    mediaW_ = img.width;
+    mediaH_ = img.height;
+    contentAspect_ = PerEyeAspect(imgInfo.layout, img.width, img.height);
+    LOG_INFO("Displaying %s image (%s), per-eye aspect %.3f",
+             MediaSource::LayoutName(imgInfo.layout), path.c_str(), contentAspect_);
+    return true;
+}
+
+void App::ReloadMedia(const std::string& path) {
+    video_.Stop();   // joins the decode thread; no-op when current media is an image
+    isVideo_ = false;
+    scrubValue_ = 0.0f;
+    scrubActive_ = false;
+    if (!LoadMedia(path)) {
+        LOG_WARN("Open: keeping previous view (failed to open '%s')", path.c_str());
+    }
+}
+
+void App::RequestOpenFile() {
+    if (openFilePending_) return;
+    openFilePending_ = true;
+
+    // Prefer the workspace spatial picker (XR_EXT_workspace_file_dialog). In a
+    // workspace it spawns displayxr-file-picker.exe and the result arrives async via
+    // xr_.TakePickedFile(); anywhere else we fall back to a native OS dialog.
+    const XrSession::PickerStatus st = xr_.RequestFilePicker();
+    if (st == XrSession::PickerStatus::Pending) {
+        LOG_INFO("Open: workspace file picker requested");
+        return;
+    }
+    LOG_INFO("Open: workspace picker unavailable (status=%d) — native dialog", (int)st);
+
+    static const SDL_DialogFileFilter kFilters[] = {
+        {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png"},
+        {"All files", "*"},
+    };
+    SDL_ShowOpenFileDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this,
+                           window_.SdlWindow(), kFilters, 2, nullptr, false);
+}
+
+void App::NativeFileCallback(void* userdata, const char* const* filelist, int /*filter*/) {
+    auto* self = static_cast<App*>(userdata);
+    std::string picked;
+    // filelist == NULL → error; filelist[0] == NULL → user cancelled; else first path.
+    if (filelist && filelist[0]) picked = filelist[0];
+    std::lock_guard<std::mutex> lk(self->nativePathMutex_);
+    self->nativePath_ = picked;   // empty = cancel/error → main loop just clears pending
+    self->hasNativePath_ = true;
 }
 
 } // namespace mp

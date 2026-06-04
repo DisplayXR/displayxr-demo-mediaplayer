@@ -39,6 +39,13 @@ public:
     void TogglePaused() { paused_.store(!paused_.load()); }
     bool Paused() const { return paused_.load(); }
 
+    // Seek to `seconds` (clamped to [0, duration]). Thread-safe: the decode thread
+    // performs the actual av_seek_frame on its next iteration, even while paused
+    // (it decodes + publishes one frame at the new position so the view updates).
+    void Seek(double seconds);
+    double PositionSeconds() const { return positionSec_.load(); }   // current frame PTS
+    double DurationSeconds() const { return durationSec_; }           // 0 if unknown
+
     bool IsOpen() const { return open_; }
     int Width() const { return width_; }    // full SBS frame width
     int Height() const { return height_; }
@@ -64,6 +71,9 @@ private:
     std::thread thread_;
     std::atomic<bool> stop_{false};
     std::atomic<bool> paused_{false};
+    std::atomic<double> seekRequest_{-1.0};   // target seconds, <0 = none pending
+    std::atomic<double> positionSec_{0.0};     // last published frame's PTS
+    double durationSec_ = 0.0;                  // set in Open()
     bool open_ = false;
     int width_ = 0;
     int height_ = 0;

@@ -197,9 +197,14 @@ bool VideoDecoder::Open(const std::string& path) {
 
     width_ = impl_->codec->width;
     height_ = impl_->codec->height;
+    durationSec_ = (impl_->fmt->duration > 0)
+                       ? (double)impl_->fmt->duration / (double)AV_TIME_BASE
+                       : 0.0;
+    positionSec_.store(0.0);
+    seekRequest_.store(-1.0);
     open_ = true;
-    LOG_INFO("VideoDecoder: '%s' %dx%d codec=%s backend=%s", path.c_str(), width_, height_,
-             codecName_, hwName_);
+    LOG_INFO("VideoDecoder: '%s' %dx%d codec=%s backend=%s dur=%.1fs", path.c_str(), width_,
+             height_, codecName_, hwName_, durationSec_);
 
     stop_ = false;
     thread_ = std::thread(&VideoDecoder::DecodeLoop, this);
@@ -218,11 +223,25 @@ void VideoDecoder::DecodeLoop() {
     double firstPtsSec = -1.0;
 
     while (!stop_.load()) {
-        // Pause: hold here without consuming packets, then advance the wall clock by
-        // the paused duration so pacing resumes from where it left off (no catch-up).
-        if (paused_.load()) {
+        // Seek (serviced even while paused): jump to the keyframe at/before the target,
+        // flush the decoder, and re-anchor the presentation clock. After a seek we fall
+        // through once to decode + publish a frame at the new position, then re-pause.
+        const double sk = seekRequest_.exchange(-1.0);
+        bool justSought = false;
+        if (sk >= 0.0) {
+            const int64_t ts = (int64_t)(sk / timeBase);
+            av_seek_frame(impl_->fmt, impl_->videoStream, ts, AVSEEK_FLAG_BACKWARD);
+            avcodec_flush_buffers(impl_->codec);
+            firstPtsSec = -1.0;
+            wallStart = clock::now();
+            justSought = true;
+        }
+
+        // Pause: hold here without consuming packets (but wake to service a seek), then
+        // advance the wall clock by the paused duration so pacing resumes seamlessly.
+        if (paused_.load() && !justSought) {
             const auto pauseBegin = clock::now();
-            while (paused_.load() && !stop_.load()) {
+            while (paused_.load() && seekRequest_.load() < 0.0 && !stop_.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(8));
             }
             wallStart += clock::now() - pauseBegin;
@@ -284,15 +303,20 @@ void VideoDecoder::DecodeLoop() {
                 sws_scale(impl_->sws, src->data, src->linesize, 0, src->height,
                           dstData, dstStride);
 
-                // Pace to the presentation clock so playback runs at real speed.
+                // Pace to the presentation clock so playback runs at real speed; track
+                // the current position for the scrubber. A post-seek frame served while
+                // paused isn't paced (firstPtsSec just reset → target is now anyway).
                 int64_t ptsTicks = (src->best_effort_timestamp != AV_NOPTS_VALUE)
                                        ? src->best_effort_timestamp : src->pts;
                 if (ptsTicks != AV_NOPTS_VALUE) {
                     double ptsSec = (double)ptsTicks * timeBase;
+                    positionSec_.store(ptsSec);
                     if (firstPtsSec < 0.0) firstPtsSec = ptsSec;
-                    auto target = wallStart + std::chrono::duration_cast<clock::duration>(
-                                                  std::chrono::duration<double>(ptsSec - firstPtsSec));
-                    std::this_thread::sleep_until(target);
+                    if (!paused_.load()) {
+                        auto target = wallStart + std::chrono::duration_cast<clock::duration>(
+                                                      std::chrono::duration<double>(ptsSec - firstPtsSec));
+                        std::this_thread::sleep_until(target);
+                    }
                 }
 
                 ring_.Publish();
@@ -303,6 +327,12 @@ void VideoDecoder::DecodeLoop() {
 
     av_frame_free(&frame);
     av_packet_free(&pkt);
+}
+
+void VideoDecoder::Seek(double seconds) {
+    if (seconds < 0.0) seconds = 0.0;
+    if (durationSec_ > 0.0 && seconds > durationSec_) seconds = durationSec_;
+    seekRequest_.store(seconds);
 }
 
 void VideoDecoder::Stop() {
@@ -322,6 +352,7 @@ bool VideoDecoder::Open(const std::string&) {
     return false;
 }
 void VideoDecoder::DecodeLoop() {}
+void VideoDecoder::Seek(double) {}
 void VideoDecoder::Stop() {}
 
 #endif

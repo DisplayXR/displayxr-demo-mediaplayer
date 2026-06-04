@@ -75,6 +75,8 @@ bool XrSession::InitInstanceAndSystem() {
         if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (kWindowBindingExt && strcmp(e.extensionName, kWindowBindingExt) == 0) hasWindowBindingExt_ = true;
         if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) hasDisplayInfoExt_ = true;
+        if (strcmp(e.extensionName, XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0)
+            hasFilePickerExt_ = true;
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "yes" : "NO");
@@ -82,6 +84,7 @@ bool XrSession::InitInstanceAndSystem() {
              kWindowBindingExt ? kWindowBindingExt : "<none>",
              hasWindowBindingExt_ ? "yes" : "no");
     LOG_INFO("XR_EXT_display_info: %s", hasDisplayInfoExt_ ? "yes" : "no");
+    LOG_INFO("XR_EXT_workspace_file_dialog: %s", hasFilePickerExt_ ? "yes" : "no");
 
     if (!hasVulkan) {
         LOG_ERROR("Runtime does not expose XR_KHR_vulkan_enable");
@@ -92,6 +95,7 @@ bool XrSession::InitInstanceAndSystem() {
     enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     if (hasWindowBindingExt_) enabled.push_back(kWindowBindingExt);
     if (hasDisplayInfoExt_) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+    if (hasFilePickerExt_) enabled.push_back(XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     std::strncpy(ci.applicationInfo.applicationName, "DisplayXR Media Player",
@@ -104,6 +108,13 @@ bool XrSession::InitInstanceAndSystem() {
 
     XR_CHECK(xrCreateInstance(&ci, &instance_));
     LOG_INFO("OpenXR instance created");
+
+    // Resolve the file-picker entry point (extension function — must go through
+    // xrGetInstanceProcAddr, never the loader's exported symbols).
+    if (hasFilePickerExt_) {
+        xrGetInstanceProcAddr(instance_, "xrRequestFilePickerEXT",
+                              (PFN_xrVoidFunction*)&pfnRequestFilePicker_);
+    }
 
     XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
     sysInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -657,6 +668,16 @@ void XrSession::PollEvents() {
             case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
                 exitRequested_ = true;
                 break;
+            case (XrStructureType)XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT: {
+                auto* e = reinterpret_cast<XrEventDataFilePickerCompleteEXT*>(&event);
+                if (e->requestId != pendingPickerId_) break;  // stale / not ours
+                pendingPickerId_ = XR_NULL_ASYNC_REQUEST_ID_EXT;
+                hasPickedFile_ = true;  // latched even on cancel (App clears its busy flag)
+                pickedFile_ = (e->result == XR_FILE_PICKER_RESULT_SUCCESS_EXT) ? e->path : "";
+                LOG_INFO("File picker complete: result=%d path='%s'", (int)e->result,
+                         pickedFile_.c_str());
+                break;
+            }
             case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
                 auto* e = reinterpret_cast<XrEventDataRenderingModeChangedEXT*>(&event);
                 currentModeIndex_ = e->currentModeIndex;
@@ -670,6 +691,40 @@ void XrSession::PollEvents() {
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};
     }
+}
+
+XrSession::PickerStatus XrSession::RequestFilePicker() {
+    if (!pfnRequestFilePicker_) return PickerStatus::Unsupported;  // ext absent
+
+    XrFilePickerInfoEXT info = {XR_TYPE_FILE_PICKER_INFO_EXT};
+    info.mode = XR_FILE_PICKER_MODE_OPEN_EXT;
+    info.flags = XR_FILE_PICKER_FLAG_NONE_EXT;
+    std::strncpy(info.title, "Open media", sizeof(info.title) - 1);
+    info.filterCount = 2;
+    std::strncpy(info.filters[0].description, "Stereo media", XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT - 1);
+    std::strncpy(info.filters[0].extensions,
+                 "*.mp4;*.mkv;*.mov;*.jpg;*.jpeg;*.png", XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT - 1);
+    std::strncpy(info.filters[1].description, "All files", XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT - 1);
+    std::strncpy(info.filters[1].extensions, "*.*", XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT - 1);
+
+    XrAsyncRequestIdEXT id = XR_NULL_ASYNC_REQUEST_ID_EXT;
+    const XrResult r = pfnRequestFilePicker_(session_, &info, &id);
+    if (r == XR_SUCCESS) {
+        pendingPickerId_ = id;
+        return PickerStatus::Pending;  // result arrives via the completion event
+    }
+    if (r == (XrResult)XR_FILE_PICKER_FALLBACK_TIER0_EXT) return PickerStatus::FallbackTier0;
+    if (r == XR_ERROR_FEATURE_UNSUPPORTED) return PickerStatus::Unsupported;
+    LOG_WARN("xrRequestFilePickerEXT failed: XrResult=%d", (int)r);
+    return PickerStatus::Error;
+}
+
+bool XrSession::TakePickedFile(std::string& path) {
+    if (!hasPickedFile_) return false;
+    hasPickedFile_ = false;
+    path = pickedFile_;
+    pickedFile_.clear();
+    return true;
 }
 
 bool XrSession::BeginFrame(Frame& frame) {
