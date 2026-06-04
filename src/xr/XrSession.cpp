@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSL-1.0
 #include "XrSession.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -338,9 +339,29 @@ bool XrSession::CreateSessionWithWindowBinding(void* nativeWindowHandle) {
 #elif defined(_WIN32)
     XrWin32WindowBindingCreateInfoEXT windowBinding = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
     windowBinding.windowHandle = nativeWindowHandle; // HWND
+    // Experimental, PARKED — left as scaffolding (default off). MEDIAPLAYER_TRANSPARENT=1
+    // asks the runtime/DP to compose the letterbox through to the desktop: the renderer
+    // clears those regions to alpha 0 and the runtime honours per-pixel alpha
+    // (chromaKeyColor 0 = no chroma-key pass). Set only at session creation; can't toggle.
+    //
+    // Not finished, for two reasons found on Windows + LeiaSR:
+    //   1. WINDOW: this still shows BLACK, not see-through. SDL hands us an ordinary
+    //      HWND with an opaque redirection surface that sits on top of the pixels the DP
+    //      composes through. Seeing it needs a window created with WS_EX_NOREDIRECTIONBITMAP
+    //      + a null background brush (as the model/gauss demos' own Win32 windows do),
+    //      then adopted into SDL via SDL_PROP_WINDOW_CREATE_WIN32_HWND_POINTER. SDL's
+    //      default SDL_CreateWindow path can't request that extended style.
+    //   2. PERF: the DP's background-capture composite ~halves framerate (60 -> ~25 fps
+    //      at 4K here) — a poor trade for video. Revisit only if both are acceptable.
+    if (const char* t = std::getenv("MEDIAPLAYER_TRANSPARENT"); t && *t && *t != '0') {
+        windowBinding.transparentBackgroundEnabled = XR_TRUE;
+        windowBinding.chromaKeyColor = 0;
+        transparentBg_ = true;
+    }
     if (hasWindowBindingExt_ && nativeWindowHandle) {
         vkBinding.next = &windowBinding;
-        LOG_INFO("Using XR_EXT_win32_window_binding (HWND=%p)", nativeWindowHandle);
+        LOG_INFO("Using XR_EXT_win32_window_binding (HWND=%p, transparent-bg=%s)",
+                 nativeWindowHandle, transparentBg_ ? "ON" : "off");
     }
 #else
     (void)nativeWindowHandle;

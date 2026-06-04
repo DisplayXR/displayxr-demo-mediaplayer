@@ -515,7 +515,9 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
     vkBeginCommandBuffer(commandBuffer_, &bi);
 
     VkClearValue clear = {};
-    clear.color = {{0.0f, 0.0f, 0.0f, 1.0f}};  // black background outside the tiles
+    // Letterbox/background: opaque black normally; alpha 0 in transparent-bg mode so
+    // the runtime composes those pixels through to the desktop.
+    clear.color = {{0.0f, 0.0f, 0.0f, transparentLetterbox_ ? 0.0f : 1.0f}};
     VkRenderPassBeginInfo rb = {};
     rb.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rb.renderPass = renderPass_;

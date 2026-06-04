@@ -74,6 +74,10 @@ public:
 
     // Draw the uploaded texture into each view's tile, sampling the UV sub-region in
     // `uvs[v]`. Clears the rest of the image to black. Blocks until the GPU finishes.
+    // When true, DrawViews clears the letterbox region to alpha 0 (instead of opaque
+    // black) so the runtime composes it through to the desktop (MEDIAPLAYER_TRANSPARENT).
+    void SetTransparentLetterbox(bool t) { transparentLetterbox_ = t; }
+
     // `rects` are the per-view content rects (the viewport — may be convergence-
     // shifted); `clipRects` are the per-view tile bounds the drawing is scissored to,
     // so a shifted content rect can never spill into the neighbouring eye's tile.
@@ -114,6 +118,7 @@ private:
     uint32_t texW_ = 0;
     uint32_t texH_ = 0;
     bool textureInitialized_ = false;  // false right after (re)create -> first barrier from UNDEFINED
+    bool transparentLetterbox_ = false; // clear letterbox to alpha 0 (transparent-bg mode)
 
     bool CreatePipeline();
     uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;

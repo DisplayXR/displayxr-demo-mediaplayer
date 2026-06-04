@@ -82,6 +82,9 @@ bool App::Initialize(const char* mediaPath) {
         LOG_ERROR("Vulkan renderer initialization failed");
         return false;
     }
+    // Transparent-background experiment: when the session was created with it, clear
+    // the letterbox to alpha 0 so the runtime composes those pixels through.
+    renderer_.SetTransparentLetterbox(xr_.TransparentBackground());
 
     // Load a stereo image or video if one was given; otherwise the loop falls back
     // to the RED|BLUE L/R test pattern (and the user can Open one at runtime).

@@ -81,6 +81,10 @@ public:
     bool BeginFrame(Frame& frame);
     bool EndFrame(Frame& frame, const ViewRect* rects, const HudSubmit* hud = nullptr);
 
+    // True when the session was created with transparent-background compositing
+    // (MEDIAPLAYER_TRANSPARENT=1) — the renderer should clear letterbox to alpha 0.
+    bool TransparentBackground() const { return transparentBg_; }
+
     // Window-space HUD swapchain (created in Initialize if the runtime supports it).
     bool HasHud() const { return hasHud_; }
     uint32_t HudWidth() const { return hudSwapchain_.width; }
@@ -207,6 +211,7 @@ private:
     // Capabilities discovered at instance creation.
     bool hasWindowBindingExt_ = false;
     bool hasDisplayInfoExt_ = false;
+    bool transparentBg_ = false;   // MEDIAPLAYER_TRANSPARENT — letterbox composes through
     uint32_t displayPixelWidth_ = 0;
     uint32_t displayPixelHeight_ = 0;
 
