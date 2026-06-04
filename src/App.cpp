@@ -10,6 +10,10 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+#include "imgui.h"
+#endif
+
 namespace mp {
 
 namespace {
@@ -21,6 +25,10 @@ constexpr ClearColor kRightImage{0.10f, 0.20f, 0.85f, 1.0f};  // BLUE = right
 // step, clamped to ±max — fractions of a view tile, kept small for "subtle" depth.
 constexpr float kConvergenceStep = 0.0025f;
 constexpr float kConvergenceMax = 0.05f;
+
+// HUD layer disparity: small negative shift floats the transport bar a touch toward
+// the viewer (PRD §9 "just in front of the convergence plane"). Kept subtle.
+constexpr float kHudDisparity = -0.008f;
 
 // Per-eye display aspect (width/height): full SBS packs two eyes across the width
 // (each eye half-width); half-SBS and mono use the full frame width.
@@ -107,6 +115,19 @@ bool App::Initialize(const char* mediaPath) {
     if (!hasMedia_) {
         LOG_INFO("No media loaded — showing RED|BLUE L/R test pattern");
     }
+
+    // Dear ImGui transport bar, rendered into the window-space HUD layer (M4). If it
+    // can't init, RenderOneFrame falls back to the CPU-rasterized text HUD.
+    if (xr_.HasHud()) {
+        if (imgui_.Init(window_.SdlWindow(), xr_.VkInstanceHandle(), xr_.PhysicalDevice(),
+                        xr_.Device(), xr_.GraphicsQueue(), xr_.GraphicsQueueFamily(),
+                        (VkFormat)xr_.HudFormat(), xr_.HudWidth(), xr_.HudHeight(),
+                        xr_.HudImages())) {
+            window_.SetEventHook([this](void* ev) { imgui_.ProcessEvent(ev); });
+        } else {
+            LOG_WARN("ImGui unavailable — using the text HUD");
+        }
+    }
     return true;
 }
 
@@ -116,6 +137,7 @@ int App::Run() {
         return e ? std::atoi(e) : -1;
     }();
     dumpPath_ = std::getenv("MEDIAPLAYER_DUMP_ATLAS");
+    dumpHudPath_ = std::getenv("MEDIAPLAYER_DUMP_HUD");
     if (const char* h = std::getenv("MEDIAPLAYER_HUD")) showHud_ = (*h && *h != '0');
     // Env-gated initial stereo state (test scaffolding: lets a headless atlas dump
     // prove convergence/swap without keystrokes). Interactive keys still apply on top.
@@ -262,68 +284,123 @@ void App::RenderOneFrame() {
         }
     }
 
-    // Window-space HUD overlay (SHIFT+TAB). Rasterize stats, upload to the HUD
-    // swapchain image, and submit it as a second layer.
+    // Window-space HUD overlay (SHIFT+TAB): the ImGui transport bar floating just in
+    // front of the image, or the CPU text HUD if ImGui is unavailable.
     XrSession::HudSubmit hud;
     if (showHud_ && frame.shouldRender && xr_.HasHud()) {
         uint32_t cw = 0, ch = 0;
         window_.PixelSize(cw, ch);
-        const uint32_t tileW = rects[0].w;  // per-view render size = canvas * viewScale
-        const uint32_t tileH = rects[0].h;
-
-        // Line 1: fps + active mode. Line 2: source frame + layout. Line 3: window
-        // canvas + per-view tile (the numbers that drive GPU cost / track resize).
-        // Last line: stereo controls — convergence, eye assignment, play state.
-        char stereo[64];
-        std::snprintf(stereo, sizeof(stereo), "conv %+.3f  eyes %s%s", convergence_,
-                      swapEyes_ ? "swapped" : "normal",
-                      (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "");
-
-        char text[320];
-        if (isVideo_) {
-            // Line 2 adds the decode backend (codec + hwaccel) so HW vs SW is visible.
-            std::snprintf(text, sizeof(text),
-                          "%.0f FPS   %s\nsrc %dx%d  %s  %s/%s\nwin %ux%u  tile %ux%u\n%s", fps_,
-                          xr_.ActiveModeName(), mediaW_, mediaH_,
-                          MediaSource::LayoutName(layout_), video_.CodecName(),
-                          video_.BackendName(), cw, ch, tileW, tileH, stereo);
-        } else if (hasMedia_) {
-            std::snprintf(text, sizeof(text),
-                          "%.0f FPS   %s\nsrc %dx%d  %s\nwin %ux%u  tile %ux%u\n%s", fps_,
-                          xr_.ActiveModeName(), mediaW_, mediaH_,
-                          MediaSource::LayoutName(layout_), cw, ch, tileW, tileH, stereo);
-        } else {
-            std::snprintf(text, sizeof(text),
-                          "%.0f FPS   %s\nsrc RED|BLUE test\nwin %ux%u  tile %ux%u\n%s", fps_,
-                          xr_.ActiveModeName(), cw, ch, tileW, tileH, stereo);
-        }
-        // Tight panel drawn into the top-left; the rest of the (content-sized) buffer
-        // is transparent. We submit the full buffer and place it preserving the HUD
-        // aspect — matching the runtime's reference window-space HUD path.
-        hud::RenderText(hudPixels_, (int)xr_.HudWidth(), (int)xr_.HudHeight(), text);
+        const float hudAR = (float)xr_.HudWidth() / (float)xr_.HudHeight();
+        const float winAR = (ch > 0) ? (float)cw / (float)ch : 1.0f;
 
         uint32_t hudIdx = 0;
         if (xr_.AcquireHudImage(hudIdx)) {
-            renderer_.UploadToSwapchainImage(xr_.HudImages()[hudIdx], hudPixels_.data(),
-                                             xr_.HudWidth(), xr_.HudHeight());
-            xr_.ReleaseHudImage();
+            if (imgui_.Ready()) {
+                // Transport bar: bottom-center, aspect-preserving, floats toward viewer.
+                hud.enabled = true;
+                hud.width = 0.70f;
+                hud.height = hud.width * winAR / hudAR;
+                hud.x = 0.5f * (1.0f - hud.width);
+                hud.y = 1.0f - hud.height - 0.04f;
+                hud.disparity = kHudDisparity;
 
-            // Place top-left; fix the on-screen height fraction and derive the width
-            // from the HUD aspect so glyphs stay undistorted at any window size.
-            const float hudAR = (float)xr_.HudWidth() / (float)xr_.HudHeight();
-            const float winAR = (ch > 0) ? (float)cw / (float)ch : 1.0f;
-            hud.enabled = true;
-            hud.x = 0.012f;
-            hud.y = 0.018f;
-            hud.height = 0.125f;             // panel height as a fraction of window (4 lines)
-            hud.width = hud.height * hudAR / winAR;
-            hud.disparity = 0.0f;            // zero-disparity plane (screen depth)
+                uint32_t pw = 0, phh = 0;
+                window_.PointSize(pw, phh);
+                imgui_.BeginFrame((float)pw, (float)phh, hud.x, hud.y, hud.width, hud.height);
+                BuildTransportUI();
+                imgui_.RenderToHud(hudIdx);
+                if (dumpHudPath_ && !dumpedHud_ && rendered_ >= 100) {
+                    renderer_.DumpExternalImage(xr_.HudImages()[hudIdx], xr_.HudWidth(),
+                                                xr_.HudHeight(), dumpHudPath_);
+                    dumpedHud_ = true;
+                }
+            } else {
+                // CPU text-HUD fallback: top-left stats panel (pre-M4 behavior).
+                const uint32_t tileW = rects[0].w, tileH = rects[0].h;
+                char stereo[64];
+                std::snprintf(stereo, sizeof(stereo), "conv %+.3f  eyes %s%s", convergence_,
+                              swapEyes_ ? "swapped" : "normal",
+                              (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "");
+                char text[320];
+                if (isVideo_) {
+                    std::snprintf(text, sizeof(text),
+                                  "%.0f FPS   %s\nsrc %dx%d  %s  %s/%s\nwin %ux%u  tile %ux%u\n%s",
+                                  fps_, xr_.ActiveModeName(), mediaW_, mediaH_,
+                                  MediaSource::LayoutName(layout_), video_.CodecName(),
+                                  video_.BackendName(), cw, ch, tileW, tileH, stereo);
+                } else if (hasMedia_) {
+                    std::snprintf(text, sizeof(text),
+                                  "%.0f FPS   %s\nsrc %dx%d  %s\nwin %ux%u  tile %ux%u\n%s", fps_,
+                                  xr_.ActiveModeName(), mediaW_, mediaH_,
+                                  MediaSource::LayoutName(layout_), cw, ch, tileW, tileH, stereo);
+                } else {
+                    std::snprintf(text, sizeof(text),
+                                  "%.0f FPS   %s\nsrc RED|BLUE test\nwin %ux%u  tile %ux%u\n%s",
+                                  fps_, xr_.ActiveModeName(), cw, ch, tileW, tileH, stereo);
+                }
+                hud::RenderText(hudPixels_, (int)xr_.HudWidth(), (int)xr_.HudHeight(), text);
+                renderer_.UploadToSwapchainImage(xr_.HudImages()[hudIdx], hudPixels_.data(),
+                                                 xr_.HudWidth(), xr_.HudHeight());
+                hud.enabled = true;
+                hud.x = 0.012f;
+                hud.y = 0.018f;
+                hud.height = 0.125f;
+                hud.width = hud.height * hudAR / winAR;
+                hud.disparity = 0.0f;
+            }
+            xr_.ReleaseHudImage();
         }
     }
 
     xr_.EndFrame(frame, rects, &hud);
     ++frames_;
     UpdateFps();
+}
+
+void App::BuildTransportUI() {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(io.DisplaySize);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                                   ImGuiWindowFlags_NoBringToFrontOnFocus;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.06f, 0.08f, 0.70f));
+    if (ImGui::Begin("##transport", nullptr, flags)) {
+        // Row 1: transport + stereo toggles.
+        if (isVideo_) {
+            if (ImGui::Button(video_.Paused() ? "Play" : "Pause", ImVec2(120, 0)))
+                video_.TogglePaused();
+            ImGui::SameLine();
+        }
+        ImGui::Checkbox("Swap L/R", &swapEyes_);
+        ImGui::SameLine();
+        if (ImGui::Button("Fullscreen", ImVec2(140, 0))) window_.ToggleFullscreen();
+        ImGui::SameLine();
+        if (ImGui::Button("Reset conv", ImVec2(140, 0))) convergence_ = 0.0f;
+
+        // Row 2: convergence slider (full width).
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat("##conv", &convergence_, -kConvergenceMax, kConvergenceMax,
+                           "convergence  %+.3f");
+
+        // Row 3: format / stats.
+        if (isVideo_) {
+            ImGui::Text("%.0f FPS   %s   %dx%d %s   %s/%s", fps_, xr_.ActiveModeName(),
+                        mediaW_, mediaH_, MediaSource::LayoutName(layout_),
+                        video_.CodecName(), video_.BackendName());
+        } else if (hasMedia_) {
+            ImGui::Text("%.0f FPS   %s   %dx%d %s", fps_, xr_.ActiveModeName(), mediaW_,
+                        mediaH_, MediaSource::LayoutName(layout_));
+        } else {
+            ImGui::Text("%.0f FPS   %s   RED|BLUE test", fps_, xr_.ActiveModeName());
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+#endif
 }
 
 void App::UpdateFps() {
@@ -347,6 +424,7 @@ void App::UpdateFps() {
 
 void App::Shutdown() {
     video_.Stop();        // join the decode thread before tearing down the GPU
+    imgui_.Shutdown();    // before xr_ destroys the Vulkan device ImGui borrows
     renderer_.Shutdown();
     xr_.Shutdown();
     window_.Destroy();

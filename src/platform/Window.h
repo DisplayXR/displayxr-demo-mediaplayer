@@ -28,11 +28,21 @@ public:
 
     // NSView* (macOS) or HWND (Windows), to pass into the OpenXR window binding.
     void* NativeHandle() const { return nativeHandle_; }
+    // The SDL_Window itself (for the ImGui SDL3 backend).
+    SDL_Window* SdlWindow() const { return window_; }
 
     // Backing-store size in pixels (Retina-aware). This is the runtime's canvas.
     void PixelSize(uint32_t& width, uint32_t& height) const;
+    // Logical (point) size — the space SDL/ImGui mouse coordinates live in.
+    void PointSize(uint32_t& width, uint32_t& height) const;
 
     void SetTitle(const char* title);
+
+    // Forward every SDL event to a sink (the ImGui backend) before our own handling.
+    // The argument is an `SDL_Event*` (void to keep SDL out of this header).
+    void SetEventHook(std::function<void(void*)> hook);
+
+    void ToggleFullscreen();      // `F` key, and the ImGui button
 
     // Pump SDL events; returns false when the user asked to quit (close / Esc).
     bool PumpEvents();
@@ -55,8 +65,6 @@ public:
     void SetLiveResizeCallback(std::function<void()> cb);
 
 private:
-    void ToggleFullscreen();      // `F` — handled internally (Window owns the SDL_Window)
-
     SDL_Window* window_ = nullptr;
     void* metalView_ = nullptr;   // SDL_MetalView (macOS only); owned, destroyed on Destroy
     void* nativeHandle_ = nullptr;
@@ -68,6 +76,7 @@ private:
     bool togglePauseRequested_ = false;
     bool fullscreen_ = false;
     std::function<void()> liveResizeCb_;
+    std::function<void(void*)> eventHook_;
     bool eventWatchAdded_ = false;
 };
 

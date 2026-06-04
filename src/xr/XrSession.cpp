@@ -48,7 +48,7 @@ bool XrSession::Initialize(void* nativeWindowHandle) {
     EnumerateRenderingModes();   // needs the session; informs swapchain sizing
     if (!CreateLocalSpace()) return false;
     if (!CreateSwapchain()) return false;
-    CreateHudSwapchain(448, 96);  // sized to the 3-line stats text (window-space overlay)
+    CreateHudSwapchain(960, 200);  // window-space overlay: ImGui transport bar + stats
     LOG_INFO("OpenXR session ready (swapchain %ux%u fmt=%lld, active mode '%s': %u views %ux%u)",
              swapchain_.width, swapchain_.height, (long long)swapchain_.format,
              ActiveModeName(), ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());

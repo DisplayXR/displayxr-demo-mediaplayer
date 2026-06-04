@@ -756,6 +756,95 @@ bool VulkanRenderer::DumpImage(uint32_t imageIndex, const char* path) {
     return ok != 0;
 }
 
+bool VulkanRenderer::DumpExternalImage(VkImage image, uint32_t width, uint32_t height,
+                                       const char* path) {
+    if (image == VK_NULL_HANDLE || width == 0 || height == 0) return false;
+    const VkDeviceSize bytes = (VkDeviceSize)width * height * 4;
+
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkBufferCreateInfo bci = {};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(device_, &bci, nullptr, &buf) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements memReq;
+    vkGetBufferMemoryRequirements(device_, buf, &memReq);
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memProps);
+    uint32_t memType = UINT32_MAX;
+    const VkMemoryPropertyFlags want =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        if ((memReq.memoryTypeBits & (1u << i)) &&
+            (memProps.memoryTypes[i].propertyFlags & want) == want) { memType = i; break; }
+    }
+    if (memType == UINT32_MAX) { vkDestroyBuffer(device_, buf, nullptr); return false; }
+
+    VkMemoryAllocateInfo mai = {};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = memReq.size;
+    mai.memoryTypeIndex = memType;
+    if (vkAllocateMemory(device_, &mai, nullptr, &mem) != VK_SUCCESS) {
+        vkDestroyBuffer(device_, buf, nullptr);
+        return false;
+    }
+    vkBindBufferMemory(device_, buf, mem, 0);
+
+    vkResetCommandBuffer(commandBuffer_, 0);
+    VkCommandBufferBeginInfo cbi = {};
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(commandBuffer_, &cbi);
+
+    VkImageMemoryBarrier toSrc = {};
+    toSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSrc.image = image;
+    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+
+    VkBufferImageCopy region = {};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    vkCmdCopyImageToBuffer(commandBuffer_, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           buf, 1, &region);
+
+    VkImageMemoryBarrier toColor = toSrc;
+    toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toColor.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr,
+                         0, nullptr, 1, &toColor);
+    vkEndCommandBuffer(commandBuffer_);
+
+    vkResetFences(device_, 1, &fence_);
+    VkSubmitInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &commandBuffer_;
+    vkQueueSubmit(queue_, 1, &si, fence_);
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+
+    void* mapped = nullptr;
+    vkMapMemory(device_, mem, 0, bytes, 0, &mapped);  // HUD is R8G8B8A8 — no swizzle
+    const int ok = stbi_write_png(path, (int)width, (int)height, 4, mapped, (int)width * 4);
+    vkUnmapMemory(device_, mem);
+    vkFreeMemory(device_, mem, nullptr);
+    vkDestroyBuffer(device_, buf, nullptr);
+
+    if (ok) LOG_INFO("Wrote HUD dump -> %s (%ux%u)", path, width, height);
+    else LOG_ERROR("stbi_write_png failed for %s", path);
+    return ok != 0;
+}
+
 void VulkanRenderer::Shutdown() {
     if (device_ == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(device_);

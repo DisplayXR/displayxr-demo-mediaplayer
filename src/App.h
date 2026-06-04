@@ -9,6 +9,7 @@
 #include "media/VideoDecoder.h"
 #include "platform/Window.h"
 #include "rhi/VulkanRenderer.h"
+#include "ui/ImGuiLayer.h"
 #include "xr/XrSession.h"
 
 #include <chrono>
@@ -31,11 +32,13 @@ public:
 
 private:
     void UpdateFps();
+    void BuildTransportUI();   // ImGui transport bar (no-op without ImGui)
 
     Window window_;
     XrSession xr_;
     VulkanRenderer renderer_;
     VideoDecoder video_;
+    ImGuiLayer imgui_;
 
     bool hasMedia_ = false;       // an image or video was loaded (vs the test pattern)
     bool isVideo_ = false;
@@ -66,6 +69,8 @@ private:
     bool startModeRequested_ = false;
     const char* dumpPath_ = nullptr;
     bool dumped_ = false;
+    const char* dumpHudPath_ = nullptr;   // dump the rendered ImGui HUD image once
+    bool dumpedHud_ = false;
 };
 
 } // namespace mp

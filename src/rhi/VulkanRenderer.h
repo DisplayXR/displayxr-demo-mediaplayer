@@ -55,6 +55,11 @@ public:
     // exactly what the app submitted to the runtime. Returns false on failure.
     bool DumpImage(uint32_t imageIndex, const char* path);
 
+    // Debug: read back an arbitrary RGBA8 image (e.g. the HUD swapchain image, left
+    // in COLOR_ATTACHMENT_OPTIMAL) and write it to `path` as PNG. Proves what was
+    // rendered into an off-screen target. Returns false on failure.
+    bool DumpExternalImage(VkImage image, uint32_t width, uint32_t height, const char* path);
+
     // Record + submit a clear of the acquired swapchain image: each of the N views
     // gets its own color written into its `rects[v]` tile (the same rect submitted
     // to the runtime). Blocks until the GPU finishes (the runtime samples the image
