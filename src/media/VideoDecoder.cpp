@@ -199,6 +199,17 @@ void VideoDecoder::DecodeLoop() {
     double firstPtsSec = -1.0;
 
     while (!stop_.load()) {
+        // Pause: hold here without consuming packets, then advance the wall clock by
+        // the paused duration so pacing resumes from where it left off (no catch-up).
+        if (paused_.load()) {
+            const auto pauseBegin = clock::now();
+            while (paused_.load() && !stop_.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(8));
+            }
+            wallStart += clock::now() - pauseBegin;
+            continue;
+        }
+
         int r = av_read_frame(impl_->fmt, pkt);
         if (r < 0) {
             // EOF (or error) -> loop back to the start.

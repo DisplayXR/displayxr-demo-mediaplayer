@@ -42,16 +42,31 @@ public:
     // True once per SHIFT+TAB (toggle HUD). Clears the latch on read.
     bool TakeToggleHudRequest();
 
+    // --- M4 transport / stereo controls (keyboard; ImGui adds pointer UI later) ---
+    // Net convergence steps since last read: `]` = +1, `[` = -1 (key-repeat counts),
+    // reset to 0 on read. The caller scales each step into its parallax budget.
+    int TakeConvergenceSteps();
+    bool TakeResetConvergence();   // `\` — convergence back to 0
+    bool TakeSwapEyesRequest();    // `X` — toggle L/R eye assignment
+    bool TakeTogglePauseRequest(); // Space — play/pause
+
     // Called to render a frame *during* the macOS modal resize loop (which would
     // otherwise block our main loop), giving continuous live resize.
     void SetLiveResizeCallback(std::function<void()> cb);
 
 private:
+    void ToggleFullscreen();      // `F` — handled internally (Window owns the SDL_Window)
+
     SDL_Window* window_ = nullptr;
     void* metalView_ = nullptr;   // SDL_MetalView (macOS only); owned, destroyed on Destroy
     void* nativeHandle_ = nullptr;
     bool cycleModeRequested_ = false;
     bool toggleHudRequested_ = false;
+    int convergenceSteps_ = 0;
+    bool resetConvergenceRequested_ = false;
+    bool swapEyesRequested_ = false;
+    bool togglePauseRequested_ = false;
+    bool fullscreen_ = false;
     std::function<void()> liveResizeCb_;
     bool eventWatchAdded_ = false;
 };

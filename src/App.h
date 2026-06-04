@@ -41,6 +41,12 @@ private:
     bool isVideo_ = false;
     StereoLayout layout_ = StereoLayout::Mono;
     float contentAspect_ = 1.0f;  // per-eye display aspect (width/height), for letterboxing
+
+    // M4 stereo controls. convergence_ is horizontal image translation as a fraction
+    // of a view tile (each eye shifted oppositely → moves the zero-disparity plane);
+    // swapEyes_ flips which SBS half feeds each eye.
+    float convergence_ = 0.0f;
+    bool swapEyes_ = false;
     int mediaW_ = 0;              // full frame dims, for the HUD label
     int mediaH_ = 0;
     std::vector<uint8_t> hudPixels_;  // CPU-rasterized HUD buffer
