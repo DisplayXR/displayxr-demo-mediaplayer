@@ -1,0 +1,233 @@
+; DisplayXR Stereo Media Player Demo — Windows Installer
+; Copyright 2026, DisplayXR
+; SPDX-License-Identifier: BSL-1.0
+;
+; Build: makensis /DVERSION=1.2.0 /DBIN_DIR=<demo-build-dir> /DSOURCE_DIR=<demo-repo-root> /DOUTPUT_DIR=<output-dir> DisplayXRMediaPlayerInstaller.nsi
+;
+; Hard-prereqs the DisplayXR runtime (HKLM\Software\DisplayXR\Runtime\InstallPath).
+; Installs the demo exe + its runtime DLLs (SDL3 + FFmpeg) + a bundled sample
+; stereo image to Program Files\DisplayXR\Demos\MediaPlayer\. Drops a
+; registered-mode app manifest under %ProgramData%\DisplayXR\apps\ so the
+; DisplayXR Shell launcher discovers the tile (system-wide; installer is elevated).
+;
+; The OpenXR loader is statically linked into the exe (the CMake build fetches +
+; builds the Khronos loader from source), so — unlike the model/gauss demos —
+; there is no openxr_loader.dll to ship next to the exe.
+
+!ifndef VERSION
+    !define VERSION "0.0.0"
+!endif
+!ifndef VERSION_MAJOR
+    !define VERSION_MAJOR "0"
+!endif
+!ifndef VERSION_MINOR
+    !define VERSION_MINOR "0"
+!endif
+!ifndef VERSION_PATCH
+    !define VERSION_PATCH "0"
+!endif
+
+!ifndef BIN_DIR
+    !define BIN_DIR "${__FILEDIR__}\..\build\Release"
+!endif
+!ifndef SOURCE_DIR
+    !define SOURCE_DIR "${__FILEDIR__}\.."
+!endif
+!ifndef OUTPUT_DIR
+    !define OUTPUT_DIR "${__FILEDIR__}"
+!endif
+
+;--------------------------------
+; General
+
+Name "DisplayXR Stereo Media Player ${VERSION}"
+OutFile "${OUTPUT_DIR}\DisplayXRMediaPlayerSetup-${VERSION}.exe"
+InstallDir "$PROGRAMFILES64\DisplayXR\Demos\MediaPlayer"
+InstallDirRegKey HKLM "Software\DisplayXR\Demos\MediaPlayer" "InstallPath"
+RequestExecutionLevel admin
+ShowInstDetails show
+ShowUninstDetails show
+
+!include "MUI2.nsh"
+!include "FileFunc.nsh"
+!include "x64.nsh"
+!include "LogicLib.nsh"
+!include "WordFunc.nsh"
+
+;--------------------------------
+; UI
+
+!define MUI_ABORTWARNING
+!define MUI_WELCOMEPAGE_TITLE "DisplayXR Stereo Media Player Setup"
+!define MUI_WELCOMEPAGE_TEXT "This will install the Stereo Media Player reference demo for the DisplayXR runtime.$\r$\n$\r$\nThe DisplayXR runtime must be installed first."
+
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+
+!insertmacro MUI_LANGUAGE "English"
+
+;--------------------------------
+; Pre-flight: hard-prereq the runtime
+
+Function .onInit
+    ${IfNot} ${RunningX64}
+        MessageBox MB_ICONSTOP "DisplayXR requires 64-bit Windows."
+        Abort
+    ${EndIf}
+
+    ; HKLM\Software\DisplayXR\Runtime\InstallPath is set by the runtime
+    ; installer. NSIS is a 32-bit executable so HKLM access is silently
+    ; redirected through WOW6432Node by default; the runtime writes to the
+    ; 64-bit view, so switch views to match.
+    SetRegView 64
+    ReadRegStr $0 HKLM "Software\DisplayXR\Runtime" "InstallPath"
+    SetRegView 32
+    ${If} $0 == ""
+        MessageBox MB_ICONSTOP "DisplayXR runtime is not installed.$\r$\n$\r$\nInstall the DisplayXR runtime first, then re-run this installer.$\r$\n$\r$\nGet it from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
+        Abort
+    ${EndIf}
+    ; Presence is the only hard gate. A minimum-version covenant can be added
+    ; here (VersionCompare against HKLM ...\Runtime "Version") once a verified
+    ; floor is established — see README "Runtime compatibility".
+FunctionEnd
+
+;--------------------------------
+; Install
+
+Section "Stereo Media Player Demo" SecDemo
+    SectionIn RO
+
+    SetRegView 64
+    SetShellVarContext all
+
+    ; Kill any running instance so we can overwrite the exe + DLLs.
+    nsExec::ExecToLog 'taskkill /f /im mediaplayer_handle_vk_win.exe'
+    Pop $0
+
+    SetOutPath "$INSTDIR"
+    File "${BIN_DIR}\mediaplayer_handle_vk_win.exe"
+    ; Runtime DLLs the CMake build stages next to the exe: SDL3 + the FFmpeg
+    ; shared libs (libav*/libsw*). Wildcards keep us version-agnostic as the
+    ; FFmpeg soname bumps (e.g. avcodec-62.dll).
+    File "${BIN_DIR}\SDL3.dll"
+    File "${BIN_DIR}\avcodec-*.dll"
+    File "${BIN_DIR}\avformat-*.dll"
+    File "${BIN_DIR}\avutil-*.dll"
+    File "${BIN_DIR}\swscale-*.dll"
+    File "${BIN_DIR}\swresample-*.dll"
+
+    ; Bundled sample stereo image (auto-loaded by the Start Menu shortcut).
+    File "${SOURCE_DIR}\assets\test_LR_2x1.png"
+
+    ; Registered-mode app manifest under %ProgramData%\DisplayXR\apps\ so the
+    ; shell launcher discovers the tile on workspace activate (manifest spec §2.2).
+    CreateDirectory "$APPDATA\DisplayXR\apps"
+    FileOpen $0 "$APPDATA\DisplayXR\apps\mediaplayer.displayxr.json" w
+    FileWrite $0 '{$\r$\n'
+    FileWrite $0 '  "schema_version": 1,$\r$\n'
+    FileWrite $0 '  "name": "Stereo Media Player",$\r$\n'
+    FileWrite $0 '  "type": "3d",$\r$\n'
+    FileWrite $0 '  "category": "demo",$\r$\n'
+    FileWrite $0 '  "display_mode": "auto",$\r$\n'
+    FileWrite $0 '  "description": "Plays side-by-side stereo images (JPG/PNG) and video (H.264/H.265/AV1) on a 3D display. Pass a file to play, or launch for a test pattern.",$\r$\n'
+    ; Forward slashes so the JSON parses with any strict library.
+    ${WordReplace} "$INSTDIR" "\" "/" "+" $1
+    FileWrite $0 '  "exe_path": "$1/mediaplayer_handle_vk_win.exe"$\r$\n'
+    FileWrite $0 '}$\r$\n'
+    FileClose $0
+
+    ; Registry breadcrumbs.
+    SetRegView 64
+    WriteRegStr HKLM "Software\DisplayXR\Demos\MediaPlayer" "InstallPath" "$INSTDIR"
+    WriteRegStr HKLM "Software\DisplayXR\Demos\MediaPlayer" "Version" "${VERSION}"
+
+    ; Add/Remove Programs entry.
+    WriteUninstaller "$INSTDIR\Uninstall.exe"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "DisplayName" "DisplayXR Stereo Media Player Demo"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "QuietUninstallString" "$\"$INSTDIR\Uninstall.exe$\" /S"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "InstallLocation" "$INSTDIR"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "DisplayIcon" "$INSTDIR\mediaplayer_handle_vk_win.exe"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "Publisher" "DisplayXR"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "DisplayVersion" "${VERSION}"
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "VersionMajor" ${VERSION_MAJOR}
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "VersionMinor" ${VERSION_MINOR}
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "NoModify" 1
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "NoRepair" 1
+    ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+    IntFmt $0 "0x%08X" $0
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer" \
+        "EstimatedSize" "$0"
+SectionEnd
+
+Section "Start Menu Shortcut" SecShortcut
+    SetShellVarContext all
+    CreateDirectory "$SMPROGRAMS\DisplayXR"
+    ; Launch with the bundled sample so the tile shows stereo content out of the
+    ; box (with no argument the app shows a RED|BLUE test pattern).
+    CreateShortCut "$SMPROGRAMS\DisplayXR\Stereo Media Player.lnk" \
+        "$INSTDIR\mediaplayer_handle_vk_win.exe" '"$INSTDIR\test_LR_2x1.png"' \
+        "$INSTDIR\mediaplayer_handle_vk_win.exe" 0
+SectionEnd
+
+;--------------------------------
+; Uninstall
+
+Section "Uninstall"
+    SetRegView 64
+    SetShellVarContext all
+
+    nsExec::ExecToLog 'taskkill /f /im mediaplayer_handle_vk_win.exe'
+    Pop $0
+
+    ; The DisplayXR Shell scans %ProgramData%\DisplayXR\apps\ and may hold an
+    ; open handle to the manifest; kill it so the Delete below can't silently
+    ; fail (mirrors the model/gauss demos). /REBOOTOK as belt-and-suspenders.
+    nsExec::ExecToLog 'taskkill /f /im displayxr-shell.exe'
+    Pop $0
+    Sleep 500
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\mediaplayer.displayxr.json"
+    RMDir "$APPDATA\DisplayXR\apps"
+
+    ; Remove install dir contents.
+    Delete "$INSTDIR\mediaplayer_handle_vk_win.exe"
+    Delete "$INSTDIR\*.dll"
+    Delete "$INSTDIR\test_LR_2x1.png"
+    Delete "$INSTDIR\Uninstall.exe"
+    RMDir "$INSTDIR"
+    RMDir "$PROGRAMFILES64\DisplayXR\Demos"
+
+    Delete "$SMPROGRAMS\DisplayXR\Stereo Media Player.lnk"
+    ; Don't RMDir $SMPROGRAMS\DisplayXR — the runtime's own shortcuts may live there.
+
+    DeleteRegKey HKLM "Software\DisplayXR\Demos\MediaPlayer"
+    DeleteRegKey /ifempty HKLM "Software\DisplayXR\Demos"
+    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayer"
+SectionEnd
+
+;--------------------------------
+; Version metadata
+
+VIProductVersion "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}.0"
+VIAddVersionKey "ProductName" "DisplayXR Stereo Media Player Demo"
+VIAddVersionKey "CompanyName" "DisplayXR"
+VIAddVersionKey "LegalCopyright" "Copyright (c) 2026 DisplayXR"
+VIAddVersionKey "FileDescription" "DisplayXR Stereo Media Player Demo Installer"
+VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "ProductVersion" "${VERSION}"

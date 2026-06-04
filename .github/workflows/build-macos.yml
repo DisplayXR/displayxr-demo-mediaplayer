@@ -1,43 +1,102 @@
 name: Build macOS
 
-# Build-validation CI for the macOS media player: compiles the app on every PR
-# and push to main. Mirrors the sibling demos' build-macos.yml dependency setup
-# (Homebrew vulkan-headers + vulkan-loader + molten-vk, VULKAN_SDK=brew prefix)
-# but stops at the app build — installer + release-on-tag packaging is deferred
-# until this demo's distribution is wired (see README "Distribution").
+# Builds the macOS media player + .pkg installer. PR + push-to-main runs are
+# validation only (build app + .pkg, assert the bundle payload). On a v* tag push
+# the .pkg is attached to the GitHub Release. Mirrors the sibling demos'
+# build-macos.yml. (versions.json is bumped by the Windows workflow only.)
 
 on:
   pull_request: {}
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   workflow_dispatch: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   Build:
     runs-on: macos-14
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        # No openxr-loader formula exists in Homebrew core — CMake fetches and
-        # builds the Khronos loader from source (FetchContent). FFmpeg arrives via
-        # Homebrew (pkg-config); vulkan-loader + molten-vk supply the Vulkan ICD.
+        # OpenXR loader is built from source by scripts/build_macos.sh (no brew
+        # formula). FFmpeg via Homebrew (pkg-config). dylibbundler gathers the
+        # app's FFmpeg/Vulkan/OpenXR dylib closure into the .app.
         run: |
-          brew install cmake ninja ffmpeg pkg-config vulkan-headers vulkan-loader molten-vk
+          brew install cmake ninja ffmpeg pkg-config vulkan-headers vulkan-loader molten-vk dylibbundler
           echo "VULKAN_SDK=$(brew --prefix)" >> "$GITHUB_ENV"
 
-      - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
-
-      - name: Build
-        run: cmake --build build
-
-      - name: Sanity-check artifact
+      - name: Derive installer version
+        id: version
         run: |
-          test -x build/mediaplayer_handle_vk_macos || {
-            echo "::error::mediaplayer_handle_vk_macos not produced"; exit 1; }
-          echo "PASS: built mediaplayer_handle_vk_macos."
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="0.0.0-dev.${GITHUB_SHA::8}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION"
+
+      - name: Build demo + installer
+        env:
+          DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build_macos.sh --installer
+
+      - name: Assert .pkg payload (regression guard)
+        run: |
+          set -euo pipefail
+          PKG=$(find _package -maxdepth 1 -name "DisplayXRMediaPlayer-*.pkg" -type f | head -1)
+          if [ -z "$PKG" ] || [ ! -f "$PKG" ]; then
+            echo "::error::DisplayXRMediaPlayer-*.pkg missing from _package/"; ls -la _package/ || true; exit 1
+          fi
+          echo "Found installer: $PKG"
+          EXPAND_DIR=$(mktemp -d)
+          pkgutil --expand "$PKG" "$EXPAND_DIR/expand"
+          PAYLOAD="$EXPAND_DIR/expand/mediaplayer.pkg/Payload"
+          if [ ! -f "$PAYLOAD" ]; then
+            echo "::error::mediaplayer.pkg/Payload not found inside .pkg"; ls -la "$EXPAND_DIR/expand/" || true; exit 1
+          fi
+          gunzip -c "$PAYLOAD" | cpio -i -t > "$EXPAND_DIR/files" 2>/dev/null
+
+          MISSING=0
+          assert_present() {
+            if ! grep -q "$1" "$EXPAND_DIR/files"; then
+              echo "::error::$2 missing from .pkg payload (pattern: $1)"; MISSING=1
+            fi
+          }
+          APP='Applications/Stereo Media Player\.app/Contents'
+          assert_present "$APP/MacOS/Stereo Media Player" "launcher"
+          assert_present "$APP/Resources/mediaplayer_handle_vk_macos" "demo binary"
+          assert_present "$APP/Resources/lib/libMoltenVK" "MoltenVK"
+          assert_present "$APP/Resources/lib/libvulkan" "Vulkan loader"
+          assert_present "$APP/Resources/lib/libopenxr_loader" "OpenXR loader"
+          assert_present "$APP/Resources/lib/libavcodec" "FFmpeg avcodec"
+          assert_present "$APP/Resources/lib/libavformat" "FFmpeg avformat"
+          if [ "$MISSING" -ne 0 ]; then echo "Payload listing:"; cat "$EXPAND_DIR/files"; exit 1; fi
+          echo "PASS: .pkg payload contains app + MoltenVK/Vulkan/OpenXR + FFmpeg dylibs."
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: DisplayXRMediaPlayer-macOS
+          if-no-files-found: error
+          path: _package/DisplayXRMediaPlayer-*.pkg
+
+      - name: Attach .pkg to GitHub release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: _package/DisplayXRMediaPlayer-*.pkg
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false

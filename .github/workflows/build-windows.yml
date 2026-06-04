@@ -1,72 +1,144 @@
 name: Build Windows
 
-# Build-validation CI for the Windows media player: compiles the app on every PR
-# and push to main to catch breakage early. Mirrors the sibling demos'
-# build-windows.yml dependency setup (same Vulkan SDK action + version, msvc-dev-cmd)
-# but stops at the app build — installer + release-on-tag packaging is deferred until
-# this demo's distribution is wired (see README "Distribution").
+# Builds the Windows media player + NSIS installer. PR + push-to-main runs are
+# validation only (compile app + installer, assert the payload). On a v* tag push
+# the installer is attached to the GitHub Release and the runtime's versions.json
+# is bumped. Mirrors the sibling demos' build-windows.yml.
 
 on:
   pull_request: {}
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   workflow_dispatch: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# contents: write lets softprops/action-gh-release create/update the Release on tags.
+permissions:
+  contents: write
+
 jobs:
   Build:
     runs-on: windows-2022
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Vulkan SDK
-        # Same action + version the runtime, Leia plug-in, and sibling demos pin.
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: 1.3.283.0
           cache: true
 
-      # Puts cl/link on PATH so the Ninja generator finds the MSVC toolchain.
       - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Fetch FFmpeg dev libraries
         shell: pwsh
         run: |
-          # No pkg-config on the MSVC toolchain; grab a prebuilt LGPL shared dev tree
-          # (headers + import libs + DLLs) and point CMake at it via FFMPEG_ROOT,
-          # exactly as the local Windows build does.
           $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip"
           Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_dl -Force
           $root = (Get-ChildItem ffmpeg_dl -Directory | Select-Object -First 1).FullName
           "FFMPEG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "FFMPEG_ROOT=$root"
 
-      - name: Configure
-        shell: pwsh
-        # OpenXR loader + SDL3 are fetched from source by CMake (FetchContent).
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DFFMPEG_ROOT="$env:FFMPEG_ROOT"
-
-      - name: Build
-        shell: pwsh
-        run: cmake --build build
-
-      - name: Sanity-check artifacts
+      - name: Configure + build
         shell: pwsh
         run: |
-          # Ninja (single-config) drops the exe in build/. The exe plus its staged
-          # runtime DLLs must all be present — this also exercises the POST_BUILD
-          # DLL staging (FFmpeg shared libs + SDL3) the CMake build performs.
-          $bindir = "build"
-          if (-not (Test-Path "$bindir/mediaplayer_handle_vk_win.exe")) {
-            Write-Host "::error::mediaplayer_handle_vk_win.exe not produced"; exit 1
-          }
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DFFMPEG_ROOT="$env:FFMPEG_ROOT"
+          cmake --build build
+
+      - name: Sanity-check app artifacts
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "build/mediaplayer_handle_vk_win.exe")) {
+            Write-Host "::error::mediaplayer_handle_vk_win.exe not produced"; exit 1 }
           foreach ($pat in @("avcodec-*.dll","avformat-*.dll","avutil-*.dll","swscale-*.dll","SDL3.dll")) {
-            if (-not (Get-ChildItem $bindir -Filter $pat -ErrorAction SilentlyContinue)) {
-              Write-Host "::error::missing staged runtime DLL: $pat"; exit 1
-            }
-          }
+            if (-not (Get-ChildItem build -Filter $pat -ErrorAction SilentlyContinue)) {
+              Write-Host "::error::missing staged runtime DLL: $pat"; exit 1 } }
           Write-Host "PASS: exe + staged runtime DLLs present."
+
+      - name: Derive installer version
+        id: version
+        shell: pwsh
+        run: |
+          # v1.2.3 -> 1.2.3 for the installer filename + VIProductVersion. Untagged
+          # builds use 0.0.0 (valid version; never published).
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF -replace '^refs/tags/v',''
+          } else { $version = "0.0.0" }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "VERSION=$version"
+
+      - name: Build installer
+        shell: cmd
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: call installer\build-installer.bat
+
+      - name: Assert installer payload (regression guard)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem installer\DisplayXRMediaPlayerSetup-*.exe | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::installer .exe not produced"; exit 1 }
+          Write-Host "Installer: $($exe.FullName)"
+          # 7-Zip (preinstalled on the runner) lists the NSIS payload.
+          $listing = & 7z l "$($exe.FullName)" 2>&1 | Out-String
+          # Vendor-neutral: must never bundle a SimulatedReality* DLL (that's the
+          # Leia plug-in's concern). Mirrors the sibling demos' guard.
+          if ($listing -match 'SimulatedReality') {
+            Write-Host "::error::installer bundles a SimulatedReality* DLL — vendor-neutral demos must not."; exit 1 }
+          foreach ($need in @("mediaplayer_handle_vk_win.exe","SDL3.dll","avcodec","avformat","avutil","swscale","swresample")) {
+            if ($listing -notmatch [regex]::Escape($need)) {
+              Write-Host "::error::installer payload missing $need"; exit 1 } }
+          Write-Host "PASS: installer payload OK (app + SDL3 + FFmpeg, no vendor SR DLL)."
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: DisplayXRMediaPlayer-Windows
+          if-no-files-found: error
+          path: installer/DisplayXRMediaPlayerSetup-*.exe
+
+      - name: Attach installer to GitHub release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/DisplayXRMediaPlayerSetup-*.exe
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+
+  # On v* tag push, after Build succeeds, ask displayxr-runtime to bump
+  # versions.json[mediaplayer_demo] to this tag. Only the Windows workflow
+  # dispatches (the macOS one racing the same tag would just no-op).
+  DispatchVersionsBump:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'DisplayXR/displayxr-demo-mediaplayer' }}
+    needs: [Build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: displayxr-runtime
+
+      - name: Dispatch versions.json bump
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.dispatch-token.outputs.token }}
+          repository: DisplayXR/displayxr-runtime
+          event-type: versions-bump
+          client-payload: |
+            {
+              "field":       "mediaplayer_demo",
+              "tag":         "${{ github.ref_name }}",
+              "source_repo": "${{ github.repository }}"
+            }
