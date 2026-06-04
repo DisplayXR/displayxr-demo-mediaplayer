@@ -1,0 +1,43 @@
+name: Build macOS
+
+# Build-validation CI for the macOS media player: compiles the app on every PR
+# and push to main. Mirrors the sibling demos' build-macos.yml dependency setup
+# (Homebrew vulkan-headers + vulkan-loader + molten-vk, VULKAN_SDK=brew prefix)
+# but stops at the app build — installer + release-on-tag packaging is deferred
+# until this demo's distribution is wired (see README "Distribution").
+
+on:
+  pull_request: {}
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # No openxr-loader formula exists in Homebrew core — CMake fetches and
+        # builds the Khronos loader from source (FetchContent). FFmpeg arrives via
+        # Homebrew (pkg-config); vulkan-loader + molten-vk supply the Vulkan ICD.
+        run: |
+          brew install cmake ninja ffmpeg pkg-config vulkan-headers vulkan-loader molten-vk
+          echo "VULKAN_SDK=$(brew --prefix)" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Sanity-check artifact
+        run: |
+          test -x build/mediaplayer_handle_vk_macos || {
+            echo "::error::mediaplayer_handle_vk_macos not produced"; exit 1; }
+          echo "PASS: built mediaplayer_handle_vk_macos."
