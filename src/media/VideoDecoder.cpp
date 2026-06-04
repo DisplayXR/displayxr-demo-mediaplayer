@@ -21,6 +21,15 @@ namespace mp {
 
 #if defined(MEDIAPLAYER_WITH_FFMPEG)
 
+// Passed via AVCodecContext::opaque to the get_format hook. Carries the wanted GPU
+// surface format plus write-backs so the hook can record a software fallback for the
+// HUD/logs. Defined before Impl so Impl can embed one.
+struct HwFormatHook {
+    enum AVPixelFormat want = AV_PIX_FMT_NONE;  // the decoder's GPU surface format
+    bool* hardware = nullptr;                   // cleared if we fall back to software
+    const char** backendName = nullptr;         // retargeted to "software …" on fallback
+};
+
 struct VideoDecoder::Impl {
     AVFormatContext* fmt = nullptr;
     AVCodecContext* codec = nullptr;
@@ -28,6 +37,7 @@ struct VideoDecoder::Impl {
     AVBufferRef* hwDevice = nullptr;            // hwaccel device (null = software decode)
     AVFrame* swFrame = nullptr;                 // download target for hardware frames
     enum AVPixelFormat hwPixFmt = AV_PIX_FMT_NONE;  // the decoder's GPU surface format
+    HwFormatHook hook;                          // ctx->opaque for the get_format callback
     int videoStream = -1;
     int swsW = 0, swsH = 0, swsFmt = -1;        // cached sws source params
 
@@ -63,12 +73,20 @@ const AVHWDeviceType* PreferredHwTypes(size_t& count) {
 // frames stay on the device until we explicitly download them. opaque points at the
 // Impl's hwPixFmt (set before avcodec_open2), keeping this free of the private type.
 enum AVPixelFormat PickHwFormat(AVCodecContext* ctx, const enum AVPixelFormat* fmts) {
-    const enum AVPixelFormat want = *static_cast<const enum AVPixelFormat*>(ctx->opaque);
+    auto* hook = static_cast<HwFormatHook*>(ctx->opaque);
     for (const enum AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; ++p) {
-        if (*p == want) return *p;
+        if (*p == hook->want) return *p;
     }
-    LOG_WARN("VideoDecoder: decoder did not offer the hw surface format; software path");
-    return AV_PIX_FMT_NONE;
+    // The GPU surface format isn't on offer — the runtime hwaccel failed to initialise
+    // for this stream (commonly: H.264 wider than the GPU's 4096px DXVA decode limit,
+    // as with 5120-wide SBS clips). Returning AV_PIX_FMT_NONE would *abort* the decoder
+    // (black video); instead fall back to software so playback continues. frame->format
+    // then won't match hwPixFmt, so DecodeLoop skips the download and swscale runs on the
+    // CPU frame directly. The flag writes race a HUD read but are word-sized + write-once.
+    LOG_WARN("VideoDecoder: hw surface unavailable for this stream — decoding in software");
+    if (hook->hardware) *hook->hardware = false;
+    if (hook->backendName) *hook->backendName = "software (hw unsupported)";
+    return avcodec_default_get_format(ctx, fmts);
 }
 
 // Find the decoder's GPU pixel format for `type`, if this build/codec supports it.
@@ -114,8 +132,9 @@ bool VideoDecoder::TryEnableHwAccel(const void* decoder) {
 
         impl_->hwDevice = dev;
         impl_->hwPixFmt = pf;
+        impl_->hook = {pf, &hardware_, &hwName_};  // read/written by PickHwFormat
         impl_->codec->hw_device_ctx = av_buffer_ref(dev);
-        impl_->codec->opaque = &impl_->hwPixFmt;  // read by PickHwFormat
+        impl_->codec->opaque = &impl_->hook;
         impl_->codec->get_format = PickHwFormat;
         hwName_ = av_hwdevice_get_type_name(type);
         hardware_ = true;

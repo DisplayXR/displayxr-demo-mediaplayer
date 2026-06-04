@@ -25,6 +25,9 @@ third_party/**/build/
 # vcpkg
 vcpkg_installed/
 
+# Prebuilt FFmpeg dev tree (Windows; downloaded locally, see README build section)
+third_party/ffmpeg-win64/
+
 # Editor / OS
 .vscode/
 .idea/
