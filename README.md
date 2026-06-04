@@ -15,14 +15,22 @@ vendor SR SDK, no weaving, no CUDA dependency.
 
 ## Status
 
-✅ **M2 complete** — stereo video playback (+ M1 stereo images). FFmpeg software-decodes
-a side-by-side video on a background thread, hands frames through a triple-buffered
-`FrameRing` to the render loop (decode rate decoupled from display rate), and samples
-the correct half into each display view with aspect-correct **letterboxing**. Stereo
-images (JPG/PNG via stb_image) work the same way. Builds on M0 (SDL3 window → OpenXR
-stereo session → runtime weave) and M1 (SBS routing). Verified on macOS (Apple Silicon,
-MoltenVK) against a local `displayxr-runtime` dev build; Windows scaffolded but unverified.
-Next: M3 (per-OS hardware decode).
+✅ **M0–M6 complete — v1.0.0.** The full milestone arc is in: SDL3 window → OpenXR stereo
+session → runtime weave (M0); SBS L/R routing (M1); FFmpeg video decode through a
+triple-buffered `FrameRing` with aspect-correct letterboxing (M2); per-OS hardware decode
+(VideoToolbox / D3D11VA+NVDEC / VAAPI) with software fallback (M3); a subtle-3D Dear ImGui
+transport bar with per-eye parallax, convergence/L-R-swap controls, fullscreen, open-file,
+and low-latency frame-exact scrubbing (M4); the macOS Vulkan path (M5); and Windows + macOS
+installers with CI release-on-tag (M6).
+
+Stereo images (JPG/PNG via stb_image) and SBS video (`*_2x1` / `*_half_2x1`) share the same
+decode → atlas → submit path; the runtime + display processor do all weaving.
+
+**Verified on macOS (Apple Silicon, MoltenVK)** against a local `displayxr-runtime` dev
+build — correct per-eye L/R routing in 2-view (Squeezed SBS) and 4-view (Quad) modes, HUD
+compositing, 114 FPS on M1 Pro. See [`docs/M5-NOTES.md`](docs/M5-NOTES.md). Windows builds
+in CI; the macOS Vulkan path uses `VK_KHR_portability_enumeration` + `VK_KHR_portability_subset`
+over an `XR_EXT_cocoa_window_binding` NSView.
 
 Also in: live (continuous) window resize, an FPS counter in the title bar, and a
 window-space stats **HUD** (toggle with **SHIFT+TAB**) showing fps / mode / source /
@@ -78,10 +86,17 @@ Set `MEDIAPLAYER_LOG_DEBUG=1` for verbose logs.
 ## Runtime compatibility
 
 <!-- Covenant: which displayxr-runtime versions this demo is verified against.
-     Fill in on first release per docs/roadmap/demo-distribution.md. -->
+     Updated on each release per docs/roadmap/demo-distribution.md. -->
 | Media player | Verified against runtime |
 |---|---|
-| (unreleased) | — |
+| v1.0.0 | v1.10.2 |
+
+v1.0.0 is verified against the DisplayXR runtime **v1.10.2** release line (the
+current `versions.json[runtime]` pin). Coupling is **extension-wire-protocol only** —
+the demo needs the runtime's window-binding + stereo-session extensions
+(`XR_EXT_win32_window_binding` / `XR_EXT_cocoa_window_binding`, `XR_EXT_display_info`),
+so any runtime exposing that protocol should work, but v1.10.2 is the combination this
+release was validated against.
 
 ## License
 
