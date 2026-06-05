@@ -131,6 +131,17 @@ FetchContent_Declare(imgui
     GIT_TAG v1.91.5
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(imgui)
+
+# --- nlohmann/json (header-only) for parsing the LIF container's JSON metadata.
+#     Lightweight (no link step), so LIF support is on the default path — unlike the
+#     heavier libheif behind MEDIAPLAYER_WITH_HEIF.
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE
+    FIND_PACKAGE_ARGS NAMES nlohmann_json)
+FetchContent_MakeAvailable(nlohmann_json)
 set(MP_IMGUI_DIR "${imgui_SOURCE_DIR}")
 set(MP_IMGUI_SOURCES
     ${MP_IMGUI_DIR}/imgui.cpp
@@ -151,6 +162,7 @@ add_executable(${MP_TARGET}
     src/xr/XrSession.cpp
     src/rhi/VulkanRenderer.cpp
     src/media/ImageDecoder.cpp
+    src/media/LifLoader.cpp
     src/media/MediaSource.cpp
     src/media/VideoDecoder.cpp
     src/media/AudioPlayer.cpp
@@ -190,6 +202,7 @@ target_include_directories(${MP_TARGET} BEFORE PRIVATE
 target_link_libraries(${MP_TARGET} PRIVATE
     SDL3::SDL3
     Vulkan::Vulkan
+    nlohmann_json::nlohmann_json
     ${MP_OPENXR_LOADER}
 )
 
@@ -230,3 +243,24 @@ add_custom_command(TARGET ${MP_TARGET} POST_BUILD
     COMMENT "Staging displayxr/ sidecar (manifest + logos) next to ${MP_TARGET}")
 
 message(STATUS "Configured target: ${MP_TARGET}")
+
+# ---------------------------------------------------------------------------
+# Tests (opt-in: -DMP_BUILD_TESTS=ON). LifLoader container round-trip — builds
+# synthetic stereo/mono/corrupt LIFs in memory and asserts the parse + SBS compose.
+# Header-only deps (stb, nlohmann/json) + Log/ImageDecoder; no Vulkan/SDL/OpenXR.
+# ---------------------------------------------------------------------------
+option(MP_BUILD_TESTS "Build unit tests" OFF)
+if(MP_BUILD_TESTS)
+    enable_testing()
+    add_executable(lif_roundtrip_test
+        tests/lif_roundtrip_test.cpp
+        src/media/LifLoader.cpp
+        src/media/ImageDecoder.cpp
+        src/Log.cpp)
+    target_include_directories(lif_roundtrip_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_link_libraries(lif_roundtrip_test PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME lif_roundtrip COMMAND lif_roundtrip_test)
+    message(STATUS "Tests enabled: lif_roundtrip_test")
+endif()

@@ -24,6 +24,11 @@ class ImageDecoder {
 public:
     // Load a JPG/PNG file as RGBA8. Returns an invalid image on failure (logged).
     static DecodedImage Load(const std::string& path);
+
+    // Decode an in-memory JPG/PNG buffer as RGBA8 (e.g. a JPEG blob embedded in a
+    // LIF container). `tag` is only used for log messages. Invalid image on failure.
+    static DecodedImage LoadFromMemory(const uint8_t* data, size_t len,
+                                       const char* tag = "<memory>");
 };
 
 } // namespace mp
