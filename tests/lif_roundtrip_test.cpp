@@ -170,6 +170,31 @@ void TestOrderingByPosition() {
     }
 }
 
+// Classic Leia LIF schema (as shipped in real .jpg files): RGB keyed by top-level
+// "albedoId" (-1 = base), position by "xLocation", JSON in the legacy type-7 field.
+// Must compose just like the modern schema: base(red) at xLocation 0 → left.
+void TestClassicLeiaSchema() {
+    std::printf("[classic Leia schema: albedoId/xLocation, type-7 JSON]\n");
+    const auto red = MakeSolidJpeg(kW, kH, 220, 30, 30);    // base = left
+    const auto blue = MakeSolidJpeg(kW, kH, 30, 30, 220);   // embedded = right
+    const std::string json =
+        R"({"isCAI":false,"viewMode":"LIGHTFIELD","views":[)"
+        R"({"albedoId":-1,"disparityId":0,"xLocation":0.0,"yLocation":0.0},)"
+        R"({"albedoId":1000001,"disparityId":0,"xLocation":1.0,"yLocation":0.0}]})";
+    // JSON in the legacy type-7 field; right view blob under type 1000001.
+    const auto lif = BuildLif(red, {{7, JsonBytes(json)}, {1000001, blue}});
+    const LifResult r = LoadFromBytes(lif, "mp_lif_classic.lif");
+
+    CHECK(r.ok, "classic: ok");
+    CHECK(r.stereo, "classic: stereo");
+    CHECK(r.layout == StereoLayout::SbsFull, "classic: SbsFull layout");
+    CHECK(r.image.width == kW * 2 && r.image.height == kH, "classic: 2W×H");
+    if (r.image.Valid() && r.image.width == kW * 2) {
+        CHECK(Reddish(PixelAt(r.image, kW / 2, kH / 2)), "classic: red on left");
+        CHECK(Bluish(PixelAt(r.image, kW + kW / 2, kH / 2)), "classic: blue on right");
+    }
+}
+
 // One-view LIF: not stereo → decode the base JPEG as flat 2D (Mono), W×H.
 void TestMonoFallbackOneView() {
     std::printf("[mono fallback: single view]\n");
@@ -216,6 +241,7 @@ int main() {
     std::printf("LifLoader synthetic round-trip test\n");
     TestStereoComposed();
     TestOrderingByPosition();
+    TestClassicLeiaSchema();
     TestMonoFallbackOneView();
     TestNonLifFallback();
     TestTruncatedRegion();

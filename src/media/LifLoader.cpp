@@ -100,7 +100,8 @@ struct ViewRef {
 };
 
 float ViewPosX(const json& view) {
-    // position[0], or legacy camera_data.position[0]; default 0.
+    // Camera x, used only to order left/right. Modern 5.x: position[0] (or
+    // camera_data.position[0]); classic Leia: xLocation. Default 0.
     auto pick = [](const json& arr) -> float {
         if (arr.is_array() && !arr.empty() && arr[0].is_number())
             return arr[0].get<float>();
@@ -110,20 +111,30 @@ float ViewPosX(const json& view) {
     if (view.contains("camera_data") && view["camera_data"].is_object() &&
         view["camera_data"].contains("position"))
         return pick(view["camera_data"]["position"]);
+    if (view.contains("xLocation") && view["xLocation"].is_number())
+        return view["xLocation"].get<float>();
     return 0.0f;
 }
 
 ViewRef ResolveView(const json& view, const std::vector<uint8_t>& buf,
                     const std::vector<Field>& fields) {
     ViewRef ref;
-    // RGB lives under "image" (5.x) or legacy "albedo".
+    // RGB blob id: modern 5.x nests it under "image"/"albedo".blob_id; classic Leia
+    // puts it directly on the view as "albedoId". -1 means the base JPEG is this view.
+    int64_t blobId = 0;
+    bool haveBlob = false;
     const json* img = nullptr;
     if (view.contains("image") && view["image"].is_object()) img = &view["image"];
     else if (view.contains("albedo") && view["albedo"].is_object()) img = &view["albedo"];
-    if (!img || !img->contains("blob_id") || !(*img)["blob_id"].is_number_integer())
-        return ref;
+    if (img && img->contains("blob_id") && (*img)["blob_id"].is_number_integer()) {
+        blobId = (*img)["blob_id"].get<int64_t>();
+        haveBlob = true;
+    } else if (view.contains("albedoId") && view["albedoId"].is_number_integer()) {
+        blobId = view["albedoId"].get<int64_t>();
+        haveBlob = true;
+    }
+    if (!haveBlob) return ref;
 
-    const int64_t blobId = (*img)["blob_id"].get<int64_t>();
     if (blobId == -1) {
         ref.data = buf.data();          // the base JPEG is this view's image
         ref.size = buf.size();
@@ -149,6 +160,17 @@ LifResult MonoFallback(const std::vector<uint8_t>& buf, const std::string& path)
 }
 
 } // namespace
+
+bool LifLoader::IsLif(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    const std::streamoff len = f.tellg();
+    if (len < 2) return false;
+    f.seekg(len - 2);
+    unsigned char tail[2] = {0, 0};
+    f.read(reinterpret_cast<char*>(tail), 2);
+    return (bool)f && tail[0] == 0x1E && tail[1] == 0x1A;
+}
 
 LifResult LifLoader::Load(const std::string& path) {
     std::vector<uint8_t> buf;
