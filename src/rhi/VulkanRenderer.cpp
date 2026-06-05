@@ -671,9 +671,11 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
     vkBeginCommandBuffer(commandBuffer_, &bi);
 
     VkClearValue clear = {};
-    // Letterbox/background: opaque black normally; alpha 0 in transparent-bg mode so
-    // the runtime composes those pixels through to the desktop.
-    clear.color = {{0.0f, 0.0f, 0.0f, transparentLetterbox_ ? 0.0f : 1.0f}};
+    // Letterbox/background: the configured fill (opaque black by default, dark grey for
+    // the idle logo); alpha 0 in transparent-bg mode so the runtime composes those
+    // pixels through to the desktop.
+    clear.color = {{background_.r, background_.g, background_.b,
+                    transparentLetterbox_ ? 0.0f : background_.a}};
     VkRenderPassBeginInfo rb = {};
     rb.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rb.renderPass = renderPass_;

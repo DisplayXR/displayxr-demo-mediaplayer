@@ -86,6 +86,11 @@ public:
     // black) so the runtime composes it through to the desktop (MEDIAPLAYER_TRANSPARENT).
     void SetTransparentLetterbox(bool t) { transparentLetterbox_ = t; }
 
+    // Letterbox/background color for DrawViews (the area outside the fitted content).
+    // Defaults to black; the idle logo screen sets it to dark grey so the mark sits on
+    // a calm backdrop with no black bars. Ignored in transparent-letterbox mode (alpha 0).
+    void SetBackground(float r, float g, float b) { background_ = {r, g, b, 1.0f}; }
+
     // `rects` are the per-view content rects (the viewport — may be convergence-
     // shifted); `clipRects` are the per-view tile bounds the drawing is scissored to,
     // so a shifted content rect can never spill into the neighbouring eye's tile.
@@ -135,6 +140,7 @@ private:
     VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
     VkImageView dummyView_ = VK_NULL_HANDLE;
     bool transparentLetterbox_ = false; // clear letterbox to alpha 0 (transparent-bg mode)
+    ClearColor background_{0.0f, 0.0f, 0.0f, 1.0f}; // DrawViews letterbox/background fill
 
     bool CreatePipeline();
     uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;

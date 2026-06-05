@@ -22,9 +22,13 @@
 namespace mp {
 
 namespace {
-// RED|BLUE left/right test pattern (shown when no media is loaded).
+// RED|BLUE left/right test pattern (the no-media fallback when the idle logo is absent).
 constexpr ClearColor kLeftImage{0.85f, 0.10f, 0.10f, 1.0f};   // RED  = left
 constexpr ClearColor kRightImage{0.10f, 0.20f, 0.85f, 1.0f};  // BLUE = right
+
+// Idle screen: the DisplayXR mark on a calm, slightly-cool dark grey (matches the shell
+// home backdrop). Used both as the DrawViews background and the logo-composite fill.
+constexpr float kIdleBgR = 0.12f, kIdleBgG = 0.12f, kIdleBgB = 0.13f;
 
 // Convergence (horizontal image translation) budget: each '[' / ']' nudges by one
 // step, clamped to ±max — fractions of a view tile, kept small for "subtle" depth.
@@ -130,7 +134,7 @@ bool App::Initialize(const char* mediaPath) {
         }
     }
     if (!hasMedia_) {
-        LOG_INFO("No media loaded — showing RED|BLUE L/R test pattern");
+        LoadIdleLogo();  // DisplayXR mark on dark grey; falls back to RED|BLUE if absent
     }
 
     // Dear ImGui transport bar, rendered into the window-space HUD layer (M4). If it
@@ -425,8 +429,10 @@ void App::RenderOneFrame() {
                                   MediaSource::LayoutName(layout_), cw, ch, tileW, tileH, stereo);
                 } else {
                     std::snprintf(text, sizeof(text),
-                                  "%.0f FPS   %s\nsrc RED|BLUE test\nwin %ux%u  tile %ux%u\n%s",
-                                  fps_, xr_.ActiveModeName(), cw, ch, tileW, tileH, stereo);
+                                  "%.0f FPS   %s\nsrc %s\nwin %ux%u  tile %ux%u\n%s",
+                                  fps_, xr_.ActiveModeName(),
+                                  isLogo_ ? "DisplayXR idle logo" : "RED|BLUE test",
+                                  cw, ch, tileW, tileH, stereo);
                 }
                 hud::RenderText(hudPixels_, (int)xr_.HudWidth(), (int)xr_.HudHeight(), text);
                 renderer_.UploadToSwapchainImage(xr_.HudImages()[hudIdx], hudPixels_.data(),
@@ -728,6 +734,7 @@ bool App::LoadMedia(const std::string& path) {
         }
         isVideo_ = true;
         hasMedia_ = true;
+        ClearIdleLogo();
         layout_ = info.layout;
         mediaW_ = video_.Width();
         mediaH_ = video_.Height();
@@ -756,6 +763,7 @@ bool App::LoadMedia(const std::string& path) {
     }
     isVideo_ = false;
     hasMedia_ = true;
+    ClearIdleLogo();
     layout_ = imgInfo.layout;
     mediaW_ = img.width;
     mediaH_ = img.height;
@@ -833,6 +841,59 @@ void App::ToggleSlideshow() {
     if (slideshowActive_ && isVideo_) video_.SetLoop(false);  // play once, then advance
     LOG_INFO("slideshow %s", slideshowActive_ ? "on" : "off");
     ShowToast(slideshowActive_ ? "Slideshow on" : "Slideshow off");
+}
+
+void App::LoadIdleLogo() {
+    // Resolve <exe-dir>/displayxr/logo.png — the brand mark staged next to the binary
+    // (the same sidecar folder as the workspace manifest). SDL_GetBasePath gives the
+    // executable's directory; the returned string is owned by SDL (do not free).
+    namespace fs = std::filesystem;
+    std::string base;
+    if (const char* b = SDL_GetBasePath()) base = b;
+    const std::string logoPath = (fs::path(base) / "displayxr" / "logo.png").string();
+    DecodedImage logo = ImageDecoder::Load(logoPath);
+    if (!logo.Valid()) {
+        LOG_INFO("No media, and no idle logo at '%s' — showing RED|BLUE L/R test pattern",
+                 logoPath.c_str());
+        return;
+    }
+
+    // Composite the (transparent-background) logo centered at half scale onto an opaque
+    // dark-grey square. DrawViews fills the surrounding view with the same grey, so the
+    // mark floats on a seamless backdrop with no black letterbox bars. Mono (one image
+    // fed to both eyes) so it sits flat at screen depth.
+    const int C = std::max(logo.width, logo.height) * 2;  // logo occupies the centered 50%
+    const uint8_t bg[3] = {(uint8_t)(kIdleBgR * 255.0f + 0.5f),
+                           (uint8_t)(kIdleBgG * 255.0f + 0.5f),
+                           (uint8_t)(kIdleBgB * 255.0f + 0.5f)};
+    std::vector<uint8_t> canvas((size_t)C * C * 4);
+    for (size_t i = 0; i < canvas.size(); i += 4) {
+        canvas[i] = bg[0]; canvas[i + 1] = bg[1]; canvas[i + 2] = bg[2]; canvas[i + 3] = 255;
+    }
+    const int ox = (C - logo.width) / 2, oy = (C - logo.height) / 2;
+    for (int y = 0; y < logo.height; ++y) {
+        for (int x = 0; x < logo.width; ++x) {
+            const uint8_t* s = &logo.pixels[((size_t)y * logo.width + x) * 4];
+            const float a = s[3] / 255.0f;  // alpha-over the grey backdrop
+            uint8_t* d = &canvas[((size_t)(oy + y) * C + (ox + x)) * 4];
+            for (int c = 0; c < 3; ++c) d[c] = (uint8_t)(s[c] * a + d[c] * (1.0f - a) + 0.5f);
+        }
+    }
+    if (!renderer_.UploadTexture(canvas.data(), (uint32_t)C, (uint32_t)C)) {
+        LOG_WARN("Idle logo upload failed — showing RED|BLUE L/R test pattern");
+        return;
+    }
+    renderer_.SetBackground(kIdleBgR, kIdleBgG, kIdleBgB);
+    isLogo_ = true;
+    layout_ = StereoLayout::Mono;
+    contentAspect_ = 1.0f;
+    LOG_INFO("No media — showing the DisplayXR idle logo");
+}
+
+void App::ClearIdleLogo() {
+    if (!isLogo_) return;
+    isLogo_ = false;
+    renderer_.SetBackground(0.0f, 0.0f, 0.0f);  // back to the black media letterbox
 }
 
 void App::TogglePlayback() {

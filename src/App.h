@@ -58,6 +58,11 @@ private:
     // Per-frame UI state: advance the auto-hide fade, toast fade, and slideshow machine.
     void TickUi();
     void ToggleSlideshow();
+    // Idle screen: composite the DisplayXR logo onto a dark-grey backdrop and upload it
+    // as a mono texture, so launching with no file/folder shows the brand mark instead
+    // of the RED|BLUE test pattern. No-op (keeps the test pattern) if the asset is absent.
+    void LoadIdleLogo();
+    void ClearIdleLogo();  // leave the idle screen: restore the black letterbox background
     void TogglePlayback();   // play/pause (video+audio); restarts if the clip already ended
     void ToggleMute();       // silence audio (keeps playing); persists across clips
     void StepFrame(int n);   // pause + step n frames (']' +1 / '[' -1)
@@ -73,7 +78,8 @@ private:
     ImGuiLayer imgui_;
     bool muted_ = false;   // audio mute (M / speaker button); persists across clips
 
-    bool hasMedia_ = false;       // an image or video was loaded (vs the test pattern)
+    bool hasMedia_ = false;       // an image or video was loaded (vs the idle logo)
+    bool isLogo_ = false;         // the idle DisplayXR logo screen is showing (no media)
     bool isVideo_ = false;
     StereoLayout layout_ = StereoLayout::Mono;
     float contentAspect_ = 1.0f;  // per-eye display aspect (width/height), for letterboxing
