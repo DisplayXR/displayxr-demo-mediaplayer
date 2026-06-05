@@ -41,6 +41,23 @@ private:
     void RequestOpenFile();
     bool LoadMedia(const std::string& path);
     void ReloadMedia(const std::string& path);
+
+    // Folder navigation: scan the current file's directory for supported assets, and
+    // step prev/next (wrapping). delta is +1 (next) or -1 (prev). `path` is taken BY
+    // VALUE on purpose: callers pass a reference into folderFiles_, which this clears.
+    void RebuildFolderList(std::string path);
+    void NavigateMedia(int delta);
+    // Start a dip-to-black transition that navigates by `delta` at full black (manual
+    // ←/→). Shares the fade machine with the slideshow.
+    void RequestNavTransition(int delta);
+
+    // Transient toast (e.g. convergence %). Shows `msg` for a short time, then fades.
+    void ShowToast(const std::string& msg);
+
+    // Per-frame UI state: advance the auto-hide fade, toast fade, and slideshow machine.
+    void TickUi();
+    void ToggleSlideshow();
+    void TogglePlayback();   // play/pause; restarts from 0 if the clip already ended
     // SDL native-dialog callback (Tier-0 fallback). May fire on another thread, so it
     // just hands the path to the main loop through the guarded slot below.
     static void NativeFileCallback(void* userdata, const char* const* filelist, int filter);
@@ -75,6 +92,13 @@ private:
     std::mutex nativePathMutex_;
     std::string nativePath_;
     bool hasNativePath_ = false;
+
+    // Folder navigation / slideshow. folderFiles_ holds the supported assets in the
+    // current media's directory (sorted); folderIndex_ points at the loaded one.
+    std::string currentMediaPath_;
+    std::vector<std::string> folderFiles_;
+    size_t folderIndex_ = 0;
+
     int mediaW_ = 0;              // full frame dims, for the HUD label
     int mediaH_ = 0;
     std::vector<uint8_t> hudPixels_;  // CPU-rasterized HUD buffer
@@ -86,8 +110,33 @@ private:
     std::chrono::steady_clock::time_point fpsWindowStart_{};
     uint32_t fpsWindowFrames_ = 0;
     float fps_ = 0.0f;
-    bool showHud_ = false;
+    bool showHud_ = true;         // master UI enable (SHIFT+TAB); auto-hide governs the rest
     bool inRenderFrame_ = false;  // reentrancy guard (live-resize watch vs main loop)
+
+    // Auto-hide: the UI fades in on activity and out after kIdleHideSeconds. fadeAlpha_
+    // (0..1) scales every widget; lastActivity_ is reset on mouse-move / control input.
+    float fadeAlpha_ = 0.0f;
+    std::chrono::steady_clock::time_point lastActivity_{};
+    std::chrono::steady_clock::time_point lastFrameTime_{};
+    // Resting cursor position: motion is "real" only when it moves more than a few px
+    // from here, so sensor jitter near rest can't keep the UI awake. <0 = uninitialized.
+    float restMouseX_ = -1.0f;
+    float restMouseY_ = -1.0f;
+
+    // Transient toast (convergence readout, nav filename). Independent alpha so it shows
+    // even when the bars are hidden.
+    std::string toastText_;
+    std::chrono::steady_clock::time_point toastExpiry_{};
+    float toastAlpha_ = 0.0f;
+
+    // Slideshow ("diaporama"): auto-advance through folderFiles_. Stills hold for
+    // kStillSeconds; videos play to the end. Transitions dip to black (transitionAlpha_).
+    bool slideshowActive_ = false;
+    double slideshowImageElapsed_ = 0.0;
+    enum class Transition { Playing, FadeOut, FadeIn };
+    Transition transition_ = Transition::Playing;
+    float transitionAlpha_ = 0.0f;  // 0 = clear, 1 = full black
+    int pendingNavDelta_ = 0;       // navigation to apply at full black (slideshow or ←/→)
 
     // Test scaffolding (env-gated).
     int startMode_ = -1;

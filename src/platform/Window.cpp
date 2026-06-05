@@ -105,18 +105,29 @@ bool Window::PumpEvents() {
         if (eventHook_) eventHook_(&e);   // feed ImGui first (it may want the input)
         if (e.type == SDL_EVENT_QUIT) return false;
         if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) return false;
+        // Discrete pointer activity wakes the auto-hide UI. Continuous motion is handled
+        // by polling in the app (jitter-immune), NOT here — a noisy sensor emits a stream
+        // of tiny MOTION events that would otherwise pin the UI permanently visible.
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_WHEEL)
+            mouseActivity_ = true;
+        if (e.type == SDL_EVENT_WINDOW_MOUSE_ENTER) { mouseInWindow_ = true; mouseActivity_ = true; }
+        if (e.type == SDL_EVENT_WINDOW_MOUSE_LEAVE) { mouseInWindow_ = false; mouseLeft_ = true; }
         if (e.type == SDL_EVENT_KEY_DOWN) {
-            // Convergence nudges repeat while held; everything else is one-shot.
-            if (e.key.key == SDLK_RIGHTBRACKET) ++convergenceSteps_;
-            else if (e.key.key == SDLK_LEFTBRACKET) --convergenceSteps_;
+            // Convergence nudges repeat while held; everything else is one-shot. The
+            // convergence keys form the contiguous `0 - =` cluster: `=`/`-` nudge, `0` resets.
+            if (e.key.key == SDLK_EQUALS) ++convergenceSteps_;
+            else if (e.key.key == SDLK_MINUS) --convergenceSteps_;
             else if (!e.key.repeat) {
                 if (e.key.key == SDLK_ESCAPE) return false;
                 if (e.key.key == SDLK_V) cycleModeRequested_ = true;
                 if (e.key.key == SDLK_TAB && (e.key.mod & SDL_KMOD_SHIFT)) toggleHudRequested_ = true;
-                if (e.key.key == SDLK_BACKSLASH) resetConvergenceRequested_ = true;
+                if (e.key.key == SDLK_0) resetConvergenceRequested_ = true;
                 if (e.key.key == SDLK_X) swapEyesRequested_ = true;
                 if (e.key.key == SDLK_SPACE) togglePauseRequested_ = true;
-                if (e.key.key == SDLK_F) ToggleFullscreen();
+                if (e.key.key == SDLK_LEFT) prevMediaRequested_ = true;
+                if (e.key.key == SDLK_RIGHT) nextMediaRequested_ = true;
+                if (e.key.key == SDLK_S) toggleSlideshowRequested_ = true;
+                if (e.key.key == SDLK_F || e.key.key == SDLK_F11) ToggleFullscreen();
             }
         }
     }
@@ -162,6 +173,36 @@ bool Window::TakeSwapEyesRequest() {
 bool Window::TakeTogglePauseRequest() {
     bool v = togglePauseRequested_;
     togglePauseRequested_ = false;
+    return v;
+}
+
+bool Window::TakePrevMediaRequest() {
+    bool v = prevMediaRequested_;
+    prevMediaRequested_ = false;
+    return v;
+}
+
+bool Window::TakeNextMediaRequest() {
+    bool v = nextMediaRequested_;
+    nextMediaRequested_ = false;
+    return v;
+}
+
+bool Window::TakeToggleSlideshowRequest() {
+    bool v = toggleSlideshowRequested_;
+    toggleSlideshowRequested_ = false;
+    return v;
+}
+
+bool Window::TakeMouseActivity() {
+    bool v = mouseActivity_;
+    mouseActivity_ = false;
+    return v;
+}
+
+bool Window::TakeMouseLeft() {
+    bool v = mouseLeft_;
+    mouseLeft_ = false;
     return v;
 }
 
