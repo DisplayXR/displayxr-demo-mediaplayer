@@ -72,7 +72,7 @@ set(MP_FFMPEG_LINK "")           # what the target links against (pkg-config tar
 set(MP_FFMPEG_DLL_DIR "")        # Windows: dir holding the runtime DLLs to stage by the exe
 if(PkgConfig_FOUND)
     pkg_check_modules(FFMPEG IMPORTED_TARGET
-        libavformat libavcodec libavutil libswscale)
+        libavformat libavcodec libavutil libswscale libswresample)
     if(FFMPEG_FOUND)
         set(MP_HAVE_FFMPEG TRUE)
         set(MP_FFMPEG_LINK PkgConfig::FFMPEG)
@@ -90,11 +90,13 @@ if(NOT MP_HAVE_FFMPEG)
     find_library(FFMPEG_avformat avformat HINTS "${FFMPEG_ROOT}/lib")
     find_library(FFMPEG_avutil   avutil   HINTS "${FFMPEG_ROOT}/lib")
     find_library(FFMPEG_swscale  swscale  HINTS "${FFMPEG_ROOT}/lib")
-    if(FFMPEG_INCLUDE_DIR AND FFMPEG_avcodec AND FFMPEG_avformat AND FFMPEG_avutil AND FFMPEG_swscale)
+    find_library(FFMPEG_swresample swresample HINTS "${FFMPEG_ROOT}/lib")
+    if(FFMPEG_INCLUDE_DIR AND FFMPEG_avcodec AND FFMPEG_avformat AND FFMPEG_avutil AND FFMPEG_swscale AND FFMPEG_swresample)
         add_library(mp_ffmpeg INTERFACE)
         target_include_directories(mp_ffmpeg INTERFACE "${FFMPEG_INCLUDE_DIR}")
         target_link_libraries(mp_ffmpeg INTERFACE
-            "${FFMPEG_avcodec}" "${FFMPEG_avformat}" "${FFMPEG_avutil}" "${FFMPEG_swscale}")
+            "${FFMPEG_avcodec}" "${FFMPEG_avformat}" "${FFMPEG_avutil}" "${FFMPEG_swscale}"
+            "${FFMPEG_swresample}")
         set(MP_HAVE_FFMPEG TRUE)
         set(MP_FFMPEG_LINK mp_ffmpeg)
         message(STATUS "FFmpeg: found via FFMPEG_ROOT='${FFMPEG_ROOT}' (${FFMPEG_INCLUDE_DIR})")
@@ -151,6 +153,7 @@ add_executable(${MP_TARGET}
     src/media/ImageDecoder.cpp
     src/media/MediaSource.cpp
     src/media/VideoDecoder.cpp
+    src/media/AudioPlayer.cpp
     src/ui/Hud.cpp
     src/ui/ImGuiLayer.cpp
     src/media/FrameRing.h  # header-only triple buffer

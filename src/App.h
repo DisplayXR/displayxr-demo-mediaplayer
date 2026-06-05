@@ -5,6 +5,7 @@
 // decode + UI (PRD §4).
 #pragma once
 
+#include "media/AudioPlayer.h"
 #include "media/MediaSource.h"
 #include "media/VideoDecoder.h"
 #include "platform/Window.h"
@@ -57,7 +58,9 @@ private:
     // Per-frame UI state: advance the auto-hide fade, toast fade, and slideshow machine.
     void TickUi();
     void ToggleSlideshow();
-    void TogglePlayback();   // play/pause; restarts from 0 if the clip already ended
+    void TogglePlayback();   // play/pause (video+audio); restarts if the clip already ended
+    void ToggleMute();       // silence audio (keeps playing); persists across clips
+    void StepFrame(int n);   // pause + step n frames (']' +1 / '[' -1)
     // SDL native-dialog callback (Tier-0 fallback). May fire on another thread, so it
     // just hands the path to the main loop through the guarded slot below.
     static void NativeFileCallback(void* userdata, const char* const* filelist, int filter);
@@ -66,7 +69,9 @@ private:
     XrSession xr_;
     VulkanRenderer renderer_;
     VideoDecoder video_;
+    AudioPlayer audio_;
     ImGuiLayer imgui_;
+    bool muted_ = false;   // audio mute (M / speaker button); persists across clips
 
     bool hasMedia_ = false;       // an image or video was loaded (vs the test pattern)
     bool isVideo_ = false;
@@ -85,6 +90,10 @@ private:
     float scrubValue_ = 0.0f;
     bool scrubActive_ = false;
     float scrubTarget_ = -1.0f;
+    // Velocity-aware scrubbing: a fast sweep shows keyframes (responsive on long-GOP 8K),
+    // a slow/fine drag shows exact frames, and settling after a sweep resolves to exact.
+    float lastScrubValue_ = 0.0f;
+    bool scrubWasPreview_ = false;
 
     // Open-file flow. openFilePending_ gates the Open button while a picker is up.
     // The native-dialog callback may run off-thread; it parks the result here.

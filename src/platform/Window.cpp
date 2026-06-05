@@ -117,6 +117,8 @@ bool Window::PumpEvents() {
             // convergence keys form the contiguous `0 - =` cluster: `=`/`-` nudge, `0` resets.
             if (e.key.key == SDLK_EQUALS) ++convergenceSteps_;
             else if (e.key.key == SDLK_MINUS) --convergenceSteps_;
+            else if (e.key.key == SDLK_RIGHTBRACKET) ++frameStepRequest_;  // ']' next frame
+            else if (e.key.key == SDLK_LEFTBRACKET) --frameStepRequest_;   // '[' prev frame
             else if (!e.key.repeat) {
                 if (e.key.key == SDLK_ESCAPE) return false;
                 if (e.key.key == SDLK_V) cycleModeRequested_ = true;
@@ -127,6 +129,7 @@ bool Window::PumpEvents() {
                 if (e.key.key == SDLK_LEFT) prevMediaRequested_ = true;
                 if (e.key.key == SDLK_RIGHT) nextMediaRequested_ = true;
                 if (e.key.key == SDLK_S) toggleSlideshowRequested_ = true;
+                if (e.key.key == SDLK_M) toggleMuteRequested_ = true;
                 if (e.key.key == SDLK_F || e.key.key == SDLK_F11) ToggleFullscreen();
             }
         }
@@ -164,6 +167,12 @@ bool Window::TakeResetConvergence() {
     return v;
 }
 
+int Window::TakeFrameStep() {
+    int v = frameStepRequest_;
+    frameStepRequest_ = 0;
+    return v;
+}
+
 bool Window::TakeSwapEyesRequest() {
     bool v = swapEyesRequested_;
     swapEyesRequested_ = false;
@@ -191,6 +200,12 @@ bool Window::TakeNextMediaRequest() {
 bool Window::TakeToggleSlideshowRequest() {
     bool v = toggleSlideshowRequested_;
     toggleSlideshowRequested_ = false;
+    return v;
+}
+
+bool Window::TakeToggleMuteRequest() {
+    bool v = toggleMuteRequested_;
+    toggleMuteRequested_ = false;
     return v;
 }
 

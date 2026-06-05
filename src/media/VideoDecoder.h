@@ -14,6 +14,7 @@
 #include "media/FrameRing.h"
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -47,11 +48,18 @@ public:
     bool Ended() const { return ended_.load(); }   // reached EOF with loop disabled
 
     // Seek to `seconds` (clamped to [0, duration]). Thread-safe: the decode thread
-    // performs the actual av_seek_frame on its next iteration, even while paused
-    // (it decodes + publishes one frame at the new position so the view updates).
-    void Seek(double seconds);
+    // performs the actual av_seek_frame on its next iteration, even while paused.
+    // `preview` (during a scrub drag) shows the nearest keyframe — fast on high-res
+    // long-GOP clips; the default exact seek decodes forward to the precise frame.
+    void Seek(double seconds, bool preview = false);
     double PositionSeconds() const { return positionSec_.load(); }   // current frame PTS
     double DurationSeconds() const { return durationSec_; }           // 0 if unknown
+    double FrameRate() const { return frameRate_; }                  // fps, 0 if unknown
+
+    // Optional A/V master clock (audio position in seconds, or <0 when unavailable). When
+    // set and returning >=0, the decode thread presents each frame when the clock reaches
+    // its PTS instead of using its own wall clock. Set once before Open().
+    void SetMasterClock(std::function<double()> fn) { masterClock_ = std::move(fn); }
 
     bool IsOpen() const { return open_; }
     int Width() const { return width_; }    // full SBS frame width
@@ -75,14 +83,17 @@ private:
     std::unique_ptr<Impl> impl_;
 
     FrameRing ring_;
+    std::function<double()> masterClock_;   // audio clock for A/V sync (null = wall clock)
     std::thread thread_;
     std::atomic<bool> stop_{false};
     std::atomic<bool> paused_{false};
     std::atomic<bool> loopEnabled_{false};     // off by default: play once, hold last frame
     std::atomic<bool> ended_{false};           // hit EOF with looping disabled
     std::atomic<double> seekRequest_{-1.0};   // target seconds, <0 = none pending
+    std::atomic<bool> seekPreview_{false};    // current seek wants the nearest keyframe
     std::atomic<double> positionSec_{0.0};     // last published frame's PTS
     double durationSec_ = 0.0;                  // set in Open()
+    double frameRate_ = 0.0;                    // fps, for frame stepping
     bool open_ = false;
     int width_ = 0;
     int height_ = 0;

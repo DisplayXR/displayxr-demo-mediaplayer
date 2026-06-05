@@ -42,6 +42,9 @@ constexpr double kFadeSeconds = 0.20;       // UI fade in/out duration
 constexpr double kToastFadeSeconds = 0.30;  // toast fade in/out duration
 constexpr double kStillSeconds = 5.0;       // slideshow: seconds to hold a still image
 constexpr double kTransitionSeconds = 0.40; // slideshow: dip-to-black half-duration
+// Scrub speed (video-seconds moved per UI frame) above which we show keyframes instead
+// of exact frames — a fast sweep; below it, fine adjustment gets exact frames.
+constexpr float kFastScrubSeconds = 1.0f;
 
 // Per-eye display aspect (width/height): full SBS packs two eyes across the width
 // (each eye half-width); half-SBS and mono use the full frame width.
@@ -94,6 +97,10 @@ bool App::Initialize(const char* mediaPath) {
     // Transparent-background experiment: when the session was created with it, clear
     // the letterbox to alpha 0 so the runtime composes those pixels through.
     renderer_.SetTransparentLetterbox(xr_.TransparentBackground());
+
+    // Audio is the A/V master: the video decoder paces frames to the audio clock when a
+    // clip has sound (else it falls back to its own wall clock).
+    video_.SetMasterClock([this]() { return audio_.ClockSeconds(); });
 
     // Load a stereo image or video if one was given; otherwise the loop falls back
     // to the RED|BLUE L/R test pattern (and the user can Open one at runtime). The
@@ -192,6 +199,10 @@ int App::Run() {
             ShowToast("Convergence reset");
             activity = true;
         }
+        if (const int fs = window_.TakeFrameStep(); fs != 0) {        // '[' / ']'
+            StepFrame(fs);
+            activity = true;
+        }
         if (window_.TakeSwapEyesRequest()) {                          // 'X'
             swapEyes_ = !swapEyes_;
             LOG_INFO("swap eyes %s", swapEyes_ ? "on" : "off");
@@ -201,6 +212,7 @@ int App::Run() {
         if (window_.TakePrevMediaRequest()) { RequestNavTransition(-1); activity = true; }  // Left
         if (window_.TakeNextMediaRequest()) { RequestNavTransition(+1); activity = true; }  // Right
         if (window_.TakeToggleSlideshowRequest()) { ToggleSlideshow(); activity = true; } // 'S'
+        if (window_.TakeToggleMuteRequest()) { ToggleMute(); activity = true; }            // 'M'
         if (window_.TakeMouseLeft()) {
             // Cursor left the window — drop the UI now (push idle past the hide threshold).
             lastActivity_ =
@@ -438,7 +450,7 @@ void App::RenderOneFrame() {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 namespace {
 constexpr float kPi = 3.14159265358979f;  // IM_PI lives in imgui_internal.h; keep our own
-enum class Icon { Play, Pause, Loop, Slideshow };
+enum class Icon { Play, Pause, Loop, Slideshow, Speaker, SpeakerMuted };
 
 // A borderless icon button: an invisible hit-target with a hand-drawn glyph centered
 // in it (no icon font needed). `active` tints it with the accent color (toggle-on);
@@ -501,6 +513,26 @@ bool IconButton(const char* id, Icon kind, float size, bool active = false) {
             const float h = size * 0.16f;
             dl->AddTriangleFilled(ImVec2(c.x - h * 0.5f, c.y - h), ImVec2(c.x - h * 0.5f, c.y + h),
                                   ImVec2(c.x + h, c.y), u);
+            break;
+        }
+        case Icon::Speaker:
+        case Icon::SpeakerMuted: {
+            // Body box + cone (triangle pointing right).
+            const float bx = -r * 0.35f;
+            dl->AddRectFilled(ImVec2(c.x - r * 0.95f, c.y - r * 0.30f),
+                              ImVec2(c.x + bx, c.y + r * 0.30f), u);
+            dl->AddTriangleFilled(ImVec2(c.x + bx, c.y - r * 0.62f),
+                                  ImVec2(c.x + bx, c.y + r * 0.62f), ImVec2(c.x + r * 0.25f, c.y), u);
+            if (kind == Icon::Speaker) {  // two sound-wave arcs
+                dl->PathArcTo(ImVec2(c.x + r * 0.1f, c.y), r * 0.58f, -kPi * 0.28f, kPi * 0.28f);
+                dl->PathStroke(u, 0, th * 0.7f);
+                dl->PathArcTo(ImVec2(c.x + r * 0.1f, c.y), r * 0.92f, -kPi * 0.28f, kPi * 0.28f);
+                dl->PathStroke(u, 0, th * 0.7f);
+            } else {                      // muted: a small X
+                const float xc = c.x + r * 0.72f, d = r * 0.26f;
+                dl->AddLine(ImVec2(xc - d, c.y - d), ImVec2(xc + d, c.y + d), u, th * 0.9f);
+                dl->AddLine(ImVec2(xc - d, c.y + d), ImVec2(xc + d, c.y - d), u, th * 0.9f);
+            }
             break;
         }
     }
@@ -591,21 +623,45 @@ void App::BuildTransportUI() {
                 ImGui::AlignTextToFramePadding();
                 ImGui::Text("%s", cur);
                 ImGui::SameLine();
-                // Leave room on the right for the total-time label and the loop icon.
-                const float rightW = ImGui::CalcTextSize(tot).x + iconSz + 28.0f;
+                // Leave room on the right for the total-time label + mute + loop icons.
+                const float rightW = ImGui::CalcTextSize(tot).x + 2.0f * iconSz + 36.0f;
                 ImGui::SetNextItemWidth(-rightW);
                 const bool changed = ImGui::SliderFloat("##scrub", &scrubValue_, 0.0f, dur, "");
-                scrubActive_ = ImGui::IsItemActive();
+                const bool active = ImGui::IsItemActive();
+                const float scrubDelta = std::fabs(scrubValue_ - lastScrubValue_);
                 if (changed) {
-                    video_.Seek(scrubValue_);
+                    // Fast sweep -> keyframe preview (responsive); slow/fine drag -> exact
+                    // frame (precise). Audio goes silent while scrubbing.
+                    const bool fast = active && scrubDelta > kFastScrubSeconds;
+                    video_.Seek(scrubValue_, /*preview=*/fast);
+                    scrubWasPreview_ = fast;
                     scrubTarget_ = scrubValue_;  // hold the knob until the decode lands
+                    if (active) audio_.SetPaused(true);
+                } else if (active && scrubWasPreview_) {
+                    // Settled after a fast sweep -> resolve to the exact frame.
+                    video_.Seek(scrubValue_, /*preview=*/false);
+                    scrubWasPreview_ = false;
                 }
+                if (scrubActive_ && !active) {
+                    // Released: settle on the exact frame and realign + resume audio.
+                    video_.Seek(scrubValue_, /*preview=*/false);
+                    audio_.Seek(scrubValue_);
+                    if (!video_.Paused()) audio_.SetPaused(false);
+                    scrubWasPreview_ = false;
+                }
+                scrubActive_ = active;
+                lastScrubValue_ = scrubValue_;
                 ImGui::SameLine();
                 ImGui::AlignTextToFramePadding();
                 ImGui::Text("%s", tot);
                 ImGui::SameLine();
-                if (IconButton("##loop", Icon::Loop, iconSz, video_.Loop()))
+                if (IconButton("##mute", muted_ ? Icon::SpeakerMuted : Icon::Speaker, iconSz, muted_))
+                    ToggleMute();
+                ImGui::SameLine();
+                if (IconButton("##loop", Icon::Loop, iconSz, video_.Loop())) {
                     video_.ToggleLoop();
+                    audio_.SetLoop(video_.Loop());
+                }
             }
             ImGui::End();
         }
@@ -653,7 +709,8 @@ void App::UpdateFps() {
 }
 
 void App::Shutdown() {
-    video_.Stop();        // join the decode thread before tearing down the GPU
+    video_.Stop();        // join the decode thread (reads the audio clock) before audio,
+    audio_.Stop();        // and before tearing down the GPU
     imgui_.Shutdown();    // before xr_ destroys the Vulkan device ImGui borrows
     renderer_.Shutdown();
     xr_.Shutdown();
@@ -678,6 +735,10 @@ bool App::LoadMedia(const std::string& path) {
         // In slideshow, force play-once so the clip can end and advance, regardless of
         // the user's manual loop preference.
         if (slideshowActive_) video_.SetLoop(false);
+        // Audio (optional — silent if the clip has none). Match mute + loop state.
+        audio_.Open(path);
+        audio_.SetMuted(muted_);
+        audio_.SetLoop(video_.Loop());
         LOG_INFO("Playing %s video (%s), per-eye aspect %.3f",
                  MediaSource::LayoutName(info.layout), path.c_str(), contentAspect_);
         currentMediaPath_ = path;
@@ -707,7 +768,8 @@ bool App::LoadMedia(const std::string& path) {
 }
 
 void App::ReloadMedia(const std::string& path) {
-    video_.Stop();   // joins the decode thread; no-op when current media is an image
+    video_.Stop();   // joins the decode thread (which reads the audio clock) FIRST,
+    audio_.Stop();   // then tear down audio so the clock callback can't outlive it.
     isVideo_ = false;
     scrubValue_ = 0.0f;
     scrubActive_ = false;
@@ -778,10 +840,34 @@ void App::TogglePlayback() {
     if (video_.Ended()) {
         video_.Seek(0.0);          // restart a clip that already ran to the end
         video_.SetPaused(false);
+        audio_.Seek(0.0);
+        audio_.SetPaused(false);
     } else {
         video_.TogglePaused();
+        audio_.SetPaused(video_.Paused());
     }
     LOG_INFO("playback %s", video_.Paused() ? "paused" : "playing");
+}
+
+void App::ToggleMute() {
+    muted_ = !muted_;
+    audio_.SetMuted(muted_);
+    LOG_INFO("audio %s", muted_ ? "muted" : "unmuted");
+    ShowToast(muted_ ? "Muted" : "Unmuted");
+}
+
+void App::StepFrame(int n) {
+    if (!isVideo_ || n == 0) return;
+    const double fr = video_.FrameRate();
+    const double fd = (fr > 1.0) ? 1.0 / fr : 1.0 / 30.0;  // frame duration (fallback 30fps)
+    // Frame stepping is a paused operation; freeze both streams.
+    if (!video_.Paused()) { video_.SetPaused(true); audio_.SetPaused(true); }
+    // Seek so the target frame is the first one at/after sk: sk = pos + (n - 0.5)*fd.
+    double t = video_.PositionSeconds() + ((double)n - 0.5) * fd;
+    if (t < 0.0) t = 0.0;
+    video_.Seek(t);             // exact
+    audio_.Seek(t);             // keep audio aligned for the eventual resume
+    scrubTarget_ = (float)t;    // hold the scrubber knob until the frame lands
 }
 
 void App::TickUi() {

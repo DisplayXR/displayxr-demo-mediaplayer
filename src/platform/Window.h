@@ -57,6 +57,8 @@ public:
     // reset to 0 on read. The caller scales each step into its parallax budget.
     int TakeConvergenceSteps();
     bool TakeResetConvergence();   // `0` — convergence back to 0
+    // Net single-frame steps since last read: `]` = +1, `[` = -1 (key-repeat counts).
+    int TakeFrameStep();
     bool TakeSwapEyesRequest();    // `X` — toggle L/R eye assignment
     bool TakeTogglePauseRequest(); // Space — play/pause
 
@@ -64,6 +66,7 @@ public:
     bool TakePrevMediaRequest();      // Left arrow — previous asset in the folder
     bool TakeNextMediaRequest();      // Right arrow — next asset in the folder
     bool TakeToggleSlideshowRequest(); // `S` — toggle slideshow ("diaporama")
+    bool TakeToggleMuteRequest();      // `M` — toggle audio mute
 
     // Discrete pointer activity (click / wheel / window-enter) since last read — wakes
     // the auto-hide UI. Continuous motion is detected by polling (jitter-immune).
@@ -84,12 +87,14 @@ private:
     bool cycleModeRequested_ = false;
     bool toggleHudRequested_ = false;
     int convergenceSteps_ = 0;
+    int frameStepRequest_ = 0;
     bool resetConvergenceRequested_ = false;
     bool swapEyesRequested_ = false;
     bool togglePauseRequested_ = false;
     bool prevMediaRequested_ = false;
     bool nextMediaRequested_ = false;
     bool toggleSlideshowRequested_ = false;
+    bool toggleMuteRequested_ = false;
     bool mouseActivity_ = false;
     bool mouseLeft_ = false;
     bool mouseInWindow_ = true;

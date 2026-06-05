@@ -204,6 +204,8 @@ bool VideoDecoder::Open(const std::string& path) {
 
     width_ = impl_->codec->width;
     height_ = impl_->codec->height;
+    frameRate_ = av_q2d(st->avg_frame_rate);
+    if (frameRate_ <= 0.0) frameRate_ = av_q2d(st->r_frame_rate);
     durationSec_ = (impl_->fmt->duration > 0)
                        ? (double)impl_->fmt->duration / (double)AV_TIME_BASE
                        : 0.0;
@@ -322,6 +324,7 @@ void VideoDecoder::DecodeLoop() {
         // release. The keyframe-preview variant lived here briefly; see git history.
         const double sk = seekRequest_.exchange(-1.0);
         if (sk >= 0.0) {
+            const bool preview = seekPreview_.load();  // drag -> nearest keyframe (fast)
             const auto seekT0 = clock::now();
             av_seek_frame(impl_->fmt, impl_->videoStream, (int64_t)(sk / timeBase),
                           AVSEEK_FLAG_BACKWARD);
@@ -349,13 +352,15 @@ void VideoDecoder::DecodeLoop() {
                     const int64_t ticks = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
                                               ? frame->best_effort_timestamp : frame->pts;
                     const double pts = (ticks != AV_NOPTS_VALUE) ? (double)ticks * timeBase : -1.0;
-                    if (pts < 0.0 || pts + 1e-3 >= sk) {
-                        const double fpts = fillFrame(frame);  // download + convert this one
+                    // Preview: take the first frame (the keyframe) — no forward decode.
+                    // Exact: decode forward until we reach the target frame.
+                    if (preview || pts < 0.0 || pts + 1e-3 >= sk) {
+                        const double fpts = fillFrame(frame);  // copy this one to the ring
                         if (fpts > -2.0) { filled = true; lastPts = (fpts >= 0.0) ? fpts : sk; }
                         reached = true;
                         break;
                     }
-                    // earlier than target → discard cheaply (no download), keep decoding
+                    // earlier than target → discard cheaply (no copy), keep decoding
                 }
             }
             // Always publish the frame we landed on — during a drag this is the preview
@@ -411,10 +416,23 @@ void VideoDecoder::DecodeLoop() {
                 if (ptsSec <= -2.0) continue;  // dropped
                 if (ptsSec >= 0.0) {
                     positionSec_.store(ptsSec);
-                    if (firstPtsSec < 0.0) firstPtsSec = ptsSec;
-                    auto target = wallStart + std::chrono::duration_cast<clock::duration>(
-                                                  std::chrono::duration<double>(ptsSec - firstPtsSec));
-                    std::this_thread::sleep_until(target);
+                    const double mc = masterClock_ ? masterClock_() : -1.0;
+                    if (mc >= 0.0) {
+                        // Audio is the master clock: present when it reaches this PTS.
+                        for (;;) {
+                            if (stop_.load() || paused_.load() || seekRequest_.load() >= 0.0) break;
+                            const double now = masterClock_();
+                            if (now < 0.0) break;               // audio stopped -> show now
+                            if (now >= ptsSec - 0.005) break;   // audio caught up
+                            if (ptsSec - now > 1.0) break;      // far ahead (loop) -> show now
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        }
+                    } else {
+                        if (firstPtsSec < 0.0) firstPtsSec = ptsSec;
+                        auto target = wallStart + std::chrono::duration_cast<clock::duration>(
+                                                      std::chrono::duration<double>(ptsSec - firstPtsSec));
+                        std::this_thread::sleep_until(target);
+                    }
                 }
                 ring_.Publish();
             }
@@ -426,7 +444,7 @@ void VideoDecoder::DecodeLoop() {
     av_packet_free(&pkt);
 }
 
-void VideoDecoder::Seek(double seconds) {
+void VideoDecoder::Seek(double seconds, bool preview) {
     if (seconds < 0.0) seconds = 0.0;
     // Leave a little headroom before EOF so the forward-decode always finds a frame at
     // or after the target (otherwise a seek to the very end lands nothing to display).
@@ -434,6 +452,7 @@ void VideoDecoder::Seek(double seconds) {
     if (seconds < 0.0) seconds = 0.0;
     LOG_DEBUG("VideoDecoder: seek request -> %.2fs (paused=%d)", seconds, (int)paused_.load());
     ended_.store(false);   // a seek leaves the EOF/hold state
+    seekPreview_.store(preview);
     seekRequest_.store(seconds);
 }
 
