@@ -32,7 +32,10 @@ MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int ima
     const std::string lower = Lower(path);
     MediaInfo info;
 
-    if (EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png")) {
+    if (EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png") ||
+        EndsWith(lower, ".lif")) {
+        // .lif is a JPEG container; the LifLoader composes it to SBS and reports the
+        // authoritative layout, so the layout decided below is unused for that path.
         info.kind = MediaKind::Image;
     } else if (EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov")) {
         info.kind = MediaKind::Video;
@@ -59,6 +62,7 @@ MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int ima
 bool MediaSource::IsSupported(const std::string& path) {
     const std::string lower = Lower(path);
     return EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png") ||
+           EndsWith(lower, ".lif") ||
            EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov");
 }
 

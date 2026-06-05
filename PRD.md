@@ -170,11 +170,15 @@ reference. Specifics:
 
 ## 8. Supported formats (v1)
 
-**Images:** SBS JPG/PNG (`Name_2x1.ext`, `Name_half_2x1.ext`) via stb_image. HEIF/LIF
+**Images:** SBS JPG/PNG (`Name_2x1.ext`, `Name_half_2x1.ext`) via stb_image. HEIF
 behind `MEDIAPLAYER_WITH_HEIF` CMake option, **OFF by default** (libheif is LGPL +
 heavier — opt-in for Leia content). 2D images shown centered as flat (no conversion).
+**Stereo LIF** (`.lif`): the container is parsed directly (no vendor SDK) — the two
+embedded views are decoded and composed to a full-SBS frame (`src/media/LifLoader.*`,
+nlohmann/json for the metadata). Mono+depth LIFs fall back to flat 2D for now; their
+depth-based rendering (porting the raycast LIF shader) is a later step.
 **Video:** SBS H.264 / H.265 / AV1 in MP4/MKV via FFmpeg; `*_2x1` / `*_half_2x1`
-naming. **No LVF/LIF container parsing in v1** (deferred — see §12). 2D video shown flat.
+naming. 2D video shown flat.
 **Detection:** filename suffix first (matches Leia convention), container hints
 second.
 
@@ -232,12 +236,14 @@ Because the app renders both eyes, UI depth is free via per-eye horizontal shift
 These were open questions; settled with sensible minimal-scope defaults. Revisit
 any of them if product priorities shift.
 
-- **HEIF/LIF images → behind `MEDIAPLAYER_WITH_HEIF`, OFF by default.** v1 ships
+- **HEIF images → behind `MEDIAPLAYER_WITH_HEIF`, OFF by default.** v1 ships
   stb_image (JPG/PNG SBS) only. libheif (LGPL, heavier) is an opt-in build flag for
-  Leia HEIF/LIF content — not on the default path.
-- **No LVF/LIF *container* parsing in v1 → SBS + filename convention first.**
-  Detect `*_2x1` / `*_half_2x1` by name (matches Leia's convention) and read the
-  SBS frame; full Leia LVF/LIF container parsing is deferred to a later milestone.
+  Leia HEIF content — not on the default path.
+- **Stereo LIF container parsing → implemented, on by default.** A two-view `.lif`
+  is parsed in-tree (`LifLoader`, nlohmann/json header-only) and composed to SBS — no
+  vendor SDK, per the GOLDEN RULE. Mono+depth/LDI synthesis (raycast LIF shader port)
+  is the next step. Filename `*_2x1` / `*_half_2x1` detection still covers plain SBS
+  JPG/PNG.
 - **Single-file open in v1**, via a tiny native dialog (SDL3 / tinyfiledialogs).
   *Low-cost stretch:* once a file is open, arrow-key prev/next across the
   containing folder (cheap, no playlist UI). Full playlist/library UI is post-v1.

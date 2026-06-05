@@ -3,6 +3,7 @@
 
 #include "Log.h"
 #include "media/ImageDecoder.h"
+#include "media/LifLoader.h"
 #include "media/MediaSource.h"
 #include "ui/Hud.h"
 
@@ -752,6 +753,39 @@ bool App::LoadMedia(const std::string& path) {
         RebuildFolderList(path);
         return true;
     }
+    // LIF container (JPEG + appended views): compose stereo to SBS; a non-stereo or
+    // malformed LIF falls back to flat 2D inside the loader. Extension-gated since a
+    // LIF is otherwise indistinguishable from a plain JPEG at the dispatch layer.
+    auto hasLifExt = [](const std::string& p) {
+        const size_t n = p.size();
+        if (n < 4) return false;
+        auto lc = [](char c) { return (char)(c | 0x20); };  // ASCII lower
+        return p[n - 4] == '.' && lc(p[n - 3]) == 'l' && lc(p[n - 2]) == 'i' &&
+               lc(p[n - 1]) == 'f';
+    };
+    if (hasLifExt(path)) {
+        LifResult lif = LifLoader::Load(path);
+        if (!lif.ok) {
+            LOG_ERROR("Open: cannot load LIF '%s'", path.c_str());
+            return false;
+        }
+        if (!renderer_.UploadTexture(lif.image.pixels.data(), (uint32_t)lif.image.width,
+                                     (uint32_t)lif.image.height)) {
+            return false;
+        }
+        isVideo_ = false;
+        hasMedia_ = true;
+        ClearIdleLogo();
+        layout_ = lif.layout;
+        mediaW_ = lif.image.width;
+        mediaH_ = lif.image.height;
+        contentAspect_ = PerEyeAspect(lif.layout, lif.image.width, lif.image.height);
+        LOG_INFO("Displaying %s LIF (%s), per-eye aspect %.3f",
+                 lif.stereo ? "stereo" : "mono", path.c_str(), contentAspect_);
+        currentMediaPath_ = path;
+        RebuildFolderList(path);
+        return true;
+    }
     DecodedImage img = ImageDecoder::Load(path);
     if (!img.Valid()) {
         LOG_ERROR("Open: cannot load image '%s'", path.c_str());
@@ -1037,7 +1071,7 @@ void App::RequestOpenFile() {
     LOG_INFO("Open: workspace picker unavailable (status=%d) — native dialog", (int)st);
 
     static const SDL_DialogFileFilter kFilters[] = {
-        {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png"},
+        {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png;lif"},
         {"All files", "*"},
     };
     SDL_ShowOpenFileDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this,
