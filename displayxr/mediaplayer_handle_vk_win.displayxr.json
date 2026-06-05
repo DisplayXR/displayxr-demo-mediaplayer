@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "Media Player",
+  "type": "3d",
+  "category": "app",
+  "display_mode": "auto",
+  "description": "Two-view video and image player for 3D displays",
+  "icon": "icon.png",
+  "icon_3d": "icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}
