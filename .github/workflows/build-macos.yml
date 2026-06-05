@@ -4,6 +4,11 @@ name: Build macOS
 # validation only (build app + .pkg, assert the bundle payload). On a v* tag push
 # the .pkg is attached to the GitHub Release. Mirrors the sibling demos'
 # build-macos.yml. (versions.json is bumped by the Windows workflow only.)
+#
+# The DetectChanges job + docs_only step gating let this workflow be a required
+# status check (the "Build macOS" job always runs and reports success in ~30s
+# on doc-only PRs, skipping the heavy build) without blocking doc PRs. Mirrors
+# the sentinel pattern in displayxr-runtime + displayxr-leia-plugin.
 
 on:
   pull_request: {}
@@ -20,7 +25,36 @@ permissions:
   contents: write
 
 jobs:
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
   Build:
+    name: Build macOS
+    needs: DetectChanges
     runs-on: macos-14
     timeout-minutes: 30
     env:
@@ -28,7 +62,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Doc-only PR — skipping heavy build steps
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "docs_only=true; build steps will skip and report success."
+
       - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         # OpenXR loader is built from source by scripts/build_macos.sh (no brew
         # formula). FFmpeg via Homebrew (pkg-config). The app's dylib closure is
         # bundled by a recursive otool/install_name_tool walk in create_app_bundle.sh.
@@ -37,6 +76,7 @@ jobs:
           echo "VULKAN_SDK=$(brew --prefix)" >> "$GITHUB_ENV"
 
       - name: Derive installer version
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         id: version
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
@@ -48,11 +88,13 @@ jobs:
           echo "VERSION=$VERSION"
 
       - name: Build demo + installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
           DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build_macos.sh --installer
 
       - name: Assert .pkg payload (regression guard)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
           PKG=$(find _package -maxdepth 1 -name "DisplayXRMediaPlayer-*.pkg" -type f | head -1)
@@ -86,6 +128,7 @@ jobs:
           echo "PASS: .pkg payload contains app + MoltenVK/Vulkan/OpenXR + FFmpeg dylibs."
 
       - name: Upload installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v4
         with:
           retention-days: 3
@@ -94,7 +137,7 @@ jobs:
           path: _package/DisplayXRMediaPlayer-*.pkg
 
       - name: Attach .pkg to GitHub release on tag
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: _package/DisplayXRMediaPlayer-*.pkg
