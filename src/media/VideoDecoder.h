@@ -39,6 +39,13 @@ public:
     void TogglePaused() { paused_.store(!paused_.load()); }
     bool Paused() const { return paused_.load(); }
 
+    // Loop toggle. When off (default), the decoder holds the last frame at EOF and
+    // reports Ended(); when on, it seeks back to the start. Read by the decode thread.
+    void SetLoop(bool v) { loopEnabled_.store(v); }
+    void ToggleLoop() { loopEnabled_.store(!loopEnabled_.load()); }
+    bool Loop() const { return loopEnabled_.load(); }
+    bool Ended() const { return ended_.load(); }   // reached EOF with loop disabled
+
     // Seek to `seconds` (clamped to [0, duration]). Thread-safe: the decode thread
     // performs the actual av_seek_frame on its next iteration, even while paused
     // (it decodes + publishes one frame at the new position so the view updates).
@@ -71,6 +78,8 @@ private:
     std::thread thread_;
     std::atomic<bool> stop_{false};
     std::atomic<bool> paused_{false};
+    std::atomic<bool> loopEnabled_{false};     // off by default: play once, hold last frame
+    std::atomic<bool> ended_{false};           // hit EOF with looping disabled
     std::atomic<double> seekRequest_{-1.0};   // target seconds, <0 = none pending
     std::atomic<double> positionSec_{0.0};     // last published frame's PTS
     double durationSec_ = 0.0;                  // set in Open()

@@ -6,10 +6,12 @@
 #include "media/MediaSource.h"
 #include "ui/Hud.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 
 #include <SDL3/SDL.h>   // SDL_ShowOpenFileDialog (Tier-0 native file dialog)
 
@@ -33,6 +35,13 @@ constexpr float kConvergenceMax = 0.05f;
 // where the cursor is and clicks align across both eyes. (A small negative value would
 // float it toward the viewer per PRD §9, but that offsets the perceived hit target.)
 constexpr float kHudDisparity = 0.0f;
+
+// Auto-hide / slideshow timing.
+constexpr double kIdleHideSeconds = 5.0;    // fade the UI out after this much inactivity
+constexpr double kFadeSeconds = 0.20;       // UI fade in/out duration
+constexpr double kToastFadeSeconds = 0.30;  // toast fade in/out duration
+constexpr double kStillSeconds = 5.0;       // slideshow: seconds to hold a still image
+constexpr double kTransitionSeconds = 0.40; // slideshow: dip-to-black half-duration
 
 // Per-eye display aspect (width/height): full SBS packs two eyes across the width
 // (each eye half-width); half-SBS and mono use the full frame width.
@@ -87,9 +96,31 @@ bool App::Initialize(const char* mediaPath) {
     renderer_.SetTransparentLetterbox(xr_.TransparentBackground());
 
     // Load a stereo image or video if one was given; otherwise the loop falls back
-    // to the RED|BLUE L/R test pattern (and the user can Open one at runtime).
+    // to the RED|BLUE L/R test pattern (and the user can Open one at runtime). The
+    // argument may be a single file OR a folder — for a folder we load the first
+    // supported asset (sorted), and LoadMedia builds the prev/next list from it.
     if (mediaPath && *mediaPath) {
-        LoadMedia(mediaPath);
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if (fs::is_directory(fs::path(mediaPath), ec) && !ec) {
+            std::vector<std::string> files;
+            for (fs::directory_iterator it(mediaPath, ec), end; !ec && it != end;
+                 it.increment(ec)) {
+                std::error_code fe;
+                if (!it->is_regular_file(fe) || fe) continue;
+                const std::string s = it->path().string();
+                if (MediaSource::IsSupported(s)) files.push_back(s);
+            }
+            std::sort(files.begin(), files.end());
+            if (!files.empty()) {
+                LOG_INFO("Folder '%s': %zu asset(s), opening first", mediaPath, files.size());
+                LoadMedia(files.front());
+            } else {
+                LOG_WARN("No supported media in folder '%s'", mediaPath);
+            }
+        } else {
+            LoadMedia(mediaPath);
+        }
     }
     if (!hasMedia_) {
         LOG_INFO("No media loaded — showing RED|BLUE L/R test pattern");
@@ -123,7 +154,12 @@ int App::Run() {
     // prove convergence/swap without keystrokes). Interactive keys still apply on top.
     if (const char* c = std::getenv("MEDIAPLAYER_CONV")) convergence_ = (float)std::atof(c);
     if (const char* s = std::getenv("MEDIAPLAYER_SWAP")) swapEyes_ = (*s && *s != '0');
-    fpsWindowStart_ = std::chrono::steady_clock::now();
+    const auto bootNow = std::chrono::steady_clock::now();
+    fpsWindowStart_ = bootNow;
+    lastFrameTime_ = bootNow;
+    lastActivity_ = bootNow;   // UI starts visible, then fades after the idle timeout
+    if (const char* fs = std::getenv("MEDIAPLAYER_FULLSCREEN"); fs && *fs && *fs != '0')
+        window_.ToggleFullscreen();
 
     // Render during the macOS modal resize loop too, for continuous live resize.
     window_.SetLiveResizeCallback([this]() { RenderOneFrame(); });
@@ -131,30 +167,47 @@ int App::Run() {
     bool keepRunning = true;
     while (keepRunning && !xr_.ExitRequested()) {
         keepRunning = window_.PumpEvents();
-        if (window_.TakeCycleModeRequest()) xr_.RequestNextMode();   // 'V'
-        if (window_.TakeToggleHudRequest()) {                        // SHIFT+TAB
+        const auto nowT = std::chrono::steady_clock::now();
+        bool activity = window_.TakeMouseActivity();   // any input revives the UI
+        if (window_.TakeCycleModeRequest()) { xr_.RequestNextMode(); activity = true; }  // 'V'
+        if (window_.TakeToggleHudRequest()) {                        // SHIFT+TAB (master)
             showHud_ = !showHud_;
             LOG_INFO("HUD %s", showHud_ ? "on" : "off");
+            activity = true;
         }
         // M4 transport / stereo controls.
-        if (const int steps = window_.TakeConvergenceSteps(); steps != 0) {  // '[' / ']'
+        if (const int steps = window_.TakeConvergenceSteps(); steps != 0) {  // '-' / '='
             convergence_ += steps * kConvergenceStep;
             if (convergence_ > kConvergenceMax) convergence_ = kConvergenceMax;
             if (convergence_ < -kConvergenceMax) convergence_ = -kConvergenceMax;
             LOG_INFO("convergence=%+.3f", convergence_);
+            char t[48];
+            std::snprintf(t, sizeof(t), "Convergence %+.1f%%", convergence_ * 100.0f);
+            ShowToast(t);
+            activity = true;
         }
-        if (window_.TakeResetConvergence()) {                         // '\'
+        if (window_.TakeResetConvergence()) {                         // '0'
             convergence_ = 0.0f;
             LOG_INFO("convergence reset");
+            ShowToast("Convergence reset");
+            activity = true;
         }
         if (window_.TakeSwapEyesRequest()) {                          // 'X'
             swapEyes_ = !swapEyes_;
             LOG_INFO("swap eyes %s", swapEyes_ ? "on" : "off");
+            activity = true;
         }
-        if (window_.TakeTogglePauseRequest() && isVideo_) {           // Space
-            video_.TogglePaused();
-            LOG_INFO("playback %s", video_.Paused() ? "paused" : "playing");
+        if (window_.TakeTogglePauseRequest()) { TogglePlayback(); activity = true; }  // Space
+        if (window_.TakePrevMediaRequest()) { RequestNavTransition(-1); activity = true; }  // Left
+        if (window_.TakeNextMediaRequest()) { RequestNavTransition(+1); activity = true; }  // Right
+        if (window_.TakeToggleSlideshowRequest()) { ToggleSlideshow(); activity = true; } // 'S'
+        if (window_.TakeMouseLeft()) {
+            // Cursor left the window — drop the UI now (push idle past the hide threshold).
+            lastActivity_ =
+                nowT - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                           std::chrono::duration<double>(kIdleHideSeconds + 1.0));
         }
+        if (activity) lastActivity_ = nowT;
         xr_.PollEvents();
 
         // Open-file results: the workspace picker completion (drained by PollEvents)
@@ -196,15 +249,22 @@ void App::RenderOneFrame() {
     inRenderFrame_ = true;
     struct Guard { bool& f; ~Guard() { f = false; } } guard{inRenderFrame_};
 
+    // Advance UI fades + the slideshow machine (may swap media at a fade's mid-black).
+    TickUi();
+
     if (startMode_ >= 0 && !startModeRequested_) {
         xr_.RequestMode((uint32_t)startMode_);
         startModeRequested_ = true;
     }
 
-    // Pull the latest decoded video frame (if any) and upload it.
+    // Pull the latest decoded video frame (if any) and upload its YUV planes — the GPU
+    // does the colour convert + downscale, so no swscale ran on the decode thread.
     if (isVideo_) {
         if (const FrameRing::Frame* vf = video_.Ring().AcquireLatest()) {
-            renderer_.UploadTexture(vf->pixels.data(), (uint32_t)vf->width, (uint32_t)vf->height);
+            const bool i420 = (vf->format == PixFormat::I420);
+            renderer_.UploadYUV(vf->plane[0].data(), vf->plane[1].data(),
+                                i420 ? vf->plane[2].data() : nullptr, (uint32_t)vf->width,
+                                (uint32_t)vf->height, i420 ? 0 : 1, vf->fullRange);
         }
     }
 
@@ -289,10 +349,22 @@ void App::RenderOneFrame() {
         }
     }
 
-    // Window-space HUD overlay (SHIFT+TAB): the ImGui transport bar floating just in
-    // front of the image, or the CPU text HUD if ImGui is unavailable.
+    // Window-space HUD overlay: the ImGui UI (top bar + transport + toast + slideshow
+    // dip) covering the whole window, or the CPU text HUD if ImGui is unavailable. The
+    // ImGui path renders whenever anything is visible (fade / toast / transition); the
+    // text fallback follows the SHIFT+TAB master toggle.
     XrSession::HudSubmit hud;
-    if (showHud_ && frame.shouldRender && xr_.HasHud()) {
+    const bool imguiReady = imgui_.Ready();
+    // While the master toggle is on, keep submitting the (full-window, mostly-transparent)
+    // HUD layer every frame so auto-hide is driven purely by alpha — no layer on/off that
+    // could flicker or be held stale by the compositor. Stop only when master-off and
+    // nothing transient (toast / slideshow dip) needs to show.
+    const bool wantHud =
+        frame.shouldRender && xr_.HasHud() &&
+        (imguiReady ? (showHud_ || fadeAlpha_ > 0.001f || toastAlpha_ > 0.001f ||
+                       transitionAlpha_ > 0.001f)
+                    : showHud_);
+    if (wantHud) {
         uint32_t cw = 0, ch = 0;
         window_.PixelSize(cw, ch);
         const float hudAR = (float)xr_.HudWidth() / (float)xr_.HudHeight();
@@ -300,13 +372,14 @@ void App::RenderOneFrame() {
 
         uint32_t hudIdx = 0;
         if (xr_.AcquireHudImage(hudIdx)) {
-            if (imgui_.Ready()) {
-                // Transport bar: bottom-center, aspect-preserving, floats toward viewer.
+            if (imguiReady) {
+                // Full-window layer: ImGui positions the bars within the canvas; the
+                // runtime composites it 1:1 over the content at screen depth.
                 hud.enabled = true;
-                hud.width = 0.70f;
-                hud.height = hud.width * winAR / hudAR;
-                hud.x = 0.5f * (1.0f - hud.width);
-                hud.y = 1.0f - hud.height - 0.04f;
+                hud.x = 0.0f;
+                hud.y = 0.0f;
+                hud.width = 1.0f;
+                hud.height = 1.0f;
                 hud.disparity = kHudDisparity;
 
                 uint32_t pw = 0, phh = 0;
@@ -362,88 +435,201 @@ void App::RenderOneFrame() {
     UpdateFps();
 }
 
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+namespace {
+constexpr float kPi = 3.14159265358979f;  // IM_PI lives in imgui_internal.h; keep our own
+enum class Icon { Play, Pause, Loop, Slideshow };
+
+// A borderless icon button: an invisible hit-target with a hand-drawn glyph centered
+// in it (no icon font needed). `active` tints it with the accent color (toggle-on);
+// hover brightens. Returns true on click. Glyph colors go through GetColorU32 so the
+// surrounding ImGui Alpha (the auto-hide fade) applies for free.
+bool IconButton(const char* id, Icon kind, float size, bool active = false) {
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(size, size));
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();   // mouse held down — immediate press feedback
+    const ImVec2 c(p.x + size * 0.5f, p.y + size * 0.5f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Toggle state (accent) must read THROUGH hover — hover/press only brighten the base,
+    // they don't replace the accent, so an active toggle stays clearly cyan when hovered.
+    ImVec4 col = active ? ImVec4(0.20f, 0.65f, 1.00f, 1.0f)       // toggled on  -> accent
+                        : ImVec4(0.88f, 0.91f, 0.95f, 1.0f);      // off         -> light grey
+    if (held) col = active ? ImVec4(0.55f, 0.85f, 1.00f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+    else if (hovered) col = active ? ImVec4(0.42f, 0.78f, 1.00f, 1.0f)
+                                   : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+    const ImU32 u = ImGui::GetColorU32(col);
+    const float r = size * 0.30f;
+    const float th = size * 0.11f;
+
+    switch (kind) {
+        case Icon::Play: {
+            const float h = size * 0.30f;
+            dl->AddTriangleFilled(ImVec2(c.x - h * 0.7f, c.y - h),
+                                  ImVec2(c.x - h * 0.7f, c.y + h),
+                                  ImVec2(c.x + h, c.y), u);
+            break;
+        }
+        case Icon::Pause: {
+            const float bw = size * 0.13f, bh = size * 0.30f, gap = size * 0.10f;
+            dl->AddRectFilled(ImVec2(c.x - gap - bw, c.y - bh), ImVec2(c.x - gap, c.y + bh), u,
+                              th * 0.4f);
+            dl->AddRectFilled(ImVec2(c.x + gap, c.y - bh), ImVec2(c.x + gap + bw, c.y + bh), u,
+                              th * 0.4f);
+            break;
+        }
+        case Icon::Loop: {
+            // Two arcs forming a near-circle, with a small arrowhead at each open end.
+            dl->PathArcTo(c, r, kPi * 0.30f, kPi * 0.95f);
+            dl->PathStroke(u, 0, th);
+            dl->PathArcTo(c, r, kPi * 1.30f, kPi * 1.95f);
+            dl->PathStroke(u, 0, th);
+            const float ah = size * 0.13f;
+            const ImVec2 e1(c.x + r * std::cos(kPi * 0.95f), c.y + r * std::sin(kPi * 0.95f));
+            dl->AddTriangleFilled(ImVec2(e1.x - ah, e1.y), ImVec2(e1.x + ah * 0.4f, e1.y - ah),
+                                  ImVec2(e1.x + ah * 0.4f, e1.y + ah), u);
+            const ImVec2 e2(c.x + r * std::cos(kPi * 1.95f), c.y + r * std::sin(kPi * 1.95f));
+            dl->AddTriangleFilled(ImVec2(e2.x + ah, e2.y), ImVec2(e2.x - ah * 0.4f, e2.y - ah),
+                                  ImVec2(e2.x - ah * 0.4f, e2.y + ah), u);
+            break;
+        }
+        case Icon::Slideshow: {
+            // A photo frame with a small play triangle inside (auto-advancing stills).
+            dl->AddRect(ImVec2(c.x - r, c.y - r * 0.78f), ImVec2(c.x + r, c.y + r * 0.78f), u,
+                        size * 0.10f, 0, th * 0.8f);
+            const float h = size * 0.16f;
+            dl->AddTriangleFilled(ImVec2(c.x - h * 0.5f, c.y - h), ImVec2(c.x - h * 0.5f, c.y + h),
+                                  ImVec2(c.x + h, c.y), u);
+            break;
+        }
+    }
+    return ImGui::IsItemClicked();
+}
+}  // namespace
+#endif
+
 void App::BuildTransportUI() {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
-    ImGui::SetNextWindowSize(io.DisplaySize);
-    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
-                                   ImGuiWindowFlags_NoBringToFrontOnFocus;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14.0f);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.06f, 0.08f, 0.70f));
-    if (ImGui::Begin("##transport", nullptr, flags)) {
-        // Row 1: open + transport + stereo toggles.
-        ImGui::BeginDisabled(openFilePending_);
-        if (ImGui::Button("Open", ImVec2(90, 0))) RequestOpenFile();
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (isVideo_) {
-            if (ImGui::Button(video_.Paused() ? "Play" : "Pause", ImVec2(120, 0)))
-                video_.TogglePaused();
-            ImGui::SameLine();
-        }
-        ImGui::Checkbox("Swap L/R", &swapEyes_);
-        ImGui::SameLine();
-        if (ImGui::Button("Fullscreen", ImVec2(140, 0))) window_.ToggleFullscreen();
-        ImGui::SameLine();
-        if (ImGui::Button("Reset conv", ImVec2(140, 0))) convergence_ = 0.0f;
+    const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    const ImGuiWindowFlags pill = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                                  ImGuiWindowFlags_NoBringToFrontOnFocus |
+                                  ImGuiWindowFlags_AlwaysAutoResize;
 
-        // Row 2: scrubber (video only). Position tracks playback except while dragging.
+    // The bars fade in/out together with the idle timer.
+    if (fadeAlpha_ > 0.001f) {
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fadeAlpha_);
+        const float iconSz = ImGui::GetFrameHeight();
+
+        // --- Top window-space bar: full width, flush to the top of the window.
+        //     Open / Mode on the left, Slideshow / Close on the right. ---
+        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
+        const ImGuiWindowFlags topbar = pill & ~ImGuiWindowFlags_AlwaysAutoResize;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);  // flat bar, flush to edges
+        if (ImGui::Begin("##wsui_top", nullptr, topbar)) {
+            ImGui::BeginDisabled(openFilePending_);
+            if (ImGui::Button("Open")) RequestOpenFile();
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            char modeLabel[96];
+            std::snprintf(modeLabel, sizeof(modeLabel), "Mode: %s", xr_.ActiveModeName());
+            if (ImGui::Button(modeLabel)) xr_.RequestNextMode();
+            // Current filename, centered in the bar.
+            if (!currentMediaPath_.empty()) {
+                const std::string name =
+                    std::filesystem::path(currentMediaPath_).filename().string();
+                const float tw = ImGui::CalcTextSize(name.c_str()).x;
+                ImGui::SameLine();
+                ImGui::SetCursorPosX((ImGui::GetWindowWidth() - tw) * 0.5f);
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(name.c_str());
+            }
+            // Right-align the slideshow toggle. (Close the app via ESC or the window's
+            // own close button — no in-UI X needed.)
+            ImGui::SameLine(ImGui::GetWindowWidth() - iconSz -
+                            ImGui::GetStyle().WindowPadding.x);
+            if (IconButton("##slideshow", Icon::Slideshow, iconSz, slideshowActive_))
+                ToggleSlideshow();
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+
+        // --- Bottom transport: play/pause + scrubber + loop (video only) ---
         if (isVideo_ && video_.DurationSeconds() > 0.0) {
-            const float dur = (float)video_.DurationSeconds();
-            const float pos = (float)video_.PositionSeconds();
-            // Track playback into the knob, but not while dragging, and not while a seek
-            // we issued is still landing — otherwise the knob snaps back to the stale
-            // position on release. scrubTarget_ clears once the decode reaches it.
-            if (!scrubActive_) {
-                if (scrubTarget_ >= 0.0f) {
-                    if (std::fabs(pos - scrubTarget_) < 0.3f) scrubTarget_ = -1.0f;
-                } else {
-                    scrubValue_ = pos;
+            ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.955f), ImGuiCond_Always,
+                                    ImVec2(0.5f, 1.0f));
+            ImGui::SetNextWindowSize(ImVec2(W * 0.8f, 0.0f), ImGuiCond_Always);
+            const ImGuiWindowFlags bar = pill & ~ImGuiWindowFlags_AlwaysAutoResize;
+            if (ImGui::Begin("##transport", nullptr, bar)) {
+                const float dur = (float)video_.DurationSeconds();
+                const float pos = (float)video_.PositionSeconds();
+                // Track playback into the knob, but not while dragging, and not while a
+                // seek we issued is still landing — else it snaps back on release.
+                if (!scrubActive_) {
+                    if (scrubTarget_ >= 0.0f) {
+                        if (std::fabs(pos - scrubTarget_) < 0.3f) scrubTarget_ = -1.0f;
+                    } else {
+                        scrubValue_ = pos;
+                    }
                 }
-            }
-            auto mmss = [](double s, char* out, size_t n) {
-                if (s < 0.0) s = 0.0;
-                const int t = (int)s;
-                std::snprintf(out, n, "%d:%02d", t / 60, t % 60);
-            };
-            char cur[16], tot[16];
-            mmss(scrubValue_, cur, sizeof(cur));
-            mmss(dur, tot, sizeof(tot));
-            ImGui::Text("%s", cur);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-ImGui::CalcTextSize(tot).x - 16.0f);
-            const bool changed = ImGui::SliderFloat("##scrub", &scrubValue_, 0.0f, dur, "");
-            scrubActive_ = ImGui::IsItemActive();
-            if (changed) {
-                video_.Seek(scrubValue_);
-                scrubTarget_ = scrubValue_;  // hold the knob here until the decode lands
-            }
-            ImGui::SameLine();
-            ImGui::Text("%s", tot);
-        }
+                auto mmss = [](double s, char* out, size_t n) {
+                    if (s < 0.0) s = 0.0;
+                    const int t = (int)s;
+                    std::snprintf(out, n, "%d:%02d", t / 60, t % 60);
+                };
+                char cur[16], tot[16];
+                mmss(scrubValue_, cur, sizeof(cur));
+                mmss(dur, tot, sizeof(tot));
 
-        // Row 3: convergence slider (full width).
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::SliderFloat("##conv", &convergence_, -kConvergenceMax, kConvergenceMax,
-                           "convergence  %+.3f");
-
-        // Row 4: format / stats.
-        if (isVideo_) {
-            ImGui::Text("%.0f FPS   %s   %dx%d %s   %s/%s", fps_, xr_.ActiveModeName(),
-                        mediaW_, mediaH_, MediaSource::LayoutName(layout_),
-                        video_.CodecName(), video_.BackendName());
-        } else if (hasMedia_) {
-            ImGui::Text("%.0f FPS   %s   %dx%d %s", fps_, xr_.ActiveModeName(), mediaW_,
-                        mediaH_, MediaSource::LayoutName(layout_));
-        } else {
-            ImGui::Text("%.0f FPS   %s   RED|BLUE test", fps_, xr_.ActiveModeName());
+                const bool paused = video_.Paused() || video_.Ended();
+                if (IconButton("##playpause", paused ? Icon::Play : Icon::Pause, iconSz))
+                    TogglePlayback();
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
+                ImGui::Text("%s", cur);
+                ImGui::SameLine();
+                // Leave room on the right for the total-time label and the loop icon.
+                const float rightW = ImGui::CalcTextSize(tot).x + iconSz + 28.0f;
+                ImGui::SetNextItemWidth(-rightW);
+                const bool changed = ImGui::SliderFloat("##scrub", &scrubValue_, 0.0f, dur, "");
+                scrubActive_ = ImGui::IsItemActive();
+                if (changed) {
+                    video_.Seek(scrubValue_);
+                    scrubTarget_ = scrubValue_;  // hold the knob until the decode lands
+                }
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
+                ImGui::Text("%s", tot);
+                ImGui::SameLine();
+                if (IconButton("##loop", Icon::Loop, iconSz, video_.Loop()))
+                    video_.ToggleLoop();
+            }
+            ImGui::End();
         }
+        ImGui::PopStyleVar();
     }
-    ImGui::End();
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
+
+    // --- Toast (convergence readout, nav filename): own alpha, shows even when hidden ---
+    if (toastAlpha_ > 0.001f && !toastText_.empty()) {
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, toastAlpha_);
+        ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.14f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        if (ImGui::Begin("##toast", nullptr, pill)) {
+            ImGui::TextUnformatted(toastText_.c_str());
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
+
+    // --- Slideshow dip-to-black: a full-canvas overlay above everything. Because the
+    //     HUD layer composites on top of the content layer, this dims the whole view. ---
+    if (transitionAlpha_ > 0.001f) {
+        const int a = (int)(std::min(1.0f, transitionAlpha_) * 255.0f + 0.5f);
+        ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2(W, H),
+                                                      IM_COL32(0, 0, 0, a));
+    }
 #endif
 }
 
@@ -489,8 +675,13 @@ bool App::LoadMedia(const std::string& path) {
         mediaW_ = video_.Width();
         mediaH_ = video_.Height();
         contentAspect_ = PerEyeAspect(info.layout, video_.Width(), video_.Height());
+        // In slideshow, force play-once so the clip can end and advance, regardless of
+        // the user's manual loop preference.
+        if (slideshowActive_) video_.SetLoop(false);
         LOG_INFO("Playing %s video (%s), per-eye aspect %.3f",
                  MediaSource::LayoutName(info.layout), path.c_str(), contentAspect_);
+        currentMediaPath_ = path;
+        RebuildFolderList(path);
         return true;
     }
     DecodedImage img = ImageDecoder::Load(path);
@@ -510,6 +701,8 @@ bool App::LoadMedia(const std::string& path) {
     contentAspect_ = PerEyeAspect(imgInfo.layout, img.width, img.height);
     LOG_INFO("Displaying %s image (%s), per-eye aspect %.3f",
              MediaSource::LayoutName(imgInfo.layout), path.c_str(), contentAspect_);
+    currentMediaPath_ = path;
+    RebuildFolderList(path);
     return true;
 }
 
@@ -518,8 +711,155 @@ void App::ReloadMedia(const std::string& path) {
     isVideo_ = false;
     scrubValue_ = 0.0f;
     scrubActive_ = false;
+    scrubTarget_ = -1.0f;
+    slideshowImageElapsed_ = 0.0;
     if (!LoadMedia(path)) {
         LOG_WARN("Open: keeping previous view (failed to open '%s')", path.c_str());
+    }
+}
+
+void App::RebuildFolderList(std::string path) {
+    namespace fs = std::filesystem;
+    folderFiles_.clear();   // frees any string `path` might have aliased — it's a copy now
+    folderIndex_ = 0;
+    std::error_code ec;
+    fs::path p = fs::absolute(fs::path(path), ec);
+    if (ec) p = fs::path(path);
+    for (fs::directory_iterator it(p.parent_path(), ec), end; !ec && it != end;
+         it.increment(ec)) {
+        std::error_code fe;
+        if (!it->is_regular_file(fe) || fe) continue;
+        const std::string s = it->path().string();
+        if (MediaSource::IsSupported(s)) folderFiles_.push_back(s);
+    }
+    std::sort(folderFiles_.begin(), folderFiles_.end());
+    for (size_t i = 0; i < folderFiles_.size(); ++i) {
+        std::error_code e2;
+        if (fs::equivalent(fs::path(folderFiles_[i]), p, e2) && !e2) {
+            folderIndex_ = i;
+            break;
+        }
+    }
+    LOG_INFO("Folder: %zu asset(s), current index %zu", folderFiles_.size(), folderIndex_);
+}
+
+void App::NavigateMedia(int delta) {
+    const size_t n = folderFiles_.size();
+    if (n < 2) return;  // nothing to step to (LoadMedia rebuilt folderIndex_)
+    const int wrapped = ((delta % (int)n) + (int)n) % (int)n;
+    folderIndex_ = (folderIndex_ + (size_t)wrapped) % n;
+    ReloadMedia(folderFiles_[folderIndex_]);  // sets currentMediaPath_ + rebuilds list
+    // (filename is shown persistently in the top bar — no toast needed here.)
+}
+
+void App::RequestNavTransition(int delta) {
+    if (folderFiles_.size() < 2) return;
+    if (transition_ != Transition::Playing) return;  // already mid-transition — ignore
+    pendingNavDelta_ = delta;
+    transition_ = Transition::FadeOut;
+}
+
+void App::ShowToast(const std::string& msg) {
+    toastText_ = msg;
+    toastExpiry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+}
+
+void App::ToggleSlideshow() {
+    slideshowActive_ = !slideshowActive_;
+    slideshowImageElapsed_ = 0.0;
+    transition_ = Transition::Playing;
+    if (slideshowActive_ && isVideo_) video_.SetLoop(false);  // play once, then advance
+    LOG_INFO("slideshow %s", slideshowActive_ ? "on" : "off");
+    ShowToast(slideshowActive_ ? "Slideshow on" : "Slideshow off");
+}
+
+void App::TogglePlayback() {
+    if (!isVideo_) return;
+    if (video_.Ended()) {
+        video_.Seek(0.0);          // restart a clip that already ran to the end
+        video_.SetPaused(false);
+    } else {
+        video_.TogglePaused();
+    }
+    LOG_INFO("playback %s", video_.Paused() ? "paused" : "playing");
+}
+
+void App::TickUi() {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    double dt = duration<double>(now - lastFrameTime_).count();
+    lastFrameTime_ = now;
+    if (dt < 0.0 || dt > 0.25) dt = 0.0;  // ignore the first frame and big hitches
+
+    // Real mouse movement (only while the cursor is in the window): compare against the
+    // resting position so a jittery sensor near rest doesn't count. A move > a few px
+    // wakes the UI and re-bases the resting point.
+    if (window_.MouseInWindow()) {
+        float mx = 0.0f, my = 0.0f;
+        SDL_GetMouseState(&mx, &my);
+        if (restMouseX_ < 0.0f ||
+            std::fabs(mx - restMouseX_) + std::fabs(my - restMouseY_) > 3.0f) {
+            restMouseX_ = mx;
+            restMouseY_ = my;
+            lastActivity_ = now;
+        }
+    }
+    // Dragging the scrubber counts as activity even with the cursor held still.
+    if (scrubActive_) lastActivity_ = now;
+    // Keep the UI pinned visible until a pending HUD dump lands (diagnostic/screenshot).
+    if (dumpHudPath_ && !dumpedHud_) lastActivity_ = now;
+
+    // Auto-hide fade: visible while the master toggle is on and we're not idle.
+    const double idle = duration<double>(now - lastActivity_).count();
+    const bool wantVisible = showHud_ && idle < kIdleHideSeconds;
+    const float fadeTarget = wantVisible ? 1.0f : 0.0f;
+    const float fadeStep = (float)(dt / kFadeSeconds);
+    if (fadeAlpha_ < fadeTarget) fadeAlpha_ = std::min(fadeTarget, fadeAlpha_ + fadeStep);
+    else if (fadeAlpha_ > fadeTarget) fadeAlpha_ = std::max(fadeTarget, fadeAlpha_ - fadeStep);
+
+    // Toast fade: ease toward 1 while live, toward 0 once expired; clear when gone.
+    const bool toastLive = !toastText_.empty() && now < toastExpiry_;
+    const float toastTarget = toastLive ? 1.0f : 0.0f;
+    const float toastStep = (float)(dt / kToastFadeSeconds);
+    if (toastAlpha_ < toastTarget) toastAlpha_ = std::min(toastTarget, toastAlpha_ + toastStep);
+    else if (toastAlpha_ > toastTarget) toastAlpha_ = std::max(toastTarget, toastAlpha_ - toastStep);
+    if (!toastLive && toastAlpha_ <= 0.001f) toastText_.clear();
+
+    // Dip-to-black transition machine, shared by the slideshow and manual ←/→ nav.
+    // Slideshow auto-starts a transition when a still has shown long enough / a video
+    // ended; manual nav starts one via RequestNavTransition(). The swap happens at full
+    // black. pendingNavDelta_ carries the step (+1 next, -1 prev).
+    const float transStep = (float)(dt / kTransitionSeconds);
+    if (slideshowActive_ && transition_ == Transition::Playing && pendingNavDelta_ == 0) {
+        bool advance = false;
+        if (isVideo_) {
+            advance = video_.Ended();
+        } else if (hasMedia_) {
+            slideshowImageElapsed_ += dt;
+            advance = slideshowImageElapsed_ >= kStillSeconds;
+        }
+        if (advance && folderFiles_.size() > 1) {
+            pendingNavDelta_ = +1;
+            transition_ = Transition::FadeOut;
+        }
+    }
+    switch (transition_) {
+        case Transition::Playing:
+            break;
+        case Transition::FadeOut:
+            transitionAlpha_ = std::min(1.0f, transitionAlpha_ + transStep);
+            if (transitionAlpha_ >= 1.0f) {
+                if (pendingNavDelta_ != 0) {
+                    NavigateMedia(pendingNavDelta_);  // swap while fully black
+                    pendingNavDelta_ = 0;
+                }
+                transition_ = Transition::FadeIn;
+            }
+            break;
+        case Transition::FadeIn:
+            transitionAlpha_ = std::max(0.0f, transitionAlpha_ - transStep);
+            if (transitionAlpha_ <= 0.0f) transition_ = Transition::Playing;
+            break;
     }
 }
 

@@ -56,6 +56,12 @@ MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int ima
     return info;
 }
 
+bool MediaSource::IsSupported(const std::string& path) {
+    const std::string lower = Lower(path);
+    return EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png") ||
+           EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov");
+}
+
 const char* MediaSource::KindName(MediaKind k) {
     switch (k) {
         case MediaKind::Image: return "image";

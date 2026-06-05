@@ -13,6 +13,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "xr/XrSession.h"  // for XrSession::ViewRect
@@ -67,10 +68,17 @@ public:
     bool ClearViews(uint32_t imageIndex, const ClearColor* colors,
                     const XrSession::ViewRect* rects, uint32_t viewCount);
 
-    // Upload an RGBA8 image as the source texture for DrawViews. Replaces any prior
-    // texture. Safe to call once at load time.
+    // Upload an RGBA8 image as the source for DrawViews (images / test patterns).
     bool UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t height);
-    bool HasTexture() const { return textureView_ != VK_NULL_HANDLE; }
+
+    // Upload a planar YUV frame (the video decoder's native output): the shader does the
+    // BT.709 convert AND the downscale via sampling, so no swscale runs on the decode
+    // thread. format: 0 = I420 (plane1=U, plane2=V), 1 = NV12 (plane1=interleaved UV,
+    // plane2 ignored). Chroma planes are (w+1)/2 x (h+1)/2.
+    bool UploadYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2,
+                   uint32_t width, uint32_t height, int format, bool fullRange);
+
+    bool HasTexture() const { return planes_[0].view != VK_NULL_HANDLE; }
 
     // Draw the uploaded texture into each view's tile, sampling the UV sub-region in
     // `uvs[v]`. Clears the rest of the image to black. Blocks until the GPU finishes.
@@ -110,18 +118,34 @@ private:
     VkDescriptorSet descSet_ = VK_NULL_HANDLE;
     VkSampler sampler_ = VK_NULL_HANDLE;
 
-    // Source texture (the whole SBS frame; views sample sub-regions). Reused across
-    // video frames — reallocated only when the dimensions change.
-    VkImage textureImage_ = VK_NULL_HANDLE;
-    VkDeviceMemory textureMemory_ = VK_NULL_HANDLE;
-    VkImageView textureView_ = VK_NULL_HANDLE;
-    uint32_t texW_ = 0;
-    uint32_t texH_ = 0;
-    bool textureInitialized_ = false;  // false right after (re)create -> first barrier from UNDEFINED
+    // Up to three source planes. RGBA images use plane 0 only (mode 0); video uses Y +
+    // chroma (mode 1 = I420, mode 2 = NV12). Each is reused across frames, reallocated
+    // only when its size/format changes. Planes a mode doesn't sample bind a 1x1 dummy.
+    struct Plane {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        uint32_t w = 0, h = 0;
+        VkFormat fmt = VK_FORMAT_UNDEFINED;
+        bool initialized = false;  // false right after (re)create -> barrier from UNDEFINED
+    } planes_[3];
+    int sourceMode_ = 0;             // 0 RGBA, 1 I420, 2 NV12 (pushed to the shader)
+    float sourceFullRange_ = 0.0f;
+    VkImage dummyImage_ = VK_NULL_HANDLE;       // 1x1, bound to unused plane slots
+    VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
+    VkImageView dummyView_ = VK_NULL_HANDLE;
     bool transparentLetterbox_ = false; // clear letterbox to alpha 0 (transparent-bg mode)
 
     bool CreatePipeline();
     uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
+    // Record plane (re)creation + a staged copy into `cmd` (already recording). The
+    // staging buffer/memory is appended to `staging` for the caller to free post-submit.
+    // `recreated` is set when the image view changed (so the descriptor needs rebinding).
+    bool RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8_t* data, uint32_t w,
+                           uint32_t h, VkFormat fmt, uint32_t bytesPerTexel, bool& recreated,
+                           std::vector<std::pair<VkBuffer, VkDeviceMemory>>& staging);
+    bool EnsureDummy();
+    void BindDescriptors();          // point the 3 sampler bindings at planes_/dummy
     void DestroyTexture();
 };
 

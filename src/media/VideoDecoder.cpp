@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 
 #if defined(MEDIAPLAYER_WITH_FFMPEG)
@@ -33,17 +34,19 @@ struct HwFormatHook {
 struct VideoDecoder::Impl {
     AVFormatContext* fmt = nullptr;
     AVCodecContext* codec = nullptr;
-    SwsContext* sws = nullptr;
+    SwsContext* sws = nullptr;                  // only for the odd-format -> I420 fallback
     AVBufferRef* hwDevice = nullptr;            // hwaccel device (null = software decode)
     AVFrame* swFrame = nullptr;                 // download target for hardware frames
+    AVFrame* convFrame = nullptr;               // I420 fallback target (rare formats)
     enum AVPixelFormat hwPixFmt = AV_PIX_FMT_NONE;  // the decoder's GPU surface format
     HwFormatHook hook;                          // ctx->opaque for the get_format callback
     int videoStream = -1;
-    int swsW = 0, swsH = 0, swsFmt = -1;        // cached sws source params
+    int swsW = 0, swsH = 0, swsFmt = -1;        // cached sws source params (fallback)
 
     ~Impl() {
         if (sws) sws_freeContext(sws);
         if (swFrame) av_frame_free(&swFrame);
+        if (convFrame) av_frame_free(&convFrame);
         if (codec) avcodec_free_context(&codec);
         if (hwDevice) av_buffer_unref(&hwDevice);
         if (fmt) avformat_close_input(&fmt);
@@ -172,7 +175,11 @@ bool VideoDecoder::Open(const std::string& path) {
     impl_->codec = avcodec_alloc_context3(dec);
     avcodec_parameters_to_context(impl_->codec, st->codecpar);
     const bool wantHw = TryEnableHwAccel(dec);
-    if (!wantHw) impl_->codec->thread_count = 0;  // multithreaded software decode
+    // Always allow auto multithreading. Hardware decode ignores thread_count; but when a
+    // stream is too wide for the GPU (PickHwFormat falls back to software PER FRAME), this
+    // is what keeps that fallback multithreaded instead of crawling on one core — the case
+    // for 7680-wide SBS clips, where single-threaded software decode misses the budget.
+    impl_->codec->thread_count = 0;
 
     int rc = avcodec_open2(impl_->codec, dec, nullptr);
     if (rc < 0 && wantHw) {
@@ -202,6 +209,7 @@ bool VideoDecoder::Open(const std::string& path) {
                        : 0.0;
     positionSec_.store(0.0);
     seekRequest_.store(-1.0);
+    ended_.store(false);
     open_ = true;
     LOG_INFO("VideoDecoder: '%s' %dx%d codec=%s backend=%s dur=%.1fs", path.c_str(), width_,
              height_, codecName_, hwName_, durationSec_);
@@ -222,9 +230,21 @@ void VideoDecoder::DecodeLoop() {
     auto wallStart = clock::now();
     double firstPtsSec = -1.0;
 
-    // Download a HW frame if needed, convert to RGBA into the ring's write buffer (no
-    // Publish yet), and return its PTS in seconds (-1 unknown, -2 = drop/HW fail). The
-    // caller decides when to Publish (paced playback vs. immediate seek result).
+    // Copy one plane (stride-aware) into a tightly packed buffer.
+    auto copyPlane = [](std::vector<uint8_t>& d, const uint8_t* s, int stride, int wBytes, int h) {
+        d.resize((size_t)wBytes * h);
+        if (stride == wBytes) {
+            std::memcpy(d.data(), s, (size_t)wBytes * h);
+        } else {
+            for (int y = 0; y < h; ++y)
+                std::memcpy(d.data() + (size_t)y * wBytes, s + (size_t)y * stride, wBytes);
+        }
+    };
+
+    // Download a HW frame if needed, then hand the decoder's NATIVE planar YUV to the
+    // ring (no RGBA convert, no downscale — the GPU does both, off this thread). Returns
+    // PTS in seconds (-1 unknown, -2 = drop/HW fail). I420 (software) and NV12 (hw) are
+    // copied directly; any other format (10-bit, 4:2:2/4:4:4) is swscale'd to I420 first.
     auto fillFrame = [&](AVFrame* f) -> double {
         AVFrame* src = f;
         if (impl_->hwPixFmt != AV_PIX_FMT_NONE && f->format == impl_->hwPixFmt) {
@@ -236,25 +256,55 @@ void VideoDecoder::DecodeLoop() {
             }
             impl_->swFrame->pts = f->pts;
             impl_->swFrame->best_effort_timestamp = f->best_effort_timestamp;
+            impl_->swFrame->color_range = f->color_range;
             src = impl_->swFrame;
         }
-        if (!impl_->sws || impl_->swsW != src->width || impl_->swsH != src->height ||
-            impl_->swsFmt != src->format) {
-            if (impl_->sws) sws_freeContext(impl_->sws);
-            impl_->sws = sws_getContext(src->width, src->height, (AVPixelFormat)src->format,
-                                        src->width, src->height, AV_PIX_FMT_RGBA,
-                                        SWS_BILINEAR, nullptr, nullptr, nullptr);
-            impl_->swsW = src->width;
-            impl_->swsH = src->height;
-            impl_->swsFmt = src->format;
+
+        const AVPixelFormat sf = (AVPixelFormat)src->format;
+        AVFrame* yuv = src;
+        PixFormat outFmt;
+        if (sf == AV_PIX_FMT_YUV420P || sf == AV_PIX_FMT_YUVJ420P) {
+            outFmt = PixFormat::I420;
+        } else if (sf == AV_PIX_FMT_NV12) {
+            outFmt = PixFormat::NV12;
+        } else {
+            // Rare formats -> I420 (no scale) so the GPU path stays uniform.
+            if (!impl_->convFrame) impl_->convFrame = av_frame_alloc();
+            if (!impl_->sws || impl_->swsW != src->width || impl_->swsH != src->height ||
+                impl_->swsFmt != sf) {
+                if (impl_->sws) sws_freeContext(impl_->sws);
+                impl_->sws = sws_getContext(src->width, src->height, sf, src->width, src->height,
+                                            AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, nullptr, nullptr,
+                                            nullptr);
+                impl_->swsW = src->width;
+                impl_->swsH = src->height;
+                impl_->swsFmt = sf;
+                av_frame_unref(impl_->convFrame);
+                impl_->convFrame->format = AV_PIX_FMT_YUV420P;
+                impl_->convFrame->width = src->width;
+                impl_->convFrame->height = src->height;
+                av_frame_get_buffer(impl_->convFrame, 32);
+            }
+            sws_scale(impl_->sws, src->data, src->linesize, 0, src->height, impl_->convFrame->data,
+                      impl_->convFrame->linesize);
+            yuv = impl_->convFrame;
+            outFmt = PixFormat::I420;
         }
+
         FrameRing::Frame& dst = ring_.WriteBuffer();
-        dst.width = src->width;
-        dst.height = src->height;
-        dst.pixels.resize((size_t)src->width * src->height * 4);
-        uint8_t* dstData[4] = {dst.pixels.data(), nullptr, nullptr, nullptr};
-        int dstStride[4] = {src->width * 4, 0, 0, 0};
-        sws_scale(impl_->sws, src->data, src->linesize, 0, src->height, dstData, dstStride);
+        dst.width = yuv->width;
+        dst.height = yuv->height;
+        dst.format = outFmt;
+        dst.fullRange = (src->color_range == AVCOL_RANGE_JPEG) || sf == AV_PIX_FMT_YUVJ420P;
+        const int cw = (yuv->width + 1) / 2, ch = (yuv->height + 1) / 2;
+        copyPlane(dst.plane[0], yuv->data[0], yuv->linesize[0], yuv->width, yuv->height);
+        if (outFmt == PixFormat::I420) {
+            copyPlane(dst.plane[1], yuv->data[1], yuv->linesize[1], cw, ch);
+            copyPlane(dst.plane[2], yuv->data[2], yuv->linesize[2], cw, ch);
+        } else {  // NV12: a single interleaved chroma plane, cw*2 bytes per row
+            copyPlane(dst.plane[1], yuv->data[1], yuv->linesize[1], cw * 2, ch);
+            dst.plane[2].clear();
+        }
         const int64_t ticks = (src->best_effort_timestamp != AV_NOPTS_VALUE)
                                   ? src->best_effort_timestamp : src->pts;
         return (ticks != AV_NOPTS_VALUE) ? (double)ticks * timeBase : -1.0;
@@ -336,11 +386,18 @@ void VideoDecoder::DecodeLoop() {
 
         int r = av_read_frame(impl_->fmt, pkt);
         if (r < 0) {
-            // EOF (or error) -> loop back to the start.
-            av_seek_frame(impl_->fmt, impl_->videoStream, 0, AVSEEK_FLAG_BACKWARD);
-            avcodec_flush_buffers(impl_->codec);
-            firstPtsSec = -1.0;
-            wallStart = clock::now();
+            if (loopEnabled_.load()) {
+                // EOF (or error) -> loop back to the start.
+                av_seek_frame(impl_->fmt, impl_->videoStream, 0, AVSEEK_FLAG_BACKWARD);
+                avcodec_flush_buffers(impl_->codec);
+                firstPtsSec = -1.0;
+                wallStart = clock::now();
+            } else {
+                // Loop off: mark ended and pause, holding the last published frame. A
+                // Seek() (e.g. resume-from-end, or slideshow advance) clears `ended_`.
+                ended_.store(true);
+                paused_.store(true);
+            }
             continue;
         }
         if (pkt->stream_index != impl_->videoStream) {
@@ -376,6 +433,7 @@ void VideoDecoder::Seek(double seconds) {
     if (durationSec_ > 0.0 && seconds > durationSec_ - 0.1) seconds = durationSec_ - 0.1;
     if (seconds < 0.0) seconds = 0.0;
     LOG_DEBUG("VideoDecoder: seek request -> %.2fs (paused=%d)", seconds, (int)paused_.load());
+    ended_.store(false);   // a seek leaves the EOF/hold state
     seekRequest_.store(seconds);
 }
 

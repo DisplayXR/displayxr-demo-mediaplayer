@@ -53,12 +53,25 @@ public:
     bool TakeToggleHudRequest();
 
     // --- M4 transport / stereo controls (keyboard; ImGui adds pointer UI later) ---
-    // Net convergence steps since last read: `]` = +1, `[` = -1 (key-repeat counts),
+    // Net convergence steps since last read: `=` = +1, `-` = -1 (key-repeat counts),
     // reset to 0 on read. The caller scales each step into its parallax budget.
     int TakeConvergenceSteps();
-    bool TakeResetConvergence();   // `\` — convergence back to 0
+    bool TakeResetConvergence();   // `0` — convergence back to 0
     bool TakeSwapEyesRequest();    // `X` — toggle L/R eye assignment
     bool TakeTogglePauseRequest(); // Space — play/pause
+
+    // --- Folder navigation / slideshow ---
+    bool TakePrevMediaRequest();      // Left arrow — previous asset in the folder
+    bool TakeNextMediaRequest();      // Right arrow — next asset in the folder
+    bool TakeToggleSlideshowRequest(); // `S` — toggle slideshow ("diaporama")
+
+    // Discrete pointer activity (click / wheel / window-enter) since last read — wakes
+    // the auto-hide UI. Continuous motion is detected by polling (jitter-immune).
+    bool TakeMouseActivity();
+    // True once when the cursor left the window (auto-hide should drop the UI).
+    bool TakeMouseLeft();
+    // Is the cursor currently inside the window? (gates motion polling.)
+    bool MouseInWindow() const { return mouseInWindow_; }
 
     // Called to render a frame *during* the macOS modal resize loop (which would
     // otherwise block our main loop), giving continuous live resize.
@@ -74,6 +87,12 @@ private:
     bool resetConvergenceRequested_ = false;
     bool swapEyesRequested_ = false;
     bool togglePauseRequested_ = false;
+    bool prevMediaRequested_ = false;
+    bool nextMediaRequested_ = false;
+    bool toggleSlideshowRequested_ = false;
+    bool mouseActivity_ = false;
+    bool mouseLeft_ = false;
+    bool mouseInWindow_ = true;
     bool fullscreen_ = false;
     std::function<void()> liveResizeCb_;
     std::function<void(void*)> eventHook_;

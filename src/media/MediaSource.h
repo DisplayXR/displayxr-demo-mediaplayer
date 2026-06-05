@@ -28,6 +28,10 @@ public:
     // clearly-wide (>=1.9:1) frame is treated as full SBS.
     static MediaInfo Identify(const std::string& path, int imageWidth = 0, int imageHeight = 0);
 
+    // True if the extension is a supported image or video (used to filter a folder for
+    // prev/next navigation). The single source of truth for the supported set.
+    static bool IsSupported(const std::string& path);
+
     static const char* KindName(MediaKind k);
     static const char* LayoutName(StereoLayout l);
 };
