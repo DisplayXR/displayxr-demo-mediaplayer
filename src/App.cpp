@@ -844,25 +844,40 @@ void App::ToggleSlideshow() {
 }
 
 void App::LoadIdleLogo() {
-    // Resolve <exe-dir>/displayxr/logo.png — the brand mark staged next to the binary
-    // (the same sidecar folder as the workspace manifest). SDL_GetBasePath gives the
-    // executable's directory; the returned string is owned by SDL (do not free).
+    // Resolve <exe-dir>/displayxr/ — the sidecar staged next to the binary (same folder
+    // as the workspace manifest). SDL_GetBasePath gives the executable's directory; the
+    // returned string is owned by SDL (do not free). Prefer the composed idle lockup
+    // (DisplayXR mark + bold "Media Player" label, pre-padded as a square) and fall back
+    // to the bare brand mark, then to the RED|BLUE test pattern if neither is present.
     namespace fs = std::filesystem;
     std::string base;
     if (const char* b = SDL_GetBasePath()) base = b;
-    const std::string logoPath = (fs::path(base) / "displayxr" / "logo.png").string();
-    DecodedImage logo = ImageDecoder::Load(logoPath);
-    if (!logo.Valid()) {
-        LOG_INFO("No media, and no idle logo at '%s' — showing RED|BLUE L/R test pattern",
-                 logoPath.c_str());
-        return;
-    }
+    const fs::path dir = fs::path(base) / "displayxr";
 
-    // Composite the (transparent-background) logo centered at half scale onto an opaque
-    // dark-grey square. DrawViews fills the surrounding view with the same grey, so the
-    // mark floats on a seamless backdrop with no black letterbox bars. Mono (one image
-    // fed to both eyes) so it sits flat at screen depth.
-    const int C = std::max(logo.width, logo.height) * 2;  // logo occupies the centered 50%
+    // {file, occupy}: idle.png carries its own margin (fills the square ~1:1); the bare
+    // logo.png is the lone mark, centered at half scale so it doesn't dominate the view.
+    const struct { const char* file; float occupy; } cands[] = {
+        {"idle.png", 1.0f}, {"logo.png", 0.5f}};
+    for (const auto& c : cands) {
+        const std::string path = (dir / c.file).string();
+        DecodedImage art = ImageDecoder::Load(path);
+        if (!art.Valid()) continue;
+        if (CompositeIdleArt(art, c.occupy)) {
+            LOG_INFO("No media — showing the DisplayXR idle screen ('%s')", c.file);
+            return;
+        }
+        LOG_WARN("Idle art upload failed for '%s'", c.file);
+    }
+    LOG_INFO("No media, and no idle art in '%s' — showing RED|BLUE L/R test pattern",
+             dir.string().c_str());
+}
+
+bool App::CompositeIdleArt(const DecodedImage& art, float occupy) {
+    // Alpha-composite the (transparent-background) art centered onto an opaque dark-grey
+    // square sized so the art fills `occupy` of it. DrawViews fills the surrounding view
+    // with the same grey, so the lockup floats on a seamless backdrop with no black
+    // letterbox bars. Mono (one image fed to both eyes) so it sits flat at screen depth.
+    const int C = (int)std::lround(std::max(art.width, art.height) / occupy);
     const uint8_t bg[3] = {(uint8_t)(kIdleBgR * 255.0f + 0.5f),
                            (uint8_t)(kIdleBgG * 255.0f + 0.5f),
                            (uint8_t)(kIdleBgB * 255.0f + 0.5f)};
@@ -870,24 +885,21 @@ void App::LoadIdleLogo() {
     for (size_t i = 0; i < canvas.size(); i += 4) {
         canvas[i] = bg[0]; canvas[i + 1] = bg[1]; canvas[i + 2] = bg[2]; canvas[i + 3] = 255;
     }
-    const int ox = (C - logo.width) / 2, oy = (C - logo.height) / 2;
-    for (int y = 0; y < logo.height; ++y) {
-        for (int x = 0; x < logo.width; ++x) {
-            const uint8_t* s = &logo.pixels[((size_t)y * logo.width + x) * 4];
+    const int ox = (C - art.width) / 2, oy = (C - art.height) / 2;
+    for (int y = 0; y < art.height; ++y) {
+        for (int x = 0; x < art.width; ++x) {
+            const uint8_t* s = &art.pixels[((size_t)y * art.width + x) * 4];
             const float a = s[3] / 255.0f;  // alpha-over the grey backdrop
             uint8_t* d = &canvas[((size_t)(oy + y) * C + (ox + x)) * 4];
             for (int c = 0; c < 3; ++c) d[c] = (uint8_t)(s[c] * a + d[c] * (1.0f - a) + 0.5f);
         }
     }
-    if (!renderer_.UploadTexture(canvas.data(), (uint32_t)C, (uint32_t)C)) {
-        LOG_WARN("Idle logo upload failed — showing RED|BLUE L/R test pattern");
-        return;
-    }
+    if (!renderer_.UploadTexture(canvas.data(), (uint32_t)C, (uint32_t)C)) return false;
     renderer_.SetBackground(kIdleBgR, kIdleBgG, kIdleBgB);
     isLogo_ = true;
     layout_ = StereoLayout::Mono;
     contentAspect_ = 1.0f;
-    LOG_INFO("No media — showing the DisplayXR idle logo");
+    return true;
 }
 
 void App::ClearIdleLogo() {

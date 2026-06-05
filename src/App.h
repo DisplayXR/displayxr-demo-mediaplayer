@@ -58,10 +58,15 @@ private:
     // Per-frame UI state: advance the auto-hide fade, toast fade, and slideshow machine.
     void TickUi();
     void ToggleSlideshow();
-    // Idle screen: composite the DisplayXR logo onto a dark-grey backdrop and upload it
-    // as a mono texture, so launching with no file/folder shows the brand mark instead
-    // of the RED|BLUE test pattern. No-op (keeps the test pattern) if the asset is absent.
+    // Idle screen: composite the DisplayXR idle art onto a dark-grey backdrop and upload
+    // it as a mono texture, so launching with no file/folder shows the brand lockup
+    // instead of the RED|BLUE test pattern. Prefers the composed "mark + Media Player"
+    // idle.png; falls back to the bare logo.png, then the test pattern if both are absent.
     void LoadIdleLogo();
+    // Alpha-composite a transparent idle image centered on the dark-grey backdrop and
+    // upload it. `occupy` is the fraction of the square canvas the art fills (the rest is
+    // grey margin). Returns false if the GPU upload fails. Helper for LoadIdleLogo.
+    bool CompositeIdleArt(const struct DecodedImage& art, float occupy);
     void ClearIdleLogo();  // leave the idle screen: restore the black letterbox background
     void TogglePlayback();   // play/pause (video+audio); restarts if the clip already ended
     void ToggleMute();       // silence audio (keeps playing); persists across clips
