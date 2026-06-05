@@ -754,8 +754,9 @@ bool App::LoadMedia(const std::string& path) {
         return true;
     }
     // LIF container (JPEG + appended views): compose stereo to SBS; a non-stereo or
-    // malformed LIF falls back to flat 2D inside the loader. Extension-gated since a
-    // LIF is otherwise indistinguishable from a plain JPEG at the dispatch layer.
+    // malformed LIF falls back to flat 2D inside the loader. Detect by content — real
+    // LIFs commonly ship as .jpg, so we sniff the trailer magic rather than the name
+    // (a plain SBS .jpg has no trailer and keeps its filename-based layout below).
     auto hasLifExt = [](const std::string& p) {
         const size_t n = p.size();
         if (n < 4) return false;
@@ -763,7 +764,7 @@ bool App::LoadMedia(const std::string& path) {
         return p[n - 4] == '.' && lc(p[n - 3]) == 'l' && lc(p[n - 2]) == 'i' &&
                lc(p[n - 1]) == 'f';
     };
-    if (hasLifExt(path)) {
+    if (hasLifExt(path) || LifLoader::IsLif(path)) {
         LifResult lif = LifLoader::Load(path);
         if (!lif.ok) {
             LOG_ERROR("Open: cannot load LIF '%s'", path.c_str());

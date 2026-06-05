@@ -29,6 +29,11 @@ struct LifResult {
 
 class LifLoader {
 public:
+    // Cheap content sniff: true if the file ends with the LIF magic (0x1E1A). Real LIFs
+    // commonly ship with a .jpg extension, so the dispatch must detect them by content,
+    // not just by a .lif name. Reads only the last 2 bytes.
+    static bool IsLif(const std::string& path);
+
     // Parse `path` and produce a renderable image:
     //   * 2+ views  -> compose left|right into a full-SBS RGBA buffer (SbsFull, stereo=true)
     //   * otherwise -> decode the base JPEG as flat 2D (Mono) — never hard-fails on a
