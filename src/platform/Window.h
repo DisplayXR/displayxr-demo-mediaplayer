@@ -60,6 +60,7 @@ public:
     // Net single-frame steps since last read: `]` = +1, `[` = -1 (key-repeat counts).
     int TakeFrameStep();
     bool TakeSwapEyesRequest();    // `X` — toggle L/R eye assignment
+    bool TakeCaptureRequest();     // `I` — snapshot the composed atlas to a PNG
     bool TakeTogglePauseRequest(); // Space — play/pause
 
     // --- Folder navigation / slideshow ---
@@ -90,6 +91,7 @@ private:
     int frameStepRequest_ = 0;
     bool resetConvergenceRequested_ = false;
     bool swapEyesRequested_ = false;
+    bool captureRequested_ = false;
     bool togglePauseRequested_ = false;
     bool prevMediaRequested_ = false;
     bool nextMediaRequested_ = false;

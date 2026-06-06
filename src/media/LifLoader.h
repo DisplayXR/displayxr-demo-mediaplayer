@@ -25,6 +25,8 @@ struct LifResult {
     StereoLayout layout = StereoLayout::Mono;
     bool ok = false;                           // a renderable image was produced
     bool stereo = false;                       // two views were composed side-by-side
+    float convergence = 0.0f;                  // baked reconvergence from the LIF metadata
+                                               // (normalized; 0 if absent/non-stereo)
 };
 
 class LifLoader {

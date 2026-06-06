@@ -94,6 +94,12 @@ private:
     // swapEyes_ flips which SBS half feeds each eye.
     float convergence_ = 0.0f;
     bool swapEyes_ = false;
+    // Per-media baked convergence from a LIF's metadata (0 for non-LIF). Applied on
+    // top of the user's convergence_ so the image lands at the author's intended
+    // zero-disparity plane; the user slider still trims from there. The 0.5 factor maps
+    // the LIF's normalized convergence to this app's per-tile shift (matches the
+    // reference ViewShift: per-eye shift = 0.5 * convergence of an eye width).
+    float mediaConvergence_ = 0.0f;
 
     // Scrubber: displayed position tracks playback except while the user drags it, or
     // while an issued seek hasn't landed yet (scrubTarget_ >= 0 holds the knob steady

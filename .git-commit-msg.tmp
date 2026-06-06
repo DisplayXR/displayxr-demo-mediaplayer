@@ -1,0 +1,22 @@
+feat(lif): baked reconvergence + de-occlusion fill + crop-to-fill; 'I' atlas capture
+
+Stereo LIF display polish, verified on the Leia display via the new capture key:
+
+- Reconvergence: apply the LIF's baked `convergence` (parsed into LifResult) on top
+  of the user's convergence slider, scaled 0.5 to match the reference ViewShift
+  per-eye convention so the image lands at the author's intended zero-disparity plane.
+- De-occlusion fill: the reconvergence shift exposes a strip on one edge of each eye;
+  paint it with the *other* eye's same-side edge sliver (draw the other view's quad,
+  scissored to the gap) instead of leaving it black. Stereo, two-view only.
+- Crop-to-fill: replace letterbox FitRect with CoverRect — content fills the tile and
+  the overflow is cropped by the scissor, so the atlas tiles have no black bars
+  (combined with the de-occlusion fill). Applies to all media.
+
+- 'I' key atlas capture via XR_EXT_atlas_capture: the runtime snapshots the composed
+  multi-view atlas to <Pictures>/DisplayXR/<stem>-<N>_<cols>x<rows>_atlas.png (no
+  app-side readback). Mirrors the modelviewer/gaussiansplat demos. MEDIAPLAYER_DUMP_ATLAS
+  now routes through this runtime capture (the compositor-owned swapchain made the
+  local readback unreliable). Vendors the extension header; links shell32/ole32 for
+  the Pictures path.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

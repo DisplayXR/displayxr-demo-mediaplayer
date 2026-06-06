@@ -247,8 +247,12 @@ LifResult LifLoader::Load(const std::string& path) {
     r.layout = StereoLayout::SbsFull;
     r.stereo = true;
     r.ok = true;
-    LOG_INFO("LifLoader: '%s' stereo LIF composed to %dx%d SBS (per-eye %dx%d)",
-             path.c_str(), r.image.width, r.image.height, w, h);
+    // Baked reconvergence: the LIF's normalized horizontal shift that sets the intended
+    // zero-disparity plane. Top-level "convergence" (classic Leia) — default 0.
+    if (root.contains("convergence") && root["convergence"].is_number())
+        r.convergence = root["convergence"].get<float>();
+    LOG_INFO("LifLoader: '%s' stereo LIF composed to %dx%d SBS (per-eye %dx%d), convergence=%+.4f",
+             path.c_str(), r.image.width, r.image.height, w, h, r.convergence);
     return r;
 }
 

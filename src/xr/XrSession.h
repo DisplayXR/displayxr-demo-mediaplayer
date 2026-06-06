@@ -106,6 +106,13 @@ public:
     // (empty on cancel). Drains the latch.
     bool TakePickedFile(std::string& path);
 
+    // --- Atlas capture (XR_EXT_atlas_capture, the 'I' key) ---
+    // True if the runtime exposes the capture entry point.
+    bool HasAtlasCapture() const { return pfnCaptureAtlasEXT_ != nullptr; }
+    // Ask the runtime to snapshot the composed multi-view atlas to "<pathPrefix>_atlas.png".
+    // Non-blocking: the readback runs at the next EndFrame, so the PNG lands shortly after.
+    bool CaptureAtlas(const std::string& pathPrefix);
+
     // Vulkan handles the runtime selected for us — handed to the renderer.
     VkInstance VkInstanceHandle() const { return vkInstance_; }
     VkPhysicalDevice PhysicalDevice() const { return physicalDevice_; }
@@ -207,6 +214,10 @@ private:
     XrAsyncRequestIdEXT pendingPickerId_ = XR_NULL_ASYNC_REQUEST_ID_EXT;
     bool hasPickedFile_ = false;
     std::string pickedFile_;
+
+    // Atlas capture (XR_EXT_atlas_capture). PFN null when the runtime lacks it.
+    bool hasAtlasCaptureExt_ = false;
+    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT_ = nullptr;
 
     // Capabilities discovered at instance creation.
     bool hasWindowBindingExt_ = false;

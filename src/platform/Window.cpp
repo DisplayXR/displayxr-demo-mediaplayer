@@ -130,6 +130,7 @@ bool Window::PumpEvents() {
                 if (e.key.key == SDLK_RIGHT) nextMediaRequested_ = true;
                 if (e.key.key == SDLK_S) toggleSlideshowRequested_ = true;
                 if (e.key.key == SDLK_M) toggleMuteRequested_ = true;
+                if (e.key.key == SDLK_I) captureRequested_ = true;  // snapshot the atlas
                 if (e.key.key == SDLK_F || e.key.key == SDLK_F11) ToggleFullscreen();
             }
         }
@@ -176,6 +177,12 @@ int Window::TakeFrameStep() {
 bool Window::TakeSwapEyesRequest() {
     bool v = swapEyesRequested_;
     swapEyesRequested_ = false;
+    return v;
+}
+
+bool Window::TakeCaptureRequest() {
+    bool v = captureRequested_;
+    captureRequested_ = false;
     return v;
 }
 
