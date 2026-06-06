@@ -427,12 +427,15 @@ void App::RenderOneFrame() {
                 contentRects[v].h = (uint32_t)((float)viewFit.h * sy + 0.5f);
             }
 
-            // Build the draw list: content quads (viewport = content rect, scissor = the
-            // tile so a shifted rect can't spill into the other eye), then de-occlusion
-            // fill strips. kMaxViews=8 leaves room for the extra fill draws.
-            XrSession::ViewRect drawVp[XrSession::kMaxViews];
-            XrSession::ViewRect drawClip[XrSession::kMaxViews];
-            ViewUV drawUv[XrSession::kMaxViews];
+            // Build the draw list: each eye's content quad (scissor = its tile), then
+            // MIRROR-PAD every gap between the content and the tile edge — both the
+            // reconvergence de-occlusion AND any match-min letterbox — by reflecting the
+            // content's own edge (reflect-101) into the gap. Result: the tiles are
+            // black-free for any scaling/convergence, no second-view dependency.
+            constexpr uint32_t kMaxDraws = 12;  // 2 content + up to 4 mirror pads per eye
+            XrSession::ViewRect drawVp[kMaxDraws];
+            XrSession::ViewRect drawClip[kMaxDraws];
+            ViewUV drawUv[kMaxDraws];
             uint32_t n = 0;
             for (uint32_t v = 0; v < frame.viewCount; ++v) {
                 drawVp[n] = contentRects[v];
@@ -440,44 +443,31 @@ void App::RenderOneFrame() {
                 drawUv[n] = uvs[v];
                 ++n;
             }
-            // Reconvergence exposes a strip on one edge of each eye. Fill it by MIRRORING
-            // this eye's own content across that edge (reflect-101 padding): draw the
-            // content quad reflected about the content edge, scissored to the strip. Works
-            // for every source (image/video, baked or manual convergence) with no second-
-            // view dependency. The mirror UV (offX+scaleX, -scaleX) reflects whichever
-            // edge the gap abuts — the gap sits at the matching end of the reflected quad.
-            if (frame.viewCount == 2) {
-                for (uint32_t v = 0; v < frame.viewCount && n < XrSession::kMaxViews; ++v) {
-                    if (cdx[v] == 0) continue;          // no shift → no gap
-                    const int32_t cw = (int32_t)contentRects[v].w;
-                    XrSession::ViewRect gap;
-                    gap.y = rects[v].y;                 // clamp to the tile (content may overflow it)
-                    gap.h = rects[v].h;
-                    XrSession::ViewRect fillVp;
-                    fillVp.y = contentRects[v].y;
-                    fillVp.h = contentRects[v].h;
-                    fillVp.w = contentRects[v].w;
-                    if (cdx[v] > 0) {                   // content moved right → gap on left edge
-                        const int32_t E = contentRects[v].x;            // content left edge
-                        gap.x = rects[v].x + lbx;
-                        gap.w = (uint32_t)cdx[v];
-                        fillVp.x = E - cw;             // reflected quad sits to the left of E
-                    } else {                           // content moved left → gap on right edge
-                        const int32_t E = contentRects[v].x + cw;       // content right edge
-                        gap.x = E;
-                        gap.w = (uint32_t)(-cdx[v]);
-                        fillVp.x = E;                  // reflected quad sits to the right of E
-                    }
-                    ViewUV mu;
-                    mu.offX = uvs[v].offX + uvs[v].scaleX;  // far edge of this eye's half
-                    mu.scaleX = -uvs[v].scaleX;             // mirror horizontally
-                    mu.offY = uvs[v].offY;
-                    mu.scaleY = uvs[v].scaleY;
-                    drawVp[n] = fillVp;
-                    drawClip[n] = gap;
-                    drawUv[n] = mu;
-                    ++n;
-                }
+            for (uint32_t v = 0; v < frame.viewCount; ++v) {
+                const XrSession::ViewRect& cr = contentRects[v];
+                const XrSession::ViewRect& t = rects[v];
+                const int32_t cw = (int32_t)cr.w, ch = (int32_t)cr.h;
+                const int32_t crR = cr.x + cw, crB = cr.y + ch;
+                const int32_t tR = t.x + (int32_t)t.w, tB = t.y + (int32_t)t.h;
+                const ViewUV& u = uvs[v];
+                // A reflected copy of the content quad lives just outside each content
+                // edge; scissored to the gap, it mirrors that edge into the bar. Mirror X
+                // for vertical edges (negate scaleX, offset to the far edge); mirror Y for
+                // horizontal edges.
+                const ViewUV mx{u.offX + u.scaleX, u.offY, -u.scaleX, u.scaleY};
+                const ViewUV my{u.offX, u.offY + u.scaleY, u.scaleX, -u.scaleY};
+                auto add = [&](XrSession::ViewRect vp, XrSession::ViewRect clip, const ViewUV& uv) {
+                    if (clip.w == 0 || clip.h == 0 || n >= kMaxDraws) return;
+                    drawVp[n] = vp; drawClip[n] = clip; drawUv[n] = uv; ++n;
+                };
+                if (cr.x > t.x)  // left bar
+                    add({cr.x - cw, cr.y, cr.w, cr.h}, {t.x, t.y, (uint32_t)(cr.x - t.x), t.h}, mx);
+                if (crR < tR)    // right bar
+                    add({crR, cr.y, cr.w, cr.h}, {crR, t.y, (uint32_t)(tR - crR), t.h}, mx);
+                if (cr.y > t.y)  // top bar
+                    add({cr.x, cr.y - ch, cr.w, cr.h}, {t.x, t.y, t.w, (uint32_t)(cr.y - t.y)}, my);
+                if (crB < tB)    // bottom bar
+                    add({cr.x, crB, cr.w, cr.h}, {t.x, crB, t.w, (uint32_t)(tB - crB)}, my);
             }
             renderer_.DrawViews(frame.imageIndex, drawVp, drawClip, drawUv, n);
         } else if (hasMedia_) {
