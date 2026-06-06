@@ -436,8 +436,20 @@ void App::RenderOneFrame() {
             ViewUV drawUv[XrSession::kMaxViews];
             uint32_t n = 0;
             for (uint32_t v = 0; v < frame.viewCount; ++v) {
+                // Clip the content to a FIXED window (the unshifted match-min rect, clamped
+                // to the tile) — the same tile-relative region for both eyes. Convergence
+                // shifts the content *within* this window, so the letterbox stays symmetric
+                // (no region is content in one eye but black letterbox in the other); the
+                // exposed window edge is the offset/2 de-occlusion, mirror-filled below.
+                const int32_t wx0 = std::max(rects[v].x + lbx, rects[v].x);
+                const int32_t wy0 = std::max(contentRects[v].y, rects[v].y);
+                const int32_t wx1 = std::min(rects[v].x + lbx + (int32_t)contentRects[v].w,
+                                             rects[v].x + (int32_t)rects[v].w);
+                const int32_t wy1 = std::min(contentRects[v].y + (int32_t)contentRects[v].h,
+                                             rects[v].y + (int32_t)rects[v].h);
                 drawVp[n] = contentRects[v];
-                drawClip[n] = rects[v];
+                drawClip[n] = {wx0, wy0, (uint32_t)std::max(0, wx1 - wx0),
+                               (uint32_t)std::max(0, wy1 - wy0)};
                 drawUv[n] = uvs[v];
                 ++n;
             }
