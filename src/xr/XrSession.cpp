@@ -80,6 +80,8 @@ bool XrSession::InitInstanceAndSystem() {
             hasFilePickerExt_ = true;
         if (strcmp(e.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
             hasAtlasCaptureExt_ = true;
+        if (strcmp(e.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0)
+            hasMcpToolsExt_ = true;
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "yes" : "NO");
@@ -89,6 +91,7 @@ bool XrSession::InitInstanceAndSystem() {
     LOG_INFO("XR_EXT_display_info: %s", hasDisplayInfoExt_ ? "yes" : "no");
     LOG_INFO("XR_EXT_workspace_file_dialog: %s", hasFilePickerExt_ ? "yes" : "no");
     LOG_INFO("XR_EXT_atlas_capture: %s", hasAtlasCaptureExt_ ? "yes" : "no");
+    LOG_INFO("XR_EXT_mcp_tools: %s", hasMcpToolsExt_ ? "yes" : "no");
 
     if (!hasVulkan) {
         LOG_ERROR("Runtime does not expose XR_KHR_vulkan_enable");
@@ -101,6 +104,7 @@ bool XrSession::InitInstanceAndSystem() {
     if (hasDisplayInfoExt_) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
     if (hasFilePickerExt_) enabled.push_back(XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
     if (hasAtlasCaptureExt_) enabled.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+    if (hasMcpToolsExt_) enabled.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     std::strncpy(ci.applicationInfo.applicationName, "DisplayXR Media Player",
@@ -124,6 +128,22 @@ bool XrSession::InitInstanceAndSystem() {
         xrGetInstanceProcAddr(instance_, "xrCaptureAtlasEXT",
                               (PFN_xrVoidFunction*)&pfnCaptureAtlasEXT_);
         LOG_INFO("xrCaptureAtlasEXT: %s", pfnCaptureAtlasEXT_ ? "resolved" : "NULL");
+    }
+    // Agent-tools entry points (resolve via xrGetInstanceProcAddr like every other
+    // extension function). The tools operate on the session, but the PFNs only need the
+    // instance, so resolve them here alongside the rest; null PFNs leave HasMcpTools()
+    // false and the whole feature inert.
+    if (hasMcpToolsExt_) {
+        xrGetInstanceProcAddr(instance_, "xrSetMCPAppInfoEXT",
+                              (PFN_xrVoidFunction*)&pfnSetMcpAppInfo_);
+        xrGetInstanceProcAddr(instance_, "xrRegisterMCPToolEXT",
+                              (PFN_xrVoidFunction*)&pfnRegisterMcpTool_);
+        xrGetInstanceProcAddr(instance_, "xrGetMCPToolCallArgsEXT",
+                              (PFN_xrVoidFunction*)&pfnGetMcpToolCallArgs_);
+        xrGetInstanceProcAddr(instance_, "xrSubmitMCPToolResultEXT",
+                              (PFN_xrVoidFunction*)&pfnSubmitMcpToolResult_);
+        LOG_INFO("XR_EXT_mcp_tools entry points: %s",
+                 HasMcpTools() ? "resolved" : "NULL");
     }
 
     XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
@@ -716,10 +736,72 @@ void XrSession::PollEvents() {
                          ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());
                 break;
             }
+            case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT: {
+                // An agent invoked one of our registered tools. We're on the main loop, so
+                // dispatch + answer here where player state is consistent (no locking).
+                HandleMcpToolCall(reinterpret_cast<const XrEventDataMCPToolCallEXT*>(&event));
+                break;
+            }
             default:
                 break;
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+}
+
+bool XrSession::SetMcpAppId(const std::string& appId) {
+    if (!HasMcpTools() || !pfnSetMcpAppInfo_) return false;
+    XrMCPAppInfoEXT info = {XR_TYPE_MCP_APP_INFO_EXT};
+    std::strncpy(info.appId, appId.c_str(), sizeof(info.appId) - 1);
+    XrResult r = pfnSetMcpAppInfo_(session_, &info);
+    if (XR_FAILED(r)) {
+        LOG_WARN("xrSetMCPAppInfoEXT('%s') failed: XrResult=%d", appId.c_str(), (int)r);
+        return false;
+    }
+    return true;
+}
+
+bool XrSession::RegisterMcpTool(const std::string& name, const std::string& description,
+                               const std::string& schemaJson) {
+    if (!HasMcpTools()) return false;
+    XrMCPToolInfoEXT tool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+    tool.name = name.c_str();
+    tool.description = description.c_str();
+    tool.inputSchemaJson = schemaJson.empty() ? nullptr : schemaJson.c_str();
+    XrResult r = pfnRegisterMcpTool_(session_, &tool);
+    if (XR_FAILED(r)) {
+        LOG_WARN("xrRegisterMCPToolEXT('%s') failed: XrResult=%d", name.c_str(), (int)r);
+        return false;
+    }
+    LOG_INFO("Registered MCP tool '%s'", name.c_str());
+    return true;
+}
+
+void XrSession::HandleMcpToolCall(const XrEventDataMCPToolCallEXT* call) {
+    // Fetch the JSON arguments via the two-call idiom — the event's argsSize is the exact
+    // capacity needed (incl. NUL). A no-arg tool reports argsSize 0; treat that as "{}".
+    std::string args;
+    if (pfnGetMcpToolCallArgs_ && call->argsSize > 0) {
+        std::vector<char> buf(call->argsSize);
+        uint32_t needed = 0;
+        if (XR_SUCCEEDED(pfnGetMcpToolCallArgs_(session_, call->callId,
+                                                (uint32_t)buf.size(), &needed, buf.data())))
+            args.assign(buf.data());
+    }
+
+    // Dispatch to the app's handler (runs here, on the main loop). Answer EVERY call —
+    // an unanswered call fails to the agent after ~5 s.
+    bool success = true;
+    std::string result;
+    if (mcpToolHandler_) {
+        result = mcpToolHandler_(call->toolName, args, success);
+    } else {
+        success = false;
+        result = "{\"error\":\"no tool handler installed\"}";
+    }
+    if (pfnSubmitMcpToolResult_) {
+        pfnSubmitMcpToolResult_(session_, call->callId,
+                                success ? XR_TRUE : XR_FALSE, result.c_str());
     }
 }
 

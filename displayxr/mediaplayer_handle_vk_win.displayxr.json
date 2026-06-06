@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "id": "mediaplayer",
   "name": "Media Player",
   "type": "3d",
   "category": "app",
