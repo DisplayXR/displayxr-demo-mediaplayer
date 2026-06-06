@@ -71,6 +71,14 @@ private:
     void TogglePlayback();   // play/pause (video+audio); restarts if the clip already ended
     void ToggleMute();       // silence audio (keeps playing); persists across clips
     void StepFrame(int n);   // pause + step n frames (']' +1 / '[' -1)
+
+    // Agent tools (XR_EXT_mcp_tools). SetupAgentTools registers the player's controls as
+    // MCP tools on the runtime's per-process server (no-op when the MCP gate is off);
+    // DispatchAgentTool runs a tool invocation against live player state — it executes on
+    // the main loop (inside xr_.PollEvents), so it touches state without locking.
+    void SetupAgentTools();
+    std::string DispatchAgentTool(const std::string& tool, const std::string& argsJson,
+                                  bool& success);
     // SDL native-dialog callback (Tier-0 fallback). May fire on another thread, so it
     // just hands the path to the main loop through the guarded slot below.
     static void NativeFileCallback(void* userdata, const char* const* filelist, int filter);

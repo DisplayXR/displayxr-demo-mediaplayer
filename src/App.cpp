@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 
+#include <nlohmann/json.hpp>  // parse agent-tool args / build results (XR_EXT_mcp_tools)
 #include <SDL3/SDL.h>   // SDL_ShowOpenFileDialog (Tier-0 native file dialog)
 
 #if defined(_WIN32)
@@ -211,6 +212,10 @@ bool App::Initialize(const char* mediaPath) {
             LOG_WARN("ImGui unavailable — using the text HUD");
         }
     }
+
+    // Expose the player's transport controls to agents (XR_EXT_mcp_tools). Inert when the
+    // runtime lacks the extension or the MCP capability gate is off.
+    SetupAgentTools();
     return true;
 }
 
@@ -1135,6 +1140,168 @@ void App::StepFrame(int n) {
     video_.Seek(t);             // exact
     audio_.Seek(t);             // keep audio aligned for the eventual resume
     scrubTarget_ = (float)t;    // hold the scrubber knob until the frame lands
+}
+
+void App::SetupAgentTools() {
+    if (!xr_.HasMcpTools()) {
+        LOG_INFO("XR_EXT_mcp_tools unavailable — agent tools not registered");
+        return;
+    }
+    // The app id MUST equal the manifest `id` (linter INV-10.1). It is the agent-visible
+    // tool prefix (e.g. mediaplayer__play_pause through the workspace aggregator).
+    if (!xr_.SetMcpAppId("mediaplayer")) {
+        LOG_WARN("xrSetMCPAppInfoEXT failed — skipping agent-tool registration");
+        return;
+    }
+
+    // Descriptions are agent-facing API docs: state what the tool does, the units, and the
+    // preconditions. Schemas are JSON Schema objects; mark required args.
+    xr_.RegisterMcpTool(
+        "play_pause",
+        "Toggle play/pause of the current video. If the clip already played to the end, "
+        "restarts it from the beginning. No-op for still images. Returns the new playing "
+        "state and the current position in seconds.",
+        "{\"type\":\"object\"}");
+
+    xr_.RegisterMcpTool(
+        "open_file",
+        "Open a media file by path, replacing whatever is loaded. Supports SBS images "
+        "(jpg/png), LIF containers, and SBS video (mp4/mkv/mov). Returns the loaded file "
+        "and its kind on success; an error result if the path cannot be opened.",
+        "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\","
+        "\"description\":\"Path to the media file to open (absolute recommended).\"}},"
+        "\"required\":[\"path\"]}");
+
+    xr_.RegisterMcpTool(
+        "seek",
+        "Seek the current video to an absolute position in seconds, clamped to "
+        "[0, duration]. Requires a video to be open (errors for still images). Returns the "
+        "applied position in seconds.",
+        "{\"type\":\"object\",\"properties\":{\"position_s\":{\"type\":\"number\","
+        "\"minimum\":0,\"description\":\"Target position in seconds from the start.\"}},"
+        "\"required\":[\"position_s\"]}");
+
+    xr_.RegisterMcpTool(
+        "navigate",
+        "Step to the previous or next supported asset in the current file's folder "
+        "(wrapping). Requires at least two assets in the folder. Returns the newly-loaded "
+        "file plus its folder index and the folder asset count.",
+        "{\"type\":\"object\",\"properties\":{\"delta\":{\"type\":\"integer\","
+        "\"description\":\"Steps to move: +1 for next, -1 for previous.\"}},"
+        "\"required\":[\"delta\"]}");
+
+    xr_.RegisterMcpTool(
+        "get_status",
+        "Read the player's live state: whether a video is playing, the current and total "
+        "position in seconds, the open file path, the media kind, mute state, and the "
+        "folder index/count used by navigate. Requires no arguments.",
+        "{\"type\":\"object\"}");
+
+    xr_.SetMcpToolHandler([this](const std::string& tool, const std::string& args,
+                                 bool& success) {
+        return DispatchAgentTool(tool, args, success);
+    });
+    LOG_INFO("Agent tools registered (appId=mediaplayer)");
+}
+
+std::string App::DispatchAgentTool(const std::string& tool, const std::string& argsJson,
+                                   bool& success) {
+    using json = nlohmann::json;
+    success = true;
+
+    // Parse args leniently: empty/whitespace means "no arguments".
+    json args = json::object();
+    if (argsJson.find_first_not_of(" \t\r\n") != std::string::npos) {
+        json parsed = json::parse(argsJson, nullptr, /*allow_exceptions=*/false);
+        if (parsed.is_discarded()) {
+            success = false;
+            return "{\"error\":\"arguments are not valid JSON\"}";
+        }
+        if (parsed.is_object()) {
+            args = std::move(parsed);
+        } else if (!parsed.is_null()) {
+            success = false;
+            return "{\"error\":\"arguments must be a JSON object\"}";
+        }
+    }
+
+    const bool playing = isVideo_ && !video_.Paused();
+    const double positionS = isVideo_ ? video_.PositionSeconds() : 0.0;
+    const double durationS = isVideo_ ? video_.DurationSeconds() : 0.0;
+
+    json out;
+    if (tool == "play_pause") {
+        TogglePlayback();
+        out["playing"] = isVideo_ && !video_.Paused();
+        out["position_s"] = isVideo_ ? video_.PositionSeconds() : 0.0;
+        return out.dump();
+    }
+    if (tool == "open_file") {
+        if (!args.contains("path") || !args["path"].is_string() ||
+            args["path"].get<std::string>().empty()) {
+            success = false;
+            return "{\"error\":\"missing required string arg 'path'\"}";
+        }
+        const std::string path = args["path"].get<std::string>();
+        ReloadMedia(path);  // tears down current media, then loads; keeps prior on failure
+        if (currentMediaPath_ != path) {
+            success = false;
+            out["error"] = "could not open '" + path + "'";
+            return out.dump();
+        }
+        out["file"] = currentMediaPath_;
+        out["is_video"] = isVideo_;
+        out["duration_s"] = isVideo_ ? video_.DurationSeconds() : 0.0;
+        return out.dump();
+    }
+    if (tool == "seek") {
+        if (!isVideo_) {
+            success = false;
+            return "{\"error\":\"no video is open (seek requires a video)\"}";
+        }
+        if (!args.contains("position_s") || !args["position_s"].is_number()) {
+            success = false;
+            return "{\"error\":\"missing required number arg 'position_s'\"}";
+        }
+        double t = args["position_s"].get<double>();
+        if (t < 0.0) t = 0.0;
+        if (durationS > 0.0 && t > durationS) t = durationS;
+        video_.Seek(t);             // exact
+        audio_.Seek(t);             // keep audio aligned
+        scrubTarget_ = (float)t;    // hold the scrubber knob until the decode lands
+        out["position_s"] = t;
+        return out.dump();
+    }
+    if (tool == "navigate") {
+        if (!args.contains("delta") || !args["delta"].is_number()) {
+            success = false;
+            return "{\"error\":\"missing required integer arg 'delta'\"}";
+        }
+        if (folderFiles_.size() < 2) {
+            success = false;
+            return "{\"error\":\"no other media in the current folder\"}";
+        }
+        NavigateMedia(args["delta"].get<int>());
+        out["file"] = currentMediaPath_;
+        out["index"] = static_cast<uint64_t>(folderIndex_);
+        out["count"] = static_cast<uint64_t>(folderFiles_.size());
+        return out.dump();
+    }
+    if (tool == "get_status") {
+        out["playing"] = playing;
+        out["position_s"] = positionS;
+        out["duration_s"] = durationS;
+        out["file"] = currentMediaPath_;
+        out["has_media"] = hasMedia_;
+        out["is_video"] = isVideo_;
+        out["muted"] = muted_;
+        out["folder_index"] = static_cast<uint64_t>(folderIndex_);
+        out["folder_count"] = static_cast<uint64_t>(folderFiles_.size());
+        return out.dump();
+    }
+
+    success = false;
+    return "{\"error\":\"unknown tool '" + tool + "'\"}";
 }
 
 void App::TickUi() {

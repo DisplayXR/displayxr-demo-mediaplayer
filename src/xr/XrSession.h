@@ -15,6 +15,7 @@
 #include "XrCommon.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -112,6 +113,38 @@ public:
     // Ask the runtime to snapshot the composed multi-view atlas to "<pathPrefix>_atlas.png".
     // Non-blocking: the readback runs at the next EndFrame, so the PNG lands shortly after.
     bool CaptureAtlas(const std::string& pathPrefix);
+
+    // --- Agent tools (XR_EXT_mcp_tools) ---
+    // The app exposes its playback controls as MCP tools on the per-process server the
+    // runtime hosts. Registration is never load-bearing: when the MCP capability gate is
+    // off (or the runtime predates the extension) HasMcpTools() is false and every call
+    // below is an inert no-op, so the player runs identically with no agent surface.
+    //
+    // A tool invocation arrives as XrEventDataMCPToolCallEXT through PollEvents() — i.e.
+    // on the main loop — and is dispatched to the handler installed via SetMcpToolHandler.
+    // The handler runs synchronously there (player state is consistent, no locking), and
+    // its returned JSON is submitted back to the agent. Every call is answered; an
+    // unanswered call fails to the agent after ~5 s.
+
+    // Dispatch handler: given a registered tool's bare name and its JSON arguments,
+    // perform the action and return the JSON result value. Set `success=false` (it
+    // defaults true) to make the agent receive a tool error with that JSON.
+    using McpToolHandler = std::function<std::string(const std::string& toolName,
+                                                     const std::string& argsJson,
+                                                     bool& success)>;
+    // True once the extension is present AND its entry points resolved — registration
+    // and dispatch are live. False ⇒ all MCP calls below are inert.
+    bool HasMcpTools() const { return hasMcpToolsExt_ && pfnRegisterMcpTool_ != nullptr; }
+    // Declare the app's stable id (must equal the manifest `id`; linter INV-10.1). Call
+    // once before registering tools. No-op (returns false) when HasMcpTools() is false.
+    bool SetMcpAppId(const std::string& appId);
+    // Register one tool. `name` is the bare tool name; `description` is agent-facing API
+    // documentation; `schemaJson` is a JSON Schema object for the arguments (empty ⇒ no
+    // args). Returns false on failure or when MCP is unavailable.
+    bool RegisterMcpTool(const std::string& name, const std::string& description,
+                         const std::string& schemaJson);
+    // Install the handler invoked when an agent calls a registered tool.
+    void SetMcpToolHandler(McpToolHandler handler) { mcpToolHandler_ = std::move(handler); }
 
     // Vulkan handles the runtime selected for us — handed to the renderer.
     VkInstance VkInstanceHandle() const { return vkInstance_; }
@@ -218,6 +251,16 @@ private:
     // Atlas capture (XR_EXT_atlas_capture). PFN null when the runtime lacks it.
     bool hasAtlasCaptureExt_ = false;
     PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT_ = nullptr;
+
+    // Agent tools (XR_EXT_mcp_tools). All PFNs null when the runtime lacks the extension
+    // or the MCP capability gate is off — the whole feature is then inert.
+    void HandleMcpToolCall(const XrEventDataMCPToolCallEXT* call);
+    bool hasMcpToolsExt_ = false;
+    PFN_xrSetMCPAppInfoEXT pfnSetMcpAppInfo_ = nullptr;
+    PFN_xrRegisterMCPToolEXT pfnRegisterMcpTool_ = nullptr;
+    PFN_xrGetMCPToolCallArgsEXT pfnGetMcpToolCallArgs_ = nullptr;
+    PFN_xrSubmitMCPToolResultEXT pfnSubmitMcpToolResult_ = nullptr;
+    McpToolHandler mcpToolHandler_;
 
     // Capabilities discovered at instance creation.
     bool hasWindowBindingExt_ = false;
