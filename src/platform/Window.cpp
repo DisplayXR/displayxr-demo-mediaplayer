@@ -124,6 +124,7 @@ bool Window::PumpEvents() {
                 if (e.key.key == SDLK_V) cycleModeRequested_ = true;
                 if (e.key.key == SDLK_TAB && (e.key.mod & SDL_KMOD_SHIFT)) toggleHudRequested_ = true;
                 if (e.key.key == SDLK_0) resetConvergenceRequested_ = true;
+                if (e.key.key == SDLK_BACKSPACE) autoConvergeRequested_ = true;
                 if (e.key.key == SDLK_X) swapEyesRequested_ = true;
                 if (e.key.key == SDLK_SPACE) togglePauseRequested_ = true;
                 if (e.key.key == SDLK_LEFT) prevMediaRequested_ = true;
@@ -165,6 +166,12 @@ int Window::TakeConvergenceSteps() {
 bool Window::TakeResetConvergence() {
     bool v = resetConvergenceRequested_;
     resetConvergenceRequested_ = false;
+    return v;
+}
+
+bool Window::TakeAutoConvergeRequest() {
+    bool v = autoConvergeRequested_;
+    autoConvergeRequested_ = false;
     return v;
 }
 
