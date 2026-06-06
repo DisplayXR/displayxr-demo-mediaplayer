@@ -57,6 +57,7 @@ public:
     // reset to 0 on read. The caller scales each step into its parallax budget.
     int TakeConvergenceSteps();
     bool TakeResetConvergence();   // `0` — convergence back to 0
+    bool TakeAutoConvergeRequest(); // Backspace — apply auto-convergence (LIF w/o convergence)
     // Net single-frame steps since last read: `]` = +1, `[` = -1 (key-repeat counts).
     int TakeFrameStep();
     bool TakeSwapEyesRequest();    // `X` — toggle L/R eye assignment
@@ -90,6 +91,7 @@ private:
     int convergenceSteps_ = 0;
     int frameStepRequest_ = 0;
     bool resetConvergenceRequested_ = false;
+    bool autoConvergeRequested_ = false;
     bool swapEyesRequested_ = false;
     bool captureRequested_ = false;
     bool togglePauseRequested_ = false;

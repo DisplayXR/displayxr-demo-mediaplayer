@@ -100,6 +100,10 @@ private:
     // the LIF's normalized convergence to this app's per-tile shift (matches the
     // reference ViewShift: per-eye shift = 0.5 * convergence of an eye width).
     float mediaConvergence_ = 0.0f;
+    // Coarse auto-convergence estimate for LIFs whose metadata carries NO convergence
+    // field. Not applied automatically — Backspace sets convergence_ to it (undo with 0).
+    bool mediaAutoConvAvailable_ = false;
+    float mediaAutoConvergence_ = 0.0f;
 
     // Scrubber: displayed position tracks playback except while the user drags it, or
     // while an issued seek hasn't landed yet (scrubTarget_ >= 0 holds the knob steady

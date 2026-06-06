@@ -265,6 +265,18 @@ int App::Run() {
             ShowToast("Convergence reset");
             activity = true;
         }
+        if (window_.TakeAutoConvergeRequest()) {                      // Backspace
+            if (mediaAutoConvAvailable_) {
+                convergence_ = mediaAutoConvergence_;  // undo with '0'
+                LOG_INFO("auto-convergence applied: %+.4f", convergence_);
+                char t[48];
+                std::snprintf(t, sizeof(t), "Auto-converge %+.1f%%", convergence_ * 100.0f);
+                ShowToast(t);
+            } else {
+                ShowToast("Auto-converge: file already has convergence");
+            }
+            activity = true;
+        }
         if (const int fs = window_.TakeFrameStep(); fs != 0) {        // '[' / ']'
             StepFrame(fs);
             activity = true;
@@ -878,6 +890,7 @@ bool App::LoadMedia(const std::string& path) {
         ClearIdleLogo();
         layout_ = info.layout;
         mediaConvergence_ = 0.0f;  // no baked convergence for video
+        mediaAutoConvAvailable_ = false;
         mediaW_ = video_.Width();
         mediaH_ = video_.Height();
         contentAspect_ = PerEyeAspect(info.layout, video_.Width(), video_.Height());
@@ -920,6 +933,8 @@ bool App::LoadMedia(const std::string& path) {
         ClearIdleLogo();
         layout_ = lif.layout;
         mediaConvergence_ = lif.convergence;  // baked reconvergence from the LIF
+        mediaAutoConvAvailable_ = lif.stereo && !lif.hasConvergence;  // estimate available
+        mediaAutoConvergence_ = lif.autoConvergence;
         mediaW_ = lif.image.width;
         mediaH_ = lif.image.height;
         contentAspect_ = PerEyeAspect(lif.layout, lif.image.width, lif.image.height);
@@ -943,6 +958,7 @@ bool App::LoadMedia(const std::string& path) {
     ClearIdleLogo();
     layout_ = imgInfo.layout;
     mediaConvergence_ = 0.0f;  // plain SBS image carries no baked convergence
+    mediaAutoConvAvailable_ = false;
     mediaW_ = img.width;
     mediaH_ = img.height;
     contentAspect_ = PerEyeAspect(imgInfo.layout, img.width, img.height);

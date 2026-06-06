@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -149,6 +150,51 @@ ViewRef ResolveView(const json& view, const std::vector<uint8_t>& buf,
     return ref;
 }
 
+// Coarse global horizontal disparity between the two views, returned as the app's
+// convergence_ value that pulls the dominant plane toward the screen. Downsamples to a
+// small grid, grayscales, and finds the integer shift minimizing SAD. Used only when the
+// LIF carries no convergence field, so an under-specified stereo pair can still be
+// reconverged on demand.
+float EstimateAutoConvergence(const DecodedImage& L, const DecodedImage& R) {
+    const int w = L.width, h = L.height;
+    if (w < 16 || h < 16 || R.width != w || R.height != h) return 0.0f;
+    constexpr int DW = 96;                       // downsample width
+    const int DH = std::max(8, DW * h / w);
+    auto gray = [](const DecodedImage& im, int sx, int sy) {
+        const uint8_t* p = &im.pixels[((size_t)sy * im.width + sx) * 4];
+        return 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2];
+    };
+    std::vector<float> gl((size_t)DW * DH), gr((size_t)DW * DH);
+    for (int y = 0; y < DH; ++y)
+        for (int x = 0; x < DW; ++x) {
+            const int sx = x * w / DW, sy = y * h / DH;
+            gl[(size_t)y * DW + x] = gray(L, sx, sy);
+            gr[(size_t)y * DW + x] = gray(R, sx, sy);
+        }
+    const int maxD = DW / 5;                      // search ±20% disparity
+    float bestSad = 1e30f;
+    int bestD = 0;
+    for (int d = -maxD; d <= maxD; ++d) {
+        float sad = 0.0f;
+        int cnt = 0;
+        const int x0 = std::max(0, -d), x1 = std::min(DW, DW - d);
+        for (int y = 0; y < DH; ++y)
+            for (int x = x0; x < x1; ++x) {
+                sad += std::fabs(gl[(size_t)y * DW + x] - gr[(size_t)y * DW + x + d]);
+                ++cnt;
+            }
+        if (cnt > 0) {
+            sad /= (float)cnt;
+            if (sad < bestSad) { bestSad = sad; bestD = d; }
+        }
+    }
+    const float dFrac = (float)bestD / (float)DW;  // right−left disparity, fraction of width
+    // Applying convergence_ reduces the dominant disparity by 2*conv, so conv = dFrac/2
+    // pulls that plane to zero. (Yields a negative value for the usual pair, matching the
+    // sign of the LIFs that do carry a convergence field.)
+    return 0.5f * dFrac;
+}
+
 // Decode the base JPEG (the file is a valid JPEG even when it isn't a LIF) → flat 2D.
 LifResult MonoFallback(const std::vector<uint8_t>& buf, const std::string& path) {
     LifResult r;
@@ -248,11 +294,18 @@ LifResult LifLoader::Load(const std::string& path) {
     r.stereo = true;
     r.ok = true;
     // Baked reconvergence: the LIF's normalized horizontal shift that sets the intended
-    // zero-disparity plane. Top-level "convergence" (classic Leia) — default 0.
-    if (root.contains("convergence") && root["convergence"].is_number())
+    // zero-disparity plane. Top-level "convergence" (classic Leia). When the field is
+    // absent, estimate a fallback from the pair (applied on demand, not automatically).
+    r.hasConvergence = (root.contains("convergence") && root["convergence"].is_number());
+    if (r.hasConvergence) {
         r.convergence = root["convergence"].get<float>();
-    LOG_INFO("LifLoader: '%s' stereo LIF composed to %dx%d SBS (per-eye %dx%d), convergence=%+.4f",
-             path.c_str(), r.image.width, r.image.height, w, h, r.convergence);
+    } else {
+        r.autoConvergence = EstimateAutoConvergence(limg, rimg);
+    }
+    LOG_INFO("LifLoader: '%s' stereo LIF %dx%d SBS (per-eye %dx%d), convergence=%+.4f%s",
+             path.c_str(), r.image.width, r.image.height, w, h,
+             r.hasConvergence ? r.convergence : r.autoConvergence,
+             r.hasConvergence ? "" : " (MISSING — auto estimate)");
     return r;
 }
 
