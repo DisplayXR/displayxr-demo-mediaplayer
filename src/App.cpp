@@ -428,14 +428,12 @@ void App::RenderOneFrame() {
             }
 
             // Build the draw list: each eye's content quad (scissor = its tile), then
-            // MIRROR-PAD every gap between the content and the tile edge — both the
-            // reconvergence de-occlusion AND any match-min letterbox — by reflecting the
-            // content's own edge (reflect-101) into the gap. Result: the tiles are
-            // black-free for any scaling/convergence, no second-view dependency.
-            constexpr uint32_t kMaxDraws = 12;  // 2 content + up to 4 mirror pads per eye
-            XrSession::ViewRect drawVp[kMaxDraws];
-            XrSession::ViewRect drawClip[kMaxDraws];
-            ViewUV drawUv[kMaxDraws];
+            // mirror-fill ONLY the reconvergence de-occlusion strip (offset/2 wide) by
+            // reflecting this eye's own content across the exposed edge (reflect-101). Any
+            // match-min letterbox bar is left as-is (black). No second-view dependency.
+            XrSession::ViewRect drawVp[XrSession::kMaxViews];
+            XrSession::ViewRect drawClip[XrSession::kMaxViews];
+            ViewUV drawUv[XrSession::kMaxViews];
             uint32_t n = 0;
             for (uint32_t v = 0; v < frame.viewCount; ++v) {
                 drawVp[n] = contentRects[v];
@@ -443,31 +441,34 @@ void App::RenderOneFrame() {
                 drawUv[n] = uvs[v];
                 ++n;
             }
-            for (uint32_t v = 0; v < frame.viewCount; ++v) {
+            for (uint32_t v = 0; v < frame.viewCount && n < XrSession::kMaxViews; ++v) {
+                if (cdx[v] == 0) continue;          // no convergence shift → no de-occlusion
                 const XrSession::ViewRect& cr = contentRects[v];
                 const XrSession::ViewRect& t = rects[v];
-                const int32_t cw = (int32_t)cr.w, ch = (int32_t)cr.h;
-                const int32_t crR = cr.x + cw, crB = cr.y + ch;
-                const int32_t tR = t.x + (int32_t)t.w, tB = t.y + (int32_t)t.h;
-                const ViewUV& u = uvs[v];
-                // A reflected copy of the content quad lives just outside each content
-                // edge; scissored to the gap, it mirrors that edge into the bar. Mirror X
-                // for vertical edges (negate scaleX, offset to the far edge); mirror Y for
-                // horizontal edges.
-                const ViewUV mx{u.offX + u.scaleX, u.offY, -u.scaleX, u.scaleY};
-                const ViewUV my{u.offX, u.offY + u.scaleY, u.scaleX, -u.scaleY};
-                auto add = [&](XrSession::ViewRect vp, XrSession::ViewRect clip, const ViewUV& uv) {
-                    if (clip.w == 0 || clip.h == 0 || n >= kMaxDraws) return;
-                    drawVp[n] = vp; drawClip[n] = clip; drawUv[n] = uv; ++n;
-                };
-                if (cr.x > t.x)  // left bar
-                    add({cr.x - cw, cr.y, cr.w, cr.h}, {t.x, t.y, (uint32_t)(cr.x - t.x), t.h}, mx);
-                if (crR < tR)    // right bar
-                    add({crR, cr.y, cr.w, cr.h}, {crR, t.y, (uint32_t)(tR - crR), t.h}, mx);
-                if (cr.y > t.y)  // top bar
-                    add({cr.x, cr.y - ch, cr.w, cr.h}, {t.x, t.y, t.w, (uint32_t)(cr.y - t.y)}, my);
-                if (crB < tB)    // bottom bar
-                    add({cr.x, crB, cr.w, cr.h}, {t.x, crB, t.w, (uint32_t)(tB - crB)}, my);
+                const int32_t cw = (int32_t)cr.w;
+                int32_t gx, gw, vpx;
+                if (cdx[v] > 0) {                   // content moved right → strip on its left edge
+                    gx = cr.x - cdx[v];             // [cr.x - offset/2, cr.x]
+                    gw = cdx[v];
+                    vpx = cr.x - cw;                // reflected quad sits left of cr.x
+                } else {                            // content moved left → strip on its right edge
+                    gx = cr.x + cw;                 // [cr.x+cw, cr.x+cw + offset/2]
+                    gw = -cdx[v];
+                    vpx = cr.x + cw;                // reflected quad sits right of the edge
+                }
+                // Clamp the strip to the tile so it never spills into the letterbox or the
+                // adjacent eye; when the content overflows the tile there's no strip to fill.
+                const int32_t gl = std::max(gx, t.x);
+                const int32_t gr = std::min(gx + gw, t.x + (int32_t)t.w);
+                if (gr <= gl) continue;
+                XrSession::ViewRect gap{gl, t.y, (uint32_t)(gr - gl), t.h};
+                XrSession::ViewRect fillVp{vpx, cr.y, cr.w, cr.h};
+                ViewUV mu{uvs[v].offX + uvs[v].scaleX, uvs[v].offY,
+                          -uvs[v].scaleX, uvs[v].scaleY};  // mirror across the exposed edge
+                drawVp[n] = fillVp;
+                drawClip[n] = gap;
+                drawUv[n] = mu;
+                ++n;
             }
             renderer_.DrawViews(frame.imageIndex, drawVp, drawClip, drawUv, n);
         } else if (hasMedia_) {
