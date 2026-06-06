@@ -16,6 +16,16 @@
 
 #include <SDL3/SDL.h>   // SDL_ShowOpenFileDialog (Tier-0 native file dialog)
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX        // keep std::min/std::max usable (windows.h defines min/max macros)
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <shlobj.h>     // SHGetKnownFolderPath — resolve the user's Pictures folder
+#endif
+
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include "imgui.h"
 #endif
@@ -35,6 +45,51 @@ constexpr float kIdleBgR = 0.12f, kIdleBgG = 0.12f, kIdleBgB = 0.13f;
 // step, clamped to ±max — fractions of a view tile, kept small for "subtle" depth.
 constexpr float kConvergenceStep = 0.0025f;
 constexpr float kConvergenceMax = 0.05f;
+
+// Where the 'I'-key atlas captures land: <Pictures>/DisplayXR on Windows, else the
+// working directory. xrCaptureAtlasEXT appends "_atlas.png" to the prefix we return;
+// we number against existing "<stem>-<N>_<cols>x<rows>_atlas.png" so repeats accumulate
+// instead of overwriting. Mirrors the modelviewer/gaussiansplat demos' convention.
+std::string MakeCaptureAtlasPrefix(const std::string& stem, uint32_t cols, uint32_t rows) {
+    namespace fs = std::filesystem;
+    std::string dir;
+#if defined(_WIN32)
+    PWSTR picsW = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, KF_FLAG_CREATE, nullptr, &picsW)) &&
+        picsW) {
+        char buf[MAX_PATH] = {};
+        WideCharToMultiByte(CP_UTF8, 0, picsW, -1, buf, MAX_PATH, nullptr, nullptr);
+        CoTaskMemFree(picsW);
+        dir = std::string(buf) + "\\DisplayXR";
+    }
+    const char* sep = "\\";
+#else
+    if (const char* home = std::getenv("HOME")) dir = std::string(home) + "/Pictures/DisplayXR";
+    const char* sep = "/";
+#endif
+    if (dir.empty()) dir = ".";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    char suffix[64];
+    std::snprintf(suffix, sizeof(suffix), "_%ux%u_atlas.png", cols, rows);
+    const std::string head = stem + "-";
+    const std::string suf = suffix;
+    int maxN = 0;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string fn = it->path().filename().string();
+        if (fn.size() <= head.size() + suf.size()) continue;
+        if (fn.compare(0, head.size(), head) != 0) continue;
+        if (fn.compare(fn.size() - suf.size(), suf.size(), suf) != 0) continue;
+        const std::string num = fn.substr(head.size(), fn.size() - head.size() - suf.size());
+        bool digits = !num.empty();
+        for (char c : num) digits = digits && (c >= '0' && c <= '9');
+        if (digits) maxN = std::max(maxN, std::atoi(num.c_str()));
+    }
+    char tail[256];
+    std::snprintf(tail, sizeof(tail), "%s-%d_%ux%u", stem.c_str(), maxN + 1, cols, rows);
+    return dir + sep + tail;
+}
 
 // HUD layer disparity. 0 = zero-disparity plane (screen depth) so the UI sits exactly
 // where the cursor is and clicks align across both eyes. (A small negative value would
@@ -59,26 +114,28 @@ float PerEyeAspect(StereoLayout layout, int frameW, int frameH) {
     return eyeW / (float)frameH;
 }
 
-// Aspect-fit `contentAspect` (width/height) inside `tile`, centered, with black bars
-// (letterbox if the content is wider than the tile, pillarbox if narrower). No stretch.
-XrSession::ViewRect FitRect(const XrSession::ViewRect& tile, float contentAspect) {
+// Aspect-COVER `contentAspect` (width/height) over `tile`, centered: scale so the
+// content fills the whole tile and the overflowing dimension is cropped (by the
+// scissor) — no black bars, no stretch. The returned rect may extend past the tile
+// (negative offset / larger extent); the caller clips it to the tile.
+XrSession::ViewRect CoverRect(const XrSession::ViewRect& tile, float contentAspect) {
     if (tile.w == 0 || tile.h == 0 || contentAspect <= 0.0f) return tile;
     const float tileAspect = (float)tile.w / (float)tile.h;
     XrSession::ViewRect r = tile;
     if (contentAspect > tileAspect) {
-        // Content is wider: fit to tile width, bars top/bottom.
+        // Content wider than the tile: fill the height, overflow (crop) left/right.
+        const uint32_t w = (uint32_t)((float)tile.h * contentAspect + 0.5f);
+        r.h = tile.h;
+        r.w = w;
+        r.y = tile.y;
+        r.x = tile.x - (int32_t)((w - tile.w) / 2);
+    } else {
+        // Content narrower/taller: fill the width, overflow (crop) top/bottom.
         const uint32_t h = (uint32_t)((float)tile.w / contentAspect + 0.5f);
         r.w = tile.w;
         r.h = h;
         r.x = tile.x;
-        r.y = tile.y + (int32_t)((tile.h - h) / 2);
-    } else {
-        // Content is narrower: fit to tile height, bars left/right.
-        const uint32_t w = (uint32_t)((float)tile.h * contentAspect + 0.5f);
-        r.w = w;
-        r.h = tile.h;
-        r.x = tile.x + (int32_t)((tile.w - w) / 2);
-        r.y = tile.y;
+        r.y = tile.y - (int32_t)((h - tile.h) / 2);
     }
     return r;
 }
@@ -213,6 +270,19 @@ int App::Run() {
             LOG_INFO("swap eyes %s", swapEyes_ ? "on" : "off");
             activity = true;
         }
+        if (window_.TakeCaptureRequest()) {                           // 'I' — atlas snapshot
+            if (xr_.HasAtlasCapture()) {
+                const std::string stem = currentMediaPath_.empty()
+                    ? std::string("capture")
+                    : std::filesystem::path(currentMediaPath_).stem().string();
+                const std::string prefix = MakeCaptureAtlasPrefix(
+                    stem, xr_.ActiveTileColumns(), xr_.ActiveTileRows());
+                ShowToast(xr_.CaptureAtlas(prefix) ? "Captured atlas" : "Capture failed");
+            } else {
+                ShowToast("Capture unsupported");
+            }
+            activity = true;
+        }
         if (window_.TakeTogglePauseRequest()) { TogglePlayback(); activity = true; }  // Space
         if (window_.TakePrevMediaRequest()) { RequestNavTransition(-1); activity = true; }  // Left
         if (window_.TakeNextMediaRequest()) { RequestNavTransition(+1); activity = true; }  // Right
@@ -333,25 +403,72 @@ void App::RenderOneFrame() {
         }
 
         if (renderer_.HasTexture()) {
-            // Letterbox in display-view space, then scale into each tile (handles
-            // non-uniform modes the runtime stretches back to the full view).
+            // Cover the view (fill the tile, crop overflow — no black bars), then scale
+            // into each tile (handles non-uniform modes the runtime stretches back).
             const float sx = xr_.ActiveViewScaleX();
             const float sy = xr_.ActiveViewScaleY();
-            const XrSession::ViewRect viewFit = FitRect({0, 0, canvasW, canvasH}, contentAspect_);
+            const XrSession::ViewRect viewFit = CoverRect({0, 0, canvasW, canvasH}, contentAspect_);
+            const int32_t lbx = (int32_t)((float)viewFit.x * sx);  // horizontal inset (0 when covering width)
+            // Convergence = horizontal image translation: shift the two eyes' content
+            // oppositely within their tiles, moving the zero-disparity plane. A LIF's
+            // baked convergence (mediaConvergence_, scaled 0.5 to match the reference
+            // per-eye shift) lands it at the author's intended plane; convergence_ trims.
+            const float conv = convergence_ + 0.5f * mediaConvergence_;
+            int32_t cdx[XrSession::kMaxViews];
             for (uint32_t v = 0; v < frame.viewCount; ++v) {
-                // Convergence = horizontal image translation: shift the two eyes'
-                // content oppositely within their tiles, moving the zero-disparity
-                // plane. Exposed edges fall on the black letterbox the renderer clears.
-                const int32_t cdx =
-                    (int32_t)(convergence_ * (float)rects[v].w * (isLeftView[v] ? 1.0f : -1.0f));
-                contentRects[v].x = rects[v].x + cdx + (int32_t)((float)viewFit.x * sx + 0.5f);
+                cdx[v] = (int32_t)(conv * (float)rects[v].w * (isLeftView[v] ? 1.0f : -1.0f));
+                contentRects[v].x = rects[v].x + cdx[v] + lbx;
                 contentRects[v].y = rects[v].y + (int32_t)((float)viewFit.y * sy + 0.5f);
                 contentRects[v].w = (uint32_t)((float)viewFit.w * sx + 0.5f);
                 contentRects[v].h = (uint32_t)((float)viewFit.h * sy + 0.5f);
             }
-            // Pass the tile rects as scissor bounds so a convergence-shifted content
-            // rect is truncated at its tile edge, never spilling into the other eye.
-            renderer_.DrawViews(frame.imageIndex, contentRects, rects, uvs, frame.viewCount);
+
+            // Build the draw list: content quads (viewport = content rect, scissor = the
+            // tile so a shifted rect can't spill into the other eye), then de-occlusion
+            // fill strips. kMaxViews=8 leaves room for the extra fill draws.
+            XrSession::ViewRect drawVp[XrSession::kMaxViews];
+            XrSession::ViewRect drawClip[XrSession::kMaxViews];
+            ViewUV drawUv[XrSession::kMaxViews];
+            uint32_t n = 0;
+            for (uint32_t v = 0; v < frame.viewCount; ++v) {
+                drawVp[n] = contentRects[v];
+                drawClip[n] = rects[v];
+                drawUv[n] = uvs[v];
+                ++n;
+            }
+            // Reconvergence exposes a black strip on one edge of each eye. Paint it with
+            // the *other* eye's same-side edge: draw the other view's full quad aligned so
+            // its matching edge sits against the gap, scissored to just the exposed strip.
+            // (Translating by a whole tile instead would sample the other view at this
+            // eye's own scene position — visually indistinguishable from this view; we
+            // want the other view's actual border content.) Stereo, two-view only.
+            if (layout_ != StereoLayout::Mono && frame.viewCount == 2) {
+                for (uint32_t v = 0; v < 2 && n < XrSession::kMaxViews; ++v) {
+                    if (cdx[v] == 0) continue;          // no shift → no gap
+                    const uint32_t o = 1u - v;          // the other eye
+                    XrSession::ViewRect gap;
+                    gap.y = rects[v].y;                 // clamp to the tile (cover overflows it)
+                    gap.h = rects[v].h;
+                    XrSession::ViewRect fillVp;
+                    fillVp.y = contentRects[o].y;
+                    fillVp.h = contentRects[o].h;
+                    fillVp.w = contentRects[o].w;       // full other-view content width
+                    if (cdx[v] > 0) {                   // content moved right → gap on left
+                        gap.x = rects[v].x + lbx;
+                        gap.w = (uint32_t)cdx[v];
+                        fillVp.x = gap.x;               // other view's LEFT edge at gap left
+                    } else {                            // content moved left → gap on right
+                        gap.x = contentRects[v].x + (int32_t)contentRects[v].w;
+                        gap.w = (uint32_t)(-cdx[v]);
+                        fillVp.x = gap.x + (int32_t)gap.w - (int32_t)fillVp.w;  // RIGHT edge at gap right
+                    }
+                    drawVp[n] = fillVp;
+                    drawClip[n] = gap;
+                    drawUv[n] = uvs[o];
+                    ++n;
+                }
+            }
+            renderer_.DrawViews(frame.imageIndex, drawVp, drawClip, drawUv, n);
         } else if (hasMedia_) {
             const ClearColor black[XrSession::kMaxViews] = {};  // video warming up
             renderer_.ClearViews(frame.imageIndex, black, rects, frame.viewCount);
@@ -361,7 +478,16 @@ void App::RenderOneFrame() {
         ++rendered_;
 
         if (dumpPath_ && !dumped_ && rendered_ >= 100) {
-            renderer_.DumpImage(frame.imageIndex, dumpPath_);
+            // Prefer the runtime-owned atlas capture (compositor-owned swapchain makes the
+            // app-side readback unreliable); fall back to the local readback if absent.
+            if (xr_.HasAtlasCapture()) {
+                std::string prefix = dumpPath_;
+                if (prefix.size() > 4 && prefix.compare(prefix.size() - 4, 4, ".png") == 0)
+                    prefix.resize(prefix.size() - 4);
+                xr_.CaptureAtlas(prefix);
+            } else {
+                renderer_.DumpImage(frame.imageIndex, dumpPath_);
+            }
             dumped_ = true;
         }
     }
@@ -737,6 +863,7 @@ bool App::LoadMedia(const std::string& path) {
         hasMedia_ = true;
         ClearIdleLogo();
         layout_ = info.layout;
+        mediaConvergence_ = 0.0f;  // no baked convergence for video
         mediaW_ = video_.Width();
         mediaH_ = video_.Height();
         contentAspect_ = PerEyeAspect(info.layout, video_.Width(), video_.Height());
@@ -778,11 +905,12 @@ bool App::LoadMedia(const std::string& path) {
         hasMedia_ = true;
         ClearIdleLogo();
         layout_ = lif.layout;
+        mediaConvergence_ = lif.convergence;  // baked reconvergence from the LIF
         mediaW_ = lif.image.width;
         mediaH_ = lif.image.height;
         contentAspect_ = PerEyeAspect(lif.layout, lif.image.width, lif.image.height);
-        LOG_INFO("Displaying %s LIF (%s), per-eye aspect %.3f",
-                 lif.stereo ? "stereo" : "mono", path.c_str(), contentAspect_);
+        LOG_INFO("Displaying %s LIF (%s), per-eye aspect %.3f, baked convergence %+.4f",
+                 lif.stereo ? "stereo" : "mono", path.c_str(), contentAspect_, mediaConvergence_);
         currentMediaPath_ = path;
         RebuildFolderList(path);
         return true;
@@ -800,6 +928,7 @@ bool App::LoadMedia(const std::string& path) {
     hasMedia_ = true;
     ClearIdleLogo();
     layout_ = imgInfo.layout;
+    mediaConvergence_ = 0.0f;  // plain SBS image carries no baked convergence
     mediaW_ = img.width;
     mediaH_ = img.height;
     contentAspect_ = PerEyeAspect(imgInfo.layout, img.width, img.height);

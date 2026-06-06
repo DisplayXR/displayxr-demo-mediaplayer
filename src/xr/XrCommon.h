@@ -12,6 +12,7 @@
 
 #include <openxr/XR_EXT_display_info.h>
 #include <openxr/XR_EXT_workspace_file_dialog.h>  // Tier-1 spatial file picker (Open)
+#include <openxr/XR_EXT_atlas_capture.h>           // 'I' key — snapshot the composed atlas
 #if defined(__APPLE__)
 #  include <openxr/XR_EXT_cocoa_window_binding.h>
 #elif defined(_WIN32)

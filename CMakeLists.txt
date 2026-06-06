@@ -206,6 +206,12 @@ target_link_libraries(${MP_TARGET} PRIVATE
     ${MP_OPENXR_LOADER}
 )
 
+# Windows: SHGetKnownFolderPath (shell32) + CoTaskMemFree (ole32) for the 'I'-key
+# atlas-capture output path under the user's Pictures folder.
+if(WIN32)
+    target_link_libraries(${MP_TARGET} PRIVATE shell32 ole32)
+endif()
+
 # Copy the OpenXR loader dylib/dll next to the binary when it's an imported target,
 # so the app runs without extra PATH/DYLD setup.
 if(TARGET OpenXR::openxr_loader)

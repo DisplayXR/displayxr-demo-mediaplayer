@@ -78,6 +78,8 @@ bool XrSession::InitInstanceAndSystem() {
         if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) hasDisplayInfoExt_ = true;
         if (strcmp(e.extensionName, XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0)
             hasFilePickerExt_ = true;
+        if (strcmp(e.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
+            hasAtlasCaptureExt_ = true;
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "yes" : "NO");
@@ -86,6 +88,7 @@ bool XrSession::InitInstanceAndSystem() {
              hasWindowBindingExt_ ? "yes" : "no");
     LOG_INFO("XR_EXT_display_info: %s", hasDisplayInfoExt_ ? "yes" : "no");
     LOG_INFO("XR_EXT_workspace_file_dialog: %s", hasFilePickerExt_ ? "yes" : "no");
+    LOG_INFO("XR_EXT_atlas_capture: %s", hasAtlasCaptureExt_ ? "yes" : "no");
 
     if (!hasVulkan) {
         LOG_ERROR("Runtime does not expose XR_KHR_vulkan_enable");
@@ -97,6 +100,7 @@ bool XrSession::InitInstanceAndSystem() {
     if (hasWindowBindingExt_) enabled.push_back(kWindowBindingExt);
     if (hasDisplayInfoExt_) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
     if (hasFilePickerExt_) enabled.push_back(XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
+    if (hasAtlasCaptureExt_) enabled.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     std::strncpy(ci.applicationInfo.applicationName, "DisplayXR Media Player",
@@ -115,6 +119,11 @@ bool XrSession::InitInstanceAndSystem() {
     if (hasFilePickerExt_) {
         xrGetInstanceProcAddr(instance_, "xrRequestFilePickerEXT",
                               (PFN_xrVoidFunction*)&pfnRequestFilePicker_);
+    }
+    if (hasAtlasCaptureExt_) {
+        xrGetInstanceProcAddr(instance_, "xrCaptureAtlasEXT",
+                              (PFN_xrVoidFunction*)&pfnCaptureAtlasEXT_);
+        LOG_INFO("xrCaptureAtlasEXT: %s", pfnCaptureAtlasEXT_ ? "resolved" : "NULL");
     }
 
     XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
@@ -745,6 +754,23 @@ bool XrSession::TakePickedFile(std::string& path) {
     hasPickedFile_ = false;
     path = pickedFile_;
     pickedFile_.clear();
+    return true;
+}
+
+bool XrSession::CaptureAtlas(const std::string& pathPrefix) {
+    if (!pfnCaptureAtlasEXT_ || session_ == XR_NULL_HANDLE) return false;
+    XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+    info.next = nullptr;
+    // POST_COMPOSE = the full atlas handed to the display processor (our projection
+    // tiles plus any window-space HUD) — i.e. exactly what gets woven to the panel.
+    info.stage = XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_EXT;
+    std::strncpy(info.pathPrefix, pathPrefix.c_str(), XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
+    const XrResult r = pfnCaptureAtlasEXT_(session_, &info, nullptr);
+    if (XR_FAILED(r)) {
+        LOG_WARN("xrCaptureAtlasEXT failed: XrResult=%d", (int)r);
+        return false;
+    }
+    LOG_INFO("Atlas capture requested -> %s_atlas.png", pathPrefix.c_str());
     return true;
 }
 
