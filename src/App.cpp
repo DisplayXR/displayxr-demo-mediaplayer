@@ -114,35 +114,39 @@ float PerEyeAspect(StereoLayout layout, int frameW, int frameH) {
     return eyeW / (float)frameH;
 }
 
-// Aspect-COVER `contentAspect` (width/height) over `tile`, centered: scale so the
-// content fills the whole tile and the overflowing dimension is cropped (by the
-// scissor) — no black bars, no stretch. The returned rect may extend past the tile
-// (negative offset / larger extent); the caller clips it to the tile.
-XrSession::ViewRect CoverRect(const XrSession::ViewRect& tile, float contentAspect) {
+// "Match min-to-min": scale `contentAspect` so the content's SHORTER screen side equals
+// the tile's shorter side, then center. The longer side then overflows (cropped by the
+// scissor) when the content is more elongated than the tile, or sits inside it otherwise.
+// Adapts dynamically to the window aspect (landscape vs portrait). No stretch.
+XrSession::ViewRect MatchMinRect(const XrSession::ViewRect& tile, float contentAspect) {
     if (tile.w == 0 || tile.h == 0 || contentAspect <= 0.0f) return tile;
-    const float tileAspect = (float)tile.w / (float)tile.h;
-    XrSession::ViewRect r = tile;
-    if (contentAspect > tileAspect) {
-        // Content wider than the tile: fill the height, overflow (crop) left/right.
-        const uint32_t w = (uint32_t)((float)tile.h * contentAspect + 0.5f);
-        r.h = tile.h;
-        r.w = w;
-        r.y = tile.y;
-        r.x = tile.x - (int32_t)((w - tile.w) / 2);
-    } else {
-        // Content narrower/taller: fill the width, overflow (crop) top/bottom.
-        const uint32_t h = (uint32_t)((float)tile.w / contentAspect + 0.5f);
-        r.w = tile.w;
-        r.h = h;
-        r.x = tile.x;
-        r.y = tile.y - (int32_t)((h - tile.h) / 2);
+    const uint32_t tileMin = std::min(tile.w, tile.h);
+    uint32_t cw, ch;
+    if (contentAspect >= 1.0f) {           // landscape content: height is its min side
+        ch = tileMin;
+        cw = (uint32_t)((float)tileMin * contentAspect + 0.5f);
+    } else {                               // portrait content: width is its min side
+        cw = tileMin;
+        ch = (uint32_t)((float)tileMin / contentAspect + 0.5f);
     }
+    XrSession::ViewRect r;
+    r.w = cw;
+    r.h = ch;
+    r.x = tile.x + (int32_t)(((int64_t)tile.w - (int64_t)cw) / 2);
+    r.y = tile.y + (int32_t)(((int64_t)tile.h - (int64_t)ch) / 2);
     return r;
 }
 } // namespace
 
 bool App::Initialize(const char* mediaPath) {
-    if (!window_.Create("DisplayXR Stereo Media Player", 1280, 720)) return false;
+    // Default 1280x720; MEDIAPLAYER_WINDOW="WxH" overrides (e.g. "720x1280" to test
+    // portrait aspect handling without a rebuild).
+    int winW = 1280, winH = 720;
+    if (const char* s = std::getenv("MEDIAPLAYER_WINDOW")) {
+        int a = 0, b = 0;
+        if (std::sscanf(s, "%dx%d", &a, &b) == 2 && a > 0 && b > 0) { winW = a; winH = b; }
+    }
+    if (!window_.Create("DisplayXR Stereo Media Player", winW, winH)) return false;
 
     if (!xr_.Initialize(window_.NativeHandle())) {
         LOG_ERROR("OpenXR initialization failed");
@@ -403,12 +407,12 @@ void App::RenderOneFrame() {
         }
 
         if (renderer_.HasTexture()) {
-            // Cover the view (fill the tile, crop overflow — no black bars), then scale
-            // into each tile (handles non-uniform modes the runtime stretches back).
+            // Match the content's shorter side to the tile's shorter side (crop the
+            // longer axis), then scale into each tile (handles non-uniform modes).
             const float sx = xr_.ActiveViewScaleX();
             const float sy = xr_.ActiveViewScaleY();
-            const XrSession::ViewRect viewFit = CoverRect({0, 0, canvasW, canvasH}, contentAspect_);
-            const int32_t lbx = (int32_t)((float)viewFit.x * sx);  // horizontal inset (0 when covering width)
+            const XrSession::ViewRect viewFit = MatchMinRect({0, 0, canvasW, canvasH}, contentAspect_);
+            const int32_t lbx = (int32_t)((float)viewFit.x * sx);  // horizontal inset of the content
             // Convergence = horizontal image translation: shift the two eyes' content
             // oppositely within their tiles, moving the zero-disparity plane. A LIF's
             // baked convergence (mediaConvergence_, scaled 0.5 to match the reference
@@ -436,32 +440,42 @@ void App::RenderOneFrame() {
                 drawUv[n] = uvs[v];
                 ++n;
             }
-            // Reconvergence exposes a black strip on one edge of each eye. Paint it with
-            // the *other* eye's POST-shift content at the same screen position: draw the
-            // other view's quad with its own convergence shift, translated one tile over,
-            // and scissor it to the exposed strip. This makes the seam stereo-consistent
-            // (the filled pixels match what the other eye shows there, at zero disparity)
-            // rather than grafting in the other view's raw edge. Stereo, two-view only.
-            if (layout_ != StereoLayout::Mono && frame.viewCount == 2) {
-                for (uint32_t v = 0; v < 2 && n < XrSession::kMaxViews; ++v) {
+            // Reconvergence exposes a strip on one edge of each eye. Fill it by MIRRORING
+            // this eye's own content across that edge (reflect-101 padding): draw the
+            // content quad reflected about the content edge, scissored to the strip. Works
+            // for every source (image/video, baked or manual convergence) with no second-
+            // view dependency. The mirror UV (offX+scaleX, -scaleX) reflects whichever
+            // edge the gap abuts — the gap sits at the matching end of the reflected quad.
+            if (frame.viewCount == 2) {
+                for (uint32_t v = 0; v < frame.viewCount && n < XrSession::kMaxViews; ++v) {
                     if (cdx[v] == 0) continue;          // no shift → no gap
-                    const uint32_t o = 1u - v;          // the other eye
+                    const int32_t cw = (int32_t)contentRects[v].w;
                     XrSession::ViewRect gap;
-                    gap.y = rects[v].y;                 // clamp to the tile (cover overflows it)
+                    gap.y = rects[v].y;                 // clamp to the tile (content may overflow it)
                     gap.h = rects[v].h;
-                    if (cdx[v] > 0) {                   // content moved right → gap on left
+                    XrSession::ViewRect fillVp;
+                    fillVp.y = contentRects[v].y;
+                    fillVp.h = contentRects[v].h;
+                    fillVp.w = contentRects[v].w;
+                    if (cdx[v] > 0) {                   // content moved right → gap on left edge
+                        const int32_t E = contentRects[v].x;            // content left edge
                         gap.x = rects[v].x + lbx;
                         gap.w = (uint32_t)cdx[v];
-                    } else {                            // content moved left → gap on right
-                        gap.x = contentRects[v].x + (int32_t)contentRects[v].w;
+                        fillVp.x = E - cw;             // reflected quad sits to the left of E
+                    } else {                           // content moved left → gap on right edge
+                        const int32_t E = contentRects[v].x + cw;       // content right edge
+                        gap.x = E;
                         gap.w = (uint32_t)(-cdx[v]);
+                        fillVp.x = E;                  // reflected quad sits to the right of E
                     }
-                    // Other eye's content (incl. its shift) placed in this eye's tile.
-                    XrSession::ViewRect fillVp = contentRects[o];
-                    fillVp.x = contentRects[o].x + (rects[v].x - rects[o].x);
+                    ViewUV mu;
+                    mu.offX = uvs[v].offX + uvs[v].scaleX;  // far edge of this eye's half
+                    mu.scaleX = -uvs[v].scaleX;             // mirror horizontally
+                    mu.offY = uvs[v].offY;
+                    mu.scaleY = uvs[v].scaleY;
                     drawVp[n] = fillVp;
                     drawClip[n] = gap;
-                    drawUv[n] = uvs[o];
+                    drawUv[n] = mu;
                     ++n;
                 }
             }
