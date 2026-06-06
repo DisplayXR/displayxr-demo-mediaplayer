@@ -437,11 +437,11 @@ void App::RenderOneFrame() {
                 ++n;
             }
             // Reconvergence exposes a black strip on one edge of each eye. Paint it with
-            // the *other* eye's same-side edge: draw the other view's full quad aligned so
-            // its matching edge sits against the gap, scissored to just the exposed strip.
-            // (Translating by a whole tile instead would sample the other view at this
-            // eye's own scene position — visually indistinguishable from this view; we
-            // want the other view's actual border content.) Stereo, two-view only.
+            // the *other* eye's POST-shift content at the same screen position: draw the
+            // other view's quad with its own convergence shift, translated one tile over,
+            // and scissor it to the exposed strip. This makes the seam stereo-consistent
+            // (the filled pixels match what the other eye shows there, at zero disparity)
+            // rather than grafting in the other view's raw edge. Stereo, two-view only.
             if (layout_ != StereoLayout::Mono && frame.viewCount == 2) {
                 for (uint32_t v = 0; v < 2 && n < XrSession::kMaxViews; ++v) {
                     if (cdx[v] == 0) continue;          // no shift → no gap
@@ -449,19 +449,16 @@ void App::RenderOneFrame() {
                     XrSession::ViewRect gap;
                     gap.y = rects[v].y;                 // clamp to the tile (cover overflows it)
                     gap.h = rects[v].h;
-                    XrSession::ViewRect fillVp;
-                    fillVp.y = contentRects[o].y;
-                    fillVp.h = contentRects[o].h;
-                    fillVp.w = contentRects[o].w;       // full other-view content width
                     if (cdx[v] > 0) {                   // content moved right → gap on left
                         gap.x = rects[v].x + lbx;
                         gap.w = (uint32_t)cdx[v];
-                        fillVp.x = gap.x;               // other view's LEFT edge at gap left
                     } else {                            // content moved left → gap on right
                         gap.x = contentRects[v].x + (int32_t)contentRects[v].w;
                         gap.w = (uint32_t)(-cdx[v]);
-                        fillVp.x = gap.x + (int32_t)gap.w - (int32_t)fillVp.w;  // RIGHT edge at gap right
                     }
+                    // Other eye's content (incl. its shift) placed in this eye's tile.
+                    XrSession::ViewRect fillVp = contentRects[o];
+                    fillVp.x = contentRects[o].x + (rects[v].x - rects[o].x);
                     drawVp[n] = fillVp;
                     drawClip[n] = gap;
                     drawUv[n] = uvs[o];
