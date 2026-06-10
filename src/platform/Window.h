@@ -38,6 +38,10 @@ public:
 
     void SetTitle(const char* title);
 
+    // Make the window visible. Deferred until after XR setup so the window doesn't flash on
+    // top of the workspace shell while the runtime is still binding/hiding the HWND.
+    void Show();
+
     // Forward every SDL event to a sink (the ImGui backend) before our own handling.
     // The argument is an `SDL_Event*` (void to keep SDL out of this header).
     void SetEventHook(std::function<void(void*)> hook);

@@ -53,6 +53,20 @@ public:
 
 private:
     bool ready_ = false;
+    SDL_Window* sdlWindow_ = nullptr;  // borrowed; used to fetch the live HWND (Win32)
+    // Cursor in window points from SDL motion events — a fallback source. On Windows the
+    // primary source is the raw WM_MOUSEMOVE position captured by the window-proc subclass
+    // (see ImGuiLayer.cpp): for the hidden workspace HWND, both the SDL poll and SDL's own
+    // motion events clamp/collapse to a window edge, while the forwarded WM_MOUSEMOVE lParam
+    // is the correct content-space position. -1 until the first event arrives.
+    float lastMouseX_ = -1.0f;
+    float lastMouseY_ = -1.0f;
+    // Remap context cached each BeginFrame so ProcessEvent can place the corrected cursor in
+    // io.MousePos *before* a button event reaches ImGui — otherwise a click latches at the
+    // stale SDL position (the press lands off the widget; it takes a second click once hover
+    // has caught up). rectW_ <= 0 means "not yet valid".
+    float remapRectX_ = 0.0f, remapRectY_ = 0.0f, remapRectW_ = 0.0f, remapRectH_ = 0.0f;
+    float remapDivW_ = 0.0f, remapDivH_ = 0.0f;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t hudWidth_ = 0;

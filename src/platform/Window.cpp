@@ -35,7 +35,10 @@ bool Window::Create(const char* title, int width, int height) {
     // request a Metal-capable window so SDL gives us a CAMetalLayer-backed NSView.
     // Resizable from the start — the render path reads the live pixel size each
     // frame, so tiles + letterboxing re-fit automatically.
-    Uint32 flags = SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE;
+    // Created HIDDEN: in workspace mode the runtime hides/binds the HWND during session
+    // creation, which takes a couple of seconds. A window shown up-front flashes on top of
+    // the shell during that init; we show it (via Show()) only after XR setup completes.
+    Uint32 flags = SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN;
 #if defined(__APPLE__)
     flags |= SDL_WINDOW_METAL;
 #endif
@@ -85,6 +88,10 @@ void Window::PointSize(uint32_t& width, uint32_t& height) const {
 
 void Window::SetTitle(const char* title) {
     if (window_) SDL_SetWindowTitle(window_, title);
+}
+
+void Window::Show() {
+    if (window_) SDL_ShowWindow(window_);
 }
 
 void Window::SetEventHook(std::function<void(void*)> hook) {

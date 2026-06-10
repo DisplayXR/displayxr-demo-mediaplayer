@@ -11,6 +11,14 @@
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_vulkan.h"
+
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  define NOMINMAX
+#  include <windows.h>
+#  include <windowsx.h>  // GET_X_LPARAM / GET_Y_LPARAM
+#  include <climits>
+#endif
 #endif
 
 namespace mp {
@@ -21,6 +29,25 @@ namespace {
 void CheckVk(VkResult r) {
     if (r != VK_SUCCESS) LOG_ERROR("ImGuiLayer: VkResult=%d", (int)r);
 }
+
+#if defined(_WIN32)
+// Read the cursor straight from the window message stream (like the Gauss/model Win32
+// demos): in workspace mode the runtime forwards a synthetic, content-space cursor via
+// WM_MOUSEMOVE, which is correct by construction — unlike SDL's clamped copy or the real
+// global cursor (GetCursorPos), which both miss because the app HWND is hidden. We subclass
+// SDL's window proc, capture the lParam, then chain to the original.
+WNDPROC g_originalWndProc = nullptr;
+HWND    g_subclassedHwnd = nullptr;
+LONG    g_wmMouseX = LONG_MIN;
+LONG    g_wmMouseY = LONG_MIN;
+LRESULT CALLBACK MouseCaptureWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_MOUSEMOVE || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) {
+        g_wmMouseX = GET_X_LPARAM(lp);
+        g_wmMouseY = GET_Y_LPARAM(lp);
+    }
+    return CallWindowProc(g_originalWndProc, hwnd, msg, wp, lp);
+}
+#endif
 
 // Polished "dark glass" look: generous rounding, padded controls, faint translucent
 // surfaces, one cyan accent. Centralizes all styling so the per-widget code stays clean.
@@ -61,6 +88,7 @@ bool ImGuiLayer::Init(SDL_Window* window, VkInstance instance, VkPhysicalDevice 
                       uint32_t hudWidth, uint32_t hudHeight,
                       const std::vector<VkImage>& hudImages) {
     if (hudImages.empty() || hudWidth == 0 || hudHeight == 0) return false;
+    sdlWindow_ = window;
     device_ = device;
     queue_ = queue;
     hudWidth_ = hudWidth;
@@ -191,6 +219,19 @@ bool ImGuiLayer::Init(SDL_Window* window, VkInstance instance, VkPhysicalDevice 
     }
     ImGui_ImplVulkan_CreateFontsTexture();
 
+#if defined(_WIN32)
+    if (sdlWindow_ && !g_originalWndProc) {
+        HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(sdlWindow_),
+                                                 SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+        if (hwnd) {
+            g_subclassedHwnd = hwnd;
+            g_originalWndProc = (WNDPROC)SetWindowLongPtr(hwnd, GWLP_WNDPROC,
+                                                          (LONG_PTR)MouseCaptureWndProc);
+            LOG_INFO("ImGuiLayer: subclassed window proc for WM_MOUSEMOVE capture");
+        }
+    }
+#endif
+
     ready_ = true;
     LOG_INFO("ImGuiLayer: ready (HUD %ux%u, %zu images)", hudWidth_, hudHeight_,
              hudImages.size());
@@ -198,7 +239,30 @@ bool ImGuiLayer::Init(SDL_Window* window, VkInstance instance, VkPhysicalDevice 
 }
 
 void ImGuiLayer::ProcessEvent(const void* sdlEvent) {
-    if (ready_) ImGui_ImplSDL3_ProcessEvent(static_cast<const SDL_Event*>(sdlEvent));
+    if (!ready_) return;
+    const SDL_Event* e = static_cast<const SDL_Event*>(sdlEvent);
+    // Track the cursor from MOTION events only. Button-event coords are unreliable for the
+    // hidden workspace HWND (they collapse to a window edge), so we keep the last motion pos.
+    if (e->type == SDL_EVENT_MOUSE_MOTION) {
+        lastMouseX_ = e->motion.x;
+        lastMouseY_ = e->motion.y;
+    }
+    // Before a button event reaches ImGui, queue the corrected cursor position so the click
+    // latches on the widget under the visible cursor (not the stale SDL position queued by the
+    // backend during pumping). The subclass updated g_wmMouse from the same WM_LBUTTONDOWN.
+    if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_MOUSE_BUTTON_UP) {
+        float mx = lastMouseX_, my = lastMouseY_;
+#if defined(_WIN32)
+        if (g_wmMouseX != LONG_MIN) { mx = (float)g_wmMouseX; my = (float)g_wmMouseY; }
+#endif
+        if (remapRectW_ > 0.0f && remapRectH_ > 0.0f && remapDivW_ > 0.0f && remapDivH_ > 0.0f &&
+            mx >= 0.0f) {
+            const float u = ((mx / remapDivW_) - remapRectX_) / remapRectW_;
+            const float v = ((my / remapDivH_) - remapRectY_) / remapRectH_;
+            ImGui::GetIO().AddMousePosEvent(u * (float)hudWidth_, v * (float)hudHeight_);
+        }
+    }
+    ImGui_ImplSDL3_ProcessEvent(e);
 }
 
 void ImGuiLayer::BeginFrame(float winPointW, float winPointH,
@@ -210,18 +274,40 @@ void ImGuiLayer::BeginFrame(float winPointW, float winPointH,
     io.DisplaySize = ImVec2((float)hudWidth_, (float)hudHeight_);
     io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
 
-    // Remap the OS cursor (window points) into HUD pixels via the layer's placement
-    // rect, and queue it as the LAST mouse-position event before NewFrame. NewFrame
-    // applies the event queue in order, so ours overrides the SDL backend's window-
-    // space position — and because it's queued *before* NewFrame, a button press this
-    // frame latches its click position in HUD space (a post-NewFrame fixup would be
-    // too late: the click would have already been recorded at the window-space point).
-    if (rectW > 0.0f && rectH > 0.0f && winPointW > 0.0f && winPointH > 0.0f) {
-        float mx = 0.0f, my = 0.0f;
-        SDL_GetMouseState(&mx, &my);  // window-relative logical (point) coordinates
-        const float u = ((mx / winPointW) - rectX) / rectW;
-        const float v = ((my / winPointH) - rectY) / rectH;
+    // Remap the cursor (window points) into HUD pixels via the layer's placement rect, and
+    // queue it as the LAST mouse-position event before NewFrame so it overrides the SDL
+    // backend's window-space position. The divisor is the live Win32 client size: in
+    // workspace mode the shell resizes the HWND externally and SDL's cached size can lag, so
+    // GetClientRect gives the exact size the runtime scaled the cursor against. Off-Windows
+    // (or if the HWND is unavailable) we fall back to the SDL point size.
+    float remapW = winPointW, remapH = winPointH;
+#if defined(_WIN32)
+    if (sdlWindow_) {
+        HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(sdlWindow_),
+                                                 SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+        RECT rc{};
+        if (hwnd && GetClientRect(hwnd, &rc)) {
+            const float cw = (float)(rc.right - rc.left);
+            const float ch = (float)(rc.bottom - rc.top);
+            if (cw > 0.0f && ch > 0.0f) { remapW = cw; remapH = ch; }
+        }
+    }
+#endif
+    if (rectW > 0.0f && rectH > 0.0f && remapW > 0.0f && remapH > 0.0f) {
+        // Cursor source priority: the raw WM_MOUSEMOVE position the runtime forwards (correct
+        // content-space coords, like the Gauss Win32 demo) > SDL motion events > the poll.
+        float mx = lastMouseX_, my = lastMouseY_;
+        if (mx < 0.0f && my < 0.0f) SDL_GetMouseState(&mx, &my);
+#if defined(_WIN32)
+        if (g_wmMouseX != LONG_MIN) { mx = (float)g_wmMouseX; my = (float)g_wmMouseY; }
+#endif
+        const float u = ((mx / remapW) - rectX) / rectW;
+        const float v = ((my / remapH) - rectY) / rectH;
         io.AddMousePosEvent(u * (float)hudWidth_, v * (float)hudHeight_);
+
+        // Cache for ProcessEvent so a click latches at this same corrected position.
+        remapRectX_ = rectX; remapRectY_ = rectY; remapRectW_ = rectW; remapRectH_ = rectH;
+        remapDivW_ = remapW; remapDivH_ = remapH;
     }
     ImGui::NewFrame();
 }
@@ -265,6 +351,13 @@ bool ImGuiLayer::WantCaptureMouse() const {
 
 void ImGuiLayer::Shutdown() {
     if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+#if defined(_WIN32)
+    if (g_originalWndProc && g_subclassedHwnd) {
+        SetWindowLongPtr(g_subclassedHwnd, GWLP_WNDPROC, (LONG_PTR)g_originalWndProc);
+        g_originalWndProc = nullptr;
+        g_subclassedHwnd = nullptr;
+    }
+#endif
     if (ready_) {
         ImGui_ImplVulkan_Shutdown();
         ImGui_ImplSDL3_Shutdown();
