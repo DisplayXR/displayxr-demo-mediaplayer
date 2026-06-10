@@ -39,3 +39,9 @@ assets/media/
 *.mp4
 *.mkv
 *.mov
+
+# Android leg (Gradle)
+local.properties
+.gradle/
+android/build/
+android/.cxx/
