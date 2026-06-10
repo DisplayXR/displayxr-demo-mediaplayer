@@ -304,6 +304,7 @@ int App::Run() {
             }
             activity = true;
         }
+        if (window_.TakeOpenFileRequest()) { RequestOpenFile(); activity = true; }     // Ctrl+O
         if (window_.TakeTogglePauseRequest()) { TogglePlayback(); activity = true; }  // Space
         if (window_.TakePrevMediaRequest()) { RequestNavTransition(-1); activity = true; }  // Left
         if (window_.TakeNextMediaRequest()) { RequestNavTransition(+1); activity = true; }  // Right
@@ -1396,6 +1397,10 @@ void App::RequestOpenFile() {
         return;
     }
     LOG_INFO("Open: workspace picker unavailable (status=%d) — native dialog", (int)st);
+    // The native dialog is a desktop window — useful for standalone/dev runs, but inside a
+    // fullscreen workspace it opens behind the compositor and looks like a dead button. Toast
+    // so the fallback is never a silent no-op.
+    ShowToast("File picker unavailable — opening desktop dialog");
 
     static const SDL_DialogFileFilter kFilters[] = {
         {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png;lif"},

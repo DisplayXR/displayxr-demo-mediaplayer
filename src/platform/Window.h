@@ -63,6 +63,7 @@ public:
     bool TakeSwapEyesRequest();    // `X` — toggle L/R eye assignment
     bool TakeCaptureRequest();     // `I` — snapshot the composed atlas to a PNG
     bool TakeTogglePauseRequest(); // Space — play/pause
+    bool TakeOpenFileRequest();    // Ctrl+O — open the file picker
 
     // --- Folder navigation / slideshow ---
     bool TakePrevMediaRequest();      // Left arrow — previous asset in the folder
@@ -95,6 +96,7 @@ private:
     bool swapEyesRequested_ = false;
     bool captureRequested_ = false;
     bool togglePauseRequested_ = false;
+    bool openFileRequested_ = false;
     bool prevMediaRequested_ = false;
     bool nextMediaRequested_ = false;
     bool toggleSlideshowRequested_ = false;

@@ -129,6 +129,10 @@ Section "Stereo Media Player Demo" SecDemo
     SetOutPath "$INSTDIR\displayxr"
     File "${SOURCE_DIR}\displayxr\icon.png"
     File "${SOURCE_DIR}\displayxr\icon_sbs.png"
+    ; idle.png + logo.png back the no-media idle screen (LoadIdleLogo resolves them at
+    ; <exe-dir>\displayxr\); without them the app falls back to the RED|BLUE test pattern.
+    File "${SOURCE_DIR}\displayxr\idle.png"
+    File "${SOURCE_DIR}\displayxr\logo.png"
     File "${SOURCE_DIR}\displayxr\mediaplayer_handle_vk_win.displayxr.json"
     SetOutPath "$INSTDIR"
 
@@ -147,7 +151,7 @@ Section "Stereo Media Player Demo" SecDemo
     FileWrite $0 '  "type": "3d",$\r$\n'
     FileWrite $0 '  "category": "demo",$\r$\n'
     FileWrite $0 '  "display_mode": "auto",$\r$\n'
-    FileWrite $0 '  "description": "Plays side-by-side stereo images (JPG/PNG) and video (H.264/H.265/AV1) on a 3D display. Pass a file to play, or launch for a test pattern.",$\r$\n'
+    FileWrite $0 '  "description": "Plays side-by-side stereo images (JPG/PNG) and video (H.264/H.265/AV1) on a 3D display. Pass a file to play, or open one from inside the app.",$\r$\n'
     FileWrite $0 '  "icon": "mediaplayer.png",$\r$\n'
     FileWrite $0 '  "icon_3d": "mediaplayer_sbs.png",$\r$\n'
     FileWrite $0 '  "icon_3d_layout": "sbs-lr",$\r$\n'
@@ -195,10 +199,10 @@ SectionEnd
 Section "Start Menu Shortcut" SecShortcut
     SetShellVarContext all
     CreateDirectory "$SMPROGRAMS\DisplayXR"
-    ; Launch with the bundled sample so the tile shows stereo content out of the
-    ; box (with no argument the app shows a RED|BLUE test pattern).
+    ; Launch with no argument so the app opens on the DisplayXR idle screen (mark +
+    ; "Media Player"); the user opens media via the in-app picker (Open / Ctrl+O).
     CreateShortCut "$SMPROGRAMS\DisplayXR\Stereo Media Player.lnk" \
-        "$INSTDIR\mediaplayer_handle_vk_win.exe" '"$INSTDIR\test_LR_2x1.png"' \
+        "$INSTDIR\mediaplayer_handle_vk_win.exe" "" \
         "$INSTDIR\mediaplayer_handle_vk_win.exe" 0
 SectionEnd
 
@@ -229,6 +233,8 @@ Section "Uninstall"
     Delete "$INSTDIR\test_LR_2x1.png"
     Delete "$INSTDIR\displayxr\icon.png"
     Delete "$INSTDIR\displayxr\icon_sbs.png"
+    Delete "$INSTDIR\displayxr\idle.png"
+    Delete "$INSTDIR\displayxr\logo.png"
     Delete "$INSTDIR\displayxr\mediaplayer_handle_vk_win.displayxr.json"
     RMDir "$INSTDIR\displayxr"
     Delete "$INSTDIR\Uninstall.exe"

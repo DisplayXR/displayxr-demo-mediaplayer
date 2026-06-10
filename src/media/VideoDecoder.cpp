@@ -473,7 +473,7 @@ bool VideoDecoder::Open(const std::string&) {
     return false;
 }
 void VideoDecoder::DecodeLoop() {}
-void VideoDecoder::Seek(double) {}
+void VideoDecoder::Seek(double, bool) {}
 void VideoDecoder::Stop() {}
 
 #endif
