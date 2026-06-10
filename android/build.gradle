@@ -85,6 +85,14 @@ android {
             useLegacyPackaging true
         }
     }
+
+    sourceSets {
+        main {
+            // Bundle the repo's displayxr/ brand art (idle.png lockup etc.) as
+            // assets — referenced, not copied, same as the shared shaders.
+            assets.srcDirs += ['../displayxr']
+        }
+    }
 }
 
 dependencies {

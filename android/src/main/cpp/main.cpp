@@ -37,12 +37,14 @@
 #include <jni.h>
 #include <string>
 #include <sys/system_properties.h>
+#include <thread>
 #include <unistd.h>
 
 #include "sbs_renderer.h"
 #include "video_decoder.h"
 #include "transport_ui.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
+#include "LifLoader.h"  // SHARED desktop LIF parser (src/media/, referenced by CMake)
 
 #define LOG_TAG "mediaplayer_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -164,14 +166,25 @@ SbsRenderer g_sbs;
 bool g_sbs_ready = false;
 std::atomic<bool> g_scene_loaded{false};
 
-// Media sources. The default at launch is an SBS video in the app's external
-// files dir (pushed there; too big to bundle); the transport bar's Load button
-// opens the SAF picker, handed down as an fd via nativeOpenVideoFd. If no
-// video opens, fall back to the bundled SBS test image (stb).
+// Media sources. The app starts on the DisplayXR idle screen (same lockup as
+// Windows: displayxr/idle.png over dark grey) — nothing auto-plays. Media is
+// opened via the SAF picker: tap the idle/image screen, or the transport bar's
+// Load button in video mode. Picked files are sniffed by content: JPEG/PNG go
+// through the SHARED desktop LifLoader (stereo LIF → composed full-SBS with
+// baked reconvergence; plain image / mono LIF → flat 2D), everything else is
+// AMediaCodec video.
 VideoDecoder g_video;
 bool g_is_video = false;
-const char *const kDefaultVideo = "test_SBS_2x1.mp4";   // in externalDataPath
-const char *const kFallbackImage = "test_LR_2x1.png";   // bundled asset
+bool g_image_mono = false;  // current image is 2D → both eyes sample the full image
+const char *const kIdleArt = "idle.png";  // bundled asset (repo displayxr/)
+// Desktop App.cpp's idle backdrop grey (kIdleBg*).
+constexpr uint8_t kIdleBg[3] = {31, 31, 33};  // 0.12,0.12,0.13 * 255
+
+// Opening the SAF picker while the XR session runs leaves the runtime's weave
+// overlay on screen with the last frame — the picker opens UNDERNEATH it,
+// invisible (runtime-side bug, #523 family). Workaround: tear the whole XR
+// instance down right before the picker opens (the overlay drops with it) and
+// rebuild from scratch when the activity resumes.
 
 // A file the user picked via SAF: fd + byte range, published from the JNI
 // thread and serviced (decoder reopen) on the android_main thread.
@@ -223,6 +236,7 @@ bool
 create_instance(struct android_app *app)
 {
 	g_runtime_unavailable.store(false, std::memory_order_relaxed);
+	g_view_rig_enabled = false;  // re-evaluated below (rebuilds reuse these globals)
 	const char *extensions[4] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
@@ -652,59 +666,165 @@ sbs_init()
 	return true;
 }
 
-// Decode the bundled SBS image (APK asset) to RGBA8 via stb and upload it.
+// The DisplayXR idle screen, same as Windows (App::LoadIdleLogo +
+// CompositeIdleArt): the transparent idle.png lockup, scaled to fit (aspect
+// preserved — never stretched), centered on an opaque dark-grey canvas built at
+// the EXACT per-eye swapchain size so the mono full-viewport blit is 1:1. The
+// grey therefore fills the view to every border, and the logo keeps its shape
+// in any orientation.
 bool
-load_fallback_image(struct android_app *app)
+load_splash(struct android_app *app)
 {
 	AAssetManager *mgr = app->activity->assetManager;
-	AAsset *asset = AAssetManager_open(mgr, kFallbackImage, AASSET_MODE_BUFFER);
+	AAsset *asset = AAssetManager_open(mgr, kIdleArt, AASSET_MODE_BUFFER);
 	if (asset == nullptr) {
-		LOGE("%s not found in assets", kFallbackImage);
+		LOGE("%s not found in assets", kIdleArt);
 		return false;
 	}
 	const uint8_t *buf = (const uint8_t *)AAsset_getBuffer(asset);
 	const off_t len = AAsset_getLength(asset);
 	int w = 0, h = 0, comp = 0;
-	stbi_uc *pixels = nullptr;
+	stbi_uc *art = nullptr;
 	if (buf != nullptr && len > 0) {
-		pixels = stbi_load_from_memory(buf, (int)len, &w, &h, &comp, 4);  // force RGBA
+		art = stbi_load_from_memory(buf, (int)len, &w, &h, &comp, 4);  // force RGBA
 	}
 	AAsset_close(asset);
-	if (pixels == nullptr) {
-		LOGE("stbi_load_from_memory failed for %s: %s", kFallbackImage, stbi_failure_reason());
+	if (art == nullptr) {
+		LOGE("stbi_load_from_memory failed for %s: %s", kIdleArt, stbi_failure_reason());
 		return false;
 	}
-	const bool ok = g_sbs.uploadTexture(pixels, (uint32_t)w, (uint32_t)h);
-	stbi_image_free(pixels);
+
+	// Canvas == the eye swapchain image (1:1 blit → grey reaches every border).
+	const int cw = (int)g_views[0].width, ch = (int)g_views[0].height;
+	std::vector<uint8_t> canvas((size_t)cw * ch * 4);
+	for (size_t i = 0; i < canvas.size(); i += 4) {
+		canvas[i] = kIdleBg[0];
+		canvas[i + 1] = kIdleBg[1];
+		canvas[i + 2] = kIdleBg[2];
+		canvas[i + 3] = 255;
+	}
+	// Fit the lockup into ~55% of the view's shorter side, aspect preserved.
+	const float target = 0.55f * (float)(cw < ch ? cw : ch);
+	const float scale = target / (float)(w > h ? w : h);
+	const int dw = (int)std::lround((float)w * scale);
+	const int dh = (int)std::lround((float)h * scale);
+	const int ox = (cw - dw) / 2, oy = (ch - dh) / 2;
+	for (int dy = 0; dy < dh; ++dy) {
+		const int sy = (int)((float)dy / scale);
+		for (int dx = 0; dx < dw; ++dx) {
+			const int sx = (int)((float)dx / scale);
+			const uint8_t *s = &art[((size_t)sy * w + sx) * 4];
+			const float a = s[3] / 255.0f;  // alpha-over the grey backdrop
+			uint8_t *d = &canvas[((size_t)(oy + dy) * cw + (ox + dx)) * 4];
+			for (int c = 0; c < 3; ++c) {
+				d[c] = (uint8_t)(s[c] * a + d[c] * (1.0f - a) + 0.5f);
+			}
+		}
+	}
+	stbi_image_free(art);
+
+	const bool ok = g_sbs.uploadTexture(canvas.data(), (uint32_t)cw, (uint32_t)ch);
 	if (ok) {
-		LOGI("Loaded SBS image: %s (%dx%d)", kFallbackImage, w, h);
+		g_image_mono = true;  // flat at screen depth, both eyes
+		g_is_video = false;
 		g_scene_loaded.store(true, std::memory_order_relaxed);
+		LOGI("No media — showing the DisplayXR idle screen (%dx%d)", cw, ch);
 	}
 	return ok;
 }
 
-// Default media: try the SBS video in the app's external files dir; if it can't
-// be opened, show the bundled SBS test image instead. Video frames stream in on
-// the decoder thread and get uploaded per-frame in render_frame. Audio (AAudio)
-// is Stage 3 — no master clock is set, so the decoder paces to the wall clock.
-bool
-load_media(struct android_app *app)
+// Bake the LIF's intended zero-disparity plane into the composed full-SBS
+// buffer: shift each eye's half horizontally by ±0.5*conv*W px (the desktop
+// applies the same 0.5-scaled per-eye shift at render time — App.cpp's
+// `conv = convergence_ + 0.5*mediaConvergence_`). Exposed strips are filled by
+// edge replication; a static image pays this once at load, so no shader or
+// per-frame work is needed.
+void
+bake_lif_convergence(mp::DecodedImage &img, float conv)
 {
-	if (!g_sbs_ready) {
+	const int W = img.width / 2, H = img.height;
+	const int s = (int)std::lround(0.5f * conv * (float)W);
+	if (s == 0) {
+		return;
+	}
+	std::vector<uint8_t> row((size_t)W * 4);
+	auto shift_half = [&](int x0, int dx) {
+		for (int y = 0; y < H; ++y) {
+			uint8_t *base = img.pixels.data() + ((size_t)y * img.width + x0) * 4;
+			for (int x = 0; x < W; ++x) {
+				int sx = x - dx;
+				if (sx < 0) sx = 0;
+				if (sx >= W) sx = W - 1;
+				std::memcpy(row.data() + (size_t)x * 4, base + (size_t)sx * 4, 4);
+			}
+			std::memcpy(base, row.data(), (size_t)W * 4);
+		}
+	};
+	shift_half(0, +s);  // left eye content moves right
+	shift_half(W, -s);  // right eye content moves left
+	LOGI("LIF reconvergence baked: conv=%+.4f -> ±%d px per eye", conv, s);
+}
+
+// Run an on-disk image through the SHARED desktop LifLoader — stereo LIF
+// composes to full-SBS with baked reconvergence; a plain image (or any parse
+// fallback, incl. mono/1-view LIFs, which are not yet synthesized) displays as
+// flat 2D. Runs on the android_main thread (uploadTexture submits Vulkan work).
+bool
+load_image_file(const std::string &path)
+{
+	mp::LifResult r = mp::LifLoader::Load(path);
+	if (!r.ok) {
+		LOGE("image failed to decode: %s", path.c_str());
 		return false;
 	}
-	std::string videoPath =
-	    std::string(app->activity->externalDataPath ? app->activity->externalDataPath : ".") +
-	    "/" + kDefaultVideo;
-	if (g_video.openPath(videoPath)) {
-		g_is_video = true;
-		g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);  // show controls at start
-		LOGI("Playing SBS video: %s (audio=none, Stage 3)", videoPath.c_str());
-		return true;  // g_scene_loaded flips true on the first decoded frame
+	if (r.stereo && r.hasConvergence) {
+		bake_lif_convergence(r.image, r.convergence);
 	}
-	LOGW("No video at %s — falling back to bundled image", videoPath.c_str());
-	return load_fallback_image(app);
+	if (!g_sbs.uploadTexture(r.image.pixels.data(), (uint32_t)r.image.width,
+	                         (uint32_t)r.image.height)) {
+		return false;
+	}
+	g_image_mono = !r.stereo;
+	g_is_video = false;
+	g_scene_loaded.store(true, std::memory_order_relaxed);
+	LOGI("Loaded image: %s %dx%d %s%s", path.c_str(), r.image.width, r.image.height,
+	     r.stereo ? "stereo LIF (full-SBS)" : "mono 2D",
+	     (r.stereo && r.hasConvergence) ? ", convergence baked" : "");
+	return true;
 }
+
+// A picked JPEG/PNG fd: stage it to a file (LifLoader reads paths), then load.
+bool
+load_picked_image(struct android_app *app, int fd, long long off, long long len)
+{
+	std::string path = std::string(app->activity->internalDataPath) + "/picked_image";
+	FILE *out = std::fopen(path.c_str(), "wb");
+	if (out == nullptr) {
+		LOGE("cannot stage picked image to %s", path.c_str());
+		return false;
+	}
+	bool copy_ok = true;
+	uint8_t buf[64 * 1024];
+	long long pos = off;
+	long long remaining = len;
+	while (remaining > 0) {
+		const size_t want = remaining < (long long)sizeof(buf) ? (size_t)remaining : sizeof(buf);
+		const ssize_t got = pread(fd, buf, want, (off_t)pos);
+		if (got <= 0 || std::fwrite(buf, 1, (size_t)got, out) != (size_t)got) {
+			copy_ok = false;
+			break;
+		}
+		pos += got;
+		remaining -= got;
+	}
+	std::fclose(out);
+	if (!copy_ok) {
+		LOGE("failed to stage picked image (fd=%d len=%lld)", fd, len);
+		return false;
+	}
+	return load_image_file(path);
+}
+
 
 void
 handle_session_state(XrSessionState new_state)
@@ -868,10 +988,16 @@ render_frame()
 				}
 
 				// SBS split: left view samples the source's left half, right
-				// view the right half. The DP weaves the two views.
-				const float offX = (i == 0) ? 0.0f : 0.5f;
-				g_sbs.drawEye(g_views[i].images[img_idx].image, g_views[i].width,
-				              g_views[i].height, offX, 0.0f, 0.5f, 1.0f);
+				// view the right half. The DP weaves the two views. A mono 2D
+				// image sends the full image to both eyes instead.
+				if (!g_is_video && g_image_mono) {
+					g_sbs.drawEye(g_views[i].images[img_idx].image, g_views[i].width,
+					              g_views[i].height, 0.0f, 0.0f, 1.0f, 1.0f);
+				} else {
+					const float offX = (i == 0) ? 0.0f : 0.5f;
+					g_sbs.drawEye(g_views[i].images[img_idx].image, g_views[i].width,
+					              g_views[i].height, offX, 0.0f, 0.5f, 1.0f);
+				}
 
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
@@ -979,6 +1105,53 @@ destroy_all()
 		xrDestroyInstance(g_instance);
 		g_instance = XR_NULL_HANDLE;
 	}
+	// Reset the per-instance state so a rebuild (picker round-trip) starts
+	// clean — destroy_all used to run only on process exit, where this didn't
+	// matter.
+	g_session_running = false;
+	g_session_state = XR_SESSION_STATE_UNKNOWN;
+	g_exit_requested = false;
+	g_scene_loaded.store(false, std::memory_order_relaxed);
+	g_swapchain_format = VK_FORMAT_UNDEFINED;
+	g_use_rig = false;
+	g_invalid_locate_count = 0;
+}
+
+// The full bring-up chain, ending on the idle screen (nothing auto-plays).
+// Runs on first APP_CMD_INIT_WINDOW and again after a picker-driven teardown.
+bool
+bring_up(struct android_app *app)
+{
+	bool ok =
+	    create_instance(app) &&
+	    query_system_and_graphics_reqs() &&
+	    create_vulkan_instance() &&
+	    pick_physical_device() &&
+	    create_vulkan_device() &&
+	    create_session() &&
+	    create_swapchains() &&
+	    create_reference_space() &&
+	    enumerate_rendering_modes() &&
+	    sbs_init();
+	if (!ok) {
+		LOGI("Bring-up failed; see logs.");
+		return false;
+	}
+	// TEMP (until the SAF picker is unblocked by runtime#528): auto-load a
+	// default SBS video from the app's external files dir so playback can be
+	// checked without the picker. Falls back to the idle splash if absent.
+	const std::string videoPath =
+	    std::string(app->activity->externalDataPath ? app->activity->externalDataPath : ".") +
+	    "/default.mp4";
+	if (access(videoPath.c_str(), R_OK) == 0 && g_video.openPath(videoPath)) {
+		g_is_video = true;
+		g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
+		LOGI("TEMP auto-load: playing %s (audio=none, Stage 3)", videoPath.c_str());
+	} else {
+		load_splash(app);
+	}
+	LOGI("Bring-up complete.");
+	return true;
 }
 
 void
@@ -986,22 +1159,11 @@ handle_cmd(struct android_app *app, int32_t cmd)
 {
 	switch (cmd) {
 	case APP_CMD_INIT_WINDOW:
+		// Bring-up (and rebuild after the picker round-trip) is driven from the
+		// loop by state — (no instance) + (window present) + (no teardown in
+		// flight) — NOT from this event, whose timing races the off-thread
+		// teardown completing. Just log that the window is available.
 		LOGI("APP_CMD_INIT_WINDOW (window=%p)", app->window);
-		if (g_instance == XR_NULL_HANDLE) {
-			bool ok =
-			    create_instance(app) &&
-			    query_system_and_graphics_reqs() &&
-			    create_vulkan_instance() &&
-			    pick_physical_device() &&
-			    create_vulkan_device() &&
-			    create_session() &&
-			    create_swapchains() &&
-			    create_reference_space() &&
-			    enumerate_rendering_modes() &&
-			    sbs_init() &&
-			    load_media(app);
-			LOGI(ok ? "Bring-up complete." : "Bring-up failed; see logs.");
-		}
 		break;
 	case APP_CMD_DESTROY:
 		LOGI("APP_CMD_DESTROY");
@@ -1062,7 +1224,20 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 	static bool moved = false;
 	static float downX = 0.0f, downY = 0.0f;
 	constexpr int kDown = 0, kUp = 1, kMove = 2;
-	if (!g_is_video) return 0;
+	if (!g_is_video) {
+		// Image mode has no transport bar — any clean tap opens the picker.
+		if (action == kDown) {
+			downX = nx;
+			downY = ny;
+			moved = false;
+		} else if (action == kMove) {
+			if (std::fabs(nx - downX) + std::fabs(ny - downY) > 0.01f) moved = true;
+		} else if (action == kUp && !moved) {
+			LOGI("touch UP on image -> open picker");
+			return 1;
+		}
+		return 0;
+	}
 	g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);  // re-reveal + keep controls up
 
 	auto seekBar = [&](float x) {
@@ -1132,20 +1307,42 @@ android_main(struct android_app *app)
 				return;
 			}
 		}
+		// State-driven bring-up: once a window is available and there's no
+		// instance yet, bring the stack up (first launch). The instance then
+		// lives for the process; backgrounding (e.g. the SAF picker) is handled
+		// by the runtime's own session-state events — STOPPING pauses rendering
+		// and drops the weave overlay, READY resumes it — with no IPC teardown
+		// from our side (that hangs once the runtime has dropped our session).
+		if (g_instance == XR_NULL_HANDLE && app->window != nullptr && !g_exit_requested) {
+			bring_up(app);
+		}
 		if (g_instance != XR_NULL_HANDLE) {
 			poll_xr_events();
 			if (g_exit_requested) {
 				destroy_all();
 				return;
 			}
-			// Service a file the user picked (Load button → SAF). Reopen the
-			// decoder on this thread; the old decode thread is joined in stop().
+			// Service a file the user picked (Load button → SAF). Sniff the
+			// content: JPEG/PNG (incl. LIF — a JPEG with a trailer) go through
+			// the image path; everything else reopens the video decoder on
+			// this thread (the old decode thread is joined in stop()).
 			const int pick = g_pick_fd.exchange(-1, std::memory_order_acquire);
 			if (pick >= 0) {
+				const long long off = g_pick_off.load(std::memory_order_relaxed);
+				const long long len = g_pick_len.load(std::memory_order_relaxed);
+				uint8_t magic[4] = {};
+				const bool have_magic = pread(pick, magic, sizeof(magic), (off_t)off) == 4;
+				const bool is_jpeg = have_magic && magic[0] == 0xFF && magic[1] == 0xD8;
+				const bool is_png = have_magic && magic[0] == 0x89 && magic[1] == 'P' &&
+				                    magic[2] == 'N' && magic[3] == 'G';
 				g_video.stop();
 				g_scene_loaded.store(false, std::memory_order_relaxed);
-				if (g_video.openFd(pick, g_pick_off.load(std::memory_order_relaxed),
-				                   g_pick_len.load(std::memory_order_relaxed))) {
+				if (is_jpeg || is_png) {
+					if (!load_picked_image(app, pick, off, len)) {
+						LOGE("Failed to load picked image (fd=%d)", pick);
+					}
+					close(pick);  // image path stages a copy; the fd is done
+				} else if (g_video.openFd(pick, off, len)) {
 					g_is_video = true;
 					g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
 					LOGI("Opened picked video (fd=%d)", pick);

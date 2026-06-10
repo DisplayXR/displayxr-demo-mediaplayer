@@ -22,6 +22,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Repo root is four levels up from android/src/main/cpp.
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 
+# ── nlohmann/json (header-only) for the SHARED LifLoader's container JSON ──
+# Same tag as the desktop build (top-level CMakeLists.txt).
+include(FetchContent)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(nlohmann_json)
+
 # ── SBS blit + overlay shaders → SPIR-V header arrays ─────────────────────
 # var name = <name>_<stage>_data, header = <name>.<stage>.h (matches the
 # #includes in sbs_renderer.cpp). fullscreen.vert + sbs.frag come from the
@@ -60,13 +70,20 @@ add_library(mediaplayer_vk_android SHARED
     main.cpp
     sbs_renderer.cpp
     video_decoder.cpp
-    stb_impl.cpp
+    lif_log_android.cpp
+    # ── SHARED desktop sources (referenced, not copied): LIF container parse +
+    #    stb image decode. Log.h's impl is the logcat shim above, NOT src/Log.cpp.
+    #    ImageDecoder.cpp also owns the STB_IMAGE_IMPLEMENTATION TU.
+    ${REPO_ROOT}/src/media/LifLoader.cpp
+    ${REPO_ROOT}/src/media/ImageDecoder.cpp
     ${SHADER_HEADERS})
 
 target_include_directories(mediaplayer_vk_android PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}                 # generated *.vert.h / *.frag.h
     ${CMAKE_CURRENT_SOURCE_DIR}/stb             # vendored stb_image.h (SBS image decode)
+    ${REPO_ROOT}/src                            # Log.h (impl = lif_log_android.cpp)
+    ${REPO_ROOT}/src/media                      # LifLoader.h, ImageDecoder.h, MediaSource.h
     ${REPO_ROOT}/third_party/displayxr-openxr)  # DisplayXR XR_EXT_* headers
 
 set_target_properties(mediaplayer_vk_android PROPERTIES
@@ -75,6 +92,7 @@ set_target_properties(mediaplayer_vk_android PROPERTIES
 target_link_libraries(mediaplayer_vk_android
     native_app_glue
     OpenXR::openxr_loader
+    nlohmann_json::nlohmann_json
     vulkan
     mediandk   # AMediaExtractor + AMediaCodec (framework-native video decode)
     android
