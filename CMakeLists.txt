@@ -174,6 +174,15 @@ add_executable(${MP_TARGET}
     ${MP_IMGUI_SOURCES}
 )
 
+# Windows: link as a GUI (WINDOWS subsystem) app so launching the player never
+# pops a console window — neither standalone (Explorer) nor under the shell. SDL3's
+# <SDL3/SDL_main.h> supplies the WinMain entry that forwards to our main(), so the
+# console subsystem is unnecessary. stderr still works when a console is attached
+# (e.g. the shell's CREATE_NEW_CONSOLE) or redirected.
+if(WIN32)
+    set_target_properties(${MP_TARGET} PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
+
 target_include_directories(${MP_TARGET} PRIVATE
     ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)
 target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_IMGUI=1)
