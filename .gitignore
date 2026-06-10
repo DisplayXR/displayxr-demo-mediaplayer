@@ -19,6 +19,12 @@ compile_commands.json
 _deps/
 third_party/**/build/
 
+# Android (Gradle leg)
+local.properties
+.gradle/
+.cxx/
+*.log
+
 # Worktrees
 .claude/worktrees/
 

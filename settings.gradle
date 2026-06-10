@@ -1,0 +1,29 @@
+// Copyright 2026, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+//
+// Gradle settings for the Android leg of displayxr-demo-mediaplayer. The
+// desktop (windows/linux/macos) build is the top-level CMakeLists.txt; the
+// android/ leg is an Android Gradle application that uses the shared SBS
+// shaders (shaders/sbs.frag + fullscreen.vert) and provides Android-native
+// decode (AMediaCodec) + audio (AAudio). See android/src/main/cpp/CMakeLists.txt.
+
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        google()
+        mavenCentral()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'displayxr-demo-mediaplayer'
+
+include ':android'
+project(':android').projectDir = new File(rootDir, 'android')
