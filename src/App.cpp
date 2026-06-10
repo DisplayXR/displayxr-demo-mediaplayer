@@ -216,6 +216,11 @@ bool App::Initialize(const char* mediaPath) {
     // Expose the player's transport controls to agents (XR_EXT_mcp_tools). Inert when the
     // runtime lacks the extension or the MCP capability gate is off.
     SetupAgentTools();
+
+    // Now that the XR session exists (the runtime has bound/hidden the HWND in workspace
+    // mode), reveal the window. Standalone: the real window appears. Workspace: the runtime
+    // keeps it hidden and composites via the shell — same as the Gauss/model demos.
+    window_.Show();
     return true;
 }
 
@@ -548,13 +553,21 @@ void App::RenderOneFrame() {
         uint32_t hudIdx = 0;
         if (xr_.AcquireHudImage(hudIdx)) {
             if (imguiReady) {
-                // Full-window layer: ImGui positions the bars within the canvas; the
-                // runtime composites it 1:1 over the content at screen depth.
+                // Aspect-preserving HUD footprint (matches the Gauss demo's demo-gs#8 fix).
+                // The HUD swapchain is a fixed 16:9 image; the runtime stretches it per-axis to
+                // fill the layer rect. A full-window rect on a non-16:9 tile stretches the two
+                // axes unequally and distorts the buttons/glyphs. Pick a centered rect whose
+                // fractions match the HUD aspect so both axes scale by the same factor (uniform,
+                // no distortion). The SAME rect drives the cursor remap below, so hit-testing
+                // stays aligned with what's drawn.
+                float fracW = 1.0f, fracH = 1.0f;
+                if (winAR > hudAR) fracW = hudAR / winAR;   // wide tile: full height, inset width
+                else if (winAR > 0.0f) fracH = winAR / hudAR;  // tall tile: full width, inset height
                 hud.enabled = true;
-                hud.x = 0.0f;
-                hud.y = 0.0f;
-                hud.width = 1.0f;
-                hud.height = 1.0f;
+                hud.x = (1.0f - fracW) * 0.5f;  // centered horizontally
+                hud.y = 0.0f;                   // anchored to the top so the bar stays flush
+                hud.width = fracW;
+                hud.height = fracH;
                 hud.disparity = kHudDisparity;
 
                 uint32_t pw = 0, phh = 0;
