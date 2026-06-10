@@ -736,13 +736,19 @@ SbsRenderer::drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h)
 	v.reserve(1024);
 	const float aspect = (float)h / (float)w;  // x-fraction per y-fraction for round discs
 
-	// The Leia weave presents the eye tile vertically flipped relative to our
-	// framebuffer (content drawn at fb-bottom shows at screen-top). transport_ui
-	// fractions are SCREEN fractions (matching the touch hit-test), so flip Y
-	// here: a bar specified near screen-bottom lands at screen-bottom and the
-	// 7-seg digits read upright. X is not flipped (play=left, load=right).
+	// Standard Vulkan NDC: fy=0 (screen-top) → -1, fy=1 (screen-bottom) → +1.
+	// transport_ui fractions are SCREEN fractions (= the touch hit-test), so the
+	// bar near fy~0.9 lands at screen-bottom where touch expects it. Per-device
+	// panel orientation is corrected globally by the runtime/DP weave
+	// (debug.dxr.leia.flip_uv) — the overlay does NOT flip Y itself, otherwise it
+	// double-flips wherever flip_uv is set (drawing jumps to the top while touch
+	// stays at the bottom). With no app-side flip the overlay is correct on every
+	// device whose flip_uv is calibrated right (e.g. nubia NP02J = 1, others = 0).
+	// Standard Vulkan NDC (matches the SBS blit's fullscreen.vert): fy=0 → -1
+	// (screen top), fy=1 → +1 (screen bottom). transport_ui fractions are screen
+	// fractions (= the touch hit-test), so the bar at fy~0.9 lands at the bottom.
 	auto NX = [](float fx) { return fx * 2.0f - 1.0f; };
-	auto NY = [](float fy) { return 1.0f - fy * 2.0f; };
+	auto NY = [](float fy) { return fy * 2.0f - 1.0f; };
 	auto pt = [&](float fx, float fy, const float c[4]) {
 		v.push_back({NX(fx), NY(fy), c[0], c[1], c[2], c[3]});
 	};
