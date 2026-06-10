@@ -176,6 +176,13 @@ std::atomic<bool> g_scene_loaded{false};
 VideoDecoder g_video;
 bool g_is_video = false;
 bool g_image_mono = false;  // current image is 2D → both eyes sample the full image
+// Per-eye DISPLAY aspect of the current media (w/h). Drives the center-crop
+// (cover) fit so content fills the view without stretching — its shorter side
+// is matched to the view's shorter side and the longer axis is cropped, the
+// same min-to-min rule as the desktop's MatchMinRect/PerEyeAspect. Half-SBS
+// video: full-frame aspect (each eye stretched 2×). Full-SBS image: (w/2)/h.
+// Mono: w/h.
+std::atomic<float> g_content_aspect{1.6f};
 const char *const kIdleArt = "idle.png";  // bundled asset (repo displayxr/)
 // Desktop App.cpp's idle backdrop grey (kIdleBg*).
 constexpr uint8_t kIdleBg[3] = {31, 31, 33};  // 0.12,0.12,0.13 * 255
@@ -726,6 +733,10 @@ load_splash(struct android_app *app)
 	const bool ok = g_sbs.uploadTexture(canvas.data(), (uint32_t)cw, (uint32_t)ch);
 	if (ok) {
 		g_image_mono = true;  // flat at screen depth, both eyes
+		// Canvas == landscape swapchain, so no crop in landscape; the rotation
+		// flip in render_frame crops it to the panel in portrait.
+		g_content_aspect.store(ch > 0 ? (float)cw / (float)ch : 1.6f,
+		                       std::memory_order_relaxed);
 		g_is_video = false;
 		g_scene_loaded.store(true, std::memory_order_relaxed);
 		LOGI("No media — showing the DisplayXR idle screen (%dx%d)", cw, ch);
@@ -785,6 +796,11 @@ load_image_file(const std::string &path)
 		return false;
 	}
 	g_image_mono = !r.stereo;
+	// Per-eye display aspect: full-SBS → (w/2)/h; mono → w/h.
+	g_content_aspect.store(
+	    r.stereo ? ((float)r.image.width * 0.5f) / (float)r.image.height
+	             : (float)r.image.width / (float)r.image.height,
+	    std::memory_order_relaxed);
 	g_is_video = false;
 	g_scene_loaded.store(true, std::memory_order_relaxed);
 	LOGI("Loaded image: %s %dx%d %s%s", path.c_str(), r.image.width, r.image.height,
@@ -911,6 +927,12 @@ render_frame()
 			g_sbs.uploadYUV(vf->y.data(), vf->uv.data(),
 			                vf->nv12 ? nullptr : vf->v.data(), (uint32_t)vf->width,
 			                (uint32_t)vf->height, vf->nv12, vf->fullRange);
+			// Half-SBS: each eye is stretched 2× → per-eye display aspect is the
+			// full-frame aspect.
+			if (vf->height > 0) {
+				g_content_aspect.store((float)vf->width / (float)vf->height,
+				                       std::memory_order_relaxed);
+			}
 			g_scene_loaded.store(true, std::memory_order_relaxed);
 		}
 		// Transport overlay (scrub bar + play/pause + load + time).
@@ -987,17 +1009,36 @@ render_frame()
 					break;
 				}
 
-				// SBS split: left view samples the source's left half, right
-				// view the right half. The DP weaves the two views. A mono 2D
-				// image sends the full image to both eyes instead.
-				if (!g_is_video && g_image_mono) {
-					g_sbs.drawEye(g_views[i].images[img_idx].image, g_views[i].width,
-					              g_views[i].height, 0.0f, 0.0f, 1.0f, 1.0f);
+				// Center-crop (cover) fit, min-to-min like the desktop's
+				// MatchMinRect: sample a view-aspect sub-rect of the per-eye
+				// content (stereo = its half; mono = the whole image) instead of
+				// stretching the half to fill — the shorter side matches the
+				// view's shorter side, the longer axis is cropped. The swapchain
+				// is fixed in the panel's landscape frame, so the effective view
+				// aspect flips with the device rotation (portrait → crop the
+				// width). drawEye fills the whole swapchain image with this
+				// sub-rect, so the runtime's per-orientation weave shows it
+				// undistorted.
+				const int rot = g_display_rotation.load(std::memory_order_relaxed);
+				const bool portrait = (rot & 1) != 0;  // ROTATION_90/270
+				const float vpW = portrait ? (float)g_views[i].height : (float)g_views[i].width;
+				const float vpH = portrait ? (float)g_views[i].width : (float)g_views[i].height;
+				const float aVp = vpH > 0.0f ? vpW / vpH : 1.0f;
+				const float aC = g_content_aspect.load(std::memory_order_relaxed);
+				const float boxW = g_image_mono ? 1.0f : 0.5f;
+				const float offBase = g_image_mono ? 0.0f : (i == 0 ? 0.0f : 0.5f);
+				float fx = 1.0f, fy = 1.0f;
+				const float ratio = aVp > 0.0f ? aC / aVp : 1.0f;
+				if (ratio > 1.0f) {
+					fx = 1.0f / ratio;  // content wider than view → crop sides
 				} else {
-					const float offX = (i == 0) ? 0.0f : 0.5f;
-					g_sbs.drawEye(g_views[i].images[img_idx].image, g_views[i].width,
-					              g_views[i].height, offX, 0.0f, 0.5f, 1.0f);
+					fy = ratio;  // content taller → crop top/bottom
 				}
+				const float sw = boxW * fx;
+				const float ox = offBase + (boxW - sw) * 0.5f;
+				const float oy = (1.0f - fy) * 0.5f;
+				g_sbs.drawEye(g_views[i].images[img_idx].image, g_views[i].width,
+				              g_views[i].height, ox, oy, sw, fy);
 
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
