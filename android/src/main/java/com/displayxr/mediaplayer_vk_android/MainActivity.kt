@@ -35,6 +35,7 @@ import android.widget.Toast
 class MainActivity : NativeActivity() {
 
     companion object {
+        private const val TAG = "mediaplayer_vk_android"
         private const val REQUEST_PICK_VIDEO = 2
 
         // Load the native lib into the JVM so the external JNI functions below
@@ -70,6 +71,7 @@ class MainActivity : NativeActivity() {
     // only Java can launch the system file picker.
     private external fun nativeTouch(action: Int, nx: Float, ny: Float): Int
 
+
     // First installed runtime package, preferring out_of_process. Null if none.
     private val installedRuntime: String? by lazy {
         RUNTIME_PACKAGES.firstOrNull {
@@ -100,7 +102,14 @@ class MainActivity : NativeActivity() {
         try {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
-                type = "video/*"
+                // Videos AND images: stereo LIFs ship as .jpg, plain SBS images
+                // as jpg/png. Native sniffs the picked fd's content and routes
+                // image vs video accordingly.
+                type = "*/*"
+                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("video/*", "image/*"))
+                // Persistable so the relaunched process can reopen it at cold start.
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
             }
             startActivityForResult(intent, REQUEST_PICK_VIDEO)
         } catch (_: Throwable) {
@@ -110,15 +119,21 @@ class MainActivity : NativeActivity() {
     @Deprecated("startActivityForResult is fine for a NativeActivity demo app")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        android.util.Log.i(TAG, "onActivityResult req=$requestCode res=$resultCode uri=${data?.data}")
         if (requestCode == REQUEST_PICK_VIDEO && resultCode == RESULT_OK) {
             val uri = data?.data ?: return
+            // NOTE: opening media from the SAF picker is BLOCKED by runtime#528 —
+            // returning from the picker leaves the OOP compositor wedged on the
+            // client's abandoned surface, so the panel freezes regardless of what
+            // we do here. Deferred until that runtime fix lands; this just hands
+            // the fd to native for when it does.
             try {
                 val pfd = contentResolver.openFileDescriptor(uri, "r") ?: return
                 val length = pfd.statSize
-                // detachFd → native owns the fd (AMediaExtractor reads it); the
-                // ParcelFileDescriptor no longer closes it on GC.
                 nativeOpenVideoFd(pfd.detachFd(), 0L, length)
-            } catch (_: Throwable) {
+                android.util.Log.i(TAG, "picked fd handed to native (len=$length)")
+            } catch (t: Throwable) {
+                android.util.Log.e(TAG, "openFileDescriptor failed", t)
             }
         }
     }
@@ -218,7 +233,7 @@ class MainActivity : NativeActivity() {
             if (!isFinishing) {
                 Toast.makeText(
                     this,
-                    "Tap: play/pause   ·   Bar: scrub   ·   Load: pick a video",
+                    "Tap the screen to open a video / image / LIF",
                     Toast.LENGTH_LONG,
                 ).show()
             }
