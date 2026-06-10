@@ -863,7 +863,7 @@ SbsRenderer::drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h)
 
 void
 SbsRenderer::drawEye(VkImage image, uint32_t w, uint32_t h, float offX, float offY,
-                     float scaleX, float scaleY)
+                     float scaleX, float scaleY, float vpX, float vpY, float vpW, float vpH)
 {
 	if (planes_[0].view == VK_NULL_HANDLE) return;
 	const Target &t = targetFor(image, w, h);
@@ -885,7 +885,9 @@ SbsRenderer::drawEye(VkImage image, uint32_t w, uint32_t h, float offX, float of
 	rpbi.pClearValues = &clear;
 	vkCmdBeginRenderPass(cmd_, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
-	VkViewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
+	// Content viewport (may overflow the image); the scissor clips it (crop),
+	// and whatever it doesn't cover stays cleared (letterbox).
+	VkViewport vp = {vpX, vpY, vpW, vpH, 0.0f, 1.0f};
 	VkRect2D sc = {{0, 0}, {w, h}};
 	vkCmdSetViewport(cmd_, 0, 1, &vp);
 	vkCmdSetScissor(cmd_, 0, 1, &sc);
@@ -901,6 +903,10 @@ SbsRenderer::drawEye(VkImage image, uint32_t w, uint32_t h, float offX, float of
 	push.fullRange = sourceFullRange_;
 	vkCmdPushConstants(cmd_, pipeLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 	vkCmdDraw(cmd_, 3, 1, 0, 0);
+	// Overlay is screen-fixed: restore the full-image viewport so the content
+	// viewport above doesn't scale/offset the transport bar.
+	VkViewport full = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
+	vkCmdSetViewport(cmd_, 0, 1, &full);
 	drawOverlay(cmd_, w, h);  // transport bar / buttons, same in both eyes (screen plane)
 	vkCmdEndRenderPass(cmd_);
 	vkEndCommandBuffer(cmd_);

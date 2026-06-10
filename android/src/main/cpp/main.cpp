@@ -1009,36 +1009,41 @@ render_frame()
 					break;
 				}
 
-				// Center-crop (cover) fit, min-to-min like the desktop's
-				// MatchMinRect: sample a view-aspect sub-rect of the per-eye
-				// content (stereo = its half; mono = the whole image) instead of
-				// stretching the half to fill — the shorter side matches the
-				// view's shorter side, the longer axis is cropped. The swapchain
-				// is fixed in the panel's landscape frame, so the effective view
-				// aspect flips with the device rotation (portrait → crop the
-				// width). drawEye fills the whole swapchain image with this
-				// sub-rect, so the runtime's per-orientation weave shows it
-				// undistorted.
+				// Min-to-min fit, identical to the desktop MatchMinRect: size a
+				// content viewport so the content's SHORTER side equals the
+				// image's shorter side, centered. The longer axis then overflows
+				// (cropped by the scissor) when the content is more elongated
+				// than the image, or underflows (black letterbox) otherwise — no
+				// stretch. The UV stays the full per-eye half (stereo) or whole
+				// image (mono); the viewport does the fit. The swapchain is fixed
+				// in the panel's landscape frame, so the effective image aspect
+				// flips with the device rotation (portrait → tall image → the
+				// landscape content letterboxes top/bottom + crops the width).
 				const int rot = g_display_rotation.load(std::memory_order_relaxed);
 				const bool portrait = (rot & 1) != 0;  // ROTATION_90/270
-				const float vpW = portrait ? (float)g_views[i].height : (float)g_views[i].width;
-				const float vpH = portrait ? (float)g_views[i].width : (float)g_views[i].height;
-				const float aVp = vpH > 0.0f ? vpW / vpH : 1.0f;
+				const float iw = portrait ? (float)g_views[i].height : (float)g_views[i].width;
+				const float ih = portrait ? (float)g_views[i].width : (float)g_views[i].height;
+				const float imin = iw < ih ? iw : ih;
 				const float aC = g_content_aspect.load(std::memory_order_relaxed);
+				// Content quad sized min-to-min (in the rotation-adjusted frame).
+				float qw, qh;
+				if (aC >= 1.0f) {  // landscape content: height is its shorter side
+					qh = imin;
+					qw = imin * aC;
+				} else {  // portrait content: width is its shorter side
+					qw = imin;
+					qh = imin / aC;
+				}
+				// Map the quad back into the landscape swapchain (w x h). In
+				// portrait the swapchain axes are swapped vs the panel frame.
+				float vpW = portrait ? qh : qw;
+				float vpH = portrait ? qw : qh;
+				const float vpX = ((float)g_views[i].width - vpW) * 0.5f;
+				const float vpY = ((float)g_views[i].height - vpH) * 0.5f;
 				const float boxW = g_image_mono ? 1.0f : 0.5f;
 				const float offBase = g_image_mono ? 0.0f : (i == 0 ? 0.0f : 0.5f);
-				float fx = 1.0f, fy = 1.0f;
-				const float ratio = aVp > 0.0f ? aC / aVp : 1.0f;
-				if (ratio > 1.0f) {
-					fx = 1.0f / ratio;  // content wider than view → crop sides
-				} else {
-					fy = ratio;  // content taller → crop top/bottom
-				}
-				const float sw = boxW * fx;
-				const float ox = offBase + (boxW - sw) * 0.5f;
-				const float oy = (1.0f - fy) * 0.5f;
 				g_sbs.drawEye(g_views[i].images[img_idx].image, g_views[i].width,
-				              g_views[i].height, ox, oy, sw, fy);
+				              g_views[i].height, offBase, 0.0f, boxW, 1.0f, vpX, vpY, vpW, vpH);
 
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;

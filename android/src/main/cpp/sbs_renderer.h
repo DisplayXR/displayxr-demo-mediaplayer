@@ -43,11 +43,15 @@ struct SbsRenderer {
 	void setOverlay(bool visible, float progress, bool paused, const char *left,
 	                const char *right);
 
-	// Blit the UV sub-rect [off, off+scale) into `image` (a per-view swapchain
-	// image of size w x h), clearing to black first. Left eye = off(0,0)
-	// scale(0.5,1); right eye = off(0.5,0). Blocks until the GPU finishes.
+	// Blit the UV sub-rect [off, off+scale) of the source into a centered
+	// content viewport (vpX,vpY,vpW,vpH) of `image` (a per-view swapchain image
+	// of size w x h), clearing the rest to black (letterbox). The viewport may
+	// overflow the image — the scissor clips it (crop). This is the min-to-min
+	// fit: the caller sizes the viewport so the content's shorter side matches
+	// the image's shorter side. Left eye = off(0,0) scale(0.5,1); right eye =
+	// off(0.5,0). Blocks until the GPU finishes.
 	void drawEye(VkImage image, uint32_t w, uint32_t h, float offX, float offY,
-	             float scaleX, float scaleY);
+	             float scaleX, float scaleY, float vpX, float vpY, float vpW, float vpH);
 
 	void cleanup();
 
