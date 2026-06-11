@@ -71,6 +71,7 @@ add_library(mediaplayer_vk_android SHARED
     main.cpp
     sbs_renderer.cpp
     video_decoder.cpp
+    audio_player.cpp
     lif_log_android.cpp
     # ── SHARED desktop sources (referenced, not copied): LIF container parse +
     #    stb image decode. Log.h's impl is the logcat shim above, NOT src/Log.cpp.
@@ -95,6 +96,7 @@ target_link_libraries(mediaplayer_vk_android
     OpenXR::openxr_loader
     nlohmann_json::nlohmann_json
     vulkan
-    mediandk   # AMediaExtractor + AMediaCodec (framework-native video decode)
+    mediandk   # AMediaExtractor + AMediaCodec (framework-native video + audio decode)
+    aaudio     # audio output (AudioPlayer → A/V master clock)
     android
     log)

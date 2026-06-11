@@ -43,6 +43,7 @@
 
 #include "sbs_renderer.h"
 #include "video_decoder.h"
+#include "audio_player.h"
 #include "transport_ui.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
 #include "LifLoader.h"  // SHARED desktop LIF parser (src/media/, referenced by CMake)
@@ -194,6 +195,9 @@ std::atomic<bool> g_scene_loaded{false};
 // baked reconvergence; plain image / mono LIF → flat 2D), everything else is
 // AMediaCodec video.
 VideoDecoder g_video;
+// AMediaCodec audio → AAudio; its playback position is the A/V master clock the
+// video decoder paces to (wired via g_video.setMasterClock before each open).
+AudioPlayer g_audio;
 bool g_is_video = false;
 // True from "Load tapped" (picker launching) until the pick fd arrives or the
 // picker is cancelled. While pending we keep rendering the clear color instead
@@ -1316,6 +1320,7 @@ void
 destroy_all()
 {
 	g_video.stop();
+	g_audio.stop();
 	if (g_vk_device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(g_vk_device);
 	}
@@ -1387,8 +1392,13 @@ bring_up(struct android_app *app)
 	// iteration doesn't need the SAF picker round-trip each cycle. Empty (default)
 	// → the normal idle splash. NOT a behaviour change for end users.
 	char dbgFile[PROP_VALUE_MAX] = {0};
+	// Set the A/V master clock BEFORE openPath (it starts the video decode
+	// thread, which reads the clock). g_audio is silent if the clip has no audio
+	// track; clockSeconds() then stays -1 and the video paces on its wall clock.
+	g_video.setMasterClock(AudioPlayer::clockThunk, &g_audio);
 	if (__system_property_get("debug.dxr.mp.file", dbgFile) > 0 && dbgFile[0] != '\0' &&
 	    g_video.openPath(dbgFile)) {
+		g_audio.openPath(dbgFile);  // own fd; no-op if no audio track
 		g_is_video = true;
 		g_image_mono = false;
 		g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
@@ -1504,10 +1514,12 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 		const double frac = tui::barFraction(x);
 		const double t = frac * g_video.durationSeconds();
 		g_video.seekTo(t);
+		g_audio.seekTo(t);  // keep audio in lockstep with the scrub
 		LOGI("transport: seek -> %.1fs (%.0f%%)", t, frac * 100.0);
 	};
 	auto togglePause = [&]() {
 		g_video.togglePaused();
+		g_audio.setPaused(g_video.paused());  // mirror play/pause to audio
 		LOGI("transport: %s @ %.1fs", g_video.paused() ? "PAUSE" : "PLAY",
 		     g_video.positionSeconds());
 	};
@@ -1599,6 +1611,7 @@ android_main(struct android_app *app)
 				const bool is_png = have_magic && magic[0] == 0x89 && magic[1] == 'P' &&
 				                    magic[2] == 'N' && magic[3] == 'G';
 				g_video.stop();
+				g_audio.stop();
 				g_scene_loaded.store(false, std::memory_order_relaxed);
 				g_pick_pending.store(false, std::memory_order_relaxed);
 				if (is_jpeg || is_png) {
@@ -1606,14 +1619,24 @@ android_main(struct android_app *app)
 						LOGE("Failed to load picked image (fd=%d)", pick);
 					}
 					close(pick);  // image path stages a copy; the fd is done
-				} else if (g_video.openFd(pick, off, len)) {
-					g_is_video = true;
-					g_image_mono = false;
-					g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
-					g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
-					LOGI("Opened picked video (fd=%d)", pick);
 				} else {
-					LOGE("Failed to open picked video (fd=%d)", pick);
+					// Audio gets its OWN dup'd fd (independent file offset from the
+					// video extractor); set the master clock before video open. dup
+					// before openFd since the video decoder takes ownership of `pick`.
+					int audio_fd = dup(pick);
+					g_video.setMasterClock(AudioPlayer::clockThunk, &g_audio);
+					if (g_video.openFd(pick, off, len)) {
+						if (audio_fd >= 0) g_audio.openFd(audio_fd, off, len);
+						else audio_fd = -1;
+						g_is_video = true;
+						g_image_mono = false;
+						g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
+						g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
+						LOGI("Opened picked video (fd=%d, audio_fd=%d)", pick, audio_fd);
+					} else {
+						if (audio_fd >= 0) close(audio_fd);
+						LOGE("Failed to open picked video (fd=%d)", pick);
+					}
 				}
 			}
 			// Drive frames from READY (not SYNCHRONIZED+): a CTS-compliant
