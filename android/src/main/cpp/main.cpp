@@ -223,6 +223,9 @@ std::atomic<long long> g_pick_off{0};
 std::atomic<long long> g_pick_len{0};
 
 std::atomic<int> g_display_rotation{0};
+// True held orientation, from the Android window dims (not the device-dependent
+// rotation parity). Drives the per-eye tile dims in active_tile_dims.
+std::atomic<bool> g_portrait{false};
 std::atomic<bool> g_runtime_unavailable{false};
 
 // Transport auto-hide: the bar stays up while paused and for a few seconds
@@ -608,8 +611,10 @@ active_tile_dims(uint32_t *render_w, uint32_t *render_h, uint32_t *cols, uint32_
 	// orientation-independent long/short first.
 	uint32_t big = g_display_px_w >= g_display_px_h ? g_display_px_w : g_display_px_h;
 	uint32_t small = g_display_px_w >= g_display_px_h ? g_display_px_h : g_display_px_w;
-	const int rot = g_display_rotation.load(std::memory_order_relaxed);
-	const bool portrait = (rot == 1 || rot == 3);
+	// True held orientation from Android (not the device-dependent rotation
+	// parity): on this panel the natural orientation is portrait, so ROTATION_90
+	// is landscape — only the window dims tell wide-vs-tall reliably.
+	const bool portrait = g_portrait.load(std::memory_order_relaxed);
 	uint32_t disp_w = portrait ? small : big;
 	uint32_t disp_h = portrait ? big : small;
 	if (disp_w == 0 || disp_h == 0) {  // no display info — fall back to atlas tiles
@@ -1311,9 +1316,10 @@ handle_cmd(struct android_app *app, int32_t cmd)
 // ─── JNI bridge to MainActivity ──────────────────────────────────────────
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeSetRotation(
-    JNIEnv * /*env*/, jobject /*thiz*/, jint rotation)
+    JNIEnv * /*env*/, jobject /*thiz*/, jint rotation, jboolean portrait)
 {
 	g_display_rotation.store(rotation & 3, std::memory_order_relaxed);
+	g_portrait.store(portrait != JNI_FALSE, std::memory_order_relaxed);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
