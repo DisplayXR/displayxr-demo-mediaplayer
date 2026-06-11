@@ -209,34 +209,39 @@ VideoDecoder::decodeLoop()
 		AMediaCodecBufferInfo info;
 		ssize_t outIdx = AMediaCodec_dequeueOutputBuffer(codec_, &info, 2000);
 		if (outIdx >= 0) {
-			// Pace the frame BEFORE rendering it to the surface: to the audio clock
-			// if one is set (A/V master), else to the frame PTS on our wall clock.
+			// Pace the frame BEFORE rendering it to the surface.
+			//
+			// (1) WALL-CLOCK CEILING — runs ALWAYS. Caps playback at real time so a
+			//     racing/garbage audio master clock (unsupported audio codec that
+			//     decodes far faster than real time, e.g. some .mkv tracks) can NOT
+			//     speed the video up. This is the correct-speed guarantee.
+			// (2) AUDIO SYNC — only ever SLOWS video further: if the audio clock is
+			//     valid and BEHIND this frame, wait for it (lip-sync). It can never
+			//     push video past the wall-clock ceiling above.
 			if (!decodeOneWhilePaused) {
-				if (masterClock_ != nullptr) {
-					const double audioSec = masterClock_(masterCtx_);
-					if (audioSec >= 0.0) {
-						const double frameSec = info.presentationTimeUs / 1e6;
-						for (int guard = 0; guard < 200 &&
-						                    !stop_.load(std::memory_order_relaxed) &&
-						                    !paused_.load(std::memory_order_relaxed) &&
-						                    masterClock_(masterCtx_) + 0.005 < frameSec;
-						     ++guard) {
-							std::this_thread::sleep_for(std::chrono::milliseconds(2));
-						}
-					}
-				} else {
-					if (firstPtsUs < 0) {
-						firstPtsUs = info.presentationTimeUs;
-						wallStart = clock::now();
-					}
-					const int64_t targetUs = info.presentationTimeUs - firstPtsUs;
-					const int64_t elapsedUs =
-					    std::chrono::duration_cast<std::chrono::microseconds>(clock::now() -
-					                                                          wallStart)
-					        .count();
-					if (targetUs > elapsedUs + 1000) {
-						std::this_thread::sleep_for(
-						    std::chrono::microseconds(targetUs - elapsedUs));
+				if (firstPtsUs < 0) {
+					firstPtsUs = info.presentationTimeUs;
+					wallStart = clock::now();
+				}
+				const int64_t targetUs = info.presentationTimeUs - firstPtsUs;
+				const int64_t elapsedUs =
+				    std::chrono::duration_cast<std::chrono::microseconds>(clock::now() -
+				                                                          wallStart)
+				        .count();
+				if (targetUs > elapsedUs + 1000) {
+					std::this_thread::sleep_for(
+					    std::chrono::microseconds(targetUs - elapsedUs));
+				}
+				const double audioSec =
+				    masterClock_ != nullptr ? masterClock_(masterCtx_) : -1.0;
+				if (audioSec >= 0.0) {
+					const double frameSec = info.presentationTimeUs / 1e6;
+					for (int guard = 0; guard < 200 &&
+					                    !stop_.load(std::memory_order_relaxed) &&
+					                    !paused_.load(std::memory_order_relaxed) &&
+					                    masterClock_(masterCtx_) + 0.005 < frameSec;
+					     ++guard) {
+						std::this_thread::sleep_for(std::chrono::milliseconds(2));
 					}
 				}
 			}
