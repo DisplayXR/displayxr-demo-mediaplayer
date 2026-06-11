@@ -43,15 +43,18 @@ struct SbsRenderer {
 	void setOverlay(bool visible, float progress, bool paused, const char *left,
 	                const char *right);
 
-	// Blit the UV sub-rect [off, off+scale) of the source into a centered
-	// content viewport (vpX,vpY,vpW,vpH) of `image` (a per-view swapchain image
-	// of size w x h), clearing the rest to black (letterbox). The viewport may
-	// overflow the image — the scissor clips it (crop). This is the min-to-min
-	// fit: the caller sizes the viewport so the content's shorter side matches
-	// the image's shorter side. Left eye = off(0,0) scale(0.5,1); right eye =
-	// off(0.5,0). Blocks until the GPU finishes.
-	void drawEye(VkImage image, uint32_t w, uint32_t h, float offX, float offY,
-	             float scaleX, float scaleY, float vpX, float vpY, float vpW, float vpH);
+	// Render the active mode's `viewCount` views into TILES of the single atlas
+	// image (size atlasW x atlasH) in ONE render pass, then blocks until the GPU
+	// finishes. Each view v occupies tile (v%cols, v/cols) sized renderW x
+	// renderH; its content is min-to-min fit (MatchMinRect) within the tile
+	// (shorter side matched, longer axis cropped/letterboxed), scissor-clipped
+	// to the tile, with the transport overlay drawn per tile. Stereo SBS slices
+	// the source by column (left half → view 0, right half → view 1); `mono`
+	// sends the whole image to every view. The caller submits N projection views
+	// over this atlas with per-tile imageRects.
+	void drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t renderW,
+	               uint32_t renderH, uint32_t cols, uint32_t rows, uint32_t viewCount,
+	               float contentAspect, bool mono, const float clearRgb[3]);
 
 	void cleanup();
 

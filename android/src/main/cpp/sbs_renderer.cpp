@@ -862,11 +862,13 @@ SbsRenderer::drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h)
 }
 
 void
-SbsRenderer::drawEye(VkImage image, uint32_t w, uint32_t h, float offX, float offY,
-                     float scaleX, float scaleY, float vpX, float vpY, float vpW, float vpH)
+SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t renderW,
+                       uint32_t renderH, uint32_t cols, uint32_t rows, uint32_t viewCount,
+                       float contentAspect, bool mono, const float clearRgb[3])
 {
 	if (planes_[0].view == VK_NULL_HANDLE) return;
-	const Target &t = targetFor(image, w, h);
+	const Target &t = targetFor(image, atlasW, atlasH);
+	const uint32_t c = cols ? cols : 1;
 
 	vkResetCommandBuffer(cmd_, 0);
 	VkCommandBufferBeginInfo cbbi = {};
@@ -874,40 +876,70 @@ SbsRenderer::drawEye(VkImage image, uint32_t w, uint32_t h, float offX, float of
 	cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(cmd_, &cbbi);
 
+	// One render pass over the WHOLE atlas: clear it black once (the letterbox
+	// bars inside each tile are this cleared black), then render every view's
+	// tile into a sub-rect via per-tile viewport + scissor.
 	VkClearValue clear = {};
-	clear.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+	clear.color = {{clearRgb[0], clearRgb[1], clearRgb[2], 1.0f}};
 	VkRenderPassBeginInfo rpbi = {};
 	rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 	rpbi.renderPass = renderPass_;
 	rpbi.framebuffer = t.fb;
-	rpbi.renderArea.extent = {w, h};
+	rpbi.renderArea.extent = {atlasW, atlasH};
 	rpbi.clearValueCount = 1;
 	rpbi.pClearValues = &clear;
 	vkCmdBeginRenderPass(cmd_, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
-	// Content viewport (may overflow the image); the scissor clips it (crop),
-	// and whatever it doesn't cover stays cleared (letterbox).
-	VkViewport vp = {vpX, vpY, vpW, vpH, 0.0f, 1.0f};
-	VkRect2D sc = {{0, 0}, {w, h}};
-	vkCmdSetViewport(cmd_, 0, 1, &vp);
-	vkCmdSetScissor(cmd_, 0, 1, &sc);
-	vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-	vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout_, 0, 1, &descSet_,
-	                        0, nullptr);
-	SbsPush push = {};
-	push.uvOffset[0] = offX;
-	push.uvOffset[1] = offY;
-	push.uvScale[0] = scaleX;
-	push.uvScale[1] = scaleY;
-	push.mode = sourceMode_;
-	push.fullRange = sourceFullRange_;
-	vkCmdPushConstants(cmd_, pipeLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
-	vkCmdDraw(cmd_, 3, 1, 0, 0);
-	// Overlay is screen-fixed: restore the full-image viewport so the content
-	// viewport above doesn't scale/offset the transport bar.
-	VkViewport full = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
-	vkCmdSetViewport(cmd_, 0, 1, &full);
-	drawOverlay(cmd_, w, h);  // transport bar / buttons, same in both eyes (screen plane)
+	for (uint32_t v = 0; v < viewCount; ++v) {
+		const uint32_t tile_x = v % c;
+		const uint32_t tile_y = v / c;
+		const float tx = (float)(tile_x * renderW);
+		const float ty = (float)(tile_y * renderH);
+
+		// Min-to-min (MatchMinRect) fit WITHIN the tile: content's shorter side
+		// == the tile's shorter side, centered; the longer axis crops (scissor)
+		// or letterboxes (cleared black). No stretch.
+		const float tileMin = renderW < renderH ? (float)renderW : (float)renderH;
+		float cqW, cqH;
+		if (contentAspect >= 1.0f) {
+			cqH = tileMin;
+			cqW = tileMin * contentAspect;
+		} else {
+			cqW = tileMin;
+			cqH = tileMin / contentAspect;
+		}
+		const float vx = tx + ((float)renderW - cqW) * 0.5f;
+		const float vy = ty + ((float)renderH - cqH) * 0.5f;
+
+		// UV: mono → whole image to every view; stereo SBS → this view's column
+		// slice (left half to view 0, right half to view 1 for a 2×1 layout).
+		const float boxW = mono ? 1.0f : 1.0f / (float)c;
+		const float offBase = mono ? 0.0f : (float)tile_x / (float)c;
+
+		// Content quad, scissor-clipped to the tile.
+		VkViewport vp = {vx, vy, cqW, cqH, 0.0f, 1.0f};
+		VkRect2D sc = {{(int32_t)tx, (int32_t)ty}, {renderW, renderH}};
+		vkCmdSetViewport(cmd_, 0, 1, &vp);
+		vkCmdSetScissor(cmd_, 0, 1, &sc);
+		vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+		vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout_, 0, 1, &descSet_,
+		                        0, nullptr);
+		SbsPush push = {};
+		push.uvOffset[0] = offBase;
+		push.uvOffset[1] = 0.0f;
+		push.uvScale[0] = boxW;
+		push.uvScale[1] = 1.0f;
+		push.mode = sourceMode_;
+		push.fullRange = sourceFullRange_;
+		vkCmdPushConstants(cmd_, pipeLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+		vkCmdDraw(cmd_, 3, 1, 0, 0);
+
+		// Transport overlay fills this tile (screen-fixed within the eye tile).
+		VkViewport ovp = {tx, ty, (float)renderW, (float)renderH, 0.0f, 1.0f};
+		vkCmdSetViewport(cmd_, 0, 1, &ovp);
+		drawOverlay(cmd_, renderW, renderH);  // re-binds its own pipeline
+	}
+
 	vkCmdEndRenderPass(cmd_);
 	vkEndCommandBuffer(cmd_);
 
