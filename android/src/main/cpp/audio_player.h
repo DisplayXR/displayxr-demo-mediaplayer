@@ -20,7 +20,7 @@ struct AMediaCodec;
 struct AAudioStreamStruct;  // AAudioStream is a typedef of this (aaudio/AAudio.h)
 
 struct AudioPlayer {
-	~AudioPlayer() { stop(); }
+	~AudioPlayer();  // closes the AAudio stream (kept open across clips for reuse)
 
 	// Open from a filesystem path (opens its own fd) or a content fd (from the
 	// SAF picker — the caller keeps ownership of `fd`; we dup it internally so
@@ -52,6 +52,13 @@ struct AudioPlayer {
 private:
 	bool startFromExtractor();  // select audio track, configure codec, open AAudio, spawn thread
 	bool start(int sampleRate, int channels);
+	// Open the AAudio stream, or REUSE the existing one when rate/channels match
+	// (closing+reopening a SHARED stream per clip leaves the new one silent on
+	// some devices — "audio works clip 1, silent clip 2"). Flushes on reuse.
+	bool ensureStream(int sampleRate, int channels);
+	// Tear down the per-clip media (decode thread + codec + extractor + fd) but
+	// KEEP the AAudio stream alive for reuse on the next clip.
+	void teardownMedia();
 	void decodeLoop();
 
 	AMediaExtractor *ex_ = nullptr;
@@ -65,5 +72,7 @@ private:
 	std::atomic<int64_t> seekRequestUs_{-1};
 	int sampleRate_ = 48000;
 	int channels_ = 2;
+	int streamRate_ = 0;  // params the currently-open AAudio stream was created with
+	int streamCh_ = 0;
 	int ownedFd_ = -1;
 };
