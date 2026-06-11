@@ -35,6 +35,12 @@ AudioPlayer::openPath(const std::string &path)
 bool
 AudioPlayer::openFd(int fd, int64_t offset, int64_t length)
 {
+	// Idempotent: fully release any prior stream/codec/thread before opening a
+	// new clip. Without this, switching clips leaks the AAudio stream + decode
+	// thread; after a few clips the device runs out of output streams and new
+	// ones open but stay silent ("audio stops after a few clips").
+	stop();
+	stop_.store(false, std::memory_order_relaxed);
 	ownedFd_ = fd;
 	ex_ = AMediaExtractor_new();
 	if (AMediaExtractor_setDataSourceFd(ex_, fd, offset, length) != AMEDIA_OK) {
@@ -188,12 +194,23 @@ AudioPlayer::decodeLoop()
 				if (obuf != nullptr && stream_ != nullptr) {
 					const int frames = (int)(info.size / (channels_ * 2));  // PCM_I16
 					int written = 0;
+					aaudio_result_t lastW = 0;
 					while (written < frames && !stop_.load(std::memory_order_relaxed)) {
 						aaudio_result_t w = AAudioStream_write(
 						    stream_, obuf + (size_t)written * channels_ * 2, frames - written,
 						    1'000'000'000L);
+						lastW = w;
 						if (w < 0) break;
 						written += w;
+					}
+					// One-shot confirmation that PCM data is reaching AAudio (the
+					// first few buffers); silent thereafter to avoid log spam.
+					static int dbgN = 0;
+					if (dbgN++ < 3) {
+						LOGI("audio: frames=%d written=%d lastW=%d (%s) clk=%.2f", frames,
+						     written, (int)lastW,
+						     lastW < 0 ? AAudio_convertResultToText(lastW) : "ok",
+						     info.presentationTimeUs / 1e6);
 					}
 					clockUs_.store(info.presentationTimeUs, std::memory_order_relaxed);
 				}
@@ -206,6 +223,14 @@ AudioPlayer::decodeLoop()
 				sawInputEOS = false;
 				clockUs_.store(0, std::memory_order_relaxed);
 			}
+		} else if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+			// DIAG: the decoder's real output format (PCM encoding 2=I16/4=FLOAT,
+			// actual sample rate/channels) — confirms our PCM_I16 assumption.
+			AMediaFormat *of = AMediaCodec_getOutputFormat(codec_);
+			if (of != nullptr) {
+				LOGI("audio DIAG output format: %s", AMediaFormat_toString(of));
+				AMediaFormat_delete(of);
+			}
 		}
 	}
 }
@@ -217,7 +242,9 @@ AudioPlayer::stop()
 	if (thread_.joinable()) thread_.join();
 	if (stream_) {
 		AAudioStream_requestStop(stream_);
-		AAudioStream_close(stream_);
+		aaudio_result_t cr = AAudioStream_close(stream_);
+		if (cr != AAUDIO_OK)
+			LOGE("AAudioStream_close failed: %s", AAudio_convertResultToText(cr));
 		stream_ = nullptr;
 	}
 	if (codec_) {
