@@ -733,16 +733,18 @@ SbsRenderer::drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h)
 	if (!ovVisible_ || ovPipeline_ == VK_NULL_HANDLE) return;
 
 	std::vector<OvVert> v;
-	v.reserve(1024);
+	v.reserve(2048);
 	const float aspect = (float)h / (float)w;  // x-fraction per y-fraction for round discs
 
-	// The Leia weave presents the eye tile vertically flipped relative to our
-	// framebuffer (content drawn at fb-bottom shows at screen-top). transport_ui
-	// fractions are SCREEN fractions (matching the touch hit-test), so flip Y
-	// here: a bar specified near screen-bottom lands at screen-bottom and the
-	// 7-seg digits read upright. X is not flipped (play=left, load=right).
+	// transport_ui fractions are SCREEN fractions (0 = top, 1 = bottom),
+	// matching the touch hit-test. Vulkan NDC has +Y pointing DOWN, so the map
+	// is the plain affine one — no vertical flip. (An earlier flip compensated
+	// for the Leia weave presenting the eye tile upside-down; the runtime's
+	// tiled-atlas rework made tiles upright, which left the bar drawing at
+	// screen-top while touch stayed at screen-bottom.) X is unchanged
+	// (play=left, load=right).
 	auto NX = [](float fx) { return fx * 2.0f - 1.0f; };
-	auto NY = [](float fy) { return 1.0f - fy * 2.0f; };
+	auto NY = [](float fy) { return fy * 2.0f - 1.0f; };
 	auto pt = [&](float fx, float fy, const float c[4]) {
 		v.push_back({NX(fx), NY(fy), c[0], c[1], c[2], c[3]});
 	};
@@ -764,39 +766,96 @@ SbsRenderer::drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h)
 			prevx = nx; prevy = ny;
 		}
 	};
+	// Vertical-gradient quad: cT along the top edge, cB along the bottom.
+	auto quadV = [&](float x0, float y0, float x1, float y1, const float cT[4],
+	                 const float cB[4]) {
+		pt(x0, y0, cT); pt(x1, y0, cT); pt(x1, y1, cB);
+		pt(x0, y0, cT); pt(x1, y1, cB); pt(x0, y1, cB);
+	};
+	// Annulus arc [a0,a1] whose inner edge carries cIn and whose outer edge
+	// fades to alpha 0 — the per-vertex-colour trick that buys soft shadows
+	// and halos without textures. Round in pixels like disc().
+	auto softRing = [&](float cx, float cy, float ry0, float ry1, float a0, float a1,
+	                    const float cIn[4]) {
+		const float cOut[4] = {cIn[0], cIn[1], cIn[2], 0.0f};
+		const int N = 18;
+		float pc = cosf(a0), ps = sinf(a0);
+		for (int i = 1; i <= N; ++i) {
+			const float a = a0 + (a1 - a0) * (float)i / N;
+			const float nc = cosf(a), ns = sinf(a);
+			pt(cx + ry0 * aspect * pc, cy + ry0 * ps, cIn);
+			pt(cx + ry1 * aspect * pc, cy + ry1 * ps, cOut);
+			pt(cx + ry1 * aspect * nc, cy + ry1 * ns, cOut);
+			pt(cx + ry0 * aspect * pc, cy + ry0 * ps, cIn);
+			pt(cx + ry1 * aspect * nc, cy + ry1 * ns, cOut);
+			pt(cx + ry0 * aspect * nc, cy + ry0 * ns, cIn);
+			pc = nc; ps = ns;
+		}
+	};
 
-	// Palette.
-	const float colPanel[4] = {0.06f, 0.07f, 0.09f, 0.66f};
-	const float colTrack[4] = {0.32f, 0.34f, 0.40f, 0.95f};
+	// Palette: one cyan accent family, neutral darks/whites everywhere else.
+	// Icon/text/glyph colours keep alpha 1.0 and dim via RGB instead, so
+	// overlapping quads (7-seg corners, folder tab/body seam) don't
+	// double-blend into hot or dark spots.
+	const float colPanel[4] = {0.04f, 0.05f, 0.07f, 0.62f};
+	const float colShadow[4] = {0.0f, 0.0f, 0.0f, 0.25f};
+	const float colShadow0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	const float colEdge[4] = {1.0f, 1.0f, 1.0f, 0.07f};
+	const float colEdge0[4] = {1.0f, 1.0f, 1.0f, 0.0f};
+	const float colTrack[4] = {0.78f, 0.80f, 0.86f, 0.32f};
 	const float colFill[4] = {0.18f, 0.80f, 0.88f, 1.0f};
+	const float colHalo[4] = {0.18f, 0.80f, 0.88f, 0.35f};
 	const float colKnob[4] = {0.97f, 0.98f, 1.0f, 1.0f};
-	const float colIcon[4] = {0.94f, 0.96f, 0.99f, 1.0f};
+	const float colIcon[4] = {0.93f, 0.95f, 0.98f, 1.0f};
+	const float colText[4] = {0.78f, 0.80f, 0.85f, 1.0f};
+	const float colGlyph[4] = {0.03f, 0.04f, 0.06f, 1.0f};  // near-black on the accent pill
 
+	const float kPi2 = 6.2831853f;
 	const float midY = (tui::kRowY0 + tui::kRowY1) * 0.5f;
 
-	// Control panel backdrop (translucent rounded strip).
-	const float pX0 = 0.010f, pX1 = 0.990f, pY0 = tui::kRowY0 - 0.020f, pY1 = tui::kRowY1 + 0.020f;
-	const float pr = (pY1 - pY0) * 0.5f;
-	quad(pX0 + pr * aspect, pY0, pX1 - pr * aspect, pY1, colPanel);
-	quad(pX0, pY0 + pr, pX0 + pr * aspect, pY1 - pr, colPanel);
-	quad(pX1 - pr * aspect, pY0 + pr, pX1, pY1 - pr, colPanel);
-	disc(pX0 + pr * aspect, pY0 + pr, pr, colPanel);
-	disc(pX1 - pr * aspect, pY0 + pr, pr, colPanel);
-	disc(pX0 + pr * aspect, pY1 - pr, pr, colPanel);
-	disc(pX1 - pr * aspect, pY1 - pr, pr, colPanel);
+	// Panel: slim translucent pill spanning exactly the interactive band
+	// (kRowY0..kRowY1, so the drawn slab IS the hit band). Soft drop shadow
+	// from gradient bands along the straight edges + outward-facing soft half
+	// rings at the caps (they abut the bands seamlessly at the cap tangents),
+	// then a faint top-edge highlight for a hint of depth.
+	const float pY0 = tui::kRowY0, pY1 = tui::kRowY1;
+	const float pr = (pY1 - pY0) * 0.5f;  // pill end radius = half height
+	const float pX0 = 0.012f, pX1 = 0.988f;
+	const float capL = pX0 + pr * aspect, capR = pX1 - pr * aspect;
+	const float sh = 0.014f;  // shadow spread
+	quadV(capL, pY0 - sh, capR, pY0, colShadow0, colShadow);
+	quadV(capL, pY1, capR, pY1 + sh, colShadow, colShadow0);
+	softRing(capL, midY, pr, pr + sh, kPi2 * 0.25f, kPi2 * 0.75f, colShadow);
+	softRing(capR, midY, pr, pr + sh, -kPi2 * 0.25f, kPi2 * 0.25f, colShadow);
+	quad(capL, pY0, capR, pY1, colPanel);
+	disc(capL, midY, pr, colPanel);
+	disc(capR, midY, pr, colPanel);
+	quadV(capL, pY0 + 0.0015f, capR, pY0 + 0.0065f, colEdge, colEdge0);
 
-	// Play / pause button.
-	const float bh = 0.026f;  // half-height
-	const float btnX0 = tui::kBtnX0, btnX1 = tui::kBtnX1;
-	if (ovPaused_) {  // PLAY: clean right-pointing triangle
-		tri(btnX0, midY - bh, btnX0, midY + bh, btnX1, midY, colIcon);
+	// Play / pause. The play triangle gets a small rightward optical offset —
+	// a bounding-box-centred right-pointing triangle reads left-of-centre.
+	const float bcx = (tui::kBtnX0 + tui::kBtnX1) * 0.5f;
+	const float bh = 0.022f;  // glyph half-height
+	if (ovPaused_) {  // PLAY: right-pointing triangle, ~equilateral in pixels
+		const float tw = 2.0f * bh * 0.92f * aspect;
+		const float ox = tw * 0.07f;  // optical centring
+		tri(bcx - tw * 0.5f + ox, midY - bh, bcx - tw * 0.5f + ox, midY + bh,
+		    bcx + tw * 0.5f + ox, midY, colIcon);
 	} else {  // PAUSE: two rounded bars
-		const float bw = (btnX1 - btnX0) * 0.30f;
-		quad(btnX0, midY - bh, btnX0 + bw, midY + bh, colIcon);
-		quad(btnX1 - bw, midY - bh, btnX1, midY + bh, colIcon);
+		const float gw = 2.0f * bh * 0.80f * aspect;  // glyph width
+		const float bw = gw * 0.32f;                  // bar width
+		const float br = bw / aspect * 0.5f;          // cap radius (y units)
+		const float xs[2] = {bcx - gw * 0.5f, bcx + gw * 0.5f - bw};
+		for (float x0 : xs) {
+			quad(x0, midY - bh + br, x0 + bw, midY + bh - br, colIcon);
+			disc(x0 + bw * 0.5f, midY - bh + br, br, colIcon);
+			disc(x0 + bw * 0.5f, midY + bh - br, br, colIcon);
+		}
 	}
 
-	// Scrub track + fill + knob (rounded caps via discs).
+	// Scrub track: thin neutral line; accent fill with a rounded leading end;
+	// modest knob over a soft accent halo. Track thickness comes from
+	// transport_ui so drawing and grab zone move together.
 	const float trkH = (tui::kBarY1 - tui::kBarY0) * 0.5f;  // half-thickness
 	const float bx0 = tui::kBarX0, bx1 = tui::kBarX1;
 	quad(bx0, midY - trkH, bx1, midY + trkH, colTrack);
@@ -806,35 +865,72 @@ SbsRenderer::drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h)
 	quad(bx0, midY - trkH, fillX, midY + trkH, colFill);
 	disc(bx0, midY, trkH, colFill);
 	disc(fillX, midY, trkH, colFill);
-	disc(fillX, midY, 0.020f, colKnob);  // knob
+	const float kr = 0.014f;  // knob radius
+	softRing(fillX, midY, kr, kr * 2.0f, 0.0f, kPi2, colHalo);
+	disc(fillX, midY, kr, colKnob);
 
-	// Folder / load icon (body + tab + up-arrow to suggest "open").
+	// Load button: accent pill with a dark "open file" glyph — kept loud on
+	// purpose (#15: a dim outline was invisible under the weave; it also
+	// collided with a left-anchored total-time readout), but slimmed to match
+	// the new proportions.
 	const float lx0 = tui::kLoadX0, lx1 = tui::kLoadX1;
-	const float lh = 0.018f;  // half-height
-	const float bodyTop = midY - lh * 0.4f;
-	quad(lx0, bodyTop, lx1, midY + lh, colIcon);                       // body
-	quad(lx0, midY - lh, lx0 + (lx1 - lx0) * 0.45f, bodyTop, colIcon);  // tab
-	tri((lx0 + lx1) * 0.5f, midY - lh * 0.1f, (lx0 + lx1) * 0.5f - 0.010f * aspect,
-	    midY + lh * 0.5f, (lx0 + lx1) * 0.5f + 0.010f * aspect, midY + lh * 0.5f, colPanel);
+	{
+		const float ph = 0.026f;  // pill half-height = end-cap radius
+		const float cx0 = lx0 + ph * aspect, cx1 = lx1 - ph * aspect;
+		quad(cx0, midY - ph, cx1, midY + ph, colFill);
+		disc(cx0, midY, ph, colFill);
+		disc(cx1, midY, ph, colFill);
+
+		// Upload/open mark: a horizontal tray with rounded ends + an upward
+		// arrow (triangle head, rounded stem) floating above it with a clear
+		// notch of negative space. All strokes are matched in PIXELS (tray
+		// thickness == stem width == 2*gr px) and sit above the ~0.004 weave
+		// shimmer floor; the gap is likewise wide enough not to fuse. The
+		// composite is vertically symmetric about midY (apex gh up, tray
+		// bottom gh down), so it centres optically without a fudge.
+		const float gcx = (lx0 + lx1) * 0.5f;
+		const float gh = 0.015f;   // glyph half-extent (pill ph=0.026 → ~21% inset)
+		const float gr = 0.003f;   // stroke half-thickness (0.006 ≈ 9.6 px @1600)
+		// Tray (bottom): rounded-end bar, top edge at midY + gh - 2*gr.
+		const float trayCy = midY + gh - gr;       // tray centreline
+		const float tw2 = 0.013f * aspect;         // cap-centre half-span
+		quad(gcx - tw2, trayCy - gr, gcx + tw2, trayCy + gr, colGlyph);
+		disc(gcx - tw2, trayCy, gr, colGlyph);
+		disc(gcx + tw2, trayCy, gr, colGlyph);
+		// Arrow head: up-pointing triangle, apex at the glyph top.
+		const float hh = 0.011f;            // head height
+		const float hw = 0.009f * aspect;   // head half-width (~2.2x stem width)
+		const float headB = midY - gh + hh; // head base
+		tri(gcx, midY - gh, gcx - hw, headB, gcx + hw, headB, colGlyph);
+		// Arrow stem: pixel-square width, tucked 0.0005 under the head base
+		// (same-colour alpha-1 overlap, no seam), rounded bottom cap held a
+		// 0.004 (≈6.4 px) notch above the tray.
+		const float sw = gr * aspect;             // stem half-width (px == tray)
+		const float stemCapCy = (trayCy - gr) - 0.004f - gr;
+		quad(gcx - sw, headB - 0.0005f, gcx + sw, stemCapCy, colGlyph);
+		disc(gcx, stemCapCy, gr, colGlyph);
+	}
 
 	// Seven-segment time readout. dh/dw are per-digit cell size; segments are
-	// thin quads. Colon is two square dots.
+	// thin quads whose horizontal (ty) and vertical (tx) strokes are matched
+	// in PIXELS, so digits read evenly. Dimmed via RGB (colText) so they don't
+	// compete with the accent. Colon is two square dots.
 	auto digit = [&](float x0, float topY, float dw, float dh, int d) {
 		if (d < 0 || d > 9) return;
 		const uint8_t m = kSeg7[d];
-		const float tx = dw * 0.26f, ty = dh * 0.16f;  // segment thickness
+		const float ty = dh * 0.18f, tx = ty * aspect;  // stroke, px-matched
 		const float x1 = x0 + dw, y0 = topY, y1 = topY + dh, my = topY + dh * 0.5f;
-		if (m & 0x01) quad(x0, y0, x1, y0 + ty, colIcon);              // a top
-		if (m & 0x40) quad(x0, my - ty * 0.5f, x1, my + ty * 0.5f, colIcon);  // g mid
-		if (m & 0x08) quad(x0, y1 - ty, x1, y1, colIcon);             // d bottom
-		if (m & 0x20) quad(x0, y0, x0 + tx, my, colIcon);             // f top-left
-		if (m & 0x02) quad(x1 - tx, y0, x1, my, colIcon);             // b top-right
-		if (m & 0x10) quad(x0, my, x0 + tx, y1, colIcon);             // e bottom-left
-		if (m & 0x04) quad(x1 - tx, my, x1, y1, colIcon);             // c bottom-right
+		if (m & 0x01) quad(x0, y0, x1, y0 + ty, colText);              // a top
+		if (m & 0x40) quad(x0, my - ty * 0.5f, x1, my + ty * 0.5f, colText);  // g mid
+		if (m & 0x08) quad(x0, y1 - ty, x1, y1, colText);             // d bottom
+		if (m & 0x20) quad(x0, y0, x0 + tx, my, colText);             // f top-left
+		if (m & 0x02) quad(x1 - tx, y0, x1, my, colText);             // b top-right
+		if (m & 0x10) quad(x0, my, x0 + tx, y1, colText);             // e bottom-left
+		if (m & 0x04) quad(x1 - tx, my, x1, y1, colText);             // c bottom-right
 	};
 	auto drawTime = [&](const char *s, float startX) {
-		const float dh = 0.030f, dw = dh * aspect * 0.62f;
-		const float advD = dw + dw * 0.40f, advC = dw * 0.55f;
+		const float dh = 0.028f, dw = dh * aspect * 0.58f;
+		const float advD = dw * 1.42f, advC = dw * 0.60f;
 		const float topY = midY - dh * 0.5f;
 		float x = startX;
 		for (const char *p = s; *p; ++p) {
@@ -842,16 +938,29 @@ SbsRenderer::drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h)
 				digit(x, topY, dw, dh, *p - '0');
 				x += advD;
 			} else if (*p == ':') {
-				const float dotw = dw * 0.18f, doth = dh * 0.16f;
+				const float doth = dh * 0.18f, dotw = doth * aspect;  // = seg stroke
 				const float cx = x + advC * 0.5f - dotw * 0.5f;
-				quad(cx, topY + dh * 0.28f, cx + dotw, topY + dh * 0.28f + doth, colIcon);
-				quad(cx, topY + dh * 0.62f, cx + dotw, topY + dh * 0.62f + doth, colIcon);
+				quad(cx, topY + dh * 0.26f, cx + dotw, topY + dh * 0.26f + doth, colText);
+				quad(cx, topY + dh * 0.60f, cx + dotw, topY + dh * 0.60f + doth, colText);
 				x += advC;
 			}
 		}
 	};
+	// Total time is RIGHT-aligned to end just left of the Load button: a
+	// left-anchored total overran the button zone for hour-long content (the
+	// bright digits buried the Load glyph, #15).
+	auto timeWidth = [&](const char *s) {
+		const float dh = 0.028f, dw = dh * aspect * 0.58f;
+		const float advD = dw * 1.42f, advC = dw * 0.60f;
+		float wsum = 0.0f;
+		for (const char *p = s; *p; ++p) {
+			if (*p >= '0' && *p <= '9') wsum += advD;
+			else if (*p == ':') wsum += advC;
+		}
+		return wsum;
+	};
 	drawTime(ovLeft_, tui::kElapsedX);
-	drawTime(ovRight_, tui::kTotalX);
+	drawTime(ovRight_, tui::kLoadX0 - 0.015f - timeWidth(ovRight_));
 
 	if (v.empty() || v.size() > ovVboCapVerts_) return;
 	std::memcpy(ovVboMapped_, v.data(), v.size() * sizeof(OvVert));

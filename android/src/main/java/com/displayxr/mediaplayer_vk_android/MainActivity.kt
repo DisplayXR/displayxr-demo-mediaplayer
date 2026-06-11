@@ -76,6 +76,10 @@ class MainActivity : NativeActivity() {
     // only Java can launch the system file picker.
     private external fun nativeTouch(action: Int, nx: Float, ny: Float): Int
 
+    // Picker dismissed without a selection — native resumes the previous asset
+    // (it blanks the scene while a pick is pending to avoid a stale-frame flash).
+    private external fun nativePickCancelled()
+
 
     // First installed runtime package, preferring out_of_process. Null if none.
     private val installedRuntime: String? by lazy {
@@ -125,13 +129,16 @@ class MainActivity : NativeActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         android.util.Log.i(TAG, "onActivityResult req=$requestCode res=$resultCode uri=${data?.data}")
-        if (requestCode == REQUEST_PICK_VIDEO && resultCode == RESULT_OK) {
-            val uri = data?.data ?: return
-            // NOTE: opening media from the SAF picker is BLOCKED by runtime#528 —
-            // returning from the picker leaves the OOP compositor wedged on the
-            // client's abandoned surface, so the panel freezes regardless of what
-            // we do here. Deferred until that runtime fix lands; this just hands
-            // the fd to native for when it does.
+        if (requestCode == REQUEST_PICK_VIDEO) {
+            val uri = if (resultCode == RESULT_OK) data?.data else null
+            if (uri == null) {
+                // Cancelled (or no uri): let native resume the previous asset.
+                try {
+                    nativePickCancelled()
+                } catch (_: Throwable) {
+                }
+                return
+            }
             try {
                 val pfd = contentResolver.openFileDescriptor(uri, "r") ?: return
                 val length = pfd.statSize
@@ -139,6 +146,10 @@ class MainActivity : NativeActivity() {
                 android.util.Log.i(TAG, "picked fd handed to native (len=$length)")
             } catch (t: Throwable) {
                 android.util.Log.e(TAG, "openFileDescriptor failed", t)
+                try {
+                    nativePickCancelled()
+                } catch (_: Throwable) {
+                }
             }
         }
     }

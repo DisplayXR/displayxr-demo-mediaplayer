@@ -194,6 +194,11 @@ std::atomic<bool> g_scene_loaded{false};
 // AMediaCodec video.
 VideoDecoder g_video;
 bool g_is_video = false;
+// True from "Load tapped" (picker launching) until the pick fd arrives or the
+// picker is cancelled. While pending we keep rendering the clear color instead
+// of the previous asset — otherwise the old video flashes for the few frames
+// between activity resume and the fd landing.
+std::atomic<bool> g_pick_pending{false};
 bool g_image_mono = false;  // current image is 2D → both eyes sample the full image
 // Per-eye DISPLAY aspect of the current media (w/h). Drives the center-crop
 // (cover) fit so content fills the view without stretching — its shorter side
@@ -1065,7 +1070,8 @@ render_frame()
 	XrCompositionLayerProjectionView projection_views[kMaxViews] = {};
 	uint32_t submit_views = 0;
 	bool rendered = false;
-	if (frame_state.shouldRender && g_scene_loaded.load(std::memory_order_relaxed)) {
+	if (frame_state.shouldRender && g_scene_loaded.load(std::memory_order_relaxed) &&
+	    !g_pick_pending.load(std::memory_order_relaxed)) {
 		XrViewState view_state = {};
 		view_state.type = XR_TYPE_VIEW_STATE;
 		XrViewLocateInfo locate_info = {};
@@ -1349,6 +1355,14 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeOpenVideoFd(
 	g_pick_fd.store((int)fd, std::memory_order_release);  // publish last
 }
 
+// Picker dismissed without a selection: resume showing the previous asset.
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativePickCancelled(
+    JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	g_pick_pending.store(false, std::memory_order_relaxed);
+}
+
 // Raw touch (normalized screen coords) hit-tested against the transport bar
 // (transport_ui.h). Returns 1 to ask Java to open the SAF picker (Load button
 // tapped — only Java can launch ACTION_OPEN_DOCUMENT); 0 otherwise. The button
@@ -1372,6 +1386,7 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 			if (std::fabs(nx - downX) + std::fabs(ny - downY) > 0.01f) moved = true;
 		} else if (action == kUp && !moved) {
 			LOGI("touch UP on image -> open picker");
+			g_pick_pending.store(true, std::memory_order_relaxed);
 			return 1;
 		}
 		return 0;
@@ -1411,9 +1426,12 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 			togglePause();
 		} else if (r == tui::Region::Load) {
 			LOGI("touch UP -> Load (open picker)");
+			g_pick_pending.store(true, std::memory_order_relaxed);
 			return 1;  // Java opens the picker
 		} else if (r == tui::Region::None && !moved) {
-			togglePause();  // tap on the video area
+			// Tap on the video area only reveals the transport bar (the
+			// g_ui_interaction_ns store above already did that) — playback
+			// continues; pause is the bar's button only.
 		}
 	}
 	return 0;
@@ -1475,6 +1493,7 @@ android_main(struct android_app *app)
 				                    magic[2] == 'N' && magic[3] == 'G';
 				g_video.stop();
 				g_scene_loaded.store(false, std::memory_order_relaxed);
+				g_pick_pending.store(false, std::memory_order_relaxed);
 				if (is_jpeg || is_png) {
 					if (!load_picked_image(app, pick, off, len)) {
 						LOGE("Failed to load picked image (fd=%d)", pick);

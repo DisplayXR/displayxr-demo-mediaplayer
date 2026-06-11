@@ -6,18 +6,20 @@
 // touches against the same regions). Single source of truth so draw + touch
 // agree. Coordinates are fractions of the per-view tile / screen [0,1].
 //
-// Layout (bottom strip):  [▶/❚❚]  0:42 ━━━●──── 3:15            [load]
+// Layout (bottom strip):  [▶/❚❚]  0:42 ━━━●────  3:15 [load]
 #pragma once
 
 namespace tui {
 
-constexpr float kRowY0 = 0.835f, kRowY1 = 0.945f;  // interactive vertical band (= panel)
-constexpr float kBarY0 = 0.880f, kBarY1 = 0.900f;  // the thin track itself
+constexpr float kRowY0 = 0.850f, kRowY1 = 0.950f;  // interactive vertical band (= panel)
+constexpr float kBarY0 = 0.897f, kBarY1 = 0.903f;  // the thin track itself
 
 constexpr float kBtnX0 = 0.020f, kBtnX1 = 0.070f;  // play / pause (left)
-constexpr float kElapsedX = 0.085f;                // elapsed-time text anchor
-constexpr float kBarX0 = 0.150f, kBarX1 = 0.760f;  // scrub track
-constexpr float kTotalX = 0.775f;                  // total-time text anchor
+constexpr float kElapsedX = 0.088f;                // elapsed-time text anchor
+constexpr float kBarX0 = 0.195f, kBarX1 = 0.760f;  // scrub track
+// Total time has no left anchor: the renderer RIGHT-aligns it to end 0.015
+// before kLoadX0 (a left-anchored total overran the Load button on hour-long
+// content, #15).
 constexpr float kLoadX0 = 0.910f, kLoadX1 = 0.975f;  // load / open file (right)
 
 enum class Region { None, Button, Bar, Load };
