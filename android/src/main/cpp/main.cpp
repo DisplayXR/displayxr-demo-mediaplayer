@@ -1278,21 +1278,10 @@ bring_up(struct android_app *app)
 		LOGI("Bring-up failed; see logs.");
 		return false;
 	}
-	// TEMP (until the SAF picker is unblocked by runtime#528): auto-load a
-	// default SBS video from the app's external files dir so playback can be
-	// checked without the picker. Falls back to the idle splash if absent.
-	const std::string videoPath =
-	    std::string(app->activity->externalDataPath ? app->activity->externalDataPath : ".") +
-	    "/default.mp4";
-	if (access(videoPath.c_str(), R_OK) == 0 && g_video.openPath(videoPath)) {
-		g_is_video = true;
-		g_image_mono = false;
-		g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
-		g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
-		LOGI("TEMP auto-load: playing %s (audio=none, Stage 3)", videoPath.c_str());
-	} else {
-		load_splash(app);
-	}
+	// Start on the idle splash; content comes from the SAF picker (tap → Load).
+	// The old TEMP default.mp4 auto-load is gone — the picker round-trip is
+	// unblocked since runtime#528 + plugin v1.6.5.
+	load_splash(app);
 	LOGI("Bring-up complete.");
 	return true;
 }
