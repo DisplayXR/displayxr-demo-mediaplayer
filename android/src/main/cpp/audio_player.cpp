@@ -35,11 +35,10 @@ AudioPlayer::openPath(const std::string &path)
 bool
 AudioPlayer::openFd(int fd, int64_t offset, int64_t length)
 {
-	// Idempotent: fully release any prior stream/codec/thread before opening a
-	// new clip. Without this, switching clips leaks the AAudio stream + decode
-	// thread; after a few clips the device runs out of output streams and new
-	// ones open but stay silent ("audio stops after a few clips").
-	stop();
+	// Tear down the PREVIOUS clip's media (thread/codec/extractor) but KEEP the
+	// AAudio stream so it can be reused — closing+reopening the stream per clip
+	// leaves the new one silent on some devices ("works clip 1, silent clip 2").
+	teardownMedia();
 	stop_.store(false, std::memory_order_relaxed);
 	ownedFd_ = fd;
 	ex_ = AMediaExtractor_new();
@@ -92,8 +91,35 @@ AudioPlayer::startFromExtractor()
 bool
 AudioPlayer::start(int sampleRate, int channels)
 {
+	if (!ensureStream(sampleRate, channels)) return false;
+	open_.store(true, std::memory_order_relaxed);
+	stop_.store(false, std::memory_order_relaxed);
+	thread_ = std::thread([this] { decodeLoop(); });
+	return true;
+}
+
+// Reuse the existing AAudio stream when the new clip's rate/channels match
+// (just flush leftover audio + restart); only close+reopen on a real mismatch.
+bool
+AudioPlayer::ensureStream(int sampleRate, int channels)
+{
 	sampleRate_ = sampleRate > 0 ? sampleRate : 48000;
 	channels_ = channels > 0 ? channels : 2;
+
+	if (stream_ != nullptr && sampleRate_ == streamRate_ && channels_ == streamCh_) {
+		// Reuse: flush clip-1's tail (requires STOPPED/PAUSED), then restart.
+		AAudioStream_requestStop(stream_);
+		AAudioStream_requestFlush(stream_);
+		aaudio_result_t rs = AAudioStream_requestStart(stream_);
+		LOGI("AudioPlayer reuse stream %dHz %dch (start=%d)", streamRate_, streamCh_, (int)rs);
+		channels_ = streamCh_;
+		return true;
+	}
+	if (stream_ != nullptr) {  // params changed — must reopen
+		AAudioStream_requestStop(stream_);
+		AAudioStream_close(stream_);
+		stream_ = nullptr;
+	}
 
 	AAudioStreamBuilder *builder = nullptr;
 	if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK) {
@@ -106,6 +132,8 @@ AudioPlayer::start(int sampleRate, int channels)
 	AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
 	AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
 	AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_NONE);
+	AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
+	AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MOVIE);
 	aaudio_result_t r = AAudioStreamBuilder_openStream(builder, &stream_);
 	AAudioStreamBuilder_delete(builder);
 	if (r != AAUDIO_OK || stream_ == nullptr) {
@@ -113,10 +141,16 @@ AudioPlayer::start(int sampleRate, int channels)
 		return false;
 	}
 	AAudioStream_requestStart(stream_);
-	LOGI("AudioPlayer open: %dHz %dch", sampleRate_, channels_);
-	open_.store(true, std::memory_order_relaxed);
-	stop_.store(false, std::memory_order_relaxed);
-	thread_ = std::thread([this] { decodeLoop(); });
+	const int actRate = AAudioStream_getSampleRate(stream_);
+	const int actCh = AAudioStream_getChannelCount(stream_);
+	const aaudio_format_t actFmt = AAudioStream_getFormat(stream_);
+	LOGI("AudioPlayer open: requested %dHz %dch I16 → actual %dHz %dch fmt=%d state=%d", sampleRate_,
+	     channels_, actRate, actCh, (int)actFmt, (int)AAudioStream_getState(stream_));
+	if (actCh > 0) channels_ = actCh;
+	if (actFmt != AAUDIO_FORMAT_PCM_I16)
+		LOGE("AAudio granted non-I16 format %d — playback will be wrong/silent", (int)actFmt);
+	streamRate_ = sampleRate_;  // remember what we opened with (request rate; ch adopted)
+	streamCh_ = channels_;
 	return true;
 }
 
@@ -235,18 +269,13 @@ AudioPlayer::decodeLoop()
 	}
 }
 
+// Per-clip teardown: stop the decode thread + release codec/extractor/fd, but
+// LEAVE the AAudio stream open so the next clip reuses it.
 void
-AudioPlayer::stop()
+AudioPlayer::teardownMedia()
 {
 	stop_.store(true, std::memory_order_relaxed);
 	if (thread_.joinable()) thread_.join();
-	if (stream_) {
-		AAudioStream_requestStop(stream_);
-		aaudio_result_t cr = AAudioStream_close(stream_);
-		if (cr != AAUDIO_OK)
-			LOGE("AAudioStream_close failed: %s", AAudio_convertResultToText(cr));
-		stream_ = nullptr;
-	}
 	if (codec_) {
 		AMediaCodec_stop(codec_);
 		AMediaCodec_delete(codec_);
@@ -262,4 +291,26 @@ AudioPlayer::stop()
 	}
 	open_.store(false, std::memory_order_relaxed);
 	clockUs_.store(-1, std::memory_order_relaxed);
+}
+
+// Public stop (clip switch / session teardown): tear down the media but KEEP
+// the AAudio stream open so the next clip reuses it (closing+reopening per clip
+// is what left clip 2 silent). The stream is closed only at process exit (dtor).
+void
+AudioPlayer::stop()
+{
+	teardownMedia();
+}
+
+// Process exit: media + the AAudio stream itself.
+AudioPlayer::~AudioPlayer()
+{
+	teardownMedia();
+	if (stream_) {
+		AAudioStream_requestStop(stream_);
+		AAudioStream_close(stream_);
+		stream_ = nullptr;
+		streamRate_ = 0;
+		streamCh_ = 0;
+	}
 }
