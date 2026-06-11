@@ -248,6 +248,62 @@ now_ns()
 }
 uint64_t g_frame_count = 0;
 
+// ─── Per-frame CPU phase profiler (perf analysis / tuning) ────────────────
+// Wall-clock times each render_frame() phase via now_ns(). uploadYUV() and
+// drawAtlas() both vkQueueSubmit + vkWaitForFences (synchronous), so their CPU
+// wall time INCLUDES the GPU upload/blit — a first-order breakdown needs no GPU
+// timestamp pool. Phases the runtime owns: 'wait' is the xrWaitFrame pacing
+// block (large here = display-rate-bound, not work-bound); 'end' is xrEndFrame
+// (can block on the runtime weave). Averaged + logged every 120 frames beside
+// the fps line. Phases inside the render block (locate/acquire/draw) only run
+// on frames that actually render; on idle/no-view frames their time is not
+// attributed anywhere (so the phase sum can be < frame time when idle) rather
+// than over-counted onto 'end'. Build with -DMP_PROFILE=0 to compile out.
+#ifndef MP_PROFILE
+#define MP_PROFILE 1
+#endif
+#if MP_PROFILE
+enum ProfPhase {
+	PROF_WAIT,    // xrWaitFrame (frame pacing)
+	PROF_BEGIN,   // xrBeginFrame
+	PROF_UPLOAD,  // acquireLatest + uploadYUV (decode-frame fetch + GPU YUV upload)
+	PROF_LOCATE,  // xrLocateViews
+	PROF_ACQUIRE, // xrAcquire + xrWaitSwapchainImage
+	PROF_DRAW,    // drawAtlas (SBS blit + overlay) + release
+	PROF_END,     // xrEndFrame (submit to runtime / weave)
+	PROF_COUNT
+};
+static const char *const kProfNames[PROF_COUNT] = {"wait",   "begin", "upload", "locate",
+                                                   "acquire", "draw",  "end"};
+static double g_prof_acc[PROF_COUNT] = {0};
+static int64_t g_prof_t0 = 0;
+#define PROF_RESET() (g_prof_t0 = now_ns())
+#define PROF_MARK(phase)                                                                           \
+	do {                                                                                       \
+		int64_t _t = now_ns();                                                             \
+		g_prof_acc[(phase)] += (double)(_t - g_prof_t0) / 1.0e6;                            \
+		g_prof_t0 = _t;                                                                     \
+	} while (0)
+static void
+prof_log(uint64_t frame, double frame_ms)
+{
+	char buf[256];
+	int n = 0;
+	double sum = 0.0;
+	for (int i = 0; i < PROF_COUNT; ++i) {
+		double avg = g_prof_acc[i] / 120.0;
+		sum += avg;
+		n += snprintf(buf + n, sizeof(buf) - (size_t)n, " %s=%.2f", kProfNames[i], avg);
+		g_prof_acc[i] = 0.0;
+	}
+	LOGI("PROF frame %llu  %.1f ms/frame:%s  (phases=%.2f)", (unsigned long long)frame,
+	     frame_ms, buf, sum);
+}
+#else
+#define PROF_RESET() ((void)0)
+#define PROF_MARK(phase) ((void)0)
+#endif
+
 // ─── OpenXR-Android bring-up (reused verbatim from cube_handle_vk_android) ─
 bool
 initialize_loader(struct android_app *app)
@@ -1018,6 +1074,7 @@ poll_xr_events()
 bool
 render_frame()
 {
+	PROF_RESET();
 	XrFrameWaitInfo wait_info = {};
 	wait_info.type = XR_TYPE_FRAME_WAIT_INFO;
 	XrFrameState frame_state = {};
@@ -1027,6 +1084,7 @@ render_frame()
 		log_xr_result("xrWaitFrame", res);
 		return false;
 	}
+	PROF_MARK(PROF_WAIT);
 	XrFrameBeginInfo begin_info = {};
 	begin_info.type = XR_TYPE_FRAME_BEGIN_INFO;
 	res = xrBeginFrame(g_session, &begin_info);
@@ -1034,6 +1092,7 @@ render_frame()
 		log_xr_result("xrBeginFrame", res);
 		return false;
 	}
+	PROF_MARK(PROF_BEGIN);
 
 	// Pull the latest decoded video frame (if any) and upload its YUV planes —
 	// the GPU does the BT.709 convert + per-eye downscale in sbs.frag. First
@@ -1066,6 +1125,7 @@ render_frame()
 	} else {
 		g_sbs.setOverlay(false, 0.0f, false, "", "");  // image: no transport
 	}
+	PROF_MARK(PROF_UPLOAD);
 
 	XrCompositionLayerProjectionView projection_views[kMaxViews] = {};
 	uint32_t submit_views = 0;
@@ -1102,6 +1162,7 @@ render_frame()
 		}
 		uint32_t located = 0;
 		res = xrLocateViews(g_session, &locate_info, &view_state, g_max_view_count, &located, views);
+		PROF_MARK(PROF_LOCATE);
 		constexpr XrViewStateFlags kValidFlags =
 		    XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
 		const bool views_valid = res == XR_SUCCESS && located >= g_view_count &&
@@ -1129,6 +1190,7 @@ render_frame()
 				wait_img.timeout = XR_INFINITE_DURATION;
 				res = xrWaitSwapchainImage(g_atlas.swapchain, &wait_img);
 			}
+			PROF_MARK(PROF_ACQUIRE);
 			if (res == XR_SUCCESS) {
 				const float aC = g_content_aspect.load(std::memory_order_relaxed);
 				g_sbs.drawAtlas(g_atlas.images[img_idx].image, g_atlas.width, g_atlas.height,
@@ -1139,6 +1201,7 @@ render_frame()
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
 				res = xrReleaseSwapchainImage(g_atlas.swapchain, &rel);
 			}
+			PROF_MARK(PROF_DRAW);
 			if (res == XR_SUCCESS) {
 				for (uint32_t i = 0; i < submit_views; ++i) {
 					const uint32_t tile_x = cols ? (i % cols) : 0;
@@ -1190,11 +1253,13 @@ render_frame()
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 	end_info.layerCount = rendered ? 1 : 0;
 	end_info.layers = rendered ? layers : nullptr;
+	PROF_RESET();  // exclude the trivial projection-layer setup from 'end'
 	res = xrEndFrame(g_session, &end_info);
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrEndFrame", res);
 		return false;
 	}
+	PROF_MARK(PROF_END);
 
 	g_frame_count++;
 	if ((g_frame_count % 120) == 0) {
@@ -1204,6 +1269,9 @@ render_frame()
 		last = now;
 		LOGI("frame %llu  ~%.1f ms/frame (%.1f fps)", (unsigned long long)g_frame_count,
 		     ms, ms > 0.0 ? 1000.0 / ms : 0.0);
+#if MP_PROFILE
+		prof_log(g_frame_count, ms);
+#endif
 	}
 	return true;
 }
