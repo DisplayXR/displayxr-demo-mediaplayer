@@ -3,6 +3,7 @@
 
 #include "sbs_renderer.h"
 
+#include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <cmath>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include "overlay.frag.h"     // overlay_frag_data (SPIR-V)
 #include "overlay.vert.h"     // overlay_vert_data (SPIR-V)
 #include "sbs.frag.h"         // sbs_frag_data (SPIR-V)
+#include "sbs_ahb.frag.h"     // sbs_ahb_frag_data (SPIR-V) — zero-copy ycbcr blit
 #include "transport_ui.h"     // shared bar/button layout fractions
 
 namespace {
@@ -268,6 +270,13 @@ SbsRenderer::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 	}
 	if (!initOverlayPipeline()) {
 		return false;
+	}
+	// Zero-copy AHB import entrypoint (device extension fn — must be loaded, not
+	// linked). Built lazily into a ycbcr pipeline on the first video frame.
+	pfnGetAhbProps_ = (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(
+	    device_, "vkGetAndroidHardwareBufferPropertiesANDROID");
+	if (pfnGetAhbProps_ == nullptr) {
+		LOGE("vkGetAndroidHardwareBufferPropertiesANDROID unavailable (AHB zero-copy off)");
 	}
 	LOGI("SbsRenderer initialized (format=0x%x)", (uint32_t)format_);
 	return true;
@@ -970,12 +979,344 @@ SbsRenderer::drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h)
 	vkCmdDraw(cmd, (uint32_t)v.size(), 1, 0, 0);
 }
 
+// ── Zero-copy AHB video path ──────────────────────────────────────────────
+// Build the per-stream ycbcr conversion + immutable sampler + descriptor layout
+// + pipeline from the first frame's external format. All frames of a stream
+// share one external format, so this runs once.
+bool
+SbsRenderer::ensureAhbPipeline(const VkAndroidHardwareBufferFormatPropertiesANDROID &fmt)
+{
+	if (ahbInited_) return true;
+	ahbExternalFormat_ = fmt.externalFormat;
+
+	VkExternalFormatANDROID extFmt = {};
+	extFmt.sType = VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID;
+	extFmt.externalFormat = fmt.externalFormat;
+
+	VkSamplerYcbcrConversionCreateInfo cci = {};
+	cci.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO;
+	cci.pNext = &extFmt;
+	cci.format = VK_FORMAT_UNDEFINED;  // sampling an external format
+	cci.ycbcrModel = fmt.suggestedYcbcrModel;
+	cci.ycbcrRange = fmt.suggestedYcbcrRange;
+	cci.components = fmt.samplerYcbcrConversionComponents;
+	cci.xChromaOffset = fmt.suggestedXChromaOffset;
+	cci.yChromaOffset = fmt.suggestedYChromaOffset;
+	cci.chromaFilter = VK_FILTER_LINEAR;
+	cci.forceExplicitReconstruction = VK_FALSE;
+	if (vkCreateSamplerYcbcrConversion(device_, &cci, nullptr, &ahbYcbcr_) != VK_SUCCESS) {
+		LOGE("vkCreateSamplerYcbcrConversion failed");
+		return false;
+	}
+
+	VkSamplerYcbcrConversionInfo convInfo = {};
+	convInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
+	convInfo.conversion = ahbYcbcr_;
+	VkSamplerCreateInfo sci = {};
+	sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	sci.pNext = &convInfo;
+	sci.magFilter = VK_FILTER_LINEAR;
+	sci.minFilter = VK_FILTER_LINEAR;
+	sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sci.unnormalizedCoordinates = VK_FALSE;
+	if (vkCreateSampler(device_, &sci, nullptr, &ahbSampler_) != VK_SUCCESS) {
+		LOGE("ycbcr sampler failed");
+		return false;
+	}
+
+	// Binding 0 = combined image sampler with the IMMUTABLE ycbcr sampler baked in.
+	VkDescriptorSetLayoutBinding b = {};
+	b.binding = 0;
+	b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	b.descriptorCount = 1;
+	b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	b.pImmutableSamplers = &ahbSampler_;
+	VkDescriptorSetLayoutCreateInfo dslci = {};
+	dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	dslci.bindingCount = 1;
+	dslci.pBindings = &b;
+	if (vkCreateDescriptorSetLayout(device_, &dslci, nullptr, &ahbSetLayout_) != VK_SUCCESS) {
+		LOGE("ahb set layout failed");
+		return false;
+	}
+
+	VkPushConstantRange pc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(SbsPush)};
+	VkPipelineLayoutCreateInfo plci = {};
+	plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	plci.setLayoutCount = 1;
+	plci.pSetLayouts = &ahbSetLayout_;
+	plci.pushConstantRangeCount = 1;
+	plci.pPushConstantRanges = &pc;
+	if (vkCreatePipelineLayout(device_, &plci, nullptr, &ahbPipeLayout_) != VK_SUCCESS) {
+		LOGE("ahb pipe layout failed");
+		return false;
+	}
+
+	auto makeModule = [&](const uint32_t *code, size_t bytes) {
+		VkShaderModuleCreateInfo smci = {};
+		smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+		smci.codeSize = bytes;
+		smci.pCode = code;
+		VkShaderModule m = VK_NULL_HANDLE;
+		vkCreateShaderModule(device_, &smci, nullptr, &m);
+		return m;
+	};
+	VkShaderModule vert = makeModule(fullscreen_vert_data, sizeof(fullscreen_vert_data));
+	VkShaderModule frag = makeModule(sbs_ahb_frag_data, sizeof(sbs_ahb_frag_data));
+	if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+		LOGE("ahb shader module creation failed");
+		return false;
+	}
+	VkPipelineShaderStageCreateInfo stages[2] = {};
+	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+	stages[0].module = vert;
+	stages[0].pName = "main";
+	stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	stages[1].module = frag;
+	stages[1].pName = "main";
+	VkPipelineVertexInputStateCreateInfo vi = {};
+	vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	VkPipelineInputAssemblyStateCreateInfo ia = {};
+	ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	VkPipelineViewportStateCreateInfo vp = {};
+	vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	vp.viewportCount = 1;
+	vp.scissorCount = 1;
+	VkPipelineRasterizationStateCreateInfo rs = {};
+	rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	rs.polygonMode = VK_POLYGON_MODE_FILL;
+	rs.cullMode = VK_CULL_MODE_NONE;
+	rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	rs.lineWidth = 1.0f;
+	VkPipelineMultisampleStateCreateInfo ms = {};
+	ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	VkPipelineColorBlendAttachmentState cba = {};
+	cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+	                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+	VkPipelineColorBlendStateCreateInfo cb = {};
+	cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	cb.attachmentCount = 1;
+	cb.pAttachments = &cba;
+	VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+	VkPipelineDynamicStateCreateInfo dyn = {};
+	dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	dyn.dynamicStateCount = 2;
+	dyn.pDynamicStates = dynStates;
+	VkGraphicsPipelineCreateInfo gp = {};
+	gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	gp.stageCount = 2;
+	gp.pStages = stages;
+	gp.pVertexInputState = &vi;
+	gp.pInputAssemblyState = &ia;
+	gp.pViewportState = &vp;
+	gp.pRasterizationState = &rs;
+	gp.pMultisampleState = &ms;
+	gp.pColorBlendState = &cb;
+	gp.pDynamicState = &dyn;
+	gp.layout = ahbPipeLayout_;
+	gp.renderPass = renderPass_;
+	VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gp, nullptr, &ahbPipeline_);
+	vkDestroyShaderModule(device_, vert, nullptr);
+	vkDestroyShaderModule(device_, frag, nullptr);
+	if (r != VK_SUCCESS) {
+		LOGE("ahb pipeline failed: %d", (int)r);
+		return false;
+	}
+
+	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+	VkDescriptorPoolCreateInfo dpci = {};
+	dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	dpci.maxSets = 1;
+	dpci.poolSizeCount = 1;
+	dpci.pPoolSizes = &ps;
+	if (vkCreateDescriptorPool(device_, &dpci, nullptr, &ahbDescPool_) != VK_SUCCESS) {
+		LOGE("ahb desc pool failed");
+		return false;
+	}
+	VkDescriptorSetAllocateInfo dsai = {};
+	dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	dsai.descriptorPool = ahbDescPool_;
+	dsai.descriptorSetCount = 1;
+	dsai.pSetLayouts = &ahbSetLayout_;
+	if (vkAllocateDescriptorSets(device_, &dsai, &ahbDescSet_) != VK_SUCCESS) {
+		LOGE("ahb desc set alloc failed");
+		return false;
+	}
+	ahbInited_ = true;
+	LOGI("AHB ycbcr pipeline ready (externalFormat=%llu model=%d range=%d)",
+	     (unsigned long long)fmt.externalFormat, (int)fmt.suggestedYcbcrModel,
+	     (int)fmt.suggestedYcbcrRange);
+	return true;
+}
+
+// Import (or cache-hit) an AHardwareBuffer as a Vulkan image aliasing its memory.
+const SbsRenderer::AhbImport *
+SbsRenderer::importAhb(struct AHardwareBuffer *ahb, uint32_t w, uint32_t h)
+{
+	for (int i = 0; i < ahbCacheCount_; ++i) {
+		if (ahbCache_[i].ahb == ahb) return &ahbCache_[i];
+	}
+	if (pfnGetAhbProps_ == nullptr) return nullptr;
+
+	VkAndroidHardwareBufferFormatPropertiesANDROID fmtProps = {};
+	fmtProps.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+	VkAndroidHardwareBufferPropertiesANDROID props = {};
+	props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+	props.pNext = &fmtProps;
+	if (pfnGetAhbProps_(device_, ahb, &props) != VK_SUCCESS) {
+		LOGE("vkGetAndroidHardwareBufferProperties failed");
+		return nullptr;
+	}
+	if (!ensureAhbPipeline(fmtProps)) return nullptr;
+
+	// VkImage aliasing the AHB. External format → image/view format UNDEFINED,
+	// usage SAMPLED only, and the ycbcr conversion must be set on the view.
+	VkExternalFormatANDROID extFmt = {};
+	extFmt.sType = VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID;
+	extFmt.externalFormat = fmtProps.externalFormat;
+	VkExternalMemoryImageCreateInfo extMem = {};
+	extMem.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+	extMem.pNext = &extFmt;
+	extMem.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+	VkImageCreateInfo ici = {};
+	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	ici.pNext = &extMem;
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = fmtProps.format;  // VK_FORMAT_UNDEFINED for an external format
+	ici.extent = {w, h, 1};
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+	ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+	ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	VkImage image = VK_NULL_HANDLE;
+	if (vkCreateImage(device_, &ici, nullptr, &image) != VK_SUCCESS) {
+		LOGE("ahb vkCreateImage failed");
+		return nullptr;
+	}
+
+	VkImportAndroidHardwareBufferInfoANDROID importInfo = {};
+	importInfo.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+	importInfo.buffer = ahb;
+	VkMemoryDedicatedAllocateInfo dedicated = {};
+	dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+	dedicated.pNext = &importInfo;
+	dedicated.image = image;
+	uint32_t memType = 0;
+	for (uint32_t i = 0; i < 32; ++i) {
+		if (props.memoryTypeBits & (1u << i)) {
+			memType = i;
+			break;
+		}
+	}
+	VkMemoryAllocateInfo mai = {};
+	mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	mai.pNext = &dedicated;
+	mai.allocationSize = props.allocationSize;
+	mai.memoryTypeIndex = memType;
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	if (vkAllocateMemory(device_, &mai, nullptr, &memory) != VK_SUCCESS) {
+		LOGE("ahb vkAllocateMemory failed");
+		vkDestroyImage(device_, image, nullptr);
+		return nullptr;
+	}
+	if (vkBindImageMemory(device_, image, memory, 0) != VK_SUCCESS) {
+		LOGE("ahb vkBindImageMemory failed");
+		vkFreeMemory(device_, memory, nullptr);
+		vkDestroyImage(device_, image, nullptr);
+		return nullptr;
+	}
+
+	VkSamplerYcbcrConversionInfo convInfo = {};
+	convInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
+	convInfo.conversion = ahbYcbcr_;
+	VkImageViewCreateInfo ivci = {};
+	ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	ivci.pNext = &convInfo;
+	ivci.image = image;
+	ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	ivci.format = fmtProps.format;  // UNDEFINED for external; the conversion drives it
+	ivci.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+	                   VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+	ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	VkImageView view = VK_NULL_HANDLE;
+	if (vkCreateImageView(device_, &ivci, nullptr, &view) != VK_SUCCESS) {
+		LOGE("ahb vkCreateImageView failed");
+		vkFreeMemory(device_, memory, nullptr);
+		vkDestroyImage(device_, image, nullptr);
+		return nullptr;
+	}
+
+	AHardwareBuffer_acquire(ahb);  // own a ref; released in destroyAhbImport
+
+	if (ahbCacheCount_ == kAhbCacheCap) {  // evict oldest (shouldn't hit: cache > pool depth)
+		destroyAhbImport(ahbCache_[0]);
+		for (int i = 1; i < ahbCacheCount_; ++i) ahbCache_[i - 1] = ahbCache_[i];
+		ahbCacheCount_--;
+	}
+	AhbImport &slot = ahbCache_[ahbCacheCount_++];
+	slot.ahb = ahb;
+	slot.image = image;
+	slot.memory = memory;
+	slot.view = view;
+	return &slot;
+}
+
+void
+SbsRenderer::destroyAhbImport(AhbImport &imp)
+{
+	if (imp.view) vkDestroyImageView(device_, imp.view, nullptr);
+	if (imp.memory) vkFreeMemory(device_, imp.memory, nullptr);
+	if (imp.image) vkDestroyImage(device_, imp.image, nullptr);
+	if (imp.ahb) AHardwareBuffer_release(imp.ahb);
+	imp = AhbImport{};
+}
+
+bool
+SbsRenderer::setVideoAhb(struct AHardwareBuffer *ahb, uint32_t width, uint32_t height)
+{
+	const AhbImport *imp = importAhb(ahb, width, height);
+	if (imp == nullptr) return false;
+	// Point the (immutable-sampler) descriptor at this frame's view. Safe to
+	// rewrite each frame: drawAtlas waits idle, so the prior submit is done.
+	VkDescriptorImageInfo dii = {};
+	dii.imageView = imp->view;
+	dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	VkWriteDescriptorSet wr = {};
+	wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	wr.dstSet = ahbDescSet_;
+	wr.dstBinding = 0;
+	wr.descriptorCount = 1;
+	wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	wr.pImageInfo = &dii;
+	vkUpdateDescriptorSets(device_, 1, &wr, 0, nullptr);
+	ahbActiveImage_ = imp->image;
+	ahbActiveView_ = imp->view;
+	ahbActiveW_ = width;
+	ahbActiveH_ = height;
+	sourceMode_ = 3;
+	sourceFullRange_ = 1.0f;  // unused in mode 3 (the ycbcr conversion owns range)
+	return true;
+}
+
 void
 SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t renderW,
                        uint32_t renderH, uint32_t cols, uint32_t rows, uint32_t viewCount,
                        float contentAspect, bool mono, const float clearRgb[3])
 {
-	if (planes_[0].view == VK_NULL_HANDLE) return;
+	const bool useAhb = (sourceMode_ == 3 && ahbActiveView_ != VK_NULL_HANDLE);
+	if (!useAhb && planes_[0].view == VK_NULL_HANDLE) return;
+	VkPipeline pipe = useAhb ? ahbPipeline_ : pipeline_;
+	VkPipelineLayout pl = useAhb ? ahbPipeLayout_ : pipeLayout_;
+	VkDescriptorSet ds = useAhb ? ahbDescSet_ : descSet_;
 	const Target &t = targetFor(image, atlasW, atlasH);
 	const uint32_t c = cols ? cols : 1;
 
@@ -984,6 +1325,26 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(cmd_, &cbbi);
+
+	// Zero-copy AHB: acquire the imported image from the FOREIGN queue (the video
+	// decoder/display engine wrote it) to our graphics family before sampling.
+	// oldLayout UNDEFINED is correct for an external image — the pixels live in
+	// the AHardwareBuffer, not Vulkan's layout tracking, so they're preserved.
+	if (useAhb) {
+		VkImageMemoryBarrier bar = {};
+		bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		bar.srcAccessMask = 0;
+		bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+		bar.dstQueueFamilyIndex = queueFamily_;
+		bar.image = ahbActiveImage_;
+		bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+		                     &bar);
+	}
 
 	// One render pass over the WHOLE atlas: clear it black once (the letterbox
 	// bars inside each tile are this cleared black), then render every view's
@@ -1030,9 +1391,8 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		VkRect2D sc = {{(int32_t)tx, (int32_t)ty}, {renderW, renderH}};
 		vkCmdSetViewport(cmd_, 0, 1, &vp);
 		vkCmdSetScissor(cmd_, 0, 1, &sc);
-		vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-		vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout_, 0, 1, &descSet_,
-		                        0, nullptr);
+		vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+		vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &ds, 0, nullptr);
 		SbsPush push = {};
 		push.uvOffset[0] = offBase;
 		push.uvOffset[1] = 0.0f;
@@ -1040,7 +1400,7 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		push.uvScale[1] = 1.0f;
 		push.mode = sourceMode_;
 		push.fullRange = sourceFullRange_;
-		vkCmdPushConstants(cmd_, pipeLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+		vkCmdPushConstants(cmd_, pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 		vkCmdDraw(cmd_, 3, 1, 0, 0);
 
 		// Transport overlay fills this tile (screen-fixed within the eye tile).
@@ -1066,6 +1426,24 @@ SbsRenderer::cleanup()
 {
 	if (device_ == VK_NULL_HANDLE) return;
 	vkDeviceWaitIdle(device_);
+	// Zero-copy AHB resources.
+	for (int i = 0; i < ahbCacheCount_; ++i) destroyAhbImport(ahbCache_[i]);
+	ahbCacheCount_ = 0;
+	ahbActiveImage_ = VK_NULL_HANDLE;
+	ahbActiveView_ = VK_NULL_HANDLE;
+	if (ahbPipeline_) vkDestroyPipeline(device_, ahbPipeline_, nullptr);
+	if (ahbPipeLayout_) vkDestroyPipelineLayout(device_, ahbPipeLayout_, nullptr);
+	if (ahbDescPool_) vkDestroyDescriptorPool(device_, ahbDescPool_, nullptr);
+	if (ahbSetLayout_) vkDestroyDescriptorSetLayout(device_, ahbSetLayout_, nullptr);
+	if (ahbSampler_) vkDestroySampler(device_, ahbSampler_, nullptr);
+	if (ahbYcbcr_) vkDestroySamplerYcbcrConversion(device_, ahbYcbcr_, nullptr);
+	ahbPipeline_ = VK_NULL_HANDLE;
+	ahbPipeLayout_ = VK_NULL_HANDLE;
+	ahbDescPool_ = VK_NULL_HANDLE;
+	ahbSetLayout_ = VK_NULL_HANDLE;
+	ahbSampler_ = VK_NULL_HANDLE;
+	ahbYcbcr_ = VK_NULL_HANDLE;
+	ahbInited_ = false;
 	for (auto &kv : targets_) {
 		if (kv.second.fb) vkDestroyFramebuffer(device_, kv.second.fb, nullptr);
 		if (kv.second.view) vkDestroyImageView(device_, kv.second.view, nullptr);

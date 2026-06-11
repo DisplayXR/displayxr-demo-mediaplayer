@@ -55,6 +55,7 @@ function(mp_compile_shader DIR S)
 endfunction()
 mp_compile_shader("${REPO_ROOT}/shaders" fullscreen.vert)
 mp_compile_shader("${REPO_ROOT}/shaders" sbs.frag)
+mp_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders" sbs_ahb.frag)  # zero-copy AHB ycbcr blit
 mp_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders" overlay.vert)
 mp_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders" overlay.frag)
 

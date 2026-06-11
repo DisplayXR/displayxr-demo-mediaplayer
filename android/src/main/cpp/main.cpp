@@ -21,6 +21,7 @@
 
 #define XR_USE_PLATFORM_ANDROID
 #define XR_USE_GRAPHICS_API_VULKAN
+#define VK_USE_PLATFORM_ANDROID_KHR  // vulkan_android.h: AHardwareBuffer import (zero-copy video)
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
@@ -531,12 +532,31 @@ create_vulkan_device()
 	qci.queueCount = 1;
 	qci.pQueuePriorities = &priority;
 
-	// The SBS blit needs no optional device features (unlike the model
-	// viewer's int64 compute sort) — plain graphics + transfer is enough.
+	// Zero-copy video: import the decoder's AHardwareBuffer output straight
+	// into Vulkan (no CPU plane upload). Needs VK_ANDROID_external_memory_*
+	// (+ VK_EXT_queue_family_foreign for the FOREIGN->graphics ownership
+	// transfer) and the samplerYcbcrConversion feature (the imported image is a
+	// YUV external format sampled via an immutable ycbcr sampler). The other
+	// deps — sampler_ycbcr_conversion, bind_memory2, get_memory_requirements2,
+	// external_memory — are core at Vulkan 1.1 (our instance apiVersion), so we
+	// don't request them as extensions. The runtime's xrCreateVulkanDeviceKHR
+	// MERGES these into its own required set and preserves our pNext chain
+	// (oxr_vulkan.c create_vk_device).
+	static const char *const kDeviceExts[] = {
+	    VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
+	    VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+	};
+	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_feat = {};
+	ycbcr_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+	ycbcr_feat.samplerYcbcrConversion = VK_TRUE;
+
 	VkDeviceCreateInfo dci = {};
 	dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+	dci.pNext = &ycbcr_feat;
 	dci.queueCreateInfoCount = 1;
 	dci.pQueueCreateInfos = &qci;
+	dci.enabledExtensionCount = (uint32_t)(sizeof(kDeviceExts) / sizeof(kDeviceExts[0]));
+	dci.ppEnabledExtensionNames = kDeviceExts;
 
 	PFN_xrCreateVulkanDeviceKHR xr_create_vk_device = nullptr;
 	XrResult res = xrGetInstanceProcAddr(
@@ -1098,17 +1118,20 @@ render_frame()
 	// the GPU does the BT.709 convert + per-eye downscale in sbs.frag. First
 	// frame flips g_scene_loaded so the render block below engages.
 	if (g_is_video) {
-		if (const VideoDecoder::Frame *vf = g_video.acquireLatest()) {
-			g_sbs.uploadYUV(vf->y.data(), vf->uv.data(),
-			                vf->nv12 ? nullptr : vf->v.data(), (uint32_t)vf->width,
-			                (uint32_t)vf->height, vf->nv12, vf->fullRange);
-			// Half-SBS: each eye is stretched 2× → per-eye display aspect is the
-			// full-frame aspect.
-			if (vf->height > 0) {
-				g_content_aspect.store((float)vf->width / (float)vf->height,
-				                       std::memory_order_relaxed);
+		// Zero-copy: import the decoder's latest AHardwareBuffer and sample it via
+		// the ycbcr conversion (no CPU plane upload). nullptr = no new frame, keep
+		// showing the previous one (the renderer holds the last import).
+		int vw = 0, vh = 0;
+		if (AHardwareBuffer *ahb = g_video.acquireLatestBuffer(&vw, &vh)) {
+			if (g_sbs.setVideoAhb(ahb, (uint32_t)vw, (uint32_t)vh)) {
+				// Half-SBS: each eye is stretched 2× → per-eye display aspect is
+				// the full-frame aspect.
+				if (vh > 0) {
+					g_content_aspect.store((float)vw / (float)vh,
+					                       std::memory_order_relaxed);
+				}
+				g_scene_loaded.store(true, std::memory_order_relaxed);
 			}
-			g_scene_loaded.store(true, std::memory_order_relaxed);
 		}
 		// Transport overlay (scrub bar + play/pause + load + time).
 		const double pos = g_video.positionSeconds();
@@ -1346,10 +1369,24 @@ bring_up(struct android_app *app)
 		LOGI("Bring-up failed; see logs.");
 		return false;
 	}
-	// Start on the idle splash; content comes from the SAF picker (tap → Load).
-	// The old TEMP default.mp4 auto-load is gone — the picker round-trip is
-	// unblocked since runtime#528 + plugin v1.6.5.
-	load_splash(app);
+	// Debug/perf hook: `setprop debug.dxr.mp.file /path/to/clip_2x1.mp4` auto-opens
+	// that clip at bring-up (app-readable path, e.g. the externalDataPath), so perf
+	// iteration doesn't need the SAF picker round-trip each cycle. Empty (default)
+	// → the normal idle splash. NOT a behaviour change for end users.
+	char dbgFile[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.mp.file", dbgFile) > 0 && dbgFile[0] != '\0' &&
+	    g_video.openPath(dbgFile)) {
+		g_is_video = true;
+		g_image_mono = false;
+		g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
+		g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
+		LOGI("DEBUG auto-load: %s", dbgFile);
+	} else {
+		// Start on the idle splash; content comes from the SAF picker (tap → Load).
+		// The old TEMP default.mp4 auto-load is gone — the picker round-trip is
+		// unblocked since runtime#528 + plugin v1.6.5.
+		load_splash(app);
+	}
 	LOGI("Bring-up complete.");
 	return true;
 }

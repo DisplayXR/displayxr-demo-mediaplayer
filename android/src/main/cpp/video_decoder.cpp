@@ -3,7 +3,9 @@
 
 #include "video_decoder.h"
 
+#include <android/hardware_buffer.h>
 #include <android/log.h>
+#include <media/NDKImageReader.h>
 #include <media/NDKMediaCodec.h>
 #include <media/NDKMediaExtractor.h>
 #include <media/NDKMediaFormat.h>
@@ -21,10 +23,9 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 namespace {
-// OMX color formats (stable values; we read them from the output format).
-constexpr int32_t kColorI420 = 19;       // COLOR_FormatYUV420Planar
-constexpr int32_t kColorNV12 = 21;       // COLOR_FormatYUV420SemiPlanar
-constexpr int32_t kColorFlexible = 0x7F420888;
+// AImageReader buffer pool depth: enough for the codec to decode ahead, plus
+// the one the render thread holds + the one Vulkan still references on import.
+constexpr int32_t kReaderMaxImages = 6;
 
 int32_t
 fmtInt(AMediaFormat *f, const char *key, int32_t fallback)
@@ -95,17 +96,34 @@ VideoDecoder::start()
 	if (AMediaFormat_getInt64(trackFmt, AMEDIAFORMAT_KEY_DURATION, &dur)) durationUs_ = dur;
 	AMediaExtractor_selectTrack(ex_, videoTrack);
 
+	// ── Zero-copy output: a GPU-sampleable AImageReader Surface. The codec
+	// writes its native (vendor-tiled YUV) frames straight into AHardwareBuffers
+	// we later import into Vulkan — no CPU plane copy, no swscale. PRIVATE format
+	// = vendor-opaque, accessible only via AImage_getHardwareBuffer (exactly what
+	// the Vulkan AHB import wants). ──
+	media_status_t rs = AImageReader_newWithUsage(width_, height_, AIMAGE_FORMAT_PRIVATE,
+	                                              AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+	                                              kReaderMaxImages, &reader_);
+	if (rs != AMEDIA_OK || reader_ == nullptr) {
+		LOGE("AImageReader_newWithUsage failed (%d)", (int)rs);
+		AMediaFormat_delete(trackFmt);
+		return false;
+	}
+	if (AImageReader_getWindow(reader_, &window_) != AMEDIA_OK || window_ == nullptr) {
+		LOGE("AImageReader_getWindow failed");
+		AMediaFormat_delete(trackFmt);
+		return false;
+	}
+
 	codec_ = AMediaCodec_createDecoderByType(mime);
 	if (codec_ == nullptr) {
 		LOGE("createDecoderByType(%s) failed", mime);
 		AMediaFormat_delete(trackFmt);
 		return false;
 	}
-	// Ask for a flexible (linear, CPU-readable) YUV output rather than a tiled
-	// vendor surface format, so we can copy planes out of the ByteBuffer.
-	AMediaFormat_setInt32(trackFmt, AMEDIAFORMAT_KEY_COLOR_FORMAT, kColorFlexible);
-	if (AMediaCodec_configure(codec_, trackFmt, nullptr, nullptr, 0) != AMEDIA_OK) {
-		LOGE("AMediaCodec_configure failed");
+	// Configure WITH the reader's surface → decoded frames go to AHardwareBuffers.
+	if (AMediaCodec_configure(codec_, trackFmt, window_, nullptr, 0) != AMEDIA_OK) {
+		LOGE("AMediaCodec_configure (surface) failed");
 		AMediaFormat_delete(trackFmt);
 		return false;
 	}
@@ -114,64 +132,11 @@ VideoDecoder::start()
 		LOGE("AMediaCodec_start failed");
 		return false;
 	}
-	LOGI("VideoDecoder open: %s %dx%d", mime, width_, height_);
+	LOGI("VideoDecoder open (zero-copy surface): %s %dx%d", mime, width_, height_);
 	open_.store(true, std::memory_order_relaxed);
 	stop_.store(false, std::memory_order_relaxed);
 	thread_ = std::thread([this] { decodeLoop(); });
 	return true;
-}
-
-void
-VideoDecoder::extractFrame(uint8_t *src, int /*srcSize*/)
-{
-	const int32_t color = fmtInt(outFmt_, AMEDIAFORMAT_KEY_COLOR_FORMAT, kColorNV12);
-	int32_t stride = fmtInt(outFmt_, AMEDIAFORMAT_KEY_STRIDE, width_);
-	int32_t sliceH = fmtInt(outFmt_, AMEDIAFORMAT_KEY_SLICE_HEIGHT, height_);
-	if (stride < width_) stride = width_;
-	if (sliceH < height_) sliceH = height_;
-	const int32_t range = fmtInt(outFmt_, AMEDIAFORMAT_KEY_COLOR_RANGE, 0);
-	const bool fullRange = (range == 1);  // COLOR_RANGE_FULL=1, LIMITED=2
-	const bool planar = (color == kColorI420);
-
-	const int w = width_, h = height_;
-	const int cw = (w + 1) / 2, ch = (h + 1) / 2;
-
-	Frame &fr = buffers_[producer_];
-	fr.width = w;
-	fr.height = h;
-	fr.nv12 = !planar;
-	fr.fullRange = fullRange;
-
-	// Y plane: copy display width out of each strided row.
-	fr.y.resize((size_t)w * h);
-	for (int r = 0; r < h; ++r) {
-		std::memcpy(fr.y.data() + (size_t)r * w, src + (size_t)r * stride, w);
-	}
-	const uint8_t *chromaSrc = src + (size_t)stride * sliceH;
-
-	if (planar) {  // I420: separate U then V planes, chroma stride = stride/2
-		const int cstride = stride / 2;
-		const uint8_t *uSrc = chromaSrc;
-		const uint8_t *vSrc = chromaSrc + (size_t)cstride * (sliceH / 2);
-		fr.uv.resize((size_t)cw * ch);
-		fr.v.resize((size_t)cw * ch);
-		for (int r = 0; r < ch; ++r) {
-			std::memcpy(fr.uv.data() + (size_t)r * cw, uSrc + (size_t)r * cstride, cw);
-			std::memcpy(fr.v.data() + (size_t)r * cw, vSrc + (size_t)r * cstride, cw);
-		}
-	} else {  // NV12: interleaved UV, row bytes = cw*2, source row stride = stride
-		const int rowBytes = cw * 2;
-		fr.uv.resize((size_t)rowBytes * ch);
-		for (int r = 0; r < ch; ++r) {
-			std::memcpy(fr.uv.data() + (size_t)r * rowBytes, chromaSrc + (size_t)r * stride,
-			            rowBytes);
-		}
-	}
-
-	std::lock_guard<std::mutex> lk(mutex_);
-	fr.serial = ++serial_;
-	std::swap(producer_, middle_);
-	hasNew_ = true;
 }
 
 void
@@ -244,48 +209,47 @@ VideoDecoder::decodeLoop()
 		AMediaCodecBufferInfo info;
 		ssize_t outIdx = AMediaCodec_dequeueOutputBuffer(codec_, &info, 2000);
 		if (outIdx >= 0) {
-			if (info.size > 0 && outFmt_ != nullptr) {
-				size_t outSize = 0;
-				uint8_t *obuf = AMediaCodec_getOutputBuffer(codec_, outIdx, &outSize);
-				if (obuf != nullptr) {
-					// Pace the frame: to the audio clock if one is set (A/V master),
-					// else to the frame PTS on our own wall clock.
-					if (!decodeOneWhilePaused) {
-						if (masterClock_ != nullptr) {
-							const double audioSec = masterClock_(masterCtx_);
-							if (audioSec >= 0.0) {
-								const double frameSec = info.presentationTimeUs / 1e6;
-								for (int guard = 0; guard < 200 &&
-								                    !stop_.load(std::memory_order_relaxed) &&
-								                    !paused_.load(std::memory_order_relaxed) &&
-								                    masterClock_(masterCtx_) + 0.005 < frameSec;
-								     ++guard) {
-									std::this_thread::sleep_for(std::chrono::milliseconds(2));
-								}
-							}
-						} else {
-							if (firstPtsUs < 0) {
-								firstPtsUs = info.presentationTimeUs;
-								wallStart = clock::now();
-							}
-							const int64_t targetUs = info.presentationTimeUs - firstPtsUs;
-							const int64_t elapsedUs =
-							    std::chrono::duration_cast<std::chrono::microseconds>(
-							        clock::now() - wallStart)
-							        .count();
-							if (targetUs > elapsedUs + 1000) {
-								std::this_thread::sleep_for(
-								    std::chrono::microseconds(targetUs - elapsedUs));
-							}
+			// Pace the frame BEFORE rendering it to the surface: to the audio clock
+			// if one is set (A/V master), else to the frame PTS on our wall clock.
+			if (!decodeOneWhilePaused) {
+				if (masterClock_ != nullptr) {
+					const double audioSec = masterClock_(masterCtx_);
+					if (audioSec >= 0.0) {
+						const double frameSec = info.presentationTimeUs / 1e6;
+						for (int guard = 0; guard < 200 &&
+						                    !stop_.load(std::memory_order_relaxed) &&
+						                    !paused_.load(std::memory_order_relaxed) &&
+						                    masterClock_(masterCtx_) + 0.005 < frameSec;
+						     ++guard) {
+							std::this_thread::sleep_for(std::chrono::milliseconds(2));
 						}
 					}
-					extractFrame(obuf, (int)info.size);
-					positionUs_.store(info.presentationTimeUs, std::memory_order_relaxed);
-					decodeOneWhilePaused = false;  // shown the post-seek frame; hold again
+				} else {
+					if (firstPtsUs < 0) {
+						firstPtsUs = info.presentationTimeUs;
+						wallStart = clock::now();
+					}
+					const int64_t targetUs = info.presentationTimeUs - firstPtsUs;
+					const int64_t elapsedUs =
+					    std::chrono::duration_cast<std::chrono::microseconds>(clock::now() -
+					                                                          wallStart)
+					        .count();
+					if (targetUs > elapsedUs + 1000) {
+						std::this_thread::sleep_for(
+						    std::chrono::microseconds(targetUs - elapsedUs));
+					}
 				}
 			}
 			const bool eos = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
-			AMediaCodec_releaseOutputBuffer(codec_, outIdx, false);
+			// render=true → present the frame into the reader's Surface (the
+			// AHardwareBuffer the render thread will sample). info.size is 0 in
+			// surface mode; an EOS buffer carries no image, so don't render it.
+			const bool render = info.size > 0 && !eos;
+			AMediaCodec_releaseOutputBuffer(codec_, outIdx, render);
+			if (render) {
+				positionUs_.store(info.presentationTimeUs, std::memory_order_relaxed);
+				decodeOneWhilePaused = false;  // shown the post-seek frame; hold again
+			}
 			if (eos) {  // loop: seek back + flush, restart the clock
 				AMediaExtractor_seekTo(ex_, 0, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
 				AMediaCodec_flush(codec_);
@@ -300,14 +264,31 @@ VideoDecoder::decodeLoop()
 	}
 }
 
-const VideoDecoder::Frame *
-VideoDecoder::acquireLatest()
+AHardwareBuffer *
+VideoDecoder::acquireLatestBuffer(int *width, int *height)
 {
-	std::lock_guard<std::mutex> lk(mutex_);
-	if (!hasNew_) return nullptr;
-	std::swap(consumer_, middle_);
-	hasNew_ = false;
-	return &buffers_[consumer_];
+	if (reader_ == nullptr) return nullptr;
+	AImage *img = nullptr;
+	media_status_t r = AImageReader_acquireLatestImage(reader_, &img);
+	if (r != AMEDIA_OK || img == nullptr) {
+		return nullptr;  // nothing new — caller keeps displaying the previous buffer
+	}
+	// The previously-held image's AHardwareBuffer is kept alive by the renderer's
+	// own AHardwareBuffer_acquire() on import, so releasing it back to the pool
+	// here is safe (the GPU finished sampling it — drawAtlas waits idle).
+	if (heldImage_ != nullptr) {
+		AImage_delete(heldImage_);
+	}
+	heldImage_ = img;
+
+	AHardwareBuffer *ahb = nullptr;
+	if (AImage_getHardwareBuffer(img, &ahb) != AMEDIA_OK || ahb == nullptr) {
+		LOGE("AImage_getHardwareBuffer failed");
+		return nullptr;
+	}
+	if (width) *width = width_;
+	if (height) *height = height_;
+	return ahb;
 }
 
 void
@@ -315,10 +296,19 @@ VideoDecoder::stop()
 {
 	stop_.store(true, std::memory_order_relaxed);
 	if (thread_.joinable()) thread_.join();
+	if (heldImage_) {
+		AImage_delete(heldImage_);
+		heldImage_ = nullptr;
+	}
 	if (codec_) {
 		AMediaCodec_stop(codec_);
 		AMediaCodec_delete(codec_);
 		codec_ = nullptr;
+	}
+	if (reader_) {  // also frees window_ (owned by the reader)
+		AImageReader_delete(reader_);
+		reader_ = nullptr;
+		window_ = nullptr;
 	}
 	if (ex_) {
 		AMediaExtractor_delete(ex_);

@@ -17,6 +17,7 @@
 // is a memcpy + one transfer submit — no per-frame Vulkan object churn.
 #pragma once
 
+#define VK_USE_PLATFORM_ANDROID_KHR  // vulkan_android.h: AHardwareBuffer import structs + PFNs
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
@@ -35,7 +36,17 @@ struct SbsRenderer {
 	bool uploadYUV(const uint8_t *y, const uint8_t *uv_or_u, const uint8_t *v,
 	               uint32_t width, uint32_t height, bool nv12, bool fullRange);
 
-	bool hasSource() const { return planes_[0].view != VK_NULL_HANDLE; }
+	// Zero-copy video (Android): import the decoder's AHardwareBuffer and select
+	// it as the active source (sourceMode_ = 3). The first call lazily builds the
+	// ycbcr conversion + immutable sampler + pipeline from the stream's external
+	// format. Imports are cached by AHardwareBuffer pointer (the AImageReader
+	// cycles a bounded pool), so steady-state cost is one descriptor rewrite per
+	// frame. Returns false on import failure (caller can fall back).
+	bool setVideoAhb(struct AHardwareBuffer *ahb, uint32_t width, uint32_t height);
+
+	bool hasSource() const {
+		return planes_[0].view != VK_NULL_HANDLE || ahbActiveView_ != VK_NULL_HANDLE;
+	}
 
 	// Transport overlay (scrub bar + play/pause + load button + time), drawn
 	// into each eye at zero disparity (screen plane). progress in [0,1]. left/
@@ -106,8 +117,41 @@ private:
 	VkFence fence_ = VK_NULL_HANDLE;
 
 	Plane planes_[3];
-	int sourceMode_ = 0;          // 0 RGBA, 1 I420, 2 NV12 (pushed to the shader)
+	int sourceMode_ = 0;          // 0 RGBA, 1 I420, 2 NV12, 3 AHB-ycbcr (pushed to the shader)
 	float sourceFullRange_ = 1.0f;
+
+	// ── Zero-copy AHB video path (Android) ──────────────────────────────────
+	// One ycbcr conversion + immutable sampler + pipeline per stream (built lazily
+	// from the first frame's external format). Per-AHB imports (image+memory+view)
+	// are cached so the AImageReader's pooled buffers each import once.
+	struct AhbImport {
+		struct AHardwareBuffer *ahb = nullptr;  // we hold an AHardwareBuffer_acquire ref
+		VkImage image = VK_NULL_HANDLE;
+		VkDeviceMemory memory = VK_NULL_HANDLE;
+		VkImageView view = VK_NULL_HANDLE;
+	};
+	bool ensureAhbPipeline(const VkAndroidHardwareBufferFormatPropertiesANDROID &fmt);
+	const AhbImport *importAhb(struct AHardwareBuffer *ahb, uint32_t w, uint32_t h);
+	void destroyAhbImport(AhbImport &imp);
+
+	VkSamplerYcbcrConversion ahbYcbcr_ = VK_NULL_HANDLE;
+	VkSampler ahbSampler_ = VK_NULL_HANDLE;  // immutable, carries ahbYcbcr_
+	VkDescriptorSetLayout ahbSetLayout_ = VK_NULL_HANDLE;
+	VkPipelineLayout ahbPipeLayout_ = VK_NULL_HANDLE;
+	VkPipeline ahbPipeline_ = VK_NULL_HANDLE;
+	VkDescriptorPool ahbDescPool_ = VK_NULL_HANDLE;
+	VkDescriptorSet ahbDescSet_ = VK_NULL_HANDLE;
+	uint64_t ahbExternalFormat_ = 0;  // VkExternalFormatANDROID.externalFormat for this stream
+	bool ahbInited_ = false;
+	PFN_vkGetAndroidHardwareBufferPropertiesANDROID pfnGetAhbProps_ = nullptr;
+
+	static constexpr int kAhbCacheCap = 8;
+	AhbImport ahbCache_[kAhbCacheCap];
+	int ahbCacheCount_ = 0;
+	// Active (current-frame) import, bound by drawAtlas when sourceMode_ == 3.
+	VkImage ahbActiveImage_ = VK_NULL_HANDLE;
+	VkImageView ahbActiveView_ = VK_NULL_HANDLE;
+	uint32_t ahbActiveW_ = 0, ahbActiveH_ = 0;
 	VkImage dummyImage_ = VK_NULL_HANDLE;
 	VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
 	VkImageView dummyView_ = VK_NULL_HANDLE;
