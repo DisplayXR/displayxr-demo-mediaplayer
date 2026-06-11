@@ -123,15 +123,34 @@ bool g_session_running = false;
 bool g_exit_requested = false;
 XrSpace g_app_space = XR_NULL_HANDLE;
 
-// ── Display rendering-mode switching (XR_EXT_display_info) ─────────────────
-// The runtime advertises a set of display rendering modes (e.g. 3D-stereo,
-// 2D-mono). Enumeration is best-effort and log-only for now; requests are
-// async — the runtime applies them and the next frame adapts.
+// ── Display rendering-mode + tiled-atlas multiview (XR_EXT_display_info) ─────
+// The runtime advertises rendering modes (2D-mono, 3D-stereo) each with a tile
+// layout (cols×rows) and per-view scale, plus the native panel pixels. Per
+// ADR-026 / runtime#518 the app renders the active mode's views into TILES of a
+// SINGLE worst-case atlas swapchain and submits N projection views that all
+// reference it with per-tile imageRects. The atlas spans both orientations (the
+// swapchain is never recreated on rotation); each frame renders a
+// per-orientation sub-rect (current_display × view_scale) so portrait and
+// landscape each render at their true per-eye tile. Mirrors
+// cube_handle_vk_android.
 PFN_xrEnumerateDisplayRenderingModesEXT g_pfnEnumModes = nullptr;
 PFN_xrRequestDisplayRenderingModeEXT g_pfnReqMode = nullptr;
-uint32_t g_rmode_count = 0;
-uint32_t g_rmode_current = 0;
-bool g_rmode_requestable = false;
+
+constexpr uint32_t kMaxViews = 8;
+
+// The active 3D rendering mode's layout (the media player adopts whatever mode
+// the runtime reports active; on Leia SR that's the 2×1 SBS 3D mode at
+// 0.75×0.75). Defaults give a single 2-view SBS atlas if XR_EXT_display_info is
+// absent.
+uint32_t g_tile_columns = 2;
+uint32_t g_tile_rows = 1;
+uint32_t g_view_count = 2;
+float g_view_scale_x = 0.5f;
+float g_view_scale_y = 1.0f;
+uint32_t g_max_view_count = 2;   // xrLocateViews capacity (max across modes)
+uint32_t g_display_px_w = 0;     // native panel pixels (XR_EXT_display_info)
+uint32_t g_display_px_h = 0;
+bool g_has_display_info = false;
 
 // ── XR_EXT_view_rig contingency (runtime#510) ───────────────────────────────
 // On the OOP runtime the plain xrLocateViews path can return no valid view
@@ -146,9 +165,9 @@ bool g_use_rig = false;           // chain XrDisplayRigEXT on xrLocateViews
 int g_invalid_locate_count = 0;
 constexpr int kInvalidLocateThreshold = 10;
 
-constexpr uint32_t kViewCount = 2;
-
-struct PerView
+// Single tiled-atlas swapchain shared by all views (sized worst-case across
+// modes + orientations in create_swapchains).
+struct AtlasSwapchain
 {
 	XrSwapchain swapchain{XR_NULL_HANDLE};
 	uint32_t width{0};
@@ -156,7 +175,7 @@ struct PerView
 	XrSwapchainImageVulkanKHR images[8]{};
 	uint32_t image_count{0};
 };
-PerView g_views[kViewCount];
+AtlasSwapchain g_atlas;
 
 VkFormat g_swapchain_format = VK_FORMAT_UNDEFINED;
 
@@ -183,6 +202,10 @@ bool g_image_mono = false;  // current image is 2D → both eyes sample the full
 // video: full-frame aspect (each eye stretched 2×). Full-SBS image: (w/2)/h.
 // Mono: w/h.
 std::atomic<float> g_content_aspect{1.6f};
+// Atlas letterbox/clear color: black for video + images (standard letterbox),
+// the idle grey for the splash (so its min-to-min letterbox is one seamless
+// grey field). android_main thread only.
+float g_clear_rgb[3] = {0.0f, 0.0f, 0.0f};
 const char *const kIdleArt = "idle.png";  // bundled asset (repo displayxr/)
 // Desktop App.cpp's idle backdrop grey (kIdleBg*).
 constexpr uint8_t kIdleBg[3] = {31, 31, 33};  // 0.12,0.12,0.13 * 255
@@ -244,10 +267,11 @@ create_instance(struct android_app *app)
 {
 	g_runtime_unavailable.store(false, std::memory_order_relaxed);
 	g_view_rig_enabled = false;  // re-evaluated below (rebuilds reuse these globals)
+	g_has_display_info = true;   // XR_EXT_display_info is always enabled (below)
 	const char *extensions[4] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
-	    XR_EXT_DISPLAY_INFO_EXTENSION_NAME,  // display rendering-mode switching
+	    XR_EXT_DISPLAY_INFO_EXTENSION_NAME,  // display info + rendering-mode atlas layout
 	};
 	uint32_t extension_count = 3;
 
@@ -497,80 +521,142 @@ create_session()
 	return res == XR_SUCCESS;
 }
 
-// Resolve the rendering-mode entry points and enumerate what the runtime/DP
-// advertises. Best-effort: logs each mode so we can see (on this device) whether
-// modes differ in view count/tiling (→ render-loop work) or are a pure DP-side
-// 2D/3D toggle (→ app just requests them). Never fails bring-up.
+// Query native panel pixels (XR_EXT_display_info) + the active rendering mode's
+// tile layout / view scale / view count, and the max view count the runtime
+// advertises (xrLocateViews capacity). Feeds the worst-case atlas sizing and
+// the per-orientation tile dims. Never fails bring-up — falls back to a single
+// 2-view SBS atlas. Mirrors cube_handle_vk_android::query_display_info_and_modes.
 bool
-enumerate_rendering_modes()
+query_display_info_and_modes()
 {
+	uint32_t vc = 0;
+	if (xrEnumerateViewConfigurationViews(g_instance, g_system_id,
+	                                      XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &vc,
+	                                      nullptr) == XR_SUCCESS &&
+	    vc > 0) {
+		g_max_view_count = vc > kMaxViews ? kMaxViews : vc;
+	}
+	LOGI("Runtime advertises %u views (max across modes)", g_max_view_count);
+
+	// Native panel pixels — chain XrDisplayInfoEXT onto the system-properties query.
+	if (g_has_display_info) {
+		XrDisplayInfoEXT di = {XR_TYPE_DISPLAY_INFO_EXT};
+		XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
+		sp.next = &di;
+		if (xrGetSystemProperties(g_instance, g_system_id, &sp) == XR_SUCCESS) {
+			g_display_px_w = di.displayPixelWidth;
+			g_display_px_h = di.displayPixelHeight;
+			LOGI("Display: %ux%u px", g_display_px_w, g_display_px_h);
+		}
+	}
+
 	xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesEXT",
 	                      (PFN_xrVoidFunction *)&g_pfnEnumModes);
 	xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeEXT",
 	                      (PFN_xrVoidFunction *)&g_pfnReqMode);
-	if (g_pfnEnumModes == nullptr || g_pfnReqMode == nullptr) {
-		LOGI("Display rendering-mode ext entry points not resolved — mode switch disabled");
+	if (g_pfnEnumModes == nullptr) {
+		LOGI("No rendering-mode ext — defaulting to a single 2-view SBS atlas");
 		return true;
 	}
 	uint32_t count = 0;
-	XrResult res = g_pfnEnumModes(g_session, 0, &count, nullptr);
-	if (res != XR_SUCCESS || count == 0) {
-		LOGI("xrEnumerateDisplayRenderingModesEXT: count=%u res=%d", count, (int)res);
+	if (g_pfnEnumModes(g_session, 0, &count, nullptr) != XR_SUCCESS || count == 0) {
 		return true;
 	}
-	std::vector<XrDisplayRenderingModeInfoEXT> modes(count);
-	for (auto &m : modes) {
-		m.type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
-		m.next = nullptr;
+	if (count > kMaxViews) {
+		count = kMaxViews;
 	}
-	res = g_pfnEnumModes(g_session, count, &count, modes.data());
-	if (res != XR_SUCCESS) {
-		LOGI("xrEnumerateDisplayRenderingModesEXT (fill) res=%d", (int)res);
+	XrDisplayRenderingModeInfoEXT modes[kMaxViews] = {};
+	for (uint32_t i = 0; i < count; ++i) {
+		modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+	}
+	if (g_pfnEnumModes(g_session, count, &count, modes) != XR_SUCCESS) {
 		return true;
 	}
-	g_rmode_count = count;
+	LOGI("Rendering modes (%u):", count);
 	for (uint32_t i = 0; i < count; ++i) {
 		const auto &m = modes[i];
+		LOGI("  [%u] %s views=%u tiles=%ux%u scale=%.2fx%.2f 3D=%d active=%d", m.modeIndex,
+		     m.modeName, m.viewCount, m.tileColumns, m.tileRows, m.viewScaleX, m.viewScaleY,
+		     (int)m.hardwareDisplay3D, (int)m.isActive);
+		// Adopt the active mode's layout (the runtime reports which is active).
 		if (m.isActive) {
-			g_rmode_current = m.modeIndex;
-			g_rmode_requestable = m.isRequestable;
+			g_view_count = m.viewCount ? m.viewCount : 1;
+			g_tile_columns = m.tileColumns ? m.tileColumns : 1;
+			g_tile_rows = m.tileRows ? m.tileRows : 1;
+			g_view_scale_x = m.viewScaleX > 0.0f ? m.viewScaleX : 1.0f;
+			g_view_scale_y = m.viewScaleY > 0.0f ? m.viewScaleY : 1.0f;
 		}
-		LOGI("RMODE[%u] idx=%u \"%s\" views=%u scale=(%.3f,%.3f) hw3D=%d tiles=%ux%u "
-		     "%ux%u active=%d requestable=%d",
-		     i, m.modeIndex, m.modeName, m.viewCount, m.viewScaleX, m.viewScaleY,
-		     (int)m.hardwareDisplay3D, m.tileColumns, m.tileRows, m.viewWidthPixels,
-		     m.viewHeightPixels, (int)m.isActive, (int)m.isRequestable);
 	}
-	LOGI("Display rendering modes: %u total, current=%u, requestable=%d",
-	     g_rmode_count, g_rmode_current, (int)g_rmode_requestable);
+	// All modes feed the worst-case atlas; stash the max tile footprint by
+	// scanning here (create_swapchains recomputes per mode + orientation).
 	return true;
 }
 
+// Per-tile render size + tile grid for the active mode, sized for the CURRENTLY
+// HELD orientation (#518 / ADR-026). Each eye renders at current_display ×
+// view_scale — landscape e.g. 1920×1200, portrait 1200×1920 — a sub-rect of the
+// fixed worst-case atlas. render_w/h drive both the render viewport and the
+// submitted subImage.imageRect, so the weave reads the correct per-orientation
+// tile.
+void
+active_tile_dims(uint32_t *render_w, uint32_t *render_h, uint32_t *cols, uint32_t *rows)
+{
+	const uint32_t c = g_tile_columns ? g_tile_columns : 1;
+	const uint32_t r = g_tile_rows ? g_tile_rows : 1;
+	// Panel long/short edges are fixed; the held orientation decides which is
+	// width vs height. g_display_px is the startup orientation, so derive
+	// orientation-independent long/short first.
+	uint32_t big = g_display_px_w >= g_display_px_h ? g_display_px_w : g_display_px_h;
+	uint32_t small = g_display_px_w >= g_display_px_h ? g_display_px_h : g_display_px_w;
+	const int rot = g_display_rotation.load(std::memory_order_relaxed);
+	const bool portrait = (rot == 1 || rot == 3);
+	uint32_t disp_w = portrait ? small : big;
+	uint32_t disp_h = portrait ? big : small;
+	if (disp_w == 0 || disp_h == 0) {  // no display info — fall back to atlas tiles
+		disp_w = g_atlas.width / c;
+		disp_h = g_atlas.height / r;
+	}
+	uint32_t rw = (uint32_t)((double)disp_w * g_view_scale_x);
+	uint32_t rh = (uint32_t)((double)disp_h * g_view_scale_y);
+	if (rw == 0) rw = disp_w;
+	if (rh == 0) rh = disp_h;
+	const uint32_t max_tw = g_atlas.width / c;
+	const uint32_t max_th = g_atlas.height / r;
+	if (rw > max_tw) rw = max_tw;
+	if (rh > max_th) rh = max_th;
+	*render_w = rw;
+	*render_h = rh;
+	*cols = c;
+	*rows = r;
+}
+
+// Create the SINGLE tiled-atlas swapchain, sized worst-case over all modes AND
+// both orientations (the swapchain is never recreated on rotation, so it must
+// hold either orientation's largest tile layout; each frame renders a
+// per-orientation sub-rect via active_tile_dims). Mirrors
+// cube_handle_vk_android::create_swapchains.
 bool
 create_swapchains()
 {
-	uint32_t expected_view_count = 0;
-	XrResult res = xrEnumerateViewConfigurationViews(
-	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
-	    0, &expected_view_count, nullptr);
-	if (res != XR_SUCCESS || expected_view_count != kViewCount) {
-		LOGE("Expected %u views, runtime reports %u", kViewCount, expected_view_count);
-		return false;
-	}
-	XrViewConfigurationView view_configs[kViewCount] = {};
-	for (uint32_t i = 0; i < kViewCount; ++i) {
-		view_configs[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
-	}
-	res = xrEnumerateViewConfigurationViews(
-	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
-	    kViewCount, &expected_view_count, view_configs);
-	if (res != XR_SUCCESS) {
-		log_xr_result("xrEnumerateViewConfigurationViews", res);
-		return false;
+	// Sample count + no-display-info fallback dims from the per-view config.
+	XrViewConfigurationView view_config = {XR_TYPE_VIEW_CONFIGURATION_VIEW};
+	{
+		uint32_t got = 0;
+		XrViewConfigurationView buf[kMaxViews] = {};
+		for (uint32_t i = 0; i < kMaxViews; ++i) {
+			buf[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+		}
+		const uint32_t cap = g_max_view_count > kMaxViews ? kMaxViews : g_max_view_count;
+		if (xrEnumerateViewConfigurationViews(g_instance, g_system_id,
+		                                      XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, cap, &got,
+		                                      buf) == XR_SUCCESS &&
+		    got > 0) {
+			view_config = buf[0];
+		}
 	}
 
 	uint32_t format_count = 0;
-	res = xrEnumerateSwapchainFormats(g_session, 0, &format_count, nullptr);
+	XrResult res = xrEnumerateSwapchainFormats(g_session, 0, &format_count, nullptr);
 	if (res != XR_SUCCESS || format_count == 0) {
 		log_xr_result("xrEnumerateSwapchainFormats(count)", res);
 		return false;
@@ -600,49 +686,74 @@ create_swapchains()
 	}
 	LOGI("Chose swapchain format: 0x%x", (uint32_t)g_swapchain_format);
 
-	for (uint32_t i = 0; i < kViewCount; ++i) {
-		g_views[i].width = view_configs[i].recommendedImageRectWidth;
-		g_views[i].height = view_configs[i].recommendedImageRectHeight;
-
-		XrSwapchainCreateInfo ci = {};
-		ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
-		ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
-		                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-		ci.format = g_swapchain_format;
-		ci.sampleCount = view_configs[i].recommendedSwapchainSampleCount;
-		ci.width = g_views[i].width;
-		ci.height = g_views[i].height;
-		ci.faceCount = 1;
-		ci.arraySize = 1;
-		ci.mipCount = 1;
-		res = xrCreateSwapchain(g_session, &ci, &g_views[i].swapchain);
-		if (res != XR_SUCCESS) {
-			log_xr_result("xrCreateSwapchain", res);
-			return false;
+	// Atlas = worst case over the active mode × both orientations. (The media
+	// player adopts a single active mode; sizing both orientations is what makes
+	// the fixed swapchain hold portrait's 1200×1920 and landscape's 1920×1200.)
+	uint32_t atlas_w = 0, atlas_h = 0;
+	if (g_display_px_w > 0 && g_display_px_h > 0) {
+		const uint32_t big = g_display_px_w >= g_display_px_h ? g_display_px_w : g_display_px_h;
+		const uint32_t small = g_display_px_w >= g_display_px_h ? g_display_px_h : g_display_px_w;
+		atlas_w = big;
+		atlas_h = big;  // square lower bound: either orientation's long edge can be w or h
+		const uint32_t dims[2][2] = {{big, small}, {small, big}};  // landscape, portrait
+		for (uint32_t o = 0; o < 2; ++o) {
+			const uint32_t aw =
+			    (uint32_t)((double)g_tile_columns * g_view_scale_x * (double)dims[o][0]);
+			const uint32_t ah =
+			    (uint32_t)((double)g_tile_rows * g_view_scale_y * (double)dims[o][1]);
+			if (aw > atlas_w) atlas_w = aw;
+			if (ah > atlas_h) atlas_h = ah;
 		}
-		uint32_t img_count = 0;
-		res = xrEnumerateSwapchainImages(g_views[i].swapchain, 0, &img_count, nullptr);
-		if (res != XR_SUCCESS) {
-			log_xr_result("xrEnumerateSwapchainImages(count)", res);
-			return false;
-		}
-		if (img_count > 8) {
-			img_count = 8;
-		}
-		for (uint32_t j = 0; j < img_count; ++j) {
-			g_views[i].images[j].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
-		}
-		res = xrEnumerateSwapchainImages(
-		    g_views[i].swapchain, img_count, &img_count,
-		    reinterpret_cast<XrSwapchainImageBaseHeader *>(g_views[i].images));
-		if (res != XR_SUCCESS) {
-			log_xr_result("xrEnumerateSwapchainImages(fill)", res);
-			return false;
-		}
-		g_views[i].image_count = img_count;
-		LOGI("View %u swapchain: %ux%u, %u images", i, g_views[i].width,
-		     g_views[i].height, img_count);
+	} else {
+		atlas_w = view_config.recommendedImageRectWidth * g_tile_columns;
+		atlas_h = view_config.recommendedImageRectHeight * g_tile_rows;
 	}
+	if (atlas_w == 0 || atlas_h == 0) {
+		LOGE("Atlas sizing failed (%ux%u)", atlas_w, atlas_h);
+		return false;
+	}
+	g_atlas.width = atlas_w;
+	g_atlas.height = atlas_h;
+
+	XrSwapchainCreateInfo ci = {};
+	ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	ci.format = g_swapchain_format;
+	ci.sampleCount = view_config.recommendedSwapchainSampleCount
+	                     ? view_config.recommendedSwapchainSampleCount
+	                     : 1;
+	ci.width = atlas_w;
+	ci.height = atlas_h;
+	ci.faceCount = 1;
+	ci.arraySize = 1;
+	ci.mipCount = 1;
+	res = xrCreateSwapchain(g_session, &ci, &g_atlas.swapchain);
+	if (res != XR_SUCCESS) {
+		log_xr_result("xrCreateSwapchain", res);
+		return false;
+	}
+	uint32_t img_count = 0;
+	res = xrEnumerateSwapchainImages(g_atlas.swapchain, 0, &img_count, nullptr);
+	if (res != XR_SUCCESS) {
+		log_xr_result("xrEnumerateSwapchainImages(count)", res);
+		return false;
+	}
+	if (img_count > 8) {
+		img_count = 8;
+	}
+	for (uint32_t j = 0; j < img_count; ++j) {
+		g_atlas.images[j].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+	}
+	res = xrEnumerateSwapchainImages(g_atlas.swapchain, img_count, &img_count,
+	                                 reinterpret_cast<XrSwapchainImageBaseHeader *>(g_atlas.images));
+	if (res != XR_SUCCESS) {
+		log_xr_result("xrEnumerateSwapchainImages(fill)", res);
+		return false;
+	}
+	g_atlas.image_count = img_count;
+	LOGI("Atlas swapchain: %ux%u, %u images (active mode views=%u tiles=%ux%u scale=%.2fx%.2f)",
+	     atlas_w, atlas_h, img_count, g_view_count, g_tile_columns, g_tile_rows, g_view_scale_x,
+	     g_view_scale_y);
 	return true;
 }
 
@@ -669,16 +780,16 @@ sbs_init()
 		return false;
 	}
 	g_sbs_ready = true;
-	LOGI("SbsRenderer ready (%ux%u/eye)", g_views[0].width, g_views[0].height);
+	LOGI("SbsRenderer ready (atlas %ux%u)", g_atlas.width, g_atlas.height);
 	return true;
 }
 
 // The DisplayXR idle screen, same as Windows (App::LoadIdleLogo +
-// CompositeIdleArt): the transparent idle.png lockup, scaled to fit (aspect
-// preserved — never stretched), centered on an opaque dark-grey canvas built at
-// the EXACT per-eye swapchain size so the mono full-viewport blit is 1:1. The
-// grey therefore fills the view to every border, and the logo keeps its shape
-// in any orientation.
+// CompositeIdleArt): the transparent idle.png lockup, aspect-preserved, centered
+// on a SQUARE dark-grey canvas. The canvas is mono and shown via the atlas's
+// min-to-min fit; the atlas clear is set to the SAME idle grey (g_clear_rgb), so
+// the letterbox around the square reads as one seamless grey field with the logo
+// centered — grey to every border in any orientation, logo never stretched.
 bool
 load_splash(struct android_app *app)
 {
@@ -701,28 +812,22 @@ load_splash(struct android_app *app)
 		return false;
 	}
 
-	// Canvas == the eye swapchain image (1:1 blit → grey reaches every border).
-	const int cw = (int)g_views[0].width, ch = (int)g_views[0].height;
-	std::vector<uint8_t> canvas((size_t)cw * ch * 4);
+	// Square grey canvas; the lockup fills ~55% of it, aspect preserved. The
+	// atlas clear matches this grey, so the min-to-min letterbox is seamless.
+	const int side = (int)std::lround((float)(w > h ? w : h) / 0.55f);
+	std::vector<uint8_t> canvas((size_t)side * side * 4);
 	for (size_t i = 0; i < canvas.size(); i += 4) {
 		canvas[i] = kIdleBg[0];
 		canvas[i + 1] = kIdleBg[1];
 		canvas[i + 2] = kIdleBg[2];
 		canvas[i + 3] = 255;
 	}
-	// Fit the lockup into ~55% of the view's shorter side, aspect preserved.
-	const float target = 0.55f * (float)(cw < ch ? cw : ch);
-	const float scale = target / (float)(w > h ? w : h);
-	const int dw = (int)std::lround((float)w * scale);
-	const int dh = (int)std::lround((float)h * scale);
-	const int ox = (cw - dw) / 2, oy = (ch - dh) / 2;
-	for (int dy = 0; dy < dh; ++dy) {
-		const int sy = (int)((float)dy / scale);
-		for (int dx = 0; dx < dw; ++dx) {
-			const int sx = (int)((float)dx / scale);
-			const uint8_t *s = &art[((size_t)sy * w + sx) * 4];
+	const int ox = (side - w) / 2, oy = (side - h) / 2;
+	for (int y = 0; y < h; ++y) {
+		for (int x = 0; x < w; ++x) {
+			const uint8_t *s = &art[((size_t)y * w + x) * 4];
 			const float a = s[3] / 255.0f;  // alpha-over the grey backdrop
-			uint8_t *d = &canvas[((size_t)(oy + dy) * cw + (ox + dx)) * 4];
+			uint8_t *d = &canvas[((size_t)(oy + y) * side + (ox + x)) * 4];
 			for (int c = 0; c < 3; ++c) {
 				d[c] = (uint8_t)(s[c] * a + d[c] * (1.0f - a) + 0.5f);
 			}
@@ -730,16 +835,16 @@ load_splash(struct android_app *app)
 	}
 	stbi_image_free(art);
 
-	const bool ok = g_sbs.uploadTexture(canvas.data(), (uint32_t)cw, (uint32_t)ch);
+	const bool ok = g_sbs.uploadTexture(canvas.data(), (uint32_t)side, (uint32_t)side);
 	if (ok) {
-		g_image_mono = true;  // flat at screen depth, both eyes
-		// Canvas == landscape swapchain, so no crop in landscape; the rotation
-		// flip in render_frame crops it to the panel in portrait.
-		g_content_aspect.store(ch > 0 ? (float)cw / (float)ch : 1.6f,
-		                       std::memory_order_relaxed);
+		g_image_mono = true;        // flat at screen depth, both eyes
+		g_content_aspect.store(1.0f, std::memory_order_relaxed);  // square
+		g_clear_rgb[0] = kIdleBg[0] / 255.0f;  // letterbox in idle grey
+		g_clear_rgb[1] = kIdleBg[1] / 255.0f;
+		g_clear_rgb[2] = kIdleBg[2] / 255.0f;
 		g_is_video = false;
 		g_scene_loaded.store(true, std::memory_order_relaxed);
-		LOGI("No media — showing the DisplayXR idle screen (%dx%d)", cw, ch);
+		LOGI("No media — showing the DisplayXR idle screen (%dx%d square)", side, side);
 	}
 	return ok;
 }
@@ -801,6 +906,7 @@ load_image_file(const std::string &path)
 	    r.stereo ? ((float)r.image.width * 0.5f) / (float)r.image.height
 	             : (float)r.image.width / (float)r.image.height,
 	    std::memory_order_relaxed);
+	g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox for media
 	g_is_video = false;
 	g_scene_loaded.store(true, std::memory_order_relaxed);
 	LOGI("Loaded image: %s %dx%d %s%s", path.c_str(), r.image.width, r.image.height,
@@ -951,7 +1057,8 @@ render_frame()
 		g_sbs.setOverlay(false, 0.0f, false, "", "");  // image: no transport
 	}
 
-	XrCompositionLayerProjectionView projection_views[kViewCount] = {};
+	XrCompositionLayerProjectionView projection_views[kMaxViews] = {};
+	uint32_t submit_views = 0;
 	bool rendered = false;
 	if (frame_state.shouldRender && g_scene_loaded.load(std::memory_order_relaxed)) {
 		XrViewState view_state = {};
@@ -978,84 +1085,67 @@ render_frame()
 			locate_info.next = &rig;
 		}
 
-		XrView views[kViewCount] = {};
-		for (uint32_t i = 0; i < kViewCount; ++i) {
+		XrView views[kMaxViews] = {};
+		for (uint32_t i = 0; i < kMaxViews; ++i) {
 			views[i].type = XR_TYPE_VIEW;
 		}
 		uint32_t located = 0;
-		res = xrLocateViews(g_session, &locate_info, &view_state, kViewCount, &located, views);
+		res = xrLocateViews(g_session, &locate_info, &view_state, g_max_view_count, &located, views);
 		constexpr XrViewStateFlags kValidFlags =
 		    XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
-		const bool views_valid = res == XR_SUCCESS && located == kViewCount &&
+		const bool views_valid = res == XR_SUCCESS && located >= g_view_count &&
 		                         (view_state.viewStateFlags & kValidFlags) == kValidFlags;
 		if (views_valid) {
 			DXR_HW_DBG_ONCE("first valid xrLocateViews (rig=%d)", (int)g_use_rig);
 			g_invalid_locate_count = 0;
-			for (uint32_t i = 0; i < kViewCount; ++i) {
-				XrSwapchainImageAcquireInfo acq = {};
-				acq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
-				uint32_t img_idx = 0;
-				res = xrAcquireSwapchainImage(g_views[i].swapchain, &acq, &img_idx);
-				if (res != XR_SUCCESS) {
-					log_xr_result("xrAcquireSwapchainImage", res);
-					break;
-				}
+
+			// Per-orientation tile dims (ADR-026): a sub-rect of the fixed
+			// worst-case atlas. render_w/h drive both the render viewport and the
+			// submitted imageRect so the weave reads the correct tile.
+			uint32_t render_w = 0, render_h = 0, cols = 0, rows = 0;
+			active_tile_dims(&render_w, &render_h, &cols, &rows);
+			submit_views = g_view_count;
+
+			// SINGLE atlas swapchain: one acquire, one tiled render pass (all
+			// views), one release.
+			XrSwapchainImageAcquireInfo acq = {};
+			acq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+			uint32_t img_idx = 0;
+			res = xrAcquireSwapchainImage(g_atlas.swapchain, &acq, &img_idx);
+			if (res == XR_SUCCESS) {
 				XrSwapchainImageWaitInfo wait_img = {};
 				wait_img.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
 				wait_img.timeout = XR_INFINITE_DURATION;
-				res = xrWaitSwapchainImage(g_views[i].swapchain, &wait_img);
-				if (res != XR_SUCCESS) {
-					log_xr_result("xrWaitSwapchainImage", res);
-					break;
-				}
-
-				// Min-to-min fit (desktop MatchMinRect): scale the per-eye view
-				// so the content's shorter side equals the tile's shorter side,
-				// centered; the longer axis crops (scissor) or letterboxes
-				// (cleared black). UV is the full per-eye half (stereo) / whole
-				// image (mono). LANDSCAPE-ONLY for now: the app is locked
-				// landscape (manifest) because correct portrait needs the
-				// tiled-atlas multiview model (worst-case atlas + per-orientation
-				// sub-rect tiles, per ADR-026 / cube_handle_vk_android) which
-				// this app has not adopted yet — the runtime + Leia DP already
-				// support it (CAN_ROTATE).
-				const float sw = (float)g_views[i].width;
-				const float sh = (float)g_views[i].height;
-				const float winMin = sw < sh ? sw : sh;
+				res = xrWaitSwapchainImage(g_atlas.swapchain, &wait_img);
+			}
+			if (res == XR_SUCCESS) {
 				const float aC = g_content_aspect.load(std::memory_order_relaxed);
-				float vpW, vpH;
-				if (aC >= 1.0f) {  // landscape content: height is its shorter side
-					vpH = winMin;
-					vpW = winMin * aC;
-				} else {  // portrait content: width is its shorter side
-					vpW = winMin;
-					vpH = winMin / aC;
-				}
-				const float vpX = (sw - vpW) * 0.5f;
-				const float vpY = (sh - vpH) * 0.5f;
-				const float boxW = g_image_mono ? 1.0f : 0.5f;
-				const float offBase = g_image_mono ? 0.0f : (i == 0 ? 0.0f : 0.5f);
-				g_sbs.drawEye(g_views[i].images[img_idx].image, g_views[i].width,
-				              g_views[i].height, offBase, 0.0f, boxW, 1.0f, vpX, vpY, vpW, vpH);
+				g_sbs.drawAtlas(g_atlas.images[img_idx].image, g_atlas.width, g_atlas.height,
+				                render_w, render_h, cols, rows, submit_views, aC, g_image_mono,
+				                g_clear_rgb);
 
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
-				res = xrReleaseSwapchainImage(g_views[i].swapchain, &rel);
-				if (res != XR_SUCCESS) {
-					log_xr_result("xrReleaseSwapchainImage", res);
-					break;
-				}
-
-				projection_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-				projection_views[i].pose = views[i].pose;
-				projection_views[i].fov = views[i].fov;
-				projection_views[i].subImage.swapchain = g_views[i].swapchain;
-				projection_views[i].subImage.imageRect.offset = {0, 0};
-				projection_views[i].subImage.imageRect.extent = {
-				    (int32_t)g_views[i].width, (int32_t)g_views[i].height};
-				projection_views[i].subImage.imageArrayIndex = 0;
+				res = xrReleaseSwapchainImage(g_atlas.swapchain, &rel);
 			}
-			rendered = (res == XR_SUCCESS);
+			if (res == XR_SUCCESS) {
+				for (uint32_t i = 0; i < submit_views; ++i) {
+					const uint32_t tile_x = cols ? (i % cols) : 0;
+					const uint32_t tile_y = cols ? (i / cols) : 0;
+					projection_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+					projection_views[i].pose = views[i].pose;
+					projection_views[i].fov = views[i].fov;
+					projection_views[i].subImage.swapchain = g_atlas.swapchain;
+					projection_views[i].subImage.imageRect.offset = {(int32_t)(tile_x * render_w),
+					                                                  (int32_t)(tile_y * render_h)};
+					projection_views[i].subImage.imageRect.extent = {(int32_t)render_w,
+					                                                  (int32_t)render_h};
+					projection_views[i].subImage.imageArrayIndex = 0;
+				}
+				rendered = true;
+			} else {
+				log_xr_result("atlas acquire/wait/release", res);
+			}
 		} else {
 			// Plain locate returning no valid poses is the known OOP gap
 			// (runtime#510): auto-enable the minimal rig once, then keep quiet.
@@ -1078,7 +1168,7 @@ render_frame()
 	XrCompositionLayerProjection projection_layer = {};
 	projection_layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
 	projection_layer.space = g_app_space;
-	projection_layer.viewCount = kViewCount;
+	projection_layer.viewCount = submit_views;
 	projection_layer.views = projection_views;
 	const XrCompositionLayerBaseHeader *layers[1] = {
 	    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection_layer)};
@@ -1122,11 +1212,9 @@ destroy_all()
 		xrDestroySession(g_session);
 		g_session = XR_NULL_HANDLE;
 	}
-	for (uint32_t i = 0; i < kViewCount; ++i) {
-		if (g_views[i].swapchain != XR_NULL_HANDLE) {
-			xrDestroySwapchain(g_views[i].swapchain);
-			g_views[i].swapchain = XR_NULL_HANDLE;
-		}
+	if (g_atlas.swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(g_atlas.swapchain);
+		g_atlas.swapchain = XR_NULL_HANDLE;
 	}
 	if (g_app_space != XR_NULL_HANDLE) {
 		xrDestroySpace(g_app_space);
@@ -1152,6 +1240,9 @@ destroy_all()
 	g_exit_requested = false;
 	g_scene_loaded.store(false, std::memory_order_relaxed);
 	g_swapchain_format = VK_FORMAT_UNDEFINED;
+	g_atlas.width = 0;
+	g_atlas.height = 0;
+	g_atlas.image_count = 0;
 	g_use_rig = false;
 	g_invalid_locate_count = 0;
 }
@@ -1168,9 +1259,9 @@ bring_up(struct android_app *app)
 	    pick_physical_device() &&
 	    create_vulkan_device() &&
 	    create_session() &&
+	    query_display_info_and_modes() &&  // BEFORE create_swapchains (atlas sizing needs it)
 	    create_swapchains() &&
 	    create_reference_space() &&
-	    enumerate_rendering_modes() &&
 	    sbs_init();
 	if (!ok) {
 		LOGI("Bring-up failed; see logs.");
@@ -1184,6 +1275,8 @@ bring_up(struct android_app *app)
 	    "/default.mp4";
 	if (access(videoPath.c_str(), R_OK) == 0 && g_video.openPath(videoPath)) {
 		g_is_video = true;
+		g_image_mono = false;
+		g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
 		g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
 		LOGI("TEMP auto-load: playing %s (audio=none, Stage 3)", videoPath.c_str());
 	} else {
@@ -1383,6 +1476,8 @@ android_main(struct android_app *app)
 					close(pick);  // image path stages a copy; the fd is done
 				} else if (g_video.openFd(pick, off, len)) {
 					g_is_video = true;
+					g_image_mono = false;
+					g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
 					g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
 					LOGI("Opened picked video (fd=%d)", pick);
 				} else {
