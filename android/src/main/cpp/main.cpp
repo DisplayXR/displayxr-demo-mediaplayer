@@ -1292,6 +1292,19 @@ render_frame()
 		last = now;
 		LOGI("frame %llu  ~%.1f ms/frame (%.1f fps)", (unsigned long long)g_frame_count,
 		     ms, ms > 0.0 ? 1000.0 / ms : 0.0);
+		// Runtime's own frame-pacing view: predictedDisplayPeriod = the period it
+		// THINKS it runs at; dDisplayTime = actual spacing of predicted display
+		// times across this 120-frame window (catches a compositor that can't hit
+		// its own period). Tells us configured-cap vs work-bound.
+		static XrTime s_last_disp = 0;
+		const double period_ms = frame_state.predictedDisplayPeriod / 1.0e6;
+		const double ddisp_ms = s_last_disp ? (double)(frame_state.predictedDisplayTime - s_last_disp) /
+		                                          1.0e6 / 120.0
+		                                    : 0.0;
+		s_last_disp = frame_state.predictedDisplayTime;
+		LOGI("PACE predictedPeriod=%.2f ms (%.1f Hz)  avg dDisplayTime=%.2f ms  shouldRender=%d",
+		     period_ms, period_ms > 0 ? 1000.0 / period_ms : 0.0, ddisp_ms,
+		     (int)frame_state.shouldRender);
 #if MP_PROFILE
 		prof_log(g_frame_count, ms);
 #endif
