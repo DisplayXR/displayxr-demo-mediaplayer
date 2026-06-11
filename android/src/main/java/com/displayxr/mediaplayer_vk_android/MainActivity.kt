@@ -53,8 +53,13 @@ class MainActivity : NativeActivity() {
         )
     }
 
-    // Implemented in main.cpp. rotation = Surface.ROTATION_0/90/180/270 → 0/1/2/3.
-    private external fun nativeSetRotation(rotation: Int)
+    // Implemented in main.cpp. rotation = Surface.ROTATION_0/90/180/270 → 0/1/2/3;
+    // portrait = the ACTUAL held orientation (window taller than wide). The
+    // rotation→orientation mapping is device-dependent (this panel's natural
+    // orientation is portrait, so ROTATION_90 is landscape), so native must NOT
+    // infer orientation from the rotation parity — it uses this flag directly to
+    // pick the per-eye tile dims.
+    private external fun nativeSetRotation(rotation: Int, portrait: Boolean)
 
     // True once xrCreateInstance failed with RUNTIME_UNAVAILABLE.
     private external fun nativeRuntimeUnavailable(): Boolean
@@ -191,8 +196,14 @@ class MainActivity : NativeActivity() {
     private fun pushRotation() {
         @Suppress("DEPRECATION")
         val rotation = windowManager.defaultDisplay.rotation // Surface.ROTATION_*
+        // True held orientation from the window itself (taller than wide), NOT
+        // inferred from the rotation parity — this panel's natural orientation
+        // is portrait, so ROTATION_90 is landscape; the parity is device-
+        // dependent but the window dims are not.
+        val dm = resources.displayMetrics
+        val portrait = dm.heightPixels > dm.widthPixels
         try {
-            nativeSetRotation(rotation)
+            nativeSetRotation(rotation, portrait)
         } catch (_: Throwable) {
             // Native lib not bound yet — a later display/config change retries.
         }
