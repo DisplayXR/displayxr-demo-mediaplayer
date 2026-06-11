@@ -1621,14 +1621,14 @@ android_main(struct android_app *app)
 					}
 					close(pick);  // image path stages a copy; the fd is done
 				} else {
-					// Audio needs an INDEPENDENT file description from the video
-					// extractor (its own offset). dup() shares the offset — the two
-					// extractors' seeks/reads would corrupt each other (→ black
-					// video). REOPEN via /proc/self/fd to get a fresh description.
-					// Do it before openFd since the video decoder takes `pick`.
-					char fdpath[64];
-					std::snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", pick);
-					int audio_fd = open(fdpath, O_RDONLY);
+					// Audio gets its own fd via dup() so it can own/close it
+					// independently of the video extractor. AMediaExtractor dups the
+					// fd internally and reads with absolute offsets (pread), so the
+					// shared file offset does NOT cause cross-corruption. (An earlier
+					// /proc/self/fd reopen failed for SAF content fds → audio_fd=-1 →
+					// no audio on picked clips.) dup before openFd since the video
+					// decoder takes ownership of `pick`.
+					int audio_fd = dup(pick);
 					g_video.setMasterClock(AudioPlayer::clockThunk, &g_audio);
 					if (g_video.openFd(pick, off, len)) {
 						if (audio_fd >= 0) g_audio.openFd(audio_fd, off, len);
