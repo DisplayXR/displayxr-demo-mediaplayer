@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <jni.h>
 #include <string>
 #include <sys/system_properties.h>
@@ -1620,14 +1621,17 @@ android_main(struct android_app *app)
 					}
 					close(pick);  // image path stages a copy; the fd is done
 				} else {
-					// Audio gets its OWN dup'd fd (independent file offset from the
-					// video extractor); set the master clock before video open. dup
-					// before openFd since the video decoder takes ownership of `pick`.
-					int audio_fd = dup(pick);
+					// Audio needs an INDEPENDENT file description from the video
+					// extractor (its own offset). dup() shares the offset — the two
+					// extractors' seeks/reads would corrupt each other (→ black
+					// video). REOPEN via /proc/self/fd to get a fresh description.
+					// Do it before openFd since the video decoder takes `pick`.
+					char fdpath[64];
+					std::snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", pick);
+					int audio_fd = open(fdpath, O_RDONLY);
 					g_video.setMasterClock(AudioPlayer::clockThunk, &g_audio);
 					if (g_video.openFd(pick, off, len)) {
 						if (audio_fd >= 0) g_audio.openFd(audio_fd, off, len);
-						else audio_fd = -1;
 						g_is_video = true;
 						g_image_mono = false;
 						g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
