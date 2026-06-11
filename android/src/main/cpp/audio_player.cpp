@@ -237,17 +237,16 @@ AudioPlayer::decodeLoop()
 						if (w < 0) break;
 						written += w;
 					}
-					// DIAG (~1s): is the HARDWARE draining the stream? framesRead
-					// advancing ⇒ audio IS playing (any silence is device output/
-					// routing/volume); framesRead stuck ⇒ stream not draining.
+					// One-shot startup confirmation that PCM is reaching AAudio and
+					// the HW is draining it (framesRead advances ⇒ audible); silent
+					// thereafter to avoid log spam.
 					static int dbgN = 0;
-					if ((dbgN++ % 50) == 0) {
-						int64_t fw = AAudioStream_getFramesWritten(stream_);
-						int64_t fr = AAudioStream_getFramesRead(stream_);
-						LOGI("audio: wrote=%d (%s) clk=%.2f fw=%lld fr=%lld xrun=%d", written,
+					if (dbgN++ < 2) {
+						LOGI("audio: wrote=%d (%s) clk=%.2f fw=%lld fr=%lld", written,
 						     lastW < 0 ? AAudio_convertResultToText(lastW) : "ok",
-						     info.presentationTimeUs / 1e6, (long long)fw, (long long)fr,
-						     (int)AAudioStream_getXRunCount(stream_));
+						     info.presentationTimeUs / 1e6,
+						     (long long)AAudioStream_getFramesWritten(stream_),
+						     (long long)AAudioStream_getFramesRead(stream_));
 					}
 					clockUs_.store(info.presentationTimeUs, std::memory_order_relaxed);
 				}
