@@ -1,38 +1,30 @@
 // Copyright 2026, Leia Inc.
 // SPDX-License-Identifier: BSL-1.0
 //
-// VideoDecoder — Android port of David's media/VideoDecoder, swapping FFmpeg
-// for the framework-native AMediaExtractor + AMediaCodec (libmediandk). Decodes
-// an SBS video on a background thread to planar YUV (NV12 or I420 — the codec's
-// native ByteBuffer output) and publishes into a lock-light triple buffer; the
-// shader does the BT.709 convert + per-eye downscale (sbs.frag mode 1/2), so no
-// swscale runs. Loops at EOF. Hardware decode is automatic (MediaCodec picks the
-// SoC decoder); software is the framework's own fallback.
+// VideoDecoder — Android port of David's media/VideoDecoder, swapping FFmpeg for
+// the framework-native AMediaExtractor + AMediaCodec (libmediandk). ZERO-COPY
+// path: the codec decodes directly into an AImageReader's Surface (the SoC
+// decoder writes vendor-YUV into GPU-sampleable AHardwareBuffers — no CPU plane
+// copy), and the render thread pulls the latest AHardwareBuffer and imports it
+// into Vulkan (SbsRenderer::setVideoAhb) where an immutable VkSamplerYcbcr-
+// Conversion does the YUV->RGB convert + per-eye downscale. Decode + pacing run
+// on a background thread; the buffer hand-off is via AImageReader. Loops at EOF.
 #pragma once
 
 #include <atomic>
 #include <cstdint>
-#include <mutex>
 #include <string>
 #include <thread>
-#include <vector>
 
 struct AMediaExtractor;
 struct AMediaCodec;
 struct AMediaFormat;
+struct AImageReader;
+struct AImage;
+struct AHardwareBuffer;
+struct ANativeWindow;
 
 struct VideoDecoder {
-	struct Frame {
-		std::vector<uint8_t> y;   // luma, width x height, tightly packed
-		std::vector<uint8_t> uv;  // NV12: interleaved UV (w x h/2). I420: U (w/2 x h/2)
-		std::vector<uint8_t> v;   // I420 only: V (w/2 x h/2)
-		int width = 0;
-		int height = 0;
-		bool nv12 = true;
-		bool fullRange = false;
-		int64_t serial = 0;
-	};
-
 	~VideoDecoder() { stop(); }
 
 	// Open from a filesystem path (app-readable, e.g. externalDataPath) or a
@@ -59,18 +51,23 @@ struct VideoDecoder {
 	// instead of using its own wall clock. Set once before openPath/openFd.
 	void setMasterClock(double (*fn)(void *), void *ctx) { masterClock_ = fn; masterCtx_ = ctx; }
 
-	// Latest decoded frame, or nullptr if nothing new since the last call.
-	// Owned by the decoder; valid until the next acquireLatest().
-	const Frame *acquireLatest();
+	// RENDER-THREAD: acquire the newest decoded frame's AHardwareBuffer, or
+	// nullptr if no NEW frame has arrived since the last call (caller keeps
+	// displaying the previous one). The decoder holds a reference to the
+	// returned buffer until the next acquireLatestBuffer()/stop(); the renderer
+	// takes its own AHardwareBuffer_acquire() on import, so it stays valid even
+	// across the hand-off. Outputs the frame dims when non-null.
+	AHardwareBuffer *acquireLatestBuffer(int *width, int *height);
 
 private:
 	bool start();
 	void decodeLoop();
-	void extractFrame(uint8_t *src, int srcSize);
 
 	AMediaExtractor *ex_ = nullptr;
 	AMediaCodec *codec_ = nullptr;
 	AMediaFormat *outFmt_ = nullptr;  // cached on FORMAT_CHANGED
+	AImageReader *reader_ = nullptr;  // decoder output surface (GPU AHardwareBuffers)
+	ANativeWindow *window_ = nullptr; // reader_'s producer surface (owned by reader_)
 	int ownedFd_ = -1;                // fd we opened (path) or were handed (SAF); closed in stop()
 	std::thread thread_;
 	std::atomic<bool> stop_{false};
@@ -84,12 +81,5 @@ private:
 	int width_ = 0;
 	int height_ = 0;
 
-	// Triple buffer (producer / handoff / consumer), pointer-swap under mutex.
-	Frame buffers_[3];
-	std::mutex mutex_;
-	int producer_ = 0;
-	int middle_ = 1;
-	int consumer_ = 2;
-	bool hasNew_ = false;
-	int64_t serial_ = 0;
+	AImage *heldImage_ = nullptr;  // most-recently-acquired image (kept alive until next acquire)
 };
