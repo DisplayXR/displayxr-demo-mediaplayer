@@ -45,3 +45,4 @@ local.properties
 .gradle/
 android/build/
 android/.cxx/
+_android_build.log
