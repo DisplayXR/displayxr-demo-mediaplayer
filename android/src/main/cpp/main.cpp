@@ -1009,37 +1009,30 @@ render_frame()
 					break;
 				}
 
-				// Min-to-min fit, identical to the desktop MatchMinRect: size a
-				// content viewport so the content's SHORTER side equals the
-				// image's shorter side, centered. The longer axis then overflows
-				// (cropped by the scissor) when the content is more elongated
-				// than the image, or underflows (black letterbox) otherwise — no
-				// stretch. The UV stays the full per-eye half (stereo) or whole
-				// image (mono); the viewport does the fit. The swapchain is fixed
-				// in the panel's landscape frame, so the effective image aspect
-				// flips with the device rotation (portrait → tall image → the
-				// landscape content letterboxes top/bottom + crops the width).
-				const int rot = g_display_rotation.load(std::memory_order_relaxed);
-				const bool portrait = (rot & 1) != 0;  // ROTATION_90/270
-				const float iw = portrait ? (float)g_views[i].height : (float)g_views[i].width;
-				const float ih = portrait ? (float)g_views[i].width : (float)g_views[i].height;
-				const float imin = iw < ih ? iw : ih;
+				// Min-to-min fit (desktop MatchMinRect): scale the per-eye view
+				// so the content's shorter side equals the tile's shorter side,
+				// centered; the longer axis crops (scissor) or letterboxes
+				// (cleared black). UV is the full per-eye half (stereo) / whole
+				// image (mono). LANDSCAPE-ONLY for now: the app is locked
+				// landscape (manifest) because correct portrait needs the
+				// tiled-atlas multiview model (worst-case atlas + per-orientation
+				// sub-rect tiles, per ADR-026 / cube_handle_vk_android) which
+				// this app has not adopted yet — the runtime + Leia DP already
+				// support it (CAN_ROTATE).
+				const float sw = (float)g_views[i].width;
+				const float sh = (float)g_views[i].height;
+				const float winMin = sw < sh ? sw : sh;
 				const float aC = g_content_aspect.load(std::memory_order_relaxed);
-				// Content quad sized min-to-min (in the rotation-adjusted frame).
-				float qw, qh;
+				float vpW, vpH;
 				if (aC >= 1.0f) {  // landscape content: height is its shorter side
-					qh = imin;
-					qw = imin * aC;
+					vpH = winMin;
+					vpW = winMin * aC;
 				} else {  // portrait content: width is its shorter side
-					qw = imin;
-					qh = imin / aC;
+					vpW = winMin;
+					vpH = winMin / aC;
 				}
-				// Map the quad back into the landscape swapchain (w x h). In
-				// portrait the swapchain axes are swapped vs the panel frame.
-				float vpW = portrait ? qh : qw;
-				float vpH = portrait ? qw : qh;
-				const float vpX = ((float)g_views[i].width - vpW) * 0.5f;
-				const float vpY = ((float)g_views[i].height - vpH) * 0.5f;
+				const float vpX = (sw - vpW) * 0.5f;
+				const float vpY = (sh - vpH) * 0.5f;
 				const float boxW = g_image_mono ? 1.0f : 0.5f;
 				const float offBase = g_image_mono ? 0.0f : (i == 0 ? 0.0f : 0.5f);
 				g_sbs.drawEye(g_views[i].images[img_idx].image, g_views[i].width,
