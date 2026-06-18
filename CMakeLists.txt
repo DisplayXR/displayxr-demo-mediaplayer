@@ -64,8 +64,11 @@ endif()
 #     without video support.
 #   * macOS / Linux: pkg-config (Homebrew / system).
 #   * Windows: no pkg-config in the usual MSVC toolchain, so fall back to a manual
-#     dev tree. Set -DFFMPEG_ROOT=<dir containing include/ + lib/> (e.g. a vcpkg
-#     'installed/x64-windows' prefix, or a BtbN/gyan.dev prebuilt — see README).
+#     dev tree. Set -DFFMPEG_ROOT=<dir containing include/ + lib/>. For the shipped
+#     installer, CI builds a slim DECODE-ONLY FFmpeg via scripts/build-ffmpeg-slim.sh
+#     (~9 MB of DLLs vs ~103 MB for a stock full build). For local dev that script
+#     works too, or use any FFmpeg dev tree (a vcpkg 'installed/x64-windows' prefix,
+#     or a BtbN/gyan.dev prebuilt).
 find_package(PkgConfig QUIET)
 set(MP_HAVE_FFMPEG FALSE)
 set(MP_FFMPEG_LINK "")           # what the target links against (pkg-config target or libs)

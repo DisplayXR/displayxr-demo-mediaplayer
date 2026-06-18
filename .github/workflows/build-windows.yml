@@ -77,15 +77,53 @@ jobs:
       - if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Fetch FFmpeg dev libraries
+      # Build a slim, DECODE-ONLY FFmpeg (scripts/build-ffmpeg-slim.sh) instead of
+      # downloading a stock full build. A stereo player only decodes, so this strips
+      # every encoder + external lib a full build statically links — cutting the
+      # bundled FFmpeg DLLs from ~103 MB to ~9 MB (installer ~46 MB -> ~12 MB).
+      # Cached by the pinned FFmpeg commit + the build script, so it builds once.
+      - name: Slim FFmpeg — set vars
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
         run: |
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip"
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
-          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_dl -Force
-          $root = (Get-ChildItem ffmpeg_dl -Directory | Select-Object -First 1).FullName
-          "FFMPEG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # FFmpeg 8.x: sonames avcodec-62 / avformat-62 / avutil-60 / swscale-9 / swresample-6.
+          $sha = "e8031e5b9ad2def2a8ff51ca674f708812a7ec29"
+          $prefix = "$env:RUNNER_TEMP\ffmpeg-slim"
+          "FFMPEG_SHA=$sha"       | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "FFMPEG_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "FFMPEG_ROOT=$prefix"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Cache slim FFmpeg
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FFMPEG_PREFIX }}
+          key: ffmpeg-slim-${{ env.FFMPEG_SHA }}-${{ hashFiles('scripts/build-ffmpeg-slim.sh') }}
+
+      - name: Build slim FFmpeg (on cache miss)
+        if: needs.DetectChanges.outputs.docs_only != 'true' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          $env:PATH = "C:\Program Files\NASM;$env:PATH"
+          # GNU make for FFmpeg's build system (MSYS2 is preinstalled at C:\msys64).
+          C:\msys64\usr\bin\bash.exe -lc "pacman -Sy --noconfirm --needed make diffutils"
+          # FFmpeg source at the pinned commit (GitHub allows fetch-by-sha).
+          $src = "$env:RUNNER_TEMP\ffmpeg-src"
+          git init $src
+          git -C $src remote add origin https://github.com/FFmpeg/FFmpeg.git
+          git -C $src fetch --depth 1 origin $env:FFMPEG_SHA
+          git -C $src checkout FETCH_HEAD
+          # Build under MSYS2 bash, inheriting this step's MSVC env (from
+          # msvc-dev-cmd) + nasm. The script puts the MSVC tools dir first so its
+          # cl.exe/link.exe win over MSYS2's /usr/bin/link.exe.
+          $env:MSYS2_PATH_TYPE = "inherit"
+          $srcU    = (& C:\msys64\usr\bin\cygpath.exe -u "$src").Trim()
+          $prefixU = (& C:\msys64\usr\bin\cygpath.exe -u "$env:FFMPEG_PREFIX").Trim()
+          $scriptU = (& C:\msys64\usr\bin\cygpath.exe -u "$PWD\scripts\build-ffmpeg-slim.sh").Trim()
+          C:\msys64\usr\bin\bash.exe -lc "FFMPEG_SRC='$srcU' FFMPEG_PREFIX='$prefixU' bash '$scriptU'"
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::slim FFmpeg build failed'; exit 1 }
 
       - name: Configure + build
         if: needs.DetectChanges.outputs.docs_only != 'true'
