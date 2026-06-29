@@ -96,6 +96,13 @@ XR_RUNTIME_JSON=/path/to/displayxr-runtime/build/openxr_displayxr-dev.json ./med
 - Distribution follows the demo pattern: own CI/tags, Windows NSIS `.exe` + macOS
   `.pkg` installers, `versions.json` autobump, `/dxr-release mediaplayer <ver>` from
   the runtime hub once wired. Carry a runtime-compat covenant in `README.md`.
+- **Dev-build dependency rule — this repo is the reference.** OpenXR + the loader
+  are **self-provisioned by CMake `FetchContent`** (`OpenXR-SDK`, pinned
+  `release-*`), not a hardcoded SDK path and no separate `build-with-deps.bat` —
+  a fresh clone builds with only the toolchain + Vulkan SDK. Keep it that way:
+  never hardcode `C:/dev/openxr_sdk` / `C:/VulkanSDK/<ver>`; if you bump the
+  vendored `openxr_includes/` headers, bump the `FetchContent` `GIT_TAG` to match.
+  (The other demos had to retrofit this after shipping with the hardcoded paths.)
 
 ## Where to start
 
