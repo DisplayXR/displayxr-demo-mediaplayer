@@ -5,10 +5,10 @@
 
 #include <android/hardware_buffer.h>
 #include <android/log.h>
-#include <media/NDKImageReader.h>
-#include <media/NDKMediaCodec.h>
-#include <media/NDKMediaExtractor.h>
-#include <media/NDKMediaFormat.h>
+#include <media/NdkImageReader.h>
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaExtractor.h>
+#include <media/NdkMediaFormat.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>

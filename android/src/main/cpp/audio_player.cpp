@@ -6,9 +6,9 @@
 #include <aaudio/AAudio.h>
 #include <android/log.h>
 #include <fcntl.h>
-#include <media/NDKMediaCodec.h>
-#include <media/NDKMediaExtractor.h>
-#include <media/NDKMediaFormat.h>
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaExtractor.h>
+#include <media/NdkMediaFormat.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
