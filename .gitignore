@@ -46,3 +46,7 @@ local.properties
 android/build/
 android/.cxx/
 _android_build.log
+
+# Android signing keystores — never commit (CI uses GitHub secrets)
+*.jks
+*.keystore
