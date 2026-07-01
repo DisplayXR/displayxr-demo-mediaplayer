@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 // 2D transport-overlay geometry. Positions arrive already in clip space (NDC),
 // built CPU-side from transport_ui.h fractions; per-vertex RGBA is passed
 // straight through for solid/translucent fills. Drawn after the SBS blit, in

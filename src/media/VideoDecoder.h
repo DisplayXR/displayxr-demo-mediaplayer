@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // VideoDecoder (M3) — FFmpeg decode of an SBS video on a background thread,
 // converting each frame to RGBA (swscale) and publishing into a FrameRing. Loops at

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 #include "media/AudioPlayer.h"
 
 #include "Log.h"

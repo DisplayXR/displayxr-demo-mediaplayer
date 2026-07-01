@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Transport bar layout + hit-testing, shared by the renderer (which draws the
 // bar into each eye at these normalized fractions) and main.cpp (which hit-tests

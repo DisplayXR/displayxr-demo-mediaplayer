@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // VideoDecoder — Android port of David's media/VideoDecoder, swapping FFmpeg for
 // the framework-native AMediaExtractor + AMediaCodec (libmediandk). ZERO-COPY

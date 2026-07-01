@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Ui (STUB — M4). Dear ImGui "subtle 3D" UI: transport bar, scrubber, file open,
 // fullscreen, parallax/convergence slider, format HUD — rendered per-eye with a

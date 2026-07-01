@@ -1,4 +1,4 @@
-:: SPDX-License-Identifier: BSL-1.0
+:: SPDX-License-Identifier: Apache-2.0
 :: Run the Windows media player against a local DisplayXR dev runtime.
 :: NOTE: Windows is scaffolded but unverified in M0 (dev machine is macOS).
 :: Use a NON-elevated terminal — elevated processes ignore XR_RUNTIME_JSON and

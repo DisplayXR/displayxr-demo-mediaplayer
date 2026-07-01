@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // AudioPlayer — Android audio playback for the media player. AMediaCodec (audio
 // decode) + AAudio (output). Decodes the file's audio track on its own thread

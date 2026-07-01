@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 # Regenerate src/rhi/Font.h — an antialiased monospace font atlas (ASCII 32..126),
 # grayscale coverage. Run from the repo root: python3 scripts/gen_font.py
 from PIL import Image, ImageFont, ImageDraw
@@ -17,7 +17,7 @@ for code in range(32,127):
     ImageDraw.Draw(img).text((0,0),chr(code),fill=255,font=font)
     glyphs.append(list(img.getdata()))
 with open("src/rhi/Font.h","w") as f:
-    f.write("// SPDX-License-Identifier: BSL-1.0\n")
+    f.write("// SPDX-License-Identifier: Apache-2.0\n")
     f.write("// GENERATED antialiased monospace font atlas (ASCII 32..126), grayscale coverage.\n")
     f.write("// Regenerate with scripts/gen_font.py (needs Pillow).\n#pragma once\n#include <cstdint>\n\n")
     f.write("static const int g_fontCellW = %d;\n" % cellW)

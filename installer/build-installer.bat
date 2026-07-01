@@ -1,5 +1,5 @@
 @echo off
-:: SPDX-License-Identifier: BSL-1.0
+:: SPDX-License-Identifier: Apache-2.0
 :: Build the Windows NSIS installer for the Stereo Media Player demo.
 :: Requires the app to be built first (cmake --build), so its exe + staged
 :: runtime DLLs (SDL3 + FFmpeg) sit in the build dir.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Transport-overlay fragment: emit the interpolated per-vertex RGBA. Alpha
 // blending is configured on the pipeline so translucent panels composite over
 // the video.

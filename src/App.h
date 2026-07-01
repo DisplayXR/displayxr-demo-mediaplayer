@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // App — wires the SDL3 window, OpenXR session, and Vulkan renderer, and owns the
 // frame loop. For M0 the loop clears the two eyes to distinct colors; M1+ adds

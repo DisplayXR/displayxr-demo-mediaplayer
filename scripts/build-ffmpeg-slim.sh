@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # Build a minimal, DECODE-ONLY FFmpeg (MSVC toolchain) for the DisplayXR media
 # player. A stereo player only needs to *decode* H.264/H.265/AV1/VP8/VP9 (+ common

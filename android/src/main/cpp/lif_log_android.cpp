@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Android backend for the shared desktop Log.h facility (src/Log.h declares
 // mp::Log; the desktop impl in src/Log.cpp writes to stderr, which goes

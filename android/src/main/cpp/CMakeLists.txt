@@ -1,5 +1,5 @@
 # Copyright 2026, Leia Inc.
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # Native build for the Android leg of displayxr-demo-mediaplayer (stereo SBS
 # image/video player). Reuses the cube_handle/model_viewer OpenXR-Android

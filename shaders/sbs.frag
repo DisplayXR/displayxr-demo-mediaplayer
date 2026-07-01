@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Sample one half of a side-by-side source and emit RGB. The source is either an RGBA
 // texture (images: mode 0) or planar YUV from the video decoder (mode 1 = I420 three
 // planes, mode 2 = NV12 two planes). For YUV the GPU does BOTH the colour convert and

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // ImGuiLayer (M4) — renders a Dear ImGui transport bar into the window-space HUD
 // swapchain. The runtime composites that HUD image into both eyes with a small
