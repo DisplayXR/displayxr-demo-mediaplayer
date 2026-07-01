@@ -1,4 +1,4 @@
-// Copyright 2026, Leia Inc.
+// Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 //
 // Android backend for the shared desktop Log.h facility (src/Log.h declares
