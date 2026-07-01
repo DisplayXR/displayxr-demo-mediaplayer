@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Central include + ordering for OpenXR (Vulkan binding) and the DisplayXR
 // window-binding extension. Vulkan must be included before openxr_platform.h so
 // the XrGraphicsBindingVulkanKHR struct is defined.

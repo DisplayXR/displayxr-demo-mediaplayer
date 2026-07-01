@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // ImageDecoder (M1) — stb_image for JPG/PNG. Produces one tightly-packed RGBA8
 // buffer (the whole SBS frame) + dimensions. The SBS split happens later in the

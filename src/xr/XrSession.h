@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // XrSession — OpenXR lifecycle for a DisplayXR `_handle` Vulkan client.
 //

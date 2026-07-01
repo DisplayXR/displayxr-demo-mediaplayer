@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Zero-copy video path (Android): the source is the decoder's AHardwareBuffer
 // imported into Vulkan and sampled through an IMMUTABLE VkSamplerYcbcrConversion
 // — so binding 0 already returns RGB (the conversion did YUV->RGB + range expand

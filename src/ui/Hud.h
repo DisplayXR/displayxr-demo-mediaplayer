@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Hud (M2) — a minimal CPU text rasterizer for the window-space overlay. Draws a
 // translucent panel sized tightly to the text, with antialiased white glyphs (from

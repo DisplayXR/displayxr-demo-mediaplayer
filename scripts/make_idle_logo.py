@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 # Compose the idle screen art: the canonical DisplayXR mark with a bold
 # "Media Player" label centered below it, on a transparent canvas (the app
 # alpha-composites it over the dark-grey idle backdrop). The logo + text are

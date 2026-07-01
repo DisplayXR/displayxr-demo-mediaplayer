@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Fullscreen triangle — no vertex buffer. Emits UV [0,1] across the viewport (the
 // per-view tile). The fragment shader remaps UV into the SBS half it should sample.
 #version 450

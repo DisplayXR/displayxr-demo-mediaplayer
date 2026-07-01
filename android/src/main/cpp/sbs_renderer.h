@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // SbsRenderer — side-by-side blit for the Android media-player port of
 // displayxr-demo-mediaplayer. Adapts David's src/rhi/VulkanRenderer (the SBS

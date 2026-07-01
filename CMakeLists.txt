@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 # DisplayXR Stereo Media Player — M0 skeleton.
 # One Vulkan codebase for Windows / Linux / macOS (macOS via MoltenVK).
 cmake_minimum_required(VERSION 3.24)  # FetchContent FIND_PACKAGE_ARGS

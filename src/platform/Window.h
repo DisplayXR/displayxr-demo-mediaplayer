@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Window — SDL3 window + native-handle extraction. The DisplayXR runtime renders
 // into a handle the app owns (the `_handle` app class), so we must hand it the

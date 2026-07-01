@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Synthetic round-trip test for LifLoader. We don't ship a real .lif fixture, so the
 // test *builds* valid LIF containers in memory (a base JPEG + an embedded second-view

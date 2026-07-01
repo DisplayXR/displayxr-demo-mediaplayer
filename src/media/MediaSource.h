@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // MediaSource (M1) — identify a file's kind (image/video) and stereo layout from
 // its name (Leia convention: `*_2x1` full SBS, `*_half_2x1` half-width SBS), with

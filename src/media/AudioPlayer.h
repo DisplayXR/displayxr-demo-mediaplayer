@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // AudioPlayer — decode a file's audio stream on its own thread (FFmpeg + swresample)
 // and play it through SDL3. Independent of VideoDecoder (its own AVFormatContext over

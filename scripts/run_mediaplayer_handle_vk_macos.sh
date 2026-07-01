@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # Run the macOS media player against a local DisplayXR dev runtime.
 # Points XR_RUNTIME_JSON at the runtime's dev manifest so the OpenXR loader picks

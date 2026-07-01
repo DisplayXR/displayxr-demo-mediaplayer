@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // VulkanRenderer — the thin RHI seam (PRD §4 "RHI"). For M0 it does exactly one
 // thing: clear the left and right halves of the SBS swapchain image to two

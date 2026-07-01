@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // FrameRing (M2) — lock-light triple-buffered handoff of decoded video frames from
 // the decode thread to the render thread. Decouples decode rate from display rate:

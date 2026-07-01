@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Tiny logging shim for the media player. Kept deliberately small — the runtime
 // test apps have a richer LOG_* facility, but a skeleton only needs stdout.
 #pragma once

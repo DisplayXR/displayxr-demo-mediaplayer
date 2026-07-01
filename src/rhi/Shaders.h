@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Embedded SPIR-V for the SBS textured-blit shaders.
 //
 // GENERATED — do not edit by hand. Regenerate with scripts/gen_shaders.sh after

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // LifLoader — parse a LIF (Leia Image Format) container: a normal JPEG with a
 // metadata region appended at the end (trailer magic 0x1E1A; a u32 region offset

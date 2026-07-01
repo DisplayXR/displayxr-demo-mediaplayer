@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // DisplayXR Stereo Media Player — entry point.
 // M0: open a window, bring up an OpenXR stereo session against the DisplayXR

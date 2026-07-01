@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 # Regenerate src/rhi/Shaders.h (embedded SPIR-V) from shaders/*.glsl.
 # Requires glslangValidator (Homebrew: `brew install glslang`).
 set -euo pipefail
@@ -11,7 +11,7 @@ glslangValidator -V shaders/sbs.frag        --vn g_sbsFragSpv        -o /tmp/_f.
 
 {
   cat <<'HDR'
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Embedded SPIR-V for the SBS textured-blit shaders.
 //
 // GENERATED — do not edit by hand. Regenerate with scripts/gen_shaders.sh after

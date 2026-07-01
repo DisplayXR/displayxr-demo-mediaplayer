@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 // GENERATED antialiased monospace font atlas (ASCII 32..126), grayscale coverage.
 // Regenerate with scripts/gen_font.py.
 #pragma once
