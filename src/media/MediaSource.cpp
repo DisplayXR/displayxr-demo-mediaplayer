@@ -41,7 +41,7 @@ MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int ima
         info.kind = MediaKind::Video;
     }
 
-    // Stereo layout: filename suffix first (matches Leia's convention).
+    // Stereo layout: filename suffix first (matches the LIF naming convention).
     if (Contains(lower, "half_2x1")) {
         info.layout = StereoLayout::SbsHalf;
     } else if (Contains(lower, "2x1")) {

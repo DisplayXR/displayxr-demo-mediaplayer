@@ -172,7 +172,7 @@ reference. Specifics:
 
 **Images:** SBS JPG/PNG (`Name_2x1.ext`, `Name_half_2x1.ext`) via stb_image. HEIF
 behind `MEDIAPLAYER_WITH_HEIF` CMake option, **OFF by default** (libheif is LGPL +
-heavier — opt-in for Leia content). 2D images shown centered as flat (no conversion).
+heavier — opt-in for LIF content). 2D images shown centered as flat (no conversion).
 **Stereo LIF** (`.lif`): the container is parsed directly (no vendor SDK) — the two
 embedded views are decoded and composed to a full-SBS frame (`src/media/LifLoader.*`,
 nlohmann/json for the metadata). Mono+depth LIFs fall back to flat 2D for now; their
