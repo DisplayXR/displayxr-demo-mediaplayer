@@ -260,10 +260,46 @@ bool XrSession::CreateVulkanDevice() {
     if (hasPortabilityEnum) {
         ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     }
+    // Opt-in Vulkan validation for interop debugging (#28): MEDIAPLAYER_VK_VALIDATION=1.
+    const char* kValLayer = "VK_LAYER_KHRONOS_validation";
+    const bool wantValidation = [] {
+        const char* e = std::getenv("MEDIAPLAYER_VK_VALIDATION");
+        return e && *e && *e != '0';
+    }();
+    if (wantValidation) {
+        instExtPtrs.push_back("VK_EXT_debug_utils");
+        ici.enabledExtensionCount = (uint32_t)instExtPtrs.size();
+        ici.ppEnabledExtensionNames = instExtPtrs.data();
+        ici.enabledLayerCount = 1;
+        ici.ppEnabledLayerNames = &kValLayer;
+        LOG_INFO("Vulkan validation layer requested (interop debug)");
+    }
 
     if (vkCreateInstance(&ici, nullptr, &vkInstance_) != VK_SUCCESS) {
         LOG_ERROR("vkCreateInstance failed");
         return false;
+    }
+    if (wantValidation) {
+        auto pfnCreate = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            vkInstance_, "vkCreateDebugUtilsMessengerEXT");
+        if (pfnCreate) {
+            VkDebugUtilsMessengerCreateInfoEXT dci = {
+                VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+            dci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            dci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+            dci.pfnUserCallback = [](VkDebugUtilsMessageSeverityFlagBitsEXT,
+                                     VkDebugUtilsMessageTypeFlagsEXT,
+                                     const VkDebugUtilsMessengerCallbackDataEXT* d,
+                                     void*) -> VkBool32 {
+                LOG_ERROR("[vk-validation] %s", d->pMessage);
+                return VK_FALSE;
+            };
+            VkDebugUtilsMessengerEXT msg = VK_NULL_HANDLE;
+            pfnCreate(vkInstance_, &dci, nullptr, &msg);
+        }
     }
 
     // ---- VkPhysicalDevice: the one the runtime is using.
@@ -332,11 +368,14 @@ bool XrSession::CreateVulkanDevice() {
         return false;
     };
     for (const char* ext : {"VK_KHR_external_memory", "VK_KHR_external_memory_win32",
-                            "VK_KHR_sampler_ycbcr_conversion", "VK_KHR_bind_memory2",
-                            "VK_KHR_get_memory_requirements2"}) {
+                            "VK_KHR_win32_keyed_mutex", "VK_KHR_sampler_ycbcr_conversion",
+                            "VK_KHR_bind_memory2", "VK_KHR_get_memory_requirements2"}) {
         if (deviceHas(ext) && !alreadyEnabled(ext)) devExtStorage.push_back(ext);
     }
-    zeroCopyCapable_ = deviceHas("VK_KHR_external_memory_win32");
+    // Zero-copy needs both external-memory-win32 (import the D3D11 NV12 surface) and
+    // win32-keyed-mutex (sync the D3D11 copy against the Vulkan sample).
+    zeroCopyCapable_ = deviceHas("VK_KHR_external_memory_win32") &&
+                       deviceHas("VK_KHR_win32_keyed_mutex");
 #endif
 
     std::vector<const char*> devExtPtrs;

@@ -29,7 +29,19 @@ public:
         PixFormat format = PixFormat::I420;
         bool fullRange = false;       // JPEG/full vs MPEG/limited range
         int64_t serial = 0;           // monotonic; lets the consumer detect newness
+
+        // Zero-copy interop (#28, Windows). When gpu==true the pixels live in a shared
+        // D3D11 NV12 texture (below) instead of the CPU plane[] buffers; the decode thread
+        // CopySubresourceRegion's the decoded surface into it and the renderer imports +
+        // samples it. Persistent per slot, owned by the decoder; synced by a keyed mutex
+        // (key 0). plane[] stays empty in this mode.
+        bool gpu = false;
+        void* gpuSharedTexture = nullptr;  // ID3D11Texture2D* (per-slot, decoder-owned)
+        void* gpuSharedHandle = nullptr;   // shared NT HANDLE for Vulkan import
     };
+
+    static constexpr int kBufferCount = 3;
+    Frame& BufferSlot(int i) { return buffers_[i]; }  // producer-side GPU resource mgmt
 
     // --- Producer (decode thread) ---
     // The buffer to fill, then Publish() to hand it to the consumer.

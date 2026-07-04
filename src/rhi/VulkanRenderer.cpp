@@ -1,4 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
+#if defined(_WIN32)
+// Zero-copy interop (#28) needs the Win32 Vulkan structs (import + keyed mutex). Define
+// the platform before <vulkan/vulkan.h> (pulled in by the header) so it exposes them;
+// windows.h must precede vulkan_win32.h, and NOMINMAX keeps its min/max macros away from
+// std::max/std::min used below.
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  define VK_USE_PLATFORM_WIN32_KHR
+#endif
+
 #include "VulkanRenderer.h"
 
 #include "Log.h"
@@ -479,6 +494,9 @@ struct PlaneSpec { const uint8_t* data; uint32_t w, h; VkFormat fmt; uint32_t bp
 
 bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t height) {
     if (!rgba || width == 0 || height == 0) return false;
+#if defined(_WIN32)
+    sharedActive_ = false;  // CPU RGBA source -> leave the zero-copy path
+#endif
     if (!EnsureDummy()) return false;
 
     std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging;
@@ -519,6 +537,9 @@ bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t
 bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2,
                                uint32_t width, uint32_t height, int format, bool fullRange) {
     if (!plane0 || !plane1 || width == 0 || height == 0) return false;
+#if defined(_WIN32)
+    sharedActive_ = false;  // CPU-plane upload -> leave the zero-copy path
+#endif
     if (format == 0 && !plane2) return false;
     if (!EnsureDummy()) return false;
     const uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
@@ -637,6 +658,18 @@ bool VulkanRenderer::EnsureDummy() {
 void VulkanRenderer::BindDescriptors() {
     // Bind the planes the current mode samples; everything else gets the dummy.
     VkImageView views[3] = {planes_[0].view, dummyView_, dummyView_};
+    VkImageLayout layouts[3] = {VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+#if defined(_WIN32)
+    if (sharedActive_) {  // zero-copy: imported NV12 plane views, sampled in GENERAL layout
+        views[0] = sharedY_;
+        views[1] = sharedUV_;
+        views[2] = dummyView_;
+        layouts[0] = VK_IMAGE_LAYOUT_GENERAL;
+        layouts[1] = VK_IMAGE_LAYOUT_GENERAL;
+    } else
+#endif
     if (sourceMode_ == 1) {            // I420: Y, U, V
         views[1] = planes_[1].view;
         views[2] = planes_[2].view;
@@ -648,7 +681,7 @@ void VulkanRenderer::BindDescriptors() {
     for (uint32_t i = 0; i < 3; ++i) {
         dii[i].sampler = sampler_;
         dii[i].imageView = views[i] ? views[i] : dummyView_;
-        dii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        dii[i].imageLayout = layouts[i];
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = descSet_;
         writes[i].dstBinding = i;
@@ -662,13 +695,38 @@ void VulkanRenderer::BindDescriptors() {
 bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* rects,
                                const XrSession::ViewRect* clipRects,
                                const ViewUV* uvs, uint32_t viewCount) {
-    if (imageIndex >= framebuffers_.size() || planes_[0].view == VK_NULL_HANDLE) return false;
+    bool haveSource = planes_[0].view != VK_NULL_HANDLE;
+#if defined(_WIN32)
+    haveSource = haveSource || sharedActive_;
+#endif
+    if (imageIndex >= framebuffers_.size() || !haveSource) return false;
 
     vkResetCommandBuffer(commandBuffer_, 0);
     VkCommandBufferBeginInfo bi = {};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(commandBuffer_, &bi);
+
+#if defined(_WIN32)
+    // Zero-copy (#28): the imported NV12 image starts in UNDEFINED; move it to GENERAL once
+    // (its contents live in shared memory the D3D11 producer writes, so we never transition
+    // it again — the keyed mutex below orders that write against this sample).
+    if (sharedActive_ && sharedLayoutReady_ && !*sharedLayoutReady_ && sharedImage_) {
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = sharedImage_;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &b);
+        *sharedLayoutReady_ = true;
+    }
+#endif
 
     VkClearValue clear = {};
     // Letterbox/background: the configured fill (opaque black by default, dark grey for
@@ -730,13 +788,169 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &commandBuffer_;
+#if defined(_WIN32)
+    // Zero-copy (#28): take the shared texture's keyed mutex (key 0) for this submit so the
+    // GPU waits for the D3D11 producer's CopySubresourceRegion to finish before sampling,
+    // and hands it back (key 0) when done. Same key both sides -> drop-safe (a published-but-
+    // never-sampled frame leaves the mutex released, so the producer can re-acquire it).
+    const uint64_t kmAcqKey = 1;      // producer released with key 1
+    const uint64_t kmRelKey = 0;      // hand back to the producer with key 0
+    const uint32_t kmTimeout = 2000;  // ms; a stuck producer shouldn't hang the render thread
+    VkWin32KeyedMutexAcquireReleaseInfoKHR km = {
+        VK_STRUCTURE_TYPE_WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR};
+    // Keyed mutex disabled: the producer CPU-waits for the copy before publishing (coarse
+    // sync), so no cross-API mutex is needed here. Kept behind a flag to re-enable for
+    // experiments (MEDIAPLAYER_ZC_KM=1).
+    static const bool kmOn = [] {
+        const char* e = std::getenv("MEDIAPLAYER_ZC_KM");
+        return e && *e && *e != '0';
+    }();
+    if (sharedActive_ && sharedMemory_ && kmOn) {
+        km.acquireCount = 1;
+        km.pAcquireSyncs = &sharedMemory_;
+        km.pAcquireKeys = &kmAcqKey;
+        km.pAcquireTimeouts = &kmTimeout;
+        km.releaseCount = 1;
+        km.pReleaseSyncs = &sharedMemory_;
+        km.pReleaseKeys = &kmRelKey;
+        si.pNext = &km;
+    }
+#endif
     if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) {
         LOG_ERROR("DrawViews vkQueueSubmit failed");
         return false;
     }
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    // 2s cap (not infinite) so a wedged zero-copy import can't hang the render thread.
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, 2000000000ULL);
     return true;
 }
+
+#if defined(_WIN32)
+VulkanRenderer::SharedImport* VulkanRenderer::ImportSharedNV12(void* handle, uint32_t w,
+                                                               uint32_t h) {
+    for (auto& kv : imports_) if (kv.first == handle) return &kv.second;  // already imported
+
+    SharedImport imp;
+    VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.pNext = &ext;
+    ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // needed for the per-plane R8/R8G8 views
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;  // == DXGI_FORMAT_NV12
+    ici.extent = {w, h, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(device_, &ici, nullptr, &imp.image) != VK_SUCCESS) {
+        LOG_WARN("BindSharedNV12: vkCreateImage failed");
+        return nullptr;
+    }
+
+    // Memory types compatible with this imported D3D11 handle, intersected with the image's.
+    auto pfnHandleProps = (PFN_vkGetMemoryWin32HandlePropertiesKHR)vkGetDeviceProcAddr(
+        device_, "vkGetMemoryWin32HandlePropertiesKHR");
+    uint32_t handleTypeBits = 0xFFFFFFFFu;
+    if (pfnHandleProps) {
+        VkMemoryWin32HandlePropertiesKHR hp = {
+            VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR};
+        if (pfnHandleProps(device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
+                           (HANDLE)handle, &hp) == VK_SUCCESS)
+            handleTypeBits = hp.memoryTypeBits;
+    }
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(device_, imp.image, &req);
+    const uint32_t chosenType = FindMemoryType(req.memoryTypeBits & handleTypeBits,
+                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    LOG_INFO("zc-import: reqBits=0x%x handleBits=0x%x -> type=%u size=%llu", req.memoryTypeBits,
+             handleTypeBits, chosenType, (unsigned long long)req.size);
+
+    VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    ded.image = imp.image;  // imported D3D texture memory must be a dedicated allocation
+    VkImportMemoryWin32HandleInfoKHR imp32 = {
+        VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR};
+    imp32.pNext = &ded;
+    imp32.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+    imp32.handle = (HANDLE)handle;
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.pNext = &imp32;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = chosenType;
+    if (vkAllocateMemory(device_, &mai, nullptr, &imp.memory) != VK_SUCCESS) {
+        LOG_WARN("BindSharedNV12: import vkAllocateMemory failed");
+        vkDestroyImage(device_, imp.image, nullptr);
+        return nullptr;
+    }
+    if (vkBindImageMemory(device_, imp.image, imp.memory, 0) != VK_SUCCESS) {
+        LOG_WARN("BindSharedNV12: vkBindImageMemory failed");
+        vkFreeMemory(device_, imp.memory, nullptr);
+        vkDestroyImage(device_, imp.image, nullptr);
+        return nullptr;
+    }
+
+    // Per-plane views feed the existing NV12 shader path (Y = R8, UV = R8G8).
+    auto makeView = [&](VkFormat fmt, VkImageAspectFlagBits aspect, VkImageView* out) {
+        VkImageViewCreateInfo v = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        v.image = imp.image;
+        v.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        v.format = fmt;
+        v.subresourceRange = {(VkImageAspectFlags)aspect, 0, 1, 0, 1};
+        return vkCreateImageView(device_, &v, nullptr, out) == VK_SUCCESS;
+    };
+    if (!makeView(VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_PLANE_0_BIT, &imp.planeY) ||
+        !makeView(VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_PLANE_1_BIT, &imp.planeUV)) {
+        LOG_WARN("BindSharedNV12: plane view create failed");
+        if (imp.planeY) vkDestroyImageView(device_, imp.planeY, nullptr);
+        vkFreeMemory(device_, imp.memory, nullptr);
+        vkDestroyImage(device_, imp.image, nullptr);
+        return nullptr;
+    }
+    imports_.emplace_back(handle, imp);
+    LOG_INFO("VulkanRenderer: imported shared NV12 %ux%u (zero-copy #28)", w, h);
+    return &imports_.back().second;
+}
+
+bool VulkanRenderer::BindSharedNV12(void* sharedHandle, uint32_t width, uint32_t height,
+                                    bool fullRange) {
+    if (!sharedHandle) return false;
+    SharedImport* imp = ImportSharedNV12(sharedHandle, width, height);
+    if (!imp) return false;
+    if (planes_[0].view != VK_NULL_HANDLE) DestroyTexture();  // drop CPU planes; sample the import
+    sharedActive_ = true;
+    sharedImage_ = imp->image;
+    sharedMemory_ = imp->memory;
+    sharedLayoutReady_ = &imp->layoutReady;
+    sharedY_ = imp->planeY;
+    sharedUV_ = imp->planeUV;
+    sourceMode_ = 2;  // NV12
+    sourceFullRange_ = fullRange ? 1.0f : 0.0f;
+    EnsureDummy();
+    BindDescriptors();
+    return true;
+}
+
+void VulkanRenderer::ClearSharedImports() {
+    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    for (auto& kv : imports_) {
+        SharedImport& s = kv.second;
+        if (s.planeUV) vkDestroyImageView(device_, s.planeUV, nullptr);
+        if (s.planeY) vkDestroyImageView(device_, s.planeY, nullptr);
+        if (s.image) vkDestroyImage(device_, s.image, nullptr);
+        if (s.memory) vkFreeMemory(device_, s.memory, nullptr);
+    }
+    imports_.clear();
+    sharedActive_ = false;
+    sharedImage_ = VK_NULL_HANDLE;
+    sharedMemory_ = VK_NULL_HANDLE;
+    sharedLayoutReady_ = nullptr;
+    sharedY_ = VK_NULL_HANDLE;
+    sharedUV_ = VK_NULL_HANDLE;
+}
+#endif  // _WIN32
 
 void VulkanRenderer::DestroyTexture() {
     for (Plane& p : planes_) {
@@ -1025,6 +1239,9 @@ bool VulkanRenderer::DumpExternalImage(VkImage image, uint32_t width, uint32_t h
 void VulkanRenderer::Shutdown() {
     if (device_ == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(device_);
+#if defined(_WIN32)
+    ClearSharedImports();  // zero-copy (#28) imported textures
+#endif
     DestroyTexture();
     if (sampler_) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
     if (descPool_) { vkDestroyDescriptorPool(device_, descPool_, nullptr); descPool_ = VK_NULL_HANDLE; }

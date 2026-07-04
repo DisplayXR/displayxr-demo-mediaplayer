@@ -78,7 +78,23 @@ public:
     bool UploadYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2,
                    uint32_t width, uint32_t height, int format, bool fullRange);
 
-    bool HasTexture() const { return planes_[0].view != VK_NULL_HANDLE; }
+#if defined(_WIN32)
+    // Zero-copy (#28): bind a shared D3D11 NV12 texture (by its shared NT handle) as the
+    // video source instead of uploading CPU planes. The texture is imported into Vulkan
+    // (cached per handle) and its two planes bound as Y (R8) + UV (R8G8); DrawViews syncs
+    // the D3D11 producer copy against the sample with a keyed mutex. Returns false (caller
+    // falls back to UploadYUV) on any import failure.
+    bool BindSharedNV12(void* sharedHandle, uint32_t width, uint32_t height, bool fullRange);
+    // Release all imported shared textures (call on media change / shutdown).
+    void ClearSharedImports();
+#endif
+
+    bool HasTexture() const {
+#if defined(_WIN32)
+        if (sharedActive_) return true;
+#endif
+        return planes_[0].view != VK_NULL_HANDLE;
+    }
 
     // Draw the uploaded texture into each view's tile, sampling the UV sub-region in
     // `uvs[v]`. Clears the rest of the image to black. Blocks until the GPU finishes.
@@ -136,6 +152,27 @@ private:
     } planes_[3];
     int sourceMode_ = 0;             // 0 RGBA, 1 I420, 2 NV12 (pushed to the shader)
     float sourceFullRange_ = 0.0f;
+
+#if defined(_WIN32)
+    // Zero-copy interop state (#28). imports_ caches one entry per shared NT handle; the
+    // bound entry's Y/UV plane views feed the descriptor set and its memory drives the
+    // per-frame keyed-mutex acquire/release in DrawViews.
+    struct SharedImport {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView planeY = VK_NULL_HANDLE;   // R8   (aspect PLANE_0)
+        VkImageView planeUV = VK_NULL_HANDLE;  // R8G8 (aspect PLANE_1)
+        bool layoutReady = false;              // transitioned UNDEFINED->GENERAL once
+    };
+    std::vector<std::pair<void*, SharedImport>> imports_;  // keyed by shared handle
+    bool sharedActive_ = false;                // current frame is a shared NV12 texture
+    VkDeviceMemory sharedMemory_ = VK_NULL_HANDLE;  // bound import's memory (keyed mutex)
+    VkImage sharedImage_ = VK_NULL_HANDLE;
+    VkImageView sharedY_ = VK_NULL_HANDLE;     // bound import's Y (R8) view
+    VkImageView sharedUV_ = VK_NULL_HANDLE;    // bound import's UV (R8G8) view
+    bool* sharedLayoutReady_ = nullptr;        // -> bound import's layoutReady
+    SharedImport* ImportSharedNV12(void* handle, uint32_t w, uint32_t h);
+#endif
     VkImage dummyImage_ = VK_NULL_HANDLE;       // 1x1, bound to unused plane slots
     VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
     VkImageView dummyView_ = VK_NULL_HANDLE;

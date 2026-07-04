@@ -54,7 +54,19 @@ struct VideoDecoder::Impl {
     int videoStream = -1;
     int swsW = 0, swsH = 0, swsFmt = -1;        // cached sws source params (fallback)
 
+#if defined(_WIN32)
+    // Zero-copy interop (#28): non-owning handles into the D3D11VA device FFmpeg decodes
+    // on (owned via hwDevice). d3dHwctx->lock/unlock guards the shared context.
+    ID3D11Device* d3dDevice = nullptr;
+    ID3D11DeviceContext* d3dContext = nullptr;
+    AVD3D11VADeviceContext* d3dHwctx = nullptr;
+    ID3D11Query* copyDoneQuery = nullptr;  // event query: producer waits for the copy (#28)
+#endif
+
     ~Impl() {
+#if defined(_WIN32)
+        if (copyDoneQuery) copyDoneQuery->Release();
+#endif
         if (sws) sws_freeContext(sws);
         if (swFrame) av_frame_free(&swFrame);
         if (convFrame) av_frame_free(&convFrame);
@@ -173,6 +185,45 @@ AVBufferRef* CreateD3D11VADeviceOnLUID(const uint8_t luid[8]) {
     if (av_hwdevice_ctx_init(hwref) < 0) { av_buffer_unref(&hwref); return nullptr; }
     return hwref;
 }
+
+// Create a shareable NV12 texture (keyed mutex) on `device`, w x h, plus its shared NT
+// handle for Vulkan import. Returns false on failure. Caller owns tex (Release) + handle
+// (CloseHandle).
+bool CreateSharedNV12(ID3D11Device* device, int w, int h, ID3D11Texture2D** outTex,
+                      void** outHandle) {
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = (UINT)w;
+    d.Height = (UINT)h;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_NV12;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    // Legacy shared handle (D3D11_RESOURCE_MISC_SHARED -> a KMT handle), which — unlike
+    // SHARED_NTHANDLE — needs NO keyed mutex. Cross-API coherence comes from the producer
+    // CPU-waiting on an event query for the copy to finish before publishing, so the later
+    // Vulkan sample (KMT import) reads settled memory. (The keyed-mutex NT-handle path
+    // wouldn't complete its acquire on this D3D11<->Vulkan stack.)
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(device->CreateTexture2D(&d, nullptr, &tex))) return false;
+    IDXGIResource* res = nullptr;
+    if (FAILED(tex->QueryInterface(__uuidof(IDXGIResource), (void**)&res))) {
+        tex->Release();
+        return false;
+    }
+    HANDLE handle = nullptr;
+    const HRESULT hr = res->GetSharedHandle(&handle);  // KMT handle, owned by the resource
+    res->Release();
+    if (FAILED(hr) || !handle) {
+        tex->Release();
+        return false;
+    }
+    *outTex = tex;
+    *outHandle = handle;
+    return true;
+}
 } // namespace
 #endif  // _WIN32
 
@@ -272,6 +323,9 @@ bool VideoDecoder::Open(const std::string& path) {
         impl_->hwPixFmt = AV_PIX_FMT_NONE;
         hardware_ = false;
         hwName_ = "software";
+#if defined(_WIN32)
+        interopActive_ = false;  // no hw device -> no zero-copy
+#endif
         impl_->codec = avcodec_alloc_context3(dec);
         avcodec_parameters_to_context(impl_->codec, st->codecpar);
         impl_->codec->thread_count = 0;
@@ -296,6 +350,17 @@ bool VideoDecoder::Open(const std::string& path) {
     open_ = true;
     LOG_INFO("VideoDecoder: '%s' %dx%d codec=%s backend=%s dur=%.1fs", path.c_str(), width_,
              height_, codecName_, hwName_, durationSec_);
+
+#if defined(_WIN32)
+    // Cache the D3D11 device/context for the zero-copy copy path (#28).
+    if (interopActive_ && impl_->hwDevice) {
+        auto* hwctx = reinterpret_cast<AVHWDeviceContext*>(impl_->hwDevice->data);
+        impl_->d3dHwctx = reinterpret_cast<AVD3D11VADeviceContext*>(hwctx->hwctx);
+        impl_->d3dDevice = impl_->d3dHwctx->device;
+        impl_->d3dContext = impl_->d3dHwctx->device_context;
+        LOG_INFO("VideoDecoder: zero-copy interop path active (shared NV12, keyed mutex)");
+    }
+#endif
 
     stop_ = false;
     thread_ = std::thread(&VideoDecoder::DecodeLoop, this);
@@ -330,6 +395,73 @@ void VideoDecoder::DecodeLoop() {
     // PTS in seconds (-1 unknown, -2 = drop/HW fail). I420 (software) and NV12 (hw) are
     // copied directly; any other format (10-bit, 4:2:2/4:4:4) is swscale'd to I420 first.
     auto fillFrame = [&](AVFrame* f) -> double {
+#if defined(_WIN32)
+        // Zero-copy (#28): the decoded surface is already an NV12 D3D11 texture on the
+        // Vulkan adapter. CopySubresourceRegion the decoder's array slice into this ring
+        // slot's shared texture (keyed mutex) and hand the renderer a handle — no CPU
+        // download/convert/upload. Any failure disables interop and falls through to the
+        // CPU path below for this and all later frames.
+        if (interopActive_ && impl_->hwPixFmt != AV_PIX_FMT_NONE && f->format == impl_->hwPixFmt &&
+            impl_->d3dContext && impl_->d3dHwctx) {
+            FrameRing::Frame& dst = ring_.WriteBuffer();
+            // (Re)create this slot's shared texture on first use or a size change.
+            if (dst.gpuSharedTexture && (dst.width != f->width || dst.height != f->height)) {
+                reinterpret_cast<ID3D11Texture2D*>(dst.gpuSharedTexture)->Release();
+                // KMT handle is owned by the resource — freed by the Release above, not closed.
+                dst.gpuSharedTexture = nullptr;
+                dst.gpuSharedHandle = nullptr;
+            }
+            if (!dst.gpuSharedTexture) {
+                ID3D11Texture2D* t = nullptr;
+                void* hnd = nullptr;
+                if (CreateSharedNV12(impl_->d3dDevice, f->width, f->height, &t, &hnd)) {
+                    dst.gpuSharedTexture = t;
+                    dst.gpuSharedHandle = hnd;
+                } else {
+                    LOG_WARN("VideoDecoder: shared NV12 create failed — disabling zero-copy");
+                    interopActive_ = false;
+                }
+            }
+            if (interopActive_ && dst.gpuSharedTexture) {
+                auto* decoderTex = reinterpret_cast<ID3D11Texture2D*>(f->data[0]);
+                const UINT slice = (UINT)(intptr_t)f->data[1];
+                auto* shared = reinterpret_cast<ID3D11Texture2D*>(dst.gpuSharedTexture);
+                D3D11_BOX box = {0, 0, 0, (UINT)f->width, (UINT)f->height, 1};
+                impl_->d3dHwctx->lock(impl_->d3dHwctx->lock_ctx);
+                if (!impl_->copyDoneQuery) {
+                    D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
+                    impl_->d3dDevice->CreateQuery(&qd, &impl_->copyDoneQuery);
+                }
+                impl_->d3dContext->CopySubresourceRegion(shared, 0, 0, 0, 0, decoderTex, slice, &box);
+                if (impl_->copyDoneQuery) impl_->d3dContext->End(impl_->copyDoneQuery);
+                impl_->d3dContext->Flush();
+                // Block until the GPU finishes the copy, so the published frame's memory is
+                // coherent for the Vulkan sample (which happens later, on the render thread).
+                if (impl_->copyDoneQuery) {
+                    BOOL done = FALSE;
+                    // Bounded wait (~100ms cap) so a wedged GPU can never hang the decode
+                    // thread; the copy is normally sub-millisecond.
+                    for (int i = 0; i < 2000; ++i) {
+                        if (impl_->d3dContext->GetData(impl_->copyDoneQuery, &done, sizeof(done), 0) ==
+                            S_OK)
+                            break;
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    }
+                }
+                impl_->d3dHwctx->unlock(impl_->d3dHwctx->lock_ctx);
+
+                dst.width = f->width;
+                dst.height = f->height;
+                dst.format = PixFormat::NV12;
+                dst.fullRange = (f->color_range == AVCOL_RANGE_JPEG);
+                dst.gpu = true;
+                const int64_t ticks = (f->best_effort_timestamp != AV_NOPTS_VALUE)
+                                          ? f->best_effort_timestamp
+                                          : f->pts;
+                return (ticks != AV_NOPTS_VALUE) ? (double)ticks * timeBase : -1.0;
+            }
+        }
+#endif
         AVFrame* src = f;
         if (impl_->hwPixFmt != AV_PIX_FMT_NONE && f->format == impl_->hwPixFmt) {
             if (!impl_->swFrame) impl_->swFrame = av_frame_alloc();
@@ -376,6 +508,7 @@ void VideoDecoder::DecodeLoop() {
         }
 
         FrameRing::Frame& dst = ring_.WriteBuffer();
+        dst.gpu = false;  // CPU-plane frame (clears any prior zero-copy state on this slot)
         dst.width = yuv->width;
         dst.height = yuv->height;
         dst.format = outFmt;
@@ -562,6 +695,20 @@ void VideoDecoder::Stop() {
     stop_ = true;
     if (thread_.joinable()) thread_.join();
     open_ = false;
+#if defined(_WIN32)
+    // Release the per-slot shared NV12 textures + handles (zero-copy, #28). Safe after the
+    // decode thread has joined; the renderer's imports keyed off these handles are torn
+    // down separately when media changes.
+    for (int i = 0; i < FrameRing::kBufferCount; ++i) {
+        FrameRing::Frame& b = ring_.BufferSlot(i);
+        if (b.gpuSharedTexture) {
+            reinterpret_cast<ID3D11Texture2D*>(b.gpuSharedTexture)->Release();
+            b.gpuSharedTexture = nullptr;
+        }
+        b.gpuSharedHandle = nullptr;  // KMT handle owned by the texture (freed by Release above)
+        b.gpu = false;
+    }
+#endif
     impl_.reset();
 }
 
