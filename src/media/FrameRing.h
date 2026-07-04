@@ -33,11 +33,12 @@ public:
         // Zero-copy interop (#28, Windows). When gpu==true the pixels live in a shared
         // D3D11 NV12 texture (below) instead of the CPU plane[] buffers; the decode thread
         // CopySubresourceRegion's the decoded surface into it and the renderer imports +
-        // samples it. Persistent per slot, owned by the decoder; synced by a keyed mutex
-        // (key 0). plane[] stays empty in this mode.
+        // samples it. Persistent per slot, owned by the decoder. Coherence is a CPU
+        // event-query wait before Publish() (no keyed mutex — the shared texture uses the
+        // legacy D3D11_RESOURCE_MISC_SHARED KMT handle). plane[] stays empty in this mode.
         bool gpu = false;
         void* gpuSharedTexture = nullptr;  // ID3D11Texture2D* (per-slot, decoder-owned)
-        void* gpuSharedHandle = nullptr;   // shared NT HANDLE for Vulkan import
+        void* gpuSharedHandle = nullptr;   // legacy KMT shared handle for Vulkan import
     };
 
     static constexpr int kBufferCount = 3;

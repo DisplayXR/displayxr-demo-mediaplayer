@@ -118,6 +118,7 @@ private:
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
+    uint32_t queueFamilyIndex_ = 0;  // graphics family; needed for the #28 external->graphics acquire
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
@@ -154,24 +155,38 @@ private:
     float sourceFullRange_ = 0.0f;
 
 #if defined(_WIN32)
-    // Zero-copy interop state (#28). imports_ caches one entry per shared NT handle; the
-    // bound entry's Y/UV plane views feed the descriptor set and its memory drives the
-    // per-frame keyed-mutex acquire/release in DrawViews.
+    // Zero-copy interop state (#28). imports_ caches one entry per shared handle; the bound
+    // entry's ycbcr view feeds a dedicated ycbcr pipeline/descriptor set (a manual per-plane
+    // R8/R8G8 sample of a D3D11-shared NV12 texture faults the GPU on this driver — the
+    // fixed-function VkSamplerYcbcrConversion owns the plane layout, so it samples correctly).
+    // The bound entry's memory drives the per-frame EXTERNAL->graphics ownership acquire in
+    // DrawViews.
     struct SharedImport {
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView planeY = VK_NULL_HANDLE;   // R8   (aspect PLANE_0)
-        VkImageView planeUV = VK_NULL_HANDLE;  // R8G8 (aspect PLANE_1)
-        bool layoutReady = false;              // transitioned UNDEFINED->GENERAL once
+        VkImageView ycbcrView = VK_NULL_HANDLE;  // single G8_B8R8_2PLANE view + ycbcr conversion
+        bool layoutReady = false;                // acquired UNDEFINED->GENERAL once
     };
     std::vector<std::pair<void*, SharedImport>> imports_;  // keyed by shared handle
     bool sharedActive_ = false;                // current frame is a shared NV12 texture
-    VkDeviceMemory sharedMemory_ = VK_NULL_HANDLE;  // bound import's memory (keyed mutex)
+    VkDeviceMemory sharedMemory_ = VK_NULL_HANDLE;  // bound import's memory
     VkImage sharedImage_ = VK_NULL_HANDLE;
-    VkImageView sharedY_ = VK_NULL_HANDLE;     // bound import's Y (R8) view
-    VkImageView sharedUV_ = VK_NULL_HANDLE;    // bound import's UV (R8G8) view
+    VkImageView sharedYcbcrView_ = VK_NULL_HANDLE;  // bound import's ycbcr view
     bool* sharedLayoutReady_ = nullptr;        // -> bound import's layoutReady
     SharedImport* ImportSharedNV12(void* handle, uint32_t w, uint32_t h);
+
+    // Dedicated ycbcr blit pipeline for the zero-copy path (built once, on first shared
+    // frame — needs the stream's range). Separate from pipeline_ because the immutable
+    // ycbcr sampler must be baked into its own single-binding descriptor set layout.
+    VkSamplerYcbcrConversion ycbcrConversion_ = VK_NULL_HANDLE;
+    VkSampler ycbcrSampler_ = VK_NULL_HANDLE;   // immutable, carries the conversion
+    VkDescriptorSetLayout ycbcrSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout ycbcrPipeLayout_ = VK_NULL_HANDLE;
+    VkPipeline ycbcrPipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool ycbcrDescPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet ycbcrDescSet_ = VK_NULL_HANDLE;
+    bool ycbcrInited_ = false;
+    bool BuildYcbcrPipeline(bool fullRange);
 #endif
     VkImage dummyImage_ = VK_NULL_HANDLE;       // 1x1, bound to unused plane slots
     VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;

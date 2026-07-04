@@ -398,6 +398,16 @@ bool XrSession::CreateVulkanDevice() {
     dci.enabledExtensionCount = (uint32_t)devExtPtrs.size();
     dci.ppEnabledExtensionNames = devExtPtrs.data();
 
+#if defined(_WIN32)
+    // Zero-copy (#28): the imported NV12 surface is sampled through a VkSamplerYcbcrConversion
+    // (fixed-function YUV->RGB), which requires this feature enabled at device creation.
+    // Gated on zeroCopyCapable_ so the default path's device is unchanged.
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrFeat = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES};
+    ycbcrFeat.samplerYcbcrConversion = VK_TRUE;
+    if (zeroCopyCapable_) dci.pNext = &ycbcrFeat;
+#endif
+
     if (vkCreateDevice(physicalDevice_, &dci, nullptr, &device_) != VK_SUCCESS) {
         LOG_ERROR("vkCreateDevice failed");
         return false;

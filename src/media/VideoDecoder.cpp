@@ -358,7 +358,8 @@ bool VideoDecoder::Open(const std::string& path) {
         impl_->d3dHwctx = reinterpret_cast<AVD3D11VADeviceContext*>(hwctx->hwctx);
         impl_->d3dDevice = impl_->d3dHwctx->device;
         impl_->d3dContext = impl_->d3dHwctx->device_context;
-        LOG_INFO("VideoDecoder: zero-copy interop path active (shared NV12, keyed mutex)");
+        LOG_INFO("VideoDecoder: zero-copy interop path active (shared NV12, KMT handle + "
+                 "event-query coherence)");
     }
 #endif
 
