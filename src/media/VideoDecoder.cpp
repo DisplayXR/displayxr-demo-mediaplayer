@@ -8,11 +8,22 @@
 #include <cstring>
 #include <thread>
 
+// Include the D3D/DXGI C++ headers first (with C++ linkage): FFmpeg's
+// hwcontext_d3d11va.h pulls in <d3d11.h>, and if that first happens inside the
+// extern "C" block below it mis-declares d3d11.h's operator==/!= as C functions.
+#if defined(_WIN32)
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#endif
+
 #if defined(MEDIAPLAYER_WITH_FFMPEG)
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
+#if defined(_WIN32)
+#include <libavutil/hwcontext_d3d11va.h>  // <d3d11.h> already included above (guarded)
+#endif
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }
@@ -110,6 +121,61 @@ enum AVPixelFormat HwPixFmtFor(const AVCodec* dec, AVHWDeviceType type) {
 VideoDecoder::VideoDecoder() = default;
 VideoDecoder::~VideoDecoder() { Stop(); }
 
+#if defined(_WIN32)
+void VideoDecoder::SetInteropAdapterLUID(const uint8_t* luid8) {
+    std::memcpy(interopLUID_, luid8, 8);
+    haveInteropLUID_ = true;
+}
+
+namespace {
+// Build an FFmpeg D3D11VA hwdevice context whose ID3D11Device lives on the adapter with
+// the given LUID, so decoded NV12 surfaces can later be shared into Vulkan on the SAME
+// GPU with no CPU round trip (issue #28). Returns nullptr on any failure — the caller
+// then falls back to FFmpeg's own default-adapter device (still hardware, just no interop).
+// On success FFmpeg owns the device + context (released when the hwdevice ref is freed).
+AVBufferRef* CreateD3D11VADeviceOnLUID(const uint8_t luid[8]) {
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) return nullptr;
+    IDXGIAdapter1* chosen = nullptr;
+    IDXGIAdapter1* it = nullptr;
+    for (UINT i = 0; factory->EnumAdapters1(i, &it) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc;
+        if (SUCCEEDED(it->GetDesc1(&desc)) && std::memcmp(&desc.AdapterLuid, luid, sizeof(LUID)) == 0) {
+            chosen = it;  // keep this ref
+            break;
+        }
+        it->Release();
+    }
+    factory->Release();
+    if (!chosen) return nullptr;
+
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    const HRESULT hr = D3D11CreateDevice(chosen, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, nullptr,
+                                         0, D3D11_SDK_VERSION, &device, nullptr, &ctx);
+    chosen->Release();
+    if (FAILED(hr)) return nullptr;
+
+    // D3D11VA + cross-thread sharing require a multithread-protected context.
+    ID3D10Multithread* mt = nullptr;
+    if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D10Multithread), (void**)&mt))) {
+        mt->SetMultithreadProtected(TRUE);
+        mt->Release();
+    }
+
+    AVBufferRef* hwref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+    if (!hwref) { ctx->Release(); device->Release(); return nullptr; }
+    auto* hwctx = reinterpret_cast<AVHWDeviceContext*>(hwref->data);
+    auto* d3d = reinterpret_cast<AVD3D11VADeviceContext*>(hwctx->hwctx);
+    d3d->device = device;           // ownership transferred to FFmpeg
+    d3d->device_context = ctx;      // ditto
+    if (av_hwdevice_ctx_init(hwref) < 0) { av_buffer_unref(&hwref); return nullptr; }
+    return hwref;
+}
+} // namespace
+#endif  // _WIN32
+
 // Attach a hwaccel device to impl_->codec, trying each preferred type. On success
 // sets hardware_/hwName_/hwPixFmt and the get_format hook; returns false (software)
 // if none initialize (e.g. headless box, codec unsupported by the GPU).
@@ -127,7 +193,22 @@ bool VideoDecoder::TryEnableHwAccel(const void* decoder) {
         if (pf == AV_PIX_FMT_NONE) continue;  // codec can't use this device in this build
 
         AVBufferRef* dev = nullptr;
-        if (av_hwdevice_ctx_create(&dev, type, nullptr, nullptr, 0) < 0) {
+#if defined(_WIN32)
+        // Prefer a D3D11 device pinned to the Vulkan adapter so decoded surfaces can be
+        // shared into Vulkan zero-copy (issue #28). Falls through to FFmpeg's own device
+        // if the LUID isn't set or the pinned device can't be created.
+        if (type == AV_HWDEVICE_TYPE_D3D11VA && haveInteropLUID_) {
+            dev = CreateD3D11VADeviceOnLUID(interopLUID_);
+            if (dev) {
+                interopActive_ = true;
+                LOG_INFO("VideoDecoder: D3D11VA device pinned to Vulkan adapter (zero-copy #28)");
+            } else {
+                LOG_WARN("VideoDecoder: could not pin D3D11 device to Vulkan adapter; "
+                         "using default device (no zero-copy)");
+            }
+        }
+#endif
+        if (!dev && av_hwdevice_ctx_create(&dev, type, nullptr, nullptr, 0) < 0) {
             LOG_WARN("VideoDecoder: hwaccel '%s' present but device init failed",
                      av_hwdevice_get_type_name(type));
             continue;

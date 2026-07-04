@@ -900,6 +900,12 @@ void App::Shutdown() {
 bool App::LoadMedia(const std::string& path) {
     const MediaInfo info = MediaSource::Identify(path);
     if (info.kind == MediaKind::Video) {
+#if defined(_WIN32)
+        // Zero-copy decode (#28): pin the D3D11VA decode device to the Vulkan adapter so
+        // decoded surfaces can be shared into Vulkan without a CPU round trip.
+        if (xr_.ZeroCopyCapable() && xr_.DeviceLUIDValid())
+            video_.SetInteropAdapterLUID(xr_.DeviceLUID());
+#endif
         if (!video_.Open(path)) {
             LOG_ERROR("Open: cannot decode video '%s'", path.c_str());
             return false;

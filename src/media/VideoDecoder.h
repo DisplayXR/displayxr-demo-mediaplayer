@@ -61,6 +61,13 @@ public:
     // its PTS instead of using its own wall clock. Set once before Open().
     void SetMasterClock(std::function<double()> fn) { masterClock_ = std::move(fn); }
 
+#if defined(_WIN32)
+    // Pin the D3D11VA decode device to a specific adapter — the Vulkan physical device's
+    // LUID — so decoded surfaces can be shared into Vulkan without a CPU round trip
+    // (zero-copy interop, issue #28). Call before Open(); the 8-byte LUID is copied.
+    void SetInteropAdapterLUID(const uint8_t* luid8);
+#endif
+
     bool IsOpen() const { return open_; }
     int Width() const { return width_; }    // full SBS frame width
     int Height() const { return height_; }
@@ -84,6 +91,11 @@ private:
 
     FrameRing ring_;
     std::function<double()> masterClock_;   // audio clock for A/V sync (null = wall clock)
+#if defined(_WIN32)
+    uint8_t interopLUID_[8] = {};   // target adapter for zero-copy D3D11VA decode (#28)
+    bool haveInteropLUID_ = false;
+    bool interopActive_ = false;    // decoding on the pinned adapter (zero-copy eligible)
+#endif
     std::thread thread_;
     std::atomic<bool> stop_{false};
     std::atomic<bool> paused_{false};
