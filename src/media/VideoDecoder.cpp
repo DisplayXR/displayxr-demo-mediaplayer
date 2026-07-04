@@ -231,6 +231,7 @@ void VideoDecoder::DecodeLoop() {
 
     auto wallStart = clock::now();
     double firstPtsSec = -1.0;
+    bool audioGiveUp = false;  // latched when the audio clock ends/stalls -> wall-clock pacing
 
     // Copy one plane (stride-aware) into a tightly packed buffer.
     auto copyPlane = [](std::vector<uint8_t>& d, const uint8_t* s, int stride, int wBytes, int h) {
@@ -330,6 +331,7 @@ void VideoDecoder::DecodeLoop() {
                           AVSEEK_FLAG_BACKWARD);
             avcodec_flush_buffers(impl_->codec);
             firstPtsSec = -1.0;
+            audioGiveUp = false;  // re-arm audio sync at the new position
 
             // Decode forward to the EXACT target frame and display only that one. We do
             // NOT bail to the keyframe or interrupt mid-decode for a newer scrub request:
@@ -396,6 +398,7 @@ void VideoDecoder::DecodeLoop() {
                 av_seek_frame(impl_->fmt, impl_->videoStream, 0, AVSEEK_FLAG_BACKWARD);
                 avcodec_flush_buffers(impl_->codec);
                 firstPtsSec = -1.0;
+                audioGiveUp = false;  // re-arm audio sync after looping to the start
                 wallStart = clock::now();
             } else {
                 // Loop off: mark ended and pause, holding the last published frame. A
@@ -416,19 +419,37 @@ void VideoDecoder::DecodeLoop() {
                 if (ptsSec <= -2.0) continue;  // dropped
                 if (ptsSec >= 0.0) {
                     positionSec_.store(ptsSec);
-                    const double mc = masterClock_ ? masterClock_() : -1.0;
-                    if (mc >= 0.0) {
-                        // Audio is the master clock: present when it reaches this PTS.
+                    // Present this frame in step with the audio master clock. Fall back to
+                    // the wall clock only when there is genuinely no usable audio clock: no
+                    // audio track, or audio has stopped/ended (`audioGiveUp` latch). We must
+                    // NOT bail just because video is momentarily far ahead of audio — at
+                    // startup the audio device warms up a beat after the video thread, so the
+                    // audio clock lags for the first ~second; bailing there is exactly what
+                    // let video run away at raw (faster-than-realtime) software-decode speed.
+                    const double mc = (masterClock_ && !audioGiveUp) ? masterClock_() : -1.0;
+                    bool wall = (mc < 0.0);
+                    if (!wall) {
+                        // Wait until the audio clock reaches this PTS. Keep waiting as long as
+                        // audio is still making progress; only give up (and hand pacing to the
+                        // wall clock for the rest of this run) if audio stops advancing for a
+                        // grace period — audio shorter than the video, or the device dropping.
+                        double lastNow = mc;
+                        int stalledMs = 0;
                         for (;;) {
                             if (stop_.load() || paused_.load() || seekRequest_.load() >= 0.0) break;
                             const double now = masterClock_();
-                            if (now < 0.0) break;               // audio stopped -> show now
-                            if (now >= ptsSec - 0.005) break;   // audio caught up
-                            if (ptsSec - now > 1.0) break;      // far ahead (loop) -> show now
+                            if (now < 0.0) { wall = true; audioGiveUp = true; break; }  // audio gone
+                            if (now >= ptsSec - 0.005) break;                            // audio reached it
+                            if (now > lastNow + 1e-4) { lastNow = now; stalledMs = 0; }   // still advancing
+                            else if ((stalledMs += 2) >= 1000) {                          // stalled -> wall
+                                wall = true; audioGiveUp = true; break;
+                            }
                             std::this_thread::sleep_for(std::chrono::milliseconds(2));
                         }
-                    } else {
-                        if (firstPtsSec < 0.0) firstPtsSec = ptsSec;
+                        if (wall) { firstPtsSec = ptsSec; wallStart = clock::now(); }  // re-anchor on handoff
+                    }
+                    if (wall) {
+                        if (firstPtsSec < 0.0) { firstPtsSec = ptsSec; wallStart = clock::now(); }
                         auto target = wallStart + std::chrono::duration_cast<clock::duration>(
                                                       std::chrono::duration<double>(ptsSec - firstPtsSec));
                         std::this_thread::sleep_until(target);
