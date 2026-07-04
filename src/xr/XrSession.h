@@ -153,6 +153,13 @@ public:
     VkQueue GraphicsQueue() const { return graphicsQueue_; }
     uint32_t GraphicsQueueFamily() const { return queueFamilyIndex_; }
 
+    // Zero-copy D3D11VA->Vulkan decode interop (issue #28). True when the device exposes
+    // VK_KHR_external_memory_win32; deviceLUID (when valid) pins the D3D11 decode device to
+    // the same adapter. Both are false/invalid off-Windows or on drivers lacking interop.
+    bool ZeroCopyCapable() const { return zeroCopyCapable_; }
+    bool DeviceLUIDValid() const { return deviceLUIDValid_; }
+    const uint8_t* DeviceLUID() const { return deviceLUID_; }  // VK_LUID_SIZE bytes
+
     // Swapchain + tile layout for the renderer. The active rendering mode's N views
     // pack into a tileColumns x tileRows grid of equally-sized tiles within one
     // swapchain image. The *active* counts come from the current rendering mode and
@@ -280,6 +287,11 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex_ = 0;
+
+    // Zero-copy decode interop (issue #28); Windows-only, off elsewhere.
+    bool zeroCopyCapable_ = false;
+    bool deviceLUIDValid_ = false;
+    uint8_t deviceLUID_[VK_LUID_SIZE] = {};
 };
 
 } // namespace mp
