@@ -19,12 +19,11 @@
 #elif defined(_WIN32)
 #  include <openxr/XR_EXT_win32_window_binding.h>
 #else
-// Linux: no window-binding extension exists yet (build-green port, #30) — the
-// runtime never advertises one, so hasWindowBindingExt_/hasHud_ stay false and
-// no window-space layer is ever submitted. But EndFrame still needs the type
-// declared. The struct is platform-neutral and wire-shared by BOTH binding
-// headers (each carries this exact #ifndef-guarded block); mirror it here
-// verbatim until a Linux binding header lands in displayxr-extensions.
+#  include <openxr/XR_EXT_xlib_window_binding.h>
+// The xlib binding header (spec v1) deliberately does NOT carry the
+// window-space layer block its cocoa/win32 siblings share — but EndFrame still
+// needs the type declared. Mirror the wire-shared #ifndef-guarded block here
+// verbatim until the xlib header (or a neutral header) picks it up.
 #ifndef XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT
 #define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT ((XrStructureType)1000999002)
 

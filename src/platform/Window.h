@@ -5,6 +5,9 @@
 // platform-native view/window:
 //   macOS  -> NSView* (CAMetalLayer-backed) via SDL_Metal_CreateView
 //   Windows-> HWND via SDL window properties
+//   Linux  -> &X11Handles (Display* + XID pair) via SDL X11 window properties;
+//             XR_EXT_xlib_window_binding needs both, unlike the single-pointer
+//             handles of the other platforms
 // One SDL codebase; only the handle extraction is per-platform.
 #pragma once
 
@@ -17,6 +20,17 @@ namespace mp {
 
 class Window {
 public:
+#if defined(__linux__) && !defined(__ANDROID__)
+    // What NativeHandle() points at on desktop Linux. XR_EXT_xlib_window_binding
+    // takes the pair (Display*, Window XID); SDL exposes them as two window
+    // properties, so they're bundled here to fit the one-void* handle plumbing.
+    // Both are borrowed from SDL — valid until Destroy().
+    struct X11Handles {
+        void* display = nullptr;      // Display* (Xlib connection SDL opened)
+        unsigned long window = 0;     // X11 Window (XID)
+    };
+#endif
+
     Window() = default;
     ~Window();
 
@@ -26,7 +40,8 @@ public:
     bool Create(const char* title, int width, int height);
     void Destroy();
 
-    // NSView* (macOS) or HWND (Windows), to pass into the OpenXR window binding.
+    // NSView* (macOS), HWND (Windows), or &X11Handles (desktop Linux), to pass
+    // into the OpenXR window binding.
     void* NativeHandle() const { return nativeHandle_; }
     // The SDL_Window itself (for the ImGui SDL3 backend).
     SDL_Window* SdlWindow() const { return window_; }
@@ -91,6 +106,9 @@ private:
     SDL_Window* window_ = nullptr;
     void* metalView_ = nullptr;   // SDL_MetalView (macOS only); owned, destroyed on Destroy
     void* nativeHandle_ = nullptr;
+#if defined(__linux__) && !defined(__ANDROID__)
+    X11Handles x11_;              // nativeHandle_ points here when X11 props resolve
+#endif
     bool cycleModeRequested_ = false;
     bool toggleHudRequested_ = false;
     int convergenceSteps_ = 0;

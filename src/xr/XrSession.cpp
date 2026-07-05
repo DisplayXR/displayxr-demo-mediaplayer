@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "XrSession.h"
 
+#include "platform/Window.h"  // Window::X11Handles — the Linux native-handle shape
+
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -67,6 +69,8 @@ bool XrSession::InitInstanceAndSystem() {
     const char* kWindowBindingExt = XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME;
 #elif defined(_WIN32)
     const char* kWindowBindingExt = XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME;
+#elif defined(__linux__) && !defined(__ANDROID__)
+    const char* kWindowBindingExt = XR_EXT_XLIB_WINDOW_BINDING_EXTENSION_NAME;
 #else
     const char* kWindowBindingExt = nullptr;
 #endif
@@ -469,6 +473,17 @@ bool XrSession::CreateSessionWithWindowBinding(void* nativeWindowHandle) {
         vkBinding.next = &windowBinding;
         LOG_INFO("Using XR_EXT_win32_window_binding (HWND=%p, transparent-bg=%s)",
                  nativeWindowHandle, transparentBg_ ? "ON" : "off");
+    }
+#elif defined(__linux__) && !defined(__ANDROID__)
+    XrXlibWindowBindingCreateInfoEXT windowBinding = {};
+    windowBinding.type = (XrStructureType)XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_EXT;
+    auto* x11 = static_cast<const Window::X11Handles*>(nativeWindowHandle);
+    if (hasWindowBindingExt_ && x11 && x11->display && x11->window) {
+        windowBinding.xDisplay = static_cast<Display*>(x11->display);
+        windowBinding.window = x11->window;
+        vkBinding.next = &windowBinding;
+        LOG_INFO("Using XR_EXT_xlib_window_binding (Display=%p, Window=0x%lx)",
+                 x11->display, x11->window);
     }
 #else
     (void)nativeWindowHandle;

@@ -15,6 +15,10 @@ Copied from `DisplayXR/displayxr-runtime` at:
 Pinned commit: `f1347340ea0dcc5d24da2f228b59d63441ca3ec7`
 (`f1347340e refactor(test-apps): macOS cube_handle capture → xrCaptureAtlasEXT + mip parity [#396 W6]`)
 
+`XR_EXT_xlib_window_binding.h` alone is pinned newer, from
+`19c4e014f0d8f79e554c5e18860152c3efc5137a`
+(`19c4e014f linux(#660): Phase 3a — XR_EXT_xlib_window_binding`).
+
 > When `DisplayXR/displayxr-extensions` is published as a standalone repo, re-pin
 > from there (FetchContent or a vendored snapshot) instead of the runtime tree.
 
@@ -26,6 +30,7 @@ Pinned commit: `f1347340ea0dcc5d24da2f228b59d63441ca3ec7`
 | `openxr/openxr_extension_helpers.h`, `openxr_reflection*.h`, `openxr_loader_negotiation.h` | Core support headers |
 | `openxr/XR_EXT_cocoa_window_binding.h` | macOS NSView/CAMetalLayer window binding (`XrCocoaWindowBindingCreateInfoEXT`) |
 | `openxr/XR_EXT_win32_window_binding.h` | Windows HWND window binding (`XrWin32WindowBindingCreateInfoEXT`) |
+| `openxr/XR_EXT_xlib_window_binding.h` | Desktop-Linux X11 window binding (`XrXlibWindowBindingCreateInfoEXT`: Display* + Window XID) |
 | `openxr/XR_EXT_display_info.h` | Display pixel dims / metadata used to size the swapchain |
 | `openxr/XR_EXT_workspace_file_dialog.h` | Tier-1 spatial file picker (`xrRequestFilePickerEXT`) for Open; native dialog fallback when unsupported |
 

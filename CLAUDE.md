@@ -84,10 +84,13 @@ is **non-required** and fires only on `workflow_dispatch` + `linux*` branches.
 (`XR_RUNTIME_JSON`, `XRT_PLUGIN_SEARCH_PATH`, `OXR_ENABLE_VK_NATIVE_COMPOSITOR=1`,
 `SIM_DISPLAY_OUTPUT=anaglyph`).
 
-**Status: BUILD-GREEN only.** On-screen is gated on the runtime's Linux
-Phase 1b + hardware, and on a Linux window-binding extension (none exists —
-only cocoa/win32 are vendored), so `Window.cpp`/`XrSession.cpp` currently no-op
-the native handle/binding on Linux. Recipe: the runtime repo's
+**Status: BUILD-GREEN, window binding wired.** `XR_EXT_xlib_window_binding`
+(runtime Phase 3a) is fully wired: `Window.cpp` extracts the (Display*, XID)
+pair from SDL's X11 properties (bundled as `Window::X11Handles` behind the
+one-void* handle plumbing) and prefers SDL's x11 driver (XWayland on Wayland
+desktops); `XrSession.cpp` chains `XrXlibWindowBindingCreateInfoEXT` when the
+runtime advertises the extension. On-screen validation is gated on the
+runtime's Linux Phase 1b/3b hardware bring-up. Recipe: the runtime repo's
 `docs/guides/linux-demo-port.md`.
 
 ## Run / test

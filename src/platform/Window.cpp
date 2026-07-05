@@ -26,6 +26,14 @@ bool SDLCALL ResizeEventWatch(void* userdata, SDL_Event* e) {
 Window::~Window() { Destroy(); }
 
 bool Window::Create(const char* title, int width, int height) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    // Prefer the X11 video driver: XR_EXT_xlib_window_binding is X11-only
+    // (runtime converts to XCB internally), and the display processor wants the
+    // absolute window position X11 exposes (Wayland hides it). On Wayland
+    // desktops this lands on XWayland. SDL_SetHint doesn't override the
+    // SDL_VIDEO_DRIVER env var, so a user can still force another driver.
+    SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         LOG_ERROR("SDL_Init failed: %s", SDL_GetError());
         return false;
@@ -63,6 +71,20 @@ bool Window::Create(const char* title, int width, int height) {
     if (!nativeHandle_) {
         LOG_ERROR("Could not get Win32 HWND from SDL window");
         return false;
+    }
+#elif defined(__linux__) && !defined(__ANDROID__)
+    // XR_EXT_xlib_window_binding needs the (Display*, Window XID) pair; bundle
+    // both SDL properties behind the single void* the XR plumbing carries.
+    SDL_PropertiesID props = SDL_GetWindowProperties(window_);
+    x11_.display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr);
+    x11_.window =
+        (unsigned long)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+    if (x11_.display && x11_.window) {
+        nativeHandle_ = &x11_;
+    } else {
+        LOG_WARN("No X11 window handles from SDL (driver '%s') — window binding unavailable; "
+                 "run under X11/XWayland for XR_EXT_xlib_window_binding",
+                 SDL_GetCurrentVideoDriver());
     }
 #else
     LOG_WARN("No native window-handle extraction for this platform");
