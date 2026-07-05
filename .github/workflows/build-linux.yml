@@ -35,7 +35,9 @@ jobs:
       # media path — including the Linux VAAPI branch — silently compiles out
       # behind MEDIAPLAYER_WITH_FFMPEG), and the X11/Wayland + ALSA headers
       # SDL3 needs to build meaningful video/audio backends from source (this
-      # demo is a _handle app that opens its own SDL window).
+      # demo is a _handle app that opens its own SDL window). libxxf86vm-dev:
+      # once GL/EGL headers are present, OpenXR-SDK-Source also configures its
+      # openxr-gfxwrapper test helper, which links Xxf86vm.
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -45,7 +47,8 @@ jobs:
             libavformat-dev libavcodec-dev libavutil-dev \
             libswscale-dev libswresample-dev \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
-            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev
+            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev \
+            libxxf86vm-dev
 
       - name: Build (build-green; app is not run — no display on CI)
         run: ./scripts/build_linux.sh
