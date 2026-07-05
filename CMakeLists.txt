@@ -222,7 +222,7 @@ target_link_libraries(${MP_TARGET} PRIVATE
 # atlas-capture output path under the user's Pictures folder.
 # d3d11 + dxgi: zero-copy D3D11VA->Vulkan decode interop (issue #28).
 if(WIN32)
-    target_link_libraries(${MP_TARGET} PRIVATE shell32 ole32 d3d11 dxgi)
+    target_link_libraries(${MP_TARGET} PRIVATE shell32 ole32 d3d11 dxgi d3dcompiler)
 endif()
 
 # Copy the OpenXR loader dylib/dll next to the binary when it's an imported target,

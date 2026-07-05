@@ -662,8 +662,14 @@ void VulkanRenderer::BindDescriptors() {
     VkImageLayout layouts[3] = {VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    // Note: the zero-copy (#28) path does not use this descriptor set — it binds its own
-    // ycbcr descriptor set/pipeline in DrawViews (see BindSharedNV12 / BuildYcbcrPipeline).
+#if defined(_WIN32)
+    // Zero-copy (#28): sample the imported RGBA texture (producer already did YUV->RGB) as
+    // mode 0, in GENERAL layout (the imported image is left in GENERAL by the acquire barrier).
+    if (sharedActive_) {
+        views[0] = sharedView_;
+        layouts[0] = VK_IMAGE_LAYOUT_GENERAL;
+    } else
+#endif
     if (sourceMode_ == 1) {            // I420: Y, U, V
         views[1] = planes_[1].view;
         views[2] = planes_[2].view;
@@ -743,17 +749,9 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
     rb.pClearValues = &clear;
     vkCmdBeginRenderPass(commandBuffer_, &rb, VK_SUBPASS_CONTENTS_INLINE);
 
-    // Zero-copy (#28) uses a dedicated pipeline whose descriptor layout bakes in the
-    // immutable ycbcr sampler; every other mode uses the shared per-plane pipeline.
+    // Both the CPU planar path and the zero-copy (#28) RGBA path use the main pipeline; the
+    // shared RGBA import just binds its view into binding 0 as mode 0 (see BindDescriptors).
     VkPipelineLayout activeLayout = pipelineLayout_;
-#if defined(_WIN32)
-    if (sharedActive_ && ycbcrInited_) {
-        activeLayout = ycbcrPipeLayout_;
-        vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, ycbcrPipeline_);
-        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, ycbcrPipeLayout_,
-                                0, 1, &ycbcrDescSet_, 0, nullptr);
-    } else
-#endif
     {
         vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
         vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
@@ -838,221 +836,39 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
 }
 
 #if defined(_WIN32)
-// ── Zero-copy #28: PARKED (opt-in MEDIAPLAYER_ZEROCOPY=1; default build is the CPU path) ──
-// Everything up to sampling the imported texture works: D3D11VA decode pinned to the Vulkan
-// LUID, per-slot shared NV12 texture, CopySubresourceRegion + event-query coherence, Vulkan
-// import (memory type valid, alloc+bind OK), an EXTERNAL->graphics ownership acquire barrier,
-// and this ycbcr conversion pipeline. What blocks CORRECT output is an irreconcilable plane
-// layout between D3D11 and the Vulkan driver for in-place import of a *single* NV12 texture:
-//   • OPTIMAL tiling            -> GPU device-lost (driver reads planes with opaque tiling)
-//   • LINEAR, driver offsets    -> renders but chroma SCRAMBLED (driver expects the UV plane
-//                                  at a 64KB-aligned offset 2097152; D3D packs it tight at
-//                                  1920*1080=2073600, so the conversion reads UV mislocated)
-//   • LINEAR, disjoint, tight   -> can't bind: UV must be 64KB-aligned, 2073600 isn't
-// The alignment requirement (65536) exceeds the padding gap, so no offset lets Vulkan's UV
-// plane land on D3D's tight UV data. A correct fix needs producer-side rework (share Y and UV
-// as SEPARATE single-plane R8/R8G8 textures, each imported at offset 0 — no multiplanar
-// alignment constraint). Left parked: at 1080p the CPU path already hits the 60Hz cap, and
-// clips large enough for the download to matter (>4096px) fall back to software decode.
-// Env A/B toggles: MEDIAPLAYER_ZC_OPTIMAL (old tiling), MEDIAPLAYER_ZC_DISJOINT (offset bind).
-//
-// Build the ycbcr conversion + immutable sampler + descriptor layout + pipeline used by the
-// zero-copy path. Runs once (the stream's format/range is constant). Mirrors the Android AHB
-// path (sbs_renderer.cpp ensureAhbPipeline) but for a concrete NV12 format.
-bool VulkanRenderer::BuildYcbcrPipeline(bool fullRange) {
-    if (ycbcrInited_) return true;
 
-    VkSamplerYcbcrConversionCreateInfo cci = {
-        VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO};
-    cci.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;      // DXGI_FORMAT_NV12
-    cci.ycbcrModel = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709;  // app convention: BT.709
-    cci.ycbcrRange = fullRange ? VK_SAMPLER_YCBCR_RANGE_ITU_FULL
-                               : VK_SAMPLER_YCBCR_RANGE_ITU_NARROW;
-    cci.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-                      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    cci.xChromaOffset = VK_CHROMA_LOCATION_MIDPOINT;      // ~matches the CPU path's centered sample
-    cci.yChromaOffset = VK_CHROMA_LOCATION_MIDPOINT;
-    cci.chromaFilter = VK_FILTER_LINEAR;
-    cci.forceExplicitReconstruction = VK_FALSE;
-    if (vkCreateSamplerYcbcrConversion(device_, &cci, nullptr, &ycbcrConversion_) != VK_SUCCESS) {
-        LOG_WARN("BuildYcbcrPipeline: vkCreateSamplerYcbcrConversion failed");
-        return false;
-    }
-
-    VkSamplerYcbcrConversionInfo convInfo = {VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO};
-    convInfo.conversion = ycbcrConversion_;
-    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    sci.pNext = &convInfo;
-    sci.magFilter = VK_FILTER_LINEAR;
-    sci.minFilter = VK_FILTER_LINEAR;
-    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sci.unnormalizedCoordinates = VK_FALSE;
-    if (vkCreateSampler(device_, &sci, nullptr, &ycbcrSampler_) != VK_SUCCESS) {
-        LOG_WARN("BuildYcbcrPipeline: ycbcr sampler create failed");
-        return false;
-    }
-
-    // Binding 0 = combined image sampler with the IMMUTABLE ycbcr sampler baked in.
-    VkDescriptorSetLayoutBinding b = {};
-    b.binding = 0;
-    b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b.descriptorCount = 1;
-    b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    b.pImmutableSamplers = &ycbcrSampler_;
-    VkDescriptorSetLayoutCreateInfo dslci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslci.bindingCount = 1;
-    dslci.pBindings = &b;
-    if (vkCreateDescriptorSetLayout(device_, &dslci, nullptr, &ycbcrSetLayout_) != VK_SUCCESS) {
-        LOG_WARN("BuildYcbcrPipeline: set layout failed");
-        return false;
-    }
-
-    // Same push-constant range as the main pipeline so DrawViews pushes identically.
-    VkPushConstantRange pcRange = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 6};
-    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.setLayoutCount = 1;
-    plci.pSetLayouts = &ycbcrSetLayout_;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges = &pcRange;
-    if (vkCreatePipelineLayout(device_, &plci, nullptr, &ycbcrPipeLayout_) != VK_SUCCESS) {
-        LOG_WARN("BuildYcbcrPipeline: pipeline layout failed");
-        return false;
-    }
-
-    VkShaderModule vert = MakeShaderModule(device_, g_fullscreenVertSpv, sizeof(g_fullscreenVertSpv));
-    VkShaderModule frag = MakeShaderModule(device_, g_sbsYcbcrFragSpv, sizeof(g_sbsYcbcrFragSpv));
-    if (!vert || !frag) {
-        LOG_WARN("BuildYcbcrPipeline: shader module creation failed");
-        return false;
-    }
-    VkPipelineShaderStageCreateInfo stages[2] = {};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vert;
-    stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = frag;
-    stages[1].pName = "main";
-
-    VkPipelineVertexInputStateCreateInfo vi = {
-        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    VkPipelineInputAssemblyStateCreateInfo ia = {
-        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-    vp.viewportCount = 1;
-    vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs = {
-        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_NONE;
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms = {
-        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineColorBlendAttachmentState cba = {};
-    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cb.attachmentCount = 1;
-    cb.pAttachments = &cba;
-    VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dyn = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dyn.dynamicStateCount = 2;
-    dyn.pDynamicStates = dynStates;
-    VkGraphicsPipelineCreateInfo gp = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    gp.stageCount = 2;
-    gp.pStages = stages;
-    gp.pVertexInputState = &vi;
-    gp.pInputAssemblyState = &ia;
-    gp.pViewportState = &vp;
-    gp.pRasterizationState = &rs;
-    gp.pMultisampleState = &ms;
-    gp.pColorBlendState = &cb;
-    gp.pDynamicState = &dyn;
-    gp.layout = ycbcrPipeLayout_;
-    gp.renderPass = renderPass_;
-    VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gp, nullptr, &ycbcrPipeline_);
-    vkDestroyShaderModule(device_, vert, nullptr);
-    vkDestroyShaderModule(device_, frag, nullptr);
-    if (r != VK_SUCCESS) {
-        LOG_WARN("BuildYcbcrPipeline: vkCreateGraphicsPipelines failed: %d", (int)r);
-        return false;
-    }
-
-    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
-    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpci.maxSets = 1;
-    dpci.poolSizeCount = 1;
-    dpci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(device_, &dpci, nullptr, &ycbcrDescPool_) != VK_SUCCESS) {
-        LOG_WARN("BuildYcbcrPipeline: desc pool failed");
-        return false;
-    }
-    VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dsai.descriptorPool = ycbcrDescPool_;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &ycbcrSetLayout_;
-    if (vkAllocateDescriptorSets(device_, &dsai, &ycbcrDescSet_) != VK_SUCCESS) {
-        LOG_WARN("BuildYcbcrPipeline: desc set alloc failed");
-        return false;
-    }
-    ycbcrInited_ = true;
-    LOG_INFO("VulkanRenderer: ycbcr zero-copy pipeline ready (BT.709 %s range)",
-             fullRange ? "full" : "narrow");
-    return true;
-}
-
-VulkanRenderer::SharedImport* VulkanRenderer::ImportSharedNV12(void* handle, uint32_t w,
+VulkanRenderer::SharedImport* VulkanRenderer::ImportSharedRGBA(void* handle, uint32_t w,
                                                                uint32_t h) {
     for (auto& kv : imports_) if (kv.first == handle) return &kv.second;  // already imported
-
-    if (ycbcrConversion_ == VK_NULL_HANDLE) {  // BindSharedNV12 builds it before importing
-        LOG_WARN("ImportSharedNV12: ycbcr conversion not built");
-        return nullptr;
-    }
 
     SharedImport imp;
     VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
     ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.pNext = &ext;
-    ici.flags = 0;  // sampled whole-image via the ycbcr conversion (no per-plane views)
+    ici.flags = 0;
     ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;  // == DXGI_FORMAT_NV12
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;  // == DXGI_FORMAT_R8G8B8A8_UNORM (producer converted)
     ici.extent = {w, h, 1};
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
-    // LINEAR, not OPTIMAL (#28): a D3D11 shared NV12 texture is laid out row-major so it can
-    // be shared across APIs/adapters. Importing it as OPTIMAL makes the driver assume its
-    // opaque tiling and read the UV plane from the wrong offset — the GPU then page-faults on
-    // the sample (device lost), for BOTH per-plane views and a ycbcr conversion. LINEAR matches
-    // the actual shared layout and samples correctly. (MEDIAPLAYER_ZC_OPTIMAL=1 forces the old
-    // OPTIMAL path for A/B debugging.)
-    static const bool zcOptimal = [] {
-        const char* e = std::getenv("MEDIAPLAYER_ZC_OPTIMAL");
+    // OPTIMAL (#28): this shared surface is a D3D11 *render target* (the NV12->RGBA convert
+    // draws into it), which the driver stores tiled — so Vulkan must import it tiled too, or it
+    // reads the tiled bytes as if linear and the image comes out blocky. (Contrast the decoder's
+    // NV12 texture, which is row-major/LINEAR. Single-plane RGBA also avoids the multiplanar
+    // UV-alignment trap that blocked importing the NV12 directly.) MEDIAPLAYER_ZC_LINEAR=1 forces
+    // LINEAR for A/B debugging.
+    static const bool zcLinear = [] {
+        const char* e = std::getenv("MEDIAPLAYER_ZC_LINEAR");
         return e && *e && *e != '0';
     }();
-    ici.tiling = zcOptimal ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR;
-    // #28 probe: MEDIAPLAYER_ZC_DISJOINT binds each plane at an explicit offset (Y at 0, UV
-    // tight after Y) instead of trusting Vulkan's padded UV offset — tests whether the
-    // "scrambled" chroma is the padded-vs-tight UV plane offset mismatch.
-    static const bool zcDisjoint = [] {
-        const char* e = std::getenv("MEDIAPLAYER_ZC_DISJOINT");
-        return e && *e && *e != '0';
-    }();
-    if (zcDisjoint) ici.flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
+    ici.tiling = zcLinear ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
     ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(device_, &ici, nullptr, &imp.image) != VK_SUCCESS) {
-        LOG_WARN("BindSharedNV12: vkCreateImage failed");
+        LOG_WARN("ImportSharedRGBA: vkCreateImage failed");
         return nullptr;
     }
 
@@ -1067,161 +883,65 @@ VulkanRenderer::SharedImport* VulkanRenderer::ImportSharedNV12(void* handle, uin
                            (HANDLE)handle, &hp) == VK_SUCCESS)
             handleTypeBits = hp.memoryTypeBits;
     }
-    // Memory requirements. Disjoint images must be queried per-plane (and allocate one memory
-    // spanning both planes, bound at explicit offsets); the non-disjoint path uses the whole-
-    // image requirement + a dedicated allocation.
-    VkMemoryRequirements2 req2 = {VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
-    uint32_t planeTypeBits = 0xFFFFFFFFu;
-    VkDeviceSize uvAlign = 1;
-    if (zcDisjoint) {
-        auto planeReq = [&](VkImageAspectFlagBits aspect) {
-            VkImagePlaneMemoryRequirementsInfo pinfo = {
-                VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO};
-            pinfo.planeAspect = aspect;
-            VkImageMemoryRequirementsInfo2 info = {
-                VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
-            info.pNext = &pinfo;
-            info.image = imp.image;
-            VkMemoryRequirements2 r = {VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
-            vkGetImageMemoryRequirements2(device_, &info, &r);
-            return r.memoryRequirements;
-        };
-        VkMemoryRequirements ry = planeReq(VK_IMAGE_ASPECT_PLANE_0_BIT);
-        VkMemoryRequirements ruv = planeReq(VK_IMAGE_ASPECT_PLANE_1_BIT);
-        planeTypeBits = ry.memoryTypeBits & ruv.memoryTypeBits;
-        uvAlign = ruv.alignment;
-        req2.memoryRequirements.size = ry.size + ruv.size;  // one span for both planes
-    } else {
-        VkImageMemoryRequirementsInfo2 info = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
-        info.image = imp.image;
-        vkGetImageMemoryRequirements2(device_, &info, &req2);
-        planeTypeBits = req2.memoryRequirements.memoryTypeBits;
-    }
-    const uint32_t chosenType = FindMemoryType(planeTypeBits & handleTypeBits,
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(device_, imp.image, &req);
+    const uint32_t chosenType = FindMemoryType(req.memoryTypeBits & handleTypeBits,
                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    LOG_INFO("zc-import: reqBits=0x%x handleBits=0x%x -> type=%u size=%llu disjoint=%d uvAlign=%llu",
-             planeTypeBits, handleTypeBits, chosenType, (unsigned long long)req2.memoryRequirements.size,
-             (int)zcDisjoint, (unsigned long long)uvAlign);
+    LOG_INFO("zc-import: RGBA reqBits=0x%x handleBits=0x%x -> type=%u size=%llu", req.memoryTypeBits,
+             handleTypeBits, chosenType, (unsigned long long)req.size);
 
-    // Dedicated allocation for the non-disjoint path; disjoint binds planes at offsets so it
-    // must be a plain (non-dedicated) import.
     VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
-    ded.image = imp.image;
+    ded.image = imp.image;  // imported D3D texture memory must be a dedicated allocation
     VkImportMemoryWin32HandleInfoKHR imp32 = {
         VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR};
-    imp32.pNext = zcDisjoint ? nullptr : &ded;
+    imp32.pNext = &ded;
     imp32.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
     imp32.handle = (HANDLE)handle;
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.pNext = &imp32;
-    mai.allocationSize = req2.memoryRequirements.size;
+    mai.allocationSize = req.size;
     mai.memoryTypeIndex = chosenType;
     if (vkAllocateMemory(device_, &mai, nullptr, &imp.memory) != VK_SUCCESS) {
-        LOG_WARN("BindSharedNV12: import vkAllocateMemory failed");
+        LOG_WARN("ImportSharedRGBA: import vkAllocateMemory failed");
         vkDestroyImage(device_, imp.image, nullptr);
         return nullptr;
     }
-    if (zcDisjoint) {
-        // Y at offset 0; UV packed tight after Y (yRowPitch * height), the layout a D3D11
-        // NV12 texture actually uses — vs Vulkan's padded, 4096-aligned default UV offset.
-        VkImageSubresource srY = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0};
-        VkSubresourceLayout lY = {};
-        vkGetImageSubresourceLayout(device_, imp.image, &srY, &lY);
-        VkDeviceSize uvOffset = lY.rowPitch * h;
-        if (uvOffset % uvAlign != 0) {
-            LOG_WARN("BindSharedNV12: tight UV offset %llu not %llu-aligned — cannot bind in place",
-                     (unsigned long long)uvOffset, (unsigned long long)uvAlign);
-            vkFreeMemory(device_, imp.memory, nullptr);
-            vkDestroyImage(device_, imp.image, nullptr);
-            return nullptr;
-        }
-        VkBindImagePlaneMemoryInfo pY = {VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO};
-        pY.planeAspect = VK_IMAGE_ASPECT_PLANE_0_BIT;
-        VkBindImagePlaneMemoryInfo pUV = {VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO};
-        pUV.planeAspect = VK_IMAGE_ASPECT_PLANE_1_BIT;
-        VkBindImageMemoryInfo binds[2] = {
-            {VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, &pY, imp.image, imp.memory, 0},
-            {VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, &pUV, imp.image, imp.memory, uvOffset}};
-        if (vkBindImageMemory2(device_, 2, binds) != VK_SUCCESS) {
-            LOG_WARN("BindSharedNV12: disjoint vkBindImageMemory2 failed (uvOffset=%llu)",
-                     (unsigned long long)uvOffset);
-            vkFreeMemory(device_, imp.memory, nullptr);
-            vkDestroyImage(device_, imp.image, nullptr);
-            return nullptr;
-        }
-        LOG_INFO("zc-import: disjoint bound Y@0 UV@%llu", (unsigned long long)uvOffset);
-    } else if (vkBindImageMemory(device_, imp.image, imp.memory, 0) != VK_SUCCESS) {
-        LOG_WARN("BindSharedNV12: vkBindImageMemory failed");
+    if (vkBindImageMemory(device_, imp.image, imp.memory, 0) != VK_SUCCESS) {
+        LOG_WARN("ImportSharedRGBA: vkBindImageMemory failed");
         vkFreeMemory(device_, imp.memory, nullptr);
         vkDestroyImage(device_, imp.image, nullptr);
         return nullptr;
     }
 
-    // #28 diagnostic: what layout does Vulkan expect for this LINEAR import? Compare against
-    // the D3D11 producer's actual NV12 layout to diagnose the "scrambled" pitch/offset mismatch.
-    {
-        VkImageSubresource srY = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0};
-        VkImageSubresource srUV = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0};
-        VkSubresourceLayout lY = {}, lUV = {};
-        vkGetImageSubresourceLayout(device_, imp.image, &srY, &lY);
-        vkGetImageSubresourceLayout(device_, imp.image, &srUV, &lUV);
-        LOG_INFO("zc-layout: Y off=%llu pitch=%llu size=%llu | UV off=%llu pitch=%llu size=%llu",
-                 (unsigned long long)lY.offset, (unsigned long long)lY.rowPitch,
-                 (unsigned long long)lY.size, (unsigned long long)lUV.offset,
-                 (unsigned long long)lUV.rowPitch, (unsigned long long)lUV.size);
-    }
-
-    // Single whole-image view carrying the ycbcr conversion; the fixed-function conversion
-    // does YUV->RGB and owns the plane layout, so it samples the D3D11-shared NV12 correctly
-    // where manual per-plane R8/R8G8 views faulted the GPU on this driver.
-    VkSamplerYcbcrConversionInfo convInfo = {VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO};
-    convInfo.conversion = ycbcrConversion_;
     VkImageViewCreateInfo v = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    v.pNext = &convInfo;
     v.image = imp.image;
     v.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    v.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
-    v.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-                    VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+    v.format = VK_FORMAT_R8G8B8A8_UNORM;
     v.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(device_, &v, nullptr, &imp.ycbcrView) != VK_SUCCESS) {
-        LOG_WARN("BindSharedNV12: ycbcr view create failed");
+    if (vkCreateImageView(device_, &v, nullptr, &imp.view) != VK_SUCCESS) {
+        LOG_WARN("ImportSharedRGBA: view create failed");
         vkFreeMemory(device_, imp.memory, nullptr);
         vkDestroyImage(device_, imp.image, nullptr);
         return nullptr;
     }
     imports_.emplace_back(handle, imp);
-    LOG_INFO("VulkanRenderer: imported shared NV12 %ux%u (zero-copy #28)", w, h);
+    LOG_INFO("VulkanRenderer: imported shared RGBA %ux%u (zero-copy #28)", w, h);
     return &imports_.back().second;
 }
 
-bool VulkanRenderer::BindSharedNV12(void* sharedHandle, uint32_t width, uint32_t height,
-                                    bool fullRange) {
+bool VulkanRenderer::BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t height) {
     if (!sharedHandle) return false;
-    if (!BuildYcbcrPipeline(fullRange)) return false;  // once; needed before the ycbcr view
-    SharedImport* imp = ImportSharedNV12(sharedHandle, width, height);
+    SharedImport* imp = ImportSharedRGBA(sharedHandle, width, height);
     if (!imp) return false;
     if (planes_[0].view != VK_NULL_HANDLE) DestroyTexture();  // drop CPU planes; sample the import
     sharedActive_ = true;
     sharedImage_ = imp->image;
     sharedMemory_ = imp->memory;
     sharedLayoutReady_ = &imp->layoutReady;
-    sharedYcbcrView_ = imp->ycbcrView;
-    sourceMode_ = 2;  // NV12 (unused by the ycbcr shader, kept for consistency)
-    sourceFullRange_ = fullRange ? 1.0f : 0.0f;
-
-    // Point the ycbcr descriptor set at this import's view. The sampler is immutable in the
-    // set layout, so only the view + layout are written (GENERAL, matching the acquire barrier).
-    VkDescriptorImageInfo dii = {};
-    dii.imageView = sharedYcbcrView_;
-    dii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    w.dstSet = ycbcrDescSet_;
-    w.dstBinding = 0;
-    w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w.pImageInfo = &dii;
-    vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+    sharedView_ = imp->view;
+    sourceMode_ = 0;  // packed RGBA (producer already did YUV->RGB); sampled by the main pipeline
+    sourceFullRange_ = 0.0f;
+    BindDescriptors();  // binds sharedView_ at binding 0, GENERAL layout (see sharedActive_ branch)
     return true;
 }
 
@@ -1229,7 +949,7 @@ void VulkanRenderer::ClearSharedImports() {
     if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
     for (auto& kv : imports_) {
         SharedImport& s = kv.second;
-        if (s.ycbcrView) vkDestroyImageView(device_, s.ycbcrView, nullptr);
+        if (s.view) vkDestroyImageView(device_, s.view, nullptr);
         if (s.image) vkDestroyImage(device_, s.image, nullptr);
         if (s.memory) vkFreeMemory(device_, s.memory, nullptr);
     }
@@ -1238,7 +958,7 @@ void VulkanRenderer::ClearSharedImports() {
     sharedImage_ = VK_NULL_HANDLE;
     sharedMemory_ = VK_NULL_HANDLE;
     sharedLayoutReady_ = nullptr;
-    sharedYcbcrView_ = VK_NULL_HANDLE;
+    sharedView_ = VK_NULL_HANDLE;
 }
 #endif  // _WIN32
 
@@ -1531,14 +1251,6 @@ void VulkanRenderer::Shutdown() {
     vkDeviceWaitIdle(device_);
 #if defined(_WIN32)
     ClearSharedImports();  // zero-copy (#28) imported textures
-    // Tear down the ycbcr zero-copy pipeline (#28).
-    if (ycbcrDescPool_) { vkDestroyDescriptorPool(device_, ycbcrDescPool_, nullptr); ycbcrDescPool_ = VK_NULL_HANDLE; }
-    if (ycbcrPipeline_) { vkDestroyPipeline(device_, ycbcrPipeline_, nullptr); ycbcrPipeline_ = VK_NULL_HANDLE; }
-    if (ycbcrPipeLayout_) { vkDestroyPipelineLayout(device_, ycbcrPipeLayout_, nullptr); ycbcrPipeLayout_ = VK_NULL_HANDLE; }
-    if (ycbcrSetLayout_) { vkDestroyDescriptorSetLayout(device_, ycbcrSetLayout_, nullptr); ycbcrSetLayout_ = VK_NULL_HANDLE; }
-    if (ycbcrSampler_) { vkDestroySampler(device_, ycbcrSampler_, nullptr); ycbcrSampler_ = VK_NULL_HANDLE; }
-    if (ycbcrConversion_) { vkDestroySamplerYcbcrConversion(device_, ycbcrConversion_, nullptr); ycbcrConversion_ = VK_NULL_HANDLE; }
-    ycbcrInited_ = false;
 #endif
     DestroyTexture();
     if (sampler_) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }

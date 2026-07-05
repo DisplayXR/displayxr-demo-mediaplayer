@@ -377,11 +377,12 @@ void App::RenderOneFrame() {
         if (const FrameRing::Frame* vf = video_.Ring().AcquireLatest()) {
             bool bound = false;
 #if defined(_WIN32)
-            // Zero-copy (#28): a GPU frame carries a shared NV12 texture handle — bind it
-            // directly. Falls back to the CPU upload if the import fails.
+            // Zero-copy (#28): a GPU frame carries a shared RGBA texture handle (the producer
+            // converted NV12->RGBA on the D3D side) — bind it directly. Falls back to the CPU
+            // upload if the import fails.
             if (vf->gpu && vf->gpuSharedHandle)
-                bound = renderer_.BindSharedNV12(vf->gpuSharedHandle, (uint32_t)vf->width,
-                                                 (uint32_t)vf->height, vf->fullRange);
+                bound = renderer_.BindSharedRGBA(vf->gpuSharedHandle, (uint32_t)vf->width,
+                                                 (uint32_t)vf->height);
 #endif
             if (!bound) {
                 const bool i420 = (vf->format == PixFormat::I420);

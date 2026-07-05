@@ -16,7 +16,7 @@
 
 namespace mp {
 
-enum class PixFormat { I420, NV12 };  // 3-plane (Y,U,V) or 2-plane (Y, interleaved UV)
+enum class PixFormat { I420, NV12, RGBA };  // 3-plane, 2-plane, or packed RGBA (zero-copy #28)
 
 class FrameRing {
 public:

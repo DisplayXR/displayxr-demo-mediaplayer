@@ -8,7 +8,6 @@ cd "${REPO_DIR}"
 
 glslangValidator -V shaders/fullscreen.vert --vn g_fullscreenVertSpv -o /tmp/_v.h
 glslangValidator -V shaders/sbs.frag        --vn g_sbsFragSpv        -o /tmp/_f.h
-glslangValidator -V shaders/sbs_ycbcr.frag  --vn g_sbsYcbcrFragSpv    -o /tmp/_fy.h
 
 {
   cat <<'HDR'
@@ -25,8 +24,6 @@ HDR
   grep -v -E '^\s*//|#pragma once' /tmp/_v.h
   echo
   grep -v -E '^\s*//|#pragma once' /tmp/_f.h
-  echo
-  grep -v -E '^\s*//|#pragma once' /tmp/_fy.h
 } > src/rhi/Shaders.h
 
 echo "Wrote src/rhi/Shaders.h"

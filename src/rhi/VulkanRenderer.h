@@ -84,7 +84,7 @@ public:
     // (cached per handle) and its two planes bound as Y (R8) + UV (R8G8); DrawViews syncs
     // the D3D11 producer copy against the sample with a keyed mutex. Returns false (caller
     // falls back to UploadYUV) on any import failure.
-    bool BindSharedNV12(void* sharedHandle, uint32_t width, uint32_t height, bool fullRange);
+    bool BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t height);
     // Release all imported shared textures (call on media change / shutdown).
     void ClearSharedImports();
 #endif
@@ -155,38 +155,24 @@ private:
     float sourceFullRange_ = 0.0f;
 
 #if defined(_WIN32)
-    // Zero-copy interop state (#28). imports_ caches one entry per shared handle; the bound
-    // entry's ycbcr view feeds a dedicated ycbcr pipeline/descriptor set (a manual per-plane
-    // R8/R8G8 sample of a D3D11-shared NV12 texture faults the GPU on this driver — the
-    // fixed-function VkSamplerYcbcrConversion owns the plane layout, so it samples correctly).
-    // The bound entry's memory drives the per-frame EXTERNAL->graphics ownership acquire in
-    // DrawViews.
+    // Zero-copy interop state (#28). imports_ caches one entry per shared handle. The producer
+    // converts the decoded NV12 to a packed RGBA texture on the D3D side, so we import a plain
+    // single-plane RGBA image (offset 0, no multiplanar plane-alignment mismatch) and sample it
+    // through the main pipeline as mode 0. The bound entry's memory drives the per-frame
+    // EXTERNAL->graphics ownership acquire in DrawViews.
     struct SharedImport {
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView ycbcrView = VK_NULL_HANDLE;  // single G8_B8R8_2PLANE view + ycbcr conversion
+        VkImageView view = VK_NULL_HANDLE;       // single R8G8B8A8 color view
         bool layoutReady = false;                // acquired UNDEFINED->GENERAL once
     };
     std::vector<std::pair<void*, SharedImport>> imports_;  // keyed by shared handle
-    bool sharedActive_ = false;                // current frame is a shared NV12 texture
+    bool sharedActive_ = false;                // current frame is a shared RGBA texture
     VkDeviceMemory sharedMemory_ = VK_NULL_HANDLE;  // bound import's memory
     VkImage sharedImage_ = VK_NULL_HANDLE;
-    VkImageView sharedYcbcrView_ = VK_NULL_HANDLE;  // bound import's ycbcr view
+    VkImageView sharedView_ = VK_NULL_HANDLE;  // bound import's RGBA view
     bool* sharedLayoutReady_ = nullptr;        // -> bound import's layoutReady
-    SharedImport* ImportSharedNV12(void* handle, uint32_t w, uint32_t h);
-
-    // Dedicated ycbcr blit pipeline for the zero-copy path (built once, on first shared
-    // frame — needs the stream's range). Separate from pipeline_ because the immutable
-    // ycbcr sampler must be baked into its own single-binding descriptor set layout.
-    VkSamplerYcbcrConversion ycbcrConversion_ = VK_NULL_HANDLE;
-    VkSampler ycbcrSampler_ = VK_NULL_HANDLE;   // immutable, carries the conversion
-    VkDescriptorSetLayout ycbcrSetLayout_ = VK_NULL_HANDLE;
-    VkPipelineLayout ycbcrPipeLayout_ = VK_NULL_HANDLE;
-    VkPipeline ycbcrPipeline_ = VK_NULL_HANDLE;
-    VkDescriptorPool ycbcrDescPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet ycbcrDescSet_ = VK_NULL_HANDLE;
-    bool ycbcrInited_ = false;
-    bool BuildYcbcrPipeline(bool fullRange);
+    SharedImport* ImportSharedRGBA(void* handle, uint32_t w, uint32_t h);
 #endif
     VkImage dummyImage_ = VK_NULL_HANDLE;       // 1x1, bound to unused plane slots
     VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
