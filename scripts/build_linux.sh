@@ -18,7 +18,7 @@
 #   SDL3 needs when built from source.
 #
 # Env:
-#   OPENXR_VERSION   OpenXR-SDK release tag for the loader (default 1.1.43).
+#   OPENXR_VERSION   OpenXR-SDK release tag for the loader (default 1.1.51).
 #                    Keep this pin equal to CMakeLists.txt's FetchContent
 #                    GIT_TAG — CI runs this script, so the CI pin follows.
 
@@ -32,7 +32,7 @@ cd "$REPO_ROOT"
 # /tmp/openxr-install (mirrors build_macos.sh + the runtime repo's
 # scripts/build_linux.sh --apps). Cached: skipped if both the .so and the
 # CMake package config are already present.
-OPENXR_VERSION="${OPENXR_VERSION:-1.1.43}"
+OPENXR_VERSION="${OPENXR_VERSION:-1.1.51}"
 OPENXR_DIR="/tmp/openxr-install"
 if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.so" ] || \
    [ ! -f "$OPENXR_DIR/lib/cmake/openxr/OpenXRConfig.cmake" ]; then

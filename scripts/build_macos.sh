@@ -10,7 +10,7 @@
 # Env:
 #   DISPLAYXR_VERSION   version string baked into the .pkg + .app Info.plist
 #                       (defaults to 0.0.0-dev). CI sets this from the v* git tag.
-#   OPENXR_VERSION      OpenXR-SDK release tag for the loader (default 1.1.43).
+#   OPENXR_VERSION      OpenXR-SDK release tag for the loader (default 1.1.51).
 
 set -euo pipefail
 
@@ -29,7 +29,7 @@ done
 # --- 0. Build OpenXR loader from source -----------------------------------
 # Homebrew has no openxr-loader formula; build the Khronos loader and install
 # it under /tmp/openxr-install (mirrors the runtime repo + sibling demos).
-OPENXR_VERSION="${OPENXR_VERSION:-1.1.43}"
+OPENXR_VERSION="${OPENXR_VERSION:-1.1.51}"
 OPENXR_DIR="/tmp/openxr-install"
 if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.dylib" ]; then
     echo "==> Building OpenXR loader $OPENXR_VERSION -> $OPENXR_DIR"

@@ -3,7 +3,7 @@
   "id": "mediaplayer",
   "name": "Media Player",
   "type": "3d",
-  "category": "app",
+  "category": "demo",
   "display_mode": "auto",
   "description": "Two-view video and image player for 3D displays",
   "icon": "icon.png",
