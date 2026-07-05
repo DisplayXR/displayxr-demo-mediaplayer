@@ -375,10 +375,21 @@ void App::RenderOneFrame() {
     // does the colour convert + downscale, so no swscale ran on the decode thread.
     if (isVideo_) {
         if (const FrameRing::Frame* vf = video_.Ring().AcquireLatest()) {
-            const bool i420 = (vf->format == PixFormat::I420);
-            renderer_.UploadYUV(vf->plane[0].data(), vf->plane[1].data(),
-                                i420 ? vf->plane[2].data() : nullptr, (uint32_t)vf->width,
-                                (uint32_t)vf->height, i420 ? 0 : 1, vf->fullRange);
+            bool bound = false;
+#if defined(_WIN32)
+            // Zero-copy (#28): a GPU frame carries a shared RGBA texture handle (the producer
+            // converted NV12->RGBA on the D3D side) — bind it directly. Falls back to the CPU
+            // upload if the import fails.
+            if (vf->gpu && vf->gpuSharedHandle)
+                bound = renderer_.BindSharedRGBA(vf->gpuSharedHandle, (uint32_t)vf->width,
+                                                 (uint32_t)vf->height);
+#endif
+            if (!bound) {
+                const bool i420 = (vf->format == PixFormat::I420);
+                renderer_.UploadYUV(vf->plane[0].data(), vf->plane[1].data(),
+                                    i420 ? vf->plane[2].data() : nullptr, (uint32_t)vf->width,
+                                    (uint32_t)vf->height, i420 ? 0 : 1, vf->fullRange);
+            }
         }
     }
 
@@ -900,6 +911,14 @@ void App::Shutdown() {
 bool App::LoadMedia(const std::string& path) {
     const MediaInfo info = MediaSource::Identify(path);
     if (info.kind == MediaKind::Video) {
+#if defined(_WIN32)
+        // Zero-copy decode (#28): pin the D3D11VA decode device to the Vulkan adapter so
+        // decoded surfaces can be shared into Vulkan without a CPU round trip. OPT-IN during
+        // bring-up (MEDIAPLAYER_ZEROCOPY=1) — the CPU-upload path remains the default.
+        const char* zc = std::getenv("MEDIAPLAYER_ZEROCOPY");
+        if (zc && *zc && *zc != '0' && xr_.ZeroCopyCapable() && xr_.DeviceLUIDValid())
+            video_.SetInteropAdapterLUID(xr_.DeviceLUID());
+#endif
         if (!video_.Open(path)) {
             LOG_ERROR("Open: cannot decode video '%s'", path.c_str());
             return false;
@@ -991,6 +1010,10 @@ bool App::LoadMedia(const std::string& path) {
 void App::ReloadMedia(const std::string& path) {
     video_.Stop();   // joins the decode thread (which reads the audio clock) FIRST,
     audio_.Stop();   // then tear down audio so the clock callback can't outlive it.
+#if defined(_WIN32)
+    // Release zero-copy imports tied to the just-stopped decoder's shared textures (#28).
+    renderer_.ClearSharedImports();
+#endif
     isVideo_ = false;
     scrubValue_ = 0.0f;
     scrubActive_ = false;

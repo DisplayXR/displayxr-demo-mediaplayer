@@ -260,10 +260,46 @@ bool XrSession::CreateVulkanDevice() {
     if (hasPortabilityEnum) {
         ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     }
+    // Opt-in Vulkan validation for interop debugging (#28): MEDIAPLAYER_VK_VALIDATION=1.
+    const char* kValLayer = "VK_LAYER_KHRONOS_validation";
+    const bool wantValidation = [] {
+        const char* e = std::getenv("MEDIAPLAYER_VK_VALIDATION");
+        return e && *e && *e != '0';
+    }();
+    if (wantValidation) {
+        instExtPtrs.push_back("VK_EXT_debug_utils");
+        ici.enabledExtensionCount = (uint32_t)instExtPtrs.size();
+        ici.ppEnabledExtensionNames = instExtPtrs.data();
+        ici.enabledLayerCount = 1;
+        ici.ppEnabledLayerNames = &kValLayer;
+        LOG_INFO("Vulkan validation layer requested (interop debug)");
+    }
 
     if (vkCreateInstance(&ici, nullptr, &vkInstance_) != VK_SUCCESS) {
         LOG_ERROR("vkCreateInstance failed");
         return false;
+    }
+    if (wantValidation) {
+        auto pfnCreate = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            vkInstance_, "vkCreateDebugUtilsMessengerEXT");
+        if (pfnCreate) {
+            VkDebugUtilsMessengerCreateInfoEXT dci = {
+                VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+            dci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            dci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+            dci.pfnUserCallback = [](VkDebugUtilsMessageSeverityFlagBitsEXT,
+                                     VkDebugUtilsMessageTypeFlagsEXT,
+                                     const VkDebugUtilsMessengerCallbackDataEXT* d,
+                                     void*) -> VkBool32 {
+                LOG_ERROR("[vk-validation] %s", d->pMessage);
+                return VK_FALSE;
+            };
+            VkDebugUtilsMessengerEXT msg = VK_NULL_HANDLE;
+            pfnCreate(vkInstance_, &dci, nullptr, &msg);
+        }
     }
 
     // ---- VkPhysicalDevice: the one the runtime is using.
@@ -320,6 +356,28 @@ bool XrSession::CreateVulkanDevice() {
         devExtStorage.push_back("VK_KHR_portability_subset");
     }
 
+#if defined(_WIN32)
+    // Zero-copy decode (issue #28): import a D3D11VA-decoded NV12 surface straight into
+    // Vulkan instead of the per-frame GPU->CPU->GPU round trip. Needs external-memory +
+    // its Win32 handle variant; the ycbcr/bind/mem-reqs helpers are core in 1.1 (only
+    // listed here if the driver still exposes them as separate extensions). All guarded
+    // by deviceHas(), so a driver lacking any of them simply leaves zeroCopyCapable_ off
+    // and playback keeps using the CPU-download path.
+    auto alreadyEnabled = [&](const char* name) {
+        for (auto& n : devExtStorage) if (n == name) return true;
+        return false;
+    };
+    for (const char* ext : {"VK_KHR_external_memory", "VK_KHR_external_memory_win32",
+                            "VK_KHR_win32_keyed_mutex", "VK_KHR_sampler_ycbcr_conversion",
+                            "VK_KHR_bind_memory2", "VK_KHR_get_memory_requirements2"}) {
+        if (deviceHas(ext) && !alreadyEnabled(ext)) devExtStorage.push_back(ext);
+    }
+    // Zero-copy needs both external-memory-win32 (import the D3D11 NV12 surface) and
+    // win32-keyed-mutex (sync the D3D11 copy against the Vulkan sample).
+    zeroCopyCapable_ = deviceHas("VK_KHR_external_memory_win32") &&
+                       deviceHas("VK_KHR_win32_keyed_mutex");
+#endif
+
     std::vector<const char*> devExtPtrs;
     for (auto& n : devExtStorage) {
         devExtPtrs.push_back(n.c_str());
@@ -346,6 +404,26 @@ bool XrSession::CreateVulkanDevice() {
     }
     vkGetDeviceQueue(device_, queueFamilyIndex_, 0, &graphicsQueue_);
     LOG_INFO("Vulkan device + graphics queue created (family %u)", queueFamilyIndex_);
+
+#if defined(_WIN32)
+    // Record the physical device's adapter LUID so the D3D11VA decode device can be
+    // pinned to the SAME adapter (issue #28); a mismatch (iGPU+dGPU laptops) makes a
+    // shared NV12 handle un-importable, in which case we fall back to the CPU path.
+    if (zeroCopyCapable_) {
+        VkPhysicalDeviceIDProperties idProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        props2.pNext = &idProps;
+        vkGetPhysicalDeviceProperties2(physicalDevice_, &props2);
+        if (idProps.deviceLUIDValid) {
+            std::memcpy(deviceLUID_, idProps.deviceLUID, VK_LUID_SIZE);
+            deviceLUIDValid_ = true;
+        }
+        LOG_INFO("Zero-copy decode: interop-capable (external_memory_win32), LUID %s",
+                 deviceLUIDValid_ ? "acquired" : "unavailable");
+    } else {
+        LOG_INFO("Zero-copy decode: unavailable (no VK_KHR_external_memory_win32) — CPU upload path");
+    }
+#endif
     return true;
 }
 

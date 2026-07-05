@@ -78,7 +78,23 @@ public:
     bool UploadYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2,
                    uint32_t width, uint32_t height, int format, bool fullRange);
 
-    bool HasTexture() const { return planes_[0].view != VK_NULL_HANDLE; }
+#if defined(_WIN32)
+    // Zero-copy (#28): bind a shared D3D11 NV12 texture (by its shared NT handle) as the
+    // video source instead of uploading CPU planes. The texture is imported into Vulkan
+    // (cached per handle) and its two planes bound as Y (R8) + UV (R8G8); DrawViews syncs
+    // the D3D11 producer copy against the sample with a keyed mutex. Returns false (caller
+    // falls back to UploadYUV) on any import failure.
+    bool BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t height);
+    // Release all imported shared textures (call on media change / shutdown).
+    void ClearSharedImports();
+#endif
+
+    bool HasTexture() const {
+#if defined(_WIN32)
+        if (sharedActive_) return true;
+#endif
+        return planes_[0].view != VK_NULL_HANDLE;
+    }
 
     // Draw the uploaded texture into each view's tile, sampling the UV sub-region in
     // `uvs[v]`. Clears the rest of the image to black. Blocks until the GPU finishes.
@@ -102,6 +118,7 @@ private:
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
+    uint32_t queueFamilyIndex_ = 0;  // graphics family; needed for the #28 external->graphics acquire
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
@@ -136,6 +153,27 @@ private:
     } planes_[3];
     int sourceMode_ = 0;             // 0 RGBA, 1 I420, 2 NV12 (pushed to the shader)
     float sourceFullRange_ = 0.0f;
+
+#if defined(_WIN32)
+    // Zero-copy interop state (#28). imports_ caches one entry per shared handle. The producer
+    // converts the decoded NV12 to a packed RGBA texture on the D3D side, so we import a plain
+    // single-plane RGBA image (offset 0, no multiplanar plane-alignment mismatch) and sample it
+    // through the main pipeline as mode 0. The bound entry's memory drives the per-frame
+    // EXTERNAL->graphics ownership acquire in DrawViews.
+    struct SharedImport {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;       // single R8G8B8A8 color view
+        bool layoutReady = false;                // acquired UNDEFINED->GENERAL once
+    };
+    std::vector<std::pair<void*, SharedImport>> imports_;  // keyed by shared handle
+    bool sharedActive_ = false;                // current frame is a shared RGBA texture
+    VkDeviceMemory sharedMemory_ = VK_NULL_HANDLE;  // bound import's memory
+    VkImage sharedImage_ = VK_NULL_HANDLE;
+    VkImageView sharedView_ = VK_NULL_HANDLE;  // bound import's RGBA view
+    bool* sharedLayoutReady_ = nullptr;        // -> bound import's layoutReady
+    SharedImport* ImportSharedRGBA(void* handle, uint32_t w, uint32_t h);
+#endif
     VkImage dummyImage_ = VK_NULL_HANDLE;       // 1x1, bound to unused plane slots
     VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
     VkImageView dummyView_ = VK_NULL_HANDLE;

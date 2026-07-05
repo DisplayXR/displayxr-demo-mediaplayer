@@ -16,7 +16,7 @@
 
 namespace mp {
 
-enum class PixFormat { I420, NV12 };  // 3-plane (Y,U,V) or 2-plane (Y, interleaved UV)
+enum class PixFormat { I420, NV12, RGBA };  // 3-plane, 2-plane, or packed RGBA (zero-copy #28)
 
 class FrameRing {
 public:
@@ -29,7 +29,20 @@ public:
         PixFormat format = PixFormat::I420;
         bool fullRange = false;       // JPEG/full vs MPEG/limited range
         int64_t serial = 0;           // monotonic; lets the consumer detect newness
+
+        // Zero-copy interop (#28, Windows). When gpu==true the pixels live in a shared
+        // D3D11 NV12 texture (below) instead of the CPU plane[] buffers; the decode thread
+        // CopySubresourceRegion's the decoded surface into it and the renderer imports +
+        // samples it. Persistent per slot, owned by the decoder. Coherence is a CPU
+        // event-query wait before Publish() (no keyed mutex — the shared texture uses the
+        // legacy D3D11_RESOURCE_MISC_SHARED KMT handle). plane[] stays empty in this mode.
+        bool gpu = false;
+        void* gpuSharedTexture = nullptr;  // ID3D11Texture2D* (per-slot, decoder-owned)
+        void* gpuSharedHandle = nullptr;   // legacy KMT shared handle for Vulkan import
     };
+
+    static constexpr int kBufferCount = 3;
+    Frame& BufferSlot(int i) { return buffers_[i]; }  // producer-side GPU resource mgmt
 
     // --- Producer (decode thread) ---
     // The buffer to fill, then Publish() to hand it to the consumer.
