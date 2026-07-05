@@ -72,6 +72,24 @@ perf headroom.
   platform API behind `#ifdef`. (This is a thin client app, so the surface is
   small — window/surface creation and the video-decode hwaccel selection.)
 
+### Linux dev build (build-green, issue #30)
+
+`./scripts/build_linux.sh` — system Vulkan + from-source OpenXR loader (pinned
+`release-1.1.43`, kept equal to the CMake FetchContent `GIT_TAG`), then a Ninja
+Release build of `mediaplayer_handle_vk_linux`. Deps: see the apt list in
+`.github/workflows/build-linux.yml` (base toolchain + FFmpeg dev packages +
+the X11/Wayland/ALSA headers SDL3 needs when built from source). That workflow
+is **non-required** and fires only on `workflow_dispatch` + `linux*` branches.
+`scripts/run_mediaplayer_handle_vk_linux.sh` sets the dev-runtime env
+(`XR_RUNTIME_JSON`, `XRT_PLUGIN_SEARCH_PATH`, `OXR_ENABLE_VK_NATIVE_COMPOSITOR=1`,
+`SIM_DISPLAY_OUTPUT=anaglyph`).
+
+**Status: BUILD-GREEN only.** On-screen is gated on the runtime's Linux
+Phase 1b + hardware, and on a Linux window-binding extension (none exists —
+only cocoa/win32 are vendored), so `Window.cpp`/`XrSession.cpp` currently no-op
+the native handle/binding on Linux. Recipe: the runtime repo's
+`docs/guides/linux-demo-port.md`.
+
 ## Run / test
 
 This app **requires a running/installed DisplayXR runtime**. Point the loader at a

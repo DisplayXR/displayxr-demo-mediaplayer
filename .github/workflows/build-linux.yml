@@ -1,0 +1,58 @@
+name: Build Linux
+
+# mediaplayer Linux build-green dev loop (issue #30; recipe: the runtime repo's
+# docs/guides/linux-demo-port.md).
+#
+# DELIBERATELY NOT a required check. It does NOT run on PRs or pushes to main —
+# only on manual dispatch and `linux*` branches — so it can't gate unrelated
+# work while the port is in progress. Promote to a PR-triggered required check
+# (with the DetectChanges docs_only short-circuit the macOS/Windows jobs use)
+# only once it passes reliably.
+#
+# Build-green scope: compile mediaplayer_handle_vk_linux on ubuntu-latest.
+# CI has no display/GPU, so the app is never run here; on-screen validation is
+# a separate pass gated on the runtime's Linux Phase 1b + hardware.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - 'linux'
+      - 'linux-**'
+      - 'feature/linux-**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Beyond the playbook's base list: FFmpeg dev packages (else the whole
+      # media path — including the Linux VAAPI branch — silently compiles out
+      # behind MEDIAPLAYER_WITH_FFMPEG), and the X11/Wayland + ALSA headers
+      # SDL3 needs to build meaningful video/audio backends from source (this
+      # demo is a _handle app that opens its own SDL window).
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libavformat-dev libavcodec-dev libavutil-dev \
+            libswscale-dev libswresample-dev \
+            libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev
+
+      - name: Build (build-green; app is not run — no display on CI)
+        run: ./scripts/build_linux.sh
+
+      # Guard against a hollow green: FFmpeg must have resolved via pkg-config
+      # so the media/VAAPI path actually compiled.
+      - name: Assert FFmpeg media path compiled
+        run: |
+          grep -q "pkgcfg_lib_FFMPEG_avcodec" build/CMakeCache.txt || {
+            echo "::error::FFmpeg was not found via pkg-config — media path compiled out"; exit 1; }
