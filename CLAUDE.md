@@ -75,7 +75,7 @@ perf headroom.
 ### Linux dev build (build-green, issue #30)
 
 `./scripts/build_linux.sh` — system Vulkan + from-source OpenXR loader (pinned
-`release-1.1.43`, kept equal to the CMake FetchContent `GIT_TAG`), then a Ninja
+`release-1.1.51`, kept equal to the CMake FetchContent `GIT_TAG`), then a Ninja
 Release build of `mediaplayer_handle_vk_linux`. Deps: see the apt list in
 `.github/workflows/build-linux.yml` (base toolchain + FFmpeg dev packages +
 the X11/Wayland/ALSA headers SDL3 needs when built from source). That workflow

@@ -54,7 +54,7 @@ else()
     set(CMAKE_MAP_IMPORTED_CONFIG_RELEASE ";RELEASE;NOCONFIG")
     FetchContent_Declare(OpenXR
         GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git
-        GIT_TAG release-1.1.43
+        GIT_TAG release-1.1.51
         GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(OpenXR)
     set(MP_OPENXR_LOADER openxr_loader)

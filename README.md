@@ -100,4 +100,4 @@ release was validated against.
 
 ## License
 
-TBD (match the DisplayXR demo convention).
+Apache-2.0 — see `LICENSE`. Bundled media samples carry their own licenses.
