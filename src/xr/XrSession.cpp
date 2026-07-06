@@ -261,9 +261,15 @@ bool XrSession::CreateVulkanDevice() {
     ici.pApplicationInfo = &appInfo;
     ici.enabledExtensionCount = (uint32_t)instExtPtrs.size();
     ici.ppEnabledExtensionNames = instExtPtrs.data();
+#if defined(__APPLE__)
+    // Guarded like the detection block above: only Apple needs the portability
+    // flag, and pre-1.3.215 Vulkan headers (Ubuntu 22.04) lack the constant.
     if (hasPortabilityEnum) {
         ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     }
+#else
+    (void)hasPortabilityEnum;
+#endif
     // Opt-in Vulkan validation for interop debugging (#28): MEDIAPLAYER_VK_VALIDATION=1.
     const char* kValLayer = "VK_LAYER_KHRONOS_validation";
     const bool wantValidation = [] {
