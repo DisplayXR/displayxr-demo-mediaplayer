@@ -261,9 +261,11 @@ bool XrSession::CreateVulkanDevice() {
     ici.pApplicationInfo = &appInfo;
     ici.enabledExtensionCount = (uint32_t)instExtPtrs.size();
     ici.ppEnabledExtensionNames = instExtPtrs.data();
+#ifdef VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
     if (hasPortabilityEnum) {
         ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     }
+#endif
     // Opt-in Vulkan validation for interop debugging (#28): MEDIAPLAYER_VK_VALIDATION=1.
     const char* kValLayer = "VK_LAYER_KHRONOS_validation";
     const bool wantValidation = [] {

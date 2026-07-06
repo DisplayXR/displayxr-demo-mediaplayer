@@ -373,7 +373,11 @@ bool VideoDecoder::Open(const std::string& path) {
         return false;
     }
 
-    const AVCodec* dec = nullptr;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 0, 100)
+    const AVCodec* dec = nullptr;  // av_find_best_stream decoder_ret const-ified in ffmpeg 5.0
+#else
+    AVCodec* dec = nullptr;
+#endif
     impl_->videoStream = av_find_best_stream(impl_->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
     if (impl_->videoStream < 0 || !dec) {
         LOG_ERROR("VideoDecoder: no video stream in '%s'", path.c_str());
