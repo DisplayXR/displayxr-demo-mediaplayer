@@ -373,7 +373,11 @@ bool VideoDecoder::Open(const std::string& path) {
         return false;
     }
 
+#if LIBAVFORMAT_VERSION_MAJOR >= 59
     const AVCodec* dec = nullptr;
+#else
+    AVCodec* dec = nullptr;  // ffmpeg 4.x (Ubuntu 22.04): out-param not yet const
+#endif
     impl_->videoStream = av_find_best_stream(impl_->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
     if (impl_->videoStream < 0 || !dec) {
         LOG_ERROR("VideoDecoder: no video stream in '%s'", path.c_str());
