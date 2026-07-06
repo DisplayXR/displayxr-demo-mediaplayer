@@ -56,7 +56,11 @@ bool AudioPlayer::Open(const std::string& path) {
         impl_.reset();
         return false;
     }
-    const AVCodec* dec = nullptr;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 0, 100)
+    const AVCodec* dec = nullptr;  // av_find_best_stream decoder_ret const-ified in ffmpeg 5.0
+#else
+    AVCodec* dec = nullptr;
+#endif
     impl_->audioStream = av_find_best_stream(impl_->fmt, AVMEDIA_TYPE_AUDIO, -1, -1, &dec, 0);
     if (impl_->audioStream < 0 || !dec) {  // no audio stream — silent playback
         impl_.reset();
@@ -76,6 +80,8 @@ bool AudioPlayer::Open(const std::string& path) {
 
     // Resample to interleaved float stereo at the source rate (SDL converts to the
     // device rate). Guard an unset input layout (older streams).
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 24, 100)
+    // ffmpeg >= 5.1: AVChannelLayout API
     if (impl_->codec->ch_layout.nb_channels <= 0) {
         av_channel_layout_default(&impl_->codec->ch_layout, 2);
     }
@@ -85,6 +91,18 @@ bool AudioPlayer::Open(const std::string& path) {
                                  &impl_->codec->ch_layout, impl_->codec->sample_fmt,
                                  impl_->codec->sample_rate, 0, nullptr);
     av_channel_layout_uninit(&outLayout);
+#else
+    // ffmpeg < 5.1 (e.g. Ubuntu 22.04's 4.4): legacy uint64 channel-mask API
+    int64_t inLayout = impl_->codec->channel_layout;
+    if (inLayout == 0) {
+        inLayout = av_get_default_channel_layout(impl_->codec->channels > 0 ? impl_->codec->channels : 2);
+    }
+    int64_t outLayout = av_get_default_channel_layout(impl_->outChannels);
+    impl_->swr = swr_alloc_set_opts(impl_->swr, outLayout, AV_SAMPLE_FMT_FLT, impl_->outRate,
+                                    inLayout, impl_->codec->sample_fmt, impl_->codec->sample_rate,
+                                    0, nullptr);
+    int rc = impl_->swr ? 0 : -1;
+#endif
     if (rc < 0 || swr_init(impl_->swr) < 0) {
         LOG_WARN("AudioPlayer: swr init failed — silent");
         impl_.reset();
@@ -115,8 +133,13 @@ bool AudioPlayer::Open(const std::string& path) {
     stop_ = false;
     paused_.store(false);
     seekRequest_.store(-1.0);
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 24, 100)
+    const int nbChannels = impl_->codec->ch_layout.nb_channels;
+#else
+    const int nbChannels = impl_->codec->channels;
+#endif
     LOG_INFO("AudioPlayer: '%s' %s %dch %dHz", dec->name,
-             av_get_sample_fmt_name(impl_->codec->sample_fmt), impl_->codec->ch_layout.nb_channels,
+             av_get_sample_fmt_name(impl_->codec->sample_fmt), nbChannels,
              impl_->codec->sample_rate);
     thread_ = std::thread(&AudioPlayer::DecodeLoop, this);
     return true;
