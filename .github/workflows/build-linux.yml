@@ -3,14 +3,21 @@ name: Build Linux
 # mediaplayer Linux build-green dev loop (issue #30; recipe: the runtime repo's
 # docs/guides/linux-demo-port.md).
 #
+# TRI-LTS MATRIX (mirrors displayxr-demo-modelviewer): the deployment target is
+# Ubuntu 26.04 + Intel iGPU, but we also keep 22.04 (where render can be
+# validated on hand today) and 24.04 green — so "build-green" means "builds on
+# every supported toolchain (GCC 11 / 13 / 15, ffmpeg 4.4 / 6 / 7)", not just
+# whatever ubuntu-latest happens to be. 22.04/24.04 use hosted runners; 26.04
+# runs in a container (no hosted 26.04 runner yet).
+#
 # DELIBERATELY NOT a required check. It does NOT run on PRs or pushes to main —
 # only on manual dispatch and `linux*` branches — so it can't gate unrelated
 # work while the port is in progress. Promote to a PR-triggered required check
 # (with the DetectChanges docs_only short-circuit the macOS/Windows jobs use)
 # only once it passes reliably.
 #
-# Build-green scope: compile mediaplayer_handle_vk_linux on ubuntu-latest.
-# CI has no display/GPU, so the app is never run here; on-screen validation is
+# Build-green scope: compile mediaplayer_handle_vk_linux. CI has no
+# display/GPU, so the app is never run here; on-screen validation is
 # a separate pass gated on the runtime's Linux Phase 1b + hardware.
 
 on:
@@ -27,8 +34,29 @@ concurrency:
 
 jobs:
   Build:
-    runs-on: ubuntu-latest
+    name: Build (Ubuntu ${{ matrix.lts }})
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lts: "22.04"
+            runner: ubuntu-22.04
+          - lts: "24.04"
+            runner: ubuntu-24.04
+          - lts: "26.04"
+            runner: ubuntu-latest
+            container: ubuntu:26.04
     steps:
+      # In the 26.04 container we start as root with a bare image — install git
+      # BEFORE checkout (which shells out to git). No-op on the hosted runners.
+      - name: Bootstrap container (git for checkout)
+        run: |
+          if [ "$(id -u)" = "0" ] && ! command -v git >/dev/null; then
+            apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+          fi
+
       - uses: actions/checkout@v5
 
       # Beyond the playbook's base list: FFmpeg dev packages (else the whole
@@ -39,16 +67,20 @@ jobs:
       # libxcb-glx0-dev: once GL/EGL headers are present, OpenXR-SDK-Source
       # flips on GLX platform support — the loader includes <xcb/glx.h> and
       # its openxr-gfxwrapper test helper links Xxf86vm.
+      # SUDO shim so the same step works on hosted runners (non-root, has sudo)
+      # and in the container (root, no sudo). Vendor-neutral libegl-dev/libgl-dev
+      # so the names resolve across 22.04/24.04/26.04.
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config \
+          SUDO=""; [ "$(id -u)" != "0" ] && SUDO=sudo
+          $SUDO apt-get update
+          $SUDO apt-get install -y \
+            build-essential cmake ninja-build pkg-config git ca-certificates curl \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libavformat-dev libavcodec-dev libavutil-dev \
             libswscale-dev libswresample-dev \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
-            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
             libxxf86vm-dev libxcb-glx0-dev
 
       - name: Build (build-green; app is not run — no display on CI)
