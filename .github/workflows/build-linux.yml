@@ -22,6 +22,7 @@ name: Build Linux
 
 on:
   workflow_dispatch: {}
+  pull_request: {}
   push:
     branches:
       - 'linux'
@@ -29,12 +30,37 @@ on:
       - 'feature/linux-**'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Detected non-PR trigger — docs_only=false"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Detected docs_only=$(grep ^docs_only= "$GITHUB_OUTPUT" | cut -d= -f2)"
+
   Build:
     name: Build (Ubuntu ${{ matrix.lts }})
+    needs: DetectChanges
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     strategy:
@@ -49,15 +75,21 @@ jobs:
             runner: ubuntu-latest
             container: ubuntu:26.04
     steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
       # In the 26.04 container we start as root with a bare image — install git
       # BEFORE checkout (which shells out to git). No-op on the hosted runners.
       - name: Bootstrap container (git for checkout)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           if [ "$(id -u)" = "0" ] && ! command -v git >/dev/null; then
             apt-get update && apt-get install -y --no-install-recommends git ca-certificates
           fi
 
       - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
 
       # Beyond the playbook's base list: FFmpeg dev packages (else the whole
       # media path — including the Linux VAAPI branch — silently compiles out
@@ -71,6 +103,7 @@ jobs:
       # and in the container (root, no sudo). Vendor-neutral libegl-dev/libgl-dev
       # so the names resolve across 22.04/24.04/26.04.
       - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           SUDO=""; [ "$(id -u)" != "0" ] && SUDO=sudo
           $SUDO apt-get update
@@ -84,11 +117,13 @@ jobs:
             libxxf86vm-dev libxcb-glx0-dev
 
       - name: Build (build-green; app is not run — no display on CI)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh
 
       # Guard against a hollow green: FFmpeg must have resolved via pkg-config
       # so the media/VAAPI path actually compiled.
       - name: Assert FFmpeg media path compiled
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           grep -q "pkgcfg_lib_FFMPEG_avcodec" build/CMakeCache.txt || {
             echo "::error::FFmpeg was not found via pkg-config — media path compiled out"; exit 1; }
