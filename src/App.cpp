@@ -149,7 +149,21 @@ bool App::Initialize(const char* mediaPath) {
     }
     if (!window_.Create("DisplayXR Stereo Media Player", winW, winH)) return false;
 
-    if (!xr_.Initialize(window_.NativeHandle())) {
+    // Open the window ON the 3D panel (INV-1.3; runtime#715): on multi-monitor
+    // boxes SDL centers new windows on the primary display, but the window-relative
+    // weave is only correct on the 3D panel itself. The runtime reports the panel's
+    // top-left via XrDisplayDesktopPositionEXT (display_info v16); XrSession fires
+    // this one-shot placement after the properties query and before xrCreateSession,
+    // so the position is settled when the session binding captures the HWND/XID and
+    // the DP's phase tracking starts. SDL global desktop coordinates are top-down
+    // virtual-desktop pixels on all platforms — pass (left, top) straight through.
+    // (0, 0) = primary/unknown (old runtimes too): keep SDL's default placement.
+    auto placeOnPanel = [this](int32_t left, int32_t top) {
+        if (left == 0 && top == 0) return;
+        window_.SetPosition(left, top);
+        LOG_INFO("Placed window on 3D panel at (%d, %d)", left, top);
+    };
+    if (!xr_.Initialize(window_.NativeHandle(), placeOnPanel)) {
         LOG_ERROR("OpenXR initialization failed");
         return false;
     }

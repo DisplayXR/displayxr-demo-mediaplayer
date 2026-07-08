@@ -66,7 +66,15 @@ public:
     // Full bring-up: instance + system + stereo view config + Vulkan device (per
     // runtime requirements) + session (with window binding) + LOCAL space + SBS
     // swapchain. `nativeWindowHandle` is an NSView* (macOS) or HWND (Windows).
-    bool Initialize(void* nativeWindowHandle);
+    //
+    // `placeWindow` (optional) fires after the system-properties query and BEFORE
+    // xrCreateSession, with the 3D panel's top-left in virtual-desktop pixels from
+    // XrDisplayDesktopPositionEXT (display_info v16). The session binding captures
+    // the native handle, so the window position must be settled by then for the
+    // display processor's phase tracking to start right. (0, 0) = primary monitor
+    // or unknown (old runtimes ignore the chained struct, leaving the zero-init).
+    bool Initialize(void* nativeWindowHandle,
+                    const std::function<void(int32_t left, int32_t top)>& placeWindow = {});
     void Shutdown();
 
     // Drain the OpenXR event queue, driving the session state machine
@@ -275,6 +283,10 @@ private:
     bool transparentBg_ = false;   // MEDIAPLAYER_TRANSPARENT — letterbox composes through
     uint32_t displayPixelWidth_ = 0;
     uint32_t displayPixelHeight_ = 0;
+    // 3D panel top-left in virtual-desktop pixels (XrDisplayDesktopPositionEXT,
+    // display_info v16). (0, 0) = primary/unknown — the safe default.
+    int32_t displayDesktopLeft_ = 0;
+    int32_t displayDesktopTop_ = 0;
 
     // Session state machine.
     XrSessionState sessionState_ = XR_SESSION_STATE_UNKNOWN;
