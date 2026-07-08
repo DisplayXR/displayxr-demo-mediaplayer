@@ -1,5 +1,13 @@
-// Copyright 2025-2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// Copyright 2025-2026, The DisplayXR Project
+// SPDX-License-Identifier: Apache-2.0
+//
+// PROVISIONAL — the XR_EXT_* identifiers in this header are NOT registered
+// with the Khronos OpenXR registry. They are provisional placeholders used
+// during DisplayXR incubation and will be re-registered — and may be renamed
+// (e.g. to a registered XR_<AUTHORID>_ prefix) — through the official Khronos
+// process on the EXT -> KHR path. Do not treat these names or numeric values
+// as stable. See GOVERNANCE.md.
+//
 /*!
  * @file
  * @brief  Header for XR_EXT_display_info extension
@@ -22,7 +30,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_display_info 1
-#define XR_EXT_display_info_SPEC_VERSION 13
+#define XR_EXT_display_info_SPEC_VERSION 16
 #define XR_EXT_DISPLAY_INFO_EXTENSION_NAME "XR_EXT_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -54,11 +62,37 @@ typedef struct XrDisplayInfoEXT {
     uint32_t                    displayPixelHeight;         //!< Native display panel height in pixels (0 if unknown)
 } XrDisplayInfoEXT;
 
+// ---- v16: Display desktop position ----
+
+#define XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT ((XrStructureType)1000999210)
+
 /*!
- * @brief Display mode for XR_EXT_display_info 2D/3D switching.
+ * @brief Desktop position of the 3D display, returned by xrGetSystemProperties
+ * (v16 addition).
  *
- * @deprecated Use xrRequestDisplayRenderingModeEXT instead. Each rendering mode
- * carries a hardwareDisplay3D field that triggers physical switching automatically.
+ * When chained to XrSystemProperties (typically via XrDisplayInfoEXT's next
+ * pointer), the runtime fills in the 3D panel's top-left corner in OS
+ * virtual-desktop coordinates: top-down pixels with the origin at the primary
+ * monitor's top-left (Windows virtual-screen / X11 root-window convention).
+ * (0, 0) means the panel is the primary monitor or its position is unknown.
+ *
+ * Applications that create their own window (the handle/texture classes)
+ * should create it at this position so the content opens on the 3D panel
+ * rather than the primary monitor — the window-relative weave can only
+ * produce correct 3D on the panel itself. Hosted-class apps need not care:
+ * the runtime self-creates its window there. See runtime issue #715.
+ *
+ * @extends XrSystemProperties
+ */
+typedef struct XrDisplayDesktopPositionEXT {
+    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT
+    void* XR_MAY_ALIAS          next;       //!< Pointer to next structure in chain
+    int32_t                     left;       //!< Panel left edge in virtual-desktop pixels
+    int32_t                     top;        //!< Panel top edge in virtual-desktop pixels
+} XrDisplayDesktopPositionEXT;
+
+/*!
+ * @brief Hardware display state for xrRequestDisplayModeEXT (v15 repurpose).
  */
 typedef enum XrDisplayModeEXT {
     XR_DISPLAY_MODE_2D_EXT = 0,
@@ -67,21 +101,29 @@ typedef enum XrDisplayModeEXT {
 } XrDisplayModeEXT;
 
 /*!
- * @brief Request display mode switch (2D/3D).
+ * @brief Request the HARDWARE display state alone for the current mode
+ * (v15 repurpose — was a deprecated mode-switching wrapper through v14).
  *
- * @deprecated Use xrRequestDisplayRenderingModeEXT instead. This function is a
- * thin wrapper that finds the first rendering mode matching the requested
- * hardware display state and delegates to xrRequestDisplayRenderingModeEXT.
+ * A rendering mode is a complete recipe: layout, view count, scales, and a
+ * default hardware state. xrRequestDisplayRenderingModeEXT requests a mode
+ * and the hardware state follows automatically. THIS function overrides the
+ * hardware state ALONE: the active rendering mode, the app's submitted
+ * content, and the display processor's atlas processing are untouched —
+ * only the physical 2D/3D element (e.g. the switchable lenticular lens)
+ * changes.
  *
- * Switches the display between 2D and 3D modes. In 3D mode, the display's
- * light field hardware is active for stereoscopic viewing. In 2D mode, the
- * display behaves as a conventional 2D panel.
+ * E.g. XR_DISPLAY_MODE_2D_EXT over an active 3D mode keeps the weave
+ * running with the lens off: the panel shows the woven atlas flat (blurry),
+ * and an app fading its parallax to zero converges back to a sharp image —
+ * the building block for app-authored 2D/3D transitions such as the MANUAL
+ * eye-tracking loss flow.
  *
- * The runtime automatically switches to 3D mode on xrBeginSession and back
- * to 2D mode on xrEndSession.
+ * The override holds until the next mode request (whose default hardware
+ * state then applies) or the next call to this function. A successful state
+ * flip is reported via XrEventDataHardwareDisplayStateChangedEXT.
  *
  * @param session A valid XrSession handle.
- * @param displayMode The desired display mode (2D or 3D).
+ * @param displayMode The desired hardware state (2D or 3D).
  * @return XR_SUCCESS on success.
  */
 typedef XrResult (XRAPI_PTR *PFN_xrRequestDisplayModeEXT)(XrSession session, XrDisplayModeEXT displayMode);
@@ -324,7 +366,69 @@ typedef struct XrEventDataHardwareDisplayStateChangedEXT {
     XrBool32                    hardwareDisplay3D;
 } XrEventDataHardwareDisplayStateChangedEXT;
 
-// xrSetSharedTextureOutputRectEXT moved to XR_EXT_win32_window_binding.h / XR_EXT_cocoa_window_binding.h (v12)
+// xrSetSharedTextureOutputRectEXT was removed (ADR-031); display-zones (XR_EXT_display_zones) is the sole region paradigm
+
+// ---- v14: Per-Mode Tracking Capability + Tracking-State Event (#441) ----
+
+#define XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT  ((XrStructureType)1000999012)
+#define XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT ((XrStructureType)1000999013)
+
+/*!
+ * @brief Per-mode tracking capability — chained by the APP to each
+ * XrDisplayRenderingModeInfoEXT element's next before calling
+ * xrEnumerateDisplayRenderingModesEXT.
+ *
+ * OPT-IN HANDSHAKE: to use the chain, the app MUST pre-set each array
+ * element's type to XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT (standard OpenXR
+ * input convention) and set next to this struct (or a chain containing it).
+ * The runtime only walks elements carrying that type — v13-and-earlier
+ * binaries leave type/next uninitialized, and the runtime keeps overwriting
+ * next with NULL for them, exactly as before.
+ *
+ * hasTracking tells whether the rendering mode consumes live eye tracking
+ * (e.g., a tracked 3D mode or a "2D tracked" mode) or is fully untracked
+ * (e.g., SBS/anaglyph export modes; every sim_display mode). When the ACTIVE
+ * mode has hasTracking == XR_FALSE, XrViewEyeTrackingStateEXT.isTracking is
+ * always XR_FALSE — regardless of tracker state. xrLocateViews still returns
+ * fully populated views in every mode.
+ *
+ * LAYOUT-FREEZE POLICY: XrDisplayRenderingModeInfoEXT is frozen at its v13
+ * layout. The runtime's enumerate fill writes array elements with its own
+ * compiled stride, so appending fields (as v12/v13 did) silently corrupts app
+ * binaries compiled against older headers. All future per-mode fields MUST be
+ * added as chained structs like this one.
+ *
+ * @extends XrDisplayRenderingModeInfoEXT
+ */
+typedef struct XrDisplayRenderingModeTrackingInfoEXT {
+    XrStructureType             type;        //!< Must be XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT
+    void* XR_MAY_ALIAS          next;
+    XrBool32                    hasTracking; //!< Mode consumes live eye tracking
+} XrDisplayRenderingModeTrackingInfoEXT;
+
+/*!
+ * @brief Event fired on every edge of the derived isTracking value.
+ *
+ * The runtime derives isTracking as
+ *   activeMode.hasTracking && dp.is_tracking
+ * and queues this event whenever the value changes — on DP-reported tracking
+ * loss/recovery AND on rendering-mode switches into/out of untracked modes.
+ *
+ * This is the primary tracking-loss notification for MANUAL eye-tracking mode
+ * (detect isTracking == XR_FALSE, run your own transition, request a 2D mode
+ * when ready). It also fires in MANAGED mode, where apps may ignore it.
+ * Edge detection runs in the runtime's xrLocateViews path, so a session that
+ * never locates views receives no events.
+ *
+ * @extends XrEventDataBaseHeader
+ */
+typedef struct XrEventDataEyeTrackingStateChangedEXT {
+    XrStructureType             type;       //!< Must be XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT
+    const void* XR_MAY_ALIAS    next;
+    XrSession                   session;
+    XrBool32                    isTracking; //!< New state
+    XrEyeTrackingModeEXT        activeMode; //!< Session's MANAGED/MANUAL preference at edge time
+} XrEventDataEyeTrackingStateChangedEXT;
 
 #ifdef __cplusplus
 }

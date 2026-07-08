@@ -44,8 +44,13 @@ const char* SessionStateName(XrSessionState s) {
 
 XrSession::~XrSession() { Shutdown(); }
 
-bool XrSession::Initialize(void* nativeWindowHandle) {
+bool XrSession::Initialize(void* nativeWindowHandle,
+                           const std::function<void(int32_t left, int32_t top)>& placeWindow) {
     if (!InitInstanceAndSystem()) return false;
+    // Let the app move its window onto the 3D panel BEFORE the session binding
+    // captures the native handle (the DP's phase tracking starts from the settled
+    // position). See XrDisplayDesktopPositionEXT / runtime#715.
+    if (placeWindow) placeWindow(displayDesktopLeft_, displayDesktopTop_);
     if (!CreateVulkanDevice()) return false;
     if (!CreateSessionWithWindowBinding(nativeWindowHandle)) return false;
     EnumerateRenderingModes();   // needs the session; informs swapchain sizing
@@ -161,17 +166,26 @@ bool XrSession::InitInstanceAndSystem() {
         }
     }
 
-    // Optional: read display pixel dims so we can size the SBS swapchain to the panel.
+    // Optional: read display pixel dims so we can size the SBS swapchain to the panel,
+    // plus the panel's desktop position so the window can open ON the 3D display.
+    // desktopPos is zero-initialized: a pre-v16 runtime ignores the unknown chain
+    // entry and we're left with (0, 0) = primary/unknown, the safe default.
     if (hasDisplayInfoExt_) {
         XrSystemProperties props = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+        XrDisplayDesktopPositionEXT desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        di.next = &desktopPos;
         props.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(instance_, systemId_, &props))) {
             displayPixelWidth_ = di.displayPixelWidth;
             displayPixelHeight_ = di.displayPixelHeight;
-            LOG_INFO("Display: %ux%u px, %.3fx%.3f m",
+            displayDesktopLeft_ = desktopPos.left;
+            displayDesktopTop_ = desktopPos.top;
+            LOG_INFO("Display: %ux%u px, %.3fx%.3f m, desktop pos (%d, %d)",
                      displayPixelWidth_, displayPixelHeight_,
-                     di.displaySizeMeters.width, di.displaySizeMeters.height);
+                     di.displaySizeMeters.width, di.displaySizeMeters.height,
+                     displayDesktopLeft_, displayDesktopTop_);
         }
     }
 

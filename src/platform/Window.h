@@ -53,6 +53,12 @@ public:
 
     void SetTitle(const char* title);
 
+    // Move the window to (x, y) in SDL global desktop coordinates — top-down
+    // virtual-desktop pixels on every platform (Windows virtual screen, X11 root,
+    // and macOS SDL global coordinates alike), matching the convention of
+    // XrDisplayDesktopPositionEXT directly. No per-platform flip needed.
+    void SetPosition(int x, int y);
+
     // Make the window visible. Deferred until after XR setup so the window doesn't flash on
     // top of the workspace shell while the runtime is still binding/hiding the HWND.
     void Show();

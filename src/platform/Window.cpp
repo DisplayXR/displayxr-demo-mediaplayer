@@ -112,6 +112,10 @@ void Window::SetTitle(const char* title) {
     if (window_) SDL_SetWindowTitle(window_, title);
 }
 
+void Window::SetPosition(int x, int y) {
+    if (window_) SDL_SetWindowPosition(window_, x, y);
+}
+
 void Window::Show() {
     if (window_) SDL_ShowWindow(window_);
 }
