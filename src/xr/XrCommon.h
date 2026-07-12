@@ -10,25 +10,25 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
-#include <openxr/XR_EXT_display_info.h>
-#include <openxr/XR_EXT_workspace_file_dialog.h>  // Tier-1 spatial file picker (Open)
-#include <openxr/XR_EXT_atlas_capture.h>           // 'I' key — snapshot the composed atlas
-#include <openxr/XR_EXT_mcp_tools.h>               // app-defined agent tools (per-app MCP)
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_workspace_file_dialog.h>  // Tier-1 spatial file picker (Open)
+#include <openxr/XR_DXR_atlas_capture.h>           // 'I' key — snapshot the composed atlas
+#include <openxr/XR_DXR_mcp_tools.h>               // app-defined agent tools (per-app MCP)
 #if defined(__APPLE__)
-#  include <openxr/XR_EXT_cocoa_window_binding.h>
+#  include <openxr/XR_DXR_cocoa_window_binding.h>
 #elif defined(_WIN32)
-#  include <openxr/XR_EXT_win32_window_binding.h>
+#  include <openxr/XR_DXR_win32_window_binding.h>
 #else
-#  include <openxr/XR_EXT_xlib_window_binding.h>
+#  include <openxr/XR_DXR_xlib_window_binding.h>
 // The xlib binding header (spec v1) deliberately does NOT carry the
 // window-space layer block its cocoa/win32 siblings share — but EndFrame still
 // needs the type declared. Mirror the wire-shared #ifndef-guarded block here
 // verbatim until the xlib header (or a neutral header) picks it up.
-#ifndef XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT
-#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT ((XrStructureType)1000999002)
+#ifndef XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
+#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR ((XrStructureType)1004999002)
 
-typedef struct XrCompositionLayerWindowSpaceEXT {
-    XrStructureType             type;       //!< Must be XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT
+typedef struct XrCompositionLayerWindowSpaceDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
     const void* XR_MAY_ALIAS    next;       //!< Pointer to next structure in chain
     XrCompositionLayerFlags     layerFlags; //!< e.g. XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
     XrSwapchainSubImage         subImage;   //!< Source swapchain + rect
@@ -38,7 +38,7 @@ typedef struct XrCompositionLayerWindowSpaceEXT {
     float                       height;     //!< Fraction of window height [0..1]
     float                       disparity;  //!< Horizontal shift, fraction of window width.
                                             //!< 0 = screen depth, negative = toward viewer
-} XrCompositionLayerWindowSpaceEXT;
+} XrCompositionLayerWindowSpaceDXR;
 #endif
 #endif
 

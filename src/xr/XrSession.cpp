@@ -49,7 +49,7 @@ bool XrSession::Initialize(void* nativeWindowHandle,
     if (!InitInstanceAndSystem()) return false;
     // Let the app move its window onto the 3D panel BEFORE the session binding
     // captures the native handle (the DP's phase tracking starts from the settled
-    // position). See XrDisplayDesktopPositionEXT / runtime#715.
+    // position). See XrDisplayDesktopPositionDXR / runtime#715.
     if (placeWindow) placeWindow(displayDesktopLeft_, displayDesktopTop_);
     if (!CreateVulkanDevice()) return false;
     if (!CreateSessionWithWindowBinding(nativeWindowHandle)) return false;
@@ -71,11 +71,11 @@ bool XrSession::InitInstanceAndSystem() {
 
     bool hasVulkan = false;
 #if defined(__APPLE__)
-    const char* kWindowBindingExt = XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME;
+    const char* kWindowBindingExt = XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME;
 #elif defined(_WIN32)
-    const char* kWindowBindingExt = XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME;
+    const char* kWindowBindingExt = XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME;
 #elif defined(__linux__) && !defined(__ANDROID__)
-    const char* kWindowBindingExt = XR_EXT_XLIB_WINDOW_BINDING_EXTENSION_NAME;
+    const char* kWindowBindingExt = XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME;
 #else
     const char* kWindowBindingExt = nullptr;
 #endif
@@ -84,12 +84,12 @@ bool XrSession::InitInstanceAndSystem() {
         LOG_DEBUG("  instance ext: %s (v%u)", e.extensionName, e.extensionVersion);
         if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (kWindowBindingExt && strcmp(e.extensionName, kWindowBindingExt) == 0) hasWindowBindingExt_ = true;
-        if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) hasDisplayInfoExt_ = true;
-        if (strcmp(e.extensionName, XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) hasDisplayInfoExt_ = true;
+        if (strcmp(e.extensionName, XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0)
             hasFilePickerExt_ = true;
-        if (strcmp(e.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
             hasAtlasCaptureExt_ = true;
-        if (strcmp(e.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0)
             hasMcpToolsExt_ = true;
     }
 
@@ -97,10 +97,10 @@ bool XrSession::InitInstanceAndSystem() {
     LOG_INFO("window binding (%s): %s",
              kWindowBindingExt ? kWindowBindingExt : "<none>",
              hasWindowBindingExt_ ? "yes" : "no");
-    LOG_INFO("XR_EXT_display_info: %s", hasDisplayInfoExt_ ? "yes" : "no");
-    LOG_INFO("XR_EXT_workspace_file_dialog: %s", hasFilePickerExt_ ? "yes" : "no");
-    LOG_INFO("XR_EXT_atlas_capture: %s", hasAtlasCaptureExt_ ? "yes" : "no");
-    LOG_INFO("XR_EXT_mcp_tools: %s", hasMcpToolsExt_ ? "yes" : "no");
+    LOG_INFO("XR_DXR_display_info: %s", hasDisplayInfoExt_ ? "yes" : "no");
+    LOG_INFO("XR_DXR_workspace_file_dialog: %s", hasFilePickerExt_ ? "yes" : "no");
+    LOG_INFO("XR_DXR_atlas_capture: %s", hasAtlasCaptureExt_ ? "yes" : "no");
+    LOG_INFO("XR_DXR_mcp_tools: %s", hasMcpToolsExt_ ? "yes" : "no");
 
     if (!hasVulkan) {
         LOG_ERROR("Runtime does not expose XR_KHR_vulkan_enable");
@@ -110,10 +110,10 @@ bool XrSession::InitInstanceAndSystem() {
     std::vector<const char*> enabled;
     enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     if (hasWindowBindingExt_) enabled.push_back(kWindowBindingExt);
-    if (hasDisplayInfoExt_) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
-    if (hasFilePickerExt_) enabled.push_back(XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
-    if (hasAtlasCaptureExt_) enabled.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
-    if (hasMcpToolsExt_) enabled.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
+    if (hasDisplayInfoExt_) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+    if (hasFilePickerExt_) enabled.push_back(XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
+    if (hasAtlasCaptureExt_) enabled.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
+    if (hasMcpToolsExt_) enabled.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     std::strncpy(ci.applicationInfo.applicationName, "DisplayXR Media Player",
@@ -130,28 +130,28 @@ bool XrSession::InitInstanceAndSystem() {
     // Resolve the file-picker entry point (extension function — must go through
     // xrGetInstanceProcAddr, never the loader's exported symbols).
     if (hasFilePickerExt_) {
-        xrGetInstanceProcAddr(instance_, "xrRequestFilePickerEXT",
+        xrGetInstanceProcAddr(instance_, "xrRequestFilePickerDXR",
                               (PFN_xrVoidFunction*)&pfnRequestFilePicker_);
     }
     if (hasAtlasCaptureExt_) {
-        xrGetInstanceProcAddr(instance_, "xrCaptureAtlasEXT",
+        xrGetInstanceProcAddr(instance_, "xrCaptureAtlasDXR",
                               (PFN_xrVoidFunction*)&pfnCaptureAtlasEXT_);
-        LOG_INFO("xrCaptureAtlasEXT: %s", pfnCaptureAtlasEXT_ ? "resolved" : "NULL");
+        LOG_INFO("xrCaptureAtlasDXR: %s", pfnCaptureAtlasEXT_ ? "resolved" : "NULL");
     }
     // Agent-tools entry points (resolve via xrGetInstanceProcAddr like every other
     // extension function). The tools operate on the session, but the PFNs only need the
     // instance, so resolve them here alongside the rest; null PFNs leave HasMcpTools()
     // false and the whole feature inert.
     if (hasMcpToolsExt_) {
-        xrGetInstanceProcAddr(instance_, "xrSetMCPAppInfoEXT",
+        xrGetInstanceProcAddr(instance_, "xrSetMCPAppInfoDXR",
                               (PFN_xrVoidFunction*)&pfnSetMcpAppInfo_);
-        xrGetInstanceProcAddr(instance_, "xrRegisterMCPToolEXT",
+        xrGetInstanceProcAddr(instance_, "xrRegisterMCPToolDXR",
                               (PFN_xrVoidFunction*)&pfnRegisterMcpTool_);
-        xrGetInstanceProcAddr(instance_, "xrGetMCPToolCallArgsEXT",
+        xrGetInstanceProcAddr(instance_, "xrGetMCPToolCallArgsDXR",
                               (PFN_xrVoidFunction*)&pfnGetMcpToolCallArgs_);
-        xrGetInstanceProcAddr(instance_, "xrSubmitMCPToolResultEXT",
+        xrGetInstanceProcAddr(instance_, "xrSubmitMCPToolResultDXR",
                               (PFN_xrVoidFunction*)&pfnSubmitMcpToolResult_);
-        LOG_INFO("XR_EXT_mcp_tools entry points: %s",
+        LOG_INFO("XR_DXR_mcp_tools entry points: %s",
                  HasMcpTools() ? "resolved" : "NULL");
     }
 
@@ -172,9 +172,9 @@ bool XrSession::InitInstanceAndSystem() {
     // entry and we're left with (0, 0) = primary/unknown, the safe default.
     if (hasDisplayInfoExt_) {
         XrSystemProperties props = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
-        XrDisplayDesktopPositionEXT desktopPos = {};
-        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         di.next = &desktopPos;
         props.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(instance_, systemId_, &props))) {
@@ -460,15 +460,15 @@ bool XrSession::CreateSessionWithWindowBinding(void* nativeWindowHandle) {
     vkBinding.queueIndex = 0;
 
 #if defined(__APPLE__)
-    XrCocoaWindowBindingCreateInfoEXT windowBinding = {};
-    windowBinding.type = (XrStructureType)XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
+    XrCocoaWindowBindingCreateInfoDXR windowBinding = {};
+    windowBinding.type = (XrStructureType)XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR;
     windowBinding.viewHandle = nativeWindowHandle; // NSView* (CAMetalLayer-backed, from SDL)
     if (hasWindowBindingExt_ && nativeWindowHandle) {
         vkBinding.next = &windowBinding;
-        LOG_INFO("Using XR_EXT_cocoa_window_binding (NSView=%p)", nativeWindowHandle);
+        LOG_INFO("Using XR_DXR_cocoa_window_binding (NSView=%p)", nativeWindowHandle);
     }
 #elif defined(_WIN32)
-    XrWin32WindowBindingCreateInfoEXT windowBinding = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+    XrWin32WindowBindingCreateInfoDXR windowBinding = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR};
     windowBinding.windowHandle = nativeWindowHandle; // HWND
     // Experimental, PARKED — left as scaffolding (default off). MEDIAPLAYER_TRANSPARENT=1
     // asks the runtime/DP to compose the letterbox through to the desktop: the renderer
@@ -491,18 +491,18 @@ bool XrSession::CreateSessionWithWindowBinding(void* nativeWindowHandle) {
     }
     if (hasWindowBindingExt_ && nativeWindowHandle) {
         vkBinding.next = &windowBinding;
-        LOG_INFO("Using XR_EXT_win32_window_binding (HWND=%p, transparent-bg=%s)",
+        LOG_INFO("Using XR_DXR_win32_window_binding (HWND=%p, transparent-bg=%s)",
                  nativeWindowHandle, transparentBg_ ? "ON" : "off");
     }
 #elif defined(__linux__) && !defined(__ANDROID__)
-    XrXlibWindowBindingCreateInfoEXT windowBinding = {};
-    windowBinding.type = (XrStructureType)XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_EXT;
+    XrXlibWindowBindingCreateInfoDXR windowBinding = {};
+    windowBinding.type = (XrStructureType)XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR;
     auto* x11 = static_cast<const Window::X11Handles*>(nativeWindowHandle);
     if (hasWindowBindingExt_ && x11 && x11->display && x11->window) {
         windowBinding.xDisplay = static_cast<Display*>(x11->display);
         windowBinding.window = x11->window;
         vkBinding.next = &windowBinding;
-        LOG_INFO("Using XR_EXT_xlib_window_binding (Display=%p, Window=0x%lx)",
+        LOG_INFO("Using XR_DXR_xlib_window_binding (Display=%p, Window=0x%lx)",
                  x11->display, x11->window);
     }
 #else
@@ -519,21 +519,21 @@ bool XrSession::CreateSessionWithWindowBinding(void* nativeWindowHandle) {
 
 void XrSession::EnumerateRenderingModes() {
     if (!hasDisplayInfoExt_) {
-        LOG_INFO("No XR_EXT_display_info — using max view count + derived tiling");
+        LOG_INFO("No XR_DXR_display_info — using max view count + derived tiling");
         return;
     }
-    xrGetInstanceProcAddr(instance_, "xrEnumerateDisplayRenderingModesEXT",
+    xrGetInstanceProcAddr(instance_, "xrEnumerateDisplayRenderingModesDXR",
                           (PFN_xrVoidFunction*)&pfnEnumModes_);
-    xrGetInstanceProcAddr(instance_, "xrRequestDisplayRenderingModeEXT",
+    xrGetInstanceProcAddr(instance_, "xrRequestDisplayRenderingModeDXR",
                           (PFN_xrVoidFunction*)&pfnRequestMode_);
     if (!pfnEnumModes_) {
-        LOG_WARN("xrEnumerateDisplayRenderingModesEXT unavailable");
+        LOG_WARN("xrEnumerateDisplayRenderingModesDXR unavailable");
         return;
     }
 
     uint32_t count = 0;
     if (XR_FAILED(pfnEnumModes_(session_, 0, &count, nullptr)) || count == 0) return;
-    std::vector<XrDisplayRenderingModeInfoEXT> raw(count, {XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT});
+    std::vector<XrDisplayRenderingModeInfoDXR> raw(count, {XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR});
     if (XR_FAILED(pfnEnumModes_(session_, count, &count, raw.data()))) return;
 
     modes_.clear();
@@ -831,28 +831,28 @@ void XrSession::PollEvents() {
             case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
                 exitRequested_ = true;
                 break;
-            case (XrStructureType)XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT: {
-                auto* e = reinterpret_cast<XrEventDataFilePickerCompleteEXT*>(&event);
+            case (XrStructureType)XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_DXR: {
+                auto* e = reinterpret_cast<XrEventDataFilePickerCompleteDXR*>(&event);
                 if (e->requestId != pendingPickerId_) break;  // stale / not ours
-                pendingPickerId_ = XR_NULL_ASYNC_REQUEST_ID_EXT;
+                pendingPickerId_ = XR_NULL_ASYNC_REQUEST_ID_DXR;
                 hasPickedFile_ = true;  // latched even on cancel (App clears its busy flag)
-                pickedFile_ = (e->result == XR_FILE_PICKER_RESULT_SUCCESS_EXT) ? e->path : "";
+                pickedFile_ = (e->result == XR_FILE_PICKER_RESULT_SUCCESS_DXR) ? e->path : "";
                 LOG_INFO("File picker complete: result=%d path='%s'", (int)e->result,
                          pickedFile_.c_str());
                 break;
             }
-            case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
-                auto* e = reinterpret_cast<XrEventDataRenderingModeChangedEXT*>(&event);
+            case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+                auto* e = reinterpret_cast<XrEventDataRenderingModeChangedDXR*>(&event);
                 currentModeIndex_ = e->currentModeIndex;
                 LOG_INFO("Rendering mode changed: %u -> %u ('%s': %u views %ux%u)",
                          e->previousModeIndex, e->currentModeIndex, ActiveModeName(),
                          ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());
                 break;
             }
-            case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT: {
+            case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
                 // An agent invoked one of our registered tools. We're on the main loop, so
                 // dispatch + answer here where player state is consistent (no locking).
-                HandleMcpToolCall(reinterpret_cast<const XrEventDataMCPToolCallEXT*>(&event));
+                HandleMcpToolCall(reinterpret_cast<const XrEventDataMCPToolCallDXR*>(&event));
                 break;
             }
             default:
@@ -864,11 +864,11 @@ void XrSession::PollEvents() {
 
 bool XrSession::SetMcpAppId(const std::string& appId) {
     if (!HasMcpTools() || !pfnSetMcpAppInfo_) return false;
-    XrMCPAppInfoEXT info = {XR_TYPE_MCP_APP_INFO_EXT};
+    XrMCPAppInfoDXR info = {XR_TYPE_MCP_APP_INFO_DXR};
     std::strncpy(info.appId, appId.c_str(), sizeof(info.appId) - 1);
     XrResult r = pfnSetMcpAppInfo_(session_, &info);
     if (XR_FAILED(r)) {
-        LOG_WARN("xrSetMCPAppInfoEXT('%s') failed: XrResult=%d", appId.c_str(), (int)r);
+        LOG_WARN("xrSetMCPAppInfoDXR('%s') failed: XrResult=%d", appId.c_str(), (int)r);
         return false;
     }
     return true;
@@ -877,20 +877,20 @@ bool XrSession::SetMcpAppId(const std::string& appId) {
 bool XrSession::RegisterMcpTool(const std::string& name, const std::string& description,
                                const std::string& schemaJson) {
     if (!HasMcpTools()) return false;
-    XrMCPToolInfoEXT tool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+    XrMCPToolInfoDXR tool = {XR_TYPE_MCP_TOOL_INFO_DXR};
     tool.name = name.c_str();
     tool.description = description.c_str();
     tool.inputSchemaJson = schemaJson.empty() ? nullptr : schemaJson.c_str();
     XrResult r = pfnRegisterMcpTool_(session_, &tool);
     if (XR_FAILED(r)) {
-        LOG_WARN("xrRegisterMCPToolEXT('%s') failed: XrResult=%d", name.c_str(), (int)r);
+        LOG_WARN("xrRegisterMCPToolDXR('%s') failed: XrResult=%d", name.c_str(), (int)r);
         return false;
     }
     LOG_INFO("Registered MCP tool '%s'", name.c_str());
     return true;
 }
 
-void XrSession::HandleMcpToolCall(const XrEventDataMCPToolCallEXT* call) {
+void XrSession::HandleMcpToolCall(const XrEventDataMCPToolCallDXR* call) {
     // Fetch the JSON arguments via the two-call idiom — the event's argsSize is the exact
     // capacity needed (incl. NUL). A no-arg tool reports argsSize 0; treat that as "{}".
     std::string args;
@@ -921,26 +921,26 @@ void XrSession::HandleMcpToolCall(const XrEventDataMCPToolCallEXT* call) {
 XrSession::PickerStatus XrSession::RequestFilePicker() {
     if (!pfnRequestFilePicker_) return PickerStatus::Unsupported;  // ext absent
 
-    XrFilePickerInfoEXT info = {XR_TYPE_FILE_PICKER_INFO_EXT};
-    info.mode = XR_FILE_PICKER_MODE_OPEN_EXT;
-    info.flags = XR_FILE_PICKER_FLAG_NONE_EXT;
+    XrFilePickerInfoDXR info = {XR_TYPE_FILE_PICKER_INFO_DXR};
+    info.mode = XR_FILE_PICKER_MODE_OPEN_DXR;
+    info.flags = XR_FILE_PICKER_FLAG_NONE_DXR;
     std::strncpy(info.title, "Open media", sizeof(info.title) - 1);
     info.filterCount = 2;
-    std::strncpy(info.filters[0].description, "Stereo media", XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT - 1);
+    std::strncpy(info.filters[0].description, "Stereo media", XR_MAX_FILE_PICKER_FILTER_LENGTH_DXR - 1);
     std::strncpy(info.filters[0].extensions,
-                 "*.mp4;*.mkv;*.mov;*.jpg;*.jpeg;*.png", XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT - 1);
-    std::strncpy(info.filters[1].description, "All files", XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT - 1);
-    std::strncpy(info.filters[1].extensions, "*.*", XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT - 1);
+                 "*.mp4;*.mkv;*.mov;*.jpg;*.jpeg;*.png", XR_MAX_FILE_PICKER_FILTER_LENGTH_DXR - 1);
+    std::strncpy(info.filters[1].description, "All files", XR_MAX_FILE_PICKER_FILTER_LENGTH_DXR - 1);
+    std::strncpy(info.filters[1].extensions, "*.*", XR_MAX_FILE_PICKER_FILTER_LENGTH_DXR - 1);
 
-    XrAsyncRequestIdEXT id = XR_NULL_ASYNC_REQUEST_ID_EXT;
+    XrAsyncRequestIdDXR id = XR_NULL_ASYNC_REQUEST_ID_DXR;
     const XrResult r = pfnRequestFilePicker_(session_, &info, &id);
     if (r == XR_SUCCESS) {
         pendingPickerId_ = id;
         return PickerStatus::Pending;  // result arrives via the completion event
     }
-    if (r == (XrResult)XR_FILE_PICKER_FALLBACK_TIER0_EXT) return PickerStatus::FallbackTier0;
+    if (r == (XrResult)XR_FILE_PICKER_FALLBACK_TIER0_DXR) return PickerStatus::FallbackTier0;
     if (r == XR_ERROR_FEATURE_UNSUPPORTED) return PickerStatus::Unsupported;
-    LOG_WARN("xrRequestFilePickerEXT failed: XrResult=%d", (int)r);
+    LOG_WARN("xrRequestFilePickerDXR failed: XrResult=%d", (int)r);
     return PickerStatus::Error;
 }
 
@@ -954,15 +954,15 @@ bool XrSession::TakePickedFile(std::string& path) {
 
 bool XrSession::CaptureAtlas(const std::string& pathPrefix) {
     if (!pfnCaptureAtlasEXT_ || session_ == XR_NULL_HANDLE) return false;
-    XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+    XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
     info.next = nullptr;
     // POST_COMPOSE = the full atlas handed to the display processor (our projection
     // tiles plus any window-space HUD) — i.e. exactly what gets woven to the panel.
-    info.stage = XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_EXT;
-    std::strncpy(info.pathPrefix, pathPrefix.c_str(), XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
+    info.stage = XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_DXR;
+    std::strncpy(info.pathPrefix, pathPrefix.c_str(), XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1);
     const XrResult r = pfnCaptureAtlasEXT_(session_, &info, nullptr);
     if (XR_FAILED(r)) {
-        LOG_WARN("xrCaptureAtlasEXT failed: XrResult=%d", (int)r);
+        LOG_WARN("xrCaptureAtlasDXR failed: XrResult=%d", (int)r);
         return false;
     }
     LOG_INFO("Atlas capture requested -> %s_atlas.png", pathPrefix.c_str());
@@ -1047,10 +1047,10 @@ bool XrSession::EndFrame(Frame& frame, const ViewRect* rects, const HudSubmit* h
     }
 
     // Optional window-space HUD overlay on top of the projection layer.
-    XrCompositionLayerWindowSpaceEXT hudLayer = {};
+    XrCompositionLayerWindowSpaceDXR hudLayer = {};
     const bool submitHud = frame.shouldRender && hud && hud->enabled && hasHud_;
     if (submitHud) {
-        hudLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+        hudLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
         hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         hudLayer.subImage.swapchain = hudSwapchain_.handle;
         hudLayer.subImage.imageRect.offset = {0, 0};

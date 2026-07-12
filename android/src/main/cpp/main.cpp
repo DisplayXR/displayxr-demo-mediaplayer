@@ -25,8 +25,8 @@
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_display_info.h>  // display rendering-mode enumerate/request
-#include <openxr/XR_EXT_view_rig.h>      // minimal display rig (OOP valid-views contingency)
+#include <openxr/XR_DXR_display_info.h>  // display rendering-mode enumerate/request
+#include <openxr/XR_DXR_view_rig.h>      // minimal display rig (OOP valid-views contingency)
 
 #include <atomic>
 #include <vector>
@@ -126,7 +126,7 @@ bool g_session_running = false;
 bool g_exit_requested = false;
 XrSpace g_app_space = XR_NULL_HANDLE;
 
-// ── Display rendering-mode + tiled-atlas multiview (XR_EXT_display_info) ─────
+// ── Display rendering-mode + tiled-atlas multiview (XR_DXR_display_info) ─────
 // The runtime advertises rendering modes (2D-mono, 3D-stereo) each with a tile
 // layout (cols×rows) and per-view scale, plus the native panel pixels. Per
 // ADR-026 / runtime#518 the app renders the active mode's views into TILES of a
@@ -136,14 +136,14 @@ XrSpace g_app_space = XR_NULL_HANDLE;
 // per-orientation sub-rect (current_display × view_scale) so portrait and
 // landscape each render at their true per-eye tile. Mirrors
 // cube_handle_vk_android.
-PFN_xrEnumerateDisplayRenderingModesEXT g_pfnEnumModes = nullptr;
-PFN_xrRequestDisplayRenderingModeEXT g_pfnReqMode = nullptr;
+PFN_xrEnumerateDisplayRenderingModesDXR g_pfnEnumModes = nullptr;
+PFN_xrRequestDisplayRenderingModeDXR g_pfnReqMode = nullptr;
 
 constexpr uint32_t kMaxViews = 8;
 
 // The active 3D rendering mode's layout (the media player adopts whatever mode
 // the runtime reports active; on Leia SR that's the 2×1 SBS 3D mode at
-// 0.75×0.75). Defaults give a single 2-view SBS atlas if XR_EXT_display_info is
+// 0.75×0.75). Defaults give a single 2-view SBS atlas if XR_DXR_display_info is
 // absent.
 uint32_t g_tile_columns = 2;
 uint32_t g_tile_rows = 1;
@@ -151,11 +151,11 @@ uint32_t g_view_count = 2;
 float g_view_scale_x = 0.5f;
 float g_view_scale_y = 1.0f;
 uint32_t g_max_view_count = 2;   // xrLocateViews capacity (max across modes)
-uint32_t g_display_px_w = 0;     // native panel pixels (XR_EXT_display_info)
+uint32_t g_display_px_w = 0;     // native panel pixels (XR_DXR_display_info)
 uint32_t g_display_px_h = 0;
 bool g_has_display_info = false;
 
-// ── XR_EXT_view_rig contingency (runtime#510) ───────────────────────────────
+// ── XR_DXR_view_rig contingency (runtime#510) ───────────────────────────────
 // On the OOP runtime the plain xrLocateViews path can return no valid view
 // poses (got_eyes=0 → viewStateFlags=0 → black panel); chaining a display rig
 // is what makes the runtime return valid views. The stereo lives in the SBS
@@ -164,7 +164,7 @@ bool g_has_display_info = false;
 // Start on the plain locate path and auto-enable the rig if the locate stays
 // invalid, so the device A/B needs no rebuild.
 bool g_view_rig_enabled = false;  // extension negotiated on the instance
-bool g_use_rig = false;           // chain XrDisplayRigEXT on xrLocateViews
+bool g_use_rig = false;           // chain XrDisplayRigDXR on xrLocateViews
 int g_invalid_locate_count = 0;
 constexpr int kInvalidLocateThreshold = 10;
 
@@ -337,15 +337,15 @@ create_instance(struct android_app *app)
 {
 	g_runtime_unavailable.store(false, std::memory_order_relaxed);
 	g_view_rig_enabled = false;  // re-evaluated below (rebuilds reuse these globals)
-	g_has_display_info = true;   // XR_EXT_display_info is always enabled (below)
+	g_has_display_info = true;   // XR_DXR_display_info is always enabled (below)
 	const char *extensions[4] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
-	    XR_EXT_DISPLAY_INFO_EXTENSION_NAME,  // display info + rendering-mode atlas layout
+	    XR_DXR_DISPLAY_INFO_EXTENSION_NAME,  // display info + rendering-mode atlas layout
 	};
 	uint32_t extension_count = 3;
 
-	// Enable XR_EXT_view_rig when the runtime advertises it (see the rig
+	// Enable XR_DXR_view_rig when the runtime advertises it (see the rig
 	// globals above) — enabling is harmless; chaining stays off until needed.
 	uint32_t n = 0;
 	if (xrEnumerateInstanceExtensionProperties(nullptr, 0, &n, nullptr) == XR_SUCCESS && n > 0) {
@@ -356,15 +356,15 @@ create_instance(struct android_app *app)
 		}
 		if (xrEnumerateInstanceExtensionProperties(nullptr, n, &n, props.data()) == XR_SUCCESS) {
 			for (uint32_t i = 0; i < n; ++i) {
-				if (std::strcmp(props[i].extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
-					extensions[extension_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
+				if (std::strcmp(props[i].extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
+					extensions[extension_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
 					g_view_rig_enabled = true;
 					break;
 				}
 			}
 		}
 	}
-	LOGI("XR_EXT_view_rig %s", g_view_rig_enabled ? "advertised -> enabled" : "not advertised");
+	LOGI("XR_DXR_view_rig %s", g_view_rig_enabled ? "advertised -> enabled" : "not advertised");
 
 	XrInstanceCreateInfoAndroidKHR android_info = {};
 	android_info.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR;
@@ -610,7 +610,7 @@ create_session()
 	return res == XR_SUCCESS;
 }
 
-// Query native panel pixels (XR_EXT_display_info) + the active rendering mode's
+// Query native panel pixels (XR_DXR_display_info) + the active rendering mode's
 // tile layout / view scale / view count, and the max view count the runtime
 // advertises (xrLocateViews capacity). Feeds the worst-case atlas sizing and
 // the per-orientation tile dims. Never fails bring-up — falls back to a single
@@ -627,9 +627,9 @@ query_display_info_and_modes()
 	}
 	LOGI("Runtime advertises %u views (max across modes)", g_max_view_count);
 
-	// Native panel pixels — chain XrDisplayInfoEXT onto the system-properties query.
+	// Native panel pixels — chain XrDisplayInfoDXR onto the system-properties query.
 	if (g_has_display_info) {
-		XrDisplayInfoEXT di = {XR_TYPE_DISPLAY_INFO_EXT};
+		XrDisplayInfoDXR di = {XR_TYPE_DISPLAY_INFO_DXR};
 		XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
 		sp.next = &di;
 		if (xrGetSystemProperties(g_instance, g_system_id, &sp) == XR_SUCCESS) {
@@ -639,9 +639,9 @@ query_display_info_and_modes()
 		}
 	}
 
-	xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesEXT",
+	xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesDXR",
 	                      (PFN_xrVoidFunction *)&g_pfnEnumModes);
-	xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeEXT",
+	xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeDXR",
 	                      (PFN_xrVoidFunction *)&g_pfnReqMode);
 	if (g_pfnEnumModes == nullptr) {
 		LOGI("No rendering-mode ext — defaulting to a single 2-view SBS atlas");
@@ -654,9 +654,9 @@ query_display_info_and_modes()
 	if (count > kMaxViews) {
 		count = kMaxViews;
 	}
-	XrDisplayRenderingModeInfoEXT modes[kMaxViews] = {};
+	XrDisplayRenderingModeInfoDXR modes[kMaxViews] = {};
 	for (uint32_t i = 0; i < count; ++i) {
-		modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+		modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
 	}
 	if (g_pfnEnumModes(g_session, count, &count, modes) != XR_SUCCESS) {
 		return true;
@@ -1172,8 +1172,8 @@ render_frame()
 		// chained only after the plain locate path proves invalid on this
 		// runtime. Exists purely to obtain valid views to submit; the SBS blit
 		// itself never reads pose/fov, so no depth/vHeight tuning applies.
-		XrDisplayRigEXT rig = {};
-		rig.type = XR_TYPE_DISPLAY_RIG_EXT;
+		XrDisplayRigDXR rig = {};
+		rig.type = XR_TYPE_DISPLAY_RIG_DXR;
 		rig.pose.orientation = {0, 0, 0, 1};
 		rig.pose.position = {0, 0, 0};
 		rig.virtualDisplayHeight = 1.0f;
@@ -1261,7 +1261,7 @@ render_frame()
 			    g_invalid_locate_count >= kInvalidLocateThreshold) {
 				g_use_rig = true;
 				LOGW("plain xrLocateViews invalid for %d frames -> enabling minimal "
-				     "XrDisplayRigEXT (identity pose, factors=1)",
+				     "XrDisplayRigDXR (identity pose, factors=1)",
 				     kInvalidLocateThreshold);
 			}
 		}

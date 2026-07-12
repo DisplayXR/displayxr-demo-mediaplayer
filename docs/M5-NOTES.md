@@ -20,7 +20,7 @@ M0–M4; this milestone is the formal verification + documentation.
 
 - **Window / surface:** `SDL_Metal_CreateView()` yields an `NSView` whose backing layer is
   a `CAMetalLayer` (`src/platform/Window.cpp`). That handle is passed to the runtime via
-  `XR_EXT_cocoa_window_binding` (`src/xr/XrSession.cpp` — `XrCocoaWindowBindingCreateInfoEXT`).
+  `XR_DXR_cocoa_window_binding` (`src/xr/XrSession.cpp` — `XrCocoaWindowBindingCreateInfoDXR`).
   The OpenXR graphics binding is still the **Vulkan** one (`XrGraphicsBindingVulkanKHR`).
 - **MoltenVK as a portability driver:** the loader needs the enumeration extension + flag
   to surface MoltenVK. We enable `VK_KHR_portability_enumeration` on the `VkInstance`
@@ -64,7 +64,7 @@ MEDIAPLAYER_HUD=1 MEDIAPLAYER_START_MODE=4 \
 
 Observed from the run log + dumps:
 
-- `XR_RUNTIME_JSON` resolved to the dev manifest; `XR_EXT_cocoa_window_binding`
+- `XR_RUNTIME_JSON` resolved to the dev manifest; `XR_DXR_cocoa_window_binding`
   negotiated over the NSView; `Vulkan device: Apple M1 Pro` with
   `VK_KHR_portability_enumeration` (instance) and `VK_KHR_portability_subset` (device).
 - **Squeezed SBS atlas:** left view tile = green **L**, right view tile = magenta **R** —

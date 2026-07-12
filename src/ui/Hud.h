@@ -3,7 +3,7 @@
 // Hud (M2) — a minimal CPU text rasterizer for the window-space overlay. Draws a
 // translucent panel sized tightly to the text, with antialiased white glyphs (from
 // the embedded SF Mono atlas). The runtime composites the result as a window-space
-// layer (XrCompositionLayerWindowSpaceEXT) into both eyes with a subtle parallax.
+// layer (XrCompositionLayerWindowSpaceDXR) into both eyes with a subtle parallax.
 //
 // The richer ImGui "subtle 3D" transport UI is a later milestone (PRD §9).
 #pragma once

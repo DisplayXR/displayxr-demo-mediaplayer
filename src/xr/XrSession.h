@@ -69,7 +69,7 @@ public:
     //
     // `placeWindow` (optional) fires after the system-properties query and BEFORE
     // xrCreateSession, with the 3D panel's top-left in virtual-desktop pixels from
-    // XrDisplayDesktopPositionEXT (display_info v16). The session binding captures
+    // XrDisplayDesktopPositionDXR (display_info v16). The session binding captures
     // the native handle, so the window position must be settled by then for the
     // display processor's phase tracking to start right. (0, 0) = primary monitor
     // or unknown (old runtimes ignore the chained struct, leaving the zero-init).
@@ -103,7 +103,7 @@ public:
     bool AcquireHudImage(uint32_t& imageIndex);
     bool ReleaseHudImage();
 
-    // --- Open-file (XR_EXT_workspace_file_dialog) ---
+    // --- Open-file (XR_DXR_workspace_file_dialog) ---
     // Outcome of a RequestFilePicker call. Pending → a completion event will arrive
     // (poll TakePickedFile); the others mean the caller should use a native dialog.
     enum class PickerStatus { Pending, FallbackTier0, Unsupported, Error };
@@ -115,20 +115,20 @@ public:
     // (empty on cancel). Drains the latch.
     bool TakePickedFile(std::string& path);
 
-    // --- Atlas capture (XR_EXT_atlas_capture, the 'I' key) ---
+    // --- Atlas capture (XR_DXR_atlas_capture, the 'I' key) ---
     // True if the runtime exposes the capture entry point.
     bool HasAtlasCapture() const { return pfnCaptureAtlasEXT_ != nullptr; }
     // Ask the runtime to snapshot the composed multi-view atlas to "<pathPrefix>_atlas.png".
     // Non-blocking: the readback runs at the next EndFrame, so the PNG lands shortly after.
     bool CaptureAtlas(const std::string& pathPrefix);
 
-    // --- Agent tools (XR_EXT_mcp_tools) ---
+    // --- Agent tools (XR_DXR_mcp_tools) ---
     // The app exposes its playback controls as MCP tools on the per-process server the
     // runtime hosts. Registration is never load-bearing: when the MCP capability gate is
     // off (or the runtime predates the extension) HasMcpTools() is false and every call
     // below is an inert no-op, so the player runs identically with no agent surface.
     //
-    // A tool invocation arrives as XrEventDataMCPToolCallEXT through PollEvents() — i.e.
+    // A tool invocation arrives as XrEventDataMCPToolCallDXR through PollEvents() — i.e.
     // on the main loop — and is dispatched to the handler installed via SetMcpToolHandler.
     // The handler runs synchronously there (player state is consistent, no locking), and
     // its returned JSON is submitted back to the agent. Every call is answered; an
@@ -248,33 +248,33 @@ private:
     std::vector<VkImage> hudVkImages_;
     bool hasHud_ = false;
 
-    // Rendering modes (XR_EXT_display_info v8+). Empty when the runtime doesn't
+    // Rendering modes (XR_DXR_display_info v8+). Empty when the runtime doesn't
     // expose them, in which case we fall back to the max view count + derived tiling.
     std::vector<RenderingMode> modes_;
     uint32_t currentModeIndex_ = 0;  // modeIndex value of the active mode
-    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumModes_ = nullptr;
-    PFN_xrRequestDisplayRenderingModeEXT pfnRequestMode_ = nullptr;
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumModes_ = nullptr;
+    PFN_xrRequestDisplayRenderingModeDXR pfnRequestMode_ = nullptr;
 
-    // Open-file picker (XR_EXT_workspace_file_dialog). PFN is null when the runtime
+    // Open-file picker (XR_DXR_workspace_file_dialog). PFN is null when the runtime
     // doesn't expose the extension (→ caller uses a native dialog).
     bool hasFilePickerExt_ = false;
-    PFN_xrRequestFilePickerEXT pfnRequestFilePicker_ = nullptr;
-    XrAsyncRequestIdEXT pendingPickerId_ = XR_NULL_ASYNC_REQUEST_ID_EXT;
+    PFN_xrRequestFilePickerDXR pfnRequestFilePicker_ = nullptr;
+    XrAsyncRequestIdDXR pendingPickerId_ = XR_NULL_ASYNC_REQUEST_ID_DXR;
     bool hasPickedFile_ = false;
     std::string pickedFile_;
 
-    // Atlas capture (XR_EXT_atlas_capture). PFN null when the runtime lacks it.
+    // Atlas capture (XR_DXR_atlas_capture). PFN null when the runtime lacks it.
     bool hasAtlasCaptureExt_ = false;
-    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT_ = nullptr;
+    PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT_ = nullptr;
 
-    // Agent tools (XR_EXT_mcp_tools). All PFNs null when the runtime lacks the extension
+    // Agent tools (XR_DXR_mcp_tools). All PFNs null when the runtime lacks the extension
     // or the MCP capability gate is off — the whole feature is then inert.
-    void HandleMcpToolCall(const XrEventDataMCPToolCallEXT* call);
+    void HandleMcpToolCall(const XrEventDataMCPToolCallDXR* call);
     bool hasMcpToolsExt_ = false;
-    PFN_xrSetMCPAppInfoEXT pfnSetMcpAppInfo_ = nullptr;
-    PFN_xrRegisterMCPToolEXT pfnRegisterMcpTool_ = nullptr;
-    PFN_xrGetMCPToolCallArgsEXT pfnGetMcpToolCallArgs_ = nullptr;
-    PFN_xrSubmitMCPToolResultEXT pfnSubmitMcpToolResult_ = nullptr;
+    PFN_xrSetMCPAppInfoDXR pfnSetMcpAppInfo_ = nullptr;
+    PFN_xrRegisterMCPToolDXR pfnRegisterMcpTool_ = nullptr;
+    PFN_xrGetMCPToolCallArgsDXR pfnGetMcpToolCallArgs_ = nullptr;
+    PFN_xrSubmitMCPToolResultDXR pfnSubmitMcpToolResult_ = nullptr;
     McpToolHandler mcpToolHandler_;
 
     // Capabilities discovered at instance creation.
@@ -283,7 +283,7 @@ private:
     bool transparentBg_ = false;   // MEDIAPLAYER_TRANSPARENT — letterbox composes through
     uint32_t displayPixelWidth_ = 0;
     uint32_t displayPixelHeight_ = 0;
-    // 3D panel top-left in virtual-desktop pixels (XrDisplayDesktopPositionEXT,
+    // 3D panel top-left in virtual-desktop pixels (XrDisplayDesktopPositionDXR,
     // display_info v16). (0, 0) = primary/unknown — the safe default.
     int32_t displayDesktopLeft_ = 0;
     int32_t displayDesktopTop_ = 0;
