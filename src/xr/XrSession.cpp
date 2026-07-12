@@ -473,7 +473,7 @@ bool XrSession::CreateSessionWithWindowBinding(void* nativeWindowHandle) {
     // Experimental, PARKED — left as scaffolding (default off). MEDIAPLAYER_TRANSPARENT=1
     // asks the runtime/DP to compose the letterbox through to the desktop: the renderer
     // clears those regions to alpha 0 and the runtime honours per-pixel alpha
-    // (chromaKeyColor 0 = no chroma-key pass). Set only at session creation; can't toggle.
+    // (the legacy chromaKeyColor field was removed by runtime#573, ABI v4). Set only at session creation; cannot toggle.
     //
     // Not finished, for two reasons found on Windows + LeiaSR:
     //   1. WINDOW: this still shows BLACK, not see-through. SDL hands us an ordinary
@@ -486,7 +486,6 @@ bool XrSession::CreateSessionWithWindowBinding(void* nativeWindowHandle) {
     //      at 4K here) — a poor trade for video. Revisit only if both are acceptable.
     if (const char* t = std::getenv("MEDIAPLAYER_TRANSPARENT"); t && *t && *t != '0') {
         windowBinding.transparentBackgroundEnabled = XR_TRUE;
-        windowBinding.chromaKeyColor = 0;
         transparentBg_ = true;
     }
     if (hasWindowBindingExt_ && nativeWindowHandle) {
