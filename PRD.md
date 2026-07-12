@@ -91,7 +91,7 @@ Metal optimization), but it's no longer on the critical path.
 
 - **App class:** `_handle` — the app owns its window (SDL3) and hands the real
   window handle to the runtime via the window-binding extension
-  (`XR_DXR_win32_window_binding` / `XR_EXT_android_surface_binding`). The app
+  (`XR_DXR_win32_window_binding` / `XR_DXR_android_surface_binding`). The app
   renders **both eyes**, which is what enables the subtle-parallax UI.
 - **OpenXR session:** one stereo swapchain (two views). Per frame: blit decoded
   **L→view[0]**, **R→view[1]**; draw UI quads into both with a per-eye
