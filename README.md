@@ -30,7 +30,7 @@ decode → atlas → submit path; the runtime + display processor do all weaving
 build — correct per-eye L/R routing in 2-view (Squeezed SBS) and 4-view (Quad) modes, HUD
 compositing, 114 FPS on M1 Pro. See [`docs/M5-NOTES.md`](docs/M5-NOTES.md). Windows builds
 in CI; the macOS Vulkan path uses `VK_KHR_portability_enumeration` + `VK_KHR_portability_subset`
-over an `XR_EXT_cocoa_window_binding` NSView.
+over an `XR_DXR_cocoa_window_binding` NSView.
 
 Also in: live (continuous) window resize, an FPS counter in the title bar, and a
 window-space stats **HUD** (toggle with **SHIFT+TAB**) showing fps / mode / source /
@@ -94,7 +94,7 @@ Set `MEDIAPLAYER_LOG_DEBUG=1` for verbose logs.
 v1.0.0 is verified against the DisplayXR runtime **v1.10.2** release line (the
 current `versions.json[runtime]` pin). Coupling is **extension-wire-protocol only** —
 the demo needs the runtime's window-binding + stereo-session extensions
-(`XR_EXT_win32_window_binding` / `XR_EXT_cocoa_window_binding`, `XR_EXT_display_info`),
+(`XR_DXR_win32_window_binding` / `XR_DXR_cocoa_window_binding`, `XR_DXR_display_info`),
 so any runtime exposing that protocol should work, but v1.10.2 is the combination this
 release was validated against.
 

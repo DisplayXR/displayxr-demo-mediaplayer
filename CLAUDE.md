@@ -36,9 +36,9 @@ exactly like any third-party OpenXR app (and like the DisplayXR Unity plugin).
 | Android Vulkan surface | `test_apps/cube_handle_vk_android/` |
 | Shared helpers used by the test apps | `test_apps/common/` (vendor the minimal subset you need — these apps aren't standalone) |
 | Extension API surface | `src/external/openxr_includes/openxr/` (also published to `displayxr-extensions`) |
-| Window-binding contract | `docs/specs/extensions/XR_EXT_win32_window_binding.md`, `XR_EXT_android_surface_binding` |
+| Window-binding contract | `docs/specs/extensions/XR_DXR_win32_window_binding.md`, `XR_EXT_android_surface_binding` |
 | Swapchain / canvas model (views use **canvas** size, not display size) | `docs/specs/runtime/swapchain-model.md` |
-| Display dims + eye-tracking modes | `docs/specs/extensions/XR_EXT_display_info.md` |
+| Display dims + eye-tracking modes | `docs/specs/extensions/XR_DXR_display_info.md` |
 
 ## Stack (keep it this small)
 
@@ -84,11 +84,11 @@ is **non-required** and fires only on `workflow_dispatch` + `linux*` branches.
 (`XR_RUNTIME_JSON`, `XRT_PLUGIN_SEARCH_PATH`, `OXR_ENABLE_VK_NATIVE_COMPOSITOR=1`,
 `SIM_DISPLAY_OUTPUT=anaglyph`).
 
-**Status: BUILD-GREEN, window binding wired.** `XR_EXT_xlib_window_binding`
+**Status: BUILD-GREEN, window binding wired.** `XR_DXR_xlib_window_binding`
 (runtime Phase 3a) is fully wired: `Window.cpp` extracts the (Display*, XID)
 pair from SDL's X11 properties (bundled as `Window::X11Handles` behind the
 one-void* handle plumbing) and prefers SDL's x11 driver (XWayland on Wayland
-desktops); `XrSession.cpp` chains `XrXlibWindowBindingCreateInfoEXT` when the
+desktops); `XrSession.cpp` chains `XrXlibWindowBindingCreateInfoDXR` when the
 runtime advertises the extension. On-screen validation is gated on the
 runtime's Linux Phase 1b/3b hardware bring-up. Recipe: the runtime repo's
 `docs/guides/linux-demo-port.md`.

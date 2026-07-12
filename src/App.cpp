@@ -14,7 +14,7 @@
 #include <cstring>
 #include <filesystem>
 
-#include <nlohmann/json.hpp>  // parse agent-tool args / build results (XR_EXT_mcp_tools)
+#include <nlohmann/json.hpp>  // parse agent-tool args / build results (XR_DXR_mcp_tools)
 #include <SDL3/SDL.h>   // SDL_ShowOpenFileDialog (Tier-0 native file dialog)
 
 #if defined(_WIN32)
@@ -48,7 +48,7 @@ constexpr float kConvergenceStep = 0.0025f;
 constexpr float kConvergenceMax = 0.05f;
 
 // Where the 'I'-key atlas captures land: <Pictures>/DisplayXR on Windows, else the
-// working directory. xrCaptureAtlasEXT appends "_atlas.png" to the prefix we return;
+// working directory. xrCaptureAtlasDXR appends "_atlas.png" to the prefix we return;
 // we number against existing "<stem>-<N>_<cols>x<rows>_atlas.png" so repeats accumulate
 // instead of overwriting. Mirrors the modelviewer/gaussiansplat demos' convention.
 std::string MakeCaptureAtlasPrefix(const std::string& stem, uint32_t cols, uint32_t rows) {
@@ -152,7 +152,7 @@ bool App::Initialize(const char* mediaPath) {
     // Open the window ON the 3D panel (INV-1.3; runtime#715): on multi-monitor
     // boxes SDL centers new windows on the primary display, but the window-relative
     // weave is only correct on the 3D panel itself. The runtime reports the panel's
-    // top-left via XrDisplayDesktopPositionEXT (display_info v16); XrSession fires
+    // top-left via XrDisplayDesktopPositionDXR (display_info v16); XrSession fires
     // this one-shot placement after the properties query and before xrCreateSession,
     // so the position is settled when the session binding captures the HWND/XID and
     // the DP's phase tracking starts. SDL global desktop coordinates are top-down
@@ -227,7 +227,7 @@ bool App::Initialize(const char* mediaPath) {
         }
     }
 
-    // Expose the player's transport controls to agents (XR_EXT_mcp_tools). Inert when the
+    // Expose the player's transport controls to agents (XR_DXR_mcp_tools). Inert when the
     // runtime lacks the extension or the MCP capability gate is off.
     SetupAgentTools();
 
@@ -1195,13 +1195,13 @@ void App::StepFrame(int n) {
 
 void App::SetupAgentTools() {
     if (!xr_.HasMcpTools()) {
-        LOG_INFO("XR_EXT_mcp_tools unavailable — agent tools not registered");
+        LOG_INFO("XR_DXR_mcp_tools unavailable — agent tools not registered");
         return;
     }
     // The app id MUST equal the manifest `id` (linter INV-10.1). It is the agent-visible
     // tool prefix (e.g. mediaplayer__play_pause through the workspace aggregator).
     if (!xr_.SetMcpAppId("mediaplayer")) {
-        LOG_WARN("xrSetMCPAppInfoEXT failed — skipping agent-tool registration");
+        LOG_WARN("xrSetMCPAppInfoDXR failed — skipping agent-tool registration");
         return;
     }
 
@@ -1438,7 +1438,7 @@ void App::RequestOpenFile() {
     if (openFilePending_) return;
     openFilePending_ = true;
 
-    // Prefer the workspace spatial picker (XR_EXT_workspace_file_dialog). In a
+    // Prefer the workspace spatial picker (XR_DXR_workspace_file_dialog). In a
     // workspace it spawns displayxr-file-picker.exe and the result arrives async via
     // xr_.TakePickedFile(); anywhere else we fall back to a native OS dialog.
     const XrSession::PickerStatus st = xr_.RequestFilePicker();

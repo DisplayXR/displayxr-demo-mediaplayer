@@ -72,7 +72,7 @@ private:
     void ToggleMute();       // silence audio (keeps playing); persists across clips
     void StepFrame(int n);   // pause + step n frames (']' +1 / '[' -1)
 
-    // Agent tools (XR_EXT_mcp_tools). SetupAgentTools registers the player's controls as
+    // Agent tools (XR_DXR_mcp_tools). SetupAgentTools registers the player's controls as
     // MCP tools on the runtime's per-process server (no-op when the MCP gate is off);
     // DispatchAgentTool runs a tool invocation against live player state — it executes on
     // the main loop (inside xr_.PollEvents), so it touches state without locking.

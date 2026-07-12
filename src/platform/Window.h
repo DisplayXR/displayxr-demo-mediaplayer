@@ -6,7 +6,7 @@
 //   macOS  -> NSView* (CAMetalLayer-backed) via SDL_Metal_CreateView
 //   Windows-> HWND via SDL window properties
 //   Linux  -> &X11Handles (Display* + XID pair) via SDL X11 window properties;
-//             XR_EXT_xlib_window_binding needs both, unlike the single-pointer
+//             XR_DXR_xlib_window_binding needs both, unlike the single-pointer
 //             handles of the other platforms
 // One SDL codebase; only the handle extraction is per-platform.
 #pragma once
@@ -21,7 +21,7 @@ namespace mp {
 class Window {
 public:
 #if defined(__linux__) && !defined(__ANDROID__)
-    // What NativeHandle() points at on desktop Linux. XR_EXT_xlib_window_binding
+    // What NativeHandle() points at on desktop Linux. XR_DXR_xlib_window_binding
     // takes the pair (Display*, Window XID); SDL exposes them as two window
     // properties, so they're bundled here to fit the one-void* handle plumbing.
     // Both are borrowed from SDL — valid until Destroy().
@@ -56,7 +56,7 @@ public:
     // Move the window to (x, y) in SDL global desktop coordinates — top-down
     // virtual-desktop pixels on every platform (Windows virtual screen, X11 root,
     // and macOS SDL global coordinates alike), matching the convention of
-    // XrDisplayDesktopPositionEXT directly. No per-platform flip needed.
+    // XrDisplayDesktopPositionDXR directly. No per-platform flip needed.
     void SetPosition(int x, int y);
 
     // Make the window visible. Deferred until after XR setup so the window doesn't flash on

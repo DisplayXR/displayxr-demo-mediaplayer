@@ -8,7 +8,7 @@
 # anaglyph weave so output is eyeball-checkable without 3D hardware.
 #
 # NOTE: on-screen operation is gated on the runtime's Linux Phase 1b/3b
-# hardware bring-up. The app side is fully wired: XR_EXT_xlib_window_binding
+# hardware bring-up. The app side is fully wired: XR_DXR_xlib_window_binding
 # (runtime Phase 3a) is enabled when advertised, with the X11 handle pair
 # extracted from SDL. Needs X11/XWayland (the app prefers SDL's x11 driver).
 #

@@ -27,7 +27,7 @@ Window::~Window() { Destroy(); }
 
 bool Window::Create(const char* title, int width, int height) {
 #if defined(__linux__) && !defined(__ANDROID__)
-    // Prefer the X11 video driver: XR_EXT_xlib_window_binding is X11-only
+    // Prefer the X11 video driver: XR_DXR_xlib_window_binding is X11-only
     // (runtime converts to XCB internally), and the display processor wants the
     // absolute window position X11 exposes (Wayland hides it). On Wayland
     // desktops this lands on XWayland. SDL_SetHint doesn't override the
@@ -58,7 +58,7 @@ bool Window::Create(const char* title, int width, int height) {
 
 #if defined(__APPLE__)
     // SDL_Metal_CreateView returns an NSView* (CAMetalLayer-backed) — exactly what
-    // XR_EXT_cocoa_window_binding wants as its viewHandle.
+    // XR_DXR_cocoa_window_binding wants as its viewHandle.
     metalView_ = SDL_Metal_CreateView(window_);
     if (!metalView_) {
         LOG_ERROR("SDL_Metal_CreateView failed: %s", SDL_GetError());
@@ -73,7 +73,7 @@ bool Window::Create(const char* title, int width, int height) {
         return false;
     }
 #elif defined(__linux__) && !defined(__ANDROID__)
-    // XR_EXT_xlib_window_binding needs the (Display*, Window XID) pair; bundle
+    // XR_DXR_xlib_window_binding needs the (Display*, Window XID) pair; bundle
     // both SDL properties behind the single void* the XR plumbing carries.
     SDL_PropertiesID props = SDL_GetWindowProperties(window_);
     x11_.display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr);
@@ -83,7 +83,7 @@ bool Window::Create(const char* title, int width, int height) {
         nativeHandle_ = &x11_;
     } else {
         LOG_WARN("No X11 window handles from SDL (driver '%s') — window binding unavailable; "
-                 "run under X11/XWayland for XR_EXT_xlib_window_binding",
+                 "run under X11/XWayland for XR_DXR_xlib_window_binding",
                  SDL_GetCurrentVideoDriver());
     }
 #else

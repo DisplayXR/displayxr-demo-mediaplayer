@@ -91,7 +91,7 @@ Metal optimization), but it's no longer on the critical path.
 
 - **App class:** `_handle` — the app owns its window (SDL3) and hands the real
   window handle to the runtime via the window-binding extension
-  (`XR_EXT_win32_window_binding` / `XR_EXT_android_surface_binding`). The app
+  (`XR_DXR_win32_window_binding` / `XR_EXT_android_surface_binding`). The app
   renders **both eyes**, which is what enables the subtle-parallax UI.
 - **OpenXR session:** one stereo swapchain (two views). Per frame: blit decoded
   **L→view[0]**, **R→view[1]**; draw UI quads into both with a per-eye
@@ -247,5 +247,5 @@ any of them if product priorities shift.
 - **Single-file open in v1**, via a tiny native dialog (SDL3 / tinyfiledialogs).
   *Low-cost stretch:* once a file is open, arrow-key prev/next across the
   containing folder (cheap, no playlist UI). Full playlist/library UI is post-v1.
-  (Under the shell, `XR_EXT_workspace_file_dialog` is a nicer spatial picker later
+  (Under the shell, `XR_DXR_workspace_file_dialog` is a nicer spatial picker later
   — Windows + workspace-mode only, so not the v1 default path.)

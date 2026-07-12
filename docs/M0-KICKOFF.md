@@ -17,7 +17,7 @@ decode, no UI yet — just prove the window → OpenXR → runtime → display p
 1. `cmake -S . -B build && cmake --build build` succeeds on the dev machine.
 2. Binary `mediaplayer_handle_vk_<platform>` launches, creates an SDL3 window, and
    hands its native window handle to the runtime via the window-binding extension
-   (`XR_EXT_win32_window_binding` on Windows; the macOS/Android equivalents stubbed
+   (`XR_DXR_win32_window_binding` on Windows; the macOS/Android equivalents stubbed
    or wired per platform).
 3. An OpenXR instance + system + **stereo** session + swapchain are created against
    the DisplayXR runtime (verified via the runtime's `loaded from:` log line).
