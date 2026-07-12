@@ -36,7 +36,7 @@ exactly like any third-party OpenXR app (and like the DisplayXR Unity plugin).
 | Android Vulkan surface | `test_apps/cube_handle_vk_android/` |
 | Shared helpers used by the test apps | `test_apps/common/` (vendor the minimal subset you need — these apps aren't standalone) |
 | Extension API surface | `src/external/openxr_includes/openxr/` (also published to `displayxr-extensions`) |
-| Window-binding contract | `docs/specs/extensions/XR_DXR_win32_window_binding.md`, `XR_EXT_android_surface_binding` |
+| Window-binding contract | `docs/specs/extensions/XR_DXR_win32_window_binding.md`, `XR_DXR_android_surface_binding` |
 | Swapchain / canvas model (views use **canvas** size, not display size) | `docs/specs/runtime/swapchain-model.md` |
 | Display dims + eye-tracking modes | `docs/specs/extensions/XR_DXR_display_info.md` |
 
