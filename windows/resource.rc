@@ -1,0 +1,37 @@
+// Copyright 2026, The DisplayXR Project and its contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include <winver.h>
+
+// Explorer/file icon — multi-size .ico generated from the 2D workspace
+// logo (displayxr/icon.png); the SBS 3D logo stays shell-only.
+1 ICON "../displayxr/icon.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "The DisplayXR Project"
+            VALUE "FileDescription",  "DisplayXR Media Player"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "mediaplayer_handle_vk_win"
+            VALUE "LegalCopyright",   "Copyright 2026 The DisplayXR Project and its contributors"
+            VALUE "OriginalFilename", "mediaplayer_handle_vk_win.exe"
+            VALUE "ProductName",      "DisplayXR Media Player"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
