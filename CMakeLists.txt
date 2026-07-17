@@ -184,6 +184,8 @@ add_executable(${MP_TARGET}
 # (e.g. the shell's CREATE_NEW_CONSOLE) or redirected.
 if(WIN32)
     set_target_properties(${MP_TARGET} PROPERTIES WIN32_EXECUTABLE TRUE)
+    # Embedded Explorer icon + version info (icon from the 2D workspace logo).
+    target_sources(${MP_TARGET} PRIVATE windows/resource.rc)
 endif()
 
 target_include_directories(${MP_TARGET} PRIVATE
