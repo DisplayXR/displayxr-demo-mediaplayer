@@ -90,6 +90,10 @@ ShowUninstDetails show
 ; UI
 
 !define MUI_ABORTWARNING
+
+; Installer / wizard / uninstaller icon — the demo's own (rounded) app logo.
+!define MUI_ICON   "${SOURCE_DIR}\displayxr\icon.ico"
+!define MUI_UNICON "${SOURCE_DIR}\displayxr\icon.ico"
 !define MUI_WELCOMEPAGE_TITLE "DisplayXR Stereo Media Player Setup"
 !define MUI_WELCOMEPAGE_TEXT "This will install the Stereo Media Player reference demo for the DisplayXR runtime.$\r$\n$\r$\nThe DisplayXR runtime must be installed first."
 
