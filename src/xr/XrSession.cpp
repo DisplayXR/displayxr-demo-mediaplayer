@@ -44,13 +44,14 @@ const char* SessionStateName(XrSessionState s) {
 
 XrSession::~XrSession() { Shutdown(); }
 
-bool XrSession::Initialize(void* nativeWindowHandle,
-                           const std::function<void(int32_t left, int32_t top)>& placeWindow) {
+bool XrSession::Initialize(void* nativeWindowHandle, const PlaceWindowFn& placeWindow) {
     if (!InitInstanceAndSystem()) return false;
     // Let the app move its window onto the 3D panel BEFORE the session binding
     // captures the native handle (the DP's phase tracking starts from the settled
     // position). See XrDisplayDesktopPositionDXR / runtime#715.
-    if (placeWindow) placeWindow(displayDesktopLeft_, displayDesktopTop_);
+    if (placeWindow)
+        placeWindow(displayDesktopLeft_, displayDesktopTop_,
+                    displayPixelWidth_, displayPixelHeight_);
     if (!CreateVulkanDevice()) return false;
     if (!CreateSessionWithWindowBinding(nativeWindowHandle)) return false;
     EnumerateRenderingModes();   // needs the session; informs swapchain sizing

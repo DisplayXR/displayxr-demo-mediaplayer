@@ -36,7 +36,10 @@ DISPLAY_NAME="DisplayXR Stereo Media Player"
 DESCRIPTION="Stereo 3D photo & video player (SBS / LR / anaglyph) for glasses-free 3D displays."
 BINARY="mediaplayer_handle_vk_linux"                # build/<BINARY>
 DESKTOP_CATEGORIES="AudioVideo;Player;"
-ASSETS_SUBDIR="assets"                              # repo dir to bundle, "" if none
+ASSETS_SUBDIR=""                                    # defaults-only: no misc assets/ dir
+# Staged flat next to the binary (Windows-installer parity): one sample stereo
+# clip the user can Open. The idle screen comes from the displayxr/ sidecar below.
+DEFAULT_ASSETS=("assets/test_LR_2x1.png:test_LR_2x1.png")
 
 set -euo pipefail
 
@@ -89,6 +92,32 @@ done
 if [ -n "$ASSETS_SUBDIR" ] && [ -d "$ROOT/$ASSETS_SUBDIR" ]; then
   cp -aR "$ROOT/$ASSETS_SUBDIR" "$APPDIR/assets"
 fi
+
+# Default assets, staged FLAT next to the binary (the app resolves them via
+# /proc/self/exe — the Windows-installer layout; see the modelviewer template).
+for pair in "${DEFAULT_ASSETS[@]:-}"; do
+  [ -n "$pair" ] || continue
+  src="$ROOT/${pair%%:*}"; dst="${pair##*:}"
+  if [ -f "$src" ]; then
+    install -m 0644 "$src" "$APPDIR/$dst"
+    echo "==> default asset staged: $dst ($(du -h "$src" | cut -f1))"
+  else
+    echo "warn: default asset '${pair%%:*}' not found." >&2
+  fi
+done
+
+# The displayxr/ sidecar next to the binary: LoadIdleLogo resolves
+# <exe-dir>/displayxr/{idle,logo}.png for the no-media idle screen, and the
+# workspace manifest/icons ride along (manifest renamed to the Linux binary).
+mkdir -p "$APPDIR/displayxr"
+for f in idle.png logo.png icon.png icon_sbs.png; do
+  [ -f "$ROOT/displayxr/$f" ] && install -m 0644 "$ROOT/displayxr/$f" "$APPDIR/displayxr/$f"
+done
+if [ -f "$ROOT/displayxr/mediaplayer_handle_vk_win.displayxr.json" ]; then
+  install -m 0644 "$ROOT/displayxr/mediaplayer_handle_vk_win.displayxr.json" \
+    "$APPDIR/displayxr/$BINARY.displayxr.json"
+fi
+echo "==> displayxr/ sidecar staged (idle screen + manifest)"
 
 # Launcher wrapper on PATH.
 cat > "$STAGE/usr/bin/$PKG" <<EOF

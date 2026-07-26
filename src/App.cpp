@@ -140,12 +140,18 @@ XrSession::ViewRect MatchMinRect(const XrSession::ViewRect& tile, float contentA
 } // namespace
 
 bool App::Initialize(const char* mediaPath) {
-    // Default 1280x720; MEDIAPLAYER_WINDOW="WxH" overrides (e.g. "720x1280" to test
-    // portrait aspect handling without a rebuild).
+    // Default 1280x720; MEDIAPLAYER_WINDOW="WxH" or the uniform "WxH+X+Y" form
+    // overrides (X,Y absolute virtual-desktop px — pins the window there and skips
+    // the panel auto-placement; "WxH" alone still auto-places, e.g. "720x1280" to
+    // test portrait aspect handling without a rebuild).
     int winW = 1280, winH = 720;
+    int forceX = 0, forceY = 0;
+    bool forcePos = false;
     if (const char* s = std::getenv("MEDIAPLAYER_WINDOW")) {
-        int a = 0, b = 0;
-        if (std::sscanf(s, "%dx%d", &a, &b) == 2 && a > 0 && b > 0) { winW = a; winH = b; }
+        int a = 0, b = 0, x = 0, y = 0;
+        int n = std::sscanf(s, "%dx%d+%d+%d", &a, &b, &x, &y);
+        if (n >= 2 && a > 0 && b > 0) { winW = a; winH = b; }
+        if (n >= 4) { forceX = x; forceY = y; forcePos = true; }
     }
     if (!window_.Create("DisplayXR Stereo Media Player", winW, winH)) return false;
 
@@ -158,10 +164,25 @@ bool App::Initialize(const char* mediaPath) {
     // the DP's phase tracking starts. SDL global desktop coordinates are top-down
     // virtual-desktop pixels on all platforms — pass (left, top) straight through.
     // (0, 0) = primary/unknown (old runtimes too): keep SDL's default placement.
-    auto placeOnPanel = [this](int32_t left, int32_t top) {
+    // With a known panel pixel size, center the window on the panel (parity with
+    // the other demos); otherwise fall back to the panel's top-left corner.
+    auto placeOnPanel = [this, winW, winH, forceX, forceY, forcePos](
+                            int32_t left, int32_t top, uint32_t panelW, uint32_t panelH) {
+        if (forcePos) {
+            window_.SetPosition(forceX, forceY);
+            LOG_INFO("MEDIAPLAYER_WINDOW override: placed window at absolute (%d, %d)",
+                     forceX, forceY);
+            return;
+        }
         if (left == 0 && top == 0) return;
-        window_.SetPosition(left, top);
-        LOG_INFO("Placed window on 3D panel at (%d, %d)", left, top);
+        int x = left, y = top;
+        if (panelW > 0 && panelH > 0) {
+            x = left + ((int)panelW - winW) / 2;
+            y = top + ((int)panelH - winH) / 2;
+        }
+        window_.SetPosition(x, y);
+        LOG_INFO("Placed window on 3D panel at (%d, %d)%s", x, y,
+                 (panelW > 0) ? " (centered)" : "");
     };
     if (!xr_.Initialize(window_.NativeHandle(), placeOnPanel)) {
         LOG_ERROR("OpenXR initialization failed");

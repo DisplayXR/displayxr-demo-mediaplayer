@@ -69,12 +69,15 @@ public:
     //
     // `placeWindow` (optional) fires after the system-properties query and BEFORE
     // xrCreateSession, with the 3D panel's top-left in virtual-desktop pixels from
-    // XrDisplayDesktopPositionDXR (display_info v16). The session binding captures
-    // the native handle, so the window position must be settled by then for the
-    // display processor's phase tracking to start right. (0, 0) = primary monitor
-    // or unknown (old runtimes ignore the chained struct, leaving the zero-init).
-    bool Initialize(void* nativeWindowHandle,
-                    const std::function<void(int32_t left, int32_t top)>& placeWindow = {});
+    // XrDisplayDesktopPositionDXR (display_info v16) plus the panel's pixel size
+    // (0 = unknown) so the app can center itself on the panel. The session binding
+    // captures the native handle, so the window position must be settled by then
+    // for the display processor's phase tracking to start right. (0, 0) = primary
+    // monitor or unknown (old runtimes ignore the chained struct, leaving the
+    // zero-init).
+    using PlaceWindowFn = std::function<void(int32_t left, int32_t top,
+                                             uint32_t panelW, uint32_t panelH)>;
+    bool Initialize(void* nativeWindowHandle, const PlaceWindowFn& placeWindow = {});
     void Shutdown();
 
     // Drain the OpenXR event queue, driving the session state machine
