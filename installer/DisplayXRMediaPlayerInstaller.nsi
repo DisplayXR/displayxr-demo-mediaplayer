@@ -87,6 +87,27 @@ ShowUninstDetails show
 !include "WordFunc.nsh"
 
 ;--------------------------------
+; Abort a pre-flight check without ever showing a modal in silent mode.
+;
+; NSIS does NOT suppress MessageBox under /S — it shows and blocks forever.
+; The DisplayXR meta-bundle runs every child installer as
+; `ExecWait '<child> /S'` and aborts the chain on a non-zero exit, so a modal
+; here would hang the ENTIRE bundle against a window nobody can see. In silent
+; mode set a distinct exit code instead; the bundle already surfaces that as
+; "<component> installer exited with code $0. Aborting bundle."
+;
+; Codes: 3 = not 64-bit, 4 = runtime absent, 5 = runtime below the floor.
+; (2 is reserved — the INNER uninstaller-emitting pass exits 2 by design.)
+!macro AbortWithReason CODE MSG
+    ${If} ${Silent}
+        SetErrorLevel ${CODE}
+    ${Else}
+        MessageBox MB_ICONSTOP "${MSG}"
+    ${EndIf}
+    Abort
+!macroend
+
+;--------------------------------
 ; UI
 
 !define MUI_ABORTWARNING
@@ -120,8 +141,7 @@ Function .onInit
     Quit
 !endif
     ${IfNot} ${RunningX64}
-        MessageBox MB_ICONSTOP "DisplayXR requires 64-bit Windows."
-        Abort
+        !insertmacro AbortWithReason 3 "DisplayXR requires 64-bit Windows."
     ${EndIf}
 
     ; HKLM\Software\DisplayXR\Runtime\InstallPath is set by the runtime
@@ -132,8 +152,7 @@ Function .onInit
     ReadRegStr $0 HKLM "Software\DisplayXR\Runtime" "InstallPath"
     SetRegView 32
     ${If} $0 == ""
-        MessageBox MB_ICONSTOP "DisplayXR runtime is not installed.$\r$\n$\r$\nInstall the DisplayXR runtime first, then re-run this installer.$\r$\n$\r$\nGet it from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
-        Abort
+        !insertmacro AbortWithReason 4 "DisplayXR runtime is not installed.$\r$\n$\r$\nInstall the DisplayXR runtime first, then re-run this installer.$\r$\n$\r$\nGet it from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
     ${EndIf}
     ; Presence is the only hard gate. A minimum-version covenant can be added
     ; here (VersionCompare against HKLM ...\Runtime "Version") once a verified
