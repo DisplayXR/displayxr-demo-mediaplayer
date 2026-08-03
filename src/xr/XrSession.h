@@ -3,7 +3,10 @@
 // XrSession — OpenXR lifecycle for a DisplayXR `_handle` Vulkan client.
 //
 // Owns the OpenXR instance/system/session, the Vulkan instance+device the runtime
-// asked us to create, the LOCAL reference space, and a single side-by-side (SBS)
+// creates for us (XR_KHR_vulkan_enable2: xrCreateVulkanInstanceKHR /
+// xrCreateVulkanDeviceKHR append the runtime's extensions and enable the device
+// features its late-weave presentation pacing needs — no app-side feature code),
+// the LOCAL reference space, and a single side-by-side (SBS)
 // stereo swapchain (both eyes packed into one image; eye 0 = left half, eye 1 =
 // right half). The app never weaves — it submits a plain stereo projection layer
 // and the runtime/display-processor does the weaving.
