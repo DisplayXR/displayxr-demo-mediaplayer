@@ -11,21 +11,6 @@ namespace mp {
 
 namespace {
 
-// Split a space-separated extension list (as returned by the KHR_vulkan_enable
-// xrGetVulkan*ExtensionsKHR helpers) into individual names.
-std::vector<std::string> SplitSpaceSeparated(const std::string& s) {
-    std::vector<std::string> out;
-    size_t start = 0;
-    while (start < s.size()) {
-        size_t end = s.find(' ', start);
-        if (end == std::string::npos) end = s.size();
-        std::string name = s.substr(start, end - start);
-        if (!name.empty() && name[0] != '\0') out.push_back(name);
-        start = end + 1;
-    }
-    return out;
-}
-
 const char* SessionStateName(XrSessionState s) {
     switch (s) {
         case XR_SESSION_STATE_IDLE: return "IDLE";
@@ -83,7 +68,7 @@ bool XrSession::InitInstanceAndSystem() {
 
     for (const auto& e : exts) {
         LOG_DEBUG("  instance ext: %s (v%u)", e.extensionName, e.extensionVersion);
-        if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
+        if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) hasVulkan = true;
         if (kWindowBindingExt && strcmp(e.extensionName, kWindowBindingExt) == 0) hasWindowBindingExt_ = true;
         if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) hasDisplayInfoExt_ = true;
         if (strcmp(e.extensionName, XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0)
@@ -94,7 +79,7 @@ bool XrSession::InitInstanceAndSystem() {
             hasMcpToolsExt_ = true;
     }
 
-    LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "yes" : "NO");
+    LOG_INFO("XR_KHR_vulkan_enable2: %s", hasVulkan ? "yes" : "NO");
     LOG_INFO("window binding (%s): %s",
              kWindowBindingExt ? kWindowBindingExt : "<none>",
              hasWindowBindingExt_ ? "yes" : "no");
@@ -104,12 +89,12 @@ bool XrSession::InitInstanceAndSystem() {
     LOG_INFO("XR_DXR_mcp_tools: %s", hasMcpToolsExt_ ? "yes" : "no");
 
     if (!hasVulkan) {
-        LOG_ERROR("Runtime does not expose XR_KHR_vulkan_enable");
+        LOG_ERROR("Runtime does not expose XR_KHR_vulkan_enable2");
         return false;
     }
 
     std::vector<const char*> enabled;
-    enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+    enabled.push_back(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
     if (hasWindowBindingExt_) enabled.push_back(kWindowBindingExt);
     if (hasDisplayInfoExt_) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     if (hasFilePickerExt_) enabled.push_back(XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
@@ -212,33 +197,35 @@ bool XrSession::InitInstanceAndSystem() {
 }
 
 bool XrSession::CreateVulkanDevice() {
-    // Resolve the KHR_vulkan_enable entry points (extension functions, not exported).
-    PFN_xrGetVulkanGraphicsRequirementsKHR pfnGetReq = nullptr;
-    PFN_xrGetVulkanInstanceExtensionsKHR pfnInstExts = nullptr;
-    PFN_xrGetVulkanGraphicsDeviceKHR pfnGetDevice = nullptr;
-    PFN_xrGetVulkanDeviceExtensionsKHR pfnDevExts = nullptr;
-    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrGetVulkanGraphicsRequirementsKHR",
-                                   (PFN_xrVoidFunction*)&pfnGetReq));
-    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrGetVulkanInstanceExtensionsKHR",
-                                   (PFN_xrVoidFunction*)&pfnInstExts));
-    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrGetVulkanGraphicsDeviceKHR",
-                                   (PFN_xrVoidFunction*)&pfnGetDevice));
-    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrGetVulkanDeviceExtensionsKHR",
-                                   (PFN_xrVoidFunction*)&pfnDevExts));
+    // KHR_vulkan_enable2: the RUNTIME creates the VkInstance/VkDevice on our
+    // behalf (xrCreateVulkanInstanceKHR / xrCreateVulkanDeviceKHR), appending
+    // whatever instance/device extensions it needs AND enabling the device
+    // features it depends on — notably VK_KHR_present_id/present_wait for
+    // late-weave presentation pacing (runtime#838/#840, INV-5.9) — with zero
+    // app-side feature code. We list only OUR OWN extensions in the create
+    // infos; the runtime merges its requirements on top (deduplicated).
+    PFN_xrGetVulkanGraphicsRequirements2KHR pfnGetReq2 = nullptr;
+    PFN_xrCreateVulkanInstanceKHR pfnCreateVkInstance = nullptr;
+    PFN_xrGetVulkanGraphicsDevice2KHR pfnGetDevice2 = nullptr;
+    PFN_xrCreateVulkanDeviceKHR pfnCreateVkDevice = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrGetVulkanGraphicsRequirements2KHR",
+                                   (PFN_xrVoidFunction*)&pfnGetReq2));
+    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrCreateVulkanInstanceKHR",
+                                   (PFN_xrVoidFunction*)&pfnCreateVkInstance));
+    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrGetVulkanGraphicsDevice2KHR",
+                                   (PFN_xrVoidFunction*)&pfnGetDevice2));
+    XR_CHECK(xrGetInstanceProcAddr(instance_, "xrCreateVulkanDeviceKHR",
+                                   (PFN_xrVoidFunction*)&pfnCreateVkDevice));
 
-    XrGraphicsRequirementsVulkanKHR req = {XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
-    XR_CHECK(pfnGetReq(instance_, systemId_, &req));
+    XrGraphicsRequirementsVulkan2KHR req = {XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR};
+    XR_CHECK(pfnGetReq2(instance_, systemId_, &req));
     LOG_INFO("Vulkan API range required: %u.%u - %u.%u",
              XR_VERSION_MAJOR(req.minApiVersionSupported), XR_VERSION_MINOR(req.minApiVersionSupported),
              XR_VERSION_MAJOR(req.maxApiVersionSupported), XR_VERSION_MINOR(req.maxApiVersionSupported));
 
-    // ---- VkInstance: runtime-required extensions + (macOS) portability enumeration.
-    uint32_t bufSize = 0;
-    pfnInstExts(instance_, systemId_, 0, &bufSize, nullptr);
-    std::string instExtStr(bufSize, '\0');
-    pfnInstExts(instance_, systemId_, bufSize, &bufSize, instExtStr.data());
-    std::vector<std::string> instExtNames = SplitSpaceSeparated(instExtStr);
-
+    // ---- VkInstance: runtime-created; we contribute only the app-side extras —
+    // (macOS) portability enumeration + the opt-in validation layer.
+    std::vector<const char*> instExtPtrs;
     bool hasPortabilityEnum = false;
 #if defined(__APPLE__)
     {
@@ -251,18 +238,12 @@ bool XrSession::CreateVulkanDevice() {
         for (const auto& e : avail) {
             if (strcmp(e.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0) {
                 hasPortabilityEnum = true;
-                instExtNames.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+                instExtPtrs.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
                 break;
             }
         }
     }
 #endif
-
-    std::vector<const char*> instExtPtrs;
-    for (auto& n : instExtNames) {
-        instExtPtrs.push_back(n.c_str());
-        LOG_INFO("  VkInstance ext: %s", n.c_str());
-    }
 
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -299,11 +280,21 @@ bool XrSession::CreateVulkanDevice() {
         ici.ppEnabledLayerNames = &kValLayer;
         LOG_INFO("Vulkan validation layer requested (interop debug)");
     }
+    for (const char* n : instExtPtrs) LOG_INFO("  VkInstance ext (app): %s", n);
 
-    if (vkCreateInstance(&ici, nullptr, &vkInstance_) != VK_SUCCESS) {
-        LOG_ERROR("vkCreateInstance failed");
+    XrVulkanInstanceCreateInfoKHR xici = {XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR};
+    xici.systemId = systemId_;
+    xici.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
+    xici.vulkanCreateInfo = &ici;
+
+    VkResult vkRes = VK_SUCCESS;
+    XrResult xrRes = pfnCreateVkInstance(instance_, &xici, &vkInstance_, &vkRes);
+    if (XR_FAILED(xrRes) || vkRes != VK_SUCCESS) {
+        LOG_ERROR("xrCreateVulkanInstanceKHR failed: XrResult=%d VkResult=%d",
+                  (int)xrRes, (int)vkRes);
         return false;
     }
+    LOG_INFO("Vulkan instance created via xrCreateVulkanInstanceKHR (runtime-managed extensions)");
     if (wantValidation) {
         auto pfnCreate = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
             vkInstance_, "vkCreateDebugUtilsMessengerEXT");
@@ -328,7 +319,10 @@ bool XrSession::CreateVulkanDevice() {
     }
 
     // ---- VkPhysicalDevice: the one the runtime is using.
-    XR_CHECK(pfnGetDevice(instance_, systemId_, vkInstance_, &physicalDevice_));
+    XrVulkanGraphicsDeviceGetInfoKHR devGetInfo = {XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR};
+    devGetInfo.systemId = systemId_;
+    devGetInfo.vulkanInstance = vkInstance_;
+    XR_CHECK(pfnGetDevice2(instance_, &devGetInfo, &physicalDevice_));
     {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(physicalDevice_, &props);
@@ -355,14 +349,11 @@ bool XrSession::CreateVulkanDevice() {
         }
     }
 
-    // ---- VkDevice: runtime-required device extensions, filtered to those the
-    // physical device actually exposes (promoted-to-core ones won't be listed),
-    // plus VK_KHR_portability_subset when present (mandatory on MoltenVK).
-    pfnDevExts(instance_, systemId_, 0, &bufSize, nullptr);
-    std::string devExtStr(bufSize, '\0');
-    pfnDevExts(instance_, systemId_, bufSize, &bufSize, devExtStr.data());
-    std::vector<std::string> requested = SplitSpaceSeparated(devExtStr);
-
+    // ---- VkDevice: runtime-created (its own required extensions + features are
+    // appended by xrCreateVulkanDeviceKHR). We pass only the APP's device
+    // extensions — the zero-copy decode interop set on Windows, plus
+    // VK_KHR_portability_subset when present (mandatory on MoltenVK) — each
+    // filtered to what the physical device actually exposes.
     uint32_t devAvailCount = 0;
     vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &devAvailCount, nullptr);
     std::vector<VkExtensionProperties> devAvail(devAvailCount);
@@ -372,13 +363,9 @@ bool XrSession::CreateVulkanDevice() {
         return false;
     };
 
-    std::vector<std::string> devExtStorage;
-    for (auto& n : requested) {
-        if (deviceHas(n.c_str())) devExtStorage.push_back(n);
-        else LOG_DEBUG("  skipping promoted-to-core device ext: %s", n.c_str());
-    }
+    std::vector<const char*> devExtPtrs;
     if (deviceHas("VK_KHR_portability_subset")) {
-        devExtStorage.push_back("VK_KHR_portability_subset");
+        devExtPtrs.push_back("VK_KHR_portability_subset");
     }
 
 #if defined(_WIN32)
@@ -388,14 +375,10 @@ bool XrSession::CreateVulkanDevice() {
     // listed here if the driver still exposes them as separate extensions). All guarded
     // by deviceHas(), so a driver lacking any of them simply leaves zeroCopyCapable_ off
     // and playback keeps using the CPU-download path.
-    auto alreadyEnabled = [&](const char* name) {
-        for (auto& n : devExtStorage) if (n == name) return true;
-        return false;
-    };
     for (const char* ext : {"VK_KHR_external_memory", "VK_KHR_external_memory_win32",
                             "VK_KHR_win32_keyed_mutex", "VK_KHR_sampler_ycbcr_conversion",
                             "VK_KHR_bind_memory2", "VK_KHR_get_memory_requirements2"}) {
-        if (deviceHas(ext) && !alreadyEnabled(ext)) devExtStorage.push_back(ext);
+        if (deviceHas(ext)) devExtPtrs.push_back(ext);
     }
     // Zero-copy needs both external-memory-win32 (import the D3D11 NV12 surface) and
     // win32-keyed-mutex (sync the D3D11 copy against the Vulkan sample).
@@ -403,11 +386,7 @@ bool XrSession::CreateVulkanDevice() {
                        deviceHas("VK_KHR_win32_keyed_mutex");
 #endif
 
-    std::vector<const char*> devExtPtrs;
-    for (auto& n : devExtStorage) {
-        devExtPtrs.push_back(n.c_str());
-        LOG_INFO("  VkDevice ext: %s", n.c_str());
-    }
+    for (const char* n : devExtPtrs) LOG_INFO("  VkDevice ext (app): %s", n);
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo qci = {};
@@ -423,12 +402,22 @@ bool XrSession::CreateVulkanDevice() {
     dci.enabledExtensionCount = (uint32_t)devExtPtrs.size();
     dci.ppEnabledExtensionNames = devExtPtrs.data();
 
-    if (vkCreateDevice(physicalDevice_, &dci, nullptr, &device_) != VK_SUCCESS) {
-        LOG_ERROR("vkCreateDevice failed");
+    XrVulkanDeviceCreateInfoKHR xdci = {XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
+    xdci.systemId = systemId_;
+    xdci.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
+    xdci.vulkanPhysicalDevice = physicalDevice_;
+    xdci.vulkanCreateInfo = &dci;
+
+    vkRes = VK_SUCCESS;
+    xrRes = pfnCreateVkDevice(instance_, &xdci, &device_, &vkRes);
+    if (XR_FAILED(xrRes) || vkRes != VK_SUCCESS) {
+        LOG_ERROR("xrCreateVulkanDeviceKHR failed: XrResult=%d VkResult=%d",
+                  (int)xrRes, (int)vkRes);
         return false;
     }
     vkGetDeviceQueue(device_, queueFamilyIndex_, 0, &graphicsQueue_);
-    LOG_INFO("Vulkan device + graphics queue created (family %u)", queueFamilyIndex_);
+    LOG_INFO("Vulkan device + graphics queue created via xrCreateVulkanDeviceKHR (family %u)",
+             queueFamilyIndex_);
 
 #if defined(_WIN32)
     // Record the physical device's adapter LUID so the D3D11VA decode device can be
