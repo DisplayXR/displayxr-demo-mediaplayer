@@ -46,7 +46,9 @@ constexpr int kDarkMean = 12;    // frames dimmer than this are skipped outright
 // 6.1 are both major 60 — and CI still builds against ffmpeg 4.4 on Ubuntu 22.04.
 bool ReadStereo3D(const AVFrame* f, StereoLayout& layout, bool& invert, const char*& why) {
     const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_STEREO3D);
-    if (!sd || sd->size < (int)sizeof(AVStereo3D)) return false;
+    // AVFrameSideData::size changed int -> size_t across ffmpeg versions; cast both to
+    // size_t so the comparison neither warns nor sign-flips on either.
+    if (!sd || (size_t)sd->size < sizeof(AVStereo3D)) return false;
     const AVStereo3D* s3 = reinterpret_cast<const AVStereo3D*>(sd->data);
 
     invert = (s3->flags & AV_STEREO3D_FLAG_INVERT) != 0;
