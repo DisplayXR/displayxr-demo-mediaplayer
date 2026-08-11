@@ -97,6 +97,34 @@ Grid BuildGrid(Sampler at, const Rect& r, int gw, int gh) {
     return g;
 }
 
+// Apply the high-pass. Runs on the DOWNSAMPLED grid, so it is ~5k operations and cannot
+// amplify sensor noise: the box-average already removed everything above the cell rate.
+Grid Prefilter(const Grid& in, StereoPrefilter mode) {
+    if (mode == StereoPrefilter::None || in.w < 3 || in.h < 3) return in;
+    Grid out;
+    out.w = in.w;
+    out.h = in.h;
+    out.v.resize(in.v.size());
+    auto at = [&](int x, int y) {   // replicate at the borders
+        x = x < 0 ? 0 : (x >= in.w ? in.w - 1 : x);
+        y = y < 0 ? 0 : (y >= in.h ? in.h - 1 : y);
+        return in.At(x, y);
+    };
+    for (int y = 0; y < in.h; ++y)
+        for (int x = 0; x < in.w; ++x) {
+            float v;
+            if (mode == StereoPrefilter::SobelX) {
+                v = (at(x + 1, y - 1) + 2.0f * at(x + 1, y) + at(x + 1, y + 1)) -
+                    (at(x - 1, y - 1) + 2.0f * at(x - 1, y) + at(x - 1, y + 1));
+            } else {
+                v = 4.0f * at(x, y) - at(x - 1, y) - at(x + 1, y) - at(x, y - 1) -
+                    at(x, y + 1);
+            }
+            out.v[(size_t)y * in.w + x] = v;
+        }
+    return out;
+}
+
 Stats GridStats(const Grid& g) {
     Stats s;
     const size_t n = g.v.size();
@@ -141,6 +169,57 @@ float Ncc(const Grid& L, const Grid& R, int d) {
     return (float)(cov / den);
 }
 
+// Systematic discontinuity at the frame midpoint.
+//
+// A mono image flows CONTINUOUSLY across x = W/2. A true side-by-side frame has a SEAM
+// there: the last column of the left eye is the right-hand edge of the scene, and the
+// first column of the right eye jumps straight back to the left-hand edge of it. Measure
+// the column-to-column difference AT the seam against the median of the same measure in
+// its neighbourhood, so the answer is scale- and content-free.
+//
+// ONE-WAY EVIDENCE, by design. Where the seam happens to fall on smooth content -- open
+// sky, an out-of-focus background, a flat wall -- a genuine SBS frame shows no
+// discontinuity at all, so a LOW score proves nothing whatsoever. Only a HIGH score is
+// informative. It is therefore wired as a VETO on the mono verdict and never as support
+// for one: it can rescue a real stereo frame the correlator underscored, and it can never
+// push an image toward mono.
+template <class Sampler>
+float SeamScore(Sampler at, int w, int mid, const Rect& rows, const StereoDetectParams&) {
+    const int K = std::min(48, std::min(mid - 2, w - mid - 2));
+    if (K < 8 || rows.H() < 8) return 0.0f;
+    const int ystep = std::max(1, rows.H() / 256);
+
+    std::vector<float> d;
+    d.reserve((size_t)2 * K);
+    int seamIdx = -1;
+    for (int x = mid - K; x < mid + K; ++x) {
+        if (x < 0 || x + 1 >= w) continue;
+        double acc = 0.0;
+        int n = 0;
+        for (int y = rows.y0; y < rows.y1; y += ystep) {
+            acc += std::fabs(at(x + 1, y) - at(x, y));
+            ++n;
+        }
+        if (n == 0) continue;
+        if (x == mid - 1) seamIdx = (int)d.size();   // the seam is between mid-1 and mid
+        d.push_back((float)(acc / n));
+    }
+    if (seamIdx < 0 || d.size() < 8) return 0.0f;
+
+    const float seam = d[(size_t)seamIdx];
+    std::vector<float> rest;
+    rest.reserve(d.size());
+    for (size_t i = 0; i < d.size(); ++i)
+        if ((int)i != seamIdx) rest.push_back(d[i]);
+    std::nth_element(rest.begin(), rest.begin() + (ptrdiff_t)(rest.size() / 2), rest.end());
+    const float med = rest[rest.size() / 2];
+
+    // Too flat either side to make a ratio meaningful: say nothing rather than divide a
+    // small number by a smaller one and report a huge, meaningless score.
+    if (med < 0.5f || seam < 2.0f) return 0.0f;
+    return seam / med;
+}
+
 float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
 // The whole analysis, parameterised on how to read a pixel so RGBA needs no temp buffer.
@@ -183,9 +262,11 @@ StereoDetectResult AnalyzeImpl(Sampler at, int w, int h, const StereoDetectParam
         return res;
     }
 
-    const Grid gl = BuildGrid(atL, act, gw, gh);
-    const Grid gr = BuildGrid(atR, act, gw, gh);
-    const Stats sl = GridStats(gl), sr = GridStats(gr);
+    const Grid rawL = BuildGrid(atL, act, gw, gh);
+    const Grid rawR = BuildGrid(atR, act, gw, gh);
+    // Abstain gates read the RAW grid — they are about whether the CONTENT has anything
+    // to match, which is a question about the image, not about the filtered signal.
+    const Stats sl = GridStats(rawL), sr = GridStats(rawR);
     res.sigmaMin = std::min(sl.sigma, sr.sigma);
     res.gradMin = std::min(sl.grad, sr.grad);
 
@@ -209,6 +290,11 @@ StereoDetectResult AnalyzeImpl(Sampler at, int w, int h, const StereoDetectParam
     // a legitimate mono verdict into an abstention, which then falls through to the very
     // aspect rule this layer exists to overrule. (Measured: it abstained on a plain 16:9
     // mono frame.)
+
+    res.seam = SeamScore(at, w, mid, act, p);
+
+    const Grid gl = Prefilter(rawL, p.prefilter);
+    const Grid gr = Prefilter(rawR, p.prefilter);
 
     // Peak over a small shift search.
     const int search = std::max(1, (int)std::lround(p.searchFrac * (float)gw));
@@ -272,18 +358,24 @@ StereoDetectResult AnalyzeImpl(Sampler at, int w, int h, const StereoDetectParam
         res.confidence = Clamp01(0.5f * (peak - p.peakMin) / std::max(0.01f, 1.0f - p.peakMin) +
                                  0.5f * std::min(1.0f, res.margin / 0.25f));
         res.reason = ambiguous ? "stereo (full/half ambiguous)" : "stereo";
-    } else if (peak < p.monoPeakMax || res.margin < p.monoMarginMax) {
-        // A CONFIDENT mono is a real verdict, not a fall-through: it has to outrank the
-        // >=1.9 aspect rule, or a 2:1 mono panorama is still split down the middle.
+    } else if (peak < p.monoPeakMax && res.seam < p.seamVetoRatio) {
+        // UNAMBIGUOUSLY 2D, and nothing else. The halves do not match at any plausible
+        // shift AND there is no discontinuity where the two eyes would meet. Only this
+        // rung can produce a mono verdict, because everything below assumes stereo.
+        //
+        // Note what is deliberately NOT here: a high peak with a flat margin (repetitive
+        // content). That is AMBIGUOUS, not 2D, so it falls through and is treated as
+        // stereo -- when in doubt, stereo.
         res.layout = StereoLayout::Mono;
         res.decided = true;
         res.confidence = Clamp01(1.0f - peak / std::max(0.01f, p.monoPeakMax));
-        res.reason = "unrelated halves";
+        res.reason = "unrelated halves, no mid-frame seam";
     } else {
-        // The grey band: something correlates, but not well enough, or not at a
-        // plausible disparity. Say nothing and let the next layer down decide.
+        // Doubt. Say nothing; the caller's policy is to assume stereo.
         res.decided = false;
-        res.reason = close ? "inconclusive" : "peak at implausible disparity";
+        if (!close) res.reason = "peak at implausible disparity";
+        else if (peak < p.monoPeakMax) res.reason = "weak match but a mid-frame seam";
+        else res.reason = "inconclusive";
     }
     return res;
 }

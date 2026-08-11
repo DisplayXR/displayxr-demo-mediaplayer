@@ -26,22 +26,35 @@ installers with CI release-on-tag (M6).
 Stereo images (JPG/PNG via stb_image, LIF and MPO containers) and SBS video share the same
 decode → atlas → submit path; the runtime + display processor do all weaving.
 
-**Stereo layout resolution.** In priority order: the `*_2x1` / `*_half_2x1` naming
-convention, then container metadata (a LIF or MPO container, or `AVStereo3D` side data from
-MKV `StereoMode`, MP4 `st3d`, or an H.264 frame-packing SEI — which also says whether the
-eyes are packed R|L), and if neither identifies the file it is **assumed to be stereo**,
-with the frame aspect settling full-SBS vs half-SBS.
+**Stereo layout resolution**, in priority order:
 
-That last step is a policy, not a measurement: this is a player for a 3D display, so mono
-is not a use case, and assuming stereo is what finally gets the common case right. A
-half-SBS frame is *dimensionally identical* to a mono one — 1920×1080 either way — so no
+1. **Filename** — the `*_2x1` / `*_half_2x1` convention.
+2. **Container metadata** — a LIF or MPO container, or `AVStereo3D` side data from MKV
+   `StereoMode`, MP4 `st3d`, or an H.264 frame-packing SEI (which also says whether the
+   eyes are packed R|L).
+3. **Content** — cross-correlation of the two halves, which may conclude **mono only on
+   unambiguous evidence**.
+4. **Otherwise the file is assumed to be stereo**, with the frame aspect settling
+   full-SBS vs half-SBS.
+
+Step 4 is a policy, not a measurement: this is a player for a 3D display, so mono is not a
+use case, and *when in doubt, stereo*. That is what finally gets the common case right — a
+half-SBS frame is dimensionally identical to a mono one (1920×1080 either way), so no
 aspect threshold can tell them apart, and the old `>= 1.9 → full SBS, else mono` rule
-therefore showed real half-SBS files flat. The cost, accepted: a genuinely mono file with
-no suffix and no metadata renders as squeezed half-SBS.
+therefore showed real half-SBS files flat.
 
-The HUD names whichever signal decided, and **L** pins the layout by hand. For mixed
-libraries, `MEDIAPLAYER_STEREO_DETECT=full` opts into a pixel cross-correlation detector
-that can recognise mono content automatically.
+Step 3 exists to rescue genuinely 2D files, and its thresholds are deliberately asymmetric:
+mono has to prove itself, stereo is the fallback. They were calibrated on 2,380 real
+7680×2160 stereo photographs plus the two variants each yields for free — its left eye
+alone (real mono) and its halves squeezed (real half-SBS), 7,140 analyses in all — and
+measured at **zero** real stereo images misclassified as 2D, with 2,367/2,380 mono
+correctly identified. Correlation runs on a Sobel high-pass so the
+match is illumination-invariant, and a mono verdict is vetoed by a systematic discontinuity
+at the frame midpoint, which a real SBS frame has and a mono one does not.
+
+The HUD names whichever signal decided, and **L** pins the layout by hand.
+`MEDIAPLAYER_STEREO_DETECT=meta` skips step 3 if you want the pure filename/metadata/assume
+ladder.
 
 **Verified on macOS (Apple Silicon, MoltenVK)** against a local `displayxr-runtime` dev
 build — correct per-eye L/R routing in 2-view (Squeezed SBS) and 4-view (Quad) modes, HUD
@@ -100,8 +113,8 @@ Set `MEDIAPLAYER_LOG_DEBUG=1` for verbose logs.
 
 | Type | Formats | Notes |
 |---|---|---|
-| Images | SBS JPG/PNG (`*_2x1`, `*_half_2x1`) | HEIF/LIF behind `MEDIAPLAYER_WITH_HEIF` (off by default) |
-| Video | SBS H.264 / H.265 / AV1 (MP4/MKV) | hardware decode via FFmpeg, CPU fallback |
+| Images | SBS JPG/PNG, LIF, MPO | layout from filename / container / content, else assumed stereo; HEIF behind `MEDIAPLAYER_WITH_HEIF` (off by default) |
+| Video | SBS H.264 / H.265 / AV1 (MP4/MKV/MOV) | hardware decode via FFmpeg, CPU fallback; `AVStereo3D` side data honoured incl. eye order |
 
 ## Runtime compatibility
 
