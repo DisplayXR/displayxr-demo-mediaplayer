@@ -424,18 +424,30 @@ void TestResolvePriority() {
     CHECK(r1.layout == StereoLayout::Mono && r1.signal == StereoSignal::Manual,
           "resolve: manual wins");
 
-    // 2. metadata beats filename and content — and is the only source of eyeSwap.
+    // 2. THE REGRESSION LOCK. The filename outranks container metadata, so a `*_2x1`
+    //    file keeps rendering exactly as it always has even when a tag disagrees. Without
+    //    this ordering, such a clip carrying a top-bottom or 2D AVStereo3D tag (both of
+    //    which map to Mono) would suddenly display flat.
     MediaInfo r2 = MediaSource::Resolve("x_2x1.png", MediaKind::Image, 3840, 1080,
                                         nullptr, &meta, &content);
-    CHECK(r2.layout == StereoLayout::SbsHalf && r2.signal == StereoSignal::Metadata,
-          "resolve: metadata beats filename");
-    CHECK(r2.eyeSwap, "resolve: eyeSwap comes from metadata");
+    CHECK(r2.layout == StereoLayout::SbsFull && r2.signal == StereoSignal::Filename,
+          "resolve: filename outranks metadata — existing *_2x1 assets are untouched");
+    // ...but eye ORDER still comes from the tag: the name says how the frame is packed,
+    // never which half is the left eye.
+    CHECK(r2.eyeSwap, "resolve: eyeSwap still taken from metadata under a filename match");
 
-    // 3. filename beats content.
-    MediaInfo r3 = MediaSource::Resolve("x_half_2x1.png", MediaKind::Image, 3840, 1080,
-                                        nullptr, nullptr, &content);
-    CHECK(r3.layout == StereoLayout::SbsHalf && r3.signal == StereoSignal::Filename,
-          "resolve: filename beats content");
+    MediaInfo metaMono;
+    metaMono.layout = StereoLayout::Mono;   // e.g. a top-bottom or AV_STEREO3D_2D tag
+    MediaInfo r2b = MediaSource::Resolve("clip_2x1.mkv", MediaKind::Video, 3840, 1080,
+                                         nullptr, &metaMono, nullptr);
+    CHECK(r2b.layout == StereoLayout::SbsFull,
+          "resolve: a mono-ish tag must NOT flatten a *_2x1 file");
+
+    // 3. metadata beats content when the filename says nothing.
+    MediaInfo r3 = MediaSource::Resolve("plain.mkv", MediaKind::Video, 3840, 1080,
+                                        nullptr, &meta, &content);
+    CHECK(r3.layout == StereoLayout::SbsHalf && r3.signal == StereoSignal::Metadata,
+          "resolve: metadata beats content");
 
     // 4. content beats aspect.
     MediaInfo r4 = MediaSource::Resolve("x.png", MediaKind::Image, 3840, 1080,

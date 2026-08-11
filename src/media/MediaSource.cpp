@@ -125,16 +125,25 @@ MediaInfo MediaSource::Resolve(const std::string& path, MediaKind kind,
         info.layout = *manual;
         info.signal = StereoSignal::Manual;
         info.confidence = 1.0f;
-    // 2. Container metadata. Authoritative when present, and the only layer that can
-    //    tell us the eyes are packed R|L.
+    // 2. Filename convention. ABOVE container metadata, deliberately: the `*_2x1` suffix
+    //    is an explicit label applied by whoever produced the file, and it is the rule
+    //    every existing asset already relies on. Ranking a container tag over it would
+    //    change how files that work today are rendered -- a `*_2x1` clip carrying a
+    //    top-bottom or 2D AVStereo3D tag would start showing as mono. Keeping the name on
+    //    top makes "existing `*_2x1` assets are unaffected" a guarantee rather than a
+    //    likelihood.
+    } else if (LayoutFromFilename(path, info.layout)) {
+        info.signal = StereoSignal::Filename;
+        info.confidence = 1.0f;
+        // Eye ORDER still comes from the tag when there is one: the filename convention
+        // says how the frame is packed, never which half is the left eye. This can only
+        // correct a file that was previously rendered with the eyes swapped.
+        if (meta) info.eyeSwap = meta->eyeSwap;
+    // 3. Container metadata.
     } else if (meta) {
         info.layout = meta->layout;
         info.eyeSwap = meta->eyeSwap;
         info.signal = StereoSignal::Metadata;
-        info.confidence = 1.0f;
-    // 3. Filename convention — unchanged from the original behaviour.
-    } else if (LayoutFromFilename(path, info.layout)) {
-        info.signal = StereoSignal::Filename;
         info.confidence = 1.0f;
     // 4. Content analysis, when it is switched on AND reached a verdict. A CONFIDENT
     //    MONO is a real verdict and wins here — that is the only way a mono file gets
