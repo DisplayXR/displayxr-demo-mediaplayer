@@ -345,6 +345,12 @@ int App::Run() {
             activity = true;
         }
         if (window_.TakeOpenFileRequest()) { RequestOpenFile(); activity = true; }     // Ctrl+O
+        // Dropped files (#44). Loading happens HERE, on the app thread — not in the SDL
+        // event handler — matching the discipline the native dialog already follows.
+        if (std::vector<std::string> dropped; window_.TakeDroppedPaths(dropped)) {
+            HandleDroppedPaths(std::move(dropped));
+            activity = true;
+        }
         if (window_.TakeTogglePauseRequest()) { TogglePlayback(); activity = true; }  // Space
         if (window_.TakePrevMediaRequest()) { RequestNavTransition(-1); activity = true; }  // Left
         if (window_.TakeNextMediaRequest()) { RequestNavTransition(+1); activity = true; }  // Right
@@ -361,10 +367,12 @@ int App::Run() {
 
         // Open-file results: the workspace picker completion (drained by PollEvents)
         // and the native dialog (parked off-thread). Either may yield a new path.
+        // Either picker is an explicit "load this one thing" gesture, so it retires any
+        // playlist a multi-file drop installed and the directory scan resumes (#44).
         std::string picked;
         if (xr_.TakePickedFile(picked)) {
             openFilePending_ = false;
-            if (!picked.empty()) ReloadMedia(picked);
+            if (!picked.empty()) { playlistFromDrop_ = false; ReloadMedia(picked); }
         }
         bool gotNative = false;
         {
@@ -373,11 +381,12 @@ int App::Run() {
         }
         if (gotNative) {
             openFilePending_ = false;
-            if (!picked.empty()) ReloadMedia(picked);  // outside the lock
+            if (!picked.empty()) { playlistFromDrop_ = false; ReloadMedia(picked); }  // outside the lock
         }
         // Test hook: exercise the media-swap path without a dialog.
         if (openAfterPath_ && !openedAfter_ && frames_ > 150) {
             openedAfter_ = true;
+            playlistFromDrop_ = false;
             ReloadMedia(openAfterPath_);
         }
 
@@ -1059,13 +1068,74 @@ void App::ReloadMedia(const std::string& path) {
     }
 }
 
+void App::HandleDroppedPaths(std::vector<std::string> paths) {
+    const size_t dropped = paths.size();
+    std::vector<std::string> good;
+    good.reserve(dropped);
+    for (auto& p : paths) {
+        if (MediaSource::IsSupported(p)) good.push_back(std::move(p));  // keep drop order
+    }
+    const size_t rejected = dropped - good.size();
+    if (good.empty()) {
+        // Never reject silently — the user aimed at the window and nothing happened.
+        LOG_INFO("Drop: %zu file(s), none supported", dropped);
+        ShowToast(dropped == 1 ? "Unsupported file type" : "No supported files in drop");
+        return;
+    }
+
+    if (good.size() == 1) {
+        // A single drop is the same gesture as Ctrl+O: load it and let the normal
+        // directory scan govern ←/→, so the user can walk the containing folder.
+        playlistFromDrop_ = false;
+        LOG_INFO("Drop: loading '%s'", good[0].c_str());
+        if (rejected > 0) {
+            char t[64];
+            std::snprintf(t, sizeof(t), "Loaded 1 of %zu (%zu unsupported)", dropped, rejected);
+            ShowToast(t);
+        }
+        ReloadMedia(good[0]);
+        return;
+    }
+
+    // Multi-file drop: the dropped set IS the nav list. Install it BEFORE loading —
+    // RebuildFolderList() sees playlistFromDrop_ and re-locates the index inside it
+    // rather than rescanning the parent directory.
+    folderFiles_ = std::move(good);
+    folderIndex_ = 0;
+    playlistFromDrop_ = true;
+    LOG_INFO("Drop: playlist of %zu asset(s), %zu unsupported", folderFiles_.size(), rejected);
+    char t[80];
+    if (rejected > 0) {
+        std::snprintf(t, sizeof(t), "Playlist: %zu items (%zu unsupported)",
+                      folderFiles_.size(), rejected);
+    } else {
+        std::snprintf(t, sizeof(t), "Playlist: %zu items", folderFiles_.size());
+    }
+    ShowToast(t);
+    ReloadMedia(folderFiles_[0]);
+}
+
 void App::RebuildFolderList(std::string path) {
     namespace fs = std::filesystem;
-    folderFiles_.clear();   // frees any string `path` might have aliased — it's a copy now
-    folderIndex_ = 0;
     std::error_code ec;
     fs::path p = fs::absolute(fs::path(path), ec);
     if (ec) p = fs::path(path);
+    if (playlistFromDrop_) {
+        // A dropped playlist replaces the directory scan (#44) — only re-locate the
+        // current entry. NOTE: folderFiles_ must NOT be cleared here, and `path` may
+        // alias into it, which is exactly why this runs before any mutation.
+        for (size_t i = 0; i < folderFiles_.size(); ++i) {
+            std::error_code e2;
+            if (fs::equivalent(fs::path(folderFiles_[i]), p, e2) && !e2) {
+                folderIndex_ = i;
+                break;
+            }
+        }
+        LOG_INFO("Playlist: %zu asset(s), current index %zu", folderFiles_.size(), folderIndex_);
+        return;
+    }
+    folderFiles_.clear();   // frees any string `path` might have aliased — it's a copy now
+    folderIndex_ = 0;
     for (fs::directory_iterator it(p.parent_path(), ec), end; !ec && it != end;
          it.increment(ec)) {
         std::error_code fe;
@@ -1315,6 +1385,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
             return "{\"error\":\"missing required string arg 'path'\"}";
         }
         const std::string path = args["path"].get<std::string>();
+        playlistFromDrop_ = false;   // explicit single-target open retires a drop playlist
         ReloadMedia(path);  // tears down current media, then loads; keeps prior on failure
         if (currentMediaPath_ != path) {
             success = false;

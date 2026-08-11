@@ -13,6 +13,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
+#include <vector>
 
 struct SDL_Window;
 
@@ -90,6 +92,13 @@ public:
     bool TakeTogglePauseRequest(); // Space — play/pause
     bool TakeOpenFileRequest();    // Ctrl+O — open the file picker
 
+    // --- Drag and drop (#44) ---
+    // Paths dropped on the window since the last read, in drop order; moved into `out`
+    // and the latch cleared. Returns false (leaving `out` untouched) if nothing was
+    // dropped. SDL3 delivers one SDL_EVENT_DROP_FILE per file, so a multi-file drop
+    // arrives as several paths — the caller decides what that means.
+    bool TakeDroppedPaths(std::vector<std::string>& out);
+
     // --- Folder navigation / slideshow ---
     bool TakePrevMediaRequest();      // Left arrow — previous asset in the folder
     bool TakeNextMediaRequest();      // Right arrow — next asset in the folder
@@ -129,6 +138,7 @@ private:
     bool nextMediaRequested_ = false;
     bool toggleSlideshowRequested_ = false;
     bool toggleMuteRequested_ = false;
+    std::vector<std::string> dropBatch_;
     bool mouseActivity_ = false;
     bool mouseLeft_ = false;
     bool mouseInWindow_ = true;
