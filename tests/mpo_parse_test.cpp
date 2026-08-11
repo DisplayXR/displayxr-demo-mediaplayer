@@ -177,6 +177,46 @@ std::vector<uint8_t> BuildMpo(const std::vector<uint8_t>& a, const std::vector<u
     return out;
 }
 
+// N-image builder: imgs[0] is the primary (the APP2 segment is spliced into it); the
+// rest are appended in order. Needed for the interleaved-thumbnail layout below.
+std::vector<uint8_t> BuildMpoN(const std::vector<std::vector<uint8_t>>& imgs,
+                               const std::vector<uint32_t>& types, const MpfOpts& o) {
+    std::vector<EntrySpec> dummy(imgs.size());
+    const size_t payloadSize = MpfPayload(dummy, o).size();
+    const size_t app2Total = 2 + 2 + 4 + payloadSize;
+    const size_t aPrimeSize = 2 + app2Total + (imgs[0].size() - 2);
+
+    std::vector<EntrySpec> entries;
+    entries.push_back(EntrySpec{types[0], (uint32_t)aPrimeSize, 0u});
+    uint32_t fileOff = (uint32_t)aPrimeSize;
+    for (size_t i = 1; i < imgs.size(); ++i) {
+        entries.push_back(EntrySpec{types[i], (uint32_t)imgs[i].size(),
+                                    (uint32_t)(fileOff - kTiffBase)});
+        fileOff += (uint32_t)imgs[i].size();
+    }
+    const std::vector<uint8_t> payload = MpfPayload(entries, o);
+
+    std::vector<uint8_t> out;
+    out.push_back(0xFF); out.push_back(0xD8);
+    out.push_back(0xFF); out.push_back(0xE2);
+    const uint16_t segLen = (uint16_t)(2 + 4 + payload.size());
+    out.push_back((uint8_t)(segLen >> 8)); out.push_back((uint8_t)segLen);
+    out.push_back('M'); out.push_back('P'); out.push_back('F'); out.push_back(0);
+    out.insert(out.end(), payload.begin(), payload.end());
+    out.insert(out.end(), imgs[0].begin() + 2, imgs[0].end());
+    for (size_t i = 1; i < imgs.size(); ++i)
+        out.insert(out.end(), imgs[i].begin(), imgs[i].end());
+    return out;
+}
+
+// A flat mid-grey JPEG, used as a stand-in thumbnail that is visually unmistakable.
+std::vector<uint8_t> MakeFlatJpeg(int w, int h, uint8_t v) {
+    std::vector<uint8_t> rgb((size_t)w * h * 3, v);
+    std::vector<uint8_t> out;
+    stbi_write_jpg_to_func(JpegSink, &out, w, h, 3, rgb.data(), 92);
+    return out;
+}
+
 std::string WriteTemp(const std::string& name, const std::vector<uint8_t>& bytes) {
     const std::filesystem::path p = std::filesystem::temp_directory_path() / name;
     std::ofstream f(p, std::ios::binary);
@@ -275,6 +315,40 @@ void TestMalformed() {
     }
 }
 
+// Real-world layout, taken from an actual Sony MPO: a stereo pair with a LARGE
+// THUMBNAIL interleaved after each view --
+//     [0] 0x020002 disparity (left)   [1] 0x010002 thumbnail
+//     [2] 0x020002 disparity (right)  [3] 0x010002 thumbnail
+// A reader that simply pairs the first two images composites a view against a preview.
+// Verified against that file: our right half matches its third image (MAE 0.098, i.e.
+// JPEG rounding), not its second.
+//
+// Note the thumbnails there were the SAME dimensions as the views, so the size check is
+// no defence at all -- only the MPType class skip is. Hence this test.
+void TestInterleavedThumbnails() {
+    const int w = 240, h = 180;
+    const std::vector<uint8_t> left  = MakeJpeg(w, h, 0);
+    const std::vector<uint8_t> right = MakeJpeg(w, h, 7);
+    const std::vector<uint8_t> thumb = MakeFlatJpeg(w, h, 128);   // same dims on purpose
+    MpfOpts o;
+    o.numImages = 4;
+    const std::string p = WriteTemp("dxr_mpo_interleaved.mpo",
+        BuildMpoN({left, thumb, right, thumb},
+                  {0x030000u, 0x010002u, 0x020002u, 0x010002u}, o));
+
+    const MpoResult r = MpoLoader::Load(p);
+    CHECK(r.ok && r.image.width == w * 2, "interleaved: composes a pair");
+    if (r.ok) {
+        // The right half must be the textured second VIEW, not the flat thumbnail.
+        const int x = w + w / 2, y = h / 2;
+        const uint8_t* px = &r.image.pixels[((size_t)y * r.image.width + x) * 4];
+        const bool flat = std::abs((int)px[0] - 128) < 12 && std::abs((int)px[1] - 128) < 12 &&
+                          std::abs((int)px[2] - 128) < 12;
+        CHECK(!flat, "interleaved: right half must be the view, not the thumbnail");
+    }
+    std::filesystem::remove(p);
+}
+
 } // namespace
 
 int main() {
@@ -283,6 +357,7 @@ int main() {
     TestValidMpo(false);
     TestPlainJpegRejected();
     TestNotAJpeg();
+    TestInterleavedThumbnails();
     TestMalformed();
 
     if (g_failures == 0) {
