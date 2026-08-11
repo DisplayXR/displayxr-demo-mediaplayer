@@ -37,6 +37,11 @@ private:
     void UpdateFps();
     void BuildTransportUI();   // ImGui transport bar (no-op without ImGui)
 
+    // Stereo-layout env vars (MEDIAPLAYER_STEREO_DETECT / MEDIAPLAYER_LAYOUT). Called
+    // from Initialize() BEFORE the command-line file is loaded — they used to live with
+    // the other env reads in Run(), which is too late to affect that first load.
+    void ReadStereoEnv();
+
     // Open-file. RequestOpenFile tries the workspace picker, else a native dialog.
     // LoadMedia opens a path fresh; ReloadMedia tears down current media first.
     void RequestOpenFile();
@@ -125,9 +130,16 @@ private:
     // forced value has to be re-applied at each load; these two remember it.
     bool layoutForced_ = false;
     StereoLayout layoutForcedValue_ = StereoLayout::Mono;
-    // MEDIAPLAYER_STEREO_DETECT: off | meta | full (default full).
+    // MEDIAPLAYER_STEREO_DETECT: off | meta | full.
+    //   meta (DEFAULT) — filename, container metadata, then assume-stereo-from-aspect.
+    //   full           — additionally run the pixel cross-correlation detector, which is
+    //                    the only layer that can conclude a file is MONO. Opt-in: this
+    //                    player targets stereo content, so guessing mono is the wrong
+    //                    default, and the detector also costs a content decode pass.
+    //   off            — no probe at all, so container metadata is ignored too. A perf
+    //                    escape hatch, not a normal setting.
     enum class DetectMode { Off, Meta, Full };
-    DetectMode detectMode_ = DetectMode::Full;
+    DetectMode detectMode_ = DetectMode::Meta;
 
     // M4 stereo controls. convergence_ is horizontal image translation as a fraction
     // of a view tile (each eye shifted oppositely → moves the zero-disparity plane);

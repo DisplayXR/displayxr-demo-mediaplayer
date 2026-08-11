@@ -379,13 +379,21 @@ void TestFilenameUnchanged() {
     CHECK(b.layout == StereoLayout::SbsFull, "filename: *_2x1 -> SBS-full");
     CHECK(b.signal == StereoSignal::Filename, "filename: signal");
 
+    // The aspect rung ASSUMES stereo and only settles full-vs-half: mono is not a use
+    // case for this player, and an unsuffixed 16:9 half-SBS frame is indistinguishable
+    // from a mono one by dimensions alone. Both of these were wrong before.
     MediaInfo c = MediaSource::Identify("wide.png", 3840, 1080);
-    CHECK(c.layout == StereoLayout::SbsFull, "aspect: >=1.9 unsuffixed -> SBS-full");
+    CHECK(c.layout == StereoLayout::SbsFull, "aspect: 3.56 unsuffixed -> SBS-full");
     CHECK(c.signal == StereoSignal::Aspect, "aspect: signal");
 
     MediaInfo d = MediaSource::Identify("plain.png", 1920, 1080);
-    CHECK(d.layout == StereoLayout::Mono, "aspect: 16:9 unsuffixed -> mono");
-    CHECK(d.signal == StereoSignal::Default, "aspect: signal");
+    CHECK(d.layout == StereoLayout::SbsHalf, "aspect: 16:9 unsuffixed -> SBS-half");
+    CHECK(d.signal == StereoSignal::Aspect, "aspect: signal");
+
+    // Only a total absence of dimensions falls through to mono.
+    MediaInfo e = MediaSource::Identify("unknown.png");
+    CHECK(e.layout == StereoLayout::Mono, "no dims: nothing to go on -> mono");
+    CHECK(e.signal == StereoSignal::Default, "no dims: signal");
 
     CHECK(MediaSource::IsSupported("a.MPO"), "supported: .mpo (case-insensitive)");
     CHECK(MediaSource::IsSupported("a.lif") && MediaSource::IsSupported("a.mkv"),
@@ -436,11 +444,17 @@ void TestResolvePriority() {
     CHECK(r5.signal == StereoSignal::Aspect && r5.layout == StereoLayout::SbsFull,
           "resolve: undecided content falls through to aspect");
 
-    // 5. nothing at all -> mono.
+    // 5. Nothing identified it -> assume stereo, aspect settles the packing.
     MediaInfo r6 = MediaSource::Resolve("x.png", MediaKind::Image, 1920, 1080,
                                         nullptr, nullptr, nullptr);
-    CHECK(r6.layout == StereoLayout::Mono && r6.signal == StereoSignal::Default,
-          "resolve: default is mono");
+    CHECK(r6.layout == StereoLayout::SbsHalf && r6.signal == StereoSignal::Aspect,
+          "resolve: unidentified 16:9 is assumed half-SBS");
+
+    // ...and with no dimensions at all there is genuinely nothing to assume.
+    MediaInfo r7 = MediaSource::Resolve("x.png", MediaKind::Image, 0, 0,
+                                        nullptr, nullptr, nullptr);
+    CHECK(r7.layout == StereoLayout::Mono && r7.signal == StereoSignal::Default,
+          "resolve: no dimensions -> mono");
 }
 
 } // namespace

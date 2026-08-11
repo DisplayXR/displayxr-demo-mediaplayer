@@ -37,48 +37,75 @@ namespace {
 
 struct Expect {
     const char* file;
-    StereoLayout layout;
+    StereoLayout layout;      // expected under the DEFAULT policy (detection off)
     StereoSignal signal;
+    StereoLayout fullLayout;  // expected with MEDIAPLAYER_STEREO_DETECT=full
+    StereoSignal fullSignal;
     bool eyeSwap;
     const char* why;
 };
 
-// The acceptance table. Every row is a case the shipped heuristic got wrong, or a
-// behaviour that must not regress.
+// The acceptance table, checked under BOTH policies.
+//
+// Default ("meta"): filename, then container metadata, then ASSUME STEREO and let the
+// aspect settle full-vs-half. This player targets a 3D display; mono is not a use case,
+// so an unidentified file is taken to be stereo. Note what that buys and what it costs
+// in the rows below: every real SBS file resolves correctly with zero tuning, and every
+// mono file is mis-packed -- knowingly.
+//
+// Opt-in ("full") additionally runs the pixel detector, which is the only layer able to
+// conclude MONO. The two columns together are the honest statement of the trade.
 const Expect kExpected[] = {
-    {"sbs_full_unsuffixed.png", StereoLayout::SbsFull, StereoSignal::Content, false,
-     "unsuffixed full SBS — only the pixels can say"},
-    {"sbs_half_unsuffixed.png", StereoLayout::SbsHalf, StereoSignal::Content, false,
-     "unsuffixed half SBS — dimensionally identical to mono 16:9"},
-    {"mono_16x9.png", StereoLayout::Mono, StereoSignal::Content, false,
-     "plain mono"},
-    {"mono_21x9.png", StereoLayout::Mono, StereoSignal::Content, false,
-     "21:9 panorama — the old >=1.9 rule split this"},
-    {"mono_2to1.png", StereoLayout::Mono, StereoSignal::Content, false,
-     "2:1 photo — the old >=1.9 rule split this"},
-    {"mono_letterbox_16x9.png", StereoLayout::Mono, StereoSignal::Content, false,
-     "letterboxed mono — matching bars must not fake a match"},
-    {"mono_pillarbox_2to1.png", StereoLayout::Mono, StereoSignal::Content, false,
-     "pillarboxed mono — aspect says SBS and the bars match"},
-    {"sbs_full_letterboxed.png", StereoLayout::SbsFull, StereoSignal::Content, false,
-     "letterboxed SBS — detect through the bars"},
-    {"sbs_full_pillarbox.png", StereoLayout::SbsFull, StereoSignal::Content, false,
-     "pillarboxed SBS — needs the per-half crop"},
-    {"mono_but_named_2x1.png", StereoLayout::SbsFull, StereoSignal::Filename, false,
-     "filename convention must still beat the content detector"},
-    {"flat_lowtexture_2to1.png", StereoLayout::SbsFull, StereoSignal::Aspect, false,
-     "near-flat: detector abstains, aspect is the documented last resort"},
-    {"sbs_full_video.mp4", StereoLayout::SbsFull, StereoSignal::Content, false,
+    {"sbs_full_unsuffixed.png", StereoLayout::SbsFull, StereoSignal::Aspect,
+     StereoLayout::SbsFull, StereoSignal::Content, false,
+     "unsuffixed full SBS"},
+    {"sbs_half_unsuffixed.png", StereoLayout::SbsHalf, StereoSignal::Aspect,
+     StereoLayout::SbsHalf, StereoSignal::Content, false,
+     "unsuffixed half SBS — the case a threshold cannot reach"},
+    {"mono_16x9.png", StereoLayout::SbsHalf, StereoSignal::Aspect,
+     StereoLayout::Mono, StereoSignal::Content, false,
+     "mono: mis-packed by default (accepted), rescued by the detector"},
+    {"mono_21x9.png", StereoLayout::SbsHalf, StereoSignal::Aspect,
+     StereoLayout::Mono, StereoSignal::Content, false,
+     "mono panorama: same trade"},
+    {"mono_2to1.png", StereoLayout::SbsFull, StereoSignal::Aspect,
+     StereoLayout::Mono, StereoSignal::Content, false,
+     "2:1 mono: same trade"},
+    {"mono_letterbox_16x9.png", StereoLayout::SbsHalf, StereoSignal::Aspect,
+     StereoLayout::Mono, StereoSignal::Content, false,
+     "letterboxed mono: same trade"},
+    {"mono_pillarbox_2to1.png", StereoLayout::SbsFull, StereoSignal::Aspect,
+     StereoLayout::Mono, StereoSignal::Content, false,
+     "pillarboxed mono: same trade"},
+    {"sbs_full_letterboxed.png", StereoLayout::SbsFull, StereoSignal::Aspect,
+     StereoLayout::SbsFull, StereoSignal::Content, false,
+     "letterboxed SBS"},
+    {"sbs_full_pillarbox.png", StereoLayout::SbsFull, StereoSignal::Aspect,
+     StereoLayout::SbsFull, StereoSignal::Content, false,
+     "pillarboxed SBS"},
+    {"mono_but_named_2x1.png", StereoLayout::SbsFull, StereoSignal::Filename,
+     StereoLayout::SbsFull, StereoSignal::Filename, false,
+     "filename beats everything below it"},
+    {"flat_lowtexture_2to1.png", StereoLayout::SbsFull, StereoSignal::Aspect,
+     StereoLayout::SbsFull, StereoSignal::Aspect, false,
+     "near-flat: detector abstains, aspect policy applies either way"},
+    {"sbs_full_video.mp4", StereoLayout::SbsFull, StereoSignal::Aspect,
+     StereoLayout::SbsFull, StereoSignal::Content, false,
      "unsuffixed SBS video"},
-    {"sbs_fadein_video.mp4", StereoLayout::SbsFull, StereoSignal::Content, false,
-     "SBS video fading in from black — frame 0 must not decide"},
-    {"sbs_meta_lr.mkv", StereoLayout::SbsFull, StereoSignal::Metadata, false,
+    {"sbs_fadein_video.mp4", StereoLayout::SbsFull, StereoSignal::Aspect,
+     StereoLayout::SbsFull, StereoSignal::Content, false,
+     "SBS video fading in from black"},
+    {"sbs_meta_lr.mkv", StereoLayout::SbsFull, StereoSignal::Metadata,
+     StereoLayout::SbsFull, StereoSignal::Metadata, false,
      "Matroska StereoMode left_right"},
-    {"sbs_meta_rl.mkv", StereoLayout::SbsFull, StereoSignal::Metadata, true,
-     "Matroska StereoMode right_left — must set the eye-swap hint"},
-    {"sbs_meta_sei.mp4", StereoLayout::SbsFull, StereoSignal::Metadata, false,
-     "H.264 frame-packing SEI — invisible to the stream-level API"},
-    {"stereo_pair.mpo", StereoLayout::SbsFull, StereoSignal::Metadata, false,
+    {"sbs_meta_rl.mkv", StereoLayout::SbsFull, StereoSignal::Metadata,
+     StereoLayout::SbsFull, StereoSignal::Metadata, true,
+     "Matroska StereoMode right_left — eye-swap hint"},
+    {"sbs_meta_sei.mp4", StereoLayout::SbsFull, StereoSignal::Metadata,
+     StereoLayout::SbsFull, StereoSignal::Metadata, false,
+     "H.264 frame-packing SEI"},
+    {"stereo_pair.mpo", StereoLayout::SbsFull, StereoSignal::Metadata,
+     StereoLayout::SbsFull, StereoSignal::Metadata, false,
      "MPO container"},
 };
 
@@ -93,12 +120,14 @@ bool HasExt(const std::string& p, const char* ext) {
 }
 
 // Mirrors App::LoadMedia's resolution ladder. Returns the MediaInfo the app would apply.
-// `det` receives the raw detector verdict so a failure can explain itself.
-MediaInfo ResolveFile(const std::string& path, StereoDetectResult& det) {
+// `useContent` mirrors MEDIAPLAYER_STEREO_DETECT=full; `det` receives the raw detector
+// verdict so a failure can explain itself.
+MediaInfo ResolveFile(const std::string& path, bool useContent, StereoDetectResult& det) {
+    det = StereoDetectResult{};
     const MediaInfo probe = MediaSource::Identify(path);
     StereoLayout fnLayout = StereoLayout::Mono;
     const bool fnDecided = MediaSource::LayoutFromFilename(path, fnLayout);
-    const bool wantContent = !fnDecided;
+    const bool wantContent = useContent && !fnDecided;
 
     if (probe.kind == MediaKind::Video) {
         VideoStereoProbe::Result pr = VideoStereoProbe::Run(path, wantContent);
@@ -140,19 +169,11 @@ MediaInfo ResolveFile(const std::string& path, StereoDetectResult& det) {
                                 nullptr, content.decided ? &content : nullptr);
 }
 
-} // namespace
-
-int main(int argc, char** argv) {
-    const std::string dir = argc > 1 ? argv[1] : "assets/media/detect";
-    if (!std::filesystem::is_directory(dir)) {
-        std::printf("stereo_sweep: '%s' not present — run scripts/gen_stereo_test_assets.sh\n",
-                    dir.c_str());
-        std::printf("  (skipping; this is not a failure)\n");
-        return 0;
-    }
-
-    int failures = 0, checked = 0, missing = 0;
-    std::printf("stereo_sweep: %s\n\n", dir.c_str());
+int RunPolicy(const std::string& dir, bool useContent, int& missing) {
+    int failures = 0, checked = 0;
+    std::printf("\n  === policy: %s ===\n",
+                useContent ? "MEDIAPLAYER_STEREO_DETECT=full (opt-in pixel detector)"
+                           : "default (filename / metadata / assume-stereo-from-aspect)");
     std::printf("  %-28s %-9s %-18s %s\n", "asset", "layout", "signal", "verdict");
     std::printf("  %-28s %-9s %-18s %s\n", "----------------------------", "---------",
                 "------------------", "-------");
@@ -164,17 +185,19 @@ int main(int argc, char** argv) {
             ++missing;
             continue;
         }
+        const StereoLayout wantLayout = useContent ? e.fullLayout : e.layout;
+        const StereoSignal wantSignal = useContent ? e.fullSignal : e.signal;
         StereoDetectResult det;
-        const MediaInfo got = ResolveFile(path, det);
+        const MediaInfo got = ResolveFile(path, useContent, det);
         ++checked;
-        const bool ok = got.layout == e.layout && got.signal == e.signal &&
+        const bool ok = got.layout == wantLayout && got.signal == wantSignal &&
                         got.eyeSwap == e.eyeSwap;
         if (!ok) ++failures;
         std::printf("  %-28s %-9s %-18s %s\n", e.file, LayoutName(got.layout),
                     SignalName(got.signal), ok ? "ok" : "FAIL");
         if (!ok) {
-            std::printf("      expected %s / %s%s  (%s)\n", LayoutName(e.layout),
-                        SignalName(e.signal), e.eyeSwap ? " / eyes R|L" : "", e.why);
+            std::printf("      expected %s / %s%s  (%s)\n", LayoutName(wantLayout),
+                        SignalName(wantSignal), e.eyeSwap ? " / eyes R|L" : "", e.why);
             if (got.eyeSwap != e.eyeSwap)
                 std::printf("      eye-swap hint: got %s\n", got.eyeSwap ? "R|L" : "L|R");
             std::printf("      detector: %s peak=%.3f base=%.3f margin=%.3f d=%d "
@@ -186,6 +209,25 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("\n  %d checked, %d failed, %d missing\n", checked, failures, missing);
+    std::printf("\n  %d checked, %d failed\n", checked, failures);
+    return failures;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    const std::string dir = argc > 1 ? argv[1] : "assets/media/detect";
+    if (!std::filesystem::is_directory(dir)) {
+        std::printf("stereo_sweep: '%s' not present — run scripts/gen_stereo_test_assets.sh\n",
+                    dir.c_str());
+        std::printf("  (skipping; this is not a failure)\n");
+        return 0;
+    }
+    std::printf("stereo_sweep: %s\n", dir.c_str());
+
+    int missing = 0;
+    int failures = RunPolicy(dir, /*useContent=*/false, missing);
+    failures += RunPolicy(dir, /*useContent=*/true, missing);
+    if (missing) std::printf("\n  %d asset(s) missing\n", missing);
     return failures == 0 ? 0 : 1;
 }
