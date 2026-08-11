@@ -8,13 +8,19 @@
 //   1. manual   — the user pinned it (L key / HUD button)
 //   2. metadata — AVStereo3D side data, or a LIF / MPO container
 //   3. filename — the `*_2x1` / `*_half_2x1` naming convention
-//   4. content  — StereoDetect's cross-correlation verdict
-//   5. aspect   — frame aspect alone; weak, last resort
+//   4. content  — StereoDetect's cross-correlation verdict. OPT-IN, off by default;
+//                 see MEDIAPLAYER_STEREO_DETECT.
+//   5. aspect   — assume SBS and let the frame aspect settle full-vs-half.
 //
-// Why the aspect rule is not sufficient on its own, and why layer 4 exists: a half-SBS
-// frame is DIMENSIONALLY IDENTICAL to a mono frame (1920x1080 either way), so no
-// threshold on aspect can ever separate them, and a 2:1 mono photo trips any threshold
-// low enough to catch half-SBS. The aspect rule survives only as the last resort.
+// The important thing about layer 5 is that it does NOT try to decide whether a file is
+// stereo. This is a stereo player for a 3D display; mono is not a use case. So an
+// unidentified file is ASSUMED stereo and the aspect only picks the packing.
+//
+// That assumption is what finally fixes the case a threshold never could: a half-SBS
+// frame is DIMENSIONALLY IDENTICAL to a mono one (1920x1080 either way). The old rule
+// (`aspect >= 1.9 -> full SBS, else mono`) therefore showed real half-SBS files flat,
+// and split 2:1 mono panoramas — wrong in both directions. Assuming stereo is wrong only
+// for mono content, which this player does not target.
 #pragma once
 
 #include "StereoTypes.h"

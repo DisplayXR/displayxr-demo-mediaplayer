@@ -2,6 +2,7 @@
 #include "MediaSource.h"
 
 #include "Log.h"
+#include "StereoDetect.h"   // ChooseFullOrHalf — pure aspect policy, no pixels involved
 
 #include <algorithm>
 #include <cctype>
@@ -26,12 +27,27 @@ bool Contains(const std::string& s, const char* needle) {
     return s.find(needle) != std::string::npos;
 }
 
-// Layer 5. The historical rule, kept verbatim: unsuffixed but unusually wide -> assume
-// full SBS. Weak on its own (a 2:1 mono photo trips it), which is why it runs last.
+// Last resort, and the deliberate default policy of this player.
+//
+// This is a STEREO media player for a 3D display. Viewing mono content is not a use
+// case, so when nothing has identified a file the working assumption is that it IS
+// stereo, and the frame aspect only has to settle full-vs-half. That is a policy call,
+// not a measurement -- and it is what finally fixes the case the old rule could not:
+// an unsuffixed 1920x1080 half-SBS frame is dimensionally identical to a mono one, so
+// no aspect THRESHOLD can separate them, but under this assumption it simply resolves
+// to half-SBS.
+//
+// The old rule was `aspect >= 1.9 -> full SBS, else mono`, which got the common
+// half-SBS case wrong in the direction that hurts: a real stereo file shown flat.
+//
+// Cost, accepted knowingly: a genuinely mono file with no suffix and no metadata --
+// e.g. an ordinary photo reached by arrow-keying through a folder -- renders as a
+// squeezed half-SBS. `L` is the escape hatch, and the content detector
+// (MEDIAPLAYER_STEREO_DETECT=full) can be switched on to catch it automatically.
 bool LayoutFromAspect(int w, int h, StereoLayout& out) {
-    if (w <= 0 || h <= 0) return false;
-    if ((float)w / (float)h < 1.9f) return false;
-    out = StereoLayout::SbsFull;
+    if (w <= 0 || h <= 0) return false;   // no dimensions: nothing to go on at all
+    bool ambiguous = false;
+    out = StereoDetect::ChooseFullOrHalf((float)w / (float)h, ambiguous);
     return true;
 }
 
@@ -51,7 +67,7 @@ const char* SignalName(StereoSignal s) {
         case StereoSignal::Metadata: return "metadata";
         case StereoSignal::Filename: return "from filename";
         case StereoSignal::Content: return "detected";
-        case StereoSignal::Aspect: return "aspect (low conf.)";
+        case StereoSignal::Aspect: return "assumed stereo (aspect)";
         default: return "default";
     }
 }
@@ -120,14 +136,14 @@ MediaInfo MediaSource::Resolve(const std::string& path, MediaKind kind,
     } else if (LayoutFromFilename(path, info.layout)) {
         info.signal = StereoSignal::Filename;
         info.confidence = 1.0f;
-    // 4. Content analysis. Only when it actually reached a verdict; note that a
-    //    CONFIDENT MONO is a real verdict and must win here, or the aspect rule below
-    //    would still split a 2:1 mono panorama.
+    // 4. Content analysis, when it is switched on AND reached a verdict. A CONFIDENT
+    //    MONO is a real verdict and wins here — that is the only way a mono file gets
+    //    recognised as such, since layer 5 assumes stereo by policy.
     } else if (content && content->decided) {
         info.layout = content->layout;
         info.signal = StereoSignal::Content;
         info.confidence = content->confidence;
-    // 5. Aspect alone.
+    // 5. Assume stereo; aspect only settles full vs half.
     } else if (LayoutFromAspect(frameW, frameH, info.layout)) {
         info.signal = StereoSignal::Aspect;
         info.confidence = 0.3f;

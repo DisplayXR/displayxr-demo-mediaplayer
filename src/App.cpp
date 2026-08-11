@@ -211,6 +211,8 @@ bool App::Initialize(const char* mediaPath) {
     // to the RED|BLUE L/R test pattern (and the user can Open one at runtime). The
     // argument may be a single file OR a folder — for a folder we load the first
     // supported asset (sorted), and LoadMedia builds the prev/next list from it.
+    ReadStereoEnv();   // must precede the first LoadMedia below
+
     if (mediaPath && *mediaPath) {
         namespace fs = std::filesystem;
         std::error_code ec;
@@ -275,25 +277,6 @@ int App::Run() {
     // prove convergence/swap without keystrokes). Interactive keys still apply on top.
     if (const char* c = std::getenv("MEDIAPLAYER_CONV")) convergence_ = (float)std::atof(c);
     if (const char* s = std::getenv("MEDIAPLAYER_SWAP")) swapEyes_ = (*s && *s != '0');
-    // Stereo-layout detection controls (#45). The kill switch turns the heuristics off
-    // for CI and perf work; LIF/MPO are containers, not heuristics, and stay active.
-    if (const char* d = std::getenv("MEDIAPLAYER_STEREO_DETECT")) {
-        if (std::strcmp(d, "off") == 0) detectMode_ = DetectMode::Off;
-        else if (std::strcmp(d, "meta") == 0) detectMode_ = DetectMode::Meta;
-        else detectMode_ = DetectMode::Full;
-        LOG_INFO("Stereo detection: %s", d);
-    }
-    // Force a layout for headless/atlas-dump runs. Loads clear the pin, so this is
-    // re-applied at every load via layoutForced_.
-    if (const char* l = std::getenv("MEDIAPLAYER_LAYOUT")) {
-        layoutForced_ = true;
-        if (std::strcmp(l, "mono") == 0) layoutForcedValue_ = StereoLayout::Mono;
-        else if (std::strcmp(l, "sbshalf") == 0) layoutForcedValue_ = StereoLayout::SbsHalf;
-        else if (std::strcmp(l, "sbsfull") == 0 || std::strcmp(l, "sbs") == 0)
-            layoutForcedValue_ = StereoLayout::SbsFull;
-        else layoutForced_ = false;   // "auto" or anything unrecognised
-        LOG_INFO("Stereo layout forced: %s", layoutForced_ ? l : "auto");
-    }
     const auto bootNow = std::chrono::steady_clock::now();
     fpsWindowStart_ = bootNow;
     lastFrameTime_ = bootNow;
@@ -997,6 +980,33 @@ void App::Shutdown() {
 
 // --- Open-file ------------------------------------------------------------------
 
+void App::ReadStereoEnv() {
+    // Read in Initialize(), BEFORE the command-line file is loaded. These two used to sit
+    // with the other env reads in Run(), which runs after that first LoadMedia -- so they
+    // silently had no effect on the file the app was launched with, only on files opened
+    // later.
+    //
+    // MEDIAPLAYER_STEREO_DETECT: default `meta`; `full` opts into the pixel detector;
+    // `off` skips the probe entirely (container metadata included).
+    if (const char* d = std::getenv("MEDIAPLAYER_STEREO_DETECT")) {
+        if (std::strcmp(d, "off") == 0) detectMode_ = DetectMode::Off;
+        else if (std::strcmp(d, "full") == 0) detectMode_ = DetectMode::Full;
+        else detectMode_ = DetectMode::Meta;
+        LOG_INFO("Stereo detection: %s", d);
+    }
+    // MEDIAPLAYER_LAYOUT forces a layout for headless/atlas-dump runs. Loads clear the
+    // pin, so layoutForced_ re-applies it at every load.
+    if (const char* l = std::getenv("MEDIAPLAYER_LAYOUT")) {
+        layoutForced_ = true;
+        if (std::strcmp(l, "mono") == 0) layoutForcedValue_ = StereoLayout::Mono;
+        else if (std::strcmp(l, "sbshalf") == 0) layoutForcedValue_ = StereoLayout::SbsHalf;
+        else if (std::strcmp(l, "sbsfull") == 0 || std::strcmp(l, "sbs") == 0)
+            layoutForcedValue_ = StereoLayout::SbsFull;
+        else layoutForced_ = false;   // "auto" or anything unrecognised
+        LOG_INFO("Stereo layout forced: %s", layoutForced_ ? l : "auto");
+    }
+}
+
 bool App::LoadMedia(const std::string& path) {
     const MediaInfo probeInfo = MediaSource::Identify(path);
 
@@ -1201,10 +1211,10 @@ void App::ApplyLayout(const MediaInfo& info) {
     // make the slideshow look broken. Cleared HERE — at the point a load commits — rather
     // than at LoadMedia entry, so a failed open leaves the still-displayed media's pin on.
     layoutPinned_ = false;
-    // Toast only when we GUESSED. Files that told us what they are don't need nagging,
-    // and this is how the ambiguous full-vs-half case reaches the user, who can hit L.
-    if (info.signal == StereoSignal::Content || info.signal == StereoSignal::Aspect)
-        ShowToast(LayoutLabel());
+    // Toast only for a genuine content verdict. The aspect rung is now the routine
+    // default rather than an exception, so toasting it would fire on nearly every load
+    // and on every slideshow step; the HUD label carries that state persistently instead.
+    if (info.signal == StereoSignal::Content) ShowToast(LayoutLabel());
 }
 
 std::string App::LayoutLabel() const {
