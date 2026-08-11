@@ -325,6 +325,7 @@ if(MP_BUILD_TESTS)
         src/Log.cpp)
     target_include_directories(stereo_sweep PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
     target_link_libraries(stereo_sweep PRIVATE nlohmann_json::nlohmann_json)
     if(TARGET PkgConfig::FFMPEG)

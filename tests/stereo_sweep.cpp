@@ -25,6 +25,9 @@
 #include "media/StereoDetect.h"
 #include "media/VideoStereoProbe.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <system_error>
@@ -270,6 +273,52 @@ DecodedImage LeftEye(const DecodedImage& src) {
     return out;
 }
 
+// --list <dir>: resolve every image in a directory and print what decided it. No
+// expectations, no ground truth — a diagnostic for pointing at a real media folder.
+// --dumpmpo <in> <out.png>: write what MpoLoader actually composed, so the extracted
+// views can be diffed against an independent MPO reader rather than merely trusted.
+int DumpMpo(const std::string& in, const std::string& out) {
+    MpoResult r = MpoLoader::Load(in);
+    if (!r.ok) { std::printf("MpoLoader declined '%s'\n", in.c_str()); return 1; }
+    if (!stbi_write_png(out.c_str(), r.image.width, r.image.height, 4,
+                        r.image.pixels.data(), r.image.width * 4)) {
+        std::printf("write failed\n");
+        return 1;
+    }
+    std::printf("wrote %s (%dx%d)\n", out.c_str(), r.image.width, r.image.height);
+    return 0;
+}
+
+int ListDir(const std::string& dir) {
+    std::vector<std::string> files;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        files.push_back(it->path().string());
+    }
+    std::sort(files.begin(), files.end());
+    std::printf("  %-34s %-9s %-24s %6s %6s %7s\n", "file", "layout", "signal",
+                "peak", "margin", "seam");
+    std::printf("  %-34s %-9s %-24s %6s %6s %7s\n", "----", "------", "------",
+                "----", "------", "----");
+    for (const std::string& f : files) {
+        if (!MediaSource::IsSupported(f)) continue;
+        StereoDetectResult det;
+        const MediaInfo got = ResolveFile(f, true, det);
+        char pk[10] = "     -", mg[10] = "     -", sm[10] = "      -";
+        if (det.peak != 0.0f || det.margin != 0.0f) {
+            std::snprintf(pk, sizeof(pk), "%6.3f", (double)det.peak);
+            std::snprintf(mg, sizeof(mg), "%6.3f", (double)det.margin);
+            std::snprintf(sm, sizeof(sm), "%7.2f", (double)det.seam);
+        }
+        std::printf("  %-34s %-9s %-24s %6s %6s %7s\n",
+                    std::filesystem::path(f).filename().string().c_str(),
+                    LayoutName(got.layout), SignalName(got.signal), pk, mg, sm);
+    }
+    return 0;
+}
+
 int ScanCorpus(const std::string& dir, int limit) {
     // GROUND TRUTH matters more than sample size here. Two traps in this corpus:
     //
@@ -448,6 +497,8 @@ int main(int argc, char** argv) {
         const int limit = argc > 3 ? std::atoi(argv[3]) : 200;
         return ScanCorpus(argv[2], limit);
     }
+    if (argc > 3 && std::strcmp(argv[1], "--dumpmpo") == 0) return DumpMpo(argv[2], argv[3]);
+    if (argc > 2 && std::strcmp(argv[1], "--list") == 0) return ListDir(argv[2]);
     const std::string dir = argc > 1 ? argv[1] : "assets/media/detect";
     if (!std::filesystem::is_directory(dir)) {
         std::printf("stereo_sweep: '%s' not present — run scripts/gen_stereo_test_assets.sh\n",
