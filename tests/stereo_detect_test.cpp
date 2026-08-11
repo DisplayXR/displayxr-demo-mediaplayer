@@ -143,7 +143,10 @@ void TestSbsFull() {
     const StereoDetectResult r = Run(im);
     CHECK(r.decided && !r.abstained, "full SBS: should decide");
     CHECK(r.layout == StereoLayout::SbsFull, "full SBS: layout");
-    CHECK(r.peak > 0.9f, "full SBS: peak should be high");
+    // 0.75, not 0.9: the SobelX high-pass removes the smooth low-frequency component
+    // that used to push synthetic pairs to 0.999, so the whole peak scale moved down.
+    // What matters is clearing peakMin (0.55) with room, and a sharp margin.
+    CHECK(r.peak > 0.75f, "full SBS: peak should be high");
     CHECK(r.margin > 0.1f, "full SBS: peak should be sharp");
     CHECK(std::abs(r.disparityPx) <= 6, "full SBS: disparity should be small");
     if (r.layout != StereoLayout::SbsFull)
@@ -257,9 +260,12 @@ void TestPeriodicRejected() {
             im.At(x, y) = (uint8_t)std::min(255.0f, bars + n);
         }
     const StereoDetectResult r = Run(im);
-    CHECK(r.layout != StereoLayout::SbsFull && r.layout != StereoLayout::SbsHalf,
-          "periodic content: repeating structure must not read as stereo");
-    if (r.layout != StereoLayout::Mono)
+    // Not stereo, but NOT mono either: a repeating pattern is ambiguous, and the policy
+    // is that doubt resolves to stereo one layer up. The detector's job here is only to
+    // decline to answer.
+    CHECK(!r.decided || r.layout == StereoLayout::Mono,
+          "periodic content: must not be claimed as stereo");
+    if (r.decided && r.layout != StereoLayout::Mono)
         std::fprintf(stderr, "    got %s peak=%.3f margin=%.3f (%s)\n", LName(r.layout),
                      (double)r.peak, (double)r.margin, r.reason);
 }

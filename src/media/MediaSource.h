@@ -8,13 +8,15 @@
 //   1. manual   — the user pinned it (L key / HUD button)
 //   2. metadata — AVStereo3D side data, or a LIF / MPO container
 //   3. filename — the `*_2x1` / `*_half_2x1` naming convention
-//   4. content  — StereoDetect's cross-correlation verdict. OPT-IN, off by default;
-//                 see MEDIAPLAYER_STEREO_DETECT.
+//   4. content  — StereoDetect's cross-correlation verdict. It runs ONLY when 1-3 all
+//                 declined, and may conclude MONO only on unambiguous evidence.
 //   5. aspect   — assume SBS and let the frame aspect settle full-vs-half.
 //
-// The important thing about layer 5 is that it does NOT try to decide whether a file is
-// stereo. This is a stereo player for a 3D display; mono is not a use case. So an
-// unidentified file is ASSUMED stereo and the aspect only picks the packing.
+// The important thing about layers 4 and 5 is the asymmetry between them. Mono has to
+// PROVE itself; stereo is what happens otherwise. This is a stereo player for a 3D
+// display, mono is not a use case, and when in doubt the answer is stereo — so anything
+// the detector finds merely ambiguous (a repeating pattern, a weak match, a flat frame)
+// falls through to layer 5 rather than being called 2D.
 //
 // That assumption is what finally fixes the case a threshold never could: a half-SBS
 // frame is DIMENSIONALLY IDENTICAL to a mono one (1920x1080 either way). The old rule

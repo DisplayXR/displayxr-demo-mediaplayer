@@ -39,9 +39,27 @@ const char* SignalName(StereoSignal s);
 
 // Tunables for StereoDetect, gathered so tests can sweep them without touching code.
 // Defaults are the shipping values; see StereoDetect.cpp for the derivation of each.
+// High-pass applied to the analysis grid before correlating. Raw intensity lets
+// LOW-FREQUENCY content — vignetting, a sky gradient, a lighting ramp — correlate
+// between two UNRELATED halves, which lifts the mono floor and eats into the gap that
+// separates mono from stereo. A high-pass makes the match illumination-invariant, which
+// is why practical stereo matchers work on gradients rather than raw pixels.
+enum class StereoPrefilter { None, SobelX, Laplacian };
+
 struct StereoDetectParams {
+    StereoPrefilter prefilter = StereoPrefilter::SobelX;
     int   gridWidth        = 96;    // per-half analysis grid width, in cells
-    float peakMin          = 0.88f; // min NCC at the best shift to call it stereo
+    // Min NCC at the best shift to call it stereo POSITIVELY. Recalibrated for the
+    // SobelX high-pass, which strips the smooth low-frequency component that used to
+    // inflate every score: with it, real stereo pairs span 0.08-0.99 (mean 0.64) rather
+    // than clustering near 1.0. 0.88 left only ~11% of a real corpus positively
+    // identified. 0.55 is safe because it is more than twice the highest peak any real
+    // MONO frame reached (0.233), and the margin and disparity gates still apply.
+    //
+    // Note this rung is not load-bearing for correctness: a stereo file that fails it
+    // falls through to the stereo assumption and renders correctly anyway. It matters for
+    // full-vs-half on letterboxed content, and for pre-empting the mono rung.
+    float peakMin          = 0.55f;
     float marginMin        = 0.10f; // min (peak - far baseline): peak must be SHARP
     float maxDisparityFrac = 0.06f; // max |best shift|, as a fraction of half-width
     float searchFrac       = 0.12f; // shift search half-range, fraction of half-width
@@ -57,8 +75,36 @@ struct StereoDetectParams {
     int   barLevel         = 16;    // luma <= this counts as a letterbox-bar sample
     float barFrac          = 0.02f; // a row/col is a bar if < this fraction exceeds barLevel
     float maxCropFrac      = 0.40f; // never crop more than this off an axis
-    float monoPeakMax      = 0.70f; // below this -> CONFIDENT mono (beats the aspect rule)
-    float monoMarginMax    = 0.03f; // ...or a margin this flat
+    // --- the mono gate -------------------------------------------------------------
+    //
+    // Both numbers below were measured on 2380 real 7680x2160 stereo photographs plus the
+    // two variants each one yields for free (its left eye alone = real mono; its halves
+    // squeezed = real half-SBS) -- 7140 analyses, NOT synthetic fixtures. That matters:
+    // synthetic mono peaks at 0.05, but real mono, with its sky gradients, defocus and
+    // vignetting, reaches 0.361; and real SBS falls all the way to 0.000, because a
+    // stereo pair is a depth-dependent warp rather than one global shift. The two
+    // populations OVERLAP, so no threshold separates them cleanly and the choice is
+    // purely about which way to be wrong.
+    //
+    // Grid over that corpus (SBS wrongly called 2D | mono correctly detected, of 2380):
+    //     monoPeak\seam    1.0        2.0        2.5        3.5
+    //         0.30      0|290     0|2318     0|2357     0|2367
+    //         0.40      0|290     0|2319     0|2358     3|2368
+    //         0.55      3|290     6|2319     9|2358    20|2368
+    //
+    // Below this peak the halves do not match at any plausible shift. 0.30 is the loosest
+    // value that still gives ZERO false-mono across the whole corpus; 0.55 gives 20.
+    // Erring low is the safe direction: an undetected mono file just renders as SBS,
+    // which is the default anyway, whereas calling a real stereo photograph 2D is the
+    // failure that actually hurts.
+    float monoPeakMax      = 0.30f;
+    // How many times its neighbourhood the mid-frame seam must exceed to VETO a mono
+    // verdict. Real mono has a median seam of 1.32, real SBS a median of 25.6, and for
+    // the low-peak SBS frames that are the actual risk the 5th percentile is still 7.5 --
+    // a stereo pair with a large depth spread scores LOW on correlation but HIGH on the
+    // seam, so the two signals are anti-correlated exactly where it helps. 3.5 keeps
+    // 2367/2380 mono detections; dropping to 1.0 would cost all but 290 of them.
+    float seamVetoRatio    = 3.5f;
 };
 
 // What the content detector concluded, plus everything needed to explain it in a log.
@@ -73,6 +119,7 @@ struct StereoDetectResult {
     int   disparityPx = 0;     // best shift, in grid cells, signed
     float sigmaMin = 0.0f;     // min per-half std-dev
     float gradMin = 0.0f;      // min per-half mean |dI/dx|
+    float seam = 0.0f;         // mid-frame discontinuity, relative to its neighbourhood
     int   cropX0 = 0, cropY0 = 0, cropX1 = 0, cropY1 = 0;  // active picture area
     const char* reason = "";   // static string; never owns storage
 };

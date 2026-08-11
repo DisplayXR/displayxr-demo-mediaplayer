@@ -131,15 +131,16 @@ private:
     bool layoutForced_ = false;
     StereoLayout layoutForcedValue_ = StereoLayout::Mono;
     // MEDIAPLAYER_STEREO_DETECT: off | meta | full.
-    //   meta (DEFAULT) — filename, container metadata, then assume-stereo-from-aspect.
-    //   full           — additionally run the pixel cross-correlation detector, which is
-    //                    the only layer that can conclude a file is MONO. Opt-in: this
-    //                    player targets stereo content, so guessing mono is the wrong
-    //                    default, and the detector also costs a content decode pass.
+    //   full (DEFAULT) — filename, container metadata, the pixel detector, then
+    //                    assume-stereo-from-aspect. The detector is the only layer that
+    //                    can conclude a file is MONO, and it only does so when the
+    //                    evidence is unambiguous; anything short of that falls through
+    //                    to the stereo assumption.
+    //   meta           — skip the pixel detector. Everything unidentified is stereo.
     //   off            — no probe at all, so container metadata is ignored too. A perf
     //                    escape hatch, not a normal setting.
     enum class DetectMode { Off, Meta, Full };
-    DetectMode detectMode_ = DetectMode::Meta;
+    DetectMode detectMode_ = DetectMode::Full;
 
     // M4 stereo controls. convergence_ is horizontal image translation as a fraction
     // of a view tile (each eye shifted oppositely → moves the zero-disparity plane);
