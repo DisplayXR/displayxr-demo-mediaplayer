@@ -2,6 +2,7 @@
 #include "LifLoader.h"
 
 #include "Log.h"
+#include "StereoCompose.h"
 
 #include <nlohmann/json.hpp>
 
@@ -150,50 +151,8 @@ ViewRef ResolveView(const json& view, const std::vector<uint8_t>& buf,
     return ref;
 }
 
-// Coarse global horizontal disparity between the two views, returned as the app's
-// convergence_ value that pulls the dominant plane toward the screen. Downsamples to a
-// small grid, grayscales, and finds the integer shift minimizing SAD. Used only when the
-// LIF carries no convergence field, so an under-specified stereo pair can still be
-// reconverged on demand.
-float EstimateAutoConvergence(const DecodedImage& L, const DecodedImage& R) {
-    const int w = L.width, h = L.height;
-    if (w < 16 || h < 16 || R.width != w || R.height != h) return 0.0f;
-    constexpr int DW = 96;                       // downsample width
-    const int DH = std::max(8, DW * h / w);
-    auto gray = [](const DecodedImage& im, int sx, int sy) {
-        const uint8_t* p = &im.pixels[((size_t)sy * im.width + sx) * 4];
-        return 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2];
-    };
-    std::vector<float> gl((size_t)DW * DH), gr((size_t)DW * DH);
-    for (int y = 0; y < DH; ++y)
-        for (int x = 0; x < DW; ++x) {
-            const int sx = x * w / DW, sy = y * h / DH;
-            gl[(size_t)y * DW + x] = gray(L, sx, sy);
-            gr[(size_t)y * DW + x] = gray(R, sx, sy);
-        }
-    const int maxD = DW / 5;                      // search ±20% disparity
-    float bestSad = 1e30f;
-    int bestD = 0;
-    for (int d = -maxD; d <= maxD; ++d) {
-        float sad = 0.0f;
-        int cnt = 0;
-        const int x0 = std::max(0, -d), x1 = std::min(DW, DW - d);
-        for (int y = 0; y < DH; ++y)
-            for (int x = x0; x < x1; ++x) {
-                sad += std::fabs(gl[(size_t)y * DW + x] - gr[(size_t)y * DW + x + d]);
-                ++cnt;
-            }
-        if (cnt > 0) {
-            sad /= (float)cnt;
-            if (sad < bestSad) { bestSad = sad; bestD = d; }
-        }
-    }
-    const float dFrac = (float)bestD / (float)DW;  // right−left disparity, fraction of width
-    // Applying convergence_ reduces the dominant disparity by 2*conv, so conv = dFrac/2
-    // pulls that plane to zero. (Yields a negative value for the usual pair, matching the
-    // sign of the LIFs that do carry a convergence field.)
-    return 0.5f * dFrac;
-}
+// (ComposeSbs + EstimateAutoConvergence moved to StereoCompose.{h,cpp} when the MPO
+// container loader landed — #45. Same code, now shared by both containers.)
 
 // Decode the base JPEG (the file is a valid JPEG even when it isn't a LIF) → flat 2D.
 LifResult MonoFallback(const std::vector<uint8_t>& buf, const std::string& path) {
@@ -278,17 +237,11 @@ LifResult LifLoader::Load(const std::string& path) {
 
     // Compose full-SBS RGBA: left view into the left half, right view into the right.
     const int w = limg.width, h = limg.height;
-    const size_t rowBytes = (size_t)w * 4;
     LifResult r;
-    r.image.width = w * 2;
-    r.image.height = h;
-    r.image.pixels.resize((size_t)w * 2 * h * 4);
-    uint8_t* dst = r.image.pixels.data();
-    for (int y = 0; y < h; ++y) {
-        const size_t rowStart = (size_t)y * (size_t)(w * 2) * 4;
-        std::copy_n(limg.pixels.data() + (size_t)y * rowBytes, rowBytes, dst + rowStart);
-        std::copy_n(rimg.pixels.data() + (size_t)y * rowBytes, rowBytes,
-                    dst + rowStart + rowBytes);
+    r.image = ComposeSbs(limg, rimg);
+    if (!r.image.Valid()) {
+        LOG_WARN("LifLoader: '%s' SBS compose failed — flat 2D", path.c_str());
+        return MonoFallback(buf, path);
     }
     r.layout = StereoLayout::SbsFull;
     r.stereo = true;

@@ -23,8 +23,16 @@ transport bar with per-eye parallax, convergence/L-R-swap controls, fullscreen, 
 and low-latency frame-exact scrubbing (M4); the macOS Vulkan path (M5); and Windows + macOS
 installers with CI release-on-tag (M6).
 
-Stereo images (JPG/PNG via stb_image) and SBS video (`*_2x1` / `*_half_2x1`) share the same
+Stereo images (JPG/PNG via stb_image, LIF and MPO containers) and SBS video share the same
 decode → atlas → submit path; the runtime + display processor do all weaving.
+
+**Stereo layout is detected, not guessed.** The `*_2x1` / `*_half_2x1` naming convention
+still wins where it applies, but files without it are resolved from real evidence: container
+metadata first (`AVStereo3D` side data from MKV `StereoMode`, MP4 `st3d`, or an H.264
+frame-packing SEI — which also says whether the eyes are packed R|L), then cross-correlation
+of the two halves. That last layer is what handles the case no aspect-ratio rule ever could:
+a half-SBS frame is dimensionally identical to a mono one. The HUD names whichever signal
+decided, and **L** pins the layout by hand when the guess is wrong.
 
 **Verified on macOS (Apple Silicon, MoltenVK)** against a local `displayxr-runtime` dev
 build — correct per-eye L/R routing in 2-view (Squeezed SBS) and 4-view (Quad) modes, HUD
@@ -42,9 +50,12 @@ scripts/run_mediaplayer_handle_vk_macos.sh /path/to/clip_2x1.mp4
 scripts/run_mediaplayer_handle_vk_macos.sh assets/test_LR_2x1.png
 ```
 
-Keys: **V** cycles display modes, **SHIFT+TAB** toggles the HUD, **Esc** quits. With no
-file argument it falls back to a RED|BLUE left/right test pattern. See `PRD.md` §11 for
-the milestone map.
+Keys: **V** cycles display modes, **SHIFT+TAB** toggles the HUD, **L** cycles the stereo
+layout override (auto / mono / SBS-full / SBS-half), **Esc** quits. With no file argument it
+falls back to a RED|BLUE left/right test pattern. See `PRD.md` §11 for the milestone map.
+
+You can also **drag files onto the window**. Dropping several at once loads the first and
+makes the dropped set the list the arrow keys and the slideshow walk.
 
 ## Requirements
 

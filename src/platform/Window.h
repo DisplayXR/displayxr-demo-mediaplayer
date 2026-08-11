@@ -104,6 +104,7 @@ public:
     bool TakeNextMediaRequest();      // Right arrow — next asset in the folder
     bool TakeToggleSlideshowRequest(); // `S` — toggle slideshow ("diaporama")
     bool TakeToggleMuteRequest();      // `M` — toggle audio mute
+    bool TakeCycleLayoutRequest();     // `L` — cycle the stereo-layout override (#45)
 
     // Discrete pointer activity (click / wheel / window-enter) since last read — wakes
     // the auto-hide UI. Continuous motion is detected by polling (jitter-immune).
@@ -138,6 +139,7 @@ private:
     bool nextMediaRequested_ = false;
     bool toggleSlideshowRequested_ = false;
     bool toggleMuteRequested_ = false;
+    bool cycleLayoutRequested_ = false;
     std::vector<std::string> dropBatch_;
     bool mouseActivity_ = false;
     bool mouseLeft_ = false;

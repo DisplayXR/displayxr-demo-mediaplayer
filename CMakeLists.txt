@@ -166,7 +166,11 @@ add_executable(${MP_TARGET}
     src/rhi/VulkanRenderer.cpp
     src/media/ImageDecoder.cpp
     src/media/LifLoader.cpp
+    src/media/MpoLoader.cpp
     src/media/MediaSource.cpp
+    src/media/StereoCompose.cpp
+    src/media/StereoDetect.cpp
+    src/media/VideoStereoProbe.cpp
     src/media/VideoDecoder.cpp
     src/media/AudioPlayer.cpp
     src/ui/Hud.cpp
@@ -276,6 +280,7 @@ if(MP_BUILD_TESTS)
     add_executable(lif_roundtrip_test
         tests/lif_roundtrip_test.cpp
         src/media/LifLoader.cpp
+        src/media/StereoCompose.cpp
         src/media/ImageDecoder.cpp
         src/Log.cpp)
     target_include_directories(lif_roundtrip_test PRIVATE
@@ -283,5 +288,55 @@ if(MP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
     target_link_libraries(lif_roundtrip_test PRIVATE nlohmann_json::nlohmann_json)
     add_test(NAME lif_roundtrip COMMAND lif_roundtrip_test)
-    message(STATUS "Tests enabled: lif_roundtrip_test")
+
+    # The stereo detector is pure by construction — no Vulkan, no SDL, no libav — so it
+    # links against almost nothing and runs on synthetic buffers with no fixtures.
+    add_executable(stereo_detect_test
+        tests/stereo_detect_test.cpp
+        src/media/StereoDetect.cpp
+        src/media/MediaSource.cpp
+        src/Log.cpp)
+    target_include_directories(stereo_detect_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME stereo_detect COMMAND stereo_detect_test)
+
+    add_executable(mpo_parse_test
+        tests/mpo_parse_test.cpp
+        src/media/MpoLoader.cpp
+        src/media/StereoCompose.cpp
+        src/media/ImageDecoder.cpp
+        src/Log.cpp)
+    target_include_directories(mpo_parse_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    add_test(NAME mpo_parse COMMAND mpo_parse_test)
+
+    # End-to-end layout sweep over the generated corpus (scripts/gen_stereo_test_assets.sh).
+    # Needs the media stack but no Vulkan/OpenXR/display; skips cleanly (exit 0) when the
+    # asset directory is absent, so CI passes without generating gigabytes of fixtures.
+    add_executable(stereo_sweep
+        tests/stereo_sweep.cpp
+        src/media/MediaSource.cpp
+        src/media/StereoDetect.cpp
+        src/media/StereoCompose.cpp
+        src/media/VideoStereoProbe.cpp
+        src/media/LifLoader.cpp
+        src/media/MpoLoader.cpp
+        src/media/ImageDecoder.cpp
+        src/Log.cpp)
+    target_include_directories(stereo_sweep PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_link_libraries(stereo_sweep PRIVATE nlohmann_json::nlohmann_json)
+    if(TARGET PkgConfig::FFMPEG)
+        target_link_libraries(stereo_sweep PRIVATE PkgConfig::FFMPEG)
+        target_compile_definitions(stereo_sweep PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
+    elseif(TARGET mp_ffmpeg)
+        target_link_libraries(stereo_sweep PRIVATE mp_ffmpeg)
+        target_compile_definitions(stereo_sweep PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
+    endif()
+    add_test(NAME stereo_sweep COMMAND stereo_sweep
+             ${CMAKE_CURRENT_SOURCE_DIR}/assets/media/detect)
+
+    message(STATUS
+        "Tests enabled: lif_roundtrip_test stereo_detect_test mpo_parse_test stereo_sweep")
 endif()

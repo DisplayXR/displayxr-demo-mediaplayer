@@ -183,6 +183,7 @@ bool Window::PumpEvents() {
                 if (e.key.key == SDLK_RIGHT) nextMediaRequested_ = true;
                 if (e.key.key == SDLK_S) toggleSlideshowRequested_ = true;
                 if (e.key.key == SDLK_M) toggleMuteRequested_ = true;
+                if (e.key.key == SDLK_L) cycleLayoutRequested_ = true;  // stereo layout override
                 if (e.key.key == SDLK_I) captureRequested_ = true;  // snapshot the atlas
                 if (e.key.key == SDLK_O && (e.key.mod & SDL_KMOD_CTRL)) openFileRequested_ = true; // Ctrl+O — open
                 if (e.key.key == SDLK_F || e.key.key == SDLK_F11) ToggleFullscreen();
@@ -255,6 +256,12 @@ bool Window::TakeTogglePauseRequest() {
 bool Window::TakeOpenFileRequest() {
     bool v = openFileRequested_;
     openFileRequested_ = false;
+    return v;
+}
+
+bool Window::TakeCycleLayoutRequest() {
+    bool v = cycleLayoutRequested_;
+    cycleLayoutRequested_ = false;
     return v;
 }
 
