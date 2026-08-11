@@ -26,43 +26,127 @@ bool Contains(const std::string& s, const char* needle) {
     return s.find(needle) != std::string::npos;
 }
 
+// Layer 5. The historical rule, kept verbatim: unsuffixed but unusually wide -> assume
+// full SBS. Weak on its own (a 2:1 mono photo trips it), which is why it runs last.
+bool LayoutFromAspect(int w, int h, StereoLayout& out) {
+    if (w <= 0 || h <= 0) return false;
+    if ((float)w / (float)h < 1.9f) return false;
+    out = StereoLayout::SbsFull;
+    return true;
+}
+
 } // namespace
+
+const char* LayoutName(StereoLayout l) {
+    switch (l) {
+        case StereoLayout::SbsFull: return "SBS-full";
+        case StereoLayout::SbsHalf: return "SBS-half";
+        default: return "mono";
+    }
+}
+
+const char* SignalName(StereoSignal s) {
+    switch (s) {
+        case StereoSignal::Manual: return "manual";
+        case StereoSignal::Metadata: return "metadata";
+        case StereoSignal::Filename: return "from filename";
+        case StereoSignal::Content: return "detected";
+        case StereoSignal::Aspect: return "aspect (low conf.)";
+        default: return "default";
+    }
+}
+
+bool MediaSource::LayoutFromFilename(const std::string& path, StereoLayout& out) {
+    const std::string lower = Lower(path);
+    if (Contains(lower, "half_2x1")) { out = StereoLayout::SbsHalf; return true; }
+    if (Contains(lower, "2x1")) { out = StereoLayout::SbsFull; return true; }
+    return false;
+}
 
 MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int imageHeight) {
     const std::string lower = Lower(path);
     MediaInfo info;
 
     if (EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png") ||
-        EndsWith(lower, ".lif")) {
-        // .lif is a JPEG container; the LifLoader composes it to SBS and reports the
-        // authoritative layout, so the layout decided below is unused for that path.
+        EndsWith(lower, ".mpo") || EndsWith(lower, ".lif")) {
+        // .lif and .mpo are JPEG containers; their loaders compose the pair to SBS and
+        // report the authoritative layout, so the layout decided below is unused for
+        // those paths.
         info.kind = MediaKind::Image;
     } else if (EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov")) {
         info.kind = MediaKind::Video;
     }
 
-    // Stereo layout: filename suffix first (matches the LIF naming convention).
-    if (Contains(lower, "half_2x1")) {
-        info.layout = StereoLayout::SbsHalf;
-    } else if (Contains(lower, "2x1")) {
-        info.layout = StereoLayout::SbsFull;
-    } else if (imageWidth > 0 && imageHeight > 0 &&
-               (float)imageWidth / (float)imageHeight >= 1.9f) {
-        // No suffix but unusually wide -> assume full SBS.
-        info.layout = StereoLayout::SbsFull;
+    // Stereo layout: filename suffix first (matches the `*_2x1` naming convention).
+    if (LayoutFromFilename(path, info.layout)) {
+        info.signal = StereoSignal::Filename;
+        info.confidence = 1.0f;
+    } else if (LayoutFromAspect(imageWidth, imageHeight, info.layout)) {
+        info.signal = StereoSignal::Aspect;
+        info.confidence = 0.3f;
     } else {
         info.layout = StereoLayout::Mono;
+        info.signal = StereoSignal::Default;
+        info.confidence = 1.0f;
     }
 
-    LOG_INFO("MediaSource: '%s' -> kind=%s layout=%s", path.c_str(),
-             KindName(info.kind), LayoutName(info.layout));
+    LOG_INFO("MediaSource: '%s' -> kind=%s layout=%s (%s)", path.c_str(),
+             KindName(info.kind), LayoutName(info.layout), SignalName(info.signal));
+    return info;
+}
+
+MediaInfo MediaSource::Resolve(const std::string& path, MediaKind kind,
+                               int frameW, int frameH,
+                               const StereoLayout* manual,
+                               const MediaInfo* meta,
+                               const StereoDetectResult* content) {
+    MediaInfo info;
+    info.kind = kind;
+
+    // 1. Manual pin beats everything — no heuristic is perfect, and the user is looking
+    //    at the result.
+    if (manual) {
+        info.layout = *manual;
+        info.signal = StereoSignal::Manual;
+        info.confidence = 1.0f;
+    // 2. Container metadata. Authoritative when present, and the only layer that can
+    //    tell us the eyes are packed R|L.
+    } else if (meta) {
+        info.layout = meta->layout;
+        info.eyeSwap = meta->eyeSwap;
+        info.signal = StereoSignal::Metadata;
+        info.confidence = 1.0f;
+    // 3. Filename convention — unchanged from the original behaviour.
+    } else if (LayoutFromFilename(path, info.layout)) {
+        info.signal = StereoSignal::Filename;
+        info.confidence = 1.0f;
+    // 4. Content analysis. Only when it actually reached a verdict; note that a
+    //    CONFIDENT MONO is a real verdict and must win here, or the aspect rule below
+    //    would still split a 2:1 mono panorama.
+    } else if (content && content->decided) {
+        info.layout = content->layout;
+        info.signal = StereoSignal::Content;
+        info.confidence = content->confidence;
+    // 5. Aspect alone.
+    } else if (LayoutFromAspect(frameW, frameH, info.layout)) {
+        info.signal = StereoSignal::Aspect;
+        info.confidence = 0.3f;
+    } else {
+        info.layout = StereoLayout::Mono;
+        info.signal = StereoSignal::Default;
+        info.confidence = 1.0f;
+    }
+
+    LOG_INFO("MediaSource: '%s' -> layout=%s signal=%s conf=%.2f%s", path.c_str(),
+             LayoutName(info.layout), SignalName(info.signal), (double)info.confidence,
+             info.eyeSwap ? " eyes=R|L" : "");
     return info;
 }
 
 bool MediaSource::IsSupported(const std::string& path) {
     const std::string lower = Lower(path);
     return EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png") ||
-           EndsWith(lower, ".lif") ||
+           EndsWith(lower, ".lif") || EndsWith(lower, ".mpo") ||
            EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov");
 }
 
@@ -74,12 +158,7 @@ const char* MediaSource::KindName(MediaKind k) {
     }
 }
 
-const char* MediaSource::LayoutName(StereoLayout l) {
-    switch (l) {
-        case StereoLayout::SbsFull: return "SBS-full";
-        case StereoLayout::SbsHalf: return "SBS-half";
-        default: return "mono";
-    }
-}
+const char* MediaSource::LayoutName(StereoLayout l) { return mp::LayoutName(l); }
+const char* MediaSource::SignalName(StereoSignal s) { return mp::SignalName(s); }
 
 } // namespace mp

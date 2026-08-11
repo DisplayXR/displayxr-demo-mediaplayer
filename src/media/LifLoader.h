@@ -14,7 +14,7 @@
 #pragma once
 
 #include "ImageDecoder.h"   // DecodedImage
-#include "MediaSource.h"    // StereoLayout
+#include "StereoTypes.h"    // StereoLayout
 
 #include <string>
 

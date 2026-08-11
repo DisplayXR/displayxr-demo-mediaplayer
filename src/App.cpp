@@ -5,6 +5,9 @@
 #include "media/ImageDecoder.h"
 #include "media/LifLoader.h"
 #include "media/MediaSource.h"
+#include "media/MpoLoader.h"
+#include "media/StereoDetect.h"
+#include "media/VideoStereoProbe.h"
 #include "ui/Hud.h"
 
 #include <algorithm>
@@ -272,6 +275,25 @@ int App::Run() {
     // prove convergence/swap without keystrokes). Interactive keys still apply on top.
     if (const char* c = std::getenv("MEDIAPLAYER_CONV")) convergence_ = (float)std::atof(c);
     if (const char* s = std::getenv("MEDIAPLAYER_SWAP")) swapEyes_ = (*s && *s != '0');
+    // Stereo-layout detection controls (#45). The kill switch turns the heuristics off
+    // for CI and perf work; LIF/MPO are containers, not heuristics, and stay active.
+    if (const char* d = std::getenv("MEDIAPLAYER_STEREO_DETECT")) {
+        if (std::strcmp(d, "off") == 0) detectMode_ = DetectMode::Off;
+        else if (std::strcmp(d, "meta") == 0) detectMode_ = DetectMode::Meta;
+        else detectMode_ = DetectMode::Full;
+        LOG_INFO("Stereo detection: %s", d);
+    }
+    // Force a layout for headless/atlas-dump runs. Loads clear the pin, so this is
+    // re-applied at every load via layoutForced_.
+    if (const char* l = std::getenv("MEDIAPLAYER_LAYOUT")) {
+        layoutForced_ = true;
+        if (std::strcmp(l, "mono") == 0) layoutForcedValue_ = StereoLayout::Mono;
+        else if (std::strcmp(l, "sbshalf") == 0) layoutForcedValue_ = StereoLayout::SbsHalf;
+        else if (std::strcmp(l, "sbsfull") == 0 || std::strcmp(l, "sbs") == 0)
+            layoutForcedValue_ = StereoLayout::SbsFull;
+        else layoutForced_ = false;   // "auto" or anything unrecognised
+        LOG_INFO("Stereo layout forced: %s", layoutForced_ ? l : "auto");
+    }
     const auto bootNow = std::chrono::steady_clock::now();
     fpsWindowStart_ = bootNow;
     lastFrameTime_ = bootNow;
@@ -356,6 +378,7 @@ int App::Run() {
         if (window_.TakeNextMediaRequest()) { RequestNavTransition(+1); activity = true; }  // Right
         if (window_.TakeToggleSlideshowRequest()) { ToggleSlideshow(); activity = true; } // 'S'
         if (window_.TakeToggleMuteRequest()) { ToggleMute(); activity = true; }            // 'M'
+        if (window_.TakeCycleLayoutRequest()) { CycleLayoutOverride(); activity = true; }  // 'L'
         if (window_.TakeMouseLeft()) {
             // Cursor left the window — drop the UI now (push idle past the hide threshold).
             lastActivity_ =
@@ -465,7 +488,10 @@ void App::RenderOneFrame() {
         bool isLeftView[XrSession::kMaxViews];
         for (uint32_t v = 0; v < frame.viewCount; ++v) {
             // 'X' swaps which SBS half each eye samples (XOR the geometric L/R).
-            const bool isLeft = (frame.views[v].pose.position.x <= centerX) != swapEyes_;
+            // mediaEyeSwap_ is the container's word that the packing is R|L; XOR it in so
+            // it composes with the user's X toggle instead of overriding it.
+            const bool isLeft =
+                (frame.views[v].pose.position.x <= centerX) != (swapEyes_ != mediaEyeSwap_);
             isLeftView[v] = isLeft;
             colors[v] = isLeft ? kLeftImage : kRightImage;  // RED|BLUE fallback
             if (layout_ == StereoLayout::Mono) {
@@ -642,18 +668,21 @@ void App::RenderOneFrame() {
                 std::snprintf(stereo, sizeof(stereo), "conv %+.3f  eyes %s%s", convergence_,
                               swapEyes_ ? "swapped" : "normal",
                               (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "");
-                char text[320];
+                // The layout label carries its provenance ("— detected" / "— from
+                // filename" / ...), so the buffer needs headroom over the old 320.
+                const std::string layoutLabel = LayoutLabel();
+                char text[512];
                 if (isVideo_) {
                     std::snprintf(text, sizeof(text),
                                   "%.0f FPS   %s\nsrc %dx%d  %s  %s/%s\nwin %ux%u  tile %ux%u\n%s",
                                   fps_, xr_.ActiveModeName(), mediaW_, mediaH_,
-                                  MediaSource::LayoutName(layout_), video_.CodecName(),
+                                  layoutLabel.c_str(), video_.CodecName(),
                                   video_.BackendName(), cw, ch, tileW, tileH, stereo);
                 } else if (hasMedia_) {
                     std::snprintf(text, sizeof(text),
                                   "%.0f FPS   %s\nsrc %dx%d  %s\nwin %ux%u  tile %ux%u\n%s", fps_,
                                   xr_.ActiveModeName(), mediaW_, mediaH_,
-                                  MediaSource::LayoutName(layout_), cw, ch, tileW, tileH, stereo);
+                                  layoutLabel.c_str(), cw, ch, tileW, tileH, stereo);
                 } else {
                     std::snprintf(text, sizeof(text),
                                   "%.0f FPS   %s\nsrc %s\nwin %ux%u  tile %ux%u\n%s",
@@ -802,13 +831,29 @@ void App::BuildTransportUI() {
             char modeLabel[96];
             std::snprintf(modeLabel, sizeof(modeLabel), "Mode: %s", xr_.ActiveModeName());
             if (ImGui::Button(modeLabel)) xr_.RequestNextMode();
+            // Stereo layout + override (#45). The trailing '*' marks a manual pin.
+            if (hasMedia_) {
+                char layoutBtn[64];
+                std::snprintf(layoutBtn, sizeof(layoutBtn), "Layout: %s%s",
+                              MediaSource::LayoutName(layout_), layoutPinned_ ? "*" : "");
+                ImGui::SameLine();
+                if (ImGui::Button(layoutBtn)) CycleLayoutOverride();
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s\nL cycles: auto / mono / SBS-full / SBS-half",
+                                      LayoutLabel().c_str());
+                }
+            }
             // Current filename, centered in the bar.
             if (!currentMediaPath_.empty()) {
                 const std::string name =
                     std::filesystem::path(currentMediaPath_).filename().string();
                 const float tw = ImGui::CalcTextSize(name.c_str()).x;
                 ImGui::SameLine();
-                ImGui::SetCursorPosX((ImGui::GetWindowWidth() - tw) * 0.5f);
+                // Clamp, don't set: with a third button on the left the centred position
+                // can fall BEHIND the cursor, and SetCursorPosX would happily back-track
+                // and overlap the buttons. The filename may only ever slide right.
+                ImGui::SetCursorPosX(
+                    std::max(ImGui::GetCursorPosX(), (ImGui::GetWindowWidth() - tw) * 0.5f));
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextUnformatted(name.c_str());
             }
@@ -953,7 +998,18 @@ void App::Shutdown() {
 // --- Open-file ------------------------------------------------------------------
 
 bool App::LoadMedia(const std::string& path) {
-    const MediaInfo info = MediaSource::Identify(path);
+    const MediaInfo probeInfo = MediaSource::Identify(path);
+
+    // Layered layout resolution (#45). Work out up front which layers we even need:
+    // a manual pin short-circuits everything, and a decisive filename means the content
+    // detector has nothing to add (we still want a metadata pass for the eye-swap bit).
+    if (layoutForced_) { layoutPinned_ = true; layoutPinnedValue_ = layoutForcedValue_; }
+    const StereoLayout* manual = layoutPinned_ ? &layoutPinnedValue_ : nullptr;
+    StereoLayout fnLayout = StereoLayout::Mono;
+    const bool fnDecided = MediaSource::LayoutFromFilename(path, fnLayout);
+    const bool wantContent = !manual && !fnDecided && detectMode_ == DetectMode::Full;
+
+    const MediaInfo info = probeInfo;
     if (info.kind == MediaKind::Video) {
 #if defined(_WIN32)
         // Zero-copy decode (#28): pin the D3D11VA decode device to the Vulkan adapter so
@@ -963,6 +1019,29 @@ bool App::LoadMedia(const std::string& path) {
         if (zc && *zc && *zc != '0' && xr_.ZeroCopyCapable() && xr_.DeviceLUIDValid())
             video_.SetInteropAdapterLUID(xr_.DeviceLUID());
 #endif
+        // Probe BEFORE opening for playback: a bounded, software-only pre-roll on its own
+        // context. See VideoStereoProbe.h for why this is synchronous rather than
+        // analysing presented frames.
+        VideoStereoProbe::Result pr;
+        if (detectMode_ != DetectMode::Off && !manual)
+            pr = VideoStereoProbe::Run(path, wantContent);
+        MediaInfo meta;
+        if (pr.haveMeta) {
+            meta.layout = pr.metaLayout;
+            meta.eyeSwap = pr.metaInvert;
+            // AVStereo3D says "side by side" but is silent on full vs half — settle that
+            // from the frame aspect, the same way the content path does.
+            if (meta.layout != StereoLayout::Mono && pr.width > 0 && pr.height > 0) {
+                bool ambiguous = false;
+                meta.layout = StereoDetect::ChooseFullOrHalf(
+                    (float)pr.width / (float)pr.height, ambiguous);
+            }
+        }
+        const MediaInfo vinfo = MediaSource::Resolve(
+            path, MediaKind::Video, pr.ok ? pr.width : 0, pr.ok ? pr.height : 0,
+            manual, pr.haveMeta ? &meta : nullptr,
+            pr.content.decided ? &pr.content : nullptr);
+
         if (!video_.Open(path)) {
             LOG_ERROR("Open: cannot decode video '%s'", path.c_str());
             return false;
@@ -970,12 +1049,12 @@ bool App::LoadMedia(const std::string& path) {
         isVideo_ = true;
         hasMedia_ = true;
         ClearIdleLogo();
-        layout_ = info.layout;
+        ApplyLayout(vinfo);
         mediaConvergence_ = 0.0f;  // no baked convergence for video
         mediaAutoConvAvailable_ = false;
         mediaW_ = video_.Width();
         mediaH_ = video_.Height();
-        contentAspect_ = PerEyeAspect(info.layout, video_.Width(), video_.Height());
+        contentAspect_ = PerEyeAspect(layout_, video_.Width(), video_.Height());
         // In slideshow, force play-once so the clip can end and advance, regardless of
         // the user's manual loop preference.
         if (slideshowActive_) video_.SetLoop(false);
@@ -984,7 +1063,7 @@ bool App::LoadMedia(const std::string& path) {
         audio_.SetMuted(muted_);
         audio_.SetLoop(video_.Loop());
         LOG_INFO("Playing %s video (%s), per-eye aspect %.3f",
-                 MediaSource::LayoutName(info.layout), path.c_str(), contentAspect_);
+                 LayoutLabel().c_str(), path.c_str(), contentAspect_);
         currentMediaPath_ = path;
         RebuildFolderList(path);
         return true;
@@ -1013,42 +1092,158 @@ bool App::LoadMedia(const std::string& path) {
         isVideo_ = false;
         hasMedia_ = true;
         ClearIdleLogo();
-        layout_ = lif.layout;
+        // The container is authoritative — the detector never runs on this path. A manual
+        // pin still applies on top: forcing mono is a legitimate "show me the raw composed
+        // frame" view.
+        MediaInfo linfo;
+        linfo.kind = MediaKind::Image;
+        linfo.layout = manual ? *manual : lif.layout;
+        linfo.signal = manual ? StereoSignal::Manual : StereoSignal::Metadata;
+        linfo.confidence = 1.0f;
+        autoInfo_ = MediaInfo{MediaKind::Image, lif.layout, StereoSignal::Metadata, false, 1.0f};
+        ApplyLayout(linfo);
         mediaConvergence_ = lif.convergence;  // baked reconvergence from the LIF
         mediaAutoConvAvailable_ = lif.stereo && !lif.hasConvergence;  // estimate available
         mediaAutoConvergence_ = lif.autoConvergence;
         mediaW_ = lif.image.width;
         mediaH_ = lif.image.height;
-        contentAspect_ = PerEyeAspect(lif.layout, lif.image.width, lif.image.height);
+        contentAspect_ = PerEyeAspect(layout_, lif.image.width, lif.image.height);
         LOG_INFO("Displaying %s LIF (%s), per-eye aspect %.3f, baked convergence %+.4f",
                  lif.stereo ? "stereo" : "mono", path.c_str(), contentAspect_, mediaConvergence_);
         currentMediaPath_ = path;
         RebuildFolderList(path);
         return true;
     }
+    // MPO container (concatenated JPEGs indexed by an APP2 "MPF" segment): like LIF, the
+    // loader composes the pair to SBS and the layout is settled. Must come AFTER the LIF
+    // sniff (a LIF is also a JPEG) and BEFORE the plain-image path. A file that isn't a
+    // well-formed two-view MPO returns ok=false and falls through to stb below, which
+    // decodes its primary image as an ordinary JPEG.
+    auto hasMpoExt = [](const std::string& p) {
+        const size_t n = p.size();
+        if (n < 4) return false;
+        auto lc = [](char c) { return (char)(c | 0x20); };  // ASCII lower
+        return p[n - 4] == '.' && lc(p[n - 3]) == 'm' && lc(p[n - 2]) == 'p' &&
+               lc(p[n - 1]) == 'o';
+    };
+    if (hasMpoExt(path) || MpoLoader::IsMpo(path)) {
+        MpoResult mpo = MpoLoader::Load(path);
+        if (mpo.ok) {
+            if (!renderer_.UploadTexture(mpo.image.pixels.data(), (uint32_t)mpo.image.width,
+                                         (uint32_t)mpo.image.height)) {
+                return false;
+            }
+            isVideo_ = false;
+            hasMedia_ = true;
+            ClearIdleLogo();
+            MediaInfo minfo;
+            minfo.kind = MediaKind::Image;
+            minfo.layout = manual ? *manual : mpo.layout;
+            minfo.signal = manual ? StereoSignal::Manual : StereoSignal::Metadata;
+            minfo.confidence = 1.0f;
+            autoInfo_ =
+                MediaInfo{MediaKind::Image, mpo.layout, StereoSignal::Metadata, false, 1.0f};
+            ApplyLayout(minfo);
+            mediaConvergence_ = 0.0f;   // MPO carries no baked convergence...
+            mediaAutoConvAvailable_ = true;   // ...so the estimate is always on offer
+            mediaAutoConvergence_ = mpo.autoConvergence;
+            mediaW_ = mpo.image.width;
+            mediaH_ = mpo.image.height;
+            contentAspect_ = PerEyeAspect(layout_, mpo.image.width, mpo.image.height);
+            LOG_INFO("Displaying stereo MPO (%s), per-eye aspect %.3f", path.c_str(),
+                     contentAspect_);
+            currentMediaPath_ = path;
+            RebuildFolderList(path);
+            return true;
+        }
+    }
     DecodedImage img = ImageDecoder::Load(path);
     if (!img.Valid()) {
         LOG_ERROR("Open: cannot load image '%s'", path.c_str());
         return false;
     }
-    const MediaInfo imgInfo = MediaSource::Identify(path, img.width, img.height);
+    // The layer that solves unsuffixed stills: a half-SBS frame is dimensionally identical
+    // to a mono one, so only the pixels can tell them apart.
+    StereoDetectResult content;
+    if (wantContent) {
+        content = StereoDetect::AnalyzeRGBA(img.pixels.data(), img.width, img.height,
+                                            (ptrdiff_t)img.width * 4);
+    }
+    const MediaInfo imgInfo =
+        MediaSource::Resolve(path, MediaKind::Image, img.width, img.height, manual,
+                             /*meta=*/nullptr, content.decided ? &content : nullptr);
     if (!renderer_.UploadTexture(img.pixels.data(), (uint32_t)img.width, (uint32_t)img.height)) {
         return false;
     }
     isVideo_ = false;
     hasMedia_ = true;
     ClearIdleLogo();
-    layout_ = imgInfo.layout;
+    ApplyLayout(imgInfo);
     mediaConvergence_ = 0.0f;  // plain SBS image carries no baked convergence
     mediaAutoConvAvailable_ = false;
     mediaW_ = img.width;
     mediaH_ = img.height;
-    contentAspect_ = PerEyeAspect(imgInfo.layout, img.width, img.height);
+    contentAspect_ = PerEyeAspect(layout_, img.width, img.height);
     LOG_INFO("Displaying %s image (%s), per-eye aspect %.3f",
-             MediaSource::LayoutName(imgInfo.layout), path.c_str(), contentAspect_);
+             LayoutLabel().c_str(), path.c_str(), contentAspect_);
     currentMediaPath_ = path;
     RebuildFolderList(path);
     return true;
+}
+
+void App::ApplyLayout(const MediaInfo& info) {
+    layout_ = info.layout;
+    layoutSignal_ = info.signal;
+    layoutConfidence_ = info.confidence;
+    mediaEyeSwap_ = info.eyeSwap;
+    if (info.signal != StereoSignal::Manual) autoInfo_ = info;
+    // The pin is per-file: carrying "SBS-full" onto the next mono photo in a folder would
+    // make the slideshow look broken. Cleared HERE — at the point a load commits — rather
+    // than at LoadMedia entry, so a failed open leaves the still-displayed media's pin on.
+    layoutPinned_ = false;
+    // Toast only when we GUESSED. Files that told us what they are don't need nagging,
+    // and this is how the ambiguous full-vs-half case reaches the user, who can hit L.
+    if (info.signal == StereoSignal::Content || info.signal == StereoSignal::Aspect)
+        ShowToast(LayoutLabel());
+}
+
+std::string App::LayoutLabel() const {
+    std::string s = MediaSource::LayoutName(layout_);
+    if (mediaEyeSwap_) s += " (R|L)";
+    s += " — ";
+    s += MediaSource::SignalName(layoutSignal_);
+    return s;
+}
+
+void App::CycleLayoutOverride() {
+    // auto -> mono -> SBS-full -> SBS-half -> auto
+    if (!layoutPinned_) {
+        layoutPinned_ = true;
+        layoutPinnedValue_ = StereoLayout::Mono;
+    } else if (layoutPinnedValue_ == StereoLayout::Mono) {
+        layoutPinnedValue_ = StereoLayout::SbsFull;
+    } else if (layoutPinnedValue_ == StereoLayout::SbsFull) {
+        layoutPinnedValue_ = StereoLayout::SbsHalf;
+    } else {
+        layoutPinned_ = false;
+    }
+    layoutForced_ = false;   // an explicit keypress retires the env-var seed
+
+    // Re-derive in place. The cached autoInfo_ is exactly why returning to auto costs no
+    // reload and no re-decode.
+    if (layoutPinned_) {
+        layout_ = layoutPinnedValue_;
+        layoutSignal_ = StereoSignal::Manual;
+        layoutConfidence_ = 1.0f;
+    } else {
+        layout_ = autoInfo_.layout;
+        layoutSignal_ = autoInfo_.signal;
+        layoutConfidence_ = autoInfo_.confidence;
+        mediaEyeSwap_ = autoInfo_.eyeSwap;
+    }
+    contentAspect_ = PerEyeAspect(layout_, mediaW_, mediaH_);
+    LOG_INFO("Layout override: %s", LayoutLabel().c_str());
+    ShowToast(LayoutLabel());
 }
 
 void App::ReloadMedia(const std::string& path) {
@@ -1335,9 +1530,20 @@ void App::SetupAgentTools() {
     xr_.RegisterMcpTool(
         "get_status",
         "Read the player's live state: whether a video is playing, the current and total "
-        "position in seconds, the open file path, the media kind, mute state, and the "
-        "folder index/count used by navigate. Requires no arguments.",
+        "position in seconds, the open file path, the media kind, mute state, the folder "
+        "index/count used by navigate, and the resolved stereo layout with the signal that "
+        "decided it. Requires no arguments.",
         "{\"type\":\"object\"}");
+
+    xr_.RegisterMcpTool(
+        "set_layout",
+        "Override how the current media is unpacked into left/right eyes, or return to "
+        "automatic detection. Mirrors the L key. The override applies to the currently "
+        "loaded file only and is dropped when other media is loaded.",
+        "{\"type\":\"object\",\"properties\":{\"layout\":{\"type\":\"string\","
+        "\"enum\":[\"auto\",\"mono\",\"sbs_full\",\"sbs_half\"],"
+        "\"description\":\"Layout to pin, or 'auto' to restore detection.\"}},"
+        "\"required\":[\"layout\"]}");
 
     xr_.SetMcpToolHandler([this](const std::string& tool, const std::string& args,
                                  bool& success) {
@@ -1440,6 +1646,38 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["muted"] = muted_;
         out["folder_index"] = static_cast<uint64_t>(folderIndex_);
         out["folder_count"] = static_cast<uint64_t>(folderFiles_.size());
+        out["layout"] = MediaSource::LayoutName(layout_);
+        out["layout_signal"] = MediaSource::SignalName(layoutSignal_);
+        out["layout_confidence"] = layoutConfidence_;
+        out["layout_pinned"] = layoutPinned_;
+        out["eye_swap"] = mediaEyeSwap_;
+        return out.dump();
+    }
+    if (tool == "set_layout") {
+        if (!args.contains("layout") || !args["layout"].is_string()) {
+            success = false;
+            return "{\"error\":\"missing required string arg 'layout'\"}";
+        }
+        const std::string want = args["layout"].get<std::string>();
+        bool pin = true;
+        StereoLayout value = StereoLayout::Mono;
+        if (want == "auto") pin = false;
+        else if (want == "mono") value = StereoLayout::Mono;
+        else if (want == "sbs_full") value = StereoLayout::SbsFull;
+        else if (want == "sbs_half") value = StereoLayout::SbsHalf;
+        else {
+            success = false;
+            return "{\"error\":\"layout must be auto|mono|sbs_full|sbs_half\"}";
+        }
+        // Reuse the cycle's re-derivation rather than duplicating it: step until the
+        // state matches (the cycle has 4 stops, so this always terminates).
+        for (int i = 0; i < 4; ++i) {
+            if (layoutPinned_ == pin && (!pin || layoutPinnedValue_ == value)) break;
+            CycleLayoutOverride();
+        }
+        out["layout"] = MediaSource::LayoutName(layout_);
+        out["layout_signal"] = MediaSource::SignalName(layoutSignal_);
+        out["layout_pinned"] = layoutPinned_;
         return out.dump();
     }
 
@@ -1545,7 +1783,8 @@ void App::RequestOpenFile() {
     ShowToast("File picker unavailable — opening desktop dialog");
 
     static const SDL_DialogFileFilter kFilters[] = {
-        {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png;lif"},
+        // Keep in sync with MediaSource::IsSupported — SDL wants its own filter string.
+        {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png;lif;mpo"},
         {"All files", "*"},
     };
     SDL_ShowOpenFileDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this,

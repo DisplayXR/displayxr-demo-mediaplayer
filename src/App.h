@@ -60,6 +60,16 @@ private:
     // Transient toast (e.g. convergence %). Shows `msg` for a short time, then fades.
     void ShowToast(const std::string& msg);
 
+    // Stereo layout override (#45): cycle auto -> mono -> SBS-full -> SBS-half -> auto.
+    // Re-derives layout_ and contentAspect_ in place; never touches the decoder.
+    void CycleLayoutOverride();
+    // "SBS-full — detected" / "mono — from filename" / "SBS-full (R|L) — metadata" ...
+    std::string LayoutLabel() const;
+    // Commit a resolved layout: layout_, the provenance fields, and the manual pin
+    // (cleared here rather than at load entry, so a FAILED load leaves the pin on the
+    // media still being displayed).
+    void ApplyLayout(const MediaInfo& info);
+
     // Per-frame UI state: advance the auto-hide fade, toast fade, and slideshow machine.
     void TickUi();
     void ToggleSlideshow();
@@ -101,6 +111,23 @@ private:
     bool isVideo_ = false;
     StereoLayout layout_ = StereoLayout::Mono;
     float contentAspect_ = 1.0f;  // per-eye display aspect (width/height), for letterboxing
+
+    // Layered stereo-layout detection (#45). layoutSignal_ records WHICH layer decided
+    // layout_, so the HUD can name it. autoInfo_ caches the automatic verdict, which is
+    // what lets `L` toggle back out of a manual pin without re-decoding the media.
+    StereoSignal layoutSignal_ = StereoSignal::Default;
+    float layoutConfidence_ = 1.0f;
+    bool mediaEyeSwap_ = false;   // container says the packing is R|L; XORs with swapEyes_
+    MediaInfo autoInfo_{};
+    bool layoutPinned_ = false;   // the user pinned a layout with L / the HUD button
+    StereoLayout layoutPinnedValue_ = StereoLayout::Mono;
+    // MEDIAPLAYER_LAYOUT seeds a pin for headless runs. Loads clear layoutPinned_, so the
+    // forced value has to be re-applied at each load; these two remember it.
+    bool layoutForced_ = false;
+    StereoLayout layoutForcedValue_ = StereoLayout::Mono;
+    // MEDIAPLAYER_STEREO_DETECT: off | meta | full (default full).
+    enum class DetectMode { Off, Meta, Full };
+    DetectMode detectMode_ = DetectMode::Full;
 
     // M4 stereo controls. convergence_ is horizontal image translation as a fraction
     // of a view tile (each eye shifted oppositely → moves the zero-disparity plane);
