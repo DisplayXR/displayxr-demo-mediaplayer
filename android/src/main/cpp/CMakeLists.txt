@@ -76,7 +76,11 @@ add_library(mediaplayer_vk_android SHARED
     # ── SHARED desktop sources (referenced, not copied): LIF container parse +
     #    stb image decode. Log.h's impl is the logcat shim above, NOT src/Log.cpp.
     #    ImageDecoder.cpp also owns the STB_IMAGE_IMPLEMENTATION TU.
+    #    StereoCompose.cpp holds ComposeSbs + EstimateAutoConvergence, which LifLoader
+    #    calls; they were factored out of LifLoader.cpp when MPO started sharing them
+    #    (#45), so this target needs the extra TU or the link fails on both symbols.
     ${REPO_ROOT}/src/media/LifLoader.cpp
+    ${REPO_ROOT}/src/media/StereoCompose.cpp
     ${REPO_ROOT}/src/media/ImageDecoder.cpp
     ${SHADER_HEADERS})
 

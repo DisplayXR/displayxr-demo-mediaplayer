@@ -93,6 +93,20 @@ jobs:
           DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build_macos.sh --installer
 
+      # MP_BUILD_TESTS defaults OFF, so nothing ran ctest before this — the unit tests
+      # existed but never executed in CI. Re-configure the tree build_macos.sh already
+      # populated (incremental: no re-fetch of SDL3/imgui/OpenXR) and run them.
+      # stereo_sweep needs the generated corpus and exits 0 with a notice without it, so
+      # CI stays green without building gigabytes of fixtures.
+      - name: Unit tests
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DMP_BUILD_TESTS=ON
+          cmake --build build --target lif_roundtrip_test stereo_detect_test \
+                                     mpo_parse_test stereo_sweep
+          ctest --test-dir build --output-on-failure
+
       - name: Assert .pkg payload (regression guard)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
