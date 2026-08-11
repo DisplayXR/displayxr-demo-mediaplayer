@@ -43,6 +43,11 @@ private:
     bool LoadMedia(const std::string& path);
     void ReloadMedia(const std::string& path);
 
+    // Drag and drop (#44). Filters the batch through MediaSource::IsSupported, toasts
+    // what was rejected, then loads: one file behaves exactly like Ctrl+O, while a
+    // multi-file drop installs the dropped set as a playlist (see playlistFromDrop_).
+    void HandleDroppedPaths(std::vector<std::string> paths);
+
     // Folder navigation: scan the current file's directory for supported assets, and
     // step prev/next (wrapping). delta is +1 (next) or -1 (prev). `path` is taken BY
     // VALUE on purpose: callers pass a reference into folderFiles_, which this clears.
@@ -136,6 +141,11 @@ private:
     std::string currentMediaPath_;
     std::vector<std::string> folderFiles_;
     size_t folderIndex_ = 0;
+    // Set when folderFiles_ came from a multi-file drop rather than a directory scan
+    // (#44). RebuildFolderList() honours it and re-locates the index inside the existing
+    // list instead of rescanning the parent directory, which would otherwise destroy the
+    // dropped set on the very next load. Cleared by any later single-target open.
+    bool playlistFromDrop_ = false;
 
     int mediaW_ = 0;              // full frame dims, for the HUD label
     int mediaH_ = 0;

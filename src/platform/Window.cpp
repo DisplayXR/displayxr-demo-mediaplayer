@@ -145,6 +145,25 @@ bool Window::PumpEvents() {
             mouseActivity_ = true;
         if (e.type == SDL_EVENT_WINDOW_MOUSE_ENTER) { mouseInWindow_ = true; mouseActivity_ = true; }
         if (e.type == SDL_EVENT_WINDOW_MOUSE_LEAVE) { mouseInWindow_ = false; mouseLeft_ = true; }
+        // Drag and drop (#44). SDL3 delivers this on Windows, macOS and X11 through the
+        // same event, so there is no per-platform handler here.
+        //
+        // TRAP: in SDL3 the path is `drop.data` and SDL OWNS the string — it is valid only
+        // for the duration of this event, so it must be COPIED now. (SDL2 used `drop.file`
+        // and required SDL_free(); most examples online are still SDL2 and would leak or
+        // double-free here.)
+        //
+        // Readiness is deliberately NOT keyed off SDL_EVENT_DROP_COMPLETE: every event of
+        // one drop is delivered inside this single SDL_PollEvent drain, so the batch is
+        // already whole by the time the app drains it later in the same frame. DROP_BEGIN
+        // is used only to discard a stale partial batch. SDL_EVENT_DROP_TEXT is ignored.
+        if (e.type == SDL_EVENT_DROP_BEGIN) dropBatch_.clear();
+        if (e.type == SDL_EVENT_DROP_FILE && e.drop.data) {
+            if (!window_ || e.drop.windowID == SDL_GetWindowID(window_)) {
+                dropBatch_.emplace_back(e.drop.data);
+                mouseActivity_ = true;   // a drop is input: wake the auto-hide UI
+            }
+        }
         if (e.type == SDL_EVENT_KEY_DOWN) {
             // Convergence nudges repeat while held; everything else is one-shot. The
             // convergence keys form the contiguous `0 - =` cluster: `=`/`-` nudge, `0` resets.
@@ -237,6 +256,13 @@ bool Window::TakeOpenFileRequest() {
     bool v = openFileRequested_;
     openFileRequested_ = false;
     return v;
+}
+
+bool Window::TakeDroppedPaths(std::vector<std::string>& out) {
+    if (dropBatch_.empty()) return false;
+    out = std::move(dropBatch_);
+    dropBatch_.clear();   // `moved-from` is unspecified, not guaranteed empty
+    return true;
 }
 
 bool Window::TakePrevMediaRequest() {
