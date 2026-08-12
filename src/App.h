@@ -78,6 +78,10 @@ private:
     // Per-frame UI state: advance the auto-hide fade, toast fade, and slideshow machine.
     void TickUi();
     void ToggleSlideshow();
+    // Idempotent form of the above — a dropped folder starts the slideshow, and must not
+    // stop it when one is already running. Call AFTER the first asset is loaded: it reads
+    // isVideo_ to decide whether the clip needs play-once.
+    void SetSlideshow(bool on);
     // Idle screen: composite the DisplayXR idle art onto a dark-grey backdrop and upload
     // it as a mono texture, so launching with no file/folder shows the brand lockup
     // instead of the RED|BLUE test pattern. Prefers the composed "mark + Media Player"
