@@ -1274,17 +1274,62 @@ void App::ReloadMedia(const std::string& path) {
 }
 
 void App::HandleDroppedPaths(std::vector<std::string> paths) {
+    namespace fs = std::filesystem;
+
     const size_t dropped = paths.size();
+    // A dropped FOLDER means the same thing as a folder on the command line, so it is
+    // expanded the same way (non-recursive, sorted, supported files only) — see the argv
+    // branch in Init(). Without this a folder fails the extension test in IsSupported()
+    // and is rejected as an unsupported file, which is the one drop gesture a media
+    // player with folder navigation should obviously accept.
+    const bool droppedOneFolder =
+        dropped == 1 && [&] { std::error_code ec; return fs::is_directory(paths[0], ec) && !ec; }();
+
     std::vector<std::string> good;
     good.reserve(dropped);
+    size_t rejected = 0;
     for (auto& p : paths) {
+        std::error_code ec;
+        if (fs::is_directory(p, ec) && !ec) {
+            std::vector<std::string> inFolder;
+            for (fs::directory_iterator it(p, ec), end; !ec && it != end; it.increment(ec)) {
+                std::error_code fe;
+                if (!it->is_regular_file(fe) || fe) continue;
+                const std::string s = it->path().string();
+                if (MediaSource::IsSupported(s)) inFolder.push_back(s);
+            }
+            std::sort(inFolder.begin(), inFolder.end());   // folders contribute in name order
+            if (inFolder.empty()) ++rejected;              // an empty folder is a rejected item
+            good.insert(good.end(), std::make_move_iterator(inFolder.begin()),
+                        std::make_move_iterator(inFolder.end()));
+            continue;
+        }
         if (MediaSource::IsSupported(p)) good.push_back(std::move(p));  // keep drop order
+        else ++rejected;
     }
-    const size_t rejected = dropped - good.size();
     if (good.empty()) {
         // Never reject silently — the user aimed at the window and nothing happened.
-        LOG_INFO("Drop: %zu file(s), none supported", dropped);
-        ShowToast(dropped == 1 ? "Unsupported file type" : "No supported files in drop");
+        LOG_INFO("Drop: %zu item(s), none supported", dropped);
+        ShowToast(droppedOneFolder      ? "No supported media in folder"
+                  : dropped == 1        ? "Unsupported file type"
+                                        : "No supported files in drop");
+        return;
+    }
+
+    if (droppedOneFolder) {
+        // Exactly the argv-folder gesture: open the first asset and let the normal
+        // directory scan govern ←/→, so the folder itself becomes the nav list.
+        playlistFromDrop_ = false;
+        LOG_INFO("Drop: folder '%s', %zu asset(s), opening first", paths[0].c_str(), good.size());
+        ReloadMedia(good.front());
+        // Dropping a folder means "play this folder" — so it starts the slideshow, unlike
+        // dropping a single file. SetSlideshow (not ToggleSlideshow) so a second folder
+        // drop during a running slideshow keeps it running instead of stopping it, and it
+        // runs AFTER the load because it reads isVideo_ to set play-once on a clip.
+        SetSlideshow(true);
+        char t[64];
+        std::snprintf(t, sizeof(t), "Slideshow: %zu items", good.size());
+        ShowToast(t);   // replaces SetSlideshow's generic "Slideshow on"
         return;
     }
 
@@ -1380,8 +1425,10 @@ void App::ShowToast(const std::string& msg) {
     toastExpiry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
 }
 
-void App::ToggleSlideshow() {
-    slideshowActive_ = !slideshowActive_;
+void App::ToggleSlideshow() { SetSlideshow(!slideshowActive_); }
+
+void App::SetSlideshow(bool on) {
+    slideshowActive_ = on;
     slideshowImageElapsed_ = 0.0;
     transition_ = Transition::Playing;
     if (slideshowActive_ && isVideo_) video_.SetLoop(false);  // play once, then advance

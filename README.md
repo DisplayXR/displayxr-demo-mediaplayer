@@ -76,8 +76,10 @@ Keys: **V** cycles display modes, **SHIFT+TAB** toggles the HUD, **L** cycles th
 layout override (auto / mono / SBS-full / SBS-half), **Esc** quits. With no file argument it
 falls back to a RED|BLUE left/right test pattern. See `PRD.md` §11 for the milestone map.
 
-You can also **drag files onto the window**. Dropping several at once loads the first and
-makes the dropped set the list the arrow keys and the slideshow walk.
+You can also **drag files or a folder onto the window**. Dropping several files at once
+loads the first and makes the dropped set the list the arrow keys and the slideshow walk.
+Dropping a **folder** opens its first asset and starts the slideshow, with the folder as
+that list — the same thing as passing the folder on the command line, plus playback.
 
 ## Requirements
 
