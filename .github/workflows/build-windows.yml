@@ -101,12 +101,99 @@ jobs:
           path: ${{ env.FFMPEG_PREFIX }}
           key: ffmpeg-slim-${{ env.FFMPEG_SHA }}-${{ hashFiles('scripts/build-ffmpeg-slim.sh') }}
 
+      # NASM - prefer the copy already on the runner image.
+      #
+      # This was a bare, single-attempt `choco install nasm -y` inside the
+      # FFmpeg step. That is a hard dependency on the Chocolatey CDN with
+      # no retry: when that CDN started answering 503 it took
+      # displayxr-shell-pvt's Windows build red for days
+      # (displayxr-shell-pvt#104). Same shape of fix, adapted to nasm.
+      #
+      # Order: use the preinstalled nasm if present -> else retry
+      # `choco install` (pinned, --no-progress, exponential backoff).
+      # There is deliberately NO direct-download rung: nasm.us publishes
+      # no checksum (and no signature) alongside its Windows builds, and
+      # running an unverified downloaded binary is worse than failing the
+      # job. The GitHub `windows-*` images ship nasm, so rung 1 is the
+      # normal path and rung 2 only covers an image regression.
+      #
+      # Same gating as the FFmpeg build below - nasm is only needed on a
+      # cache miss.
+      - name: Ensure NASM
+        if: needs.DetectChanges.outputs.docs_only != 'true' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        env:
+          NASM_FALLBACK_VERSION: '2.16.03'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # PowerShell 7.4 defaults $PSNativeCommandUseErrorActionPreference
+          # to $true, which would turn a failing `choco install` into a
+          # terminating error and defeat the retry loop below.
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          function Find-Nasm {
+            $cmd = Get-Command nasm -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            $candidates = @(
+              "$env:ProgramFiles\NASM\nasm.exe",
+              "${env:ProgramFiles(x86)}\NASM\nasm.exe",
+              'C:\Program Files\NASM\nasm.exe',
+              'C:\Program Files (x86)\NASM\nasm.exe',
+              "$env:ChocolateyInstall\bin\nasm.exe"
+            )
+            foreach ($p in $candidates) {
+              if ($p -and (Test-Path $p)) { return $p }
+            }
+            return $null
+          }
+
+          $nasm = Find-Nasm
+          if ($nasm) {
+            Write-Host "NASM already present on the runner image: $nasm"
+          }
+
+          # Chocolatey, but resilient: pinned version, no progress spam,
+          # 3 attempts with exponential backoff.
+          if (-not $nasm) {
+            Write-Host "::warning::NASM not preinstalled -- falling back to Chocolatey."
+            $delay = 15
+            foreach ($attempt in 1..3) {
+              # Pin the version for reproducibility on the first two tries;
+              # if the pinned package itself is what the CDN can't serve,
+              # the last attempt takes whatever `nasm` currently resolves to
+              # rather than failing the build over a pin.
+              if ($attempt -lt 3) {
+                $cargs = @('install','nasm','--version',$env:NASM_FALLBACK_VERSION,'-y','--no-progress')
+              } else {
+                $cargs = @('install','nasm','-y','--no-progress')
+              }
+              Write-Host "choco $($cargs -join ' ') (attempt $attempt/3)"
+              & choco @cargs
+              $nasm = Find-Nasm
+              if ($nasm) { break }
+              if ($attempt -lt 3) {
+                Write-Host "Chocolatey install failed; retrying in ${delay}s..."
+                Start-Sleep -Seconds $delay
+                $delay = $delay * 2
+              }
+            }
+          }
+
+          if (-not $nasm) {
+            Write-Error "NASM unavailable after every strategy (preinstalled / choco). nasm.us ships no checksum for its Windows builds, so there is no verified direct-download fallback."
+          }
+
+          # Publish on PATH so the FFmpeg step (and the MSYS2 bash it
+          # spawns with MSYS2_PATH_TYPE=inherit) can find nasm.
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path -Parent $nasm) -Encoding utf8
+          Write-Host "nasm: $nasm"
+          & $nasm -v
+          Write-Host ""
+
       - name: Build slim FFmpeg (on cache miss)
         if: needs.DetectChanges.outputs.docs_only != 'true' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          choco install nasm -y --no-progress
-          $env:PATH = "C:\Program Files\NASM;$env:PATH"
           # GNU make for FFmpeg's build system (MSYS2 is preinstalled at C:\msys64).
           C:\msys64\usr\bin\bash.exe -lc "pacman -Sy --noconfirm --needed make diffutils"
           # FFmpeg source at the pinned commit (GitHub allows fetch-by-sha).
