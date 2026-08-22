@@ -25,10 +25,12 @@ import android.app.NativeActivity
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.Point
 import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.Choreographer
 import android.view.MotionEvent
 import android.widget.Toast
 
@@ -79,6 +81,66 @@ class MainActivity : NativeActivity() {
     // Picker dismissed without a selection — native resumes the previous asset
     // (it blanks the scene while a pick is pending to avoid a stale-frame flash).
     private external fun nativePickCancelled()
+
+    // This window's live on-screen rect + the panel extent in the SAME rotation
+    // (XR_DXR_android_surface_binding / ADR-036 D6). The runtime anchors the
+    // weave's interlace phase and the per-window Kooima frustum to it.
+    private external fun nativeSetWindowRect(
+        x: Int,
+        y: Int,
+        w: Int,
+        h: Int,
+        panelW: Int,
+        panelH: Int,
+        displayId: Int,
+    )
+
+    // ---------------------------------------------------------------- window rect
+    //
+    // Choreographer rather than a layout / position listener, because a pure
+    // window MOVE produces neither: WindowFrames.didFrameSizeChange compares w/h
+    // only, so the move goes out as a `oneway IWindow.moved` that updates
+    // mAttachInfo.mWindowLeft/Top and nothing else — no layout, no invalidate, no
+    // callback. Cost is one getLocationOnScreen per frame plus seven int compares;
+    // the native push only happens on an actual change.
+    //
+    // TRAP: an OEM applying OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS makes
+    // getLocationOnScreen return WINDOW-relative coords — every window would report
+    // (0,0), silently. The opt-out is the
+    // PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS property in our manifest.
+    private val locationOnScreen = IntArray(2)
+    private var lastRect = intArrayOf(Int.MIN_VALUE, Int.MIN_VALUE, -1, -1, -1, -1, -1)
+    private var rectPollRunning = false
+
+    private val rectCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (!rectPollRunning) return
+            sampleWindowRect()
+            Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
+
+    private fun sampleWindowRect() {
+        val view = window?.decorView ?: return
+        val w = view.width
+        val h = view.height
+        if (w <= 0 || h <= 0) return // not laid out yet
+        view.getLocationOnScreen(locationOnScreen)
+        val display = view.display ?: return
+        val real = Point()
+        @Suppress("DEPRECATION")
+        display.getRealSize(real) // the raw panel extent, not the app bounds
+        val next = intArrayOf(
+            locationOnScreen[0], locationOnScreen[1], w, h, real.x, real.y, display.displayId,
+        )
+        if (next.contentEquals(lastRect)) return
+        lastRect = next
+        try {
+            nativeSetWindowRect(next[0], next[1], next[2], next[3], next[4], next[5], next[6])
+        } catch (_: Throwable) {
+            // Native lib not bound yet — the next frame retries.
+        }
+    }
 
 
     // First installed runtime package, preferring out_of_process. Null if none.
@@ -270,6 +332,21 @@ class MainActivity : NativeActivity() {
     override fun onResume() {
         super.onResume()
         pushRotation()
+        if (!rectPollRunning) {
+            // Forget the last sample so the first frame after a resume always
+            // re-pushes: the surface was destroyed and rebuilt underneath us and
+            // the runtime has to be told the rect again, even when it is
+            // byte-identical to the one before we went away.
+            lastRect = intArrayOf(Int.MIN_VALUE, Int.MIN_VALUE, -1, -1, -1, -1, -1)
+            rectPollRunning = true
+            Choreographer.getInstance().postFrameCallback(rectCallback)
+        }
+    }
+
+    override fun onPause() {
+        rectPollRunning = false
+        Choreographer.getInstance().removeFrameCallback(rectCallback)
+        super.onPause()
     }
 
     override fun onDestroy() {

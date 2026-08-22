@@ -75,6 +75,20 @@
             configChanges keeps the NativeActivity alive across rotations (the
             surface resizes instead of the activity recreating).
         -->
+        <!--
+            ADR-036 D6 / XR_DXR_android_surface_binding: this app owns the Surface
+            the runtime weaves into and publishes its on-screen origin
+            (View.getLocationOnScreen) every frame, so the weave's interlace phase
+            is anchored where the window physically sits on the panel. An OEM that
+            applies the OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS compat change makes that
+            call return WINDOW-relative coordinates — every window would report
+            (0,0) and weave at the wrong phase, with no error anywhere. Opting out
+            is per-APP, so it has to live here, not in the runtime's manifest.
+        -->
+        <property
+            android:name="android.window.PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS"
+            android:value="false" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
