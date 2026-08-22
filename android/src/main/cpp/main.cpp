@@ -28,6 +28,19 @@
 #include <openxr/XR_DXR_display_info.h>  // display rendering-mode enumerate/request
 #include <openxr/XR_DXR_view_rig.h>      // minimal display rig (OOP valid-views contingency)
 
+// XR_DXR_android_surface_binding (runtime#1037, ADR-036 D2/D6). When the runtime
+// advertises it we hand it THIS activity's own ANativeWindow at xrCreateSession
+// and republish it across every surface destroy/recreate, so the runtime never
+// spawns a SurfaceView of its own. That is what makes background -> resume
+// survivable: the runtime-spawned SurfaceView republish path double-releases the
+// published ANativeWindow and SIGSEGVs in android_globals_set_window
+// (displayxr-runtime#1146) — which is why opening an asset "failed" here, the
+// SAF picker being the only thing that backgrounds this activity (#50).
+#if __has_include(<openxr/XR_DXR_android_surface_binding.h>)
+#define MP_HAVE_ANDROID_SURFACE_BINDING 1
+#include <openxr/XR_DXR_android_surface_binding.h>
+#endif
+
 #include <atomic>
 #include <vector>
 #include <chrono>
@@ -233,6 +246,33 @@ std::atomic<int> g_pick_fd{-1};
 std::atomic<long long> g_pick_off{0};
 std::atomic<long long> g_pick_len{0};
 
+#ifdef MP_HAVE_ANDROID_SURFACE_BINDING
+// ── App-owned Surface (XR_DXR_android_surface_binding) ────────────────────
+// Enabled when the runtime advertises the extension AND the kill-switch is not
+// set: `adb shell setprop debug.dxr.mp.surface_binding 0` restores the legacy
+// runtime-spawned-SurfaceView path without a rebuild (read once, latched).
+bool g_has_surface_binding = false;
+PFN_xrSetAndroidSurfaceDXR g_pfnSetAndroidSurface = nullptr;
+PFN_xrSetAndroidWindowGeometryDXR g_pfnSetAndroidWindowGeometry = nullptr;
+// The window this app currently owns: published by the android_main thread on
+// APP_CMD_INIT_WINDOW / APP_CMD_TERM_WINDOW, read by create_session.
+std::atomic<ANativeWindow *> g_app_window{nullptr};
+
+// Live window geometry, sampled on the UI thread by MainActivity's Choreographer
+// callback (Android reports a pure window MOVE to nobody else) and consumed once
+// per frame by the render loop. One seq-guarded snapshot so the reader never
+// mixes halves of two samples.
+struct WindowRectSample
+{
+	int32_t x = 0, y = 0;
+	int32_t w = 0, h = 0;
+	int32_t panel_w = 0, panel_h = 0;
+	int32_t display_id = 0;
+};
+std::atomic<uint64_t> g_win_rect_seq{0};  // bumped by the UI thread on any change
+WindowRectSample g_win_rect;              // guarded by the seq above (single writer)
+#endif
+
 std::atomic<int> g_display_rotation{0};
 // True held orientation, from the Android window dims (not the device-dependent
 // rotation parity). Drives the per-eye tile dims in active_tile_dims.
@@ -337,8 +377,16 @@ create_instance(struct android_app *app)
 {
 	g_runtime_unavailable.store(false, std::memory_order_relaxed);
 	g_view_rig_enabled = false;  // re-evaluated below (rebuilds reuse these globals)
+#ifdef MP_HAVE_ANDROID_SURFACE_BINDING
+	// A rebuild (xrDestroyInstance → xrCreateInstance) invalidates these; they are
+	// re-resolved in create_session. g_app_window is NOT cleared — the window is
+	// ours and survives the XR teardown.
+	g_has_surface_binding = false;
+	g_pfnSetAndroidSurface = nullptr;
+	g_pfnSetAndroidWindowGeometry = nullptr;
+#endif
 	g_has_display_info = true;   // XR_DXR_display_info is always enabled (below)
-	const char *extensions[4] = {
+	const char *extensions[5] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
 	    XR_DXR_DISPLAY_INFO_EXTENSION_NAME,  // display info + rendering-mode atlas layout
@@ -347,6 +395,9 @@ create_instance(struct android_app *app)
 
 	// Enable XR_DXR_view_rig when the runtime advertises it (see the rig
 	// globals above) — enabling is harmless; chaining stays off until needed.
+	// XR_DXR_android_surface_binding likewise: enabled when advertised, so this
+	// app owns the Surface the runtime weaves into (#50).
+	bool surface_binding_advertised = false;
 	uint32_t n = 0;
 	if (xrEnumerateInstanceExtensionProperties(nullptr, 0, &n, nullptr) == XR_SUCCESS && n > 0) {
 		std::vector<XrExtensionProperties> props(n);
@@ -359,12 +410,32 @@ create_instance(struct android_app *app)
 				if (std::strcmp(props[i].extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
 					extensions[extension_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
 					g_view_rig_enabled = true;
-					break;
+#ifdef MP_HAVE_ANDROID_SURFACE_BINDING
+				} else if (std::strcmp(props[i].extensionName,
+				                       XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME) == 0) {
+					surface_binding_advertised = true;
+#endif
 				}
 			}
 		}
 	}
 	LOGI("XR_DXR_view_rig %s", g_view_rig_enabled ? "advertised -> enabled" : "not advertised");
+#ifdef MP_HAVE_ANDROID_SURFACE_BINDING
+	// Kill-switch: debug.dxr.mp.surface_binding=0 forces the legacy
+	// runtime-spawned-SurfaceView path (no rebuild needed).
+	char sb_prop[PROP_VALUE_MAX] = {};
+	const bool sb_allowed =
+	    !(__system_property_get("debug.dxr.mp.surface_binding", sb_prop) > 0 && sb_prop[0] == '0');
+	g_has_surface_binding = surface_binding_advertised && sb_allowed;
+	if (g_has_surface_binding) {
+		extensions[extension_count++] = XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME;
+	}
+	LOGI("XR_DXR_android_surface_binding advertised=%s allowed=%s -> %s",
+	     surface_binding_advertised ? "yes" : "no", sb_allowed ? "yes" : "no",
+	     g_has_surface_binding ? "app-owned surface" : "runtime-spawned SurfaceView");
+#else
+	(void)surface_binding_advertised;
+#endif
 
 	XrInstanceCreateInfoAndroidKHR android_info = {};
 	android_info.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR;
@@ -605,10 +676,95 @@ create_session()
 	ci.type = XR_TYPE_SESSION_CREATE_INFO;
 	ci.next = &binding;
 	ci.systemId = g_system_id;
+
+#ifdef MP_HAVE_ANDROID_SURFACE_BINDING
+	// Hand the runtime OUR window; it takes its own ANativeWindow reference and
+	// we keep owning the Surface. The graphics binding stays in the chain behind
+	// this struct.
+	XrAndroidSurfaceBindingCreateInfoDXR surface_binding = {};
+	if (g_has_surface_binding) {
+		ANativeWindow *win = g_app_window.load(std::memory_order_acquire);
+		surface_binding.type = XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR;
+		surface_binding.next = &binding;
+		surface_binding.nativeWindow = win;
+		// Seed only — MainActivity's Choreographer poll takes over immediately
+		// via xrSetAndroidWindowGeometryDXR.
+		surface_binding.screenOffsetX = g_win_rect.x;
+		surface_binding.screenOffsetY = g_win_rect.y;
+		surface_binding.transparentBackgroundEnabled = XR_FALSE;
+		ci.next = &surface_binding;
+		LOGI("xrCreateSession: chaining XR_DXR_android_surface_binding (window=%p offset=%d,%d)",
+		     (void *)win, (int)g_win_rect.x, (int)g_win_rect.y);
+	}
+#endif
+
 	XrResult res = xrCreateSession(g_instance, &ci, &g_session);
 	log_xr_result("xrCreateSession", res);
+
+#ifdef MP_HAVE_ANDROID_SURFACE_BINDING
+	if (res == XR_SUCCESS && g_has_surface_binding) {
+		xrGetInstanceProcAddr(g_instance, "xrSetAndroidSurfaceDXR",
+		                      (PFN_xrVoidFunction *)&g_pfnSetAndroidSurface);
+		xrGetInstanceProcAddr(g_instance, "xrSetAndroidWindowGeometryDXR",
+		                      (PFN_xrVoidFunction *)&g_pfnSetAndroidWindowGeometry);
+		LOGI("surface-binding entry points: set_surface=%p set_geometry=%p",
+		     (void *)g_pfnSetAndroidSurface, (void *)g_pfnSetAndroidWindowGeometry);
+	}
+#endif
 	return res == XR_SUCCESS;
 }
+
+#ifdef MP_HAVE_ANDROID_SURFACE_BINDING
+// Republish (win != nullptr) or drop (nullptr) our Surface. Called from the
+// android_main thread on APP_CMD_INIT_WINDOW / APP_CMD_TERM_WINDOW, which is
+// exactly where native_app_glue learns of surfaceCreated / surfaceDestroyed.
+void
+publish_app_surface(ANativeWindow *win)
+{
+	g_app_window.store(win, std::memory_order_release);
+	if (g_pfnSetAndroidSurface == nullptr || g_session == XR_NULL_HANDLE) {
+		return;  // pre-session: create_session picks the window up from g_app_window
+	}
+	XrAndroidSurfaceBindingCreateInfoDXR b = {};
+	b.type = XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR;
+	b.nativeWindow = win;
+	b.screenOffsetX = g_win_rect.x;
+	b.screenOffsetY = g_win_rect.y;
+	XrResult res = g_pfnSetAndroidSurface(g_session, win != nullptr ? &b : nullptr);
+	LOGI("xrSetAndroidSurfaceDXR(%p) -> %d", (void *)win, (int)res);
+}
+
+// Push the latest UI-thread window-rect sample to the runtime, once per frame
+// and only when it actually changed — the runtime needs it for BOTH the vendor
+// weave phase and the per-window Kooima canvas, and a pure window MOVE is
+// reported to nobody but this app (ADR-036 D6).
+void
+push_window_geometry()
+{
+	if (g_pfnSetAndroidWindowGeometry == nullptr || g_session == XR_NULL_HANDLE) {
+		return;
+	}
+	static uint64_t last_seq = 0;
+	const uint64_t seq = g_win_rect_seq.load(std::memory_order_acquire);
+	if (seq == last_seq || seq == 0) {
+		return;
+	}
+	last_seq = seq;
+	const WindowRectSample r = g_win_rect;
+	if (r.w <= 0 || r.h <= 0) {
+		return;
+	}
+	XrAndroidWindowGeometryDXR g = {};
+	g.type = XR_TYPE_ANDROID_WINDOW_GEOMETRY_DXR;
+	g.windowRect = XrRect2Di{{r.x, r.y}, {r.w, r.h}};
+	g.panelExtent = XrExtent2Di{r.panel_w, r.panel_h};
+	g.displayId = r.display_id;
+	const XrResult res = g_pfnSetAndroidWindowGeometry(g_session, &g);
+	// Lifecycle only (the rect actually changed), never every frame.
+	LOGI("window screen rect: %d,%d %dx%d panel %dx%d display %d -> %d", r.x, r.y, r.w, r.h,
+	     r.panel_w, r.panel_h, r.display_id, (int)res);
+}
+#endif
 
 // Query native panel pixels (XR_DXR_display_info) + the active rendering mode's
 // tile layout / view scale / view count, and the max view count the runtime
@@ -1425,6 +1581,22 @@ handle_cmd(struct android_app *app, int32_t cmd)
 		// flight) — NOT from this event, whose timing races the off-thread
 		// teardown completing. Just log that the window is available.
 		LOGI("APP_CMD_INIT_WINDOW (window=%p)", app->window);
+#ifdef MP_HAVE_ANDROID_SURFACE_BINDING
+		// Publish OUR window (#1037): before the bring-up on first launch
+		// (create_session reads g_app_window), and on every resume after it,
+		// where it goes out as xrSetAndroidSurfaceDXR so the runtime rebuilds
+		// its VkSurfaceKHR and the display processor resumes.
+		publish_app_surface(app->window);
+#endif
+		break;
+	case APP_CMD_TERM_WINDOW:
+		LOGI("APP_CMD_TERM_WINDOW");
+#ifdef MP_HAVE_ANDROID_SURFACE_BINDING
+		// Surface lost (backgrounded — e.g. the SAF picker covering us). Tell the
+		// runtime BEFORE native_app_glue frees it, so nothing presents into a dead
+		// window and the DP pauses instead of holding the panel.
+		publish_app_surface(nullptr);
+#endif
 		break;
 	case APP_CMD_DESTROY:
 		LOGI("APP_CMD_DESTROY");
@@ -1445,6 +1617,30 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeSetRotation(
 	g_display_rotation.store(rotation & 3, std::memory_order_relaxed);
 	g_portrait.store(portrait != JNI_FALSE, std::memory_order_relaxed);
 }
+
+#ifdef MP_HAVE_ANDROID_SURFACE_BINDING
+// MainActivity's Choreographer poll (ADR-036 D6). Android reports a pure window
+// MOVE to nobody: WindowFrames.didFrameSizeChange compares w/h only, so the move
+// goes out as a oneway IWindow.moved with no layout, no invalidate and no
+// callback, while SurfaceFlinger has already repositioned the layer with the OLD
+// buffer. Sampling getLocationOnScreen() per frame is the only way to see it.
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeSetWindowRect(
+    JNIEnv * /*env*/, jobject /*thiz*/, jint x, jint y, jint w, jint h, jint panelW, jint panelH,
+    jint displayId)
+{
+	// Single writer (the UI thread); the render thread reads after observing the
+	// sequence bump, which release-orders these stores.
+	g_win_rect.x = (int32_t)x;
+	g_win_rect.y = (int32_t)y;
+	g_win_rect.w = (int32_t)w;
+	g_win_rect.h = (int32_t)h;
+	g_win_rect.panel_w = (int32_t)panelW;
+	g_win_rect.panel_h = (int32_t)panelH;
+	g_win_rect.display_id = (int32_t)displayId;
+	g_win_rect_seq.fetch_add(1, std::memory_order_release);
+}
+#endif
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeRuntimeUnavailable(
@@ -1562,9 +1758,12 @@ android_main(struct android_app *app)
 {
 	LOGI("mediaplayer_vk_android: android_main entered");
 	app->onAppCmd = handle_cmd;
-	// Touch is NOT consumed via app->onInputEvent: the runtime's MonadoView
-	// overlay covers our window, so a NativeActivity never sees native input.
-	// Gestures arrive via MainActivity.dispatchTouchEvent → nativeTouch JNI.
+	// Touch is NOT consumed via app->onInputEvent: on the legacy path the
+	// runtime's MonadoView overlay covers our window, so a NativeActivity never
+	// sees native input. Gestures arrive via MainActivity.dispatchTouchEvent
+	// → nativeTouch JNI, which works on BOTH paths (it is the Activity's own
+	// dispatch entry point), so the app-owned-surface migration leaves input
+	// untouched.
 
 	if (!initialize_loader(app)) {
 		LOGE("OpenXR loader init failed");
@@ -1648,6 +1847,9 @@ android_main(struct android_app *app)
 			// xrBeginFrame, so gating on SYNCHRONIZED+ deadlocks at READY ->
 			// black (David's #507). render_frame honors shouldRender.
 			if (app->window != nullptr && g_session_running) {
+#ifdef MP_HAVE_ANDROID_SURFACE_BINDING
+				push_window_geometry();  // de-duplicated; a no-op unless it moved
+#endif
 				render_frame();
 			}
 		}
