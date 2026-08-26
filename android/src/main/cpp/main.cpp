@@ -66,6 +66,7 @@
 #include "video_stereo_probe_android.h"
 
 #include <mutex>
+#include <strings.h>
 
 #define LOG_TAG "mediaplayer_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -1681,8 +1682,23 @@ bring_up(struct android_app *app)
 	// thread, which reads the clock). g_audio is silent if the clip has no audio
 	// track; clockSeconds() then stays -1 and the video paces on its wall clock.
 	g_video.setMasterClock(AudioPlayer::clockThunk, &g_audio);
+	// The hook accepts images too (JPEG/PNG by extension), so the image
+	// resolution path can be exercised without the SAF picker.
+	auto dbg_is_image = [](const char *f) {
+		const size_t n = std::strlen(f);
+		auto ends = [&](const char *ext) {
+			const size_t e = std::strlen(ext);
+			return n >= e && strcasecmp(f + n - e, ext) == 0;
+		};
+		return ends(".jpg") || ends(".jpeg") || ends(".png");
+	};
 	if (__system_property_get("debug.dxr.mp.file", dbgFile) > 0 && dbgFile[0] != '\0' &&
-	    g_video.openPath(dbgFile)) {
+	    dbg_is_image(dbgFile)) {
+		if (load_image_file(dbgFile, dbgFile)) {
+			g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
+			LOGI("DEBUG auto-load (image): %s", dbgFile);
+		}
+	} else if (dbgFile[0] != '\0' && g_video.openPath(dbgFile)) {
 		g_audio.openPath(dbgFile);  // own fd; no-op if no audio track
 		g_is_video = true;
 		apply_layout(resolve_video_layout(dbgFile, g_video.width(), g_video.height(), -1, 0, 0, dbgFile)
