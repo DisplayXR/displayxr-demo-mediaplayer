@@ -125,6 +125,7 @@ private:
 	// value would shift A/V alignment, which is not this fix's business.
 	int64_t audioOffsetUs_ = 0;
 	bool audioOffsetValid_ = false;
+	int64_t lastAudioUs_ = -1;  // to spot the audio track looping independently
 	// Whether the PTS we handed to releaseOutputBufferAtTime actually came back
 	// through the BufferQueue. If a vendor queue overrode it we must NOT select
 	// against the nonsense value -- that would stall the picture silently.
@@ -137,6 +138,7 @@ private:
 	int64_t xrEpochOffsetNs_ = 0;
 	bool xrEpochCalibrated_ = false;
 	bool legacyPacing_ = false;  // MEDIAPLAYER_LEGACY_PACING / debug.dxr.mp.legacy_pacing
+	bool diag_ = false;          // MEDIAPLAYER_PACING_DIAG / debug.dxr.mp.diag
 
 	// media time at monoNs; caller holds clockMx_.
 	int64_t mediaUsLocked(int64_t monoNs) const;

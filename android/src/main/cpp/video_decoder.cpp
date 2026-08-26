@@ -51,6 +51,15 @@ constexpr int64_t kLookaheadUs = 50'000;
 constexpr int64_t kResyncUs = 200'000;
 constexpr int64_t kSlewUs = 1'000;
 
+// A frame legitimately sits at most kLookaheadUs ahead of the clock. Further
+// ahead than this and the clock and the stream disagree about where we are --
+// which happened for real: audio and video loop at EOS independently, so an
+// audio offset captured across a loop boundary is a whole clip-length wrong,
+// and the resync below then parked the media clock 100 s in the past and
+// nothing was ever due again. Re-anchor to the frame in hand instead: a
+// disagreement must cost one hiccup, never a frozen picture.
+constexpr int64_t kMaxAheadUs = 1'000'000;
+
 int64_t
 nowMonoNs()
 {
@@ -59,14 +68,13 @@ nowMonoNs()
 	return (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
 }
 
-// Kill switch for the display-locked pacing (#54): restores the pre-fix
-// sleep-in-the-decode-thread path. Env first (dev), then the Android property.
+// Env first (dev), then the Android property.
 bool
-legacyPacingRequested()
+switchOn(const char *env, const char *prop)
 {
-	if (const char *e = std::getenv("MEDIAPLAYER_LEGACY_PACING")) return *e && *e != '0';
+	if (const char *e = std::getenv(env)) return *e && *e != '0';
 	char sp[PROP_VALUE_MAX] = {};
-	if (__system_property_get("debug.dxr.mp.legacy_pacing", sp) > 0) return sp[0] && sp[0] != '0';
+	if (__system_property_get(prop, sp) > 0) return sp[0] && sp[0] != '0';
 	return false;
 }
 
@@ -175,12 +183,17 @@ VideoDecoder::start()
 		LOGE("AMediaCodec_start failed");
 		return false;
 	}
-	legacyPacing_ = legacyPacingRequested();
+	// Kill switch for the display-locked pacing (#54): restores the pre-fix
+	// sleep-in-the-decode-thread path. diag_ adds a 1 Hz view of both clocks --
+	// bring-up only, too chatty to leave on in a shipping build.
+	legacyPacing_ = switchOn("MEDIAPLAYER_LEGACY_PACING", "debug.dxr.mp.legacy_pacing");
+	diag_ = switchOn("MEDIAPLAYER_PACING_DIAG", "debug.dxr.mp.diag");
 	{
 		std::lock_guard<std::mutex> lk(clockMx_);
 		anchorMonoNs_ = -1;
 		anchorMediaUs_ = 0;
 	}
+	lastAudioUs_ = -1;
 	droppedLate_.store(0, std::memory_order_relaxed);
 	releasedFrames_.store(0, std::memory_order_relaxed);
 	shownFrames_.store(0, std::memory_order_relaxed);
@@ -239,6 +252,7 @@ VideoDecoder::decodeLoop()
 				anchorMonoNs_ = -1;
 				anchorMediaUs_ = sk;
 				audioOffsetValid_ = false;
+				lastAudioUs_ = -1;
 			}
 			decodeOneWhilePaused = paused_.load(std::memory_order_relaxed);
 		}
@@ -405,6 +419,14 @@ VideoDecoder::slewToAudio()
 	std::lock_guard<std::mutex> lk(clockMx_);
 	if (anchorMonoNs_ < 0) return;
 
+	// The audio track loops on its own schedule, so the clock can step backwards
+	// or jump. An offset captured across that boundary is a clip-length wrong:
+	// throw it away and recapture rather than dragging the video clock with it.
+	if (lastAudioUs_ >= 0 && (audioUs < lastAudioUs_ || audioUs - lastAudioUs_ > 1'000'000)) {
+		audioOffsetValid_ = false;
+	}
+	lastAudioUs_ = audioUs;
+
 	if (!audioOffsetValid_) {
 		// Capture (and thereafter preserve) whatever A/V alignment the stream
 		// started with, rather than snapping video onto the leading audio clock.
@@ -414,7 +436,10 @@ VideoDecoder::slewToAudio()
 	}
 	const int64_t driftUs = (audioUs - audioOffsetUs_) - mediaUsLocked(mono);
 	if (driftUs > kResyncUs || driftUs < -kResyncUs) {
-		anchorMediaUs_ = audioUs - audioOffsetUs_;  // discontinuity: snap
+		int64_t snapUs = audioUs - audioOffsetUs_;  // discontinuity: snap
+		if (snapUs < 0) snapUs = 0;                 // never outside the media
+		if (durationUs_ > 0 && snapUs > durationUs_) snapUs = durationUs_;
+		anchorMediaUs_ = snapUs;
 		anchorMonoNs_ = mono;
 	} else {
 		anchorMediaUs_ += std::clamp<int64_t>(driftUs / 8, -kSlewUs, kSlewUs);
@@ -492,7 +517,7 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 
 	// 1 Hz view of the two clocks and both ends of the queue -- the numbers that
 	// say WHY a frame is or is not being shown.
-	{
+	if (diag_) {
 		static int64_t s_lastDiagNs = 0;
 		if (mono - s_lastDiagNs > 1'000'000'000LL) {
 			s_lastDiagNs = mono;
@@ -540,6 +565,23 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 					selecting = true;
 					due = (tsNs / 1000) <= targetUs;
 				}
+			}
+		}
+		if (!due && selecting) {
+			int64_t tsNs = 0;
+			if (AImage_getTimestamp(pendingImage_, &tsNs) == AMEDIA_OK &&
+			    tsNs / 1000 - targetUs > kMaxAheadUs) {
+				// Further ahead than any legitimate lookahead: the clock is
+				// wrong, not the frame. Re-anchor onto it and show it.
+				LOGE("#54: frame %lld us is %lld ms beyond the clock (%lld us) — "
+				     "re-anchoring; audio and video most likely looped apart",
+				     (long long)(tsNs / 1000),
+				     (long long)((tsNs / 1000 - targetUs) / 1000), (long long)targetUs);
+				std::lock_guard<std::mutex> lk(clockMx_);
+				anchorMediaUs_ = tsNs / 1000;
+				anchorMonoNs_ = targetMonoNs;
+				audioOffsetValid_ = false;
+				due = true;
 			}
 		}
 		if (!due) break;  // not due yet — keep it for a later display time
