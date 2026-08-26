@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -38,7 +39,9 @@ struct VideoDecoder {
 	int height() const { return height_; }
 
 	// ── Transport (thread-safe; the decode thread applies them). ──
-	void togglePaused() { paused_.store(!paused_.load(std::memory_order_relaxed)); }
+	// Freezes/resumes the presentation clock as well as the decode thread, so a
+	// pause does not leave the media clock running ahead of the picture.
+	void togglePaused();
 	bool paused() const { return paused_.load(std::memory_order_relaxed); }
 	double positionSeconds() const { return positionUs_.load(std::memory_order_relaxed) / 1e6; }
 	double durationSeconds() const { return durationUs_ / 1e6; }
@@ -58,6 +61,25 @@ struct VideoDecoder {
 	// takes its own AHardwareBuffer_acquire() on import, so it stays valid even
 	// across the hand-off. Outputs the frame dims when non-null.
 	AHardwareBuffer *acquireLatestBuffer(int *width, int *height);
+
+	// RENDER-THREAD, display-locked path (#54). Given the display time the caller
+	// is about to submit for (XrFrameState::predictedDisplayTime, monotonic ns),
+	// return the newest decoded frame whose PTS is due at that instant, or
+	// nullptr if the frame already on screen is still the right one. Frames that
+	// fell behind are dropped here rather than shown late, and frames that are
+	// not due yet are held back -- so which video frame lands on which vsync is
+	// decided against the real display timeline instead of a sleep in the decode
+	// thread. Requires the decoder to have been fed by the non-legacy path (the
+	// PTS rides on the buffer via AMediaCodec_releaseOutputBufferAtTime).
+	AHardwareBuffer *acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int *height);
+
+	// Frames dropped because they were already past due when the render thread
+	// looked (cumulative). A healthy stream holds this at 0.
+	uint32_t droppedLate() const { return droppedLate_.load(std::memory_order_relaxed); }
+
+	// True when the pre-fix sleep-in-the-decode-thread pacing is in force; the
+	// render thread must then use acquireLatestBuffer() (no PTS on the buffers).
+	bool legacyPacing() const { return legacyPacing_; }
 
 private:
 	bool start();
@@ -81,5 +103,39 @@ private:
 	int width_ = 0;
 	int height_ = 0;
 
-	AImage *heldImage_ = nullptr;  // most-recently-acquired image (kept alive until next acquire)
+	AImage *heldImage_ = nullptr;     // most-recently-acquired image (kept alive until next acquire)
+	AImage *pendingImage_ = nullptr;  // acquired but not yet due (held for a later display time)
+
+	// ── Presentation clock (#54) ──
+	// media_us(mono_ns) = anchorMediaUs_ + (mono_ns - anchorMonoNs_) / 1000.
+	// Anchored on the first frame after open/seek/loop and thereafter slewed
+	// gently toward the audio clock, so A/V stays locked without the audio
+	// clock's ~one-AAC-frame staircase reaching the video cadence.
+	// anchorMonoNs_ < 0 means the clock is unset (pre-roll) or frozen (paused);
+	// in both cases the consumer takes whatever is queued.
+	mutable std::mutex clockMx_;
+	int64_t anchorMonoNs_ = -1;
+	int64_t anchorMediaUs_ = 0;
+	std::atomic<uint32_t> droppedLate_{0};
+	// The audio clock is the PTS just WRITTEN into AAudio, so it leads audible
+	// playback by the stream's buffer depth. We slew to kill drift only, against
+	// the offset captured at anchor time -- imposing the audio clock's absolute
+	// value would shift A/V alignment, which is not this fix's business.
+	int64_t audioOffsetUs_ = 0;
+	bool audioOffsetValid_ = false;
+	// Whether the PTS we handed to releaseOutputBufferAtTime actually came back
+	// through the BufferQueue. If a vendor queue overrode it we must NOT select
+	// against the nonsense value -- that would stall the picture silently.
+	bool ptsSelectable_ = true;
+	bool ptsChecked_ = false;
+	bool legacyPacing_ = false;  // MEDIAPLAYER_LEGACY_PACING / debug.dxr.mp.legacy_pacing
+
+	// media time at monoNs; caller holds clockMx_.
+	int64_t mediaUsLocked(int64_t monoNs) const;
+	// DECODE-THREAD: nudge the presentation clock so it cannot drift away from
+	// the audio clock. No-op without audio or before the clock is anchored.
+	void slewToAudio();
+	// RENDER-THREAD: first-frame check that the buffer timestamp is our media
+	// PTS and not something the BufferQueue substituted; clears ptsSelectable_.
+	void validatePtsOnce(int64_t tsNs);
 };

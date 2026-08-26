@@ -5,6 +5,7 @@
 
 #include <android/hardware_buffer.h>
 #include <android/log.h>
+#include <media/NdkImage.h>
 #include <media/NdkImageReader.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaExtractor.h>
@@ -12,10 +13,14 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
+#include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 #define LOG_TAG "mediaplayer_vk_android"
@@ -26,6 +31,39 @@ namespace {
 // AImageReader buffer pool depth: enough for the codec to decode ahead, plus
 // the one the render thread holds + the one Vulkan still references on import.
 constexpr int32_t kReaderMaxImages = 6;
+
+// How far ahead of the presentation clock the decode thread is allowed to run.
+// This is the cushion that absorbs decode jitter: the render thread always has
+// a frame in hand for the display time it is about to submit for. Bounded so we
+// do not race through the file (AImageReader back-pressure bounds it in buffers
+// too, but only once the pool is full).
+constexpr int64_t kLookaheadUs = 120'000;
+
+// A/V slew. Beyond kResyncUs we assume a discontinuity (seek, loop, stall) and
+// re-anchor hard; below it we nudge the anchor by at most kSlewUs per frame so
+// the audio clock's ~one-AAC-frame staircase (21.3 ms @ 48 kHz, 23.2 ms @
+// 44.1 kHz) can never reach the video cadence.
+constexpr int64_t kResyncUs = 200'000;
+constexpr int64_t kSlewUs = 1'000;
+
+int64_t
+nowMonoNs()
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
+}
+
+// Kill switch for the display-locked pacing (#54): restores the pre-fix
+// sleep-in-the-decode-thread path. Env first (dev), then the Android property.
+bool
+legacyPacingRequested()
+{
+	if (const char *e = std::getenv("MEDIAPLAYER_LEGACY_PACING")) return *e && *e != '0';
+	char sp[PROP_VALUE_MAX] = {};
+	if (__system_property_get("debug.dxr.mp.legacy_pacing", sp) > 0) return sp[0] && sp[0] != '0';
+	return false;
+}
 
 int32_t
 fmtInt(AMediaFormat *f, const char *key, int32_t fallback)
@@ -132,7 +170,18 @@ VideoDecoder::start()
 		LOGE("AMediaCodec_start failed");
 		return false;
 	}
+	legacyPacing_ = legacyPacingRequested();
+	{
+		std::lock_guard<std::mutex> lk(clockMx_);
+		anchorMonoNs_ = -1;
+		anchorMediaUs_ = 0;
+	}
+	droppedLate_.store(0, std::memory_order_relaxed);
+	ptsSelectable_ = true;
+	ptsChecked_ = false;
 	LOGI("VideoDecoder open (zero-copy surface): %s %dx%d", mime, width_, height_);
+	LOGI("#54: frame pacing: %s (MEDIAPLAYER_LEGACY_PACING / debug.dxr.mp.legacy_pacing; 1 = pre-fix)",
+	     legacyPacing_ ? "LEGACY sleep-in-decode-thread" : "display-locked (predictedDisplayTime)");
 	open_.store(true, std::memory_order_relaxed);
 	stop_.store(false, std::memory_order_relaxed);
 	thread_ = std::thread([this] { decodeLoop(); });
@@ -177,6 +226,12 @@ VideoDecoder::decodeLoop()
 			sawInputEOS = false;
 			firstPtsUs = -1;
 			positionUs_.store(sk, std::memory_order_relaxed);
+			{  // the clock re-anchors on the first frame out of the flush
+				std::lock_guard<std::mutex> lk(clockMx_);
+				anchorMonoNs_ = -1;
+				anchorMediaUs_ = sk;
+				audioOffsetValid_ = false;
+			}
 			decodeOneWhilePaused = paused_.load(std::memory_order_relaxed);
 		}
 		// ── pause: hold the current frame (don't feed/drain) unless a seek just asked
@@ -209,7 +264,9 @@ VideoDecoder::decodeLoop()
 		AMediaCodecBufferInfo info;
 		ssize_t outIdx = AMediaCodec_dequeueOutputBuffer(codec_, &info, 2000);
 		if (outIdx >= 0) {
-			// Pace the frame BEFORE rendering it to the surface.
+			// LEGACY pacing (kill switch only — see the display-locked branch
+			// below, which is the default). Paces the frame BEFORE rendering it
+			// to the surface, from this thread:
 			//
 			// (1) WALL-CLOCK CEILING — runs ALWAYS. Caps playback at real time so a
 			//     racing/garbage audio master clock (unsupported audio codec that
@@ -218,7 +275,7 @@ VideoDecoder::decodeLoop()
 			// (2) AUDIO SYNC — only ever SLOWS video further: if the audio clock is
 			//     valid and BEHIND this frame, wait for it (lip-sync). It can never
 			//     push video past the wall-clock ceiling above.
-			if (!decodeOneWhilePaused) {
+			if (!decodeOneWhilePaused && legacyPacing_) {
 				if (firstPtsUs < 0) {
 					firstPtsUs = info.presentationTimeUs;
 					wallStart = clock::now();
@@ -244,22 +301,73 @@ VideoDecoder::decodeLoop()
 						std::this_thread::sleep_for(std::chrono::milliseconds(2));
 					}
 				}
+			} else if (!decodeOneWhilePaused) {
+				// ── Display-locked pacing (#54) ──
+				// This thread does NOT try to hit the frame's instant. Sleeping
+				// here to a free-running steady_clock and then releasing the
+				// buffer "now" is what caused the judder: the release lands on
+				// whichever side of a 16.67 ms vsync boundary scheduling jitter
+				// puts it, so 30 fps content on a 60 Hz panel alternates 1/2/3
+				// display periods per frame instead of a flat 2. Which frame is
+				// shown at which display time is now decided by the render
+				// thread in acquireFrameForDisplayTime(), against the display
+				// time the runtime actually predicted. All this thread does is
+				// anchor the clock, keep a bounded decode cushion, and slew.
+				if (firstPtsUs < 0) {
+					firstPtsUs = info.presentationTimeUs;
+					wallStart = clock::now();
+					std::lock_guard<std::mutex> lk(clockMx_);
+					anchorMediaUs_ = info.presentationTimeUs;
+					anchorMonoNs_ = nowMonoNs();
+					audioOffsetValid_ = false;
+				} else {
+					slewToAudio();
+				}
+				// Keep at most kLookaheadUs of decoded picture ahead of the
+				// clock. Short sleeps so a pause/seek/stop is still responsive.
+				for (int guard = 0; guard < 1000 && !stop_.load(std::memory_order_relaxed) &&
+				                    !paused_.load(std::memory_order_relaxed);
+				     ++guard) {
+					int64_t aheadUs = 0;
+					{
+						std::lock_guard<std::mutex> lk(clockMx_);
+						if (anchorMonoNs_ < 0) break;  // frozen: don't throttle
+						aheadUs = info.presentationTimeUs - mediaUsLocked(nowMonoNs());
+					}
+					if (aheadUs <= kLookaheadUs) break;
+					std::this_thread::sleep_for(std::chrono::microseconds(
+					    std::min<int64_t>(aheadUs - kLookaheadUs, 10'000)));
+				}
 			}
 			const bool eos = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
 			// render=true → present the frame into the reader's Surface (the
 			// AHardwareBuffer the render thread will sample). info.size is 0 in
 			// surface mode; an EOS buffer carries no image, so don't render it.
 			const bool render = info.size > 0 && !eos;
-			AMediaCodec_releaseOutputBuffer(codec_, outIdx, render);
+			if (render && !legacyPacing_) {
+				// The timestamp rides through the BufferQueue to
+				// AImage_getTimestamp(), which is how the render thread knows
+				// each frame's PTS. (For an AImageReader consumer this does not
+				// defer delivery the way a SurfaceFlinger latch would -- it is
+				// purely the carrier. Delivery timing is the consumer's job.)
+				AMediaCodec_releaseOutputBufferAtTime(codec_, outIdx,
+				                                     info.presentationTimeUs * 1000);
+			} else {
+				AMediaCodec_releaseOutputBuffer(codec_, outIdx, render);
+			}
 			if (render) {
-				positionUs_.store(info.presentationTimeUs, std::memory_order_relaxed);
+				// Legacy pacing presents from this thread, so this IS the shown
+				// frame. Display-locked pacing runs a cushion ahead, so there the
+				// position is published by the consumer instead.
+				if (legacyPacing_)
+					positionUs_.store(info.presentationTimeUs, std::memory_order_relaxed);
 				decodeOneWhilePaused = false;  // shown the post-seek frame; hold again
 			}
 			if (eos) {  // loop: seek back + flush, restart the clock
 				AMediaExtractor_seekTo(ex_, 0, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
 				AMediaCodec_flush(codec_);
 				sawInputEOS = false;
-				firstPtsUs = -1;
+				firstPtsUs = -1;  // re-anchors the presentation clock
 			}
 		} else if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
 			if (outFmt_) AMediaFormat_delete(outFmt_);
@@ -267,6 +375,163 @@ VideoDecoder::decodeLoop()
 			LOGI("output format changed: %s", AMediaFormat_toString(outFmt_));
 		}
 	}
+}
+
+int64_t
+VideoDecoder::mediaUsLocked(int64_t monoNs) const
+{
+	if (anchorMonoNs_ < 0) return anchorMediaUs_;  // unset/frozen: clock stands still
+	return anchorMediaUs_ + (monoNs - anchorMonoNs_) / 1000;
+}
+
+void
+VideoDecoder::slewToAudio()
+{
+	if (masterClock_ == nullptr) return;
+	const double audioSec = masterClock_(masterCtx_);
+	if (audioSec < 0.0) return;
+
+	const int64_t audioUs = (int64_t)(audioSec * 1e6);
+	const int64_t mono = nowMonoNs();
+	std::lock_guard<std::mutex> lk(clockMx_);
+	if (anchorMonoNs_ < 0) return;
+
+	if (!audioOffsetValid_) {
+		// Capture (and thereafter preserve) whatever A/V alignment the stream
+		// started with, rather than snapping video onto the leading audio clock.
+		audioOffsetUs_ = audioUs - mediaUsLocked(mono);
+		audioOffsetValid_ = true;
+		return;
+	}
+	const int64_t driftUs = (audioUs - audioOffsetUs_) - mediaUsLocked(mono);
+	if (driftUs > kResyncUs || driftUs < -kResyncUs) {
+		anchorMediaUs_ = audioUs - audioOffsetUs_;  // discontinuity: snap
+		anchorMonoNs_ = mono;
+	} else {
+		anchorMediaUs_ += std::clamp<int64_t>(driftUs / 8, -kSlewUs, kSlewUs);
+	}
+}
+
+void
+VideoDecoder::validatePtsOnce(int64_t tsNs)
+{
+	if (ptsChecked_) return;
+	ptsChecked_ = true;
+	// Media PTS starts at (or near) zero and cannot exceed the clip. A system
+	// timestamp is many orders larger, which is the failure we are screening for.
+	const int64_t limitUs = (durationUs_ > 0 ? durationUs_ : 24LL * 3600 * 1'000'000) + 5'000'000;
+	if (tsNs / 1000 > limitUs) {
+		ptsSelectable_ = false;
+		LOGE("#54: buffer timestamp %lld us exceeds the media (duration %lld us) — the "
+		     "BufferQueue did not carry our PTS; falling back to newest-frame selection, "
+		     "cadence will NOT be display-locked",
+		     (long long)(tsNs / 1000), (long long)durationUs_);
+	}
+}
+
+void
+VideoDecoder::togglePaused()
+{
+	const bool nowPaused = !paused_.load(std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> lk(clockMx_);
+		if (nowPaused) {
+			// Freeze the clock where it stands, so resuming does not jump the
+			// picture forward by however long the pause lasted.
+			anchorMediaUs_ = mediaUsLocked(nowMonoNs());
+			anchorMonoNs_ = -1;
+		} else if (open_.load(std::memory_order_relaxed)) {
+			anchorMonoNs_ = nowMonoNs();
+			audioOffsetValid_ = false;  // audio restarts from its own position
+		}
+	}
+	paused_.store(nowPaused, std::memory_order_relaxed);
+}
+
+AHardwareBuffer *
+VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int *height)
+{
+	if (reader_ == nullptr) return nullptr;
+
+	const int64_t mono = nowMonoNs();
+	// XrTime on Android is CLOCK_MONOTONIC nanoseconds, so displayTimeNs is
+	// directly comparable. Guard anyway: a runtime on a different epoch would
+	// otherwise pin the target at +/-infinity and freeze or race the video.
+	int64_t targetMonoNs = displayTimeNs;
+	if (displayTimeNs <= 0 || displayTimeNs - mono > 1'000'000'000LL ||
+	    mono - displayTimeNs > 1'000'000'000LL) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			LOGE("#54: predictedDisplayTime %lld is not monotonic-ns near now %lld — "
+			     "falling back to wall clock (cadence will be free-running)",
+			     (long long)displayTimeNs, (long long)mono);
+		}
+		targetMonoNs = mono;
+	}
+
+	int64_t targetUs = 0;
+	bool clockRunning = false;
+	{
+		std::lock_guard<std::mutex> lk(clockMx_);
+		clockRunning = anchorMonoNs_ >= 0;
+		targetUs = mediaUsLocked(targetMonoNs);
+	}
+
+	// Walk the queue: keep the NEWEST frame that is already due, drop the ones
+	// it superseded, and hold back the first frame that is not due yet (it is
+	// the right frame for a later display time). Before the clock is anchored
+	// (pre-roll, or paused after a seek) take whatever is there.
+	bool promoted = false;
+	for (int guard = 0; guard < kReaderMaxImages + 2; ++guard) {
+		if (pendingImage_ == nullptr) {
+			AImage *img = nullptr;
+			if (AImageReader_acquireNextImage(reader_, &img) != AMEDIA_OK || img == nullptr)
+				break;  // nothing more queued
+			pendingImage_ = img;
+		}
+		// Unknown timestamp, frozen clock or unusable PTS all mean "take it" --
+		// a degraded cadence is recoverable, a frozen picture is not.
+		bool due = true;
+		bool selecting = false;
+		if (clockRunning && ptsSelectable_) {
+			int64_t tsNs = 0;
+			if (AImage_getTimestamp(pendingImage_, &tsNs) == AMEDIA_OK && tsNs > 0) {
+				validatePtsOnce(tsNs);
+				if (ptsSelectable_) {
+					selecting = true;
+					due = (tsNs / 1000) <= targetUs;
+				}
+			}
+		}
+		if (!due) break;  // not due yet — keep it for a later display time
+		if (heldImage_ != nullptr) AImage_delete(heldImage_);
+		if (promoted && selecting) {
+			// We had already taken a due frame this tick and found a newer one
+			// also due: the first one never reached the panel.
+			droppedLate_.fetch_add(1, std::memory_order_relaxed);
+		}
+		heldImage_ = pendingImage_;
+		pendingImage_ = nullptr;
+		promoted = true;
+	}
+	if (!promoted || heldImage_ == nullptr) {
+		return nullptr;  // the frame already on screen is still the right one
+	}
+
+	int64_t heldTsNs = 0;
+	if (AImage_getTimestamp(heldImage_, &heldTsNs) == AMEDIA_OK) {
+		positionUs_.store(heldTsNs / 1000, std::memory_order_relaxed);
+	}
+
+	AHardwareBuffer *ahb = nullptr;
+	if (AImage_getHardwareBuffer(heldImage_, &ahb) != AMEDIA_OK || ahb == nullptr) {
+		LOGE("AImage_getHardwareBuffer failed");
+		return nullptr;
+	}
+	if (width) *width = width_;
+	if (height) *height = height_;
+	return ahb;
 }
 
 AHardwareBuffer *
@@ -305,6 +570,17 @@ VideoDecoder::stop()
 		AImage_delete(heldImage_);
 		heldImage_ = nullptr;
 	}
+	if (pendingImage_) {
+		AImage_delete(pendingImage_);
+		pendingImage_ = nullptr;
+	}
+	{
+		std::lock_guard<std::mutex> lk(clockMx_);
+		anchorMonoNs_ = -1;
+		audioOffsetValid_ = false;
+	}
+	ptsSelectable_ = true;
+	ptsChecked_ = false;
 	if (codec_) {
 		AMediaCodec_stop(codec_);
 		AMediaCodec_delete(codec_);
