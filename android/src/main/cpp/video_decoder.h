@@ -25,6 +25,14 @@ struct AImage;
 struct AHardwareBuffer;
 struct ANativeWindow;
 
+// AImageReader pool depth. PUBLIC because the renderer's per-AHB import cache
+// must stay LARGER than this -- the reader hands out up to this many distinct
+// AHardwareBuffers, and an import cache smaller than that evicts (and destroys)
+// an import the descriptor set still points at, every frame. Raising this from
+// 6 to 10 for #54's lookahead silently broke that invariant against a hardcoded
+// cache of 8, which showed up as heavy flicker. Derive, never re-type.
+inline constexpr int32_t kVideoReaderMaxImages = 10;
+
 struct VideoDecoder {
 	~VideoDecoder() { stop(); }
 
@@ -140,6 +148,7 @@ private:
 	bool xrEpochCalibrated_ = false;
 	bool legacyPacing_ = false;  // MEDIAPLAYER_LEGACY_PACING / debug.dxr.mp.legacy_pacing
 	bool diag_ = false;          // MEDIAPLAYER_PACING_DIAG / debug.dxr.mp.diag
+	int64_t lookaheadUs_ = 0;    // debug.dxr.mp.lookahead_ms (bisect knob)
 
 	// media time at monoNs; caller holds clockMx_.
 	int64_t mediaUsLocked(int64_t monoNs) const;

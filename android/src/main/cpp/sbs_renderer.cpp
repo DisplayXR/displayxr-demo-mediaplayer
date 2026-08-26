@@ -986,7 +986,22 @@ SbsRenderer::drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h)
 bool
 SbsRenderer::ensureAhbPipeline(const VkAndroidHardwareBufferFormatPropertiesANDROID &fmt)
 {
-	if (ahbInited_) return true;
+	if (ahbInited_) {
+		if (fmt.externalFormat == ahbExternalFormat_) return true;
+		// A different decoder (AVC vs VP9, or a FORMAT_CHANGED mid-stream) can
+		// hand us a different vendor format. The ycbcr conversion is baked into
+		// an IMMUTABLE sampler, so it cannot be pointed at the new format --
+		// the whole chain has to be rebuilt. Sampling the new images through
+		// the old conversion is undefined, and in practice wrong colours.
+		LOGI("AHB external format changed %llu -> %llu; rebuilding the ycbcr pipeline",
+		     (unsigned long long)ahbExternalFormat_, (unsigned long long)fmt.externalFormat);
+		vkDeviceWaitIdle(device_);
+		for (int i = 0; i < ahbCacheCount_; ++i) destroyAhbImport(ahbCache_[i]);
+		ahbCacheCount_ = 0;
+		ahbActiveImage_ = VK_NULL_HANDLE;
+		ahbActiveView_ = VK_NULL_HANDLE;
+		destroyAhbPipeline();
+	}
 	ahbExternalFormat_ = fmt.externalFormat;
 
 	VkExternalFormatANDROID extFmt = {};
@@ -1257,7 +1272,18 @@ SbsRenderer::importAhb(struct AHardwareBuffer *ahb, uint32_t w, uint32_t h)
 
 	AHardwareBuffer_acquire(ahb);  // own a ref; released in destroyAhbImport
 
-	if (ahbCacheCount_ == kAhbCacheCap) {  // evict oldest (shouldn't hit: cache > pool depth)
+	if (ahbCacheCount_ == kAhbCacheCap) {
+		// Unreachable while kAhbCacheCap > the reader pool depth AND every
+		// stream's imports are dropped (resetVideoAhb) before the next stream
+		// opens. If it fires, one of those broke and we are destroying a live
+		// import every frame -- the picture tears between eyes. Say so.
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			LOGE("AHB import cache overflow (cap=%d) — evicting a live import; "
+			     "kAhbCacheCap must exceed the AImageReader pool depth",
+			     kAhbCacheCap);
+		}
 		destroyAhbImport(ahbCache_[0]);
 		for (int i = 1; i < ahbCacheCount_; ++i) ahbCache_[i - 1] = ahbCache_[i];
 		ahbCacheCount_--;
@@ -1422,6 +1448,43 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 }
 
 void
+SbsRenderer::destroyAhbPipeline()
+{
+	if (ahbPipeline_) vkDestroyPipeline(device_, ahbPipeline_, nullptr);
+	if (ahbPipeLayout_) vkDestroyPipelineLayout(device_, ahbPipeLayout_, nullptr);
+	if (ahbDescPool_) vkDestroyDescriptorPool(device_, ahbDescPool_, nullptr);  // frees ahbDescSet_
+	if (ahbSetLayout_) vkDestroyDescriptorSetLayout(device_, ahbSetLayout_, nullptr);
+	if (ahbSampler_) vkDestroySampler(device_, ahbSampler_, nullptr);
+	if (ahbYcbcr_) vkDestroySamplerYcbcrConversion(device_, ahbYcbcr_, nullptr);
+	ahbPipeline_ = VK_NULL_HANDLE;
+	ahbPipeLayout_ = VK_NULL_HANDLE;
+	ahbDescPool_ = VK_NULL_HANDLE;
+	ahbDescSet_ = VK_NULL_HANDLE;
+	ahbSetLayout_ = VK_NULL_HANDLE;
+	ahbSampler_ = VK_NULL_HANDLE;
+	ahbYcbcr_ = VK_NULL_HANDLE;
+	ahbExternalFormat_ = 0;
+	ahbInited_ = false;
+}
+
+void
+SbsRenderer::resetVideoAhb()
+{
+	if (device_ == VK_NULL_HANDLE) return;
+	// drawAtlas() is synchronous (fence wait before return), so nothing is in
+	// flight on the render thread -- but this is a once-per-open path and an
+	// idle wait costs nothing here, whereas a stale-image guess costs a tear.
+	vkDeviceWaitIdle(device_);
+	for (int i = 0; i < ahbCacheCount_; ++i) destroyAhbImport(ahbCache_[i]);
+	ahbCacheCount_ = 0;
+	ahbActiveImage_ = VK_NULL_HANDLE;
+	ahbActiveView_ = VK_NULL_HANDLE;
+	ahbActiveW_ = ahbActiveH_ = 0;
+	if (sourceMode_ == 3) sourceMode_ = 0;  // nothing bound until the next source
+	destroyAhbPipeline();
+}
+
+void
 SbsRenderer::cleanup()
 {
 	if (device_ == VK_NULL_HANDLE) return;
@@ -1431,19 +1494,7 @@ SbsRenderer::cleanup()
 	ahbCacheCount_ = 0;
 	ahbActiveImage_ = VK_NULL_HANDLE;
 	ahbActiveView_ = VK_NULL_HANDLE;
-	if (ahbPipeline_) vkDestroyPipeline(device_, ahbPipeline_, nullptr);
-	if (ahbPipeLayout_) vkDestroyPipelineLayout(device_, ahbPipeLayout_, nullptr);
-	if (ahbDescPool_) vkDestroyDescriptorPool(device_, ahbDescPool_, nullptr);
-	if (ahbSetLayout_) vkDestroyDescriptorSetLayout(device_, ahbSetLayout_, nullptr);
-	if (ahbSampler_) vkDestroySampler(device_, ahbSampler_, nullptr);
-	if (ahbYcbcr_) vkDestroySamplerYcbcrConversion(device_, ahbYcbcr_, nullptr);
-	ahbPipeline_ = VK_NULL_HANDLE;
-	ahbPipeLayout_ = VK_NULL_HANDLE;
-	ahbDescPool_ = VK_NULL_HANDLE;
-	ahbSetLayout_ = VK_NULL_HANDLE;
-	ahbSampler_ = VK_NULL_HANDLE;
-	ahbYcbcr_ = VK_NULL_HANDLE;
-	ahbInited_ = false;
+	destroyAhbPipeline();
 	for (auto &kv : targets_) {
 		if (kv.second.fb) vkDestroyFramebuffer(device_, kv.second.fb, nullptr);
 		if (kv.second.view) vkDestroyImageView(device_, kv.second.view, nullptr);

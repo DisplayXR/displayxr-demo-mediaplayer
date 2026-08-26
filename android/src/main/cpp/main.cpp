@@ -1870,6 +1870,10 @@ android_main(struct android_app *app)
 				                    magic[2] == 'N' && magic[3] == 'G';
 				g_video.stop();
 				g_audio.stop();
+				// The old decoder's AImageReader is gone; drop the renderer's
+				// imports of its buffers (and the refs keeping them alive) before
+				// the new reader hands out a fresh pool. See resetVideoAhb().
+				g_sbs.resetVideoAhb();
 				g_scene_loaded.store(false, std::memory_order_relaxed);
 				g_pick_pending.store(false, std::memory_order_relaxed);
 				if (is_jpeg || is_png) {
