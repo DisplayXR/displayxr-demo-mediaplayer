@@ -117,6 +117,8 @@ private:
 	int64_t anchorMonoNs_ = -1;
 	int64_t anchorMediaUs_ = 0;
 	std::atomic<uint32_t> droppedLate_{0};
+	std::atomic<uint32_t> releasedFrames_{0};  // frames the decoder handed to the reader
+	std::atomic<uint32_t> shownFrames_{0};     // frames the render thread promoted
 	// The audio clock is the PTS just WRITTEN into AAudio, so it leads audible
 	// playback by the stream's buffer depth. We slew to kill drift only, against
 	// the offset captured at anchor time -- imposing the audio clock's absolute
@@ -128,6 +130,12 @@ private:
 	// against the nonsense value -- that would stall the picture silently.
 	bool ptsSelectable_ = true;
 	bool ptsChecked_ = false;
+	// XrTime is NOT CLOCK_MONOTONIC on this runtime -- measured at ~0.33 s while
+	// the monotonic clock read 453258 s, i.e. it counts from runtime start. Only
+	// the EPOCH differs, so one calibration against our own clock is enough; a
+	// constant offset shifts latency, never cadence, which is what we are locking.
+	int64_t xrEpochOffsetNs_ = 0;
+	bool xrEpochCalibrated_ = false;
 	bool legacyPacing_ = false;  // MEDIAPLAYER_LEGACY_PACING / debug.dxr.mp.legacy_pacing
 
 	// media time at monoNs; caller holds clockMx_.

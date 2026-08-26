@@ -30,14 +30,19 @@
 namespace {
 // AImageReader buffer pool depth: enough for the codec to decode ahead, plus
 // the one the render thread holds + the one Vulkan still references on import.
-constexpr int32_t kReaderMaxImages = 6;
+// Sized for the display-locked path: the frames we deliberately leave QUEUED as
+// lookahead, plus the one on screen and the one held back as not-yet-due, plus
+// the working set the codec needs to keep decoding. At 6 (the pre-#54 value,
+// which only ever had to hold ONE frame) a 30 fps lookahead exhausted the pool
+// and stalled the decoder to ~10 fps.
+constexpr int32_t kReaderMaxImages = 10;
 
 // How far ahead of the presentation clock the decode thread is allowed to run.
 // This is the cushion that absorbs decode jitter: the render thread always has
 // a frame in hand for the display time it is about to submit for. Bounded so we
 // do not race through the file (AImageReader back-pressure bounds it in buffers
 // too, but only once the pool is full).
-constexpr int64_t kLookaheadUs = 120'000;
+constexpr int64_t kLookaheadUs = 50'000;
 
 // A/V slew. Beyond kResyncUs we assume a discontinuity (seek, loop, stall) and
 // re-anchor hard; below it we nudge the anchor by at most kSlewUs per frame so
@@ -177,8 +182,11 @@ VideoDecoder::start()
 		anchorMediaUs_ = 0;
 	}
 	droppedLate_.store(0, std::memory_order_relaxed);
+	releasedFrames_.store(0, std::memory_order_relaxed);
+	shownFrames_.store(0, std::memory_order_relaxed);
 	ptsSelectable_ = true;
 	ptsChecked_ = false;
+	xrEpochCalibrated_ = false;
 	LOGI("VideoDecoder open (zero-copy surface): %s %dx%d", mime, width_, height_);
 	LOGI("#54: frame pacing: %s (MEDIAPLAYER_LEGACY_PACING / debug.dxr.mp.legacy_pacing; 1 = pre-fix)",
 	     legacyPacing_ ? "LEGACY sleep-in-decode-thread" : "display-locked (predictedDisplayTime)");
@@ -352,6 +360,7 @@ VideoDecoder::decodeLoop()
 				// purely the carrier. Delivery timing is the consumer's job.)
 				AMediaCodec_releaseOutputBufferAtTime(codec_, outIdx,
 				                                     info.presentationTimeUs * 1000);
+				releasedFrames_.fetch_add(1, std::memory_order_relaxed);
 			} else {
 				AMediaCodec_releaseOutputBuffer(codec_, outIdx, render);
 			}
@@ -454,19 +463,22 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 	if (reader_ == nullptr) return nullptr;
 
 	const int64_t mono = nowMonoNs();
-	// XrTime on Android is CLOCK_MONOTONIC nanoseconds, so displayTimeNs is
-	// directly comparable. Guard anyway: a runtime on a different epoch would
-	// otherwise pin the target at +/-infinity and freeze or race the video.
-	int64_t targetMonoNs = displayTimeNs;
-	if (displayTimeNs <= 0 || displayTimeNs - mono > 1'000'000'000LL ||
-	    mono - displayTimeNs > 1'000'000'000LL) {
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
-			LOGE("#54: predictedDisplayTime %lld is not monotonic-ns near now %lld — "
-			     "falling back to wall clock (cadence will be free-running)",
-			     (long long)displayTimeNs, (long long)mono);
-		}
+	// Put the runtime's display timeline into our clock's epoch. Calibrated once
+	// (and re-calibrated if it ever drifts a second, which would mean the runtime
+	// re-based its clock) -- the offset carries the wait-frame phase with it, and
+	// a constant phase is exactly what we want: it shifts latency, not cadence.
+	if (displayTimeNs <= 0) return nullptr;
+	if (!xrEpochCalibrated_) {
+		xrEpochCalibrated_ = true;
+		xrEpochOffsetNs_ = mono - displayTimeNs;
+		LOGI("#54: XrTime epoch offset %lld ns (predictedDisplayTime %lld vs monotonic %lld)",
+		     (long long)xrEpochOffsetNs_, (long long)displayTimeNs, (long long)mono);
+	}
+	int64_t targetMonoNs = displayTimeNs + xrEpochOffsetNs_;
+	if (targetMonoNs - mono > 1'000'000'000LL || mono - targetMonoNs > 1'000'000'000LL) {
+		LOGE("#54: display timeline jumped (target %lld vs now %lld) — recalibrating",
+		     (long long)targetMonoNs, (long long)mono);
+		xrEpochOffsetNs_ = mono - displayTimeNs;
 		targetMonoNs = mono;
 	}
 
@@ -476,6 +488,32 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 		std::lock_guard<std::mutex> lk(clockMx_);
 		clockRunning = anchorMonoNs_ >= 0;
 		targetUs = mediaUsLocked(targetMonoNs);
+	}
+
+	// 1 Hz view of the two clocks and both ends of the queue -- the numbers that
+	// say WHY a frame is or is not being shown.
+	{
+		static int64_t s_lastDiagNs = 0;
+		if (mono - s_lastDiagNs > 1'000'000'000LL) {
+			s_lastDiagNs = mono;
+			int64_t pendPts = -1;
+			if (pendingImage_ != nullptr) {
+				int64_t t = 0;
+				if (AImage_getTimestamp(pendingImage_, &t) == AMEDIA_OK) pendPts = t / 1000;
+			}
+			int64_t anchorUs = 0;
+			{
+				std::lock_guard<std::mutex> lk(clockMx_);
+				anchorUs = anchorMediaUs_;
+			}
+			LOGI("#54 DIAG target=%lld pending_pts=%lld anchorMedia=%lld running=%d "
+			     "released=%u shown=%u dropped=%u audio=%.3f",
+			     (long long)targetUs, (long long)pendPts, (long long)anchorUs,
+			     (int)clockRunning, releasedFrames_.load(std::memory_order_relaxed),
+			     shownFrames_.load(std::memory_order_relaxed),
+			     droppedLate_.load(std::memory_order_relaxed),
+			     masterClock_ ? masterClock_(masterCtx_) : -1.0);
+		}
 	}
 
 	// Walk the queue: keep the NEWEST frame that is already due, drop the ones
@@ -514,6 +552,7 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 		heldImage_ = pendingImage_;
 		pendingImage_ = nullptr;
 		promoted = true;
+		shownFrames_.fetch_add(1, std::memory_order_relaxed);
 	}
 	if (!promoted || heldImage_ == nullptr) {
 		return nullptr;  // the frame already on screen is still the right one
