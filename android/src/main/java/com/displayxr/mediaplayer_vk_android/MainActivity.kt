@@ -71,7 +71,10 @@ class MainActivity : NativeActivity() {
 
     // Hand a picked video to native as an open fd + byte range (AMediaExtractor
     // reads the fd). Reached by tapping the on-screen Load button.
-    private external fun nativeOpenVideoFd(fd: Int, offset: Long, length: Long)
+    // `name` is the document's display name (e.g. "clip_half_2x1.mkv"): the
+    // stereo-layout resolver's filename layer needs it, and a content:// fd
+    // carries no name of its own.
+    private external fun nativeOpenVideoFd(fd: Int, offset: Long, length: Long, name: String?)
 
     // Raw touch (normalized coords) → native hit-tests the on-screen transport
     // bar (play/pause, scrub, load). Returns 1 when the Load button was tapped —
@@ -187,6 +190,17 @@ class MainActivity : NativeActivity() {
         }
     }
 
+    private fun queryDisplayName(uri: android.net.Uri): String? {
+        try {
+            contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                                  null, null, null)?.use { c ->
+                if (c.moveToFirst()) return c.getString(0)
+            }
+        } catch (_: Throwable) {
+        }
+        return uri.lastPathSegment
+    }
+
     @Deprecated("startActivityForResult is fine for a NativeActivity demo app")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
@@ -204,7 +218,7 @@ class MainActivity : NativeActivity() {
             try {
                 val pfd = contentResolver.openFileDescriptor(uri, "r") ?: return
                 val length = pfd.statSize
-                nativeOpenVideoFd(pfd.detachFd(), 0L, length)
+                nativeOpenVideoFd(pfd.detachFd(), 0L, length, queryDisplayName(uri))
                 android.util.Log.i(TAG, "picked fd handed to native (len=$length)")
             } catch (t: Throwable) {
                 android.util.Log.e(TAG, "openFileDescriptor failed", t)

@@ -61,6 +61,11 @@
 #include "transport_ui.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
 #include "LifLoader.h"  // SHARED desktop LIF parser (src/media/, referenced by CMake)
+#include "MediaSource.h"   // SHARED layered stereo-layout resolver (#45)
+#include "StereoDetect.h"
+#include "video_stereo_probe_android.h"
+
+#include <mutex>
 
 #define LOG_TAG "mediaplayer_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -243,6 +248,51 @@ constexpr uint8_t kIdleBg[3] = {31, 31, 33};  // 0.12,0.12,0.13 * 255
 // A file the user picked via SAF: fd + byte range, published from the JNI
 // thread and serviced (decoder reopen) on the android_main thread.
 std::atomic<int> g_pick_fd{-1};
+std::mutex g_pick_name_mx;
+std::string g_pick_name;  // display name of the picked document (filename layer)
+
+// ── Stereo layout (desktop parity, #45) ─────────────────────────────────────
+// The renderer has two knobs a layout maps onto: `mono` (both eyes sample the
+// whole source) and the per-eye display aspect. Full SBS packs two full-width
+// eyes, so each eye's aspect is (w/2)/h; half SBS squeezes them, so each eye is
+// stretched back and its aspect is the whole frame's w/h. Before this the video
+// path assumed half SBS unconditionally and images only knew LIF/MPO-vs-flat.
+mp::StereoLayout g_layout = mp::StereoLayout::SbsHalf;
+
+static void
+apply_layout(mp::StereoLayout layout, int w, int h)
+{
+	g_layout = layout;
+	g_image_mono = layout == mp::StereoLayout::Mono;
+	if (w > 0 && h > 0) {
+		const float a = layout == mp::StereoLayout::SbsFull ? ((float)w * 0.5f) / (float)h
+		                                                     : (float)w / (float)h;
+		g_content_aspect.store(a, std::memory_order_relaxed);
+	}
+}
+
+// The layered resolution for a VIDEO: filename > (no container tags via NDK)
+// > content vote from a CPU probe of the first frames > aspect. `name` is the
+// path or the picker's display name; the probe runs only when the name did not
+// already decide (same gate as the desktop: it costs ~100-300 ms at open).
+static mp::MediaInfo
+resolve_video_layout(const std::string &name, int w, int h, int fd, int64_t off, int64_t len,
+                     const char *path)
+{
+	mp::StereoLayout fromName;
+	const mp::StereoDetectResult *content = nullptr;
+	mp::StereoDetectResult probe{};
+	if (!mp::MediaSource::LayoutFromFilename(name, fromName)) {
+		const mp::VideoStereoProbeAndroid::Result pr =
+		    path ? mp::VideoStereoProbeAndroid::RunPath(path)
+		         : mp::VideoStereoProbeAndroid::RunFd(fd, off, len);
+		if (pr.ok && pr.content.decided) {
+			probe = pr.content;
+			content = &probe;
+		}
+	}
+	return mp::MediaSource::Resolve(name, mp::MediaKind::Video, w, h, nullptr, nullptr, content);
+}
 std::atomic<long long> g_pick_off{0};
 std::atomic<long long> g_pick_len{0};
 
@@ -1175,7 +1225,7 @@ bake_lif_convergence(mp::DecodedImage &img, float conv)
 // fallback, incl. mono/1-view LIFs, which are not yet synthesized) displays as
 // flat 2D. Runs on the android_main thread (uploadTexture submits Vulkan work).
 bool
-load_image_file(const std::string &path)
+load_image_file(const std::string &path, const std::string &logical_name)
 {
 	mp::LifResult r = mp::LifLoader::Load(path);
 	if (!r.ok) {
@@ -1189,17 +1239,28 @@ load_image_file(const std::string &path)
 	                         (uint32_t)r.image.height)) {
 		return false;
 	}
-	g_image_mono = !r.stereo;
-	// Per-eye display aspect: full-SBS → (w/2)/h; mono → w/h.
-	g_content_aspect.store(
-	    r.stereo ? ((float)r.image.width * 0.5f) / (float)r.image.height
-	             : (float)r.image.width / (float)r.image.height,
-	    std::memory_order_relaxed);
+	// Layered resolution (desktop App.cpp parity): a composed LIF/MPO is
+	// container metadata; a plain JPEG/PNG falls through to the filename, then
+	// the content detector on the decoded pixels, then aspect.
+	mp::MediaInfo meta;
+	meta.kind = mp::MediaKind::Image;
+	meta.layout = r.layout;
+	mp::StereoLayout fromName;
+	mp::StereoDetectResult content{};
+	const bool nameDecided = mp::MediaSource::LayoutFromFilename(logical_name, fromName);
+	if (!r.stereo && !nameDecided) {
+		content = mp::StereoDetect::AnalyzeRGBA(r.image.pixels.data(), r.image.width, r.image.height,
+		                                        (ptrdiff_t)r.image.width * 4);
+	}
+	const mp::MediaInfo info = mp::MediaSource::Resolve(
+	    logical_name, mp::MediaKind::Image, r.image.width, r.image.height, nullptr,
+	    r.stereo ? &meta : nullptr, (!r.stereo && !nameDecided && content.decided) ? &content : nullptr);
+	apply_layout(info.layout, r.image.width, r.image.height);
 	g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox for media
 	g_is_video = false;
 	g_scene_loaded.store(true, std::memory_order_relaxed);
-	LOGI("Loaded image: %s %dx%d %s%s", path.c_str(), r.image.width, r.image.height,
-	     r.stereo ? "stereo LIF (full-SBS)" : "mono 2D",
+	LOGI("Loaded image: %s %dx%d layout=%s (%s)%s", logical_name.c_str(), r.image.width,
+	     r.image.height, mp::LayoutName(info.layout), mp::SignalName(info.signal),
 	     (r.stereo && r.hasConvergence) ? ", convergence baked" : "");
 	return true;
 }
@@ -1233,7 +1294,12 @@ load_picked_image(struct android_app *app, int fd, long long off, long long len)
 		LOGE("failed to stage picked image (fd=%d len=%lld)", fd, len);
 		return false;
 	}
-	return load_image_file(path);
+	std::string name;
+	{
+		std::lock_guard<std::mutex> lk(g_pick_name_mx);
+		name = g_pick_name;
+	}
+	return load_image_file(path, name.empty() ? path : name);
 }
 
 
@@ -1337,10 +1403,13 @@ render_frame()
 		g_cadence.tick(ahb != nullptr, frame_state);
 		if (ahb) {
 			if (g_sbs.setVideoAhb(ahb, (uint32_t)vw, (uint32_t)vh)) {
-				// Half-SBS: each eye is stretched 2× → per-eye display aspect is
-				// the full-frame aspect.
+				// Per-eye display aspect follows the resolved layout (#45):
+				// half SBS stretches each eye back to the full-frame aspect,
+				// full SBS is (w/2)/h, mono is w/h with both eyes sampling all.
 				if (vh > 0) {
-					g_content_aspect.store((float)vw / (float)vh,
+					g_content_aspect.store(g_layout == mp::StereoLayout::SbsFull
+					                           ? ((float)vw * 0.5f) / (float)vh
+					                           : (float)vw / (float)vh,
 					                       std::memory_order_relaxed);
 				}
 				g_scene_loaded.store(true, std::memory_order_relaxed);
@@ -1616,7 +1685,9 @@ bring_up(struct android_app *app)
 	    g_video.openPath(dbgFile)) {
 		g_audio.openPath(dbgFile);  // own fd; no-op if no audio track
 		g_is_video = true;
-		g_image_mono = false;
+		apply_layout(resolve_video_layout(dbgFile, g_video.width(), g_video.height(), -1, 0, 0, dbgFile)
+		                 .layout,
+		             g_video.width(), g_video.height());
 		g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
 		g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
 		LOGI("DEBUG auto-load: %s", dbgFile);
@@ -1721,8 +1792,19 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeXrReady(
 // reads the fd, which native now owns).
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeOpenVideoFd(
-    JNIEnv * /*env*/, jobject /*thiz*/, jint fd, jlong offset, jlong length)
+    JNIEnv *env, jobject /*thiz*/, jint fd, jlong offset, jlong length, jstring name)
 {
+	{
+		std::lock_guard<std::mutex> lk(g_pick_name_mx);
+		g_pick_name.clear();
+		if (name != nullptr) {
+			const char *c = env->GetStringUTFChars(name, nullptr);
+			if (c) {
+				g_pick_name = c;
+				env->ReleaseStringUTFChars(name, c);
+			}
+		}
+	}
 	g_pick_off.store((long long)offset, std::memory_order_relaxed);
 	g_pick_len.store((long long)length, std::memory_order_relaxed);
 	g_pick_fd.store((int)fd, std::memory_order_release);  // publish last
@@ -1891,16 +1973,27 @@ android_main(struct android_app *app)
 					// no audio on picked clips.) dup before openFd since the video
 					// decoder takes ownership of `pick`.
 					int audio_fd = dup(pick);
+					const int probe_fd = dup(pick);  // the probe's extractor; closed below
+					std::string pick_name;
+					{
+						std::lock_guard<std::mutex> lk(g_pick_name_mx);
+						pick_name = g_pick_name;
+					}
 					g_video.setMasterClock(AudioPlayer::clockThunk, &g_audio);
 					if (g_video.openFd(pick, off, len)) {
 						if (audio_fd >= 0) g_audio.openFd(audio_fd, off, len);
 						g_is_video = true;
-						g_image_mono = false;
+						const mp::MediaInfo vinfo = resolve_video_layout(
+						    pick_name.empty() ? std::string("picked") : pick_name, g_video.width(),
+						    g_video.height(), probe_fd, off, len, nullptr);
+						apply_layout(vinfo.layout, g_video.width(), g_video.height());
 						g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
 						g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
 						LOGI("Opened picked video (fd=%d, audio_fd=%d)", pick, audio_fd);
+						if (probe_fd >= 0) close(probe_fd);
 					} else {
 						if (audio_fd >= 0) close(audio_fd);
+						if (probe_fd >= 0) close(probe_fd);
 						LOGE("Failed to open picked video (fd=%d)", pick);
 					}
 				}
