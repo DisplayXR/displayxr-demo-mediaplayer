@@ -129,7 +129,7 @@ XrSpace g_app_space = XR_NULL_HANDLE;
 // ── Display rendering-mode + tiled-atlas multiview (XR_DXR_display_info) ─────
 // The runtime advertises rendering modes (2D-mono, 3D-stereo) each with a tile
 // layout (cols×rows) and per-view scale, plus the native panel pixels. Per
-// ADR-026 / runtime#518 the app renders the active mode's views into TILES of a
+// ADR-026 / runtime#548 the app renders the active mode's views into TILES of a
 // SINGLE worst-case atlas swapchain and submits N projection views that all
 // reference it with per-tile imageRects. The atlas spans both orientations (the
 // swapchain is never recreated on rotation); each frame renders a
@@ -155,7 +155,7 @@ uint32_t g_display_px_w = 0;     // native panel pixels (XR_DXR_display_info)
 uint32_t g_display_px_h = 0;
 bool g_has_display_info = false;
 
-// ── XR_DXR_view_rig contingency (runtime#510) ───────────────────────────────
+// ── XR_DXR_view_rig contingency (runtime#540) ───────────────────────────────
 // On the OOP runtime the plain xrLocateViews path can return no valid view
 // poses (got_eyes=0 → viewStateFlags=0 → black panel); chaining a display rig
 // is what makes the runtime return valid views. The stereo lives in the SBS
@@ -309,6 +309,48 @@ prof_log(uint64_t frame, double frame_ms)
 #define PROF_RESET() ((void)0)
 #define PROF_MARK(phase) ((void)0)
 #endif
+
+// ─── Cadence probe (#54) ───────────────────────────────────────────────────
+// Distribution of DISPLAY PERIODS between successive NEW video frames -- the
+// one number that says whether video pacing is healthy, independent of the
+// render loop's own fps (which stays a flat 60 even while the picture judders).
+// On a 60 Hz panel 30 fps content must be a flat gap of 2, and 24 fps content a
+// clean alternation of 3 and 2. Any spread into 1/4/5+ IS the judder. Logged
+// beside PROF, once per 120 frames.
+namespace {
+struct CadenceProbe {
+	uint32_t hist[6] = {};  // index = gap in display periods; [5] = 5 or more
+	uint32_t frames = 0;
+	uint32_t newFrames = 0;
+	XrTime lastNew = 0;
+
+	void tick(bool isNewFrame, const XrFrameState &fs)
+	{
+		frames++;
+		if (!isNewFrame) return;
+		newFrames++;
+		if (lastNew != 0 && fs.predictedDisplayPeriod > 0) {
+			const int64_t d = (int64_t)fs.predictedDisplayTime - (int64_t)lastNew;
+			int64_t g = (d + fs.predictedDisplayPeriod / 2) / fs.predictedDisplayPeriod;
+			if (g < 1) g = 1;
+			if (g > 5) g = 5;
+			hist[g]++;
+		}
+		lastNew = fs.predictedDisplayTime;
+	}
+
+	void log_and_reset(uint32_t droppedDelta)
+	{
+		LOGI("CADENCE %u frames: new=%u  gaps 1=%u 2=%u 3=%u 4=%u 5+=%u  late-drops=%u",
+		     frames, newFrames, hist[1], hist[2], hist[3], hist[4], hist[5],
+		     droppedDelta);
+		frames = 0;
+		newFrames = 0;
+		for (uint32_t &h : hist) h = 0;
+	}
+};
+CadenceProbe g_cadence;
+}  // namespace
 
 // ─── OpenXR-Android bring-up (reused verbatim from cube_handle_vk_android) ─
 bool
@@ -682,7 +724,7 @@ query_display_info_and_modes()
 }
 
 // Per-tile render size + tile grid for the active mode, sized for the CURRENTLY
-// HELD orientation (#518 / ADR-026). Each eye renders at current_display ×
+// HELD orientation (#548 / ADR-026). Each eye renders at current_display ×
 // view_scale — landscape e.g. 1920×1200, portrait 1200×1920 — a sub-rect of the
 // fixed worst-case atlas. render_w/h drive both the render viewport and the
 // submitted subImage.imageRect, so the weave reads the correct per-orientation
@@ -1126,8 +1168,18 @@ render_frame()
 		// Zero-copy: import the decoder's latest AHardwareBuffer and sample it via
 		// the ycbcr conversion (no CPU plane upload). nullptr = no new frame, keep
 		// showing the previous one (the renderer holds the last import).
+		// Which video frame belongs on THIS display time is decided against
+		// frame_state.predictedDisplayTime (#54), not by a sleep in the decode
+		// thread. acquireLatestBuffer() is the pre-fix path, kept behind the
+		// kill switch because its buffers carry no usable PTS.
 		int vw = 0, vh = 0;
-		if (AHardwareBuffer *ahb = g_video.acquireLatestBuffer(&vw, &vh)) {
+		AHardwareBuffer *ahb =
+		    g_video.legacyPacing()
+		        ? g_video.acquireLatestBuffer(&vw, &vh)
+		        : g_video.acquireFrameForDisplayTime(
+		              (int64_t)frame_state.predictedDisplayTime, &vw, &vh);
+		g_cadence.tick(ahb != nullptr, frame_state);
+		if (ahb) {
 			if (g_sbs.setVideoAhb(ahb, (uint32_t)vw, (uint32_t)vh)) {
 				// Half-SBS: each eye is stretched 2× → per-eye display aspect is
 				// the full-frame aspect.
@@ -1250,7 +1302,7 @@ render_frame()
 			}
 		} else {
 			// Plain locate returning no valid poses is the known OOP gap
-			// (runtime#510): auto-enable the minimal rig once, then keep quiet.
+			// (runtime#540): auto-enable the minimal rig once, then keep quiet.
 			g_invalid_locate_count++;
 			if (g_invalid_locate_count <= 3 || (g_invalid_locate_count % 120) == 0) {
 				LOGI("xrLocateViews invalid (res=%d located=%u flags=0x%llx rig=%d count=%d)",
@@ -1310,6 +1362,12 @@ render_frame()
 		LOGI("PACE predictedPeriod=%.2f ms (%.1f Hz)  avg dDisplayTime=%.2f ms  shouldRender=%d",
 		     period_ms, period_ms > 0 ? 1000.0 / period_ms : 0.0, ddisp_ms,
 		     (int)frame_state.shouldRender);
+		if (g_is_video) {
+			static uint32_t s_last_dropped = 0;
+			const uint32_t dropped = g_video.droppedLate();
+			g_cadence.log_and_reset(dropped - s_last_dropped);
+			s_last_dropped = dropped;
+		}
 #if MP_PROFILE
 		prof_log(g_frame_count, ms);
 #endif
