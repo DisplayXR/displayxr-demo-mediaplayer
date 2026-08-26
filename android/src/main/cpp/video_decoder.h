@@ -125,7 +125,8 @@ private:
 	// value would shift A/V alignment, which is not this fix's business.
 	int64_t audioOffsetUs_ = 0;
 	bool audioOffsetValid_ = false;
-	int64_t lastAudioUs_ = -1;  // to spot the audio track looping independently
+	int64_t lastAudioUs_ = -1;      // to spot the audio track looping independently
+	int64_t lastShownMonoNs_ = -1;  // stall watchdog for the consumer's safety net
 	// Whether the PTS we handed to releaseOutputBufferAtTime actually came back
 	// through the BufferQueue. If a vendor queue overrode it we must NOT select
 	// against the nonsense value -- that would stall the picture silently.

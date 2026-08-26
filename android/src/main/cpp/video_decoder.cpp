@@ -51,14 +51,18 @@ constexpr int64_t kLookaheadUs = 50'000;
 constexpr int64_t kResyncUs = 200'000;
 constexpr int64_t kSlewUs = 1'000;
 
-// A frame legitimately sits at most kLookaheadUs ahead of the clock. Further
-// ahead than this and the clock and the stream disagree about where we are --
-// which happened for real: audio and video loop at EOS independently, so an
-// audio offset captured across a loop boundary is a whole clip-length wrong,
-// and the resync below then parked the media clock 100 s in the past and
-// nothing was ever due again. Re-anchor to the frame in hand instead: a
-// disagreement must cost one hiccup, never a frozen picture.
-constexpr int64_t kMaxAheadUs = 1'000'000;
+// A frame legitimately sits within kLookaheadUs of the clock. Further off than
+// this, in EITHER direction, and it is not a late or early frame -- it is a
+// frame from the other side of a flush that the decoder has already moved past
+// (at an EOS loop the decoder re-anchors to ~0 while a clip-length of pre-loop
+// frames is still sitting in the reader's queue). Those get discarded.
+constexpr int64_t kStaleUs = 1'000'000;
+
+// ...but discarding must never be able to eat the whole stream. If nothing has
+// reached the panel for this long while frames ARE queued, the CLOCK is what is
+// wrong: re-anchor onto the frame in hand. Bounds any present or future
+// clock/stream disagreement to one hiccup instead of a frozen picture.
+constexpr int64_t kStallNs = 1'000'000'000LL;
 
 int64_t
 nowMonoNs()
@@ -194,6 +198,7 @@ VideoDecoder::start()
 		anchorMediaUs_ = 0;
 	}
 	lastAudioUs_ = -1;
+	lastShownMonoNs_ = -1;
 	droppedLate_.store(0, std::memory_order_relaxed);
 	releasedFrames_.store(0, std::memory_order_relaxed);
 	shownFrames_.store(0, std::memory_order_relaxed);
@@ -567,21 +572,32 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 				}
 			}
 		}
-		if (!due && selecting) {
+		if (selecting) {
 			int64_t tsNs = 0;
-			if (AImage_getTimestamp(pendingImage_, &tsNs) == AMEDIA_OK &&
-			    tsNs / 1000 - targetUs > kMaxAheadUs) {
-				// Further ahead than any legitimate lookahead: the clock is
-				// wrong, not the frame. Re-anchor onto it and show it.
-				LOGE("#54: frame %lld us is %lld ms beyond the clock (%lld us) — "
-				     "re-anchoring; audio and video most likely looped apart",
-				     (long long)(tsNs / 1000),
-				     (long long)((tsNs / 1000 - targetUs) / 1000), (long long)targetUs);
-				std::lock_guard<std::mutex> lk(clockMx_);
-				anchorMediaUs_ = tsNs / 1000;
-				anchorMonoNs_ = targetMonoNs;
-				audioOffsetValid_ = false;
-				due = true;
+			if (AImage_getTimestamp(pendingImage_, &tsNs) == AMEDIA_OK) {
+				const int64_t offUs = tsNs / 1000 - targetUs;
+				const bool stalled =
+				    lastShownMonoNs_ >= 0 && mono - lastShownMonoNs_ > kStallNs;
+				if ((offUs > kStaleUs || offUs < -kStaleUs) && !stalled) {
+					// Left over from before a flush -- the decoder has already
+					// moved the clock past it. Drop it and look at the next.
+					AImage_delete(pendingImage_);
+					pendingImage_ = nullptr;
+					continue;
+				}
+				if (!due && stalled) {
+					// Nothing has reached the panel for a second while frames
+					// are queued: believe the stream, not the clock.
+					LOGE("#54: nothing shown for %lld ms with a frame at %lld us and the "
+					     "clock at %lld us — re-anchoring onto the stream",
+					     (long long)((mono - lastShownMonoNs_) / 1'000'000),
+					     (long long)(tsNs / 1000), (long long)targetUs);
+					std::lock_guard<std::mutex> lk(clockMx_);
+					anchorMediaUs_ = tsNs / 1000;
+					anchorMonoNs_ = targetMonoNs;
+					audioOffsetValid_ = false;
+					due = true;
+				}
 			}
 		}
 		if (!due) break;  // not due yet — keep it for a later display time
@@ -594,6 +610,7 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 		heldImage_ = pendingImage_;
 		pendingImage_ = nullptr;
 		promoted = true;
+		lastShownMonoNs_ = mono;
 		shownFrames_.fetch_add(1, std::memory_order_relaxed);
 	}
 	if (!promoted || heldImage_ == nullptr) {
