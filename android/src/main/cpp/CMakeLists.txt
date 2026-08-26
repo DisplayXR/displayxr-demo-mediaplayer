@@ -79,6 +79,14 @@ add_library(mediaplayer_vk_android SHARED
     #    StereoCompose.cpp holds ComposeSbs + EstimateAutoConvergence, which LifLoader
     #    calls; they were factored out of LifLoader.cpp when MPO started sharing them
     #    (#45), so this target needs the extra TU or the link fails on both symbols.
+    # Stereo-layout resolution, SHARED with the desktop (#45 layered detector):
+    # filename > container metadata > content cross-correlation > aspect. Pure
+    # C++ (Log.h + std only). The content layer's frames come from
+    # video_stereo_probe_android.cpp on this platform (CPU decode of the first
+    # frames; the playback path is zero-copy and has no CPU pixels).
+    ${REPO_ROOT}/src/media/MediaSource.cpp
+    ${REPO_ROOT}/src/media/StereoDetect.cpp
+    video_stereo_probe_android.cpp
     ${REPO_ROOT}/src/media/LifLoader.cpp
     ${REPO_ROOT}/src/media/StereoCompose.cpp
     ${REPO_ROOT}/src/media/ImageDecoder.cpp
