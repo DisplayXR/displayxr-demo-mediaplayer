@@ -35,14 +35,29 @@ namespace {
 // the working set the codec needs to keep decoding. At 6 (the pre-#54 value,
 // which only ever had to hold ONE frame) a 30 fps lookahead exhausted the pool
 // and stalled the decoder to ~10 fps.
-constexpr int32_t kReaderMaxImages = 10;
+constexpr int32_t kReaderMaxImages = kVideoReaderMaxImages;
 
-// How far ahead of the presentation clock the decode thread is allowed to run.
-// This is the cushion that absorbs decode jitter: the render thread always has
-// a frame in hand for the display time it is about to submit for. Bounded so we
-// do not race through the file (AImageReader back-pressure bounds it in buffers
-// too, but only once the pool is full).
-constexpr int64_t kLookaheadUs = 50'000;
+// How far ahead of the presentation clock the decode thread may run. DEFAULT 0
+// -- the decoder releases a frame only once it is due.
+//
+// #54 shipped this at 50 ms on the theory that a cushion absorbs decode jitter.
+// It does not, and it is actively harmful. Measured both ways on the same
+// binary and clip: cadence is IDENTICAL (gaps 2=24 3=24, zero out-of-cadence
+// either way), because the judder fix comes entirely from the CONSUMER picking
+// the frame due at predictedDisplayTime -- the decode thread's release time
+// stopped mattering the moment that landed. There was never jitter to absorb:
+// the decode thread idles at ~2.4% CPU.
+//
+// What the cushion DID buy was a hazard. Running eagerly, the decoder refills a
+// buffer the instant AImage_delete returns it to the pool -- while the renderer
+// is still sampling it. Both eye tiles are sampled from that one buffer in a
+// single drawAtlas pass, so an overwrite mid-pass shows the left eye one frame
+// and the right eye the next: rapid L/R mixing, reported from the field on a
+// 3840x1080 clip. 4K content hid it (a slower decoder refills more slowly, so
+// the race window is narrower), which is why one-clip testing missed it.
+//
+// Kept as a prop so the trade can be re-measured, not so it can be re-enabled.
+constexpr int64_t kLookaheadUs = 0;
 
 // A/V slew. Beyond kResyncUs we assume a discontinuity (seek, loop, stall) and
 // re-anchor hard; below it we nudge the anchor by at most kSlewUs per frame so
@@ -63,6 +78,16 @@ constexpr int64_t kStaleUs = 1'000'000;
 // wrong: re-anchor onto the frame in hand. Bounds any present or future
 // clock/stream disagreement to one hiccup instead of a frozen picture.
 constexpr int64_t kStallNs = 1'000'000'000LL;
+
+// Numeric prop read (bisect knob); <0 = unset.
+int64_t
+propInt(const char *env, const char *prop, int64_t dflt)
+{
+	if (const char *e = std::getenv(env)) return atoll(e);
+	char sp[PROP_VALUE_MAX] = {};
+	if (__system_property_get(prop, sp) > 0 && sp[0]) return atoll(sp);
+	return dflt;
+}
 
 int64_t
 nowMonoNs()
@@ -192,6 +217,11 @@ VideoDecoder::start()
 	// bring-up only, too chatty to leave on in a shipping build.
 	legacyPacing_ = switchOn("MEDIAPLAYER_LEGACY_PACING", "debug.dxr.mp.legacy_pacing");
 	diag_ = switchOn("MEDIAPLAYER_PACING_DIAG", "debug.dxr.mp.diag");
+	// Bisect knob: 0 = decode thread releases a frame only once it is DUE (the
+	// legacy release cadence, but still consumer-selected), >0 = run that many
+	// ms ahead. Isolates "decoder runs ahead" from "consumer picks the frame".
+	lookaheadUs_ = propInt("MEDIAPLAYER_LOOKAHEAD_MS", "debug.dxr.mp.lookahead_ms",
+	                       kLookaheadUs / 1000) * 1000;
 	{
 		std::lock_guard<std::mutex> lk(clockMx_);
 		anchorMonoNs_ = -1;
@@ -206,8 +236,10 @@ VideoDecoder::start()
 	ptsChecked_ = false;
 	xrEpochCalibrated_ = false;
 	LOGI("VideoDecoder open (zero-copy surface): %s %dx%d", mime, width_, height_);
-	LOGI("#54: frame pacing: %s (MEDIAPLAYER_LEGACY_PACING / debug.dxr.mp.legacy_pacing; 1 = pre-fix)",
-	     legacyPacing_ ? "LEGACY sleep-in-decode-thread" : "display-locked (predictedDisplayTime)");
+	LOGI("#54: frame pacing: %s (MEDIAPLAYER_LEGACY_PACING / debug.dxr.mp.legacy_pacing; 1 = pre-fix)"
+	     "  lookahead=%lld ms  pool=%d",
+	     legacyPacing_ ? "LEGACY sleep-in-decode-thread" : "display-locked (predictedDisplayTime)",
+	     (long long)(lookaheadUs_ / 1000), (int)kReaderMaxImages);
 	open_.store(true, std::memory_order_relaxed);
 	stop_.store(false, std::memory_order_relaxed);
 	thread_ = std::thread([this] { decodeLoop(); });
@@ -361,9 +393,9 @@ VideoDecoder::decodeLoop()
 						if (anchorMonoNs_ < 0) break;  // frozen: don't throttle
 						aheadUs = info.presentationTimeUs - mediaUsLocked(nowMonoNs());
 					}
-					if (aheadUs <= kLookaheadUs) break;
+					if (aheadUs <= lookaheadUs_) break;
 					std::this_thread::sleep_for(std::chrono::microseconds(
-					    std::min<int64_t>(aheadUs - kLookaheadUs, 10'000)));
+					    std::min<int64_t>(aheadUs - lookaheadUs_, 10'000)));
 				}
 			}
 			const bool eos = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
