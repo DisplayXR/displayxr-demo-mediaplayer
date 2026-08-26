@@ -18,6 +18,8 @@
 #pragma once
 
 #define VK_USE_PLATFORM_ANDROID_KHR  // vulkan_android.h: AHardwareBuffer import structs + PFNs
+#include "video_decoder.h"  // kVideoReaderMaxImages — the AHB cache is derived from it
+
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
@@ -43,6 +45,16 @@ struct SbsRenderer {
 	// cycles a bounded pool), so steady-state cost is one descriptor rewrite per
 	// frame. Returns false on import failure (caller can fall back).
 	bool setVideoAhb(struct AHardwareBuffer *ahb, uint32_t width, uint32_t height);
+
+	// Drop every zero-copy resource belonging to the CURRENT stream: the cached
+	// per-AHB imports (and the AHardwareBuffer refs that keep the old reader's
+	// pool alive) and the ycbcr pipeline built from that stream's external
+	// format. Call whenever the VideoDecoder is stopped so a new one can be
+	// opened. Without this the old reader's imports stay cached alongside the
+	// new reader's, the cache overflows, and importAhb() evicts -- destroys --
+	// a live import under the descriptor set every frame: the picture tears
+	// between eyes. Blocks until the GPU is idle; render-thread only.
+	void resetVideoAhb();
 
 	bool hasSource() const {
 		return planes_[0].view != VK_NULL_HANDLE || ahbActiveView_ != VK_NULL_HANDLE;
@@ -131,6 +143,7 @@ private:
 		VkImageView view = VK_NULL_HANDLE;
 	};
 	bool ensureAhbPipeline(const VkAndroidHardwareBufferFormatPropertiesANDROID &fmt);
+	void destroyAhbPipeline();  // ycbcr conversion + sampler + layouts + pipeline + pool
 	const AhbImport *importAhb(struct AHardwareBuffer *ahb, uint32_t w, uint32_t h);
 	void destroyAhbImport(AhbImport &imp);
 
@@ -145,7 +158,16 @@ private:
 	bool ahbInited_ = false;
 	PFN_vkGetAndroidHardwareBufferPropertiesANDROID pfnGetAhbProps_ = nullptr;
 
-	static constexpr int kAhbCacheCap = 8;
+	// MUST exceed the number of DISTINCT buffers one stream can cycle through.
+	// That is NOT the AImageReader maxImages: the BufferQueue behind it also
+	// allocates the codec's own dequeued buffers, and a single 10-image reader
+	// was measured handing out more than 12 distinct AHardwareBuffers. Size for
+	// the BufferQueue's hard ceiling (NUM_BUFFER_SLOTS = 64) -- an entry is a
+	// few handles, and resetVideoAhb() drops them all when the stream ends, so
+	// the cost is nil and eviction becomes genuinely unreachable.
+	static constexpr int kAhbCacheCap = 64;
+	static_assert(kAhbCacheCap > kVideoReaderMaxImages,
+	              "AHB import cache must be larger than the reader pool");
 	AhbImport ahbCache_[kAhbCacheCap];
 	int ahbCacheCount_ = 0;
 	// Active (current-frame) import, bound by drawAtlas when sourceMode_ == 3.
