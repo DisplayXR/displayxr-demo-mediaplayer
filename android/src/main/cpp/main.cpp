@@ -1523,6 +1523,7 @@ render_frame()
 			const uint32_t dropped = g_video.droppedLate();
 			g_cadence.log_and_reset(dropped - s_last_dropped);
 			s_last_dropped = dropped;
+			LOGI("AUDIO xruns=%d write_errors=%u", g_audio.xrunCount(), g_audio.writeErrors());
 		}
 #if MP_PROFILE
 		prof_log(g_frame_count, ms);

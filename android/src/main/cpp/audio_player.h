@@ -49,6 +49,14 @@ struct AudioPlayer {
 	// Thunk for VideoDecoder::setMasterClock(fn, ctx).
 	static double clockThunk(void *ctx) { return static_cast<AudioPlayer *>(ctx)->clockSeconds(); }
 
+	// Cumulative AAudio underruns on the output stream (an audible gap each),
+	// or -1 with no stream. Logged beside CADENCE so sound breaks are counted,
+	// not just heard.
+	int32_t xrunCount() const;
+	// Writes AAudio refused (w < 0): each one silently dropped the rest of a
+	// decoded chunk before this counter existed -- an audible gap with no log.
+	uint32_t writeErrors() const { return writeErrors_.load(std::memory_order_relaxed); }
+
 private:
 	bool startFromExtractor();  // select audio track, configure codec, open AAudio, spawn thread
 	bool start(int sampleRate, int channels);
@@ -69,6 +77,7 @@ private:
 	std::atomic<bool> open_{false};
 	std::atomic<bool> paused_{false};
 	std::atomic<int64_t> clockUs_{-1};
+	std::atomic<uint32_t> writeErrors_{0};
 	std::atomic<int64_t> seekRequestUs_{-1};
 	int sampleRate_ = 48000;
 	int channels_ = 2;

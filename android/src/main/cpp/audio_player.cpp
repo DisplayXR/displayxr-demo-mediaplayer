@@ -5,6 +5,7 @@
 
 #include <aaudio/AAudio.h>
 #include <android/log.h>
+#include <sys/system_properties.h>
 #include <fcntl.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaExtractor.h>
@@ -131,7 +132,21 @@ AudioPlayer::ensureStream(int sampleRate, int channels)
 	AAudioStreamBuilder_setChannelCount(builder, channels_);
 	AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
 	AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
-	AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_NONE);
+	// Movie playback wants the DEEP-BUFFER output path, not the low-latency one.
+	// With MODE_NONE this device put the track on the PRIMARY|FAST mixer thread
+	// (20 ms buffer), where a writer feeding one 23 ms AAC frame per blocking
+	// write from a thread that also waits on the codec underruns on any hiccup
+	// -- measured at ~1 AudioFlinger track underrun per minute, each an audible
+	// break, with the video pacing old or new. POWER_SAVING selects the deep
+	// buffer, and the capacity hint asks for ~250 ms of it; latency is free here
+	// because the video slews to this clock. debug.dxr.mp.audio_buf=0 restores
+	// the old stream for A/B.
+	char spMode[PROP_VALUE_MAX] = {};
+	const bool legacyStream =
+	    __system_property_get("debug.dxr.mp.audio_buf", spMode) > 0 && spMode[0] == '0';
+	AAudioStreamBuilder_setPerformanceMode(
+	    builder, legacyStream ? AAUDIO_PERFORMANCE_MODE_NONE : AAUDIO_PERFORMANCE_MODE_POWER_SAVING);
+	if (!legacyStream) AAudioStreamBuilder_setBufferCapacityInFrames(builder, sampleRate_ / 4);
 	AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
 	AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MOVIE);
 	aaudio_result_t r = AAudioStreamBuilder_openStream(builder, &stream_);
@@ -140,6 +155,25 @@ AudioPlayer::ensureStream(int sampleRate, int channels)
 		LOGE("AAudio openStream failed: %s", AAudio_convertResultToText(r));
 		return false;
 	}
+	// Buffer sizing. AAudio's default for PERFORMANCE_MODE_NONE is a couple of
+	// bursts, and we feed it one decoded AAC frame per blocking write (1024
+	// frames = 23 ms at 44.1 kHz) from a thread that also waits on the codec.
+	// Any scheduling gap longer than the buffer is an audible break -- measured
+	// as AudioFlinger track underruns on an NP02J. Run the buffer at capacity:
+	// that costs latency we do not care about (video slews to this clock) and
+	// buys the margin that makes a 4K decode running next door harmless.
+	const int32_t cap = AAudioStream_getBufferCapacityInFrames(stream_);
+	const int32_t burst = AAudioStream_getFramesPerBurst(stream_);
+	const int32_t before = AAudioStream_getBufferSizeInFrames(stream_);
+	// debug.dxr.mp.audio_buf=0 keeps AAudio's default (A/B only).
+	char sp[PROP_VALUE_MAX] = {};
+	const bool keepDefault =
+	    __system_property_get("debug.dxr.mp.audio_buf", sp) > 0 && sp[0] == '0';
+	const int32_t set =
+	    (cap > 0 && !keepDefault) ? AAudioStream_setBufferSizeInFrames(stream_, cap) : before;
+	LOGI("AAudio buffer: capacity=%d burst=%d size %d -> %d frames, perf mode %d%s", cap, burst,
+	     before, set, (int)AAudioStream_getPerformanceMode(stream_),
+	     keepDefault ? " (legacy stream: debug.dxr.mp.audio_buf=0)" : "");
 	AAudioStream_requestStart(stream_);
 	const int actRate = AAudioStream_getSampleRate(stream_);
 	const int actCh = AAudioStream_getChannelCount(stream_);
@@ -152,6 +186,12 @@ AudioPlayer::ensureStream(int sampleRate, int channels)
 	streamRate_ = sampleRate_;  // remember what we opened with (request rate; ch adopted)
 	streamCh_ = channels_;
 	return true;
+}
+
+int32_t
+AudioPlayer::xrunCount() const
+{
+	return stream_ ? AAudioStream_getXRunCount(stream_) : -1;
 }
 
 void
@@ -234,7 +274,17 @@ AudioPlayer::decodeLoop()
 						    stream_, obuf + (size_t)written * channels_ * 2, frames - written,
 						    1'000'000'000L);
 						lastW = w;
-						if (w < 0) break;
+						if (w < 0) {
+							// Dropping the remainder of this chunk IS a gap.
+							// Count it so a break can be attributed, and say
+							// what AAudio said the first few times.
+							const uint32_t n = writeErrors_.fetch_add(1, std::memory_order_relaxed);
+							if (n < 3) {
+								LOGE("AAudio write failed (%s) — %d of %d frames dropped",
+								     AAudio_convertResultToText(w), frames - written, frames);
+							}
+							break;
+						}
 						written += w;
 					}
 					// One-shot startup confirmation that PCM is reaching AAudio and
