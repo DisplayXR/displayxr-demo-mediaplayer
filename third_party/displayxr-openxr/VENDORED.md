@@ -20,7 +20,7 @@ Pinned commit: `f1347340ea0dcc5d24da2f228b59d63441ca3ec7`
 (`19c4e014f linux(#660): Phase 3a — XR_DXR_xlib_window_binding`).
 
 `XR_DXR_android_surface_binding.h` is pinned newer still, from
-`b662acb184ef4464f60440f47faf9f6796c44dd4` — **spec v2**, which adds the
+`8664e15130462086baf52ff155efaf0e93a8785b` — **spec v2**, which adds the
 `XrEventDataAndroidWindowLayoutHintDXR` mini-window layout hint (runtime#1396).
 
 > ⚠️ That commit is the tip of the **unmerged** runtime PR branch
