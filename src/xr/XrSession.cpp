@@ -635,6 +635,18 @@ void XrSession::RequestNextMode() {
     LOG_INFO("No other requestable rendering mode available");
 }
 
+int32_t XrSession::FindFlatMode() const {
+    // Prefer a mode that is mono AND drives the hardware to 2D; a mono mode that
+    // leaves the lens on is the second-best answer and still beats a stereo one.
+    const RenderingMode* fallback = nullptr;
+    for (const auto& m : modes_) {
+        if (!m.requestable || m.viewCount != 1) continue;
+        if (!m.hardware3D) return (int32_t)m.modeIndex;
+        if (fallback == nullptr) fallback = &m;
+    }
+    return fallback ? (int32_t)fallback->modeIndex : -1;
+}
+
 void XrSession::RequestMode(uint32_t modeIndex) {
     if (!pfnRequestMode_) return;
     for (const auto& m : modes_) {

@@ -92,6 +92,11 @@ private:
     // grey margin). Returns false if the GPU upload fails. Helper for LoadIdleLogo.
     bool CompositeIdleArt(const struct DecodedImage& art, float occupy);
     void ClearIdleLogo();  // leave the idle screen: restore the black letterbox background
+    // The idle screen is a 2D lockup, so it asks the runtime for a FLAT rendering
+    // mode while it is up and hands the previous one back when media arrives (#64).
+    // Both edges only QUEUE the request — it is issued from RenderOneFrame, because
+    // LoadIdleLogo() runs during Init, before the session is running.
+    void RequestFlatModeForIdle();
     void TogglePlayback();   // play/pause (video+audio); restarts if the clip already ended
     void ToggleMute();       // silence audio (keeps playing); persists across clips
     void StepFrame(int n);   // pause + step n frames (']' +1 / '[' -1)
@@ -229,6 +234,13 @@ private:
     Transition transition_ = Transition::Playing;
     float transitionAlpha_ = 0.0f;  // 0 = clear, 1 = full black
     int pendingNavDelta_ = 0;       // navigation to apply at full black (slideshow or ←/→)
+
+    // Idle-screen mode borrow (#64). pendingModeRequest_ is drained once per frame;
+    // modeBeforeIdle_ is what to hand back; idleModeRequested_ is what we asked for,
+    // kept so a mode the USER picked while idle is not undone on the way out.
+    int32_t pendingModeRequest_ = -1;
+    int32_t modeBeforeIdle_ = -1;
+    int32_t idleModeRequested_ = -1;
 
     // Test scaffolding (env-gated).
     int startMode_ = -1;

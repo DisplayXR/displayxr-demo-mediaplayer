@@ -421,6 +421,14 @@ void App::RenderOneFrame() {
         startModeRequested_ = true;
     }
 
+    // Idle-screen mode borrow (#64), issued here rather than at the edge that queued
+    // it: LoadIdleLogo() runs during Init, when the session exists but is not yet
+    // running, and a mode request then is dropped.
+    if (pendingModeRequest_ >= 0) {
+        xr_.RequestMode((uint32_t)pendingModeRequest_);
+        pendingModeRequest_ = -1;
+    }
+
     // Pull the latest decoded video frame (if any) and upload its YUV planes — the GPU
     // does the colour convert + downscale, so no swscale ran on the decode thread.
     if (isVideo_) {
@@ -1457,6 +1465,7 @@ void App::LoadIdleLogo() {
         if (!art.Valid()) continue;
         if (CompositeIdleArt(art, c.occupy)) {
             LOG_INFO("No media — showing the DisplayXR idle screen ('%s')", c.file);
+            RequestFlatModeForIdle();
             return;
         }
         LOG_WARN("Idle art upload failed for '%s'", c.file);
@@ -1499,6 +1508,26 @@ void App::ClearIdleLogo() {
     if (!isLogo_) return;
     isLogo_ = false;
     renderer_.SetBackground(0.0f, 0.0f, 0.0f);  // back to the black media letterbox
+    // Hand back the mode the idle screen borrowed — but only if it is still the one
+    // we asked for. If the user pressed V (or the Mode button) while the logo was up,
+    // that is their choice and media inherits it.
+    if (modeBeforeIdle_ >= 0 && idleModeRequested_ >= 0 &&
+        xr_.CurrentModeIndex() == (uint32_t)idleModeRequested_) {
+        pendingModeRequest_ = modeBeforeIdle_;
+    }
+    modeBeforeIdle_ = -1;
+    idleModeRequested_ = -1;
+}
+
+void App::RequestFlatModeForIdle() {
+    // MEDIAPLAYER_START_MODE is an explicit test pin: it owns the mode outright.
+    if (startMode_ >= 0) return;
+    const int32_t flat = xr_.FindFlatMode();
+    if (flat < 0) return;  // no flat mode on offer (or workspace-locked) — leave it
+    if ((uint32_t)flat == xr_.CurrentModeIndex()) return;  // already flat
+    modeBeforeIdle_ = (int32_t)xr_.CurrentModeIndex();
+    idleModeRequested_ = flat;
+    pendingModeRequest_ = flat;
 }
 
 void App::TogglePlayback() {
