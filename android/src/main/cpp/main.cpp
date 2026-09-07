@@ -348,6 +348,35 @@ std::atomic<int32_t> g_hint_layout_h{0};
 std::atomic<int32_t> g_hint_buf_w{0};
 std::atomic<int32_t> g_hint_buf_h{0};
 
+/*
+ * What we have actually asked THIS window for. Only the android_main thread
+ * touches these — poll_xr_events and push_window_geometry both run on it.
+ *
+ * TRAP, measured on the NP02J: ANativeWindow_getWidth/Height do NOT report the
+ * override. After a successful setBuffersGeometry(723,1129) they still answer
+ * the WINDOW size (1079x1685), even though the runtime's VkSurfaceKHR does come
+ * back at 723x1129. Deriving "has it taken?" from them therefore never
+ * converges: the app re-issues setBuffersGeometry every frame, every call
+ * re-creates the compositor's swapchain target, and the weave never gets a
+ * frame out (0 weave frames under a storm of "HW_XFORM: surface extent ...
+ * recreating target"). So remember the REQUEST instead and re-issue it only
+ * when the size or the window changes — a surface recreate hands us a NEW
+ * ANativeWindow, so the pointer compare is exactly the "the override was
+ * dropped" test.
+ */
+ANativeWindow *g_hint_applied_win = nullptr;
+int32_t g_hint_applied_w = 0;
+int32_t g_hint_applied_h = 0;
+
+//! Forget the override (the hint cleared, or the surface went away).
+void
+forget_hint_buffer_geometry()
+{
+	g_hint_applied_win = nullptr;
+	g_hint_applied_w = 0;
+	g_hint_applied_h = 0;
+}
+
 // Re-assert the fixed buffer size on our own window. Idempotent and cheap, and
 // it must be re-applied after any surface recreate (a window resize destroys and
 // rebuilds the Surface, which drops the override).
@@ -363,13 +392,18 @@ apply_hint_buffer_geometry()
 	if (win == nullptr || bw <= 0 || bh <= 0) {
 		return;
 	}
-	if (ANativeWindow_getWidth(win) == bw && ANativeWindow_getHeight(win) == bh) {
+	if (win == g_hint_applied_win && bw == g_hint_applied_w && bh == g_hint_applied_h) {
 		return;
 	}
 	// format 0 = keep whatever the window already has.
 	const int32_t rc = ANativeWindow_setBuffersGeometry(win, bw, bh, 0);
-	LOGI("miniWindow1to1: ANativeWindow_setBuffersGeometry(%d,%d) -> %d (now %dx%d)", bw, bh,
-	     (int)rc, ANativeWindow_getWidth(win), ANativeWindow_getHeight(win));
+	if (rc == 0) {
+		g_hint_applied_win = win;
+		g_hint_applied_w = bw;
+		g_hint_applied_h = bh;
+	}
+	// One line per transition; the guard above is what keeps that true.
+	LOGI("miniWindow1to1: ANativeWindow_setBuffersGeometry(%d,%d) on %p -> %d", bw, bh, (void *)win, (int)rc);
 }
 #endif
 
@@ -916,12 +950,9 @@ push_window_geometry()
 	int32_t pub_h = r.h;
 	if (g_hint_active.load(std::memory_order_acquire)) {
 		ANativeWindow *win = g_app_window.load(std::memory_order_acquire);
-		const int32_t bw = g_hint_buf_w.load(std::memory_order_relaxed);
-		const int32_t bh = g_hint_buf_h.load(std::memory_order_relaxed);
-		if (win != nullptr && bw > 0 && bh > 0 && ANativeWindow_getWidth(win) == bw &&
-		    ANativeWindow_getHeight(win) == bh) {
-			pub_w = bw;
-			pub_h = bh;
+		if (win != nullptr && win == g_hint_applied_win && g_hint_applied_w > 0 && g_hint_applied_h > 0) {
+			pub_w = g_hint_applied_w;
+			pub_h = g_hint_applied_h;
 		}
 	}
 
@@ -1476,6 +1507,7 @@ poll_xr_events()
 						// 0,0 hands the buffer size back to the window.
 						ANativeWindow_setBuffersGeometry(win, 0, 0, 0);
 					}
+					forget_hint_buffer_geometry();
 					LOGI("miniWindow1to1 HINT: OFF — restoring layout");
 				}
 			}
