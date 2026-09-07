@@ -11,6 +11,7 @@
 #include "platform/Window.h"
 #include "rhi/VulkanRenderer.h"
 #include "ui/ImGuiLayer.h"
+#include "ui/TransportUI.h"
 #include "xr/XrSession.h"
 
 #include <chrono>
@@ -167,16 +168,10 @@ private:
     bool mediaAutoConvAvailable_ = false;
     float mediaAutoConvergence_ = 0.0f;
 
-    // Scrubber: displayed position tracks playback except while the user drags it, or
-    // while an issued seek hasn't landed yet (scrubTarget_ >= 0 holds the knob steady
-    // so it doesn't snap back to the stale position on mouse-release).
-    float scrubValue_ = 0.0f;
-    bool scrubActive_ = false;
-    float scrubTarget_ = -1.0f;
-    // Velocity-aware scrubbing: a fast sweep shows keyframes (responsive on long-GOP 8K),
-    // a slow/fine drag shows exact frames, and settling after a sweep resolves to exact.
-    float lastScrubValue_ = 0.0f;
-    bool scrubWasPreview_ = false;
+    // The shared, platform-neutral UI state (scrubber drag machine, auto-hide fade,
+    // toast). Lives in ui/TransportUI.h so the Android leg drives the exact same
+    // widget code — see that header for the ownership rules.
+    ui::TransportState uiState_{};
 
     // Open-file flow. openFilePending_ gates the Open button while a picker is up.
     // The native-dialog callback may run off-thread; it parks the result here.
@@ -210,9 +205,8 @@ private:
     bool showHud_ = true;         // master UI enable (SHIFT+TAB); auto-hide governs the rest
     bool inRenderFrame_ = false;  // reentrancy guard (live-resize watch vs main loop)
 
-    // Auto-hide: the UI fades in on activity and out after kIdleHideSeconds. fadeAlpha_
-    // (0..1) scales every widget; lastActivity_ is reset on mouse-move / control input.
-    float fadeAlpha_ = 0.0f;
+    // Auto-hide: the UI fades in on activity and out after kIdleHideSeconds. The alpha
+    // itself lives in uiState_; lastActivity_ is reset on mouse-move / control input.
     std::chrono::steady_clock::time_point lastActivity_{};
     std::chrono::steady_clock::time_point lastFrameTime_{};
     // Resting cursor position: motion is "real" only when it moves more than a few px
@@ -220,19 +214,11 @@ private:
     float restMouseX_ = -1.0f;
     float restMouseY_ = -1.0f;
 
-    // Transient toast (convergence readout, nav filename). Independent alpha so it shows
-    // even when the bars are hidden.
-    std::string toastText_;
-    std::chrono::steady_clock::time_point toastExpiry_{};
-    float toastAlpha_ = 0.0f;
-
     // Slideshow ("diaporama"): auto-advance through folderFiles_. Stills hold for
     // kStillSeconds; videos play to the end. Transitions dip to black (transitionAlpha_).
-    bool slideshowActive_ = false;
     double slideshowImageElapsed_ = 0.0;
     enum class Transition { Playing, FadeOut, FadeIn };
     Transition transition_ = Transition::Playing;
-    float transitionAlpha_ = 0.0f;  // 0 = clear, 1 = full black
     int pendingNavDelta_ = 0;       // navigation to apply at full black (slideshow or ←/→)
 
     // Idle-screen mode borrow (#64). pendingModeRequest_ is drained once per frame;
