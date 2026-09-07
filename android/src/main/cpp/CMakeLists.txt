@@ -9,8 +9,9 @@
 #
 # The SBS shaders are the SHARED repo-root shaders/, referenced by relative
 # path — NOT copied — so the Android leg and the desktop legs use the exact
-# same blit. The transport-overlay shaders are Android-local (the desktop UI
-# is Dear ImGui). Audio (AAudio) is Stage 3 and not built.
+# same blit. The transport chrome is Dear ImGui on EVERY leg now (see the ImGui
+# block below); the old Android-local overlay.{vert,frag} + seven-segment digit
+# renderer are gone. Audio (AAudio) is Stage 3 and not built.
 
 cmake_minimum_required(VERSION 3.22.1)
 project(mediaplayer_vk_android C CXX)
@@ -58,7 +59,7 @@ set(MP_IMGUI_SOURCES
 # ── SBS blit + overlay shaders → SPIR-V header arrays ─────────────────────
 # var name = <name>_<stage>_data, header = <name>.<stage>.h (matches the
 # #includes in sbs_renderer.cpp). fullscreen.vert + sbs.frag come from the
-# SHARED repo-root shaders/; overlay.* are Android-local.
+# SHARED repo-root shaders/; sbs_ahb.frag is Android-local.
 find_program(GLSLANGVALIDATOR_COMMAND glslangValidator)
 if(NOT GLSLANGVALIDATOR_COMMAND)
     message(FATAL_ERROR "glslangValidator required — install the Vulkan SDK on the build host")
@@ -79,8 +80,6 @@ endfunction()
 mp_compile_shader("${REPO_ROOT}/shaders" fullscreen.vert)
 mp_compile_shader("${REPO_ROOT}/shaders" sbs.frag)
 mp_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders" sbs_ahb.frag)  # zero-copy AHB ycbcr blit
-mp_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders" overlay.vert)
-mp_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders" overlay.frag)
 
 # ── NativeActivity glue (ships with the NDK) ─────────────────────────────
 add_library(native_app_glue STATIC

@@ -46,6 +46,53 @@ void ShowTransportToast(TransportState& s, std::string msg) {
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 
+// Polished "dark glass" look: generous rounding, padded controls, faint translucent
+// surfaces, one cyan accent. Centralizes all styling so the per-widget code stays clean.
+//
+// Moved here from ImGuiLayer so both legs share it. `k` scales metrics for touch:
+// ImGui derives the icon-button size from GetFrameHeight() (= FontSize + FramePadding.y*2)
+// and every glyph inside IconButton is a fraction of that, so one scalar enlarges the
+// whole control set correctly with no per-widget touch code. TouchExtraPadding grows hit
+// rectangles without moving a single pixel.
+void ApplyMediaPlayerStyle(float k) {
+    if (!(k > 0.0f)) k = 1.0f;
+    ImGui::StyleColorsDark();
+    ImGuiStyle& s = ImGui::GetStyle();
+
+    // ---- identical on every leg ----
+    s.WindowRounding = 16.0f;
+    s.FrameRounding = 10.0f;
+    s.GrabRounding = 10.0f;
+    s.PopupRounding = 10.0f;
+    s.WindowBorderSize = 0.0f;
+    s.FrameBorderSize = 0.0f;
+
+    // ---- the one divergence: metrics scale, design does not ----
+    s.WindowPadding = ImVec2(18.0f * k, 14.0f * k);
+    s.FramePadding = ImVec2(14.0f * k, 9.0f * k);
+    s.ItemSpacing = ImVec2(12.0f * k, 10.0f * k);
+    s.GrabMinSize = 18.0f * k;
+    // Hit-only padding: enlarges the grab/press rectangles, draws nothing.
+    s.TouchExtraPadding = (k > 1.0f) ? ImVec2(10.0f, 14.0f) : ImVec2(0.0f, 0.0f);
+    // Legible against the HUD canvas (the desktop's long-standing 1.9), nudged up
+    // slightly for arm's-length tablet viewing.
+    ImGui::GetIO().FontGlobalScale = 1.9f * (k > 1.0f ? 1.15f : 1.0f);
+
+    const ImVec4 accent(0.20f, 0.65f, 1.00f, 1.00f);
+    ImVec4* c = s.Colors;
+    c[ImGuiCol_WindowBg] = ImVec4(0.05f, 0.06f, 0.08f, 0.62f);
+    c[ImGuiCol_FrameBg] = ImVec4(1.0f, 1.0f, 1.0f, 0.06f);
+    c[ImGuiCol_FrameBgHovered] = ImVec4(1.0f, 1.0f, 1.0f, 0.12f);
+    c[ImGuiCol_FrameBgActive] = ImVec4(1.0f, 1.0f, 1.0f, 0.16f);
+    c[ImGuiCol_Button] = ImVec4(1.0f, 1.0f, 1.0f, 0.07f);
+    c[ImGuiCol_ButtonHovered] = ImVec4(accent.x, accent.y, accent.z, 0.35f);
+    c[ImGuiCol_ButtonActive] = ImVec4(accent.x, accent.y, accent.z, 0.55f);
+    c[ImGuiCol_SliderGrab] = accent;
+    c[ImGuiCol_SliderGrabActive] = ImVec4(0.40f, 0.78f, 1.00f, 1.00f);
+    c[ImGuiCol_CheckMark] = accent;
+    c[ImGuiCol_Text] = ImVec4(0.92f, 0.94f, 0.97f, 1.00f);
+}
+
 namespace {
 constexpr float kPi = 3.14159265358979f;  // IM_PI lives in imgui_internal.h; keep our own
 enum class Icon { Play, Pause, Loop, Slideshow, Speaker, SpeakerMuted };
@@ -142,6 +189,56 @@ bool IconButton(const char* id, Icon kind, float size, bool active = false,
         }
     }
     return ImGui::IsItemClicked();
+}
+
+// A media-player scrubber: a THIN track with a round knob, not ImGui's
+// SliderFloat. A SliderFloat is a full-height frame widget (FontSize +
+// FramePadding.y*2), so at any legible font size it renders as a fat bar — and at
+// touch scale it dominates the transport. This draws a slim track while keeping
+// the HIT area a full row tall, so it stays easy to grab with a finger.
+//
+// Returns true on a value change; `outActive` reports the held state. Both have
+// exactly the semantics the caller's scrub machine expects from SliderFloat.
+bool ScrubBar(const char* id, float* v, float vmax, float width, bool* outActive) {
+    if (width < 8.0f) width = 8.0f;
+    const float rowH = ImGui::GetFrameHeight();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+
+    ImGui::InvisibleButton(id, ImVec2(width, rowH));
+    const bool active = ImGui::IsItemActive();
+    const bool hovered = ImGui::IsItemHovered();
+    *outActive = active;
+
+    bool changed = false;
+    if (active) {
+        const float t = (ImGui::GetIO().MousePos.x - p.x) / width;
+        const float nv = std::min(1.0f, std::max(0.0f, t)) * vmax;
+        if (nv != *v) {
+            *v = nv;
+            changed = true;
+        }
+    }
+
+    const float frac = (vmax > 0.0f) ? std::min(1.0f, std::max(0.0f, *v / vmax)) : 0.0f;
+    const float cy = p.y + rowH * 0.5f;
+    // Track thickness scales with the row so the touch build stays proportionate,
+    // but stays genuinely thin.
+    const float th = std::max(3.0f, rowH * 0.085f);
+    const float knobR = th * ((hovered || active) ? 2.2f : 1.7f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Unplayed track, then the played portion in the accent colour.
+    dl->AddRectFilled(ImVec2(p.x, cy - th * 0.5f), ImVec2(p.x + width, cy + th * 0.5f),
+                      ImGui::GetColorU32(ImGuiCol_FrameBg), th * 0.5f);
+    if (frac > 0.0f) {
+        dl->AddRectFilled(ImVec2(p.x, cy - th * 0.5f), ImVec2(p.x + width * frac, cy + th * 0.5f),
+                          ImGui::GetColorU32(ImGuiCol_SliderGrab), th * 0.5f);
+    }
+    dl->AddCircleFilled(ImVec2(p.x + width * frac, cy),
+                        knobR,
+                        ImGui::GetColorU32(active ? ImGuiCol_SliderGrabActive
+                                                  : ImGuiCol_SliderGrab));
+    return changed;
 }
 
 void Fire(const std::function<void()>& fn) { if (fn) fn(); }
@@ -248,12 +345,17 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 ImGui::Text("%s", cur);
                 ImGui::SameLine();
                 // Leave room on the right for the total-time label + mute + loop icons.
+                // Derived from the live style rather than a magic constant, so the
+                // touch build spaces correctly instead of crowding the total time.
+                const ImGuiStyle& st = ImGui::GetStyle();
                 const int rightIcons = (s.caps.mute ? 1 : 0) + (s.caps.loop ? 1 : 0);
-                const float rightW =
-                    ImGui::CalcTextSize(tot).x + (float)rightIcons * iconSz + 36.0f;
-                ImGui::SetNextItemWidth(-rightW);
-                const bool changed = ImGui::SliderFloat("##scrub", &s.scrubValue, 0.0f, dur, "");
-                const bool active = ImGui::IsItemActive();
+                const float rightW = ImGui::CalcTextSize(tot).x +
+                                     (float)rightIcons * (iconSz * s.hitTargetScale) +
+                                     (float)(rightIcons + 2) * st.ItemSpacing.x +
+                                     st.WindowPadding.x;
+                bool active = false;
+                const bool changed = ScrubBar("##scrub", &s.scrubValue, dur,
+                                              ImGui::GetContentRegionAvail().x - rightW, &active);
                 const float scrubDelta = std::fabs(s.scrubValue - s.lastScrubValue);
                 if (changed) {
                     // Fast sweep -> keyframe preview (responsive); slow/fine drag -> exact
@@ -317,6 +419,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
 
 #else  // !MEDIAPLAYER_WITH_IMGUI
 
+void ApplyMediaPlayerStyle(float) {}
 void BuildTransportUI(TransportState&, const TransportActions&) {}
 
 #endif

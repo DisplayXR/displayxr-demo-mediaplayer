@@ -82,7 +82,18 @@ class MainActivity : NativeActivity() {
     // Raw touch (normalized coords) → native hit-tests the on-screen transport
     // bar (play/pause, scrub, load). Returns 1 when the Load button was tapped —
     // only Java can launch the system file picker.
-    private external fun nativeTouch(action: Int, nx: Float, ny: Float): Int
+    private external fun nativeTouch(action: Int, nx: Float, ny: Float)
+
+    /**
+     * Polled once per Choreographer frame. True means native wants the SAF picker
+     * (only Java can launch ACTION_OPEN_DOCUMENT). Poll-don't-push, matching
+     * nativeGetWindowLayoutRequest: a JNI callback into an app class is
+     * classloader-fragile from a NativeActivity thread (runtime#507).
+     *
+     * Native decides this AFTER Dear ImGui has processed the frame's input, so a
+     * tap that landed on a widget never also reaches the content.
+     */
+    private external fun nativeTakeOpenPickerRequest(): Boolean
 
     // Picker dismissed without a selection — native resumes the previous asset
     // (it blanks the scene while a pick is pending to avoid a stale-frame flash).
@@ -145,6 +156,11 @@ class MainActivity : NativeActivity() {
         override fun doFrame(frameTimeNanos: Long) {
             if (!rectPollRunning) return
             sampleWindowRect()
+            try {
+                if (nativeTakeOpenPickerRequest()) openVideoPicker()
+            } catch (_: Throwable) {
+                // Native lib not bound yet; the next frame retries.
+            }
             Choreographer.getInstance().postFrameCallback(this)
         }
     }
@@ -224,11 +240,17 @@ class MainActivity : NativeActivity() {
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         if (event.pointerCount >= 1) {
-            val dm = resources.displayMetrics
-            val nx = event.x / dm.widthPixels.toFloat()
-            val ny = event.y / dm.heightPixels.toFloat()
+            // Normalize by the WINDOW, not the display. Under the runtime's
+            // mini-window layout hint (#1396) the window is smaller than the
+            // display and TOP|START-anchored, so displayMetrics would compress
+            // every coordinate. The old coarse hit-bands tolerated that; the
+            // ImGui widgets do not. decorView equals the display when no hint
+            // is active, so this is correct in both cases.
+            val decor = window?.decorView
+            val w = (decor?.width ?: 0).takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+            val h = (decor?.height ?: 0).takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
             try {
-                if (nativeTouch(event.actionMasked, nx, ny) == 1) openVideoPicker()
+                nativeTouch(event.actionMasked, event.x / w.toFloat(), event.y / h.toFloat())
             } catch (_: Throwable) {
                 // Native lib not bound yet — ignore until it is.
             }

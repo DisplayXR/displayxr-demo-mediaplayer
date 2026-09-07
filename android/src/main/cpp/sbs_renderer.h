@@ -60,12 +60,6 @@ struct SbsRenderer {
 		return planes_[0].view != VK_NULL_HANDLE || ahbActiveView_ != VK_NULL_HANDLE;
 	}
 
-	// Transport overlay (scrub bar + play/pause + load button + time), drawn
-	// into each eye at zero disparity (screen plane). progress in [0,1]. left/
-	// right are short time strings (e.g. "0:42"). Layout: transport_ui.h.
-	void setOverlay(bool visible, float progress, bool paused, const char *left,
-	                const char *right);
-
 	// Render the active mode's `viewCount` views into TILES of the single atlas
 	// image (size atlasW x atlasH) in ONE render pass, then blocks until the GPU
 	// finishes. Each view v occupies tile (v%cols, v/cols) sized renderW x
@@ -101,8 +95,6 @@ private:
 	};
 
 	const Target &targetFor(VkImage image, uint32_t w, uint32_t h);
-	bool initOverlayPipeline();
-	void drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h);
 	uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
 	bool ensurePlane(int idx, uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel);
 	void recordPlaneCopy(VkCommandBuffer cmd, int idx, const uint8_t *src, uint32_t w,
@@ -180,21 +172,4 @@ private:
 
 	std::unordered_map<VkImage, Target> targets_;
 
-	// 2D triangle overlay pipeline (transport bar geometry). Vertices are
-	// (vec2 NDC, vec4 RGBA); alpha-blended over the video. The vertex buffer is
-	// host-visible and rebuilt each drawOverlay (serialized by drawEye's
-	// per-eye fence wait, so the prior submit is done before we overwrite).
-	VkPipelineLayout ovPipeLayout_ = VK_NULL_HANDLE;
-	VkPipeline ovPipeline_ = VK_NULL_HANDLE;
-	VkBuffer ovVbo_ = VK_NULL_HANDLE;
-	VkDeviceMemory ovVboMem_ = VK_NULL_HANDLE;
-	void *ovVboMapped_ = nullptr;
-	uint32_t ovVboCapVerts_ = 0;
-
-	// Transport overlay state (set per frame from main).
-	bool ovVisible_ = false;
-	float ovProgress_ = 0.0f;
-	bool ovPaused_ = false;
-	char ovLeft_[12] = {0};
-	char ovRight_[12] = {0};
 };

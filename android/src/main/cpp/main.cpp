@@ -27,6 +27,11 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_display_info.h>  // display rendering-mode enumerate/request
 #include <openxr/XR_DXR_view_rig.h>      // minimal display rig (OOP valid-views contingency)
+// XrCompositionLayerWindowSpaceDXR — the shared window-space layer struct is
+// declared (ifndef-guarded) in the window-binding headers; the cocoa one is plain
+// C with no platform deps, so it serves as the decl source on Android. Same
+// approach as displayxr-demo-modelviewer's Android leg.
+#include <openxr/XR_DXR_cocoa_window_binding.h>
 
 // XR_DXR_android_surface_binding (runtime#1037, ADR-036 D2/D6). When the runtime
 // advertises it we hand it THIS activity's own ANativeWindow at xrCreateSession
@@ -58,7 +63,8 @@
 #include "sbs_renderer.h"
 #include "video_decoder.h"
 #include "audio_player.h"
-#include "transport_ui.h"
+#include "ui/ImGuiLayer.h"
+#include "ui/TransportUI.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
 #include "LifLoader.h"  // SHARED desktop LIF parser (src/media/, referenced by CMake)
 #include "MediaSource.h"   // SHARED layered stereo-layout resolver (#45)
@@ -138,6 +144,41 @@ VkPhysicalDevice g_vk_phys_device = VK_NULL_HANDLE;
 VkDevice g_vk_device = VK_NULL_HANDLE;
 VkQueue g_vk_queue = VK_NULL_HANDLE;
 uint32_t g_vk_queue_family = UINT32_MAX;
+
+// ── Dear ImGui HUD ───────────────────────────────────────────────────────────
+// The player's chrome is the SAME code the desktop runs (src/ui/TransportUI.cpp),
+// rendered into its own swapchain and handed to the runtime as a window-space
+// layer — the model modelviewer/avatar already ship on Android. Sized to the
+// per-eye TILE and submitted at x=0,y=0,w=1,h=1: the runtime's placement
+// fractions are of the tile and it ignores subImage.imageRect, so the desktop's
+// fixed 1920x1080 + aspect-fit rect would put the transport bar a third of the
+// way down the screen in portrait.
+XrSwapchain g_hud_swapchain = XR_NULL_HANDLE;
+std::vector<XrSwapchainImageVulkanKHR> g_hud_xr_images;
+std::vector<VkImage> g_hud_vk_images;
+uint32_t g_hud_w = 0, g_hud_h = 0;
+VkFormat g_hud_format = VK_FORMAT_UNDEFINED;
+bool g_hud_ready = false;
+mp::ImGuiLayer g_imgui;
+mp::ui::TransportState g_ui_state;
+mp::ui::TransportActions g_ui_actions;
+// Set once if the runtime rejects the window-space layer. Suppresses the layer AND
+// the per-frame acquire, and re-arms the legacy "tap anywhere opens the picker"
+// gesture so the app stays usable with no chrome.
+std::atomic<bool> g_ws_layer_unsupported{false};
+// A tap that ImGui did not consume asks Java for the SAF picker. Poll-don't-push:
+// the Kotlin side already polls per Choreographer frame for the window-layout
+// request (runtime#507 — JNI callbacks into app classes are classloader-fragile).
+std::atomic<bool> g_open_picker_request{false};
+// A clean tap (down+up with no drag) that is still waiting to be adjudicated
+// against ImGui's WantCaptureMouse on the render thread.
+std::atomic<bool> g_pending_tap{false};
+
+// Touch metric scale for the shared ImGui style. The ONE sanctioned divergence
+// from the desktop: it scales padding/grab sizes only — colours, rounding and every
+// icon are identical, so this is the same design at finger size, not a second one.
+// Override on-device with `setprop debug.dxr.mp.ui_scale 1.8` (no rebuild).
+constexpr float kTouchUiScale = 1.6f;
 
 XrSession g_session = XR_NULL_HANDLE;
 XrSessionState g_session_state = XR_SESSION_STATE_UNKNOWN;
@@ -1128,6 +1169,178 @@ active_tile_dims(uint32_t *render_w, uint32_t *render_h, uint32_t *cols, uint32_
 // Create the SINGLE tiled-atlas swapchain, sized worst-case over all modes AND
 // both orientations (the swapchain is never recreated on rotation, so it must
 // hold either orientation's largest tile layout; each frame renders a
+// Refresh the shared UI state from live player state. Everything the widgets read
+// is plain data — see src/ui/TransportUI.h for the ownership rules (the scrub block
+// belongs to the widget code and must not be written here).
+void
+fill_transport_state()
+{
+	static int64_t s_last_ns = 0;
+	const int64_t now = now_ns();
+	const double dt = s_last_ns ? (double)(now - s_last_ns) / 1e9 : 0.0;
+	s_last_ns = now;
+
+	g_ui_state.hasMedia = g_scene_loaded.load(std::memory_order_relaxed);
+	g_ui_state.isVideo = g_is_video;
+	{
+		// SAF DISPLAY_NAME — already a basename, so no path work is needed here.
+		std::lock_guard<std::mutex> lk(g_pick_name_mx);
+		g_ui_state.mediaFilename = g_pick_name;
+	}
+	g_ui_state.layoutName = mp::MediaSource::LayoutName(g_layout);
+	g_ui_state.positionSeconds = g_is_video ? g_video.positionSeconds() : 0.0;
+	g_ui_state.durationSeconds = g_is_video ? g_video.durationSeconds() : 0.0;
+	g_ui_state.paused = g_is_video ? g_video.paused() : true;
+
+	// Auto-hide: visible while paused or shortly after a touch. The fade itself is
+	// the shared one, so Android now eases in/out like the desktop instead of the
+	// old hard on/off.
+	const bool awake =
+	    (g_is_video && g_video.paused()) ||
+	    (now - g_ui_interaction_ns.load(std::memory_order_relaxed)) < kOverlayHideAfterNs;
+	mp::ui::TickTransportUI(g_ui_state, dt, awake);
+}
+
+// Create (or recreate) the HUD swapchain at the current per-eye tile size, and
+// point ImGui at it. Mirrors XrSession::CreateHudSwapchain on the desktop leg.
+// Non-fatal: a failure just means no chrome this session.
+bool
+create_hud_swapchain()
+{
+	uint32_t render_w = 0, render_h = 0, cols = 0, rows = 0;
+	active_tile_dims(&render_w, &render_h, &cols, &rows);
+	if (render_w == 0 || render_h == 0) {
+		return false;
+	}
+
+	uint32_t format_count = 0;
+	if (xrEnumerateSwapchainFormats(g_session, 0, &format_count, nullptr) != XR_SUCCESS ||
+	    format_count == 0) {
+		return false;
+	}
+	std::vector<int64_t> formats(format_count);
+	if (xrEnumerateSwapchainFormats(g_session, format_count, &format_count, formats.data()) !=
+	    XR_SUCCESS) {
+		return false;
+	}
+	// Prefer R8G8B8A8_UNORM (VK 37) — straight alpha, matches the desktop HUD.
+	int64_t fmt = formats[0];
+	for (int64_t f : formats) {
+		if (f == 37) {
+			fmt = f;
+			break;
+		}
+	}
+
+	XrSwapchainCreateInfo ci = {};
+	ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	ci.format = fmt;
+	ci.sampleCount = 1;
+	ci.width = render_w;
+	ci.height = render_h;
+	ci.faceCount = 1;
+	ci.arraySize = 1;
+	ci.mipCount = 1;
+	XrSwapchain sc = XR_NULL_HANDLE;
+	if (xrCreateSwapchain(g_session, &ci, &sc) != XR_SUCCESS) {
+		LOGW("HUD swapchain creation failed — no ImGui chrome this session");
+		return false;
+	}
+
+	uint32_t image_count = 0;
+	xrEnumerateSwapchainImages(sc, 0, &image_count, nullptr);
+	std::vector<XrSwapchainImageVulkanKHR> images(image_count);
+	for (auto &im : images) {
+		im.type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+		im.next = nullptr;
+	}
+	if (xrEnumerateSwapchainImages(sc, image_count, &image_count,
+	                               (XrSwapchainImageBaseHeader *)images.data()) != XR_SUCCESS ||
+	    image_count == 0) {
+		xrDestroySwapchain(sc);
+		return false;
+	}
+
+	if (g_hud_swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(g_hud_swapchain);
+	}
+	g_hud_swapchain = sc;
+	g_hud_xr_images = std::move(images);
+	g_hud_vk_images.clear();
+	for (const auto &im : g_hud_xr_images) {
+		g_hud_vk_images.push_back(im.image);
+	}
+	g_hud_w = render_w;
+	g_hud_h = render_h;
+	g_hud_format = (VkFormat)fmt;
+	LOGI("HUD swapchain: %ux%u, %u images, format=%lld", g_hud_w, g_hud_h, image_count,
+	     (long long)fmt);
+	return true;
+}
+
+// Bring up the shared ImGui chrome. `debug.dxr.mp.ws_ui=0` disables it (the same
+// kill-switch modelviewer ships), leaving a bare projection layer.
+bool
+hud_init()
+{
+	char prop[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.mp.ws_ui", prop) > 0 && prop[0] == '0') {
+		LOGI("ImGui HUD disabled by debug.dxr.mp.ws_ui=0");
+		return false;
+	}
+	if (!create_hud_swapchain()) {
+		return false;
+	}
+	if (!g_imgui.Init(nullptr, g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
+	                  g_vk_queue_family, g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images)) {
+		LOGW("ImGuiLayer init failed — no chrome this session");
+		xrDestroySwapchain(g_hud_swapchain);
+		g_hud_swapchain = XR_NULL_HANDLE;
+		return false;
+	}
+	// The ONE sanctioned divergence from the desktop: metrics scale for fingers.
+	// Colours, rounding and every icon are identical — see ApplyMediaPlayerStyle.
+	float ui_scale = kTouchUiScale;
+	char sprop[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.mp.ui_scale", sprop) > 0) {
+		const float v = (float)atof(sprop);
+		if (v > 0.5f && v < 4.0f) ui_scale = v;
+	}
+	mp::ui::ApplyMediaPlayerStyle(ui_scale);
+
+	// Android can't back these: slideshow and prev/next need to enumerate a folder,
+	// and SAF hands us a file descriptor, not a path. Hidden, not disabled — a
+	// permanently dead button reads as broken rather than absent.
+	g_ui_state.caps.slideshow = false;
+	// Wired in follow-ups (see the tracking issue): mute needs a PCM gate in
+	// AudioPlayer, loop needs a flag in the Android VideoDecoder, and Mode needs a
+	// RENDERING_MODE_CHANGED handler before it is safe to retile mid-session.
+	g_ui_state.caps.mute = false;
+	g_ui_state.caps.loop = false;
+	g_ui_state.caps.mode = false;
+	g_ui_state.caps.layout = false;
+	g_ui_state.hitTargetScale = 1.35f;
+
+	g_ui_actions.Open = [] { g_open_picker_request.store(true, std::memory_order_relaxed); };
+	g_ui_actions.TogglePlayback = [] {
+		g_video.togglePaused();
+		g_audio.setPaused(g_video.paused());  // mirror play/pause to audio
+	};
+	// AMediaExtractor has no cheap keyframe-preview mode here, so `preview` is
+	// ignored; the shared machine's follow-up exact seek is idempotent.
+	g_ui_actions.Seek = [](float sec, bool /*preview*/) { g_video.seekTo((double)sec); };
+	g_ui_actions.ScrubReleased = [](float sec) {
+		g_video.seekTo((double)sec);
+		g_audio.seekTo((double)sec);
+	};
+
+	g_hud_ready = true;
+	LOGI("ImGui HUD ready (%ux%u, scale %.2f) — shared chrome with the desktop leg",
+	     g_hud_w, g_hud_h, ui_scale);
+	return true;
+}
+
 // per-orientation sub-rect via active_tile_dims). Mirrors
 // cube_handle_vk_android::create_swapchains.
 bool
@@ -1624,20 +1837,8 @@ render_frame()
 				g_scene_loaded.store(true, std::memory_order_relaxed);
 			}
 		}
-		// Transport overlay (scrub bar + play/pause + load + time).
-		const double pos = g_video.positionSeconds();
-		const double dur = g_video.durationSeconds();
-		char left[12], right[12];
-		fmt_time(pos, left);
-		fmt_time(dur, right);
-		// Auto-hide while playing: show if paused or recently touched.
-		const bool show =
-		    g_video.paused() ||
-		    (now_ns() - g_ui_interaction_ns.load(std::memory_order_relaxed)) < kOverlayHideAfterNs;
-		g_sbs.setOverlay(show, dur > 0.0 ? (float)(pos / dur) : 0.0f, g_video.paused(), left,
-		                 right);
-	} else {
-		g_sbs.setOverlay(false, 0.0f, false, "", "");  // image: no transport
+		// The transport chrome is the shared ImGui HUD now (fill_transport_state
+		// + BuildTransportUI below); nothing to push into the content renderer.
 	}
 	PROF_MARK(PROF_UPLOAD);
 
@@ -1753,22 +1954,101 @@ render_frame()
 		}
 	}
 
+	// ── ImGui chrome ─────────────────────────────────────────────────────
+	// Same widget code as the desktop (ui::BuildTransportUI), rendered into the
+	// HUD swapchain and composited by the runtime as a window-space layer.
+	XrCompositionLayerWindowSpaceDXR hud_layer = {};
+	bool hud_active = false;
+	// "Available" is about whether the chrome EXISTS this session, not whether we
+	// drew it this frame — a frame the runtime told us to skip must not make the
+	// app forget it has an Open button.
+	const bool chrome_available = g_hud_ready && g_imgui.Ready() &&
+	                              !g_ws_layer_unsupported.load(std::memory_order_relaxed);
+	if (rendered && chrome_available) {
+		fill_transport_state();
+		// Skip the whole HUD path (and its blocking submit) when nothing is
+		// visible — steady playback must cost nothing. Same gate as the desktop.
+		const bool anything_visible = g_ui_state.fadeAlpha > 0.001f ||
+		                              g_ui_state.toastAlpha > 0.001f ||
+		                              g_ui_state.transitionAlpha > 0.001f;
+		if (anything_visible) {
+			XrSwapchainImageAcquireInfo hacq = {};
+			hacq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+			uint32_t hud_idx = 0;
+			if (xrAcquireSwapchainImage(g_hud_swapchain, &hacq, &hud_idx) == XR_SUCCESS) {
+				XrSwapchainImageWaitInfo hwait = {};
+				hwait.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
+				hwait.timeout = XR_INFINITE_DURATION;
+				if (xrWaitSwapchainImage(g_hud_swapchain, &hwait) == XR_SUCCESS) {
+					// The HUD IS the tile, so the remap is the identity rect.
+					g_imgui.BeginFrame((float)g_hud_w, (float)g_hud_h, 0.0f, 0.0f, 1.0f,
+					                   1.0f);
+					mp::ui::BuildTransportUI(g_ui_state, g_ui_actions);
+					g_imgui.RenderToHud(hud_idx);
+					hud_active = true;
+				}
+				// Always release what we acquired, even if the wait failed.
+				XrSwapchainImageReleaseInfo hrel = {};
+				hrel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
+				xrReleaseSwapchainImage(g_hud_swapchain, &hrel);
+			}
+		}
+	}
+
+	if (g_pending_tap.exchange(false, std::memory_order_relaxed)) {
+		// A clean tap. With chrome, ImGui has already had the event and either
+		// consumed it (a widget) or not — and "not" now just means "wake the
+		// chrome", which nativeTouch's interaction stamp already did. The old
+		// tap-anywhere-opens-the-picker gesture survives ONLY when there is no
+		// chrome to reach an Open button through.
+		if (!chrome_available && !g_is_video) {
+			g_open_picker_request.store(true, std::memory_order_relaxed);
+		}
+	}
+
 	XrCompositionLayerProjection projection_layer = {};
 	projection_layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
 	projection_layer.space = g_app_space;
 	projection_layer.viewCount = submit_views;
 	projection_layer.views = projection_views;
-	const XrCompositionLayerBaseHeader *layers[1] = {
-	    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection_layer)};
+	if (hud_active) {
+		hud_layer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
+		hud_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+		hud_layer.subImage.swapchain = g_hud_swapchain;
+		hud_layer.subImage.imageRect.offset = {0, 0};
+		hud_layer.subImage.imageRect.extent = {(int32_t)g_hud_w, (int32_t)g_hud_h};
+		hud_layer.subImage.imageArrayIndex = 0;
+		// Fractions of the per-eye tile; the HUD IS the tile, so fill it.
+		hud_layer.x = 0.0f;
+		hud_layer.y = 0.0f;
+		hud_layer.width = 1.0f;
+		hud_layer.height = 1.0f;
+		// Screen plane, matching the desktop's kHudDisparity — so a tap lands on the
+		// same pixel in both eyes, and the bar's perceived depth is unchanged from
+		// the old in-tile overlay.
+		hud_layer.disparity = 0.0f;
+	}
+	const XrCompositionLayerBaseHeader *layers[2] = {
+	    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection_layer),
+	    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&hud_layer)};
 
 	XrFrameEndInfo end_info = {};
 	end_info.type = XR_TYPE_FRAME_END_INFO;
 	end_info.displayTime = frame_state.predictedDisplayTime;
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-	end_info.layerCount = rendered ? 1 : 0;
+	end_info.layerCount = rendered ? (hud_active ? 2u : 1u) : 0u;
 	end_info.layers = rendered ? layers : nullptr;
 	PROF_RESET();  // exclude the trivial projection-layer setup from 'end'
 	res = xrEndFrame(g_session, &end_info);
+	if (res == XR_ERROR_LAYER_INVALID && hud_active) {
+		// The runtime won't take a window-space layer from this session. Disable the
+		// chrome for the run and RESUBMIT without it — a skipped xrEndFrame would
+		// leave frame_started set and wedge the loop (the #1394 shape).
+		g_ws_layer_unsupported.store(true, std::memory_order_relaxed);
+		LOGW("window-space layer rejected by the runtime — ImGui chrome disabled this session");
+		end_info.layerCount = 1;
+		res = xrEndFrame(g_session, &end_info);
+	}
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrEndFrame", res);
 		return false;
@@ -1877,6 +2157,10 @@ bring_up(struct android_app *app)
 	    create_swapchains() &&
 	    create_reference_space() &&
 	    sbs_init();
+	if (ok) {
+		// Non-fatal: without it the app plays fine, just with no chrome.
+		hud_init();
+	}
 	if (!ok) {
 		LOGI("Bring-up failed; see logs.");
 		return false;
@@ -2091,80 +2375,61 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativePickCancelled(
 	g_pick_pending.store(false, std::memory_order_relaxed);
 }
 
-// Raw touch (normalized screen coords) hit-tested against the transport bar
-// (transport_ui.h). Returns 1 to ask Java to open the SAF picker (Load button
-// tapped — only Java can launch ACTION_OPEN_DOCUMENT); 0 otherwise. The button
-// toggles pause, the bar seeks (tap or drag = absolute), and a tap on the video
-// also toggles pause. Decoder methods are thread-safe.
-extern "C" JNIEXPORT jint JNICALL
+// Raw touch, normalized to the WINDOW (not the display — see MainActivity).
+//
+// This runs on the Android UI thread while ImGui is driven from the render thread,
+// so it must NEVER touch ImGui state: it only enqueues into ImGuiLayer's
+// thread-safe pointer queue and records that a clean tap is pending. The render
+// thread adjudicates the tap against WantCaptureMouse() once ImGui has processed
+// the frame — that is what stops a tap on a widget ALSO firing the content gesture.
+//
+// Returns void: the SAF picker is now requested through g_open_picker_request and
+// polled by Java per Choreographer frame, the same poll-don't-push shape the
+// window-layout request already uses (runtime#507 — JNI callbacks into app classes
+// are classloader-fragile).
+extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
     JNIEnv * /*env*/, jobject /*thiz*/, jint action, jfloat nx, jfloat ny)
 {
-	static tui::Region downRegion = tui::Region::None;
 	static bool moved = false;
 	static float downX = 0.0f, downY = 0.0f;
 	constexpr int kDown = 0, kUp = 1, kMove = 2;
-	if (!g_is_video) {
-		// Image mode has no transport bar — any clean tap opens the picker.
-		if (action == kDown) {
-			downX = nx;
-			downY = ny;
-			moved = false;
-		} else if (action == kMove) {
-			if (std::fabs(nx - downX) + std::fabs(ny - downY) > 0.01f) moved = true;
-		} else if (action == kUp && !moved) {
-			LOGI("touch UP on image -> open picker");
-			g_pick_pending.store(true, std::memory_order_relaxed);
-			return 1;
-		}
-		return 0;
-	}
-	g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);  // re-reveal + keep controls up
 
-	auto seekBar = [&](float x) {
-		const double frac = tui::barFraction(x);
-		const double t = frac * g_video.durationSeconds();
-		g_video.seekTo(t);
-		g_audio.seekTo(t);  // keep audio in lockstep with the scrub
-		LOGI("transport: seek -> %.1fs (%.0f%%)", t, frac * 100.0);
-	};
-	auto togglePause = [&]() {
-		g_video.togglePaused();
-		g_audio.setPaused(g_video.paused());  // mirror play/pause to audio
-		LOGI("transport: %s @ %.1fs", g_video.paused() ? "PAUSE" : "PLAY",
-		     g_video.positionSeconds());
-	};
+	g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);  // re-reveal the chrome
 
 	if (action == kDown) {
 		downX = nx;
 		downY = ny;
 		moved = false;
-		downRegion = tui::hit(nx, ny);
-		const char *rn = downRegion == tui::Region::Button  ? "Button"
-		                 : downRegion == tui::Region::Bar    ? "Bar"
-		                 : downRegion == tui::Region::Load   ? "Load"
-		                                                     : "None";
-		LOGI("touch DOWN (%.3f,%.3f) -> %s", (double)nx, (double)ny, rn);
-		if (downRegion == tui::Region::Bar) seekBar(nx);
 	} else if (action == kMove) {
 		if (std::fabs(nx - downX) + std::fabs(ny - downY) > 0.01f) moved = true;
-		if (downRegion == tui::Region::Bar) seekBar(nx);
-	} else if (action == kUp) {
-		const tui::Region r = downRegion;
-		downRegion = tui::Region::None;
-		if (r == tui::Region::Button) {
-			togglePause();
-		} else if (r == tui::Region::Load) {
-			LOGI("touch UP -> Load (open picker)");
-			g_pick_pending.store(true, std::memory_order_relaxed);
-			return 1;  // Java opens the picker
-		} else if (r == tui::Region::None && !moved) {
-			// Tap on the video area only reveals the transport bar (the
-			// g_ui_interaction_ns store above already did that) — playback
-			// continues; pause is the bar's button only.
-		}
 	}
-	return 0;
+
+	// Feed ImGui in HUD pixels. The HUD covers the whole per-eye tile, so the window
+	// fraction maps straight onto it.
+	if (g_hud_ready && !g_ws_layer_unsupported.load(std::memory_order_relaxed)) {
+		g_imgui.PushPointer((int)action, nx * (float)g_hud_w, ny * (float)g_hud_h);
+	}
+
+	if (action == kUp && !moved) {
+		// A clean tap. Whether it belongs to the chrome or the content is decided
+		// on the render thread, where ImGui state is safe to read.
+		g_pending_tap.store(true, std::memory_order_relaxed);
+	}
+}
+
+// Java polls this once per Choreographer frame; a true result means "launch
+// ACTION_OPEN_DOCUMENT" (only Java can). Consumed on read.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTakeOpenPickerRequest(
+    JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	if (g_open_picker_request.exchange(false, std::memory_order_relaxed)) {
+		g_pick_pending.store(true, std::memory_order_relaxed);
+		LOGI("open picker requested");
+		return JNI_TRUE;
+	}
+	return JNI_FALSE;
 }
 
 extern "C" void
