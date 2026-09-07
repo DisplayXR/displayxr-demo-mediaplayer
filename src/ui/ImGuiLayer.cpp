@@ -2,6 +2,7 @@
 #include "ui/ImGuiLayer.h"
 
 #include "Log.h"
+#include "ui/TransportUI.h"
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include <cfloat>
@@ -55,36 +56,6 @@ LRESULT CALLBACK MouseCaptureWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 }
 #endif  // _WIN32 && MEDIAPLAYER_IMGUI_SDL
 
-// Polished "dark glass" look: generous rounding, padded controls, faint translucent
-// surfaces, one cyan accent. Centralizes all styling so the per-widget code stays clean.
-void ApplyMediaPlayerStyle() {
-    ImGui::StyleColorsDark();
-    ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding = 16.0f;
-    s.FrameRounding = 10.0f;
-    s.GrabRounding = 10.0f;
-    s.PopupRounding = 10.0f;
-    s.WindowBorderSize = 0.0f;
-    s.FrameBorderSize = 0.0f;
-    s.WindowPadding = ImVec2(18, 14);
-    s.FramePadding = ImVec2(14, 9);
-    s.ItemSpacing = ImVec2(12, 10);
-    s.GrabMinSize = 18.0f;
-
-    const ImVec4 accent(0.20f, 0.65f, 1.00f, 1.00f);
-    ImVec4* c = s.Colors;
-    c[ImGuiCol_WindowBg] = ImVec4(0.05f, 0.06f, 0.08f, 0.62f);
-    c[ImGuiCol_FrameBg] = ImVec4(1.0f, 1.0f, 1.0f, 0.06f);
-    c[ImGuiCol_FrameBgHovered] = ImVec4(1.0f, 1.0f, 1.0f, 0.12f);
-    c[ImGuiCol_FrameBgActive] = ImVec4(1.0f, 1.0f, 1.0f, 0.16f);
-    c[ImGuiCol_Button] = ImVec4(1.0f, 1.0f, 1.0f, 0.07f);
-    c[ImGuiCol_ButtonHovered] = ImVec4(accent.x, accent.y, accent.z, 0.35f);
-    c[ImGuiCol_ButtonActive] = ImVec4(accent.x, accent.y, accent.z, 0.55f);
-    c[ImGuiCol_SliderGrab] = accent;
-    c[ImGuiCol_SliderGrabActive] = ImVec4(0.40f, 0.78f, 1.00f, 1.00f);
-    c[ImGuiCol_CheckMark] = accent;
-    c[ImGuiCol_Text] = ImVec4(0.92f, 0.94f, 0.97f, 1.00f);
-}
 } // namespace
 
 ImGuiLayer::~ImGuiLayer() { Shutdown(); }
@@ -233,7 +204,8 @@ bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice 
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;  // don't litter an imgui.ini next to the binary
     io.FontGlobalScale = 1.9f;  // legible against the 1920x1080 HUD canvas (downscaled to window)
-    ApplyMediaPlayerStyle();
+    // Default (desktop) metrics; a touch leg re-applies with its own scale after Init.
+    ui::ApplyMediaPlayerStyle(1.0f);
 
 #if defined(MEDIAPLAYER_IMGUI_SDL)
     if (!ImGui_ImplSDL3_InitForVulkan((SDL_Window*)nativeWindow)) {
