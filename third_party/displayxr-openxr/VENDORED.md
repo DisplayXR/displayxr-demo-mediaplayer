@@ -20,13 +20,14 @@ Pinned commit: `f1347340ea0dcc5d24da2f228b59d63441ca3ec7`
 (`19c4e014f linux(#660): Phase 3a — XR_DXR_xlib_window_binding`).
 
 `XR_DXR_android_surface_binding.h` is pinned newer still, from
-`2224d9ec2444059cffdc99ccfe3d2805f0dad56a` — **spec v2**, which adds the
+`b662acb184ef4464f60440f47faf9f6796c44dd4` — **spec v2**, which adds the
 `XrEventDataAndroidWindowLayoutHintDXR` mini-window layout hint (runtime#1396).
 
 > ⚠️ That commit is the tip of the **unmerged** runtime PR branch
-> `feat/1396-android-window-layout-hint`, not a commit on `main`. **Re-pin this
-> one header to the merge commit once that PR lands**, and re-copy it in case the
-> struct changed in review. Nothing else in this directory moved.
+> `feat/1396-android-window-layout-hint` (DisplayXR/displayxr-runtime#1398), not a
+> commit on `main`. **Re-pin this one header to the merge commit once that PR
+> lands**, and re-copy it in case the struct changed in review. Nothing else in
+> this directory moved.
 
 > When `DisplayXR/displayxr-extensions` is published as a standalone repo, re-pin
 > from there (FetchContent or a vendored snapshot) instead of the runtime tree.
