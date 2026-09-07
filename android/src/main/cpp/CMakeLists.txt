@@ -32,6 +32,29 @@ FetchContent_Declare(nlohmann_json
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(nlohmann_json)
 
+# ── Dear ImGui — SAME TAG as the desktop build (top-level CMakeLists.txt) ──
+# The player's chrome is shared verbatim with the desktop legs (src/ui/TransportUI.cpp),
+# so the two can't drift. Backends: imgui_impl_vulkan ONLY.
+#   NOT imgui_impl_sdl3    — there is no SDL on Android.
+#   NOT imgui_impl_android — it reads AInputEvent from the NativeActivity input queue,
+#                            which this app never receives (the runtime's overlay covers
+#                            the window; touch arrives via dispatchTouchEvent -> JNI).
+#                            Input is fed by hand through ImGuiLayer::PushPointer().
+# No font asset: ImGui's embedded font is what the desktop uses too (only FontGlobalScale
+# is set), so typography matches with zero packaging changes.
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.91.5
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(imgui)
+set(MP_IMGUI_DIR "${imgui_SOURCE_DIR}")
+set(MP_IMGUI_SOURCES
+    ${MP_IMGUI_DIR}/imgui.cpp
+    ${MP_IMGUI_DIR}/imgui_draw.cpp
+    ${MP_IMGUI_DIR}/imgui_tables.cpp
+    ${MP_IMGUI_DIR}/imgui_widgets.cpp
+    ${MP_IMGUI_DIR}/backends/imgui_impl_vulkan.cpp)
+
 # ── SBS blit + overlay shaders → SPIR-V header arrays ─────────────────────
 # var name = <name>_<stage>_data, header = <name>.<stage>.h (matches the
 # #includes in sbs_renderer.cpp). fullscreen.vert + sbs.frag come from the
@@ -79,6 +102,11 @@ add_library(mediaplayer_vk_android SHARED
     #    StereoCompose.cpp holds ComposeSbs + EstimateAutoConvergence, which LifLoader
     #    calls; they were factored out of LifLoader.cpp when MPO started sharing them
     #    (#45), so this target needs the extra TU or the link fails on both symbols.
+    #
+    #    ***THE RULE, GENERALLY***: this list names files individually and does NOT glob.
+    #    Add or split ANY .cpp under ${REPO_ROOT}/src that this target uses and you must
+    #    add it here too, or the Android link fails with `undefined symbol` while every
+    #    desktop CI job stays green (they compile whole directories). #45 is the scar.
     # Stereo-layout resolution, SHARED with the desktop (#45 layered detector):
     # filename > container metadata > content cross-correlation > aspect. Pure
     # C++ (Log.h + std only). The content layer's frames come from
@@ -90,6 +118,13 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/media/LifLoader.cpp
     ${REPO_ROOT}/src/media/StereoCompose.cpp
     ${REPO_ROOT}/src/media/ImageDecoder.cpp
+    # The player's Dear ImGui chrome, SHARED VERBATIM with the desktop legs. This is
+    # what makes the Android UI the same UI rather than a lookalike. ImGuiLayer builds
+    # here WITHOUT MEDIAPLAYER_IMGUI_SDL, so its SDL3 platform backend compiles out and
+    # input is fed through ImGuiLayer::PushPointer().
+    ${REPO_ROOT}/src/ui/TransportUI.cpp
+    ${REPO_ROOT}/src/ui/ImGuiLayer.cpp
+    ${MP_IMGUI_SOURCES}
     ${SHADER_HEADERS})
 
 target_include_directories(mediaplayer_vk_android PRIVATE
@@ -98,10 +133,14 @@ target_include_directories(mediaplayer_vk_android PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/stb             # vendored stb_image.h (SBS image decode)
     ${REPO_ROOT}/src                            # Log.h (impl = lif_log_android.cpp)
     ${REPO_ROOT}/src/media                      # LifLoader.h, ImageDecoder.h, MediaSource.h
-    ${REPO_ROOT}/third_party/displayxr-openxr)  # DisplayXR XR_EXT_* headers
+    ${REPO_ROOT}/third_party/displayxr-openxr  # DisplayXR XR_EXT_* headers
+    ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)  # Dear ImGui + the Vulkan backend
 
 set_target_properties(mediaplayer_vk_android PROPERTIES
     LINK_FLAGS "-u ANativeActivity_onCreate")
+
+# WITH_IMGUI but deliberately NOT IMGUI_SDL — see the ImGui block above.
+target_compile_definitions(mediaplayer_vk_android PRIVATE MEDIAPLAYER_WITH_IMGUI=1)
 
 target_link_libraries(mediaplayer_vk_android
     native_app_glue

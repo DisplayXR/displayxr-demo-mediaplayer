@@ -5,14 +5,20 @@
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include <cfloat>
-
-#include <SDL3/SDL.h>
+#include <chrono>
 
 #include "imgui.h"
-#include "imgui_impl_sdl3.h"
 #include "imgui_impl_vulkan.h"
 
-#if defined(_WIN32)
+// Desktop only: SDL3 supplies the ImGui platform backend (input + dt). Android has no
+// platform backend at all — PushPointer() feeds input and dt is measured internally.
+#if defined(MEDIAPLAYER_IMGUI_SDL)
+#include <SDL3/SDL.h>
+#include "imgui_impl_sdl3.h"
+#endif
+
+// The Win32 cursor subclass is a strict subset of the SDL desktop path.
+#if defined(_WIN32) && defined(MEDIAPLAYER_IMGUI_SDL)
 #  define WIN32_LEAN_AND_MEAN
 #  define NOMINMAX
 #  include <windows.h>
@@ -30,7 +36,7 @@ void CheckVk(VkResult r) {
     if (r != VK_SUCCESS) LOG_ERROR("ImGuiLayer: VkResult=%d", (int)r);
 }
 
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(MEDIAPLAYER_IMGUI_SDL)
 // Read the cursor straight from the window message stream (like the Gauss/model Win32
 // demos): in workspace mode the runtime forwards a synthetic, content-space cursor via
 // WM_MOUSEMOVE, which is correct by construction — unlike SDL's clamped copy or the real
@@ -47,7 +53,7 @@ LRESULT CALLBACK MouseCaptureWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     }
     return CallWindowProc(g_originalWndProc, hwnd, msg, wp, lp);
 }
-#endif
+#endif  // _WIN32 && MEDIAPLAYER_IMGUI_SDL
 
 // Polished "dark glass" look: generous rounding, padded controls, faint translucent
 // surfaces, one cyan accent. Centralizes all styling so the per-widget code stays clean.
@@ -83,14 +89,10 @@ void ApplyMediaPlayerStyle() {
 
 ImGuiLayer::~ImGuiLayer() { Shutdown(); }
 
-bool ImGuiLayer::Init(SDL_Window* window, VkInstance instance, VkPhysicalDevice physicalDevice,
-                      VkDevice device, VkQueue queue, uint32_t queueFamily, VkFormat hudFormat,
-                      uint32_t hudWidth, uint32_t hudHeight,
-                      const std::vector<VkImage>& hudImages) {
-    if (hudImages.empty() || hudWidth == 0 || hudHeight == 0) return false;
-    sdlWindow_ = window;
-    device_ = device;
-    queue_ = queue;
+bool ImGuiLayer::CreateTargetObjects(VkFormat hudFormat, uint32_t hudWidth,
+                                     uint32_t hudHeight,
+                                     const std::vector<VkImage>& hudImages) {
+    DestroyTargetObjects();
     hudWidth_ = hudWidth;
     hudHeight_ = hudHeight;
 
@@ -154,6 +156,45 @@ bool ImGuiLayer::Init(SDL_Window* window, VkInstance instance, VkPhysicalDevice 
             return false;
         }
     }
+    return true;
+}
+
+void ImGuiLayer::DestroyTargetObjects() {
+    for (VkFramebuffer fb : framebuffers_) if (fb) vkDestroyFramebuffer(device_, fb, nullptr);
+    for (VkImageView iv : imageViews_) if (iv) vkDestroyImageView(device_, iv, nullptr);
+    framebuffers_.clear();
+    imageViews_.clear();
+    if (renderPass_) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
+}
+
+// Orientation change: the tile resized, so the HUD swapchain was recreated. Rebuild
+// only the target objects — the ImGui context, style and font atlas survive.
+bool ImGuiLayer::RecreateTarget(VkFormat hudFormat, uint32_t hudWidth, uint32_t hudHeight,
+                               const std::vector<VkImage>& hudImages) {
+    if (device_ == VK_NULL_HANDLE || hudImages.empty() || hudWidth == 0 || hudHeight == 0) {
+        return false;
+    }
+    vkDeviceWaitIdle(device_);
+    if (!CreateTargetObjects(hudFormat, hudWidth, hudHeight, hudImages)) {
+        LOG_ERROR("ImGuiLayer: RecreateTarget failed (%ux%u)", hudWidth, hudHeight);
+        return false;
+    }
+    LOG_INFO("ImGuiLayer: re-targeted to %ux%u (%zu images)", hudWidth, hudHeight,
+             hudImages.size());
+    return true;
+}
+
+bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice physicalDevice,
+                      VkDevice device, VkQueue queue, uint32_t queueFamily, VkFormat hudFormat,
+                      uint32_t hudWidth, uint32_t hudHeight,
+                      const std::vector<VkImage>& hudImages) {
+    if (hudImages.empty() || hudWidth == 0 || hudHeight == 0) return false;
+    nativeWindow_ = nativeWindow;
+    device_ = device;
+    queue_ = queue;
+
+    if (!CreateTargetObjects(hudFormat, hudWidth, hudHeight, hudImages)) return false;
+
 
     // --- Descriptor pool (font atlas + any user textures) and a command buffer/fence.
     VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16};
@@ -194,11 +235,19 @@ bool ImGuiLayer::Init(SDL_Window* window, VkInstance instance, VkPhysicalDevice 
     io.FontGlobalScale = 1.9f;  // legible against the 1920x1080 HUD canvas (downscaled to window)
     ApplyMediaPlayerStyle();
 
-    if (!ImGui_ImplSDL3_InitForVulkan(window)) {
+#if defined(MEDIAPLAYER_IMGUI_SDL)
+    if (!ImGui_ImplSDL3_InitForVulkan((SDL_Window*)nativeWindow)) {
         LOG_ERROR("ImGuiLayer: ImGui_ImplSDL3_InitForVulkan failed");
         ImGui::DestroyContext();
         return false;
     }
+#else
+    // No platform backend: we are the platform. Name ourselves so ImGui's asserts and
+    // any debug UI report something sane, and drive dt + input by hand (BeginFrame /
+    // PushPointer). ImGui needs no platform backend to function — only io fed correctly.
+    io.BackendPlatformName = "displayxr_touch";
+    io.MouseDrawCursor = false;
+#endif
     ImGui_ImplVulkan_InitInfo vi{};
     vi.Instance = instance;
     vi.PhysicalDevice = physicalDevice;
@@ -213,15 +262,17 @@ bool ImGuiLayer::Init(SDL_Window* window, VkInstance instance, VkPhysicalDevice 
     vi.CheckVkResultFn = CheckVk;
     if (!ImGui_ImplVulkan_Init(&vi)) {
         LOG_ERROR("ImGuiLayer: ImGui_ImplVulkan_Init failed");
+#if defined(MEDIAPLAYER_IMGUI_SDL)
         ImGui_ImplSDL3_Shutdown();
+#endif
         ImGui::DestroyContext();
         return false;
     }
     ImGui_ImplVulkan_CreateFontsTexture();
 
-#if defined(_WIN32)
-    if (sdlWindow_ && !g_originalWndProc) {
-        HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(sdlWindow_),
+#if defined(_WIN32) && defined(MEDIAPLAYER_IMGUI_SDL)
+    if (nativeWindow_ && !g_originalWndProc) {
+        HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties((SDL_Window*)nativeWindow_),
                                                  SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
         if (hwnd) {
             g_subclassedHwnd = hwnd;
@@ -239,6 +290,9 @@ bool ImGuiLayer::Init(SDL_Window* window, VkInstance instance, VkPhysicalDevice 
 }
 
 void ImGuiLayer::ProcessEvent(const void* sdlEvent) {
+#if !defined(MEDIAPLAYER_IMGUI_SDL)
+    (void)sdlEvent;  // no platform backend — input arrives via PushPointer()
+#else
     if (!ready_) return;
     const SDL_Event* e = static_cast<const SDL_Event*>(sdlEvent);
     // Track the cursor from MOTION events only. Button-event coords are unreliable for the
@@ -252,7 +306,7 @@ void ImGuiLayer::ProcessEvent(const void* sdlEvent) {
     // backend during pumping). The subclass updated g_wmMouse from the same WM_LBUTTONDOWN.
     if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_MOUSE_BUTTON_UP) {
         float mx = lastMouseX_, my = lastMouseY_;
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(MEDIAPLAYER_IMGUI_SDL)
         if (g_wmMouseX != LONG_MIN) { mx = (float)g_wmMouseX; my = (float)g_wmMouseY; }
 #endif
         if (remapRectW_ > 0.0f && remapRectH_ > 0.0f && remapDivW_ > 0.0f && remapDivH_ > 0.0f &&
@@ -263,16 +317,66 @@ void ImGuiLayer::ProcessEvent(const void* sdlEvent) {
         }
     }
     ImGui_ImplSDL3_ProcessEvent(e);
+#endif
 }
 
 void ImGuiLayer::BeginFrame(float winPointW, float winPointH,
                             float rectX, float rectY, float rectW, float rectH) {
     ImGui_ImplVulkan_NewFrame();
+#if defined(MEDIAPLAYER_IMGUI_SDL)
     ImGui_ImplSDL3_NewFrame();
+#endif
     ImGuiIO& io = ImGui::GetIO();
     // We render into the HUD image, not the window — drive ImGui at HUD resolution.
     io.DisplaySize = ImVec2((float)hudWidth_, (float)hudHeight_);
     io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+
+#if !defined(MEDIAPLAYER_IMGUI_SDL)
+    // No platform backend, so we own dt and input.
+    //
+    // dt: ImGui::NewFrame() asserts DeltaTime > 0, so clamp rather than trust the clock
+    // (the first frame has no previous sample, and a resume can produce a huge gap).
+    {
+        const double now = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now().time_since_epoch()).count();
+        double dt = (lastFrameSeconds_ < 0.0) ? (1.0 / 60.0) : (now - lastFrameSeconds_);
+        lastFrameSeconds_ = now;
+        if (!(dt > 0.001)) dt = 0.001;
+        if (dt > 0.25) dt = 0.25;
+        io.DeltaTime = (float)dt;
+    }
+
+    // Touch has no hover. Park the cursor off-screen on the frame AFTER a release, or
+    // the last-pressed widget stays hovered forever and WantCaptureMouse() never goes
+    // false again — which would swallow every subsequent tap on the content.
+    if (parkPointerNextFrame_) {
+        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        parkPointerNextFrame_ = false;
+    }
+
+    // Drain the pointer queue in arrival order. Position ALWAYS precedes the button
+    // event: on touch there is no prior hover, so the down event carries the first
+    // position ImGui ever sees for that widget (same lesson as the desktop path below).
+    {
+        std::vector<PointerEvent> events;
+        {
+            std::lock_guard<std::mutex> lock(pointerMutex_);
+            events.swap(pointerQueue_);
+        }
+        for (const PointerEvent& ev : events) {
+            io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+            io.AddMousePosEvent(ev.x, ev.y);
+            if (ev.action == 0) {
+                io.AddMouseButtonEvent(0, true);
+            } else if (ev.action == 1) {
+                io.AddMouseButtonEvent(0, false);
+                parkPointerNextFrame_ = true;
+            }
+        }
+    }
+    ImGui::NewFrame();
+    return;
+#else
 
     // Remap the cursor (window points) into HUD pixels via the layer's placement rect, and
     // queue it as the LAST mouse-position event before NewFrame so it overrides the SDL
@@ -281,9 +385,9 @@ void ImGuiLayer::BeginFrame(float winPointW, float winPointH,
     // GetClientRect gives the exact size the runtime scaled the cursor against. Off-Windows
     // (or if the HWND is unavailable) we fall back to the SDL point size.
     float remapW = winPointW, remapH = winPointH;
-#if defined(_WIN32)
-    if (sdlWindow_) {
-        HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(sdlWindow_),
+#if defined(_WIN32) && defined(MEDIAPLAYER_IMGUI_SDL)
+    if (nativeWindow_) {
+        HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties((SDL_Window*)nativeWindow_),
                                                  SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
         RECT rc{};
         if (hwnd && GetClientRect(hwnd, &rc)) {
@@ -298,7 +402,7 @@ void ImGuiLayer::BeginFrame(float winPointW, float winPointH,
         // content-space coords, like the Gauss Win32 demo) > SDL motion events > the poll.
         float mx = lastMouseX_, my = lastMouseY_;
         if (mx < 0.0f && my < 0.0f) SDL_GetMouseState(&mx, &my);
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(MEDIAPLAYER_IMGUI_SDL)
         if (g_wmMouseX != LONG_MIN) { mx = (float)g_wmMouseX; my = (float)g_wmMouseY; }
 #endif
         const float u = ((mx / remapW) - rectX) / rectW;
@@ -310,6 +414,15 @@ void ImGuiLayer::BeginFrame(float winPointW, float winPointH,
         remapDivW_ = remapW; remapDivH_ = remapH;
     }
     ImGui::NewFrame();
+#endif  // !MEDIAPLAYER_IMGUI_SDL
+}
+
+void ImGuiLayer::PushPointer(int action, float hudX, float hudY) {
+    std::lock_guard<std::mutex> lock(pointerMutex_);
+    // Bound the queue: if the render thread stalls we want the newest events, not an
+    // unbounded backlog of stale ones.
+    if (pointerQueue_.size() > 64) pointerQueue_.erase(pointerQueue_.begin());
+    pointerQueue_.push_back(PointerEvent{action, hudX, hudY});
 }
 
 void ImGuiLayer::RenderToHud(uint32_t imageIndex) {
@@ -351,7 +464,7 @@ bool ImGuiLayer::WantCaptureMouse() const {
 
 void ImGuiLayer::Shutdown() {
     if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(MEDIAPLAYER_IMGUI_SDL)
     if (g_originalWndProc && g_subclassedHwnd) {
         SetWindowLongPtr(g_subclassedHwnd, GWLP_WNDPROC, (LONG_PTR)g_originalWndProc);
         g_originalWndProc = nullptr;
@@ -360,28 +473,34 @@ void ImGuiLayer::Shutdown() {
 #endif
     if (ready_) {
         ImGui_ImplVulkan_Shutdown();
+#if defined(MEDIAPLAYER_IMGUI_SDL)
         ImGui_ImplSDL3_Shutdown();
+#endif
         ImGui::DestroyContext();
         ready_ = false;
     }
-    for (VkFramebuffer fb : framebuffers_) if (fb) vkDestroyFramebuffer(device_, fb, nullptr);
-    for (VkImageView iv : imageViews_) if (iv) vkDestroyImageView(device_, iv, nullptr);
-    framebuffers_.clear();
-    imageViews_.clear();
+    DestroyTargetObjects();
     if (fence_) { vkDestroyFence(device_, fence_, nullptr); fence_ = VK_NULL_HANDLE; }
     if (cmdPool_) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
     if (descPool_) { vkDestroyDescriptorPool(device_, descPool_, nullptr); descPool_ = VK_NULL_HANDLE; }
-    if (renderPass_) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
     device_ = VK_NULL_HANDLE;
 }
 
 #else  // !MEDIAPLAYER_WITH_IMGUI
 
 ImGuiLayer::~ImGuiLayer() {}
-bool ImGuiLayer::Init(SDL_Window*, VkInstance, VkPhysicalDevice, VkDevice, VkQueue, uint32_t,
+bool ImGuiLayer::Init(void*, VkInstance, VkPhysicalDevice, VkDevice, VkQueue, uint32_t,
                       VkFormat, uint32_t, uint32_t, const std::vector<VkImage>&) {
     return false;
 }
+bool ImGuiLayer::CreateTargetObjects(VkFormat, uint32_t, uint32_t, const std::vector<VkImage>&) {
+    return false;
+}
+void ImGuiLayer::DestroyTargetObjects() {}
+bool ImGuiLayer::RecreateTarget(VkFormat, uint32_t, uint32_t, const std::vector<VkImage>&) {
+    return false;
+}
+void ImGuiLayer::PushPointer(int, float, float) {}
 void ImGuiLayer::ProcessEvent(const void*) {}
 void ImGuiLayer::BeginFrame(float, float, float, float, float, float) {}
 void ImGuiLayer::RenderToHud(uint32_t) {}

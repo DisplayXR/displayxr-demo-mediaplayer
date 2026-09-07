@@ -102,8 +102,6 @@ constexpr float kHudDisparity = 0.0f;
 
 // Auto-hide / slideshow timing.
 constexpr double kIdleHideSeconds = 5.0;    // fade the UI out after this much inactivity
-constexpr double kFadeSeconds = 0.20;       // UI fade in/out duration
-constexpr double kToastFadeSeconds = 0.30;  // toast fade in/out duration
 constexpr double kStillSeconds = 5.0;       // slideshow: seconds to hold a still image
 constexpr double kTransitionSeconds = 0.40; // slideshow: dip-to-black half-duration
 // Scrub speed (video-seconds moved per UI frame) above which we show keyframes instead
@@ -243,7 +241,7 @@ bool App::Initialize(const char* mediaPath) {
     // Dear ImGui transport bar, rendered into the window-space HUD layer (M4). If it
     // can't init, RenderOneFrame falls back to the CPU-rasterized text HUD.
     if (xr_.HasHud()) {
-        if (imgui_.Init(window_.SdlWindow(), xr_.VkInstanceHandle(), xr_.PhysicalDevice(),
+        if (imgui_.Init((void*)window_.SdlWindow(), xr_.VkInstanceHandle(), xr_.PhysicalDevice(),
                         xr_.Device(), xr_.GraphicsQueue(), xr_.GraphicsQueueFamily(),
                         (VkFormat)xr_.HudFormat(), xr_.HudWidth(), xr_.HudHeight(),
                         xr_.HudImages())) {
@@ -613,8 +611,8 @@ void App::RenderOneFrame() {
     // nothing transient (toast / slideshow dip) needs to show.
     const bool wantHud =
         frame.shouldRender && xr_.HasHud() &&
-        (imguiReady ? (showHud_ || fadeAlpha_ > 0.001f || toastAlpha_ > 0.001f ||
-                       transitionAlpha_ > 0.001f)
+        (imguiReady ? (showHud_ || uiState_.fadeAlpha > 0.001f || uiState_.toastAlpha > 0.001f ||
+                       uiState_.transitionAlpha > 0.001f)
                     : showHud_);
     if (wantHud) {
         uint32_t cw = 0, ch = 0;
@@ -700,262 +698,47 @@ void App::RenderOneFrame() {
     UpdateFps();
 }
 
-#if defined(MEDIAPLAYER_WITH_IMGUI)
-namespace {
-constexpr float kPi = 3.14159265358979f;  // IM_PI lives in imgui_internal.h; keep our own
-enum class Icon { Play, Pause, Loop, Slideshow, Speaker, SpeakerMuted };
-
-// A borderless icon button: an invisible hit-target with a hand-drawn glyph centered
-// in it (no icon font needed). `active` tints it with the accent color (toggle-on);
-// hover brightens. Returns true on click. Glyph colors go through GetColorU32 so the
-// surrounding ImGui Alpha (the auto-hide fade) applies for free.
-bool IconButton(const char* id, Icon kind, float size, bool active = false) {
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton(id, ImVec2(size, size));
-    const bool hovered = ImGui::IsItemHovered();
-    const bool held = ImGui::IsItemActive();   // mouse held down — immediate press feedback
-    const ImVec2 c(p.x + size * 0.5f, p.y + size * 0.5f);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-
-    // Toggle state (accent) must read THROUGH hover — hover/press only brighten the base,
-    // they don't replace the accent, so an active toggle stays clearly cyan when hovered.
-    ImVec4 col = active ? ImVec4(0.20f, 0.65f, 1.00f, 1.0f)       // toggled on  -> accent
-                        : ImVec4(0.88f, 0.91f, 0.95f, 1.0f);      // off         -> light grey
-    if (held) col = active ? ImVec4(0.55f, 0.85f, 1.00f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
-    else if (hovered) col = active ? ImVec4(0.42f, 0.78f, 1.00f, 1.0f)
-                                   : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
-    const ImU32 u = ImGui::GetColorU32(col);
-    const float r = size * 0.30f;
-    const float th = size * 0.11f;
-
-    switch (kind) {
-        case Icon::Play: {
-            const float h = size * 0.30f;
-            dl->AddTriangleFilled(ImVec2(c.x - h * 0.7f, c.y - h),
-                                  ImVec2(c.x - h * 0.7f, c.y + h),
-                                  ImVec2(c.x + h, c.y), u);
-            break;
-        }
-        case Icon::Pause: {
-            const float bw = size * 0.13f, bh = size * 0.30f, gap = size * 0.10f;
-            dl->AddRectFilled(ImVec2(c.x - gap - bw, c.y - bh), ImVec2(c.x - gap, c.y + bh), u,
-                              th * 0.4f);
-            dl->AddRectFilled(ImVec2(c.x + gap, c.y - bh), ImVec2(c.x + gap + bw, c.y + bh), u,
-                              th * 0.4f);
-            break;
-        }
-        case Icon::Loop: {
-            // Two arcs forming a near-circle, with a small arrowhead at each open end.
-            dl->PathArcTo(c, r, kPi * 0.30f, kPi * 0.95f);
-            dl->PathStroke(u, 0, th);
-            dl->PathArcTo(c, r, kPi * 1.30f, kPi * 1.95f);
-            dl->PathStroke(u, 0, th);
-            const float ah = size * 0.13f;
-            const ImVec2 e1(c.x + r * std::cos(kPi * 0.95f), c.y + r * std::sin(kPi * 0.95f));
-            dl->AddTriangleFilled(ImVec2(e1.x - ah, e1.y), ImVec2(e1.x + ah * 0.4f, e1.y - ah),
-                                  ImVec2(e1.x + ah * 0.4f, e1.y + ah), u);
-            const ImVec2 e2(c.x + r * std::cos(kPi * 1.95f), c.y + r * std::sin(kPi * 1.95f));
-            dl->AddTriangleFilled(ImVec2(e2.x + ah, e2.y), ImVec2(e2.x - ah * 0.4f, e2.y - ah),
-                                  ImVec2(e2.x - ah * 0.4f, e2.y + ah), u);
-            break;
-        }
-        case Icon::Slideshow: {
-            // A photo frame with a small play triangle inside (auto-advancing stills).
-            dl->AddRect(ImVec2(c.x - r, c.y - r * 0.78f), ImVec2(c.x + r, c.y + r * 0.78f), u,
-                        size * 0.10f, 0, th * 0.8f);
-            const float h = size * 0.16f;
-            dl->AddTriangleFilled(ImVec2(c.x - h * 0.5f, c.y - h), ImVec2(c.x - h * 0.5f, c.y + h),
-                                  ImVec2(c.x + h, c.y), u);
-            break;
-        }
-        case Icon::Speaker:
-        case Icon::SpeakerMuted: {
-            // Body box + cone (triangle pointing right).
-            const float bx = -r * 0.35f;
-            dl->AddRectFilled(ImVec2(c.x - r * 0.95f, c.y - r * 0.30f),
-                              ImVec2(c.x + bx, c.y + r * 0.30f), u);
-            dl->AddTriangleFilled(ImVec2(c.x + bx, c.y - r * 0.62f),
-                                  ImVec2(c.x + bx, c.y + r * 0.62f), ImVec2(c.x + r * 0.25f, c.y), u);
-            if (kind == Icon::Speaker) {  // two sound-wave arcs
-                dl->PathArcTo(ImVec2(c.x + r * 0.1f, c.y), r * 0.58f, -kPi * 0.28f, kPi * 0.28f);
-                dl->PathStroke(u, 0, th * 0.7f);
-                dl->PathArcTo(ImVec2(c.x + r * 0.1f, c.y), r * 0.92f, -kPi * 0.28f, kPi * 0.28f);
-                dl->PathStroke(u, 0, th * 0.7f);
-            } else {                      // muted: a small X
-                const float xc = c.x + r * 0.72f, d = r * 0.26f;
-                dl->AddLine(ImVec2(xc - d, c.y - d), ImVec2(xc + d, c.y + d), u, th * 0.9f);
-                dl->AddLine(ImVec2(xc - d, c.y + d), ImVec2(xc + d, c.y - d), u, th * 0.9f);
-            }
-            break;
-        }
-    }
-    return ImGui::IsItemClicked();
-}
-}  // namespace
-#endif
-
+// Fill the shared UI state from live player state and hand it the callbacks. The
+// widgets themselves live in ui/TransportUI.cpp — shared verbatim with Android, so
+// the two legs cannot drift apart.
 void App::BuildTransportUI() {
-#if defined(MEDIAPLAYER_WITH_IMGUI)
-    ImGuiIO& io = ImGui::GetIO();
-    const float W = io.DisplaySize.x, H = io.DisplaySize.y;
-    const ImGuiWindowFlags pill = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
-                                  ImGuiWindowFlags_NoBringToFrontOnFocus |
-                                  ImGuiWindowFlags_AlwaysAutoResize;
+    uiState_.hasMedia = hasMedia_;
+    uiState_.isVideo = isVideo_;
+    uiState_.mediaFilename =
+        currentMediaPath_.empty() ? std::string()
+                                  : std::filesystem::path(currentMediaPath_).filename().string();
+    uiState_.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
+    uiState_.layoutName = MediaSource::LayoutName(layout_);
+    uiState_.layoutTooltip = LayoutLabel();
+    uiState_.layoutPinned = layoutPinned_;
+    uiState_.positionSeconds = video_.PositionSeconds();
+    uiState_.durationSeconds = video_.DurationSeconds();
+    // "Paused" for the icon includes "ended" — a finished clip shows Play, not Pause.
+    uiState_.paused = video_.Paused() || video_.Ended();
+    uiState_.muted = muted_;
+    uiState_.loop = video_.Loop();
+    uiState_.openFilePending = openFilePending_;
 
-    // The bars fade in/out together with the idle timer.
-    if (fadeAlpha_ > 0.001f) {
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fadeAlpha_);
-        const float iconSz = ImGui::GetFrameHeight();
+    ui::TransportActions actions;
+    actions.Open = [this] { RequestOpenFile(); };
+    actions.NextMode = [this] { xr_.RequestNextMode(); };
+    actions.CycleLayout = [this] { CycleLayoutOverride(); };
+    actions.ToggleSlideshow = [this] { ToggleSlideshow(); };
+    actions.TogglePlayback = [this] { TogglePlayback(); };
+    actions.ToggleMute = [this] { ToggleMute(); };
+    actions.ToggleLoop = [this] {
+        video_.ToggleLoop();
+        audio_.SetLoop(video_.Loop());
+    };
+    actions.Seek = [this](float sec, bool preview) { video_.Seek(sec, preview); };
+    actions.ScrubHeld = [this] { audio_.SetPaused(true); };
+    actions.ScrubReleased = [this](float sec) {
+        video_.Seek(sec, /*preview=*/false);
+        audio_.Seek(sec);
+        if (!video_.Paused()) audio_.SetPaused(false);
+    };
 
-        // --- Top window-space bar: full width, flush to the top of the window.
-        //     Open / Mode on the left, Slideshow / Close on the right. ---
-        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
-        const ImGuiWindowFlags topbar = pill & ~ImGuiWindowFlags_AlwaysAutoResize;
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);  // flat bar, flush to edges
-        if (ImGui::Begin("##wsui_top", nullptr, topbar)) {
-            ImGui::BeginDisabled(openFilePending_);
-            if (ImGui::Button("Open")) RequestOpenFile();
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            char modeLabel[96];
-            std::snprintf(modeLabel, sizeof(modeLabel), "Mode: %s", xr_.ActiveModeName());
-            if (ImGui::Button(modeLabel)) xr_.RequestNextMode();
-            // Stereo layout + override (#45). The trailing '*' marks a manual pin.
-            if (hasMedia_) {
-                char layoutBtn[64];
-                std::snprintf(layoutBtn, sizeof(layoutBtn), "Layout: %s%s",
-                              MediaSource::LayoutName(layout_), layoutPinned_ ? "*" : "");
-                ImGui::SameLine();
-                if (ImGui::Button(layoutBtn)) CycleLayoutOverride();
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("%s\nL cycles: auto / mono / SBS-full / SBS-half",
-                                      LayoutLabel().c_str());
-                }
-            }
-            // Current filename, centered in the bar.
-            if (!currentMediaPath_.empty()) {
-                const std::string name =
-                    std::filesystem::path(currentMediaPath_).filename().string();
-                const float tw = ImGui::CalcTextSize(name.c_str()).x;
-                ImGui::SameLine();
-                // Clamp, don't set: with a third button on the left the centred position
-                // can fall BEHIND the cursor, and SetCursorPosX would happily back-track
-                // and overlap the buttons. The filename may only ever slide right.
-                ImGui::SetCursorPosX(
-                    std::max(ImGui::GetCursorPosX(), (ImGui::GetWindowWidth() - tw) * 0.5f));
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextUnformatted(name.c_str());
-            }
-            // Right-align the slideshow toggle. (Close the app via ESC or the window's
-            // own close button — no in-UI X needed.)
-            ImGui::SameLine(ImGui::GetWindowWidth() - iconSz -
-                            ImGui::GetStyle().WindowPadding.x);
-            if (IconButton("##slideshow", Icon::Slideshow, iconSz, slideshowActive_))
-                ToggleSlideshow();
-        }
-        ImGui::End();
-        ImGui::PopStyleVar();
-
-        // --- Bottom transport: play/pause + scrubber + loop (video only) ---
-        if (isVideo_ && video_.DurationSeconds() > 0.0) {
-            ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.955f), ImGuiCond_Always,
-                                    ImVec2(0.5f, 1.0f));
-            ImGui::SetNextWindowSize(ImVec2(W * 0.8f, 0.0f), ImGuiCond_Always);
-            const ImGuiWindowFlags bar = pill & ~ImGuiWindowFlags_AlwaysAutoResize;
-            if (ImGui::Begin("##transport", nullptr, bar)) {
-                const float dur = (float)video_.DurationSeconds();
-                const float pos = (float)video_.PositionSeconds();
-                // Track playback into the knob, but not while dragging, and not while a
-                // seek we issued is still landing — else it snaps back on release.
-                if (!scrubActive_) {
-                    if (scrubTarget_ >= 0.0f) {
-                        if (std::fabs(pos - scrubTarget_) < 0.3f) scrubTarget_ = -1.0f;
-                    } else {
-                        scrubValue_ = pos;
-                    }
-                }
-                auto mmss = [](double s, char* out, size_t n) {
-                    if (s < 0.0) s = 0.0;
-                    const int t = (int)s;
-                    std::snprintf(out, n, "%d:%02d", t / 60, t % 60);
-                };
-                char cur[16], tot[16];
-                mmss(scrubValue_, cur, sizeof(cur));
-                mmss(dur, tot, sizeof(tot));
-
-                const bool paused = video_.Paused() || video_.Ended();
-                if (IconButton("##playpause", paused ? Icon::Play : Icon::Pause, iconSz))
-                    TogglePlayback();
-                ImGui::SameLine();
-                ImGui::AlignTextToFramePadding();
-                ImGui::Text("%s", cur);
-                ImGui::SameLine();
-                // Leave room on the right for the total-time label + mute + loop icons.
-                const float rightW = ImGui::CalcTextSize(tot).x + 2.0f * iconSz + 36.0f;
-                ImGui::SetNextItemWidth(-rightW);
-                const bool changed = ImGui::SliderFloat("##scrub", &scrubValue_, 0.0f, dur, "");
-                const bool active = ImGui::IsItemActive();
-                const float scrubDelta = std::fabs(scrubValue_ - lastScrubValue_);
-                if (changed) {
-                    // Fast sweep -> keyframe preview (responsive); slow/fine drag -> exact
-                    // frame (precise). Audio goes silent while scrubbing.
-                    const bool fast = active && scrubDelta > kFastScrubSeconds;
-                    video_.Seek(scrubValue_, /*preview=*/fast);
-                    scrubWasPreview_ = fast;
-                    scrubTarget_ = scrubValue_;  // hold the knob until the decode lands
-                    if (active) audio_.SetPaused(true);
-                } else if (active && scrubWasPreview_) {
-                    // Settled after a fast sweep -> resolve to the exact frame.
-                    video_.Seek(scrubValue_, /*preview=*/false);
-                    scrubWasPreview_ = false;
-                }
-                if (scrubActive_ && !active) {
-                    // Released: settle on the exact frame and realign + resume audio.
-                    video_.Seek(scrubValue_, /*preview=*/false);
-                    audio_.Seek(scrubValue_);
-                    if (!video_.Paused()) audio_.SetPaused(false);
-                    scrubWasPreview_ = false;
-                }
-                scrubActive_ = active;
-                lastScrubValue_ = scrubValue_;
-                ImGui::SameLine();
-                ImGui::AlignTextToFramePadding();
-                ImGui::Text("%s", tot);
-                ImGui::SameLine();
-                if (IconButton("##mute", muted_ ? Icon::SpeakerMuted : Icon::Speaker, iconSz, muted_))
-                    ToggleMute();
-                ImGui::SameLine();
-                if (IconButton("##loop", Icon::Loop, iconSz, video_.Loop())) {
-                    video_.ToggleLoop();
-                    audio_.SetLoop(video_.Loop());
-                }
-            }
-            ImGui::End();
-        }
-        ImGui::PopStyleVar();
-    }
-
-    // --- Toast (convergence readout, nav filename): own alpha, shows even when hidden ---
-    if (toastAlpha_ > 0.001f && !toastText_.empty()) {
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, toastAlpha_);
-        ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.14f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-        if (ImGui::Begin("##toast", nullptr, pill)) {
-            ImGui::TextUnformatted(toastText_.c_str());
-        }
-        ImGui::End();
-        ImGui::PopStyleVar();
-    }
-
-    // --- Slideshow dip-to-black: a full-canvas overlay above everything. Because the
-    //     HUD layer composites on top of the content layer, this dims the whole view. ---
-    if (transitionAlpha_ > 0.001f) {
-        const int a = (int)(std::min(1.0f, transitionAlpha_) * 255.0f + 0.5f);
-        ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2(W, H),
-                                                      IM_COL32(0, 0, 0, a));
-    }
-#endif
+    ui::BuildTransportUI(uiState_, actions);
 }
 
 void App::UpdateFps() {
@@ -1075,7 +858,7 @@ bool App::LoadMedia(const std::string& path) {
         contentAspect_ = PerEyeAspect(layout_, video_.Width(), video_.Height());
         // In slideshow, force play-once so the clip can end and advance, regardless of
         // the user's manual loop preference.
-        if (slideshowActive_) video_.SetLoop(false);
+        if (uiState_.slideshowActive) video_.SetLoop(false);
         // Audio (optional — silent if the clip has none). Match mute + loop state.
         audio_.Open(path);
         audio_.SetMuted(muted_);
@@ -1272,9 +1055,9 @@ void App::ReloadMedia(const std::string& path) {
     renderer_.ClearSharedImports();
 #endif
     isVideo_ = false;
-    scrubValue_ = 0.0f;
-    scrubActive_ = false;
-    scrubTarget_ = -1.0f;
+    uiState_.scrubValue = 0.0f;
+    uiState_.scrubActive = false;
+    uiState_.scrubTarget = -1.0f;
     slideshowImageElapsed_ = 0.0;
     if (!LoadMedia(path)) {
         LOG_WARN("Open: keeping previous view (failed to open '%s')", path.c_str());
@@ -1428,20 +1211,17 @@ void App::RequestNavTransition(int delta) {
     transition_ = Transition::FadeOut;
 }
 
-void App::ShowToast(const std::string& msg) {
-    toastText_ = msg;
-    toastExpiry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
-}
+void App::ShowToast(const std::string& msg) { ui::ShowTransportToast(uiState_, msg); }
 
-void App::ToggleSlideshow() { SetSlideshow(!slideshowActive_); }
+void App::ToggleSlideshow() { SetSlideshow(!uiState_.slideshowActive); }
 
 void App::SetSlideshow(bool on) {
-    slideshowActive_ = on;
+    uiState_.slideshowActive = on;
     slideshowImageElapsed_ = 0.0;
     transition_ = Transition::Playing;
-    if (slideshowActive_ && isVideo_) video_.SetLoop(false);  // play once, then advance
-    LOG_INFO("slideshow %s", slideshowActive_ ? "on" : "off");
-    ShowToast(slideshowActive_ ? "Slideshow on" : "Slideshow off");
+    if (uiState_.slideshowActive && isVideo_) video_.SetLoop(false);  // play once, then advance
+    LOG_INFO("slideshow %s", uiState_.slideshowActive ? "on" : "off");
+    ShowToast(uiState_.slideshowActive ? "Slideshow on" : "Slideshow off");
 }
 
 void App::LoadIdleLogo() {
@@ -1562,7 +1342,7 @@ void App::StepFrame(int n) {
     if (t < 0.0) t = 0.0;
     video_.Seek(t);             // exact
     audio_.Seek(t);             // keep audio aligned for the eventual resume
-    scrubTarget_ = (float)t;    // hold the scrubber knob until the frame lands
+    uiState_.scrubTarget = (float)t;    // hold the scrubber knob until the frame lands
 }
 
 void App::SetupAgentTools() {
@@ -1703,7 +1483,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         if (durationS > 0.0 && t > durationS) t = durationS;
         video_.Seek(t);             // exact
         audio_.Seek(t);             // keep audio aligned
-        scrubTarget_ = (float)t;    // hold the scrubber knob until the decode lands
+        uiState_.scrubTarget = (float)t;    // hold the scrubber knob until the decode lands
         out["position_s"] = t;
         return out.dump();
     }
@@ -1792,32 +1572,21 @@ void App::TickUi() {
         }
     }
     // Dragging the scrubber counts as activity even with the cursor held still.
-    if (scrubActive_) lastActivity_ = now;
+    if (uiState_.scrubActive) lastActivity_ = now;
     // Keep the UI pinned visible until a pending HUD dump lands (diagnostic/screenshot).
     if (dumpHudPath_ && !dumpedHud_) lastActivity_ = now;
 
-    // Auto-hide fade: visible while the master toggle is on and we're not idle.
+    // Auto-hide + toast fades are shared with Android — see ui/TransportUI.cpp. What
+    // counts as "activity" is platform-specific and stays here (mouse motion above).
     const double idle = duration<double>(now - lastActivity_).count();
-    const bool wantVisible = showHud_ && idle < kIdleHideSeconds;
-    const float fadeTarget = wantVisible ? 1.0f : 0.0f;
-    const float fadeStep = (float)(dt / kFadeSeconds);
-    if (fadeAlpha_ < fadeTarget) fadeAlpha_ = std::min(fadeTarget, fadeAlpha_ + fadeStep);
-    else if (fadeAlpha_ > fadeTarget) fadeAlpha_ = std::max(fadeTarget, fadeAlpha_ - fadeStep);
-
-    // Toast fade: ease toward 1 while live, toward 0 once expired; clear when gone.
-    const bool toastLive = !toastText_.empty() && now < toastExpiry_;
-    const float toastTarget = toastLive ? 1.0f : 0.0f;
-    const float toastStep = (float)(dt / kToastFadeSeconds);
-    if (toastAlpha_ < toastTarget) toastAlpha_ = std::min(toastTarget, toastAlpha_ + toastStep);
-    else if (toastAlpha_ > toastTarget) toastAlpha_ = std::max(toastTarget, toastAlpha_ - toastStep);
-    if (!toastLive && toastAlpha_ <= 0.001f) toastText_.clear();
+    ui::TickTransportUI(uiState_, dt, /*uiAwake=*/showHud_ && idle < kIdleHideSeconds);
 
     // Dip-to-black transition machine, shared by the slideshow and manual ←/→ nav.
     // Slideshow auto-starts a transition when a still has shown long enough / a video
     // ended; manual nav starts one via RequestNavTransition(). The swap happens at full
     // black. pendingNavDelta_ carries the step (+1 next, -1 prev).
     const float transStep = (float)(dt / kTransitionSeconds);
-    if (slideshowActive_ && transition_ == Transition::Playing && pendingNavDelta_ == 0) {
+    if (uiState_.slideshowActive && transition_ == Transition::Playing && pendingNavDelta_ == 0) {
         bool advance = false;
         if (isVideo_) {
             advance = video_.Ended();
@@ -1834,8 +1603,8 @@ void App::TickUi() {
         case Transition::Playing:
             break;
         case Transition::FadeOut:
-            transitionAlpha_ = std::min(1.0f, transitionAlpha_ + transStep);
-            if (transitionAlpha_ >= 1.0f) {
+            uiState_.transitionAlpha = std::min(1.0f, uiState_.transitionAlpha + transStep);
+            if (uiState_.transitionAlpha >= 1.0f) {
                 if (pendingNavDelta_ != 0) {
                     NavigateMedia(pendingNavDelta_);  // swap while fully black
                     pendingNavDelta_ = 0;
@@ -1844,8 +1613,8 @@ void App::TickUi() {
             }
             break;
         case Transition::FadeIn:
-            transitionAlpha_ = std::max(0.0f, transitionAlpha_ - transStep);
-            if (transitionAlpha_ <= 0.0f) transition_ = Transition::Playing;
+            uiState_.transitionAlpha = std::max(0.0f, uiState_.transitionAlpha - transStep);
+            if (uiState_.transitionAlpha <= 0.0f) transition_ = Transition::Playing;
             break;
     }
 }

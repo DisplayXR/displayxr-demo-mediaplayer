@@ -175,9 +175,11 @@ add_executable(${MP_TARGET}
     src/media/AudioPlayer.cpp
     src/ui/Hud.cpp
     src/ui/ImGuiLayer.cpp
+    # The player's ImGui chrome, shared VERBATIM with the Android leg. If you add or
+    # split a TU here, mirror it into android/src/main/cpp/CMakeLists.txt — that list
+    # is hand-curated and desktop CI cannot catch the resulting Android link error.
+    src/ui/TransportUI.cpp
     src/media/FrameRing.h  # header-only triple buffer
-    # Header-only stub (fleshed out in a later milestone):
-    src/ui/Ui.h
     ${MP_IMGUI_SOURCES}
 )
 
@@ -194,7 +196,10 @@ endif()
 
 target_include_directories(${MP_TARGET} PRIVATE
     ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)
-target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_IMGUI=1)
+# MEDIAPLAYER_IMGUI_SDL selects the SDL3 ImGui *platform* backend (input + dt).
+# The Android leg defines MEDIAPLAYER_WITH_IMGUI only: it has no SDL, and feeds
+# input through ImGuiLayer::PushPointer() instead. See src/ui/ImGuiLayer.h.
+target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_IMGUI=1 MEDIAPLAYER_IMGUI_SDL=1)
 
 if(MP_HAVE_FFMPEG)
     target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
