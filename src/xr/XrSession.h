@@ -202,6 +202,14 @@ public:
     void RequestNextMode();
     // Request a specific mode by index (used by MEDIAPLAYER_START_MODE for testing).
     void RequestMode(uint32_t modeIndex);
+    // modeIndex of the mode the runtime says is active right now.
+    uint32_t CurrentModeIndex() const { return currentModeIndex_; }
+    // A requestable FLAT mode: one view, and hardware 3D off so the lenticular
+    // element is off too. Mono content in a 3D mode is not wrong, just soft —
+    // the lens splits a sharp image across the eyes. Returns -1 when the runtime
+    // offers no such mode (no rendering-mode extension, 3D-only display, or the
+    // mode is workspace-locked), which callers treat as "leave the mode alone".
+    int32_t FindFlatMode() const;
     // VkImage handles backing the swapchain (length == imageCount).
     const std::vector<VkImage>& SwapchainImages() const { return swapchainVkImages_; }
 
