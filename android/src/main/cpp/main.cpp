@@ -335,6 +335,72 @@ std::string g_pick_name;  // display name of the picked document (filename layer
 // loaded" — and that is the one distinction tap-to-open and the HUD both need.
 std::atomic<bool> g_showing_splash{false};
 
+// ── Rendering-mode table + the idle-screen mode borrow (#64, Android leg) ──
+// The idle splash is a flat lockup; on a 3D panel the lens stays on over it and
+// the mark reads soft. Mirror the desktop: while the splash is up, borrow a mode
+// that is mono AND drives the hardware to 2D, and hand the previous mode back on
+// the first user media load -- but only if the borrowed mode is still the active
+// one (the user may have changed it meanwhile). Requests are deferred until the
+// session is running: one issued during init is dropped by the runtime.
+XrDisplayRenderingModeInfoDXR g_modes[kMaxViews] = {};
+uint32_t g_mode_count = 0;
+int32_t g_active_mode = -1;             // modeIndex of the mode the runtime reports active
+int32_t g_mode_before_splash = -1;      // what to hand back
+int32_t g_splash_mode_requested = -1;   // what we borrowed
+int32_t g_pending_mode_request = -1;    // issued from the frame loop once running
+
+static void
+adopt_mode(const XrDisplayRenderingModeInfoDXR &m)
+{
+	g_active_mode = (int32_t)m.modeIndex;
+	g_view_count = m.viewCount ? m.viewCount : 1;
+	g_tile_columns = m.tileColumns ? m.tileColumns : 1;
+	g_tile_rows = m.tileRows ? m.tileRows : 1;
+	g_view_scale_x = m.viewScaleX > 0.0f ? m.viewScaleX : 1.0f;
+	g_view_scale_y = m.viewScaleY > 0.0f ? m.viewScaleY : 1.0f;
+}
+
+// Desktop rule (XrSession::FindFlatMode): mono + hardware 2D first; a mono mode
+// that leaves the lens on still beats a stereo one; -1 when nothing flat exists.
+static int32_t
+find_flat_mode()
+{
+	int32_t fallback = -1;
+	for (uint32_t i = 0; i < g_mode_count; ++i) {
+		const auto &m = g_modes[i];
+		if (m.viewCount != 1) continue;
+		if (!m.hardwareDisplay3D) return (int32_t)m.modeIndex;
+		if (fallback < 0) fallback = (int32_t)m.modeIndex;
+	}
+	return fallback;
+}
+
+static void
+request_flat_mode_for_splash()
+{
+	const int32_t flat = find_flat_mode();
+	if (flat < 0 || g_active_mode < 0 || flat == g_active_mode) return;
+	g_mode_before_splash = g_active_mode;
+	g_splash_mode_requested = flat;
+	g_pending_mode_request = flat;
+	LOGI("splash: borrowing flat mode %d (was %d)", flat, g_active_mode);
+}
+
+// Every user-media load goes through here: clears the splash flag and hands the
+// borrowed mode back if it is still the one in force.
+static void
+leave_splash()
+{
+	g_showing_splash.store(false, std::memory_order_relaxed);
+	if (g_splash_mode_requested >= 0 && g_mode_before_splash >= 0 &&
+	    g_active_mode == g_splash_mode_requested) {
+		g_pending_mode_request = g_mode_before_splash;
+		LOGI("splash: handing mode %d back", g_mode_before_splash);
+	}
+	g_mode_before_splash = -1;
+	g_splash_mode_requested = -1;
+}
+
 // ── Stereo layout (desktop parity, #45) ─────────────────────────────────────
 // The renderer has two knobs a layout maps onto: `mono` (both eyes sample the
 // whole source) and the per-eye display aspect. Full SBS packs two full-width
@@ -1296,15 +1362,11 @@ query_display_info_and_modes()
 		LOGI("  [%u] %s views=%u tiles=%ux%u scale=%.2fx%.2f 3D=%d active=%d", m.modeIndex,
 		     m.modeName, m.viewCount, m.tileColumns, m.tileRows, m.viewScaleX, m.viewScaleY,
 		     (int)m.hardwareDisplay3D, (int)m.isActive);
+		g_modes[i] = m;
 		// Adopt the active mode's layout (the runtime reports which is active).
-		if (m.isActive) {
-			g_view_count = m.viewCount ? m.viewCount : 1;
-			g_tile_columns = m.tileColumns ? m.tileColumns : 1;
-			g_tile_rows = m.tileRows ? m.tileRows : 1;
-			g_view_scale_x = m.viewScaleX > 0.0f ? m.viewScaleX : 1.0f;
-			g_view_scale_y = m.viewScaleY > 0.0f ? m.viewScaleY : 1.0f;
-		}
+		if (m.isActive) adopt_mode(m);
 	}
+	g_mode_count = count;
 	// All modes feed the worst-case atlas; stash the max tile footprint by
 	// scanning here (create_swapchains recomputes per mode + orientation).
 	return true;
@@ -1754,6 +1816,7 @@ load_splash(struct android_app *app)
 		g_clear_rgb[2] = kIdleBg[2] / 255.0f;
 		g_is_video = false;
 		g_showing_splash.store(true, std::memory_order_relaxed);
+		request_flat_mode_for_splash();
 		g_scene_loaded.store(true, std::memory_order_relaxed);
 		LOGI("No media — showing the DisplayXR idle screen (%dx%d square)", side, side);
 	}
@@ -1830,7 +1893,7 @@ load_image_file(const std::string &path, const std::string &logical_name)
 	apply_layout(info.layout, r.image.width, r.image.height);
 	g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox for media
 	g_is_video = false;
-	g_showing_splash.store(false, std::memory_order_relaxed);
+	leave_splash();
 	g_scene_loaded.store(true, std::memory_order_relaxed);
 	LOGI("Loaded image: %s %dx%d layout=%s (%s)%s", logical_name.c_str(), r.image.width,
 	     r.image.height, mp::LayoutName(info.layout), mp::SignalName(info.signal),
@@ -1967,6 +2030,23 @@ poll_xr_events()
 				}
 			}
 #endif
+		} else if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
+			// Retile: the atlas is worst-case sized across modes, so only the per-
+			// frame tile geometry (view count, grid, scale) changes here.
+			const auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedDXR *>(&ev);
+			if (e->session == g_session) {
+				bool found = false;
+				for (uint32_t i = 0; i < g_mode_count; ++i) {
+					if (g_modes[i].modeIndex == e->currentModeIndex) {
+						adopt_mode(g_modes[i]);
+						found = true;
+						break;
+					}
+				}
+				LOGI("rendering mode changed %u -> %u (%s): views=%u tiles=%ux%u scale=%.2f",
+				     e->previousModeIndex, e->currentModeIndex, found ? "adopted" : "UNKNOWN index",
+				     g_view_count, g_tile_columns, g_tile_rows, g_view_scale_x);
+			}
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
 			g_exit_requested = true;
 		}
@@ -2134,7 +2214,7 @@ render_frame()
 					                           : (float)vw / (float)vh,
 					                       std::memory_order_relaxed);
 				}
-				g_showing_splash.store(false, std::memory_order_relaxed);
+				leave_splash();
 				g_scene_loaded.store(true, std::memory_order_relaxed);
 			}
 		} else if (ahb) {
@@ -2145,7 +2225,7 @@ render_frame()
 					                           : (float)vw / (float)vh,
 					                       std::memory_order_relaxed);
 				}
-				g_showing_splash.store(false, std::memory_order_relaxed);
+				leave_splash();
 				g_scene_loaded.store(true, std::memory_order_relaxed);
 			}
 		}
@@ -2544,7 +2624,7 @@ bring_up(struct android_app *app)
 	                                  g_lvf_dbg != LvfOpen::NotLvf || g_video.openPath(dbgFile))) {
 		g_audio.openPath(dbgFile);  // own fd; no-op if no audio track
 		g_is_video = true;
-		g_showing_splash.store(false, std::memory_order_relaxed);
+		leave_splash();
 		if (g_lvf_dbg == LvfOpen::Dual) {
 			apply_layout(mp::StereoLayout::Dual, g_video.width(), g_video.height());
 		} else if (g_lvf_dbg == LvfOpen::FlatLeft) {
@@ -2839,6 +2919,12 @@ android_main(struct android_app *app)
 			// content: JPEG/PNG (incl. LIF — a JPEG with a trailer) go through
 			// the image path; everything else reopens the video decoder on
 			// this thread (the old decode thread is joined in stop()).
+			if (g_pending_mode_request >= 0 && g_session_running && g_pfnReqMode != nullptr) {
+				const int32_t want = g_pending_mode_request;
+				g_pending_mode_request = -1;
+				const XrResult mr = g_pfnReqMode(g_session, (uint32_t)want);
+				LOGI("xrRequestDisplayRenderingModeDXR(%d) -> %d", want, (int)mr);
+			}
 			const int pick = g_pick_fd.exchange(-1, std::memory_order_acquire);
 			if (pick >= 0) {
 				const long long off = g_pick_off.load(std::memory_order_relaxed);
@@ -2901,7 +2987,7 @@ android_main(struct android_app *app)
 						if (audio_fd >= 0) g_audio.openFd(audio_fd, off, len);
 						g_audio.setPaused(false);  // the decoders start playing; keep audio in step
 						g_is_video = true;
-		g_showing_splash.store(false, std::memory_order_relaxed);
+		leave_splash();
 						if (lvf == LvfOpen::Dual) {
 							apply_layout(mp::StereoLayout::Dual, g_video.width(),
 							             g_video.height());
