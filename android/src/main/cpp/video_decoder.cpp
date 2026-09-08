@@ -288,6 +288,12 @@ VideoDecoder::start()
 	unpairedFuture_.store(0, std::memory_order_relaxed);
 	slaveLeadObservedUs_.store(0, std::memory_order_relaxed);
 	queuedUnacquired_.store(0, std::memory_order_relaxed);
+	// A fresh open always starts PLAYING. paused_ is otherwise only written by
+	// togglePaused(), so pausing clip A and then opening clip B left B's decode
+	// thread parked in the paused branch before its first frame: no frame ever
+	// reached the reader, g_scene_loaded never flipped, and the render loop spun
+	// forever on a black/stale picture -- the "second open freezes the app" report.
+	paused_.store(false, std::memory_order_relaxed);
 	pairDiag_ = switchOn("MEDIAPLAYER_PAIR_DIAG", "debug.dxr.mp.pair_diag");
 	pairDiagLeft_.store(pairDiag_ ? kPairDiagFrames : 0, std::memory_order_relaxed);
 	pairDiagReleased_ = 0;
@@ -584,12 +590,17 @@ VideoDecoder::decodeLoop()
 				// each frame's PTS. (For an AImageReader consumer this does not
 				// defer delivery the way a SurfaceFlinger latch would -- it is
 				// purely the carrier. Delivery timing is the consumer's job.)
+				// Only a slave gates on this; the master's pacing already guarantees
+				// one-in-flight and it never calls acquireFrameByPts to decrement it.
+				// Count the frame BEFORE it can reach the queue: the consumer may acquire
+				// it (its decrement clamps at 0) between the release returning and a
+				// post-release increment, which then counts a frame already gone -- the
+				// gate reads 1 forever and the right eye freezes until the next flush.
+				// That was the "first cycle flat, fine after the loop" report.
+				if (slave_) queuedUnacquired_.fetch_add(1, std::memory_order_relaxed);
 				AMediaCodec_releaseOutputBufferAtTime(codec_, outIdx,
 				                                     info.presentationTimeUs * 1000);
 				releasedFrames_.fetch_add(1, std::memory_order_relaxed);
-				// Only a slave gates on this; the master's pacing already guarantees
-				// one-in-flight and it never calls acquireFrameByPts to decrement it.
-				if (slave_) queuedUnacquired_.fetch_add(1, std::memory_order_relaxed);
 			} else {
 				AMediaCodec_releaseOutputBuffer(codec_, outIdx, render);
 			}
