@@ -57,6 +57,7 @@ const char* LayoutName(StereoLayout l) {
     switch (l) {
         case StereoLayout::SbsFull: return "SBS-full";
         case StereoLayout::SbsHalf: return "SBS-half";
+        case StereoLayout::Dual:    return "Dual";
         default: return "mono";
     }
 }

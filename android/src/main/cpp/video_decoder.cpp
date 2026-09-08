@@ -79,6 +79,36 @@ constexpr int64_t kStaleUs = 1'000'000;
 // clock/stream disagreement to one hiccup instead of a frozen picture.
 constexpr int64_t kStallNs = 1'000'000'000LL;
 
+// OUTER SAFETY CAP on how far ahead of the master, in MEDIA time, a slave may decode.
+// This is deliberately NOT the primary gate any more and must never be the binding one:
+// the thing that actually keeps the pair matched is consumer occupancy
+// (queuedUnacquired_), because a BufferQueue with an app-controlled producer and
+// consumer REPLACES a queued-but-unacquired buffer instead of blocking. A lead budget
+// cannot express that constraint at all -- N frames of lead is N frames queued
+// back-to-back, of which only the last survives.
+//
+// It stays as a backstop for the case the occupancy counter is wrong (a buffer the
+// consumer never sees would otherwise leave the slave free-running), so it is sized
+// well above where occupancy binds: 6 frame periods, floor 200 ms.
+constexpr int64_t kSlaveLeadFloorUs = 200'000;
+constexpr int kSlaveLeadFrames = 6;
+// Pairing decisions logged after each open/seek when debug.dxr.mp.pair_diag is set.
+constexpr int kPairDiagFrames = 60;
+
+// How long acquireFrameByPts may spend WAITING for the slave to catch up, per call.
+//
+// It only ever waits once it has proof the slave is behind (it just discarded a frame
+// older than the master's target) and the queue has then run dry. That combination is
+// the one state the occupancy gate cannot get out of on its own: the gate lets the
+// slave release only after the consumer acquires, so without this the slave advances
+// exactly one frame per CALL, and a lag -- once opened by a slow first few ticks --
+// never closes. Polling briefly here lets several frames through per tick instead.
+//
+// The budget is the render thread's to give: at 60 Hz it has ~16.7 ms, and drawAtlas
+// is synchronous, so ~6 ms is a safe share that cannot push a frame past its vsync.
+// Spent only while catching up; steady state never enters this path at all.
+constexpr int64_t kCatchUpBudgetNs = 6'000'000;
+
 // Numeric prop read (bisect knob); <0 = unset.
 int64_t
 propInt(const char *env, const char *prop, int64_t dflt)
@@ -116,7 +146,7 @@ fmtInt(AMediaFormat *f, const char *key, int32_t fallback)
 }  // namespace
 
 bool
-VideoDecoder::openPath(const std::string &path)
+VideoDecoder::openPath(const std::string &path, int videoTrackIndex)
 {
 	// Open the fd ourselves and use setDataSourceFd: a raw-path setDataSource
 	// runs in the media extractor's own process, which can't reach our
@@ -128,12 +158,13 @@ VideoDecoder::openPath(const std::string &path)
 	}
 	struct stat st;
 	int64_t length = (::fstat(fd, &st) == 0) ? (int64_t)st.st_size : 0;
-	return openFd(fd, 0, length);
+	return openFd(fd, 0, length, videoTrackIndex);
 }
 
 bool
-VideoDecoder::openFd(int fd, int64_t offset, int64_t length)
+VideoDecoder::openFd(int fd, int64_t offset, int64_t length, int videoTrackIndex)
 {
+	trackIndex_ = videoTrackIndex;
 	ownedFd_ = fd;
 	ex_ = AMediaExtractor_new();
 	if (AMediaExtractor_setDataSourceFd(ex_, fd, offset, length) != AMEDIA_OK) {
@@ -154,7 +185,12 @@ VideoDecoder::start()
 	int videoTrack = -1;
 	AMediaFormat *trackFmt = nullptr;
 	const char *mime = nullptr;
+	// trackIndex_ >= 0 = an explicitly named track (the eye tracks of a dual-track
+	// file); -1 = the historical "first video track". The named track is still
+	// checked to BE a video track, so a stale/garbage index fails loudly here rather
+	// than configuring a codec with an audio format.
 	for (size_t i = 0; i < tracks; ++i) {
+		if (trackIndex_ >= 0 && (int)i != trackIndex_) continue;
 		AMediaFormat *f = AMediaExtractor_getTrackFormat(ex_, i);
 		const char *m = nullptr;
 		if (AMediaFormat_getString(f, AMEDIAFORMAT_KEY_MIME, &m) && m &&
@@ -167,9 +203,16 @@ VideoDecoder::start()
 		AMediaFormat_delete(f);
 	}
 	if (videoTrack < 0) {
-		LOGE("no video track");
+		LOGE("no video track%s", trackIndex_ >= 0 ? " at the requested index" : "");
 		return false;
 	}
+	// AMediaFormat_getString hands back a pointer INTO the format object, and this
+	// format is deleted below (right after AMediaCodec_configure) while `mime` is
+	// still used by the LOGI at the end of this function -- which printed whatever
+	// happened to be in the freed block. Copy it now; `mime` itself stays valid until
+	// the delete, which is all createDecoderByType needs.
+	const std::string mimeStr = mime;
+	frameRate_ = (float)fmtInt(trackFmt, AMEDIAFORMAT_KEY_FRAME_RATE, 0);
 	width_ = fmtInt(trackFmt, AMEDIAFORMAT_KEY_WIDTH, 0);
 	height_ = fmtInt(trackFmt, AMEDIAFORMAT_KEY_HEIGHT, 0);
 	int64_t dur = 0;
@@ -215,7 +258,10 @@ VideoDecoder::start()
 	// Kill switch for the display-locked pacing (#54): restores the pre-fix
 	// sleep-in-the-decode-thread path. diag_ adds a 1 Hz view of both clocks --
 	// bring-up only, too chatty to leave on in a shipping build.
-	legacyPacing_ = switchOn("MEDIAPLAYER_LEGACY_PACING", "debug.dxr.mp.legacy_pacing");
+	// requireDisplayLocked_ (a dual-track pair) vetoes the kill switch: without a PTS
+	// riding each buffer there is nothing to pair the two eyes on.
+	legacyPacing_ = !requireDisplayLocked_ &&
+	                switchOn("MEDIAPLAYER_LEGACY_PACING", "debug.dxr.mp.legacy_pacing");
 	diag_ = switchOn("MEDIAPLAYER_PACING_DIAG", "debug.dxr.mp.diag");
 	// Bisect knob: 0 = decode thread releases a frame only once it is DUE (the
 	// legacy release cadence, but still consumer-selected), >0 = run that many
@@ -235,7 +281,30 @@ VideoDecoder::start()
 	ptsSelectable_ = true;
 	ptsChecked_ = false;
 	xrEpochCalibrated_ = false;
-	LOGI("VideoDecoder open (zero-copy surface): %s %dx%d", mime, width_, height_);
+	lastPresentedPtsUs_.store(-1, std::memory_order_relaxed);
+	pairedFrames_.store(0, std::memory_order_relaxed);
+	unpairedFrames_.store(0, std::memory_order_relaxed);
+	unpairedOld_.store(0, std::memory_order_relaxed);
+	unpairedFuture_.store(0, std::memory_order_relaxed);
+	slaveLeadObservedUs_.store(0, std::memory_order_relaxed);
+	queuedUnacquired_.store(0, std::memory_order_relaxed);
+	pairDiag_ = switchOn("MEDIAPLAYER_PAIR_DIAG", "debug.dxr.mp.pair_diag");
+	pairDiagLeft_.store(pairDiag_ ? kPairDiagFrames : 0, std::memory_order_relaxed);
+	pairDiagReleased_ = 0;
+	pairPtsWarned_ = false;
+	{
+		const double fps = frameRate_ > 1.0f ? (double)frameRate_ : 30.0;
+		slaveLeadUs_ = (int64_t)(kSlaveLeadFrames * 1e6 / fps);
+		if (slaveLeadUs_ < kSlaveLeadFloorUs) slaveLeadUs_ = kSlaveLeadFloorUs;
+	}
+	if (slave_) {
+		LOGI("[PAIR] slave lead budget %lld us (fps=%.2f, %d frame periods, floor %lld) "
+		     "master=%p diag=%d",
+		     (long long)slaveLeadUs_, (double)frameRate_, kSlaveLeadFrames,
+		     (long long)kSlaveLeadFloorUs, (const void *)pacingMaster_, (int)pairDiag_);
+	}
+	LOGI("VideoDecoder open (zero-copy surface): %s %dx%d track=%d%s", mimeStr.c_str(), width_,
+	     height_, videoTrack, slave_ ? " SLAVE (right eye; no pacing, no drops)" : "");
 	LOGI("#54: frame pacing: %s (MEDIAPLAYER_LEGACY_PACING / debug.dxr.mp.legacy_pacing; 1 = pre-fix)"
 	     "  lookahead=%lld ms  pool=%d",
 	     legacyPacing_ ? "LEGACY sleep-in-decode-thread" : "display-locked (predictedDisplayTime)",
@@ -284,6 +353,19 @@ VideoDecoder::decodeLoop()
 			sawInputEOS = false;
 			firstPtsUs = -1;
 			positionUs_.store(sk, std::memory_order_relaxed);
+			// The last PRESENTED pts is now a fact about the other side of the jump.
+			// Leaving it set would have a slave throttle itself against a reference the
+			// master has abandoned -- after a backward seek that reference is in the
+			// future, so the slave would run away instead of following. Clearing it
+			// hands the slave the seek TARGET (positionUs_, just stored) instead.
+			lastPresentedPtsUs_.store(-1, std::memory_order_relaxed);
+			// Whatever was in flight belongs to the other side of the flush. Clearing
+			// this can only make the gate briefly permissive (the consumer decrements
+			// are clamped at 0), which costs at most one extra queued frame right where
+			// discard(old) is expected anyway -- whereas NOT clearing it can leave the
+			// gate stuck closed on a buffer that will never be acquired.
+			queuedUnacquired_.store(0, std::memory_order_relaxed);
+			if (pairDiag_) pairDiagLeft_.store(kPairDiagFrames, std::memory_order_relaxed);
 			{  // the clock re-anchors on the first frame out of the flush
 				std::lock_guard<std::mutex> lk(clockMx_);
 				anchorMonoNs_ = -1;
@@ -334,7 +416,94 @@ VideoDecoder::decodeLoop()
 			// (2) AUDIO SYNC — only ever SLOWS video further: if the audio clock is
 			//     valid and BEHIND this frame, wait for it (lip-sync). It can never
 			//     push video past the wall-clock ceiling above.
-			if (!decodeOneWhilePaused && legacyPacing_) {
+			if (slave_) {
+				// ── SLAVE (right eye): STATION-KEEPING, not pacing. ──
+				// No wall clock, no drops, no say in which frame is shown -- but
+				// it does not get to wander either. Left truly free-running it
+				// outpaces the master and, after its own EOS loop, laps it; the
+				// master's target then falls in a gap between the frames still
+				// queued and the pair stops matching. (The AImageReader pool is
+				// NOT sufficient backpressure on its own: the consumer drains it
+				// every master frame while hunting for a twin, so it rarely stays
+				// full long enough to stall the codec.)
+				//
+				// Reference is the master's last PRESENTED pts. Before it has
+				// presented anything -- pre-roll, and the first frames out of a
+				// seek -- fall back to its position (a seek publishes the target
+				// immediately), so the slave pre-rolls to the same place instead
+				// of stalling until the master produces its first frame.
+				// GATE 1 (primary): consumer occupancy. Release only when the reader
+				// has nothing of ours left unacquired, so queueBuffer can never
+				// replace a frame the consumer has not seen.
+				{
+					int guard = 0;
+					for (; guard < 2000; ++guard) {
+						if (stop_.load(std::memory_order_relaxed)) break;
+						if (paused_.load(std::memory_order_relaxed)) break;
+						if (seekRequestUs_.load(std::memory_order_relaxed) >= 0) break;
+						if (queuedUnacquired_.load(std::memory_order_relaxed) < 1) break;
+						// 1 ms, not 2: the consumer's catch-up poll waits on this
+						// release->decode->queue round trip, so the wake-up granularity
+						// bounds how many frames it can recover per render tick.
+						std::this_thread::sleep_for(std::chrono::milliseconds(1));
+					}
+					if (guard >= 2000) {
+						// Four seconds with a frame the consumer never took. Proceed
+						// anyway (a stalled right eye is worse than a replaced frame),
+						// but say so: it means the counter and the queue disagree.
+						static bool warned = false;
+						if (!warned) {
+							warned = true;
+							LOGE("[PAIR] occupancy gate timed out with %d unacquired — the "
+							     "counter and the BufferQueue disagree; releasing anyway",
+							     queuedUnacquired_.load(std::memory_order_relaxed));
+						}
+						queuedUnacquired_.store(0, std::memory_order_relaxed);
+					}
+				}
+				// GATE 2 (backstop): the PTS-lead cap. Sized so it never binds first.
+				if (pacingMaster_ != nullptr) {
+					for (int guard = 0; guard < 2000; ++guard) {
+						if (stop_.load(std::memory_order_relaxed)) break;
+						if (paused_.load(std::memory_order_relaxed)) break;
+						// A pending seek retargets us entirely; the frame in hand
+						// is about to be flushed, so stop waiting on it.
+						if (seekRequestUs_.load(std::memory_order_relaxed) >= 0) break;
+						int64_t ref = pacingMaster_->lastPresentedPtsUs();
+						// Budget while the master has NOT yet presented -- pre-roll, and
+						// the frames right after a seek. Two reasons it must be looser
+						// than the steady-state one, both real on this content:
+						//  * positionUs_ is a SEEK TARGET, not a presented PTS, and the
+						//    decoder lands on the nearest preceding sync sample, so the
+						//    two differ by up to a GOP.
+						//  * the two timelines can have different ORIGINS. A LeiaCam2 v1
+						//    file's video traks carry an initial empty edit, so PTS start
+						//    at 167800 while position starts at 0 -- with only the
+						//    steady-state budget the slave would stall on its very first
+						//    frame waiting for a master frame it has already got.
+						// Bounded, so this is a grace period rather than a hole.
+						int64_t budget = slaveLeadUs_;
+						if (ref < 0) {
+							ref = (int64_t)(pacingMaster_->positionSeconds() * 1e6);
+							budget = slaveLeadUs_ + 1'000'000;
+						}
+						if (ref < 0) break;  // master not open yet: do not throttle
+						const int64_t lead = info.presentationTimeUs - ref;
+						slaveLeadObservedUs_.store(lead, std::memory_order_relaxed);
+						if (lead <= budget) break;
+						std::this_thread::sleep_for(std::chrono::milliseconds(2));
+					}
+				}
+				if (pairDiag_ && (pairDiagReleased_++ % 30) == 0) {
+					const int64_t ref = pacingMaster_ ? pacingMaster_->lastPresentedPtsUs() : -1;
+					LOGI("[PAIR] slave released pts=%lld lead=%lld q=%d (master_pts=%lld "
+					     "cap=%lld)",
+					     (long long)info.presentationTimeUs,
+					     (long long)(ref >= 0 ? info.presentationTimeUs - ref : 0),
+					     queuedUnacquired_.load(std::memory_order_relaxed), (long long)ref,
+					     (long long)slaveLeadUs_);
+				}
+			} else if (!decodeOneWhilePaused && legacyPacing_) {
 				if (firstPtsUs < 0) {
 					firstPtsUs = info.presentationTimeUs;
 					wallStart = clock::now();
@@ -412,6 +581,9 @@ VideoDecoder::decodeLoop()
 				AMediaCodec_releaseOutputBufferAtTime(codec_, outIdx,
 				                                     info.presentationTimeUs * 1000);
 				releasedFrames_.fetch_add(1, std::memory_order_relaxed);
+				// Only a slave gates on this; the master's pacing already guarantees
+				// one-in-flight and it never calls acquireFrameByPts to decrement it.
+				if (slave_) queuedUnacquired_.fetch_add(1, std::memory_order_relaxed);
 			} else {
 				AMediaCodec_releaseOutputBuffer(codec_, outIdx, render);
 			}
@@ -652,6 +824,10 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 	int64_t heldTsNs = 0;
 	if (AImage_getTimestamp(heldImage_, &heldTsNs) == AMEDIA_OK) {
 		positionUs_.store(heldTsNs / 1000, std::memory_order_relaxed);
+		// The pairing key for a dual-track file. Distinct from positionUs_, which a
+		// seek moves BEFORE any frame has come out of the flush -- pairing on that
+		// would ask the slave for a frame the master is not showing.
+		lastPresentedPtsUs_.store(heldTsNs / 1000, std::memory_order_relaxed);
 	}
 
 	AHardwareBuffer *ahb = nullptr;
@@ -662,6 +838,159 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 	if (width) *width = width_;
 	if (height) *height = height_;
 	return ahb;
+}
+
+AHardwareBuffer *
+VideoDecoder::acquireFrameByPts(int64_t ptsUs, int *width, int *height)
+{
+	if (reader_ == nullptr || ptsUs < 0) return nullptr;
+
+	// Rounding tolerance ONLY. The PTS makes a round trip through
+	// releaseOutputBufferAtTime (us -> ns) and AImage_getTimestamp (ns -> us), which
+	// is exact for our values; 1 us of slack costs nothing and covers a container
+	// whose two tracks round a shared 90 kHz tick differently. It is NOT a
+	// nearest-frame search: anything wider would silently paper over a real one-frame
+	// desync between the eyes, which is the single failure this whole path exists to
+	// prevent.
+	constexpr int64_t kPairSlackUs = 1;
+	const bool diag = pairDiag_ && pairDiagLeft_.load(std::memory_order_relaxed) > 0;
+	auto diagLine = [&](int64_t pendUs, int64_t d, const char *what) {
+		if (!diag) return;
+		pairDiagLeft_.fetch_sub(1, std::memory_order_relaxed);
+		LOGI("[PAIR] target=%lld pending=%lld d=%lld -> %s", (long long)ptsUs, (long long)pendUs,
+		     (long long)d, what);
+	};
+
+	// Already holding the right frame (the master did not advance this tick).
+	if (heldImage_ != nullptr) {
+		int64_t tsNs = 0;
+		if (AImage_getTimestamp(heldImage_, &tsNs) == AMEDIA_OK) {
+			const int64_t d = tsNs / 1000 - ptsUs;
+			if (d >= -kPairSlackUs && d <= kPairSlackUs) {
+				AHardwareBuffer *ahb = nullptr;
+				if (AImage_getHardwareBuffer(heldImage_, &ahb) == AMEDIA_OK && ahb != nullptr) {
+					if (width) *width = width_;
+					if (height) *height = height_;
+					return ahb;
+				}
+			}
+		}
+	}
+
+	// Drain toward the target. acquireNextImage, never acquireLatest: the frame we
+	// want may already be sitting BEHIND a newer one in the queue, and acquireLatest
+	// would throw it away along with every frame the master has yet to reach.
+	//
+	// `behind` records that we discarded a frame older than the target, i.e. the slave
+	// is demonstrably lagging. Only then is it worth waiting for more (see
+	// kCatchUpBudgetNs); if the queue runs dry with the slave level or ahead, there is
+	// nothing to wait FOR and we return immediately.
+	bool behind = false;
+	const int64_t catchUpDeadlineNs = nowMonoNs() + kCatchUpBudgetNs;
+	for (int guard = 0; guard < 4096; ++guard) {
+		if (pendingImage_ == nullptr) {
+			AImage *img = nullptr;
+			if (AImageReader_acquireNextImage(reader_, &img) != AMEDIA_OK || img == nullptr) {
+				if (behind && nowMonoNs() < catchUpDeadlineNs) {
+					// The acquire above is what unblocks the slave's occupancy gate, so
+					// the next frame is decoding right now. Give it a moment rather
+					// than returning and waiting a whole render tick for it.
+					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+					continue;
+				}
+				break;  // nothing more queued -- keep showing the previous right eye
+			}
+			pendingImage_ = img;
+			// One of ours came out of the queue: the producer may release again.
+			// Clamped at 0 because a flush resets the counter while items acquired
+			// after it are still arriving; letting it go negative would hold the gate
+			// open for exactly as many frames as it undershot.
+			int q = queuedUnacquired_.load(std::memory_order_relaxed);
+			while (q > 0 && !queuedUnacquired_.compare_exchange_weak(q, q - 1,
+			                                                        std::memory_order_relaxed)) {
+			}
+		}
+		int64_t tsNs = 0;
+		if (AImage_getTimestamp(pendingImage_, &tsNs) != AMEDIA_OK || tsNs <= 0) {
+			// No usable timestamp: it can never be matched, so it can only clog the
+			// pool. Drop it and look at the next.
+			diagLine(-1, 0, "discard(no-ts)");
+			AImage_delete(pendingImage_);
+			pendingImage_ = nullptr;
+			continue;
+		}
+		// Same screen the master runs (validatePtsOnce): did OUR media PTS actually
+		// survive the BufferQueue, or did a vendor queue substitute a system
+		// timestamp? If it did not survive, exact pairing can never match and the
+		// right eye would freeze forever -- so say so once, loudly, and degrade to
+		// "newest available" rather than to a frozen picture.
+		validatePtsOnce(tsNs);
+		if (!ptsSelectable_) {
+			if (!pairPtsWarned_) {
+				pairPtsWarned_ = true;
+				LOGE("[PAIR] the right eye's buffers do NOT carry our media PTS — exact "
+				     "pairing is impossible on this device; falling back to newest-frame, "
+				     "so the eyes may be up to a frame apart");
+			}
+			if (heldImage_ != nullptr) AImage_delete(heldImage_);
+			heldImage_ = pendingImage_;
+			pendingImage_ = nullptr;
+			continue;  // keep draining: we want the NEWEST, not the oldest
+		}
+		const int64_t d = tsNs / 1000 - ptsUs;
+		if (d >= -kPairSlackUs && d <= kPairSlackUs) {  // the twin
+			diagLine(tsNs / 1000, d, "match");
+			if (heldImage_ != nullptr) AImage_delete(heldImage_);
+			heldImage_ = pendingImage_;
+			pendingImage_ = nullptr;
+			pairedFrames_.fetch_add(1, std::memory_order_relaxed);
+			AHardwareBuffer *ahb = nullptr;
+			if (AImage_getHardwareBuffer(heldImage_, &ahb) != AMEDIA_OK || ahb == nullptr) {
+				LOGE("[LVF] right eye: AImage_getHardwareBuffer failed");
+				return nullptr;
+			}
+			if (width) *width = width_;
+			if (height) *height = height_;
+			return ahb;
+		}
+		if (d < 0) {  // older than the master: it will never be shown
+			diagLine(tsNs / 1000, d, "discard(old)");
+			AImage_delete(pendingImage_);
+			pendingImage_ = nullptr;
+			unpairedFrames_.fetch_add(1, std::memory_order_relaxed);
+			unpairedOld_.fetch_add(1, std::memory_order_relaxed);
+			behind = true;  // proof the slave is lagging: worth waiting for the next
+			continue;
+		}
+		// NEWER than the master. Normally that is read-ahead and we hold it for a
+		// later call -- but a frame a whole clip-length ahead is not read-ahead, it is
+		// left over from BEFORE a flush (the master wrapped at EOF and main re-seeked
+		// us to 0 while the reader still queued end-of-clip frames). Holding one of
+		// those would wedge the right eye forever, since the master's PTS only ever
+		// approaches it from below and it is bounded by the pool depth how many can be
+		// drained. Discard beyond kStaleUs; keep anything closer.
+		if (d > kStaleUs) {
+			diagLine(tsNs / 1000, d, "discard(future)");
+			AImage_delete(pendingImage_);
+			pendingImage_ = nullptr;
+			unpairedFrames_.fetch_add(1, std::memory_order_relaxed);
+			unpairedFuture_.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		diagLine(tsNs / 1000, d, "hold");
+		break;  // legitimately ahead: keep it pending for a later master PTS
+	}
+	if (!ptsSelectable_ && heldImage_ != nullptr) {
+		// Degraded path: newest-available. Nothing matched by PTS because nothing can.
+		AHardwareBuffer *ahb = nullptr;
+		if (AImage_getHardwareBuffer(heldImage_, &ahb) == AMEDIA_OK && ahb != nullptr) {
+			if (width) *width = width_;
+			if (height) *height = height_;
+			return ahb;
+		}
+	}
+	diagLine(-1, 0, "empty");
+	return nullptr;  // caller keeps the right eye it already has
 }
 
 AHardwareBuffer *
@@ -711,6 +1040,16 @@ VideoDecoder::stop()
 	}
 	ptsSelectable_ = true;
 	ptsChecked_ = false;
+	lastPresentedPtsUs_.store(-1, std::memory_order_relaxed);
+	queuedUnacquired_.store(0, std::memory_order_relaxed);
+	// Per-STREAM modes, cleared with the stream. Both are set again before the next
+	// open by whoever wants them; leaving requireDisplayLocked_ latched would silently
+	// disable the MEDIAPLAYER_LEGACY_PACING kill switch for every clip opened after
+	// the first dual one, which is exactly the kind of sticky state that makes a
+	// kill switch untrustworthy.
+	requireDisplayLocked_ = false;
+	slave_ = false;
+	trackIndex_ = -1;
 	if (codec_) {
 		AMediaCodec_stop(codec_);
 		AMediaCodec_delete(codec_);

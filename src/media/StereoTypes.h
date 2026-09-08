@@ -20,6 +20,18 @@ enum class StereoLayout {
     Mono,     // 2D — same image to both eyes
     SbsFull,  // full side-by-side: each eye is half the pixel width
     SbsHalf,  // half side-by-side: each eye is squeezed; stretched on display
+    // Two FULL views carried in separate container tracks ("LVF v2"): a `.mp4` with
+    // one H.264 track per eye (mdhd language `abl` / `abr`) plus an optional `mett`
+    // convergence metadata track. Nothing is packed inside a frame, so unlike the
+    // Sbs* members this layout says nothing about how to slice ONE image -- each eye
+    // samples its own decoder's FULL frame, and the per-eye aspect is that frame's
+    // w/h (same arithmetic as Mono, for a different reason).
+    //
+    // Appended LAST on purpose: StereoVote indexes its tallies by (int)layout, and
+    // reordering would silently re-map every existing vote. The pixel detector never
+    // produces Dual (it is a container fact, decided before a frame is decoded), so
+    // Dual is a legal value of this enum that simply never reaches the vote.
+    Dual,
 };
 
 // Which layer of the layered detector actually decided the layout. Ordered loosely by

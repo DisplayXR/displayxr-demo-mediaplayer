@@ -5,7 +5,10 @@
 
 #include <android/hardware_buffer.h>
 #include <android/log.h>
+#include <sys/system_properties.h>
+
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -576,6 +579,9 @@ SbsRenderer::ensureAhbPipeline(const VkAndroidHardwareBufferFormatPropertiesANDR
 		ahbCacheCount_ = 0;
 		ahbActiveImage_ = VK_NULL_HANDLE;
 		ahbActiveView_ = VK_NULL_HANDLE;
+		ahbActiveImageR_ = VK_NULL_HANDLE;
+		ahbActiveViewR_ = VK_NULL_HANDLE;
+		ahbStereo_ = false;
 		destroyAhbPipeline();
 	}
 	ahbExternalFormat_ = fmt.externalFormat;
@@ -720,25 +726,36 @@ SbsRenderer::ensureAhbPipeline(const VkAndroidHardwareBufferFormatPropertiesANDR
 		return false;
 	}
 
-	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+	// TWO sets, always. Set 0 is the single-source / left-eye binding (unchanged for
+	// every SBS and mono stream); set 1 is the right eye of a dual-track stream. They
+	// have to be separate SETS rather than one set rewritten between draws, because
+	// both eyes are drawn into the atlas inside ONE command buffer -- a mid-recording
+	// vkUpdateDescriptorSets would apply to both draws, not to the second one.
+	// Allocating the pair unconditionally keeps the single-source path byte-identical
+	// (it just never touches set 1) and costs one descriptor.
+	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
 	VkDescriptorPoolCreateInfo dpci = {};
 	dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	dpci.maxSets = 1;
+	dpci.maxSets = 2;
 	dpci.poolSizeCount = 1;
 	dpci.pPoolSizes = &ps;
 	if (vkCreateDescriptorPool(device_, &dpci, nullptr, &ahbDescPool_) != VK_SUCCESS) {
 		LOGE("ahb desc pool failed");
 		return false;
 	}
+	const VkDescriptorSetLayout layouts[2] = {ahbSetLayout_, ahbSetLayout_};
+	VkDescriptorSet sets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
 	VkDescriptorSetAllocateInfo dsai = {};
 	dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 	dsai.descriptorPool = ahbDescPool_;
-	dsai.descriptorSetCount = 1;
-	dsai.pSetLayouts = &ahbSetLayout_;
-	if (vkAllocateDescriptorSets(device_, &dsai, &ahbDescSet_) != VK_SUCCESS) {
+	dsai.descriptorSetCount = 2;
+	dsai.pSetLayouts = layouts;
+	if (vkAllocateDescriptorSets(device_, &dsai, sets) != VK_SUCCESS) {
 		LOGE("ahb desc set alloc failed");
 		return false;
 	}
+	ahbDescSet_ = sets[0];
+	ahbDescSetR_ = sets[1];
 	ahbInited_ = true;
 	LOGI("AHB ycbcr pipeline ready (externalFormat=%llu model=%d range=%d)",
 	     (unsigned long long)fmt.externalFormat, (int)fmt.suggestedYcbcrModel,
@@ -904,8 +921,67 @@ SbsRenderer::setVideoAhb(struct AHardwareBuffer *ahb, uint32_t width, uint32_t h
 	ahbActiveView_ = imp->view;
 	ahbActiveW_ = width;
 	ahbActiveH_ = height;
+	ahbStereo_ = false;  // single source: leave (or never enter) the dual path
 	sourceMode_ = 3;
 	sourceFullRange_ = 1.0f;  // unused in mode 3 (the ycbcr conversion owns range)
+	return true;
+}
+
+bool
+SbsRenderer::setVideoAhbStereo(struct AHardwareBuffer *ahbL, uint32_t wL, uint32_t hL,
+                               struct AHardwareBuffer *ahbR, uint32_t wR, uint32_t hR)
+{
+	// Left first, through the ordinary single-source path: it builds/validates the
+	// per-stream ycbcr pipeline and leaves a usable flat-left picture bound if the
+	// right eye then fails. (setVideoAhb clears ahbStereo_, so every failure below
+	// exits with the renderer in a consistent single-source state.)
+	if (!setVideoAhb(ahbL, wL, hL)) return false;
+
+	if (ahbR == nullptr) return false;
+	if (wR != wL || hR != hL) {
+		// The two eye tracks of a dual-track file are the same codec at the same
+		// resolution by construction. If they are not, the ONE ycbcr conversion built
+		// from the left stream's external format is not valid for the right one, and
+		// sampling through it is undefined -- so refuse and stay flat-left.
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			LOGE("[LVF] eye buffers differ in size (%ux%u vs %ux%u) — staying single-source",
+			     wL, hL, wR, hR);
+		}
+		return false;
+	}
+	const AhbImport *impR = importAhb(ahbR, wR, hR);
+	if (impR == nullptr) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			LOGE("[LVF] right-eye AHB import failed — staying single-source (flat left)");
+		}
+		return false;
+	}
+	// importAhb() would have REBUILT the pipeline (and invalidated the left import we
+	// just bound) had the right buffer carried a different vendor external format.
+	// ahbActiveView_ is cleared by that rebuild, which is exactly the tell.
+	if (ahbActiveView_ == VK_NULL_HANDLE) {
+		LOGE("[LVF] the two eye streams have different external formats — single-source");
+		return false;
+	}
+
+	VkDescriptorImageInfo dii = {};
+	dii.imageView = impR->view;
+	dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	VkWriteDescriptorSet wr = {};
+	wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	wr.dstSet = ahbDescSetR_;
+	wr.dstBinding = 0;
+	wr.descriptorCount = 1;
+	wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	wr.pImageInfo = &dii;
+	vkUpdateDescriptorSets(device_, 1, &wr, 0, nullptr);
+	ahbActiveImageR_ = impR->image;
+	ahbActiveViewR_ = impR->view;
+	ahbStereo_ = true;
 	return true;
 }
 
@@ -916,11 +992,79 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 {
 	const bool useAhb = (sourceMode_ == 3 && ahbActiveView_ != VK_NULL_HANDLE);
 	if (!useAhb && planes_[0].view == VK_NULL_HANDLE) return;
+	// Dual-source (LVF v2): each eye has its OWN imported image, so `mono` and the
+	// SBS column split do not apply -- every view samples its own image whole.
+	const bool dual = useAhb && ahbStereo_ && ahbActiveViewR_ != VK_NULL_HANDLE;
 	VkPipeline pipe = useAhb ? ahbPipeline_ : pipeline_;
 	VkPipelineLayout pl = useAhb ? ahbPipeLayout_ : pipeLayout_;
 	VkDescriptorSet ds = useAhb ? ahbDescSet_ : descSet_;
 	const Target &t = targetFor(image, atlasW, atlasH);
 	const uint32_t c = cols ? cols : 1;
+
+	// ── Convergence: sign, and where it comes from ───────────────────────────
+	//
+	// THE CONVENTION: POSITIVE convergence = NEARER (content comes toward the viewer),
+	// NEGATIVE = FURTHER (content recedes behind the glass). This is Leia's, and it is
+	// the default here. An earlier draft of this reader assumed the opposite; the
+	// mapping below is the corrected one.
+	//
+	// DERIVATION (first principles), so the code can be checked rather than believed.
+	// Put the screen plane at distance D in front of the viewer and the eyes at
+	// x = -e/2 (left) and x = +e/2 (right). A scene point on the centre line at depth
+	// D + b (b > 0 = BEHIND the glass) projects onto the screen at
+	//     x_eye = e_x * b / (D + b)
+	// so x_L = -(e/2)*b/(D+b) and x_R = +(e/2)*b/(D+b). Hence x_R > x_L for b > 0:
+	// content BEHIND the screen has the right eye's image to the RIGHT of the left
+	// eye's (uncrossed disparity), and the deeper it sits the larger x_R - x_L is.
+	// So pushing content BACK means INCREASING x_R - x_L, and pulling it FORWARD means
+	// decreasing it.
+	//
+	// Displaying content shifted RIGHT by s means each screen pixel shows what used to
+	// be s to its LEFT, i.e. it SUBTRACTS s from the sampling u. With "positive =
+	// nearer", split half per eye:
+	//     sampled:    uL += -c/2              uR += +c/2
+	//     displayed:  left moves RIGHT by c/2, right moves LEFT by c/2  (x_R-x_L -= c)
+	// -> positive c reduces uncrossed disparity: content comes forward. Correct.
+	//
+	// WHY THIS SIGN, on evidence rather than taste:
+	//   - Leia's camera SDK reconvergence shader adds `viewPosition * c` to the
+	//     sampling u with viewPosition = -0.5 for the left view and +0.5 for the
+	//     right -- exactly the mapping above.
+	//   - Its diopter->convergence conversion is NEGATIVE-signed: focus at infinity
+	//     gives c = 0 and focusing nearer drives c increasingly negative.
+	//   - The physics agrees. These files come from a PARALLEL two-camera rig, where
+	//     a point at distance Z has x_R - x_L = -f*b/Z < 0 -- every object is crossed,
+	//     i.e. floating in front of the glass, with only infinity at the screen. The
+	//     correction such a rig needs is therefore always "push back", and a real
+	//     LeiaCam2 v1 capture carries c ~ -0.05 throughout. Under this convention that
+	//     negative value pushes back, which is the whole point of the metadata.
+	//
+	// `setprop debug.dxr.mp.conv_sign -1` inverts the mapping without a rebuild (the
+	// A/B that settled it); `debug.dxr.mp.conv_scale 0` disables convergence entirely,
+	// which is the same thing a `_noreconv` filename asks for.
+	//
+	// Not modelled: Leia's shader also crops/zooms by (1 - |c|) about the centre to
+	// hide the edge strip the shift exposes. Here that strip is clamp-to-edge instead
+	// (both AHB samplers are CLAMP_TO_EDGE), so a large |c| smears the outer column
+	// rather than reframing. At |c| ~ 0.05 that is a 2.5%-of-width edge artifact.
+	if (!convPropsRead_) {
+		convPropsRead_ = true;
+		char sp[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.dxr.mp.conv_sign", sp) > 0 && sp[0]) {
+			const float v = (float)std::atof(sp);
+			if (v < 0.0f) convSign_ = -1.0f;
+			else if (v > 0.0f) convSign_ = 1.0f;
+		}
+		sp[0] = '\0';
+		if (__system_property_get("debug.dxr.mp.conv_scale", sp) > 0 && sp[0]) {
+			const float v = (float)std::atof(sp);
+			if (v >= 0.0f && v <= 10.0f) convScale_ = v;
+		}
+		LOGI("[LVF] convergence knobs: sign=%.0f scale=%.3f", convSign_, convScale_);
+	}
+	// Half the shift per eye; the LEFT eye samples at -c/2 and the right at +c/2, per
+	// the derivation above.
+	const float convHalf = dual ? convergence_ * convSign_ * convScale_ * 0.5f : 0.0f;
 
 	vkResetCommandBuffer(cmd_, 0);
 	VkCommandBufferBeginInfo cbbi = {};
@@ -941,11 +1085,17 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 		bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
 		bar.dstQueueFamilyIndex = queueFamily_;
-		bar.image = ahbActiveImage_;
 		bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		// Both eyes' images are written by the decoder on the foreign queue, so both
+		// need the acquire -- barriering only the left one leaves the right eye's
+		// pixels formally undefined (in practice: intermittently stale or torn).
+		VkImageMemoryBarrier bars[2] = {bar, bar};
+		bars[0].image = ahbActiveImage_;
+		bars[1].image = ahbActiveImageR_;
+		const uint32_t nbars = dual ? 2u : 1u;
 		vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-		                     &bar);
+		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+		                     nbars, bars);
 	}
 
 	// One render pass over the WHOLE atlas: clear it black once (the letterbox
@@ -985,8 +1135,16 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 
 		// UV: mono → whole image to every view; stereo SBS → this view's column
 		// slice (left half to view 0, right half to view 1 for a 2×1 layout).
-		const float boxW = mono ? 1.0f : 1.0f / (float)c;
-		const float offBase = mono ? 0.0f : (float)tile_x / (float)c;
+		// Which eye this tile is. Same column rule the SBS split uses (tile_x 0 =
+		// left), so a 2x2 quad mode gets left/right/left/right rather than every view
+		// past the first showing the right eye. With one column there is only one eye
+		// a tile can be, and the view index is all that is left to go on.
+		const bool rightEye = (c > 1) ? (tile_x != 0) : (v != 0);
+		// Dual adds: this eye's WHOLE image, shifted by half the convergence.
+		const float boxW = (dual || mono) ? 1.0f : 1.0f / (float)c;
+		float offBase = (dual || mono) ? 0.0f : (float)tile_x / (float)c;
+		if (dual) offBase += rightEye ? convHalf : -convHalf;
+		VkDescriptorSet dsv = (dual && rightEye) ? ahbDescSetR_ : ds;
 
 		// Content quad, scissor-clipped to the tile.
 		VkViewport vp = {vx, vy, cqW, cqH, 0.0f, 1.0f};
@@ -994,7 +1152,7 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		vkCmdSetViewport(cmd_, 0, 1, &vp);
 		vkCmdSetScissor(cmd_, 0, 1, &sc);
 		vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-		vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &ds, 0, nullptr);
+		vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &dsv, 0, nullptr);
 		SbsPush push = {};
 		push.uvOffset[0] = offBase;
 		push.uvOffset[1] = 0.0f;
@@ -1031,6 +1189,7 @@ SbsRenderer::destroyAhbPipeline()
 	ahbPipeLayout_ = VK_NULL_HANDLE;
 	ahbDescPool_ = VK_NULL_HANDLE;
 	ahbDescSet_ = VK_NULL_HANDLE;
+	ahbDescSetR_ = VK_NULL_HANDLE;
 	ahbSetLayout_ = VK_NULL_HANDLE;
 	ahbSampler_ = VK_NULL_HANDLE;
 	ahbYcbcr_ = VK_NULL_HANDLE;
@@ -1050,6 +1209,10 @@ SbsRenderer::resetVideoAhb()
 	ahbCacheCount_ = 0;
 	ahbActiveImage_ = VK_NULL_HANDLE;
 	ahbActiveView_ = VK_NULL_HANDLE;
+	ahbActiveImageR_ = VK_NULL_HANDLE;
+	ahbActiveViewR_ = VK_NULL_HANDLE;
+	ahbStereo_ = false;
+	convergence_ = 0.0f;
 	ahbActiveW_ = ahbActiveH_ = 0;
 	if (sourceMode_ == 3) sourceMode_ = 0;  // nothing bound until the next source
 	destroyAhbPipeline();
@@ -1065,6 +1228,9 @@ SbsRenderer::cleanup()
 	ahbCacheCount_ = 0;
 	ahbActiveImage_ = VK_NULL_HANDLE;
 	ahbActiveView_ = VK_NULL_HANDLE;
+	ahbActiveImageR_ = VK_NULL_HANDLE;
+	ahbActiveViewR_ = VK_NULL_HANDLE;
+	ahbStereo_ = false;
 	destroyAhbPipeline();
 	for (auto &kv : targets_) {
 		if (kv.second.fb) vkDestroyFramebuffer(device_, kv.second.fb, nullptr);
