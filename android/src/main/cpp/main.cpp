@@ -330,6 +330,10 @@ constexpr uint8_t kIdleBg[3] = {31, 31, 33};  // 0.12,0.12,0.13 * 255
 std::atomic<int> g_pick_fd{-1};
 std::mutex g_pick_name_mx;
 std::string g_pick_name;  // display name of the picked document (filename layer)
+// True while the idle splash (the DisplayXR logo) is the scene. It is uploaded like
+// any image, so g_scene_loaded alone cannot tell "nothing loaded" from "an image is
+// loaded" — and that is the one distinction tap-to-open and the HUD both need.
+std::atomic<bool> g_showing_splash{false};
 
 // ── Stereo layout (desktop parity, #45) ─────────────────────────────────────
 // The renderer has two knobs a layout maps onto: `mono` (both eyes sample the
@@ -1360,7 +1364,8 @@ fill_transport_state()
 	const double dt = s_last_ns ? (double)(now - s_last_ns) / 1e9 : 0.0;
 	s_last_ns = now;
 
-	g_ui_state.hasMedia = g_scene_loaded.load(std::memory_order_relaxed);
+	g_ui_state.hasMedia = g_scene_loaded.load(std::memory_order_relaxed) &&
+	                      !g_showing_splash.load(std::memory_order_relaxed);
 	g_ui_state.isVideo = g_is_video;
 	{
 		// SAF DISPLAY_NAME — already a basename, so no path work is needed here.
@@ -1748,6 +1753,7 @@ load_splash(struct android_app *app)
 		g_clear_rgb[1] = kIdleBg[1] / 255.0f;
 		g_clear_rgb[2] = kIdleBg[2] / 255.0f;
 		g_is_video = false;
+		g_showing_splash.store(true, std::memory_order_relaxed);
 		g_scene_loaded.store(true, std::memory_order_relaxed);
 		LOGI("No media — showing the DisplayXR idle screen (%dx%d square)", side, side);
 	}
@@ -1824,6 +1830,7 @@ load_image_file(const std::string &path, const std::string &logical_name)
 	apply_layout(info.layout, r.image.width, r.image.height);
 	g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox for media
 	g_is_video = false;
+	g_showing_splash.store(false, std::memory_order_relaxed);
 	g_scene_loaded.store(true, std::memory_order_relaxed);
 	LOGI("Loaded image: %s %dx%d layout=%s (%s)%s", logical_name.c_str(), r.image.width,
 	     r.image.height, mp::LayoutName(info.layout), mp::SignalName(info.signal),
@@ -2103,6 +2110,16 @@ render_frame()
 				    (g_apply_convergence && pts >= 0)
 				        ? mp::LvfProbeAndroid::ConvergenceAt(g_convergence, pts)
 				        : 0.0f);
+				{
+					static uint32_t dualDiagTick = 0;
+					if ((++dualDiagTick % 60) == 1) {
+						LOGI("[LVF] state: pts=%lld ahbL=%d ahbR=%d bound=%d stereoDual=%d mono=%d "
+						     "layout=%s conv=%.4f",
+						     (long long)pts, (int)(ahb != nullptr), (int)(ahbR != nullptr), (int)bound,
+						     (int)g_sbs.stereoDual(), (int)g_image_mono, mp::LayoutName(g_layout),
+						     g_sbs.convergence());
+					}
+				}
 			}
 			// Aspect + first-frame gating still belong to the MASTER: they describe the
 			// stream, and an idle tick says nothing new about it.
@@ -2117,6 +2134,7 @@ render_frame()
 					                           : (float)vw / (float)vh,
 					                       std::memory_order_relaxed);
 				}
+				g_showing_splash.store(false, std::memory_order_relaxed);
 				g_scene_loaded.store(true, std::memory_order_relaxed);
 			}
 		} else if (ahb) {
@@ -2127,6 +2145,7 @@ render_frame()
 					                           : (float)vw / (float)vh,
 					                       std::memory_order_relaxed);
 				}
+				g_showing_splash.store(false, std::memory_order_relaxed);
 				g_scene_loaded.store(true, std::memory_order_relaxed);
 			}
 		}
@@ -2303,12 +2322,20 @@ render_frame()
 		//
 		// chrome_available still gates the no-chrome path so a tap before the first
 		// frame (or on a runtime without window-space layers) cannot fire it twice.
-		const bool has_media = g_scene_loaded.load(std::memory_order_relaxed) || g_is_video;
+		const bool has_media = !g_showing_splash.load(std::memory_order_relaxed) &&
+		                       (g_scene_loaded.load(std::memory_order_relaxed) || g_is_video);
+		// No WantCaptureMouse gate on the empty splash: g_open_picker_request is a
+		// single flag that Java consumes once, so a tap on the Open button setting it
+		// twice is harmless, whereas a false-positive capture (any hovered window,
+		// a button still held from the trickled DOWN event) swallowed the gesture.
 		if (!chrome_available) {
 			if (!g_is_video) g_open_picker_request.store(true, std::memory_order_relaxed);
-		} else if (!has_media && !g_imgui.WantCaptureMouse()) {
+		} else if (!has_media) {
 			g_open_picker_request.store(true, std::memory_order_relaxed);
 		}
+		LOGI("tap: has_media=%d chrome=%d imgui_capture=%d -> picker=%d", (int)has_media,
+		     (int)chrome_available, (int)g_imgui.WantCaptureMouse(),
+		     (int)g_open_picker_request.load(std::memory_order_relaxed));
 	}
 
 	XrCompositionLayerProjection projection_layer = {};
@@ -2517,6 +2544,7 @@ bring_up(struct android_app *app)
 	                                  g_lvf_dbg != LvfOpen::NotLvf || g_video.openPath(dbgFile))) {
 		g_audio.openPath(dbgFile);  // own fd; no-op if no audio track
 		g_is_video = true;
+		g_showing_splash.store(false, std::memory_order_relaxed);
 		if (g_lvf_dbg == LvfOpen::Dual) {
 			apply_layout(mp::StereoLayout::Dual, g_video.width(), g_video.height());
 		} else if (g_lvf_dbg == LvfOpen::FlatLeft) {
@@ -2871,7 +2899,9 @@ android_main(struct android_app *app)
 					const LvfOpen lvf = open_dual_if_lvf(logical, pick, off, len, nullptr);
 					if (lvf != LvfOpen::NotLvf || g_video.openFd(pick, off, len)) {
 						if (audio_fd >= 0) g_audio.openFd(audio_fd, off, len);
+						g_audio.setPaused(false);  // the decoders start playing; keep audio in step
 						g_is_video = true;
+		g_showing_splash.store(false, std::memory_order_relaxed);
 						if (lvf == LvfOpen::Dual) {
 							apply_layout(mp::StereoLayout::Dual, g_video.width(),
 							             g_video.height());
