@@ -311,6 +311,7 @@ VideoDecoder::start()
 	     (long long)(lookaheadUs_ / 1000), (int)kReaderMaxImages);
 	open_.store(true, std::memory_order_relaxed);
 	stop_.store(false, std::memory_order_relaxed);
+	threadExited_.store(false, std::memory_order_relaxed);
 	thread_ = std::thread([this] { decodeLoop(); });
 	return true;
 }
@@ -469,6 +470,11 @@ VideoDecoder::decodeLoop()
 						// A pending seek retargets us entirely; the frame in hand
 						// is about to be flushed, so stop waiting on it.
 						if (seekRequestUs_.load(std::memory_order_relaxed) >= 0) break;
+						// A master that is no longer open will never advance again, so
+						// keeping station against it is waiting for something that
+						// cannot happen. Teardown stops the slave first precisely so
+						// this cannot arise -- this is the belt to that braces.
+						if (!pacingMaster_->isOpen()) break;
 						int64_t ref = pacingMaster_->lastPresentedPtsUs();
 						// Budget while the master has NOT yet presented -- pre-roll, and
 						// the frames right after a seek. Two reasons it must be looser
@@ -607,6 +613,9 @@ VideoDecoder::decodeLoop()
 			LOGI("output format changed: %s", AMediaFormat_toString(outFmt_));
 		}
 	}
+	// MUST be last: stop() waits on this, draining the reader until it flips, because
+	// this thread can be parked in a codec call that only the drain can release.
+	threadExited_.store(true, std::memory_order_relaxed);
 }
 
 int64_t
@@ -1023,8 +1032,31 @@ VideoDecoder::acquireLatestBuffer(int *width, int *height)
 void
 VideoDecoder::stop()
 {
+	const bool wasOpen = open_.load(std::memory_order_relaxed);
+	if (wasOpen) LOGI("VideoDecoder::stop%s: signalling decode thread", slave_ ? " (slave)" : "");
 	stop_.store(true, std::memory_order_relaxed);
-	if (thread_.joinable()) thread_.join();
+
+	// ── DRAIN WHILE JOINING. A bare join() here deadlocks. ────────────────────────
+	//
+	// Confirmed from a native stack: once the render thread stops consuming (the SAF
+	// picker comes to the foreground, or the activity pauses), the reader fills, the
+	// codec's looper blocks trying to dequeue its next output slot, and EVERY
+	// subsequent codec call from the decode thread waits on that looper -- including
+	// the AMediaCodec_releaseOutputBufferAtTime the thread is already inside
+	// (renderOutputBufferAndRelease -> AMessage::postAndAwaitResponse ->
+	// pthread_cond_wait, indefinitely). The decode thread therefore never reaches its
+	// `while (!stop_)` test, join() never returns, and the app hangs on OPENING THE
+	// NEXT FILE while the real fault is in closing the last one.
+	//
+	// The consumer is the only party that can break it: freeing slots lets the looper
+	// finish the pending render, the release returns, and the loop sees stop_ and
+	// exits. So release what we hold, then keep draining on a 1 ms cadence until the
+	// thread signals it is done.
+	//
+	// This is NOT specific to the dual path -- the single-decoder master runs the same
+	// code and has always been able to wedge this way, which is why it shows up after
+	// the picker whatever the file is. The occupancy gate only makes it certain for a
+	// slave, which always parks with exactly one buffer outstanding by design.
 	if (heldImage_) {
 		AImage_delete(heldImage_);
 		heldImage_ = nullptr;
@@ -1033,6 +1065,50 @@ VideoDecoder::stop()
 		AImage_delete(pendingImage_);
 		pendingImage_ = nullptr;
 	}
+	if (thread_.joinable()) {
+		constexpr int64_t kJoinDrainCapNs = 3'000'000'000LL;
+		const int64_t deadline = nowMonoNs() + kJoinDrainCapNs;
+		int drained = 0;
+		int64_t waitedNs = 0;
+		while (!threadExited_.load(std::memory_order_relaxed)) {
+			if (reader_ != nullptr) {
+				for (int i = 0; i < kReaderMaxImages + 2; ++i) {
+					AImage *img = nullptr;
+					if (AImageReader_acquireNextImage(reader_, &img) != AMEDIA_OK ||
+					    img == nullptr)
+						break;
+					AImage_delete(img);
+					++drained;
+				}
+			}
+			const int64_t now = nowMonoNs();
+			if (now >= deadline) {
+				waitedNs = kJoinDrainCapNs;
+				// Still join below: a hang we can see in a log beats one we cannot.
+				LOGE("VideoDecoder::stop%s: decode thread still running after %lld ms "
+				     "(drained %d, queuedUnacquired=%d, paused=%d) — joining anyway",
+				     slave_ ? " (slave)" : "", (long long)(kJoinDrainCapNs / 1'000'000),
+				     drained, queuedUnacquired_.load(std::memory_order_relaxed),
+				     (int)paused_.load(std::memory_order_relaxed));
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		if (wasOpen && waitedNs == 0) {
+			LOGI("VideoDecoder::stop: decode thread exited (drained %d image(s) to free it)",
+			     drained);
+		}
+		thread_.join();
+	}
+	// Anything the thread queued between its last release and its exit.
+	if (reader_ != nullptr) {
+		for (int i = 0; i < kReaderMaxImages + 2; ++i) {
+			AImage *img = nullptr;
+			if (AImageReader_acquireNextImage(reader_, &img) != AMEDIA_OK || img == nullptr) break;
+			AImage_delete(img);
+		}
+	}
+	queuedUnacquired_.store(0, std::memory_order_relaxed);
 	{
 		std::lock_guard<std::mutex> lk(clockMx_);
 		anchorMonoNs_ = -1;
@@ -1050,17 +1126,24 @@ VideoDecoder::stop()
 	requireDisplayLocked_ = false;
 	slave_ = false;
 	trackIndex_ = -1;
+	// Breadcrumbs, deliberately one per teardown step: if this ever wedges again the
+	// LAST LINE IN THE LOG NAMES THE CALL, which beats reconstructing it from a native
+	// stack after the fact.
 	if (codec_) {
+		if (wasOpen) LOGI("VideoDecoder::stop: AMediaCodec_stop");
 		AMediaCodec_stop(codec_);
+		if (wasOpen) LOGI("VideoDecoder::stop: AMediaCodec_delete");
 		AMediaCodec_delete(codec_);
 		codec_ = nullptr;
 	}
 	if (reader_) {  // also frees window_ (owned by the reader)
+		if (wasOpen) LOGI("VideoDecoder::stop: AImageReader_delete");
 		AImageReader_delete(reader_);
 		reader_ = nullptr;
 		window_ = nullptr;
 	}
 	if (ex_) {
+		if (wasOpen) LOGI("VideoDecoder::stop: AMediaExtractor_delete");
 		AMediaExtractor_delete(ex_);
 		ex_ = nullptr;
 	}
@@ -1073,4 +1156,5 @@ VideoDecoder::stop()
 		ownedFd_ = -1;
 	}
 	open_.store(false, std::memory_order_relaxed);
+	if (wasOpen) LOGI("VideoDecoder::stop: done");
 }

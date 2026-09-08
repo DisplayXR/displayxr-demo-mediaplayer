@@ -931,41 +931,55 @@ bool
 SbsRenderer::setVideoAhbStereo(struct AHardwareBuffer *ahbL, uint32_t wL, uint32_t hL,
                                struct AHardwareBuffer *ahbR, uint32_t wR, uint32_t hR)
 {
+	// Every exit below leaves the renderer in a consistent SINGLE-source state with
+	// the left eye bound (flat, but correct and never black), and says why exactly
+	// once per stream -- `stereoBindLogged_` is reset with the stream in
+	// resetVideoAhb(), so a first-play-through failure cannot hide behind a
+	// process-lifetime `static bool warned` that a previous clip already tripped.
+	auto fail = [&](const char *why) {
+		if (!stereoBindLogged_) {
+			stereoBindLogged_ = true;
+			LOGE("[LVF] stereo bind FAILED (%s): L=%ux%u R=%ux%u extFmt=%llu inited=%d "
+			     "setL=%p setR=%p — showing the LEFT eye in both views",
+			     why, wL, hL, wR, hR, (unsigned long long)ahbExternalFormat_, (int)ahbInited_,
+			     (void *)ahbDescSet_, (void *)ahbDescSetR_);
+		}
+		return false;
+	};
+
 	// Left first, through the ordinary single-source path: it builds/validates the
 	// per-stream ycbcr pipeline and leaves a usable flat-left picture bound if the
-	// right eye then fails. (setVideoAhb clears ahbStereo_, so every failure below
-	// exits with the renderer in a consistent single-source state.)
-	if (!setVideoAhb(ahbL, wL, hL)) return false;
-
-	if (ahbR == nullptr) return false;
+	// right eye then fails. (setVideoAhb clears ahbStereo_.)
+	if (!setVideoAhb(ahbL, wL, hL)) return fail("left import");
+	if (ahbR == nullptr) return fail("no right buffer");
 	if (wR != wL || hR != hL) {
 		// The two eye tracks of a dual-track file are the same codec at the same
 		// resolution by construction. If they are not, the ONE ycbcr conversion built
 		// from the left stream's external format is not valid for the right one, and
 		// sampling through it is undefined -- so refuse and stay flat-left.
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
-			LOGE("[LVF] eye buffers differ in size (%ux%u vs %ux%u) — staying single-source",
-			     wL, hL, wR, hR);
-		}
-		return false;
+		return fail("eye sizes differ");
 	}
 	const AhbImport *impR = importAhb(ahbR, wR, hR);
-	if (impR == nullptr) {
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
-			LOGE("[LVF] right-eye AHB import failed — staying single-source (flat left)");
-		}
-		return false;
-	}
-	// importAhb() would have REBUILT the pipeline (and invalidated the left import we
-	// just bound) had the right buffer carried a different vendor external format.
-	// ahbActiveView_ is cleared by that rebuild, which is exactly the tell.
+	if (impR == nullptr) return fail("right import");
+
+	// importAhb() REBUILDS the whole ycbcr chain if the right buffer carries a
+	// different vendor external format from the left -- and that rebuild destroys the
+	// left import this call just bound, clearing ahbActiveView_.
+	//
+	// Bailing out here was a PERMANENT flat-left: next frame the left import would
+	// rebuild back to its own format, the right would rebuild again, and the two would
+	// alternate forever with neither pair ever binding. Since the rebuild has already
+	// happened and the pipeline now matches the RIGHT eye's format, re-importing the
+	// left against it converges in one step instead. If it still does not take, the
+	// two streams genuinely disagree and flat-left is the honest answer.
 	if (ahbActiveView_ == VK_NULL_HANDLE) {
-		LOGE("[LVF] the two eye streams have different external formats — single-source");
-		return false;
+		LOGI("[LVF] eye streams reported different external formats; rebinding the left "
+		     "against the rebuilt pipeline");
+		if (!setVideoAhb(ahbL, wL, hL)) return fail("left re-import after format rebuild");
+		impR = importAhb(ahbR, wR, hR);
+		if (impR == nullptr || ahbActiveView_ == VK_NULL_HANDLE) {
+			return fail("external formats will not converge");
+		}
 	}
 
 	VkDescriptorImageInfo dii = {};
@@ -982,6 +996,12 @@ SbsRenderer::setVideoAhbStereo(struct AHardwareBuffer *ahbL, uint32_t wL, uint32
 	ahbActiveImageR_ = impR->image;
 	ahbActiveViewR_ = impR->view;
 	ahbStereo_ = true;
+	if (!stereoBindLogged_) {
+		stereoBindLogged_ = true;
+		LOGI("[LVF] first stereo pair BOUND: %ux%u per eye, extFmt=%llu, setL=%p setR=%p",
+		     wL, hL, (unsigned long long)ahbExternalFormat_, (void *)ahbDescSet_,
+		     (void *)ahbDescSetR_);
+	}
 	return true;
 }
 
@@ -990,11 +1010,23 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
                        uint32_t renderH, uint32_t cols, uint32_t rows, uint32_t viewCount,
                        float contentAspect, bool mono, const float clearRgb[3])
 {
-	const bool useAhb = (sourceMode_ == 3 && ahbActiveView_ != VK_NULL_HANDLE);
+	// EVERY handle the AHB path is about to bind is checked, not just the view. The
+	// failure this prevents is not a wrong picture, it is a HANG: binding a destroyed
+	// pipeline/descriptor set faults the GPU, and this function's own
+	// vkWaitForFences(UINT64_MAX) then never returns, which presents as the app
+	// freezing with no error anywhere. resetVideoAhb() destroys all of these together
+	// when a stream ends, so any one of them being null means "the stream this state
+	// belonged to is gone" and the right answer is to draw nothing.
+	const bool useAhb = (sourceMode_ == 3 && ahbActiveView_ != VK_NULL_HANDLE &&
+	                     ahbActiveImage_ != VK_NULL_HANDLE && ahbPipeline_ != VK_NULL_HANDLE &&
+	                     ahbDescSet_ != VK_NULL_HANDLE);
 	if (!useAhb && planes_[0].view == VK_NULL_HANDLE) return;
 	// Dual-source (LVF v2): each eye has its OWN imported image, so `mono` and the
-	// SBS column split do not apply -- every view samples its own image whole.
-	const bool dual = useAhb && ahbStereo_ && ahbActiveViewR_ != VK_NULL_HANDLE;
+	// SBS column split do not apply -- every view samples its own image whole. Falls
+	// back to the single-source draw (left eye to both views: flat, but correct and
+	// never a fault) unless BOTH eyes' images and BOTH descriptor sets are live.
+	const bool dual = useAhb && ahbStereo_ && ahbActiveViewR_ != VK_NULL_HANDLE &&
+	                  ahbActiveImageR_ != VK_NULL_HANDLE && ahbDescSetR_ != VK_NULL_HANDLE;
 	VkPipeline pipe = useAhb ? ahbPipeline_ : pipeline_;
 	VkPipelineLayout pl = useAhb ? ahbPipeLayout_ : pipeLayout_;
 	VkDescriptorSet ds = useAhb ? ahbDescSet_ : descSet_;
@@ -1213,6 +1245,7 @@ SbsRenderer::resetVideoAhb()
 	ahbActiveViewR_ = VK_NULL_HANDLE;
 	ahbStereo_ = false;
 	convergence_ = 0.0f;
+	stereoBindLogged_ = false;  // per-STREAM, so the next clip reports its own outcome
 	ahbActiveW_ = ahbActiveH_ = 0;
 	if (sourceMode_ == 3) sourceMode_ = 0;  // nothing bound until the next source
 	destroyAhbPipeline();

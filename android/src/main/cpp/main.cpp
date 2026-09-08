@@ -2289,12 +2289,24 @@ render_frame()
 	}
 
 	if (g_pending_tap.exchange(false, std::memory_order_relaxed)) {
-		// A clean tap. With chrome, ImGui has already had the event and either
-		// consumed it (a widget) or not — and "not" now just means "wake the
-		// chrome", which nativeTouch's interaction stamp already did. The old
-		// tap-anywhere-opens-the-picker gesture survives ONLY when there is no
-		// chrome to reach an Open button through.
-		if (!chrome_available && !g_is_video) {
+		// A clean tap, adjudicated here because this is where ImGui state is safe to
+		// read. Two cases, and the distinction is WHETHER THERE IS ANYTHING TO REVEAL:
+		//
+		//  * Nothing loaded (the idle splash) — tapping anywhere opens the picker,
+		//    which is the pre-chrome behaviour and the only sensible one: the whole
+		//    screen is an invitation, and making the user find the Open button inside
+		//    a bar that only appears after a first tap is two taps for no reason.
+		//    A tap that ImGui claimed (the Open button itself, or any widget) is NOT
+		//    ours — firing on it too would launch the picker twice.
+		//  * Media loaded — the tap belongs to the chrome; revealing it is the whole
+		//    gesture, and nativeTouch's interaction stamp has already done that.
+		//
+		// chrome_available still gates the no-chrome path so a tap before the first
+		// frame (or on a runtime without window-space layers) cannot fire it twice.
+		const bool has_media = g_scene_loaded.load(std::memory_order_relaxed) || g_is_video;
+		if (!chrome_available) {
+			if (!g_is_video) g_open_picker_request.store(true, std::memory_order_relaxed);
+		} else if (!has_media && !g_imgui.WantCaptureMouse()) {
 			g_open_picker_request.store(true, std::memory_order_relaxed);
 		}
 	}
@@ -2403,8 +2415,8 @@ render_frame()
 void
 destroy_all()
 {
+	stop_dual();  // right-eye decoder FIRST: it keeps station against g_video
 	g_video.stop();
-	stop_dual();  // right-eye decoder; joins its thread and drops its reader pool
 	g_audio.stop();
 	if (g_vk_device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(g_vk_device);
@@ -2808,13 +2820,23 @@ android_main(struct android_app *app)
 				const bool is_jpeg = have_magic && magic[0] == 0xFF && magic[1] == 0xD8;
 				const bool is_png = have_magic && magic[0] == 0x89 && magic[1] == 'P' &&
 				                    magic[2] == 'N' && magic[3] == 'G';
-				g_video.stop();
+				// ORDER MATTERS. The slave holds a pacingMaster_ pointer to g_video and
+				// its decode thread reads that decoder's published state while it waits
+				// its turn; stopping the master first leaves the slave keeping station
+				// against a decoder that will never advance again. Stop the follower,
+				// then the thing it follows.
+				LOGI("[LVF] teardown: stop_dual");
 				stop_dual();  // right-eye decoder + convergence curve of the OLD clip
+				LOGI("[LVF] teardown: g_video.stop");
+				g_video.stop();
+				LOGI("[LVF] teardown: g_audio.stop");
 				g_audio.stop();
 				// The old decoder's AImageReader is gone; drop the renderer's
 				// imports of its buffers (and the refs keeping them alive) before
 				// the new reader hands out a fresh pool. See resetVideoAhb().
+				LOGI("[LVF] teardown: resetVideoAhb");
 				g_sbs.resetVideoAhb();
+				LOGI("[LVF] teardown: complete");
 				g_scene_loaded.store(false, std::memory_order_relaxed);
 				g_pick_pending.store(false, std::memory_order_relaxed);
 				if (is_jpeg || is_png) {

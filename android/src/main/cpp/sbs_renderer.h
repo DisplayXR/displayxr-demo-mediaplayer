@@ -211,6 +211,11 @@ private:
 	float convSign_ = 1.0f;      // debug.dxr.mp.conv_sign: 1 = Leia (+ = nearer), -1 inverts
 	float convScale_ = 1.0f;     // debug.dxr.mp.conv_scale (0 = off, 1 = as authored)
 	bool convPropsRead_ = false;
+	// One decisive line per STREAM about whether the pair bound, and if not, why.
+	// Deliberately not a function-static: a `static bool warned` tripped by an earlier
+	// clip would silence exactly the case that matters -- the FIRST play-through of
+	// the next one.
+	bool stereoBindLogged_ = false;
 	VkImage dummyImage_ = VK_NULL_HANDLE;
 	VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
 	VkImageView dummyView_ = VK_NULL_HANDLE;
