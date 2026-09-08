@@ -214,6 +214,12 @@ private:
 	int ownedFd_ = -1;                // fd we opened (path) or were handed (SAF); closed in stop()
 	std::thread thread_;
 	std::atomic<bool> stop_{false};
+	// Set as the LAST statement of decodeLoop(). stop() cannot simply join(): the
+	// decode thread may be parked inside a codec call that only completes once the
+	// CONSUMER frees a buffer slot, so stop() has to keep draining while it waits, and
+	// it needs a way to know the thread is done other than the join it cannot yet make.
+	// Starts true so a decoder that was never opened waits for nothing.
+	std::atomic<bool> threadExited_{true};
 	std::atomic<bool> open_{false};
 	std::atomic<bool> paused_{false};
 	std::atomic<int64_t> positionUs_{0};       // last presented frame PTS
