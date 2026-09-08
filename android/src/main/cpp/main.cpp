@@ -70,6 +70,7 @@
 #include "MediaSource.h"   // SHARED layered stereo-layout resolver (#45)
 #include "StereoDetect.h"
 #include "video_stereo_probe_android.h"
+#include "lvf_probe_android.h"  // two-track ("LVF v2") container detection + convergence
 
 #include <mutex>
 #include <strings.h>
@@ -256,6 +257,43 @@ std::atomic<bool> g_scene_loaded{false};
 // baked reconvergence; plain image / mono LIF → flat 2D), everything else is
 // AMediaCodec video.
 VideoDecoder g_video;
+// ── Right eye of a two-track stereo file ("LVF v2", #64) ────────────────────
+// A second decoder on the SAME file, opened on the `abr` track and put in SLAVE
+// mode: it never paces and never drops, it just answers "give me the frame at
+// exactly this PTS". All timing stays with g_video, which is the only way the two
+// eyes can be guaranteed to be the same instant -- two independently paced
+// decoders drift a frame apart and that reads as shimmer, not as depth.
+VideoDecoder g_video_right;
+// Set at open when the container really is two-track; cleared on every other open
+// path, so nothing else can accidentally take the dual branch.
+bool g_stereo_dual = false;
+// Convergence curve read from the `mett` metadata track at open (may be empty),
+// and whether the filename opted out (`_noreconv`).
+std::vector<mp::LvfProbeAndroid::ConvSample> g_convergence;
+bool g_apply_convergence = true;
+// Master PTS seen on the previous rendered frame, for discontinuity detection in the
+// render loop. Reset with the clip (a value left over from the last file would fire a
+// spurious resync on the first frame of the next one). Render thread only.
+int64_t g_dual_prev_pts = -1;
+// Pairing health that only the render loop can count, cumulative for the clip.
+//   miss   — the master advanced but the right eye had no twin this tick, so the
+//            previously-bound PAIR was held for another frame. A few at warm-up and
+//            after each seek are expected; a steadily climbing count means the slave
+//            is not keeping up and the two eyes are being shown a frame apart in time.
+//   resync — discontinuity re-seeks of the slave (one per loop wrap, one per jump).
+// The matched/discard halves come from the decoder itself (pairedFrames/unpairedFrames).
+uint32_t g_dual_miss = 0;
+uint32_t g_dual_resync = 0;
+// The LEFT eye's buffer as of the master's most recent advance, so a tick on which the
+// master did NOT advance can still bind a newly-arrived right eye against it.
+//
+// Lifetime: the master's decoder holds this buffer's AImage until it promotes the next
+// frame, and the renderer holds its own AHardwareBuffer_acquire on the import. On a
+// tick where the master returned nullptr it did not promote, so this pointer is still
+// the frame on screen. It is only ever read on such a tick, and replaced on every tick
+// where the master did advance -- so it can never outlive the image backing it.
+AHardwareBuffer *g_left_ahb = nullptr;
+int g_left_w = 0, g_left_h = 0;
 // AMediaCodec audio → AAudio; its playback position is the A/V master clock the
 // video decoder paces to (wired via g_video.setMasterClock before each open).
 AudioPlayer g_audio;
@@ -307,10 +345,148 @@ apply_layout(mp::StereoLayout layout, int w, int h)
 	g_layout = layout;
 	g_image_mono = layout == mp::StereoLayout::Mono;
 	if (w > 0 && h > 0) {
+		// Per-eye display aspect. Full SBS is the only layout that packs two eyes
+		// across ONE frame's width, so it is the only one that halves. Dual carries a
+		// full view per TRACK, so w/h already IS one eye -- same arithmetic as mono,
+		// for the opposite reason.
 		const float a = layout == mp::StereoLayout::SbsFull ? ((float)w * 0.5f) / (float)h
 		                                                     : (float)w / (float)h;
 		g_content_aspect.store(a, std::memory_order_relaxed);
 	}
+}
+
+// Tear down the right-eye decoder and forget the dual state. Safe to call when
+// nothing dual is open. android_main thread only (it joins the decode thread).
+static void
+stop_dual()
+{
+	if (g_stereo_dual) {
+		// Final tally while the numbers still belong to THIS clip: the decoder's
+		// counters are zeroed by the next start(), and g_dual_* just below.
+		LOGI("[LVF] final pairing: matched=%u miss=%u (held/pending) discard=%u "
+		     "(old=%u fut=%u) resync=%u lead=%lldus",
+		     g_video_right.pairedFrames(), g_dual_miss, g_video_right.unpairedFrames(),
+		     g_video_right.unpairedOld(), g_video_right.unpairedFuture(), g_dual_resync,
+		     (long long)g_video_right.slaveLeadUs());
+	}
+	g_video_right.stop();
+	g_stereo_dual = false;
+	g_dual_miss = 0;
+	g_dual_resync = 0;
+	g_convergence.clear();
+	g_apply_convergence = true;
+	g_dual_prev_pts = -1;
+	g_left_ahb = nullptr;
+	g_left_w = g_left_h = 0;
+}
+
+// ── The container layer of stereo-layout resolution (#64) ───────────────────
+// Runs BEFORE everything in resolve_video_layout(). When the file carries one full
+// view per track there is nothing left to detect: the CPU cross-correlation probe
+// (~100-300 ms at open) is skipped entirely, and so is the filename/aspect guessing
+// -- a two-track file that happens to be named `*_2x1` must not be sliced in half.
+//
+// The three outcomes are distinct because the CALLER's next step differs, and
+// collapsing them is how you get a double-open or a two-track file sliced in half:
+//   NotLvf   — nothing was opened; open the video the ordinary way and run the
+//              filename/content/aspect layers as before.
+//   Dual     — both decoders are open; layout is Dual, do NOT reopen or re-resolve.
+//   FlatLeft — a two-track file whose RIGHT eye would not open. The left decoder is
+//              open on the `abl` track, so the honest layout is Mono (the whole left
+//              view to both eyes). Do NOT reopen, and above all do not fall through
+//              to the SBS heuristic, which would show each eye half a left view.
+enum class LvfOpen { NotLvf, Dual, FlatLeft };
+// Result of the bring-up auto-open branch. File-scope only because an `else if`
+// condition has nowhere to declare it; android_main thread, written once.
+LvfOpen g_lvf_dbg = LvfOpen::NotLvf;
+
+// `name` is the SAF display name or the path; it only decides `_noreconv`.
+static LvfOpen
+open_dual_if_lvf(const std::string &name, int fd, int64_t off, int64_t len, const char *path)
+{
+	const mp::LvfProbeAndroid::Result r =
+	    path ? mp::LvfProbeAndroid::RunPath(path) : mp::LvfProbeAndroid::RunFd(fd, off, len);
+	if (!r.ok) {
+		if (r.convTrack >= 0 || r.unnamedTracks > 0) {
+			LOGI("[LVF] not a two-track file (video tracks=%d cover=%d convTrack=%d unnamed=%d)",
+			     r.videoTracks, r.coverTracks, r.convTrack, r.unnamedTracks);
+		}
+		return LvfOpen::NotLvf;
+	}
+	if (r.convTrack < 0 && r.unnamedTracks > 0) {
+		LOGE("[LVF] this device's extractor did not name %d track(s) — if one of them is "
+		     "the `mett` convergence track we cannot read it; falling back to convergence 0",
+		     r.unnamedTracks);
+	}
+
+	// EACH decoder needs its OWN fd. AMediaExtractor dups internally and reads with
+	// absolute offsets, so sharing the open file description is safe -- but a
+	// VideoDecoder CLOSES the fd it was handed in stop(), so handing the same one to
+	// both would close it twice. dup()ing for both eyes also leaves the CALLER's fd
+	// untouched, which is what lets a failure here fall back to the ordinary open
+	// instead of stranding a consumed descriptor. (The path form opens its own.)
+	const int lfd = path ? -1 : dup(fd);
+	if (!path && lfd < 0) {
+		LOGE("[LVF] dup() for the left eye failed");
+		return LvfOpen::NotLvf;
+	}
+	// Dual pairs the eyes on the PTS carried by each buffer, so the legacy
+	// sleep-in-the-decode-thread pacing kill switch cannot apply here.
+	g_video.requireDisplayLockedPacing();
+	const bool masterOk = path ? g_video.openPath(path, r.leftTrack)
+	                           : g_video.openFd(lfd, off, len, r.leftTrack);
+	if (!masterOk) {
+		LOGE("[LVF] left-eye decoder failed to open track %d", r.leftTrack);
+		g_video.stop();  // release whatever the partial open left behind (incl. lfd)
+		return LvfOpen::NotLvf;  // nothing is open; let the caller try the ordinary path
+	}
+	g_video_right.setSlave(true);
+	// Station-keeping reference. Without it the slave free-runs and laps the master;
+	// see setPacingMaster(). Must be set BEFORE open (start() reads it).
+	g_video_right.setPacingMaster(&g_video);
+	bool slaveOk = false;
+	if (path) {
+		slaveOk = g_video_right.openPath(path, r.rightTrack);
+	} else {
+		const int rfd = dup(fd);
+		slaveOk = rfd >= 0 && g_video_right.openFd(rfd, off, len, r.rightTrack);
+		if (rfd >= 0 && !slaveOk) close(rfd);
+	}
+	if (!slaveOk) {
+		// The left eye is open and correct; showing it in both eyes is flat but not
+		// broken, and it is a far better failure than a black screen.
+		LOGE("[LVF] right-eye decoder failed to open track %d — playing FLAT (left eye only)",
+		     r.rightTrack);
+		g_video_right.stop();
+		return LvfOpen::FlatLeft;
+	}
+
+	g_convergence.clear();
+	g_apply_convergence = mp::LvfProbeAndroid::ApplyConvergenceForName(name);
+	if (g_apply_convergence) g_convergence = r.convergence;
+	g_stereo_dual = true;
+
+	const float first = r.convergence.empty() ? 0.0f : r.convergence.front().value;
+	const float last = r.convergence.empty() ? 0.0f : r.convergence.back().value;
+	LOGI("[LVF] DUAL stereo: tracks L=%d R=%d (%s) %dx%d fps=%.2f dur=%.2fs | "
+	     "convergence: track=%d mime='%s' samples=%zu first=%.4f last=%.4f apply=%d",
+	     r.leftTrack, r.rightTrack, r.how, r.width, r.height, (double)r.fps,
+	     r.durationUs / 1e6, r.convTrack, r.convMime.c_str(), r.convergence.size(), (double)first,
+	     (double)last, (int)g_apply_convergence);
+	// The edit-list observable. Convergence is interpolated in the extractor's OWN
+	// reported timeline (no elst arithmetic anywhere in this reader), so these two
+	// numbers say whether that was sufficient: a v1 file's video traks carry an
+	// initial EMPTY edit of ~167.8 ms that its convergence trak does not, and only
+	// the device's MPEG4Extractor knows whether it applied it. Equal-ish origins =
+	// aligned; video ~167800 with convergence 0 = the two curves are offset by five
+	// frames and the first ~0.17 s of convergence is being clamped rather than read.
+	LOGI("[LVF] timeline origins: first video sample=%lld us, first convergence sample=%lld us "
+	     "(difference %lld us) — if these disagree, convergence is offset by that much",
+	     (long long)r.firstVideoPtsUs, (long long)r.firstConvPtsUs,
+	     (long long)(r.firstVideoPtsUs >= 0 && r.firstConvPtsUs >= 0
+	                     ? r.firstVideoPtsUs - r.firstConvPtsUs
+	                     : 0));
+	return LvfOpen::Dual;
 }
 
 // The layered resolution for a VIDEO: filename > (no container tags via NDK)
@@ -578,11 +754,15 @@ struct CadenceProbe {
 		lastNew = fs.predictedDisplayTime;
 	}
 
-	void log_and_reset(uint32_t droppedDelta)
+	// `extra` is appended verbatim (empty for a single-track clip). It carries the
+	// dual-track pairing health, which belongs on THIS line rather than a separate one:
+	// a right-eye miss and a cadence gap are the same event seen from two ends, and
+	// reading them apart is how you mistake one for the other.
+	void log_and_reset(uint32_t droppedDelta, const char *extra)
 	{
-		LOGI("CADENCE %u frames: new=%u  gaps 1=%u 2=%u 3=%u 4=%u 5+=%u  late-drops=%u",
+		LOGI("CADENCE %u frames: new=%u  gaps 1=%u 2=%u 3=%u 4=%u 5+=%u  late-drops=%u%s",
 		     frames, newFrames, hist[1], hist[2], hist[3], hist[4], hist[5],
-		     droppedDelta);
+		     droppedDelta, extra);
 		frames = 0;
 		newFrames = 0;
 		for (uint32_t &h : hist) h = 0;
@@ -1187,6 +1367,10 @@ fill_transport_state()
 		std::lock_guard<std::mutex> lk(g_pick_name_mx);
 		g_ui_state.mediaFilename = g_pick_name;
 	}
+	// Make container-level stereo visible without a logcat: `[LVF]` on the filename
+	// says "this file's two eyes came from two tracks", which is the one thing a
+	// human cannot tell by looking at the picture.
+	if (g_stereo_dual) g_ui_state.mediaFilename = "[LVF] " + g_ui_state.mediaFilename;
 	g_ui_state.layoutName = mp::MediaSource::LayoutName(g_layout);
 	g_ui_state.positionSeconds = g_is_video ? g_video.positionSeconds() : 0.0;
 	g_ui_state.durationSeconds = g_is_video ? g_video.durationSeconds() : 0.0;
@@ -1325,13 +1509,26 @@ hud_init()
 	g_ui_actions.Open = [] { g_open_picker_request.store(true, std::memory_order_relaxed); };
 	g_ui_actions.TogglePlayback = [] {
 		g_video.togglePaused();
+		// The right eye must pause WITH the master. Left running it would fill its
+		// reader pool with frames the paused master will not reach for as long as the
+		// pause lasts, and on resume the pairing rule would hold the right eye frozen
+		// until the master caught up. Both start unpaused and are only ever toggled
+		// here, so they cannot drift out of phase.
+		if (g_stereo_dual) g_video_right.togglePaused();
 		g_audio.setPaused(g_video.paused());  // mirror play/pause to audio
 	};
 	// AMediaExtractor has no cheap keyframe-preview mode here, so `preview` is
 	// ignored; the shared machine's follow-up exact seek is idempotent.
-	g_ui_actions.Seek = [](float sec, bool /*preview*/) { g_video.seekTo((double)sec); };
+	// Both eyes seek together. Their IDRs sit at identical PTS, so SEEK_CLOSEST_SYNC
+	// lands them on the same sample; after the flush the pairing rule discards
+	// whatever was still queued on either side of it.
+	g_ui_actions.Seek = [](float sec, bool /*preview*/) {
+		g_video.seekTo((double)sec);
+		if (g_stereo_dual) g_video_right.seekTo((double)sec);
+	};
 	g_ui_actions.ScrubReleased = [](float sec) {
 		g_video.seekTo((double)sec);
+		if (g_stereo_dual) g_video_right.seekTo((double)sec);
 		g_audio.seekTo((double)sec);
 	};
 
@@ -1823,11 +2020,107 @@ render_frame()
 		        : g_video.acquireFrameForDisplayTime(
 		              (int64_t)frame_state.predictedDisplayTime, &vw, &vh);
 		g_cadence.tick(ahb != nullptr, frame_state);
-		if (ahb) {
-			if (g_sbs.setVideoAhb(ahb, (uint32_t)vw, (uint32_t)vh)) {
+		if (g_stereo_dual) {
+			// ── Two-track stereo (#64) ──
+			// Runs on EVERY tick, not only on ticks where the master advanced. The
+			// slave can only advance one frame per acquire (the occupancy gate lets it
+			// release only once the consumer has taken the previous frame), so polling
+			// it solely on master advances caps its catch-up rate at exactly one frame
+			// per master frame -- which means a lag, once opened, NEVER closes. It
+			// opens routinely: the first few ticks of a session are slow and the master
+			// skips several frames while the slave is still on its first. Calling every
+			// tick lets the slave gain ground on the ticks the master idles, and the
+			// held-match fast path makes a call with nothing to do nearly free.
+			if (ahb) {
+				g_left_ahb = ahb;
+				g_left_w = vw;
+				g_left_h = vh;
+			}
+			bool bound = false;
+			{
+				// The master decides the instant; the right eye is fetched by that
+				// exact PTS. A miss is NOT a reason to tear: keep whatever right eye
+				// is already imported and re-pair next tick.
+				const int64_t pts = g_video.lastPresentedPtsUs();
+				int rw = 0, rh = 0;
+				AHardwareBuffer *ahbR =
+				    pts >= 0 ? g_video_right.acquireFrameByPts(pts, &rw, &rh) : nullptr;
+
+				// DISCONTINUITY RESYNC. The master's presented PTS normally steps by
+				// one frame; anything bigger means it went somewhere else -- it wrapped
+				// at EOF (its own decoder re-seeks itself there, the slave has no clock
+				// to notice with), or something moved it that did not go through the
+				// transport actions. Re-seek the slave onto the master's CURRENT
+				// position rather than to 0: that is right for a wrap (position ~ 0)
+				// and right for a jump (position = wherever it landed), whereas a
+				// hardcoded 0 would fight a genuine backward seek that the transport
+				// had already forwarded correctly.
+				//
+				// The threshold has to sit above any legitimate frame step (~33 ms at
+				// 30 fps) and below a wrap; 500 ms is ~15 frames and is also the
+				// keyframe interval of a LeiaCam2 capture, so the re-seek is cheap.
+				constexpr int64_t kResyncJumpUs = 500'000;
+				if (g_dual_prev_pts >= 0 && pts >= 0 &&
+				    (pts - g_dual_prev_pts > kResyncJumpUs ||
+				     g_dual_prev_pts - pts > kResyncJumpUs)) {
+					LOGI("[LVF] master jumped %lld -> %lld us — resyncing the right eye",
+					     (long long)g_dual_prev_pts, (long long)pts);
+					g_video_right.seekTo((double)pts / 1e6);
+					++g_dual_resync;
+				}
+				g_dual_prev_pts = pts;
+
+				if (ahbR != nullptr && g_left_ahb != nullptr) {
+					// Pair against the CACHED left, which equals `ahb` whenever the
+					// master advanced this tick and is the frame still on screen when
+					// it did not -- so a right eye that arrives on an idle tick is
+					// shown immediately instead of waiting for the next master frame.
+					bound = g_sbs.setVideoAhbStereo(g_left_ahb, (uint32_t)g_left_w,
+					                                (uint32_t)g_left_h, ahbR, (uint32_t)rw,
+					                                (uint32_t)rh);
+				} else if (ahb != nullptr) {
+					// Count a miss only when the master actually advanced; an idle tick
+					// with no twin is not a dropped pairing, it is just an idle tick.
+					++g_dual_miss;
+				}
+				if (!bound) {
+					// Either no twin this tick or the stereo bind failed. Rebinding the
+					// left buffer alone would DROP the previously bound right eye
+					// (setVideoAhb clears the dual flag), so only do that while no
+					// right eye has ever been bound -- otherwise hold the whole pair
+					// for one more frame, which shows the previous stereo pair rather
+					// than flashing to flat.
+					if (!g_sbs.stereoDual() && g_left_ahb != nullptr) {
+						bound = g_sbs.setVideoAhb(g_left_ahb, (uint32_t)g_left_w,
+						                          (uint32_t)g_left_h);
+					} else {
+						bound = true;  // keep the pair already bound
+					}
+				}
+				// Convergence rides the master's PTS, sampled fresh every frame so a
+				// scrub or a wrap lands on the right value immediately.
+				g_sbs.setConvergence(
+				    (g_apply_convergence && pts >= 0)
+				        ? mp::LvfProbeAndroid::ConvergenceAt(g_convergence, pts)
+				        : 0.0f);
+			}
+			// Aspect + first-frame gating still belong to the MASTER: they describe the
+			// stream, and an idle tick says nothing new about it.
+			if (bound && ahb != nullptr) {
 				// Per-eye display aspect follows the resolved layout (#45):
 				// half SBS stretches each eye back to the full-frame aspect,
-				// full SBS is (w/2)/h, mono is w/h with both eyes sampling all.
+				// full SBS is (w/2)/h, mono is w/h with both eyes sampling all,
+				// Dual is w/h because each track already carries ONE full view.
+				if (vh > 0) {
+					g_content_aspect.store(g_layout == mp::StereoLayout::SbsFull
+					                           ? ((float)vw * 0.5f) / (float)vh
+					                           : (float)vw / (float)vh,
+					                       std::memory_order_relaxed);
+				}
+				g_scene_loaded.store(true, std::memory_order_relaxed);
+			}
+		} else if (ahb) {
+			if (g_sbs.setVideoAhb(ahb, (uint32_t)vw, (uint32_t)vh)) {
 				if (vh > 0) {
 					g_content_aspect.store(g_layout == mp::StereoLayout::SbsFull
 					                           ? ((float)vw * 0.5f) / (float)vh
@@ -2079,7 +2372,24 @@ render_frame()
 		if (g_is_video) {
 			static uint32_t s_last_dropped = 0;
 			const uint32_t dropped = g_video.droppedLate();
-			g_cadence.log_and_reset(dropped - s_last_dropped);
+			char pair[128] = {0};
+			if (g_stereo_dual) {
+				// discard is split by SIGN because the two halves have opposite
+				// causes and opposite fixes: `old` = the twin arrived after the
+				// master had passed it (the slave is running BEHIND, decode-limited
+				// -- throttling cannot help), `fut` = the twin was a clip-length
+				// ahead (the slave lapped the master). `lead` is the slave's current
+				// media-time distance ahead of the master, signed.
+				std::snprintf(pair, sizeof(pair),
+				              "  pair: matched=%u miss=%u (held/pending) discard=%u "
+				              "(old=%u fut=%u) resync=%u lead=%lldus q=%d",
+				              g_video_right.pairedFrames(), g_dual_miss,
+				              g_video_right.unpairedFrames(), g_video_right.unpairedOld(),
+				              g_video_right.unpairedFuture(), g_dual_resync,
+				              (long long)g_video_right.slaveLeadUs(),
+				              g_video_right.queuedUnacquired());
+			}
+			g_cadence.log_and_reset(dropped - s_last_dropped, pair);
 			s_last_dropped = dropped;
 			LOGI("AUDIO xruns=%d write_errors=%u", g_audio.xrunCount(), g_audio.writeErrors());
 		}
@@ -2094,6 +2404,7 @@ void
 destroy_all()
 {
 	g_video.stop();
+	stop_dual();  // right-eye decoder; joins its thread and drops its reader pool
 	g_audio.stop();
 	if (g_vk_device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(g_vk_device);
@@ -2190,15 +2501,23 @@ bring_up(struct android_app *app)
 			g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
 			LOGI("DEBUG auto-load (image): %s", dbgFile);
 		}
-	} else if (dbgFile[0] != '\0' && g_video.openPath(dbgFile)) {
+	} else if (dbgFile[0] != '\0' && (g_lvf_dbg = open_dual_if_lvf(dbgFile, -1, 0, 0, dbgFile),
+	                                  g_lvf_dbg != LvfOpen::NotLvf || g_video.openPath(dbgFile))) {
 		g_audio.openPath(dbgFile);  // own fd; no-op if no audio track
 		g_is_video = true;
-		apply_layout(resolve_video_layout(dbgFile, g_video.width(), g_video.height(), -1, 0, 0, dbgFile)
-		                 .layout,
-		             g_video.width(), g_video.height());
+		if (g_lvf_dbg == LvfOpen::Dual) {
+			apply_layout(mp::StereoLayout::Dual, g_video.width(), g_video.height());
+		} else if (g_lvf_dbg == LvfOpen::FlatLeft) {
+			apply_layout(mp::StereoLayout::Mono, g_video.width(), g_video.height());
+		} else {
+			apply_layout(resolve_video_layout(dbgFile, g_video.width(), g_video.height(), -1, 0, 0,
+			                                  dbgFile)
+			                 .layout,
+			             g_video.width(), g_video.height());
+		}
 		g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
 		g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
-		LOGI("DEBUG auto-load: %s", dbgFile);
+		LOGI("DEBUG auto-load: %s (layout %s)", dbgFile, mp::LayoutName(g_layout));
 	} else {
 		// Start on the idle splash; content comes from the SAF picker (tap → Load).
 		// The old TEMP default.mp4 auto-load is gone — the picker round-trip is
@@ -2490,6 +2809,7 @@ android_main(struct android_app *app)
 				const bool is_png = have_magic && magic[0] == 0x89 && magic[1] == 'P' &&
 				                    magic[2] == 'N' && magic[3] == 'G';
 				g_video.stop();
+				stop_dual();  // right-eye decoder + convergence curve of the OLD clip
 				g_audio.stop();
 				// The old decoder's AImageReader is gone; drop the renderer's
 				// imports of its buffers (and the refs keeping them alive) before
@@ -2518,17 +2838,41 @@ android_main(struct android_app *app)
 						pick_name = g_pick_name;
 					}
 					g_video.setMasterClock(AudioPlayer::clockThunk, &g_audio);
-					if (g_video.openFd(pick, off, len)) {
+					const std::string logical =
+					    pick_name.empty() ? std::string("picked") : pick_name;
+					// Container layer FIRST (#64). A two-track file needs no probe and
+					// must not be re-resolved: its layout is a fact, not a guess, and a
+					// two-track clip that happens to be named `*_2x1` must not be
+					// sliced in half by the filename layer. On the LVF branch the
+					// decoders take dup()s, so `pick` survives either outcome and the
+					// ordinary openFd() below is still a valid fallback.
+					const LvfOpen lvf = open_dual_if_lvf(logical, pick, off, len, nullptr);
+					if (lvf != LvfOpen::NotLvf || g_video.openFd(pick, off, len)) {
 						if (audio_fd >= 0) g_audio.openFd(audio_fd, off, len);
 						g_is_video = true;
-						const mp::MediaInfo vinfo = resolve_video_layout(
-						    pick_name.empty() ? std::string("picked") : pick_name, g_video.width(),
-						    g_video.height(), probe_fd, off, len, nullptr);
-						apply_layout(vinfo.layout, g_video.width(), g_video.height());
+						if (lvf == LvfOpen::Dual) {
+							apply_layout(mp::StereoLayout::Dual, g_video.width(),
+							             g_video.height());
+						} else if (lvf == LvfOpen::FlatLeft) {
+							apply_layout(mp::StereoLayout::Mono, g_video.width(),
+							             g_video.height());
+						} else {
+							const mp::MediaInfo vinfo =
+							    resolve_video_layout(logical, g_video.width(), g_video.height(),
+							                         probe_fd, off, len, nullptr);
+							apply_layout(vinfo.layout, g_video.width(), g_video.height());
+						}
 						g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
 						g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
-						LOGI("Opened picked video (fd=%d, audio_fd=%d)", pick, audio_fd);
+						LOGI("Opened picked video (fd=%d, audio_fd=%d, layout %s)", pick, audio_fd,
+						     mp::LayoutName(g_layout));
+						if (g_stereo_dual && g_hud_ready) {
+							mp::ui::ShowTransportToast(g_ui_state, "LVF stereo (2 tracks)");
+						}
 						if (probe_fd >= 0) close(probe_fd);
+						// The LVF path dup()s its own descriptors, so on that branch the
+						// picker's fd is ours to close; the ordinary openFd() consumed it.
+						if (lvf != LvfOpen::NotLvf) close(pick);
 					} else {
 						if (audio_fd >= 0) close(audio_fd);
 						if (probe_fd >= 0) close(probe_fd);

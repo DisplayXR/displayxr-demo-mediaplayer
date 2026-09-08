@@ -71,7 +71,11 @@ public:
 
 private:
     int samples_ = 0;
-    int count_[3] = {0, 0, 0};           // indexed by StereoLayout
+    // Indexed by StereoLayout, but only over the three layouts the PIXEL detector can
+    // produce (Mono/SbsFull/SbsHalf). StereoLayout::Dual is a container fact decided
+    // before anything is decoded, never a vote, and Add() drops any index past 2 --
+    // so appending members to StereoLayout cannot overrun this.
+    int count_[3] = {0, 0, 0};
     float conf_[3] = {0.0f, 0.0f, 0.0f}; // summed confidence per layout
     StereoDetectResult best_{};          // highest-confidence sample, for its stats
     bool acceptSingle_ = false;

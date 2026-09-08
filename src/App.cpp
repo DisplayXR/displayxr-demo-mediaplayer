@@ -483,7 +483,13 @@ void App::RenderOneFrame() {
                 (frame.views[v].pose.position.x <= centerX) != (swapEyes_ != mediaEyeSwap_);
             isLeftView[v] = isLeft;
             colors[v] = isLeft ? kLeftImage : kRightImage;  // RED|BLUE fallback
-            if (layout_ == StereoLayout::Mono) {
+            // Mono AND Dual both sample the WHOLE source per eye: mono because there
+            // is one picture, Dual because each eye's picture lives in its own
+            // container track and this leg only ever decoded the first of them (the
+            // `abl` left view). Slicing a Dual frame in half would show half a
+            // left-eye picture to each eye. The Android leg is where Dual actually
+            // renders stereo (two decoders); here it degrades to flat-left.
+            if (layout_ == StereoLayout::Mono || layout_ == StereoLayout::Dual) {
                 uvs[v] = {0.0f, 0.0f, 1.0f, 1.0f};
             } else {
                 uvs[v] = isLeft ? ViewUV{0.0f, 0.0f, 0.5f, 1.0f}
@@ -1017,6 +1023,13 @@ std::string App::LayoutLabel() const {
 }
 
 void App::CycleLayoutOverride() {
+    // A Dual (two-track) file is PINNED: its layout is a container fact, not a guess,
+    // and none of the cycle's stops can render it. Cycling one into SBS would slice a
+    // single full view in half; into Mono it is already flat here. So refuse.
+    if (autoInfo_.layout == StereoLayout::Dual) {
+        LOG_INFO("Layout override ignored: this file carries one view per track (Dual)");
+        return;
+    }
     // auto -> mono -> SBS-full -> SBS-half -> auto
     if (!layoutPinned_) {
         layoutPinned_ = true;

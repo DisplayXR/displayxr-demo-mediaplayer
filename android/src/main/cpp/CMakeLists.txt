@@ -114,6 +114,9 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/media/MediaSource.cpp
     ${REPO_ROOT}/src/media/StereoDetect.cpp
     video_stereo_probe_android.cpp
+    # Container layer of the same resolution: two-track ("LVF v2") detection plus the
+    # `mett` convergence curve. Android-local because it is pure NDK AMediaExtractor.
+    lvf_probe_android.cpp
     ${REPO_ROOT}/src/media/LifLoader.cpp
     ${REPO_ROOT}/src/media/StereoCompose.cpp
     ${REPO_ROOT}/src/media/ImageDecoder.cpp
