@@ -29,7 +29,7 @@ a PASS/FAIL line per item, using the same numbering.
     with one clock and pair frames by PTS with no search and no drift.
 
  3. `mdhd` language: left = `abl`, right = `abr` ("albedo left/right").  This
-    is how a v1 (LeiaCam2) reader identifies the eyes, and LVF v2 keeps it so
+    is how a v1 (vendor-camera) reader identifies the eyes, and LVF v2 keeps it so
     that v1 readers keep working.
 
  4. `hdlr` handler name: left = "Leia Albedo Left", right = "Leia Albedo
@@ -77,7 +77,7 @@ a PASS/FAIL line per item, using the same numbering.
     (`libavformat/mov.c: mov_read_vexu` / `mov_read_eyes`) and written by
     `libavformat/movenc.c: mov_write_vexu_tag` / `mov_write_eyes_tag`.  It is
     what makes a stereo-aware player recognise the file as 3D without knowing
-    anything about Leia.
+    anything about the vendor.
 
  7. A per-frame **convergence** track: a `meta`-handler track whose sample
     entry is `mett` (MetadataSampleEntry -- 6 reserved bytes, u16
@@ -95,7 +95,7 @@ a PASS/FAIL line per item, using the same numbering.
     equals the video timescale so the two clocks are exact, and the left video
     track's `edts` is copied verbatim onto the convergence track so the two
     share one *presentation* origin as well -- a camera-captured source can
-    carry a leading empty edit (LeiaCam2 delays video by ~168 ms to match
+    carry a leading empty edit (vendor-camera delays video by ~168 ms to match
     audio), and without the copy every convergence sample would be early by
     exactly that delay.
 
@@ -139,7 +139,7 @@ USAGE
 `convert` accepts two kinds of input, auto-detected:
   * a side-by-side (2x1 full-width) stereo `.mp4` -- the halves are cropped;
     `--half-sbs` additionally rescales each half back to 2x width;
-  * a **dual-track v1 (LeiaCam2) file** -- two video tracks tagged `abl`/`abr`,
+  * a **dual-track v1 (vendor-camera) file** -- two video tracks tagged `abl`/`abr`,
     used directly as the two eyes, with the source's own convergence track
     carried through (unless `--convergence`/`--conv-sweep`/`--conv-csv`
     overrides it).
@@ -1525,7 +1525,7 @@ def cmd_inspect(args):
         # A track's presentation origin is the sum of its leading empty edits
         # (elst entries with media_time == -1), expressed in movie timescale
         # units.  A camera source can delay video to line up with audio
-        # (LeiaCam2: ~168 ms); a convergence track without the same edit list
+        # (vendor-camera: ~168 ms); a convergence track without the same edit list
         # would then be early by exactly that delay on every sample, which is
         # why lvf2 copies the left video track's edts onto it verbatim.
         print("elst-check  : 7c compares leading empty edits (media_time == -1); "

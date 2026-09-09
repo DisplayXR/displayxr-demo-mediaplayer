@@ -1036,7 +1036,7 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	// ── Convergence: sign, and where it comes from ───────────────────────────
 	//
 	// THE CONVENTION: POSITIVE convergence = NEARER (content comes toward the viewer),
-	// NEGATIVE = FURTHER (content recedes behind the glass). This is Leia's, and it is
+	// NEGATIVE = FURTHER (content recedes behind the glass). This is the vendor convention, and it is
 	// the default here. An earlier draft of this reader assumed the opposite; the
 	// mapping below is the corrected one.
 	//
@@ -1059,7 +1059,7 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	// -> positive c reduces uncrossed disparity: content comes forward. Correct.
 	//
 	// WHY THIS SIGN, on evidence rather than taste:
-	//   - Leia's camera SDK reconvergence shader adds `viewPosition * c` to the
+	//   - the vendor camera SDK reconvergence shader adds `viewPosition * c` to the
 	//     sampling u with viewPosition = -0.5 for the left view and +0.5 for the
 	//     right -- exactly the mapping above.
 	//   - Its diopter->convergence conversion is NEGATIVE-signed: focus at infinity
@@ -1068,14 +1068,14 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	//     a point at distance Z has x_R - x_L = -f*b/Z < 0 -- every object is crossed,
 	//     i.e. floating in front of the glass, with only infinity at the screen. The
 	//     correction such a rig needs is therefore always "push back", and a real
-	//     LeiaCam2 v1 capture carries c ~ -0.05 throughout. Under this convention that
+	//     vendor-camera v1 capture carries c ~ -0.05 throughout. Under this convention that
 	//     negative value pushes back, which is the whole point of the metadata.
 	//
 	// `setprop debug.dxr.mp.conv_sign -1` inverts the mapping without a rebuild (the
 	// A/B that settled it); `debug.dxr.mp.conv_scale 0` disables convergence entirely,
 	// which is the same thing a `_noreconv` filename asks for.
 	//
-	// Not modelled: Leia's shader also crops/zooms by (1 - |c|) about the centre to
+	// Not modelled: the vendor shader also crops/zooms by (1 - |c|) about the centre to
 	// hide the edge strip the shift exposes. Here that strip is clamp-to-edge instead
 	// (both AHB samplers are CLAMP_TO_EDGE), so a large |c| smears the outer column
 	// rather than reframing. At |c| ~ 0.05 that is a 2.5%-of-width edge artifact.

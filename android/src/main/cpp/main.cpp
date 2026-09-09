@@ -2153,7 +2153,7 @@ render_frame()
 				//
 				// The threshold has to sit above any legitimate frame step (~33 ms at
 				// 30 fps) and below a wrap; 500 ms is ~15 frames and is also the
-				// keyframe interval of a LeiaCam2 capture, so the re-seek is cheap.
+				// keyframe interval of a vendor-camera capture, so the re-seek is cheap.
 				constexpr int64_t kResyncJumpUs = 500'000;
 				if (g_dual_prev_pts >= 0 && pts >= 0 &&
 				    (pts - g_dual_prev_pts > kResyncJumpUs ||

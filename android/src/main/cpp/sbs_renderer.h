@@ -208,7 +208,7 @@ private:
 	VkImageView ahbActiveViewR_ = VK_NULL_HANDLE;
 	bool ahbStereo_ = false;
 	float convergence_ = 0.0f;   // fraction of view width; see drawAtlas()
-	float convSign_ = 1.0f;      // debug.dxr.mp.conv_sign: 1 = Leia (+ = nearer), -1 inverts
+	float convSign_ = 1.0f;      // debug.dxr.mp.conv_sign: 1 = vendor convention (+ = nearer), -1 inverts
 	float convScale_ = 1.0f;     // debug.dxr.mp.conv_scale (0 = off, 1 = as authored)
 	bool convPropsRead_ = false;
 	// One decisive line per STREAM about whether the pair bound, and if not, why.
