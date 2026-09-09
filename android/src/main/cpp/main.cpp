@@ -2046,6 +2046,14 @@ poll_xr_events()
 				LOGI("rendering mode changed %u -> %u (%s): views=%u tiles=%ux%u scale=%.2f",
 				     e->previousModeIndex, e->currentModeIndex, found ? "adopted" : "UNKNOWN index",
 				     g_view_count, g_tile_columns, g_tile_rows, g_view_scale_x);
+				// The window-space HUD layer is accepted per MODE, not per session: the
+				// runtime rejected it in the 1-view splash mode and the fallback then
+				// disabled the chrome for the whole run, so the HUD never came back once
+				// media loaded. Re-arm it on every mode change; a rejection in the new
+				// mode simply re-disables it (one resubmitted frame).
+				if (g_ws_layer_unsupported.exchange(false, std::memory_order_relaxed)) {
+					LOGI("window-space layer re-armed after the mode change");
+				}
 			}
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
 			g_exit_requested = true;
