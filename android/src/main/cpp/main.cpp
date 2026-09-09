@@ -2199,8 +2199,16 @@ render_frame()
 				        ? mp::LvfProbeAndroid::ConvergenceAt(g_convergence, pts)
 				        : 0.0f);
 				{
+					// Once-a-second state line, only under debug.dxr.mp.pair_diag (the
+					// [PAIR] trace's prop) — a shipping demo must not log per second.
+					static int dualDiagOn = -1;
+					if (dualDiagOn < 0) {
+						char dp[PROP_VALUE_MAX] = {};
+						dualDiagOn = (__system_property_get("debug.dxr.mp.pair_diag", dp) > 0 &&
+						              dp[0] == '1') ? 1 : 0;
+					}
 					static uint32_t dualDiagTick = 0;
-					if ((++dualDiagTick % 60) == 1) {
+					if (dualDiagOn && (++dualDiagTick % 60) == 1) {
 						LOGI("[LVF] state: pts=%lld ahbL=%d ahbR=%d bound=%d stereoDual=%d mono=%d "
 						     "layout=%s conv=%.4f",
 						     (long long)pts, (int)(ahb != nullptr), (int)(ahbR != nullptr), (int)bound,
