@@ -1030,16 +1030,6 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	VkPipeline pipe = useAhb ? ahbPipeline_ : pipeline_;
 	VkPipelineLayout pl = useAhb ? ahbPipeLayout_ : pipeLayout_;
 	VkDescriptorSet ds = useAhb ? ahbDescSet_ : descSet_;
-	{
-		static uint32_t drawDiagTick = 0;
-		if ((++drawDiagTick % 60) == 1) {
-			LOGI("[LVF] draw: useAhb=%d dual=%d stereo=%d viewR=%d descR=%d mono=%d views=%u cols=%u "
-			     "mode=%d conv=%.4f",
-			     (int)useAhb, (int)dual, (int)ahbStereo_, (int)(ahbActiveViewR_ != VK_NULL_HANDLE),
-			     (int)(ahbDescSetR_ != VK_NULL_HANDLE), (int)mono, viewCount, cols ? cols : 1u, sourceMode_,
-			     convergence_);
-		}
-	}
 	const Target &t = targetFor(image, atlasW, atlasH);
 	const uint32_t c = cols ? cols : 1;
 
