@@ -488,7 +488,7 @@ VideoDecoder::decodeLoop()
 						//  * positionUs_ is a SEEK TARGET, not a presented PTS, and the
 						//    decoder lands on the nearest preceding sync sample, so the
 						//    two differ by up to a GOP.
-						//  * the two timelines can have different ORIGINS. A LeiaCam2 v1
+						//  * the two timelines can have different ORIGINS. A vendor-camera v1
 						//    file's video traks carry an initial empty edit, so PTS start
 						//    at 167800 while position starts at 0 -- with only the
 						//    steady-state budget the slave would stall on its very first

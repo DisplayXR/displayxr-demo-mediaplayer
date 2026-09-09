@@ -23,7 +23,7 @@ namespace mp {
 namespace {
 
 // The convergence metadata track's sample-entry MIME. The spec name is the +json one;
-// LeiaCam2 v1 recordings in the field carry the short legacy name (verified on a real
+// vendor-camera v1 recordings in the field carry the short legacy name (verified on a real
 // capture: `mett` sample entry, mime_format "application/convergence"), so both are
 // accepted and anything else containing "convergence" is taken too.
 constexpr const char *kConvMimeSpec = "application/vnd.leia.convergence+json";
@@ -40,7 +40,7 @@ mimeIsVideo(const char *m)
 	return m != nullptr && std::strncmp(m, "video/", 6) == 0;
 }
 
-// A cover-art / attached_pic track. ffmpeg writes a LeiaCam2 v1 file's thumbnail as a
+// A cover-art / attached_pic track. ffmpeg writes a vendor-camera v1 file's thumbnail as a
 // one-sample mjpeg "video" track, and counting it as an eye track turns a legitimate
 // two-eye file into a "three video tracks, give up" file. The mime test catches the
 // common shapes; the sample count is the one that is actually definitive, so the caller
@@ -176,7 +176,7 @@ run(AMediaExtractor *ex)
 	// ── Eye tracks ────────────────────────────────────────────────────────────
 	// LANGUAGE FIRST, always. `tkhd` enabled/flags and alternate_group are NOT
 	// consulted: Android's MPEG4Writer stamps every track flags=0x7 and
-	// alternate_group=1, so on a real LeiaCam2 recording both eyes read as "enabled"
+	// alternate_group=1, so on a real vendor-camera recording both eyes read as "enabled"
 	// and same-group, and a tkhd-driven rule picks the wrong track or none.
 	int li = -1, ri = -1;
 	for (size_t k = 0; k < vids.size(); ++k) {

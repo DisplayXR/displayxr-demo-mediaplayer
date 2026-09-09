@@ -28,12 +28,12 @@
 // What it deliberately does NOT key on
 // -----------------------------------
 // `tkhd` enabled/flags and `alternate_group`. A spec-shaped LVF marks the right track
-// tkhd-disabled so a dumb player shows one eye — but a REAL LeiaCam2 v1 recording has
+// tkhd-disabled so a dumb player shows one eye — but a REAL vendor-camera v1 recording has
 // BOTH video tracks tkhd-enabled (flags 0x7, alternate_group 0, Android MPEG4Writer's
 // defaults), so a tkhd-driven rule sees two "primary" tracks and picks wrong or picks
 // neither. The LANGUAGE tag is the signal here; tkhd-enabled would only ever be a
 // tiebreak for a file with no language tags at all, and this reader does not even need
-// that (it falls back to track order, which the LeiaPlayer SDK does too).
+// that (it falls back to track order, which the vendor player SDK does too).
 #pragma once
 
 #include <cstdint>
@@ -60,7 +60,7 @@ struct LvfProbeAndroid {
 		// FIRST sample time of the left video track and of the convergence track, as
 		// the extractor itself reports them (AMediaExtractor_getSampleTime), -1 if
 		// none. These exist to make ONE question observable without a rebuild: a v1
-		// LeiaCam2 file's video traks carry an initial EMPTY edit (elst 167.8 ms)
+		// vendor-camera file's video traks carry an initial EMPTY edit (elst 167.8 ms)
 		// while its convergence trak does not, so whether this device's MPEG4Extractor
 		// applies that edit decides whether video PTS start at 167800 or at 0 -- and
 		// therefore whether the two timelines line up. Nothing here does elst
