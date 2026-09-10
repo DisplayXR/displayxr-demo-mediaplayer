@@ -14,11 +14,38 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 #define LOG_TAG "mediaplayer_vk_android"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+namespace {
+int64_t
+monoNs()
+{
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+// The decoder has handed us NOTHING for this long while we are playing. An AAC
+// frame is ~21 ms, the first frame after open/flush arrives within ~100 ms, so a
+// full second of silence from the codec is a wedge, not slowness. Seen in the field
+// after opening a second clip in the same process: the thread sits in
+// dequeueOutputBuffer forever, clockUs_ freezes, and the video -- which slews to
+// this clock -- is snapped back onto the dead value every 200 ms and shows 4-10
+// frames a second with no sound.
+constexpr int64_t kNoOutputWatchdogNs = 1'000'000'000LL;
+bool
+switchOn(const char *env, const char *prop)
+{
+	const char *e = getenv(env);
+	if (e != nullptr && *e != '\0' && *e != '0') return true;
+	char sp[PROP_VALUE_MAX] = {0};
+	return __system_property_get(prop, sp) > 0 && sp[0] != '\0' && sp[0] != '0';
+}
+}  // namespace
 
 bool
 AudioPlayer::openPath(const std::string &path)
@@ -42,6 +69,8 @@ AudioPlayer::openFd(int fd, int64_t offset, int64_t length)
 	teardownMedia();
 	stop_.store(false, std::memory_order_relaxed);
 	ownedFd_ = fd;
+	srcOffset_ = offset;
+	srcLength_ = length;
 	ex_ = AMediaExtractor_new();
 	if (AMediaExtractor_setDataSourceFd(ex_, fd, offset, length) != AMEDIA_OK) {
 		LOGE("audio setDataSourceFd failed");
@@ -68,7 +97,10 @@ AudioPlayer::startFromExtractor()
 			audioTrack = (int)i;
 			AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_SAMPLE_RATE, &sr);
 			AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_CHANNEL_COUNT, &ch);
+			int64_t dur = 0;
+			durationUs_ = AMediaFormat_getInt64(f, AMEDIAFORMAT_KEY_DURATION, &dur) ? dur : 0;
 			AMediaExtractor_selectTrack(ex_, audioTrack);
+			audioTrack_ = audioTrack;
 			codec_ = AMediaCodec_createDecoderByType(m);
 			if (codec_ == nullptr ||
 			    AMediaCodec_configure(codec_, f, nullptr, nullptr, 0) != AMEDIA_OK ||
@@ -218,42 +250,143 @@ AudioPlayer::seekRelative(double deltaSeconds)
 	seekRequestUs_.store(target, std::memory_order_relaxed);
 }
 
+// Fresh extractor over the fd we still hold (the extractor dups it; absolute reads).
+bool
+AudioPlayer::rebuildExtractor()
+{
+	if (ownedFd_ < 0 || audioTrack_ < 0) return false;
+	AMediaExtractor *fresh = AMediaExtractor_new();
+	if (fresh == nullptr) return false;
+	if (AMediaExtractor_setDataSourceFd(fresh, ownedFd_, srcOffset_, srcLength_) != AMEDIA_OK ||
+	    AMediaExtractor_selectTrack(fresh, (size_t)audioTrack_) != AMEDIA_OK) {
+		LOGE("audio: extractor rebuild failed — the fd itself no longer reads");
+		AMediaExtractor_delete(fresh);
+		return false;
+	}
+	AMediaExtractor_delete(ex_);
+	ex_ = fresh;
+	return true;
+}
+
 void
 AudioPlayer::decodeLoop()
 {
 	bool sawInputEOS = false;
+
+	// Watchdog + DIAG bookkeeping, all thread-local to this loop.
+	const bool diag = switchOn("MEDIAPLAYER_PACING_DIAG", "debug.dxr.mp.diag");
+	int64_t lastOutMonoNs = monoNs();  // last time the codec handed us anything
+	uint32_t watchdogLogged = 0;
+	struct {
+		uint32_t inOk = 0, inWait = 0, outOk = 0, outWait = 0, outFmt = 0;
+		uint32_t readEos = 0, eosOut = 0, flush = 0;
+		uint64_t framesWritten = 0, blockedNs = 0;
+	} d;
+	int64_t diagLastNs = lastOutMonoNs;
+	int64_t diagLastClockUs = -1;
+
+	// Failed reads vs the end of the track -- same rule as VideoDecoder: the NDK
+	// returns -1 for both and the error is sticky until a seek, so judge by position
+	// (the end is plausible only within 250 ms of the duration), keep the input buffer,
+	// and skip to the next sample instead of restarting the audio from 0.
+	int64_t lastInPtsUs = -1;
+	int readErrStreak = 0;
+	int64_t lastReadErrLogNs = 0;
+	ssize_t heldInIdx = -1;
+	uint8_t *heldIbuf = nullptr;
+	size_t heldCap = 0;
+	auto readLooksLikeEos = [&]() {
+		if (durationUs_ <= 0) return true;
+		if (lastInPtsUs < 0) return false;
+		return lastInPtsUs >= durationUs_ - 250'000;
+	};
+
+	// Rewind/reposition + flush: the EOS loop, the seek, and the watchdog all
+	// converge here so the codec is always restarted the same way.
+	auto restart = [&](int64_t resumeUs) {
+		AMediaExtractor_seekTo(ex_, resumeUs,
+		                       resumeUs == 0 ? AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC
+		                                     : AMEDIAEXTRACTOR_SEEK_CLOSEST_SYNC);
+		AMediaCodec_flush(codec_);
+		sawInputEOS = false;
+		heldInIdx = -1;  // flush took every dequeued input buffer back
+		lastInPtsUs = -1;
+		readErrStreak = 0;
+		lastOutMonoNs = monoNs();
+		clockUs_.store(resumeUs, std::memory_order_relaxed);
+		++d.flush;
+	};
+
 	while (!stop_.load(std::memory_order_relaxed)) {
 		// seek (works while paused)
 		const int64_t sk = seekRequestUs_.exchange(-1, std::memory_order_relaxed);
 		if (sk >= 0) {
-			AMediaExtractor_seekTo(ex_, sk, AMEDIAEXTRACTOR_SEEK_CLOSEST_SYNC);
-			AMediaCodec_flush(codec_);
 			if (stream_) AAudioStream_requestFlush(stream_);
-			sawInputEOS = false;
-			clockUs_.store(sk, std::memory_order_relaxed);
+			restart(sk);
 			if (stream_ && !paused_.load(std::memory_order_relaxed))
 				AAudioStream_requestStart(stream_);
 		}
 		if (paused_.load(std::memory_order_relaxed)) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			lastOutMonoNs = monoNs();  // a paused codec is not a wedged one
 			continue;
 		}
 
 		// feed
 		if (!sawInputEOS) {
-			ssize_t inIdx = AMediaCodec_dequeueInputBuffer(codec_, 2000);
-			if (inIdx >= 0) {
-				size_t cap = 0;
-				uint8_t *ibuf = AMediaCodec_getInputBuffer(codec_, inIdx, &cap);
-				ssize_t sz = AMediaExtractor_readSampleData(ex_, ibuf, cap);
-				if (sz < 0) {
-					AMediaCodec_queueInputBuffer(codec_, inIdx, 0, 0, 0,
-					                             AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
-					sawInputEOS = true;
+			ssize_t inIdx = heldInIdx;
+			uint8_t *ibuf = heldIbuf;
+			size_t cap = heldCap;
+			if (inIdx < 0) {
+				inIdx = AMediaCodec_dequeueInputBuffer(codec_, 2000);
+				if (inIdx >= 0) {
+					++d.inOk;
+					ibuf = AMediaCodec_getInputBuffer(codec_, inIdx, &cap);
 				} else {
-					int64_t pts = AMediaExtractor_getSampleTime(ex_);
+					++d.inWait;
+				}
+			}
+			if (inIdx >= 0 && ibuf == nullptr) {
+				heldInIdx = inIdx;
+				heldIbuf = nullptr;
+				heldCap = 0;
+			} else if (inIdx >= 0) {
+				const ssize_t sz = AMediaExtractor_readSampleData(ex_, ibuf, cap);
+				if (sz >= 0) {
+					const int64_t pts = AMediaExtractor_getSampleTime(ex_);
 					AMediaCodec_queueInputBuffer(codec_, inIdx, 0, (size_t)sz, pts, 0);
 					AMediaExtractor_advance(ex_);
+					heldInIdx = -1;
+					lastInPtsUs = pts;
+					readErrStreak = 0;
+				} else if (readLooksLikeEos()) {
+					AMediaCodec_queueInputBuffer(codec_, inIdx, 0, 0, 0,
+					                             AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+					heldInIdx = -1;
+					sawInputEOS = true;
+					readErrStreak = 0;
+					++d.readEos;
+				} else {
+					heldInIdx = inIdx;
+					heldIbuf = ibuf;
+					heldCap = cap;
+					++readErrStreak;
+					readErrors_.fetch_add(1, std::memory_order_relaxed);
+					const int64_t now = monoNs();
+					if (readErrStreak <= 3 || now - lastReadErrLogNs > 5'000'000'000LL) {
+						lastReadErrLogNs = now;
+						LOGE("audio: extractor read failed after %lld us of %lld us (attempt %d) — "
+						     "not the end of the track; %s",
+						     (long long)lastInPtsUs, (long long)durationUs_, readErrStreak,
+						     readErrStreak < 3   ? "skipping to the next sample"
+						     : readErrStreak == 3 ? "rebuilding the extractor"
+						                          : "retrying");
+					}
+					if (readErrStreak == 3) rebuildExtractor();
+					if (readErrStreak > 3) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+					AMediaExtractor_seekTo(ex_, lastInPtsUs < 0 ? 0 : lastInPtsUs + 1,
+					                       lastInPtsUs < 0 ? AMEDIAEXTRACTOR_SEEK_CLOSEST_SYNC
+					                                       : AMEDIAEXTRACTOR_SEEK_NEXT_SYNC);
 				}
 			}
 		}
@@ -262,6 +395,8 @@ AudioPlayer::decodeLoop()
 		AMediaCodecBufferInfo info;
 		ssize_t outIdx = AMediaCodec_dequeueOutputBuffer(codec_, &info, 2000);
 		if (outIdx >= 0) {
+			++d.outOk;
+			lastOutMonoNs = monoNs();
 			if (info.size > 0) {
 				size_t outSize = 0;
 				uint8_t *obuf = AMediaCodec_getOutputBuffer(codec_, outIdx, &outSize);
@@ -269,6 +404,7 @@ AudioPlayer::decodeLoop()
 					const int frames = (int)(info.size / (channels_ * 2));  // PCM_I16
 					int written = 0;
 					aaudio_result_t lastW = 0;
+					const int64_t w0 = monoNs();
 					while (written < frames && !stop_.load(std::memory_order_relaxed)) {
 						aaudio_result_t w = AAudioStream_write(
 						    stream_, obuf + (size_t)written * channels_ * 2, frames - written,
@@ -287,6 +423,8 @@ AudioPlayer::decodeLoop()
 						}
 						written += w;
 					}
+					d.framesWritten += (uint64_t)written;
+					d.blockedNs += (uint64_t)(monoNs() - w0);
 					// One-shot startup confirmation that PCM is reaching AAudio and
 					// the HW is draining it (framesRead advances ⇒ audible); silent
 					// thereafter to avoid log spam.
@@ -304,18 +442,65 @@ AudioPlayer::decodeLoop()
 			const bool eos = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
 			AMediaCodec_releaseOutputBuffer(codec_, outIdx, false);
 			if (eos) {  // loop with the video
-				AMediaExtractor_seekTo(ex_, 0, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
-				AMediaCodec_flush(codec_);
-				sawInputEOS = false;
-				clockUs_.store(0, std::memory_order_relaxed);
+				++d.eosOut;
+				restart(0);
 			}
 		} else if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+			++d.outFmt;
+			lastOutMonoNs = monoNs();
 			// DIAG: the decoder's real output format (PCM encoding 2=I16/4=FLOAT,
 			// actual sample rate/channels) — confirms our PCM_I16 assumption.
 			AMediaFormat *of = AMediaCodec_getOutputFormat(codec_);
 			if (of != nullptr) {
 				LOGI("audio DIAG output format: %s", AMediaFormat_toString(of));
 				AMediaFormat_delete(of);
+			}
+		} else {
+			++d.outWait;
+			const int64_t now = monoNs();
+			if (now - lastOutMonoNs > kNoOutputWatchdogNs) {
+				// Wedged (see kNoOutputWatchdogNs). Recover the way an EOS would:
+				// if the input side already sent EOS, loop from the top like the
+				// video will; otherwise pick the stream up again at the clock.
+				const int64_t cur = clockUs_.load(std::memory_order_relaxed);
+				const int64_t resumeUs = sawInputEOS ? 0 : (cur < 0 ? 0 : cur);
+				const uint32_t n = watchdogFires_.fetch_add(1, std::memory_order_relaxed);
+				if (watchdogLogged < 5 || (watchdogLogged % 30) == 0) {
+					LOGE("audio: decoder produced no output for %lld ms (inputEOS=%d, in ok/wait "
+					     "%u/%u, out ok/wait %u/%u) — flushing, restarting at %.3f s (fire #%u)",
+					     (long long)((now - lastOutMonoNs) / 1'000'000), (int)sawInputEOS, d.inOk,
+					     d.inWait, d.outOk, d.outWait, resumeUs / 1e6, n + 1);
+				}
+				++watchdogLogged;
+				restart(resumeUs);
+			}
+		}
+
+		// AUDIO DIAG: one line every 2 s with both ends of the codec, the write
+		// path, and whether the clock the video follows is actually moving.
+		if (diag) {
+			const int64_t now = monoNs();
+			if (now - diagLastNs >= 2'000'000'000LL) {
+				const int64_t clk = clockUs_.load(std::memory_order_relaxed);
+				const long long advMs =
+				    (diagLastClockUs >= 0 && clk >= 0) ? (long long)((clk - diagLastClockUs) / 1000) : -1;
+				const long long wallMs = (long long)((now - diagLastNs) / 1'000'000);
+				LOGI("AUDIO DIAG in ok/wait=%u/%u out ok/wait/fmt=%u/%u/%u readEOS=%u eosOut=%u "
+				     "flush=%u wd=%u readErr=%u wrote=%llu fr blocked=%llu ms clk=%.3f (+%lld ms in %lld ms) "
+				     "aaudio=%s fw=%lld fr=%lld xrun=%d werr=%u",
+				     d.inOk, d.inWait, d.outOk, d.outWait, d.outFmt, d.readEos, d.eosOut, d.flush,
+				     watchdogFires_.load(std::memory_order_relaxed),
+				     readErrors_.load(std::memory_order_relaxed),
+				     (unsigned long long)d.framesWritten,
+				     (unsigned long long)(d.blockedNs / 1'000'000), clk < 0 ? -1.0 : clk / 1e6,
+				     advMs, wallMs,
+				     stream_ ? AAudio_convertStreamStateToText(AAudioStream_getState(stream_)) : "none",
+				     stream_ ? (long long)AAudioStream_getFramesWritten(stream_) : -1LL,
+				     stream_ ? (long long)AAudioStream_getFramesRead(stream_) : -1LL,
+				     stream_ ? (int)AAudioStream_getXRunCount(stream_) : -1,
+				     writeErrors_.load(std::memory_order_relaxed));
+				diagLastNs = now;
+				diagLastClockUs = clk;
 			}
 		}
 	}

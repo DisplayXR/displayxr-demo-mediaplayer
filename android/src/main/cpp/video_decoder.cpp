@@ -66,6 +66,13 @@ constexpr int64_t kLookaheadUs = 0;
 constexpr int64_t kResyncUs = 200'000;
 constexpr int64_t kSlewUs = 1'000;
 
+// A master clock that has not moved for this long is not a clock. The audio clock
+// is the PTS of the last PCM chunk written, a ~21 ms staircase; if the audio
+// decoder wedges (AudioPlayer's watchdog handles the codec side) the value freezes
+// and the drift check below would snap the video back onto it every kResyncUs --
+// the field report "no sound + 4 fps". Stop following it until it moves again.
+constexpr int64_t kAudioStaleNs = 500'000'000LL;
+
 // A frame legitimately sits within kLookaheadUs of the clock. Further off than
 // this, in EITHER direction, and it is not a late or early frame -- it is a
 // frame from the other side of a flush that the decoder has already moved past
@@ -166,6 +173,8 @@ VideoDecoder::openFd(int fd, int64_t offset, int64_t length, int videoTrackIndex
 {
 	trackIndex_ = videoTrackIndex;
 	ownedFd_ = fd;
+	srcOffset_ = offset;
+	srcLength_ = length;
 	ex_ = AMediaExtractor_new();
 	if (AMediaExtractor_setDataSourceFd(ex_, fd, offset, length) != AMEDIA_OK) {
 		LOGE("AMediaExtractor_setDataSourceFd failed");
@@ -218,6 +227,7 @@ VideoDecoder::start()
 	int64_t dur = 0;
 	if (AMediaFormat_getInt64(trackFmt, AMEDIAFORMAT_KEY_DURATION, &dur)) durationUs_ = dur;
 	AMediaExtractor_selectTrack(ex_, videoTrack);
+	selectedTrack_ = videoTrack;
 
 	// ── Zero-copy output: a GPU-sampleable AImageReader Surface. The codec
 	// writes its native (vendor-tiled YUV) frames straight into AHardwareBuffers
@@ -274,6 +284,7 @@ VideoDecoder::start()
 		anchorMediaUs_ = 0;
 	}
 	lastAudioUs_ = -1;
+	lastAudioChangeMonoNs_ = -1;
 	lastShownMonoNs_ = -1;
 	droppedLate_.store(0, std::memory_order_relaxed);
 	releasedFrames_.store(0, std::memory_order_relaxed);
@@ -342,6 +353,27 @@ VideoDecoder::seekTo(double seconds)
 	seekRequestUs_.store(target, std::memory_order_relaxed);
 }
 
+// A fresh extractor over the fd we already hold. AMediaExtractor dups the fd and
+// reads at absolute offsets, so the old one can be dropped with nothing else moving.
+// Decode thread only (ex_ is that thread's).
+bool
+VideoDecoder::rebuildExtractor()
+{
+	if (ownedFd_ < 0 || selectedTrack_ < 0) return false;
+	AMediaExtractor *fresh = AMediaExtractor_new();
+	if (fresh == nullptr) return false;
+	if (AMediaExtractor_setDataSourceFd(fresh, ownedFd_, srcOffset_, srcLength_) != AMEDIA_OK ||
+	    AMediaExtractor_selectTrack(fresh, (size_t)selectedTrack_) != AMEDIA_OK) {
+		LOGE("%sextractor rebuild failed — the fd itself no longer reads", slave_ ? "[slave] " : "");
+		AMediaExtractor_delete(fresh);
+		return false;
+	}
+	AMediaExtractor_delete(ex_);
+	ex_ = fresh;
+	extractorRebuilds_.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
 void
 VideoDecoder::decodeLoop()
 {
@@ -351,6 +383,31 @@ VideoDecoder::decodeLoop()
 	bool sawInputEOS = false;
 	bool decodeOneWhilePaused = false;  // after a seek-while-paused, show the new frame
 
+	// ── failed reads vs the end of the stream ──
+	// AMediaExtractor_readSampleData returns -1 for EVERY failure, the end of the
+	// stream included, and NuMediaExtractor keeps a failed read sticky until the
+	// next seek. Reads over the storage FUSE layer DO fail now and then (seen on all
+	// three tracks of one file within minutes: ERROR_IO and UNKNOWN_ERROR in the
+	// framework log), and taking those for an EOS restarted the clip from 0 -- or,
+	// for the right eye, left it a clip-length behind the master and, when the reads
+	// kept failing, spinning EOS→seek(0)→EOS 150 times a second with the eye frozen.
+	// Tell the two apart by POSITION: the end is only plausible once the last sample
+	// we queued sits within a few frame periods of the duration. Anything else is a
+	// failed read: keep the input buffer, skip to the next sync sample (the seek also
+	// clears the sticky error) and, if it keeps failing, rebuild the extractor.
+	int64_t lastInPtsUs = -1;
+	int readErrStreak = 0;
+	int64_t lastReadErrLogNs = 0;
+	ssize_t heldInIdx = -1;  // input buffer dequeued but not filled (read failed); reused
+	uint8_t *heldIbuf = nullptr;
+	size_t heldCap = 0;
+	auto readLooksLikeEos = [&]() {
+		if (durationUs_ <= 0) return true;  // no duration to judge by: as before
+		if (lastInPtsUs < 0) return false;  // nothing read yet: a failure is a failure
+		const int64_t period = frameRate_ > 1.0f ? (int64_t)(1'000'000.0 / frameRate_) : 42'000;
+		return lastInPtsUs >= durationUs_ - std::max<int64_t>(3 * period, 250'000);
+	};
+
 	while (!stop_.load(std::memory_order_relaxed)) {
 		// ── seek (works even while paused: reposition + flush, then show one frame) ──
 		const int64_t sk = seekRequestUs_.exchange(-1, std::memory_order_relaxed);
@@ -359,6 +416,9 @@ VideoDecoder::decodeLoop()
 			AMediaCodec_flush(codec_);
 			sawInputEOS = false;
 			firstPtsUs = -1;
+			heldInIdx = -1;  // flush took every dequeued input buffer back
+			lastInPtsUs = -1;
+			readErrStreak = 0;
 			positionUs_.store(sk, std::memory_order_relaxed);
 			// The last PRESENTED pts is now a fact about the other side of the jump.
 			// Leaving it set would have a slave throttle itself against a reference the
@@ -379,6 +439,7 @@ VideoDecoder::decodeLoop()
 				anchorMediaUs_ = sk;
 				audioOffsetValid_ = false;
 				lastAudioUs_ = -1;
+				lastAudioChangeMonoNs_ = -1;
 			}
 			decodeOneWhilePaused = paused_.load(std::memory_order_relaxed);
 		}
@@ -391,19 +452,57 @@ VideoDecoder::decodeLoop()
 
 		// ── feed input ──
 		if (!sawInputEOS) {
-			ssize_t inIdx = AMediaCodec_dequeueInputBuffer(codec_, 2000);
-			if (inIdx >= 0) {
-				size_t cap = 0;
-				uint8_t *ibuf = AMediaCodec_getInputBuffer(codec_, inIdx, &cap);
-				ssize_t sz = AMediaExtractor_readSampleData(ex_, ibuf, cap);
-				if (sz < 0) {
-					AMediaCodec_queueInputBuffer(codec_, inIdx, 0, 0, 0,
-					                             AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
-					sawInputEOS = true;
-				} else {
-					int64_t pts = AMediaExtractor_getSampleTime(ex_);
+			ssize_t inIdx = heldInIdx;
+			uint8_t *ibuf = heldIbuf;
+			size_t cap = heldCap;
+			if (inIdx < 0) {
+				inIdx = AMediaCodec_dequeueInputBuffer(codec_, 2000);
+				if (inIdx >= 0) ibuf = AMediaCodec_getInputBuffer(codec_, inIdx, &cap);
+			}
+			if (inIdx >= 0 && ibuf == nullptr) {
+				heldInIdx = inIdx;  // keep the index, try the buffer again next pass
+				heldIbuf = nullptr;
+				heldCap = 0;
+			} else if (inIdx >= 0) {
+				const ssize_t sz = AMediaExtractor_readSampleData(ex_, ibuf, cap);
+				if (sz >= 0) {
+					const int64_t pts = AMediaExtractor_getSampleTime(ex_);
 					AMediaCodec_queueInputBuffer(codec_, inIdx, 0, (size_t)sz, pts, 0);
 					AMediaExtractor_advance(ex_);
+					heldInIdx = -1;
+					lastInPtsUs = pts;
+					readErrStreak = 0;
+				} else if (readLooksLikeEos()) {
+					AMediaCodec_queueInputBuffer(codec_, inIdx, 0, 0, 0,
+					                             AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+					heldInIdx = -1;
+					sawInputEOS = true;
+					readErrStreak = 0;
+				} else {
+					// A FAILED read (see the block at the top of this loop).
+					heldInIdx = inIdx;
+					heldIbuf = ibuf;
+					heldCap = cap;
+					++readErrStreak;
+					readErrors_.fetch_add(1, std::memory_order_relaxed);
+					const int64_t now = nowMonoNs();
+					if (readErrStreak <= 3 || now - lastReadErrLogNs > 5'000'000'000LL) {
+						lastReadErrLogNs = now;
+						LOGE("%sextractor read failed after %lld us of %lld us (attempt %d) — not "
+						     "the end of the stream; %s",
+						     slave_ ? "[slave] " : "", (long long)lastInPtsUs,
+						     (long long)durationUs_, readErrStreak,
+						     readErrStreak < 3   ? "skipping to the next sync sample"
+						     : readErrStreak == 3 ? "rebuilding the extractor"
+						                          : "retrying");
+					}
+					if (readErrStreak == 3) rebuildExtractor();  // positioned by the seek below
+					if (readErrStreak > 3) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+					// The seek is what clears NuMediaExtractor's sticky error, and NEXT_SYNC
+					// resumes ahead of the bad read: a hold of at most one GOP, no restart.
+					AMediaExtractor_seekTo(ex_, lastInPtsUs < 0 ? 0 : lastInPtsUs + 1,
+					                       lastInPtsUs < 0 ? AMEDIAEXTRACTOR_SEEK_CLOSEST_SYNC
+					                                       : AMEDIAEXTRACTOR_SEEK_NEXT_SYNC);
 				}
 			}
 		}
@@ -616,6 +715,9 @@ VideoDecoder::decodeLoop()
 				AMediaExtractor_seekTo(ex_, 0, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
 				AMediaCodec_flush(codec_);
 				sawInputEOS = false;
+				heldInIdx = -1;
+				lastInPtsUs = -1;
+				readErrStreak = 0;
 				firstPtsUs = -1;  // re-anchors the presentation clock
 			}
 		} else if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
@@ -653,6 +755,21 @@ VideoDecoder::slewToAudio()
 	// throw it away and recapture rather than dragging the video clock with it.
 	if (lastAudioUs_ >= 0 && (audioUs < lastAudioUs_ || audioUs - lastAudioUs_ > 1'000'000)) {
 		audioOffsetValid_ = false;
+	}
+	if (lastAudioUs_ >= 0 && audioUs == lastAudioUs_) {
+		if (lastAudioChangeMonoNs_ >= 0 && mono - lastAudioChangeMonoNs_ > kAudioStaleNs) {
+			// Frozen master: free-run on our own anchor and recapture the A/V
+			// offset when the audio clock moves again (it will step or jump, and
+			// the loop check above invalidates the offset then anyway).
+			if (audioOffsetValid_) {
+				audioOffsetValid_ = false;
+				LOGE("audio clock stuck at %.3f s for %lld ms — video free-runs until it moves",
+				     audioUs / 1e6, (long long)((mono - lastAudioChangeMonoNs_) / 1'000'000));
+			}
+			return;
+		}
+	} else {
+		lastAudioChangeMonoNs_ = mono;
 	}
 	lastAudioUs_ = audioUs;
 
@@ -1137,6 +1254,7 @@ VideoDecoder::stop()
 	requireDisplayLocked_ = false;
 	slave_ = false;
 	trackIndex_ = -1;
+	selectedTrack_ = -1;
 	// Breadcrumbs, deliberately one per teardown step: if this ever wedges again the
 	// LAST LINE IN THE LOG NAMES THE CALL, which beats reconstructing it from a native
 	// stack after the fact.

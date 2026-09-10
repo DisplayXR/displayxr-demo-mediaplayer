@@ -140,6 +140,11 @@ struct VideoDecoder {
 	// Right-eye frames discarded because the master had already moved past them
 	// (cumulative), and right-eye frames that paired exactly. A healthy dual stream
 	// grows `paired` once per shown frame and holds `unpaired` flat after warm-up.
+	// Reads the extractor refused that were NOT the end of the stream, and how often
+	// the extractor had to be rebuilt over them (decodeLoop). Each one used to be
+	// taken for an EOS and restarted the clip.
+	uint32_t readErrors() const { return readErrors_.load(std::memory_order_relaxed); }
+	uint32_t extractorRebuilds() const { return extractorRebuilds_.load(std::memory_order_relaxed); }
 	uint32_t pairedFrames() const { return pairedFrames_.load(std::memory_order_relaxed); }
 	uint32_t unpairedFrames() const { return unpairedFrames_.load(std::memory_order_relaxed); }
 	// The discard total SPLIT BY SIGN, which is the measurement that says WHICH way
@@ -212,6 +217,12 @@ private:
 	AImageReader *reader_ = nullptr;  // decoder output surface (GPU AHardwareBuffers)
 	ANativeWindow *window_ = nullptr; // reader_'s producer surface (owned by reader_)
 	int ownedFd_ = -1;                // fd we opened (path) or were handed (SAF); closed in stop()
+	int64_t srcOffset_ = 0;           // setDataSourceFd window, kept so the extractor can be rebuilt
+	int64_t srcLength_ = 0;
+	int selectedTrack_ = -1;          // the track start() selected (rebuildExtractor re-selects it)
+	std::atomic<uint32_t> readErrors_{0};
+	std::atomic<uint32_t> extractorRebuilds_{0};
+	bool rebuildExtractor();          // decode thread only: fresh AMediaExtractor over ownedFd_
 	std::thread thread_;
 	std::atomic<bool> stop_{false};
 	// Set as the LAST statement of decodeLoop(). stop() cannot simply join(): the
@@ -253,6 +264,7 @@ private:
 	int64_t audioOffsetUs_ = 0;
 	bool audioOffsetValid_ = false;
 	int64_t lastAudioUs_ = -1;      // to spot the audio track looping independently
+	int64_t lastAudioChangeMonoNs_ = -1;  // when lastAudioUs_ last moved (stale-clock guard)
 	int64_t lastShownMonoNs_ = -1;  // stall watchdog for the consumer's safety net
 	// Whether the PTS we handed to releaseOutputBufferAtTime actually came back
 	// through the BufferQueue. If a vendor queue overrode it we must NOT select
