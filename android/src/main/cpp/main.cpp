@@ -2507,7 +2507,7 @@ render_frame()
 		if (g_is_video) {
 			static uint32_t s_last_dropped = 0;
 			const uint32_t dropped = g_video.droppedLate();
-			char pair[128] = {0};
+			char pair[192] = {0};
 			if (g_stereo_dual) {
 				// discard is split by SIGN because the two halves have opposite
 				// causes and opposite fixes: `old` = the twin arrived after the
@@ -2517,16 +2517,20 @@ render_frame()
 				// media-time distance ahead of the master, signed.
 				std::snprintf(pair, sizeof(pair),
 				              "  pair: matched=%u miss=%u (held/pending) discard=%u "
-				              "(old=%u fut=%u) resync=%u lead=%lldus q=%d",
+				              "(old=%u fut=%u) resync=%u lead=%lldus q=%d readErr=%u/%u",
 				              g_video_right.pairedFrames(), g_dual_miss,
 				              g_video_right.unpairedFrames(), g_video_right.unpairedOld(),
 				              g_video_right.unpairedFuture(), g_dual_resync,
 				              (long long)g_video_right.slaveLeadUs(),
-				              g_video_right.queuedUnacquired());
+				              g_video_right.queuedUnacquired(), g_video.readErrors(),
+				              g_video_right.readErrors());
+			} else {
+				std::snprintf(pair, sizeof(pair), "  readErr=%u", g_video.readErrors());
 			}
 			g_cadence.log_and_reset(dropped - s_last_dropped, pair);
 			s_last_dropped = dropped;
-			LOGI("AUDIO xruns=%d write_errors=%u", g_audio.xrunCount(), g_audio.writeErrors());
+			LOGI("AUDIO xruns=%d write_errors=%u read_errors=%u watchdog=%u", g_audio.xrunCount(),
+			     g_audio.writeErrors(), g_audio.readErrors(), g_audio.watchdogFires());
 		}
 #if MP_PROFILE
 		prof_log(g_frame_count, ms);

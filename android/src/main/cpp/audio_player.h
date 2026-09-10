@@ -56,6 +56,12 @@ struct AudioPlayer {
 	// Writes AAudio refused (w < 0): each one silently dropped the rest of a
 	// decoded chunk before this counter existed -- an audible gap with no log.
 	uint32_t writeErrors() const { return writeErrors_.load(std::memory_order_relaxed); }
+	// Times the decode loop's no-output watchdog had to flush + restart the codec
+	// (a wedged AAC decoder = frozen master clock = the video slewed to a standstill).
+	uint32_t watchdogFires() const { return watchdogFires_.load(std::memory_order_relaxed); }
+	// Reads the extractor refused that were NOT the end of the track (each used to be
+	// taken for an EOS and restarted the audio from 0, dragging the video with it).
+	uint32_t readErrors() const { return readErrors_.load(std::memory_order_relaxed); }
 
 private:
 	bool startFromExtractor();  // select audio track, configure codec, open AAudio, spawn thread
@@ -78,6 +84,13 @@ private:
 	std::atomic<bool> paused_{false};
 	std::atomic<int64_t> clockUs_{-1};
 	std::atomic<uint32_t> writeErrors_{0};
+	std::atomic<uint32_t> watchdogFires_{0};
+	std::atomic<uint32_t> readErrors_{0};
+	int64_t durationUs_ = 0;   // audio track duration (0 = unknown) — judges EOS vs a failed read
+	int64_t srcOffset_ = 0;    // setDataSourceFd window, so the extractor can be rebuilt
+	int64_t srcLength_ = 0;
+	int audioTrack_ = -1;
+	bool rebuildExtractor();   // decode thread only
 	std::atomic<int64_t> seekRequestUs_{-1};
 	int sampleRate_ = 48000;
 	int channels_ = 2;
