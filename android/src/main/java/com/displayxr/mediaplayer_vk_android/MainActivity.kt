@@ -99,6 +99,15 @@ class MainActivity : NativeActivity() {
     // (it blanks the scene while a pick is pending to avoid a stale-frame flash).
     private external fun nativePickCancelled()
 
+    // ── Media3 producer spike (#71, phase 1; debug.dxr.mp.media3=1) ──
+    private external fun nativeMedia3Wanted(): Boolean
+    private external fun nativeMedia3Open(width: Int, height: Int, durationUs: Long, fps: Float, name: String?)
+    private external fun nativeMedia3TakeSurface(): android.view.Surface?
+    private external fun nativeMedia3SetClock(anchor: java.nio.ByteBuffer?)
+    private external fun nativeMedia3TakeCommand(out: LongArray): Boolean
+    private var media3: com.displayxr.mediaplayer_vk_android.media3.Media3Backend? = null
+    private val media3Cmd = LongArray(2)
+
     // This window's live on-screen rect + the panel extent in the SAME rotation
     // (XR_DXR_android_surface_binding / ADR-036 D6). The runtime anchors the
     // weave's interlace phase and the per-window Kooima frustum to it.
@@ -158,6 +167,20 @@ class MainActivity : NativeActivity() {
             sampleWindowRect()
             try {
                 if (nativeTakeOpenPickerRequest()) openVideoPicker()
+                media3?.let { m ->
+                    nativeMedia3TakeSurface()?.let { s ->
+                        android.util.Log.i(TAG, "media3: handing the reader Surface to the player")
+                        m.setSurfaces(s, null)
+                        m.play()
+                    }
+                    if (nativeMedia3TakeCommand(media3Cmd)) {
+                        when (media3Cmd[0].toInt()) {
+                            1 -> m.play()
+                            2 -> m.pause()
+                            3 -> m.seekToUs(media3Cmd[1])
+                        }
+                    }
+                }
             } catch (_: Throwable) {
                 // Native lib not bound yet; the next frame retries.
             }
@@ -299,6 +322,14 @@ class MainActivity : NativeActivity() {
                     nativePickCancelled()
                 } catch (_: Throwable) {
                 }
+                return
+            }
+            // A previous Media3 clip is released whichever path the new one takes.
+            media3?.release()
+            media3 = null
+            nativeMedia3SetClock(null)
+            if (nativeMedia3Wanted() && (contentResolver.getType(uri) ?: "").startsWith("video/")) {
+                openWithMedia3(uri)
                 return
             }
             try {
@@ -443,6 +474,27 @@ class MainActivity : NativeActivity() {
         }
     }
 
+    /** #71 phase 1: the Java player produces, the native AImageReader consumes. */
+    private fun openWithMedia3(uri: android.net.Uri) {
+        val name = queryDisplayName(uri)
+        val backend = com.displayxr.mediaplayer_vk_android.media3.Media3Backend(
+            this,
+            object : com.displayxr.mediaplayer_vk_android.media3.Media3Backend.Callbacks {
+                override fun onPrepared(durationUs: Long, width: Int, height: Int, frameRate: Float, dual: Boolean) {
+                    android.util.Log.i(TAG, "media3: prepared ${width}x$height fps=$frameRate dur=${durationUs / 1000} ms dual=$dual")
+                    runOnUiThread { nativeMedia3Open(width, height, durationUs, frameRate, name) }
+                }
+                override fun onEnded() { android.util.Log.i(TAG, "media3: ended") }
+                override fun onError(code: Int, message: String) {
+                    android.util.Log.e(TAG, "media3: error $code $message")
+                }
+            })
+        media3 = backend
+        nativeMedia3SetClock(backend.clockAnchor)
+        backend.open(uri.toString(), loop = true)
+        android.util.Log.i(TAG, "media3: opening $uri")
+    }
+
     override fun onPause() {
         rectPollRunning = false
         Choreographer.getInstance().removeFrameCallback(rectCallback)
@@ -450,6 +502,8 @@ class MainActivity : NativeActivity() {
     }
 
     override fun onDestroy() {
+        media3?.release()
+        media3 = null
         try {
             (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
                 .unregisterDisplayListener(displayListener)

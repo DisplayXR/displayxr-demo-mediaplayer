@@ -55,6 +55,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <jni.h>
+#include <android/native_window_jni.h>  // ANativeWindow_toSurface (Media3 spike, #71)
 #include <string>
 #include <sys/system_properties.h>
 #include <thread>
@@ -330,6 +331,60 @@ constexpr uint8_t kIdleBg[3] = {31, 31, 33};  // 0.12,0.12,0.13 * 255
 std::atomic<int> g_pick_fd{-1};
 std::mutex g_pick_name_mx;
 std::string g_pick_name;  // display name of the picked document (filename layer)
+
+// ── Media3 producer spike (#71, phase 1). Gated on debug.dxr.mp.media3=1. ──
+// Kotlin owns the ExoPlayer; native owns the AImageReader consumer. Everything
+// crosses as poll-don't-push (the app's JNI policy, see nativeTakeOpenPickerRequest):
+//   Kotlin -> nativeMedia3Open(w,h,dur,fps,name)   publish an open request
+//   android_main                                    tears down the old clip, openExternal()
+//   Kotlin <- nativeMedia3TakeSurface()             the reader's Surface, once, when ready
+//   Kotlin <- nativeMedia3TakeCommand()             play/pause/seek the HUD asked for
+//   Kotlin -> nativeMedia3SetClock(ByteBuffer)      the audio renderer's clock anchor
+std::atomic<bool> g_media3_active{false};
+std::atomic<bool> g_media3_open_req{false};
+std::atomic<bool> g_media3_surface_ready{false};
+std::atomic<int> g_media3_w{0}, g_media3_h{0};
+std::atomic<long long> g_media3_dur_us{0};
+std::atomic<int> g_media3_fps_x1000{0};
+// Single-slot command mailbox: kind 0 = none, 1 = play, 2 = pause, 3 = seek (arg = us).
+std::atomic<int> g_media3_cmd_kind{0};
+std::atomic<long long> g_media3_cmd_arg{0};
+// Seqlock anchor written by the Java audio renderer (ClockPublishingAudioRenderer):
+// [0] seq  [1] positionUs  [2] anchorNs (System.nanoTime == CLOCK_MONOTONIC)  [3] speed*1000.
+std::atomic<const int64_t *> g_media3_clock{nullptr};
+
+static void
+media3_cmd(int kind, long long arg = 0)
+{
+	if (!g_media3_active.load(std::memory_order_relaxed)) return;
+	g_media3_cmd_arg.store(arg, std::memory_order_relaxed);
+	g_media3_cmd_kind.store(kind, std::memory_order_release);
+}
+
+// VideoDecoder master-clock thunk: the player's audio position, extrapolated from
+// the last published anchor. -1 until the renderer has published anything.
+static double
+media3_clock_thunk(void * /*ctx*/)
+{
+	const int64_t *a = g_media3_clock.load(std::memory_order_acquire);
+	if (a == nullptr) return -1.0;
+	for (int spin = 0; spin < 8; ++spin) {
+		const int64_t seq0 = __atomic_load_n(&a[0], __ATOMIC_ACQUIRE);
+		if (seq0 & 1) continue;
+		const int64_t pos = __atomic_load_n(&a[1], __ATOMIC_RELAXED);
+		const int64_t anc = __atomic_load_n(&a[2], __ATOMIC_RELAXED);
+		const int64_t spd = __atomic_load_n(&a[3], __ATOMIC_RELAXED);
+		const int64_t seq1 = __atomic_load_n(&a[0], __ATOMIC_ACQUIRE);
+		if (seq0 != seq1) continue;
+		if (anc <= 0) return -1.0;
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		const int64_t now = (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
+		const int64_t elapsedUs = (now - anc) / 1000;
+		return (pos + elapsedUs * (spd > 0 ? spd : 1000) / 1000) / 1e6;
+	}
+	return -1.0;
+}
 // True while the idle splash (the DisplayXR logo) is the scene. It is uploaded like
 // any image, so g_scene_loaded alone cannot tell "nothing loaded" from "an image is
 // loaded" — and that is the one distinction tap-to-open and the HUD both need.
@@ -1576,6 +1631,7 @@ hud_init()
 	g_ui_actions.Open = [] { g_open_picker_request.store(true, std::memory_order_relaxed); };
 	g_ui_actions.TogglePlayback = [] {
 		g_video.togglePaused();
+		media3_cmd(g_video.paused() ? 2 : 1);
 		// The right eye must pause WITH the master. Left running it would fill its
 		// reader pool with frames the paused master will not reach for as long as the
 		// pause lasts, and on resume the pairing rule would hold the right eye frozen
@@ -1597,6 +1653,7 @@ hud_init()
 		g_video.seekTo((double)sec);
 		if (g_stereo_dual) g_video_right.seekTo((double)sec);
 		g_audio.seekTo((double)sec);
+		media3_cmd(3, (long long)((sec < 0 ? 0 : sec) * 1e6));
 	};
 
 	g_hud_ready = true;
@@ -2826,6 +2883,72 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeOpenVideoFd(
 	g_pick_fd.store((int)fd, std::memory_order_release);  // publish last
 }
 
+// ── Media3 spike JNI (#71) ──
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeMedia3Wanted(JNIEnv *, jobject)
+{
+	char sp[PROP_VALUE_MAX] = {0};
+	return (__system_property_get("debug.dxr.mp.media3", sp) > 0 && sp[0] && sp[0] != '0')
+	           ? JNI_TRUE
+	           : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeMedia3Open(
+    JNIEnv *env, jobject, jint width, jint height, jlong durationUs, jfloat fps, jstring name)
+{
+	{
+		std::lock_guard<std::mutex> lk(g_pick_name_mx);
+		g_pick_name.clear();
+		if (name != nullptr) {
+			const char *c = env->GetStringUTFChars(name, nullptr);
+			if (c) {
+				g_pick_name = c;
+				env->ReleaseStringUTFChars(name, c);
+			}
+		}
+	}
+	g_media3_w.store((int)width, std::memory_order_relaxed);
+	g_media3_h.store((int)height, std::memory_order_relaxed);
+	g_media3_dur_us.store((long long)durationUs, std::memory_order_relaxed);
+	g_media3_fps_x1000.store((int)(fps * 1000.0f), std::memory_order_relaxed);
+	g_media3_surface_ready.store(false, std::memory_order_relaxed);
+	g_media3_open_req.store(true, std::memory_order_release);  // publish last
+}
+
+// Polled per Choreographer frame: the reader's Surface, exactly once per open.
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeMedia3TakeSurface(JNIEnv *env,
+                                                                                  jobject)
+{
+	if (!g_media3_surface_ready.exchange(false, std::memory_order_acq_rel)) return nullptr;
+	ANativeWindow *win = g_video.producerWindow();
+	if (win == nullptr) return nullptr;
+	return ANativeWindow_toSurface(env, win);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeMedia3SetClock(JNIEnv *env, jobject,
+                                                                              jobject buffer)
+{
+	const void *p = buffer ? env->GetDirectBufferAddress(buffer) : nullptr;
+	g_media3_clock.store(static_cast<const int64_t *>(p), std::memory_order_release);
+	LOGI("[media3] clock anchor %s", p ? "mapped" : "cleared");
+}
+
+// Polled per Choreographer frame: out[0] = kind (1 play, 2 pause, 3 seek), out[1] = arg.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeMedia3TakeCommand(JNIEnv *env,
+                                                                                  jobject,
+                                                                                  jlongArray out)
+{
+	const int kind = g_media3_cmd_kind.exchange(0, std::memory_order_acq_rel);
+	if (kind == 0) return JNI_FALSE;
+	jlong v[2] = {(jlong)kind, (jlong)g_media3_cmd_arg.load(std::memory_order_relaxed)};
+	env->SetLongArrayRegion(out, 0, 2, v);
+	return JNI_TRUE;
+}
+
 // Picker dismissed without a selection: resume showing the previous asset.
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativePickCancelled(
@@ -2944,6 +3067,46 @@ android_main(struct android_app *app)
 				g_pending_mode_request = -1;
 				const XrResult mr = g_pfnReqMode(g_session, (uint32_t)want);
 				LOGI("xrRequestDisplayRenderingModeDXR(%d) -> %d", want, (int)mr);
+			}
+			if (g_media3_open_req.exchange(false, std::memory_order_acquire)) {
+				const int w = g_media3_w.load(std::memory_order_relaxed);
+				const int h = g_media3_h.load(std::memory_order_relaxed);
+				std::string pick_name;
+				{
+					std::lock_guard<std::mutex> lk(g_pick_name_mx);
+					pick_name = g_pick_name;
+				}
+				LOGI("[media3] open request %dx%d dur=%lld us fps=%.3f name=%s", w, h,
+				     (long long)g_media3_dur_us.load(std::memory_order_relaxed),
+				     g_media3_fps_x1000.load(std::memory_order_relaxed) / 1000.0,
+				     pick_name.c_str());
+				stop_dual();
+				g_video.stop();
+				g_audio.stop();
+				g_sbs.resetVideoAhb();
+				g_scene_loaded.store(false, std::memory_order_relaxed);
+				g_pick_pending.store(false, std::memory_order_relaxed);
+				g_media3_active.store(false, std::memory_order_relaxed);
+				g_video.setMasterClock(media3_clock_thunk, nullptr);
+				if (g_video.openExternal(w, h)) {
+					g_video.setExternalStreamInfo(
+					    g_media3_dur_us.load(std::memory_order_relaxed),
+					    g_media3_fps_x1000.load(std::memory_order_relaxed) / 1000.0f);
+					g_is_video = true;
+					leave_splash();
+					const std::string logical = pick_name.empty() ? std::string("picked") : pick_name;
+					const mp::MediaInfo vinfo = resolve_video_layout(logical, w, h, -1, 0, 0, nullptr);
+					apply_layout(vinfo.layout, w, h);
+					g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;
+					g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
+					g_media3_active.store(true, std::memory_order_relaxed);
+					g_media3_surface_ready.store(true, std::memory_order_release);
+					LOGI("[media3] reader ready (layout %s); waiting for Kotlin to take the Surface",
+					     mp::LayoutName(g_layout));
+					if (g_hud_ready) mp::ui::ShowTransportToast(g_ui_state, "Media3 producer (spike)");
+				} else {
+					LOGE("[media3] openExternal failed");
+				}
 			}
 			const int pick = g_pick_fd.exchange(-1, std::memory_order_acquire);
 			if (pick >= 0) {

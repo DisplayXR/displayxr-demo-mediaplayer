@@ -44,13 +44,12 @@ class Media3Backend(context: Context, private val callbacks: Callbacks) {
     private val appContext = context.applicationContext
     private val thread = HandlerThread("media3-backend").apply { start() }
     private val handler = Handler(thread.looper)
-    private val renderers = StereoRenderersFactory(appContext)
+
+    /** Direct buffer the native clock reader maps (native byte order); allocated up front. */
+    val clockAnchor: ByteBuffer = ByteBuffer.allocateDirect(32).order(java.nio.ByteOrder.nativeOrder())
+    private val renderers = StereoRenderersFactory(appContext, clockAnchor)
     private val selector = StereoTrackSelector()
     private lateinit var player: ExoPlayer
-
-    /** Direct buffer the native clock reader maps; valid after [create]. */
-    lateinit var clockAnchor: ByteBuffer
-        private set
 
     init {
         runOnPlayer { create() }
@@ -62,13 +61,20 @@ class Media3Backend(context: Context, private val callbacks: Callbacks) {
             .setLooper(thread.looper)
             .setSeekParameters(SeekParameters.EXACT)
             .build()
-        clockAnchor = renderers.audio.anchor
         player.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 when (state) {
                     Player.STATE_READY -> if (!preparedReported) {
                         preparedReported = true
-                        val f = player.videoFormat
+                        // videoFormat is null until the renderer has a surface; the
+                        // selected track's Format from the track list is always there.
+                        var f = player.videoFormat
+                        if (f == null) {
+                            outer@ for (g in player.currentTracks.groups) {
+                                if (g.type != C.TRACK_TYPE_VIDEO) continue
+                                for (i in 0 until g.length) if (g.isTrackSelected(i)) { f = g.getTrackFormat(i); break@outer }
+                            }
+                        }
                         callbacks.onPrepared(
                             player.duration * 1000L,
                             f?.width ?: 0, f?.height ?: 0, f?.frameRate ?: 0f,
@@ -94,6 +100,7 @@ class Media3Backend(context: Context, private val callbacks: Callbacks) {
         preparedReported = false
         player.setMediaItem(MediaItem.fromUri(Uri.parse(uri)))
         player.repeatMode = if (loop) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+        player.playWhenReady = false  // native asks for play() once it has taken the Surface
         player.prepare()
     }
 

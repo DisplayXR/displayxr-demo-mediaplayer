@@ -333,6 +333,54 @@ VideoDecoder::start()
 	return true;
 }
 
+bool
+VideoDecoder::openExternal(int width, int height)
+{
+	if (width <= 0 || height <= 0) return false;
+	width_ = width;
+	height_ = height;
+	externalProducer_ = true;
+	legacyPacing_ = false;
+	diag_ = switchOn("MEDIAPLAYER_PACING_DIAG", "debug.dxr.mp.diag");
+	media_status_t rs = AImageReader_newWithUsage(width_, height_, AIMAGE_FORMAT_PRIVATE,
+	                                              AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+	                                              kReaderMaxImages, &reader_);
+	if (rs != AMEDIA_OK || reader_ == nullptr) {
+		LOGE("[media3] AImageReader_newWithUsage failed (%d)", (int)rs);
+		return false;
+	}
+	if (AImageReader_getWindow(reader_, &window_) != AMEDIA_OK || window_ == nullptr) {
+		LOGE("[media3] AImageReader_getWindow failed");
+		AImageReader_delete(reader_);
+		reader_ = nullptr;
+		return false;
+	}
+	releasedFrames_.store(0, std::memory_order_relaxed);
+	shownFrames_.store(0, std::memory_order_relaxed);
+	droppedLate_.store(0, std::memory_order_relaxed);
+	positionUs_.store(0, std::memory_order_relaxed);
+	lastPresentedPtsUs_.store(-1, std::memory_order_relaxed);
+	paused_.store(false, std::memory_order_relaxed);
+	ptsSelectable_ = true;
+	ptsChecked_ = false;
+	lastShownMonoNs_ = -1;
+	{
+		std::lock_guard<std::mutex> lk(clockMx_);
+		anchorMonoNs_ = -1;
+		anchorMediaUs_ = 0;
+		audioOffsetValid_ = false;
+		lastAudioUs_ = -1;
+		lastAudioChangeMonoNs_ = -1;
+	}
+	open_.store(true, std::memory_order_relaxed);
+	stop_.store(false, std::memory_order_relaxed);
+	threadExited_.store(true, std::memory_order_relaxed);  // there is no thread
+	LOGI("[media3] VideoDecoder open (EXTERNAL producer): %dx%d pool=%d — consumer-side "
+	     "anchoring, display-locked selection unchanged",
+	     width_, height_, (int)kReaderMaxImages);
+	return true;
+}
+
 void
 VideoDecoder::seekRelative(double deltaSeconds)
 {
@@ -346,6 +394,22 @@ VideoDecoder::seekRelative(double deltaSeconds)
 void
 VideoDecoder::seekTo(double seconds)
 {
+	if (externalProducer_) {
+		// No decode thread to apply it: the Java player seeks. Here we only put the
+		// consumer clock back to "unanchored at the target" so the first frame that
+		// arrives from the other side of the seek re-anchors it (openExternal rule).
+		int64_t sk = (int64_t)((seconds < 0 ? 0 : seconds) * 1e6);
+		if (durationUs_ > 0 && sk > durationUs_) sk = durationUs_;
+		std::lock_guard<std::mutex> lk(clockMx_);
+		anchorMonoNs_ = -1;
+		anchorMediaUs_ = sk;
+		audioOffsetValid_ = false;
+		lastAudioUs_ = -1;
+		lastAudioChangeMonoNs_ = -1;
+		positionUs_.store(sk, std::memory_order_relaxed);
+		lastPresentedPtsUs_.store(-1, std::memory_order_relaxed);
+		return;
+	}
 	if (!open_.load(std::memory_order_relaxed)) return;
 	int64_t target = (int64_t)(seconds * 1e6);
 	if (target < 0) target = 0;
@@ -853,6 +917,10 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 		targetMonoNs = mono;
 	}
 
+	// External producer: nobody else calls slewToAudio (it lives on the decode
+	// thread otherwise), so keep the consumer clock locked to the master here.
+	if (externalProducer_ && !paused_.load(std::memory_order_relaxed)) slewToAudio();
+
 	int64_t targetUs = 0;
 	bool clockRunning = false;
 	{
@@ -898,6 +966,29 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 			if (AImageReader_acquireNextImage(reader_, &img) != AMEDIA_OK || img == nullptr)
 				break;  // nothing more queued
 			pendingImage_ = img;
+			if (externalProducer_) {
+				releasedFrames_.fetch_add(1, std::memory_order_relaxed);
+				// The decode thread used to anchor the clock on its first output;
+				// with an external producer the first frame the CONSUMER sees plays
+				// that role (open, seek, and -- via the rebase rule below -- loop).
+				if (!clockRunning && !paused_.load(std::memory_order_relaxed)) {
+					int64_t tsNs = 0;
+					if (AImage_getTimestamp(pendingImage_, &tsNs) == AMEDIA_OK && tsNs > 0) {
+						validatePtsOnce(tsNs);
+						if (ptsSelectable_) {
+							std::lock_guard<std::mutex> lk(clockMx_);
+							anchorMediaUs_ = tsNs / 1000;
+							anchorMonoNs_ = targetMonoNs;
+							audioOffsetValid_ = false;
+							clockRunning = true;
+							targetUs = tsNs / 1000;
+							LOGI("[media3] clock anchored on first consumed frame pts=%lld us "
+							     "(buffer timestamp %lld ns)",
+							     (long long)(tsNs / 1000), (long long)tsNs);
+						}
+					}
+				}
+			}
 		}
 		// Unknown timestamp, frozen clock or unusable PTS all mean "take it" --
 		// a degraded cadence is recoverable, a frozen picture is not.
@@ -919,7 +1010,22 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 				const int64_t offUs = tsNs / 1000 - targetUs;
 				const bool stalled =
 				    lastShownMonoNs_ >= 0 && mono - lastShownMonoNs_ > kStallNs;
-				if ((offUs > kStaleUs || offUs < -kStaleUs) && !stalled) {
+				if (externalProducer_ && offUs < -kStaleUs) {
+					// An external producer never queues stale frames of its own accord;
+					// a frame this far BEHIND is the other side of its loop (REPEAT_ONE
+					// rebases the PTS to 0 per lap) or of a seek it applied before we
+					// heard about it. Re-anchor onto it instead of waiting out the
+					// stall watchdog -- a one-second freeze per lap is not a loop.
+					LOGI("[media3] producer rebased (pts %lld us vs clock %lld us) — re-anchoring",
+					     (long long)(tsNs / 1000), (long long)targetUs);
+					std::lock_guard<std::mutex> lk(clockMx_);
+					anchorMediaUs_ = tsNs / 1000;
+					anchorMonoNs_ = targetMonoNs;
+					audioOffsetValid_ = false;
+					lastAudioUs_ = -1;
+					targetUs = tsNs / 1000;
+					due = true;
+				} else if ((offUs > kStaleUs || offUs < -kStaleUs) && !stalled) {
 					// Left over from before a flush -- the decoder has already
 					// moved the clock past it. Drop it and look at the next.
 					AImage_delete(pendingImage_);
@@ -1255,6 +1361,7 @@ VideoDecoder::stop()
 	slave_ = false;
 	trackIndex_ = -1;
 	selectedTrack_ = -1;
+	externalProducer_ = false;
 	// Breadcrumbs, deliberately one per teardown step: if this ever wedges again the
 	// LAST LINE IN THE LOG NAMES THE CALL, which beats reconstructing it from a native
 	// stack after the fact.

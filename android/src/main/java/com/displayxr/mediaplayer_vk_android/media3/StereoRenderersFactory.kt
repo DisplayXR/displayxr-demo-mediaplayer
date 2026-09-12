@@ -23,7 +23,10 @@ import androidx.media3.exoplayer.video.VideoRendererEventListener
  * track selector and the surface messages can address the eyes by position.
  */
 @OptIn(UnstableApi::class)
-class StereoRenderersFactory(private val context: Context) : RenderersFactory {
+class StereoRenderersFactory(
+    private val context: Context,
+    private val clockAnchor: java.nio.ByteBuffer,
+) : RenderersFactory {
     lateinit var videoLeft: PtsStampingVideoRenderer
         private set
     lateinit var videoRight: PtsStampingVideoRenderer
@@ -44,7 +47,7 @@ class StereoRenderersFactory(private val context: Context) : RenderersFactory {
             context, eventHandler, videoRendererEventListener, PtsStampingVideoRenderer.EYE_RIGHT)
         audio = ClockPublishingAudioRenderer(
             context, eventHandler, audioRendererEventListener,
-            DefaultAudioSink.Builder(context).build())
+            DefaultAudioSink.Builder(context).build(), clockAnchor)
         return arrayOf(videoLeft, videoRight, audio)
     }
 

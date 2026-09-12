@@ -11,7 +11,6 @@ import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 /**
  * The player's master clock, published for a native render thread (#71, finding 6).
@@ -24,7 +23,7 @@ import java.nio.ByteOrder
  * with `clock_gettime(CLOCK_MONOTONIC)` (Java `System.nanoTime()` is the same
  * clock on Android) at zero JNI calls per frame.
  *
- * Layout (little-endian, 32 bytes):
+ * Layout (native byte order, 32 bytes; allocated by [Media3Backend]):
  *   [0]  seq        (long)  odd while a write is in progress — seqlock
  *   [8]  positionUs (long)  media position at anchor
  *   [16] anchorNs   (long)  System.nanoTime() at anchor
@@ -36,6 +35,8 @@ class ClockPublishingAudioRenderer(
     eventHandler: Handler?,
     eventListener: AudioRendererEventListener?,
     audioSink: AudioSink,
+    /** Shared with native through `GetDirectBufferAddress`; owned by the backend, never reallocated. */
+    private val anchor: ByteBuffer,
 ) : MediaCodecAudioRenderer(
     context,
     MediaCodecSelector.DEFAULT,
@@ -43,14 +44,15 @@ class ClockPublishingAudioRenderer(
     eventListener,
     audioSink,
 ) {
-    /** Shared with native through `GetDirectBufferAddress`; never reallocated. */
-    val anchor: ByteBuffer = ByteBuffer.allocateDirect(32).order(ByteOrder.LITTLE_ENDIAN)
 
     @Volatile private var speedX1000: Long = 1000L
 
     override fun getPositionUs(): Long {
         val pos = super.getPositionUs()
-        publish(pos, System.nanoTime())
+        // Renderer time carries the period's stream offset (~1e12 us for the first
+        // period); the native consumer compares against buffer PTS, which the video
+        // renderer hands out with that offset already removed. Publish media time.
+        publish(pos - outputStreamOffsetUs, System.nanoTime())
         return pos
     }
 

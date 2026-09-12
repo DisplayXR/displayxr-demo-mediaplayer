@@ -50,7 +50,13 @@ class PtsStampingVideoRenderer(
         presentationTimeUs: Long,
         releaseTimeNs: Long,
     ) {
-        codec.releaseOutputBuffer(index, presentationTimeUs * 1000L)
+        // Through super, NOT codec.releaseOutputBuffer directly: the base method
+        // passes releaseTimeNs straight to the codec (verified, 1.8.0) AND does the
+        // bookkeeping that makes this renderer report ready -- rendered-frame
+        // counters and the "first frame rendered" notification. Bypassing it left
+        // the player flapping BUFFERING<->READY: audio advanced at ~0.27x real time
+        // and frames came out in bursts (measured on the tablet, #71 phase 1).
+        super.renderOutputBufferV21(codec, index, presentationTimeUs, presentationTimeUs * 1000L)
     }
 
     override fun shouldDropOutputBuffer(

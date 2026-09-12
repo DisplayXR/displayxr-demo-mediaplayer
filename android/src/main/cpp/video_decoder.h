@@ -80,6 +80,21 @@ struct VideoDecoder {
 	// Call before open on the master of a dual pair.
 	void requireDisplayLockedPacing() { requireDisplayLocked_ = true; }
 
+	// ── External producer (#71, Media3 spike). ──
+	// Creates ONLY the AImageReader (no extractor, no codec, no decode thread) so a
+	// Java-side ExoPlayer can render into producerWindow(). The consumer side --
+	// acquireFrameForDisplayTime, PTS validation, stall/stale rules -- runs unchanged;
+	// the presentation clock anchors on the first frame the consumer takes instead of
+	// on the decode thread's first output.
+	bool openExternal(int width, int height);
+	ANativeWindow *producerWindow() const { return window_; }
+	void setExternalStreamInfo(int64_t durationUs, float frameRate)
+	{
+		durationUs_ = durationUs;
+		frameRate_ = frameRate;
+	}
+	bool isExternal() const { return externalProducer_; }
+
 	bool isOpen() const { return open_.load(std::memory_order_relaxed); }
 	int width() const { return width_; }
 	int height() const { return height_; }
@@ -278,6 +293,7 @@ private:
 	int64_t xrEpochOffsetNs_ = 0;
 	bool xrEpochCalibrated_ = false;
 	bool legacyPacing_ = false;  // MEDIAPLAYER_LEGACY_PACING / debug.dxr.mp.legacy_pacing
+	bool externalProducer_ = false;  // openExternal(): frames come from outside this class
 	bool diag_ = false;          // MEDIAPLAYER_PACING_DIAG / debug.dxr.mp.diag
 	int64_t lookaheadUs_ = 0;    // debug.dxr.mp.lookahead_ms (bisect knob)
 
