@@ -269,4 +269,11 @@ dependencies {
     // openxr/*.h headers via prefab. The loader discovers the DisplayXR
     // runtime APK at runtime via the OpenXRRuntimeService broker.
     implementation 'org.khronos.openxr:openxr_loader_for_android:1.1.41'
+
+    // Media3 (ExoPlayer) producer backend — #71. Pinned EXACTLY: the stereo
+    // backend subclasses @UnstableApi renderer/track-selector internals whose
+    // shape moves between minors (MappingTrackSelector.selectTracks is final,
+    // preferUnassociatedRenderer is hard-coded). Bump only behind the dual-track
+    // pairing test in that issue.
+    implementation 'androidx.media3:media3-exoplayer:1.8.0'
 }
