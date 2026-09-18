@@ -11,6 +11,7 @@
 #include <openxr/openxr_platform.h>
 
 #include <openxr/XR_DXR_display_info.h>
+#include <dxr_view_config.h>                       // DxrSelectViewConfigType (N-view opt-in, #1486)
 #include <openxr/XR_DXR_workspace_file_dialog.h>  // Tier-1 spatial file picker (Open)
 #include <openxr/XR_DXR_atlas_capture.h>           // 'I' key — snapshot the composed atlas
 #include <openxr/XR_DXR_mcp_tools.h>               // app-defined agent tools (per-app MCP)

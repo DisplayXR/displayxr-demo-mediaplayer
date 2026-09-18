@@ -26,9 +26,12 @@ namespace mp {
 
 class XrSession {
 public:
-    // PRIMARY_STEREO is 2 on a classic HMD, but a DisplayXR light-field display
-    // reports N views (e.g. a 4-view panel packed as a 2x2 atlas). We size for the
-    // runtime's actual count, up to this cap (matches the reference handle apps).
+    // A DisplayXR light-field display can report N views (e.g. a 4-view panel
+    // packed as a 2x2 atlas) — but ONLY under XR_VIEW_CONFIGURATION_TYPE_
+    // PRIMARY_MULTIVIEW_DXR, which this session opts into via
+    // DxrSelectViewConfigType() (runtime #1486/#1500). PRIMARY_STEREO is exactly
+    // 2 views. We size for whatever the selected configuration reports, up to
+    // this cap (== the runtime's XRT_MAX_VIEWS; matches the reference handle apps).
     static constexpr uint32_t kMaxViews = 8;
 
     // A view's tile within the swapchain image (clear target == submitted subImage).
@@ -249,9 +252,12 @@ private:
     XrSystemId systemId_ = XR_NULL_SYSTEM_ID;
     ::XrSession session_ = XR_NULL_HANDLE;  // OpenXR handle (global scope: our class shadows the name)
     XrSpace localSpace_ = XR_NULL_HANDLE;
+    // Fallback initialiser only: DxrSelectViewConfigType() overwrites this right
+    // after xrGetSystem, and every view-configuration-typed call reads it.
     XrViewConfigurationType viewConfigType_ = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     std::vector<XrViewConfigurationView> configViews_;
     uint32_t viewCount_ = 0;       // max over all modes (xrLocateViews capacity)
+    mutable bool warnedViewClamp_ = false;  // one-shot: ActiveViewCount() had to clamp
     uint32_t tileColumns_ = 1;     // fallback tiling when rendering-mode ext absent
     uint32_t tileRows_ = 1;
     SwapchainInfo swapchain_;

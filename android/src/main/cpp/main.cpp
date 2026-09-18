@@ -26,6 +26,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_display_info.h>  // display rendering-mode enumerate/request
+#include <dxr_view_config.h>             // DxrSelectViewConfigType (N-view opt-in, #1486)
 #include <openxr/XR_DXR_view_rig.h>      // minimal display rig (OOP valid-views contingency)
 // XrCompositionLayerWindowSpaceDXR — the shared window-space layer struct is
 // declared (ifndef-guarded) in the window-binding headers; the cocoa one is plain
@@ -211,7 +212,22 @@ uint32_t g_tile_rows = 1;
 uint32_t g_view_count = 2;
 float g_view_scale_x = 0.5f;
 float g_view_scale_y = 1.0f;
-uint32_t g_max_view_count = 2;   // xrLocateViews capacity (max across modes)
+uint32_t g_max_view_count = 2;   // views the view configuration reports (max across modes)
+
+// The view configuration this session runs under. PRIMARY_STEREO is the
+// fallback initialiser only -- query_system_and_graphics_reqs() replaces it with
+// DxrSelectViewConfigType()'s answer right after xrGetSystem, and every
+// view-configuration-typed call below reads THIS variable.
+//
+// Why it matters here (runtime #1486/#1500): g_view_count comes from the active
+// DXR rendering mode (adopt_mode), so on a 4-view panel it becomes 4. Under
+// PRIMARY_STEREO the runtime reports exactly 2 views and rejects an xrEndFrame
+// carrying 4 -- which used to surface as a SILENT permanent black panel, never
+// an error.
+XrViewConfigurationType g_view_config_type = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+
+// One-shot: we had to submit fewer views than the active mode wants.
+bool g_warned_view_clamp = false;
 uint32_t g_display_px_w = 0;     // native panel pixels (XR_DXR_display_info)
 uint32_t g_display_px_h = 0;
 bool g_has_display_info = false;
@@ -984,6 +1000,14 @@ query_system_and_graphics_reqs()
 		}
 	}
 
+	// N-view opt-in (runtime #1486/#1500) -- MUST precede every
+	// view-configuration-typed call (enumerate views / xrBeginSession /
+	// xrLocateViews). Returns PRIMARY_MULTIVIEW_DXR only when the runtime
+	// enumerates it (needs XR_DXR_display_info, always enabled above) and
+	// degrades to PRIMARY_STEREO otherwise, so it is safe unconditionally.
+	g_view_config_type = DxrSelectViewConfigType(g_instance, g_system_id);
+	LOGI("View configuration type: %s", DxrViewConfigTypeName(g_view_config_type));
+
 	PFN_xrGetVulkanGraphicsRequirements2KHR get_reqs = nullptr;
 	res = xrGetInstanceProcAddr(
 	    g_instance, "xrGetVulkanGraphicsRequirements2KHR",
@@ -1314,8 +1338,7 @@ bool
 query_display_info_and_modes()
 {
 	uint32_t vc = 0;
-	if (xrEnumerateViewConfigurationViews(g_instance, g_system_id,
-	                                      XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &vc,
+	if (xrEnumerateViewConfigurationViews(g_instance, g_system_id, g_view_config_type, 0, &vc,
 	                                      nullptr) == XR_SUCCESS &&
 	    vc > 0) {
 		g_max_view_count = vc > kMaxViews ? kMaxViews : vc;
@@ -1619,9 +1642,8 @@ create_swapchains()
 			buf[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
 		}
 		const uint32_t cap = g_max_view_count > kMaxViews ? kMaxViews : g_max_view_count;
-		if (xrEnumerateViewConfigurationViews(g_instance, g_system_id,
-		                                      XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, cap, &got,
-		                                      buf) == XR_SUCCESS &&
+		if (xrEnumerateViewConfigurationViews(g_instance, g_system_id, g_view_config_type, cap,
+		                                      &got, buf) == XR_SUCCESS &&
 		    got > 0) {
 			view_config = buf[0];
 		}
@@ -1947,7 +1969,7 @@ handle_session_state(XrSessionState new_state)
 	case XR_SESSION_STATE_READY: {
 		XrSessionBeginInfo begin = {};
 		begin.type = XR_TYPE_SESSION_BEGIN_INFO;
-		begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		begin.primaryViewConfigurationType = g_view_config_type;
 		XrResult res = xrBeginSession(g_session, &begin);
 		log_xr_result("xrBeginSession", res);
 		if (res == XR_SUCCESS) {
@@ -2259,7 +2281,7 @@ render_frame()
 		view_state.type = XR_TYPE_VIEW_STATE;
 		XrViewLocateInfo locate_info = {};
 		locate_info.type = XR_TYPE_VIEW_LOCATE_INFO;
-		locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		locate_info.viewConfigurationType = g_view_config_type;
 		locate_info.displayTime = frame_state.predictedDisplayTime;
 		locate_info.space = g_app_space;
 
@@ -2284,11 +2306,19 @@ render_frame()
 			views[i].type = XR_TYPE_VIEW;
 		}
 		uint32_t located = 0;
-		res = xrLocateViews(g_session, &locate_info, &view_state, g_max_view_count, &located, views);
+		// Capacity is the FULL views[] array (kMaxViews == the runtime's
+		// XRT_MAX_VIEWS), never g_max_view_count: the two agreed only by
+		// accident, and under-declaring the capacity is how a Quad mode used to
+		// come back short.
+		res = xrLocateViews(g_session, &locate_info, &view_state, kMaxViews, &located, views);
 		PROF_MARK(PROF_LOCATE);
 		constexpr XrViewStateFlags kValidFlags =
 		    XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
-		const bool views_valid = res == XR_SUCCESS && located >= g_view_count &&
+		// A SHORT locate is no longer fatal. It used to be: `located >=
+		// g_view_count` failing left submit_views 0 -> layerCount 0 -> a
+		// permanently black panel with nothing logged (runtime #1486). Now we
+		// submit what we actually have and say so once.
+		const bool views_valid = res == XR_SUCCESS && located > 0 &&
 		                         (view_state.viewStateFlags & kValidFlags) == kValidFlags;
 		if (views_valid) {
 			DXR_HW_DBG_ONCE("first valid xrLocateViews (rig=%d)", (int)g_use_rig);
@@ -2299,7 +2329,29 @@ render_frame()
 			// submitted imageRect so the weave reads the correct tile.
 			uint32_t render_w = 0, render_h = 0, cols = 0, rows = 0;
 			active_tile_dims(&render_w, &render_h, &cols, &rows);
+
+			// Submit min(active mode, located, atlas tiles). Each element is a
+			// real ceiling: the mode says what the weave wants, the locate says
+			// what poses exist, and cols*rows is how many tiles the single atlas
+			// swapchain actually has -- writing past it would alias tile 0.
+			const uint32_t tiles = (cols && rows) ? cols * rows : 1u;
 			submit_views = g_view_count;
+			if (located < submit_views) {
+				submit_views = located;
+			}
+			if (tiles < submit_views) {
+				submit_views = tiles;
+			}
+			if (submit_views > kMaxViews) {
+				submit_views = kMaxViews;
+			}
+			if (submit_views != g_view_count && !g_warned_view_clamp) {
+				g_warned_view_clamp = true;
+				LOGE("submitting %u views, active mode wants %u (located=%u tiles=%ux%u, "
+				     "view config %s) -- the weave will be wrong; this is the #1486 shape",
+				     submit_views, g_view_count, located, cols, rows,
+				     DxrViewConfigTypeName(g_view_config_type));
+			}
 
 			// SINGLE atlas swapchain: one acquire, one tiled render pass (all
 			// views), one release.
