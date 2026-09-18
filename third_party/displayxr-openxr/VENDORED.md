@@ -9,7 +9,13 @@ into the runtime tree.
 ## Source
 
     https://github.com/DisplayXR/displayxr-runtime
-    src/external/openxr_includes/openxr/
+    src/external/openxr_includes/openxr/   ->  openxr/   (pinned, byte-identical)
+    test_apps/common/                      ->  ./        (dxr_view_config.h only)
+
+`openxr/` is a verbatim mirror and every file in it is pinned by
+`VENDORED.json`. `dxr_view_config.h` sits BESIDE it rather than inside it: it
+comes from a different runtime path and carries one local addition, so the
+byte-identity check would (correctly) reject it there.
 
 ## Pins — `VENDORED.json` is the source of truth
 
@@ -32,7 +38,8 @@ Pins in force:
 
 | Runtime commit | Headers |
 |---|---|
-| `a71979a4d1385841a224eccd64ae973385300b1f`<br>a71979a4d (2026-07-12) feat(#734): fold planned XR_EXT_android_surface_binding → XR_DXR_ (docs/comments); post-rename-safe map regen | `XR_DXR_atlas_capture.h`, `XR_DXR_cocoa_window_binding.h`, `XR_DXR_display_info.h`, `XR_DXR_display_zones.h`, `XR_DXR_local_3d_zone.h`, `XR_DXR_macos_gl_binding.h`, `XR_DXR_mcp_tools.h`, `XR_DXR_spatial_workspace.h`, `XR_DXR_view_rig.h`, `XR_DXR_weave.h`, `XR_DXR_win32_window_binding.h`, `XR_DXR_workspace_file_dialog.h` |
+| `a71979a4d1385841a224eccd64ae973385300b1f`<br>a71979a4d (2026-07-12) feat(#734): fold planned XR_EXT_android_surface_binding → XR_DXR_ (docs/comments); post-rename-safe map regen | `XR_DXR_atlas_capture.h`, `XR_DXR_cocoa_window_binding.h`, `XR_DXR_display_zones.h`, `XR_DXR_local_3d_zone.h`, `XR_DXR_macos_gl_binding.h`, `XR_DXR_mcp_tools.h`, `XR_DXR_spatial_workspace.h`, `XR_DXR_view_rig.h`, `XR_DXR_weave.h`, `XR_DXR_win32_window_binding.h`, `XR_DXR_workspace_file_dialog.h` |
+| `c1e4fe00da0f189122eca14e61e9faaa88e4b38e`<br>c1e4fe00d (2026-09-17) — the `XR_DXR_display_info` **spec v19** train (runtime #1486/#1500), which adds `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` | `XR_DXR_display_info.h` |
 | `220e9393511aab23c1ef2c6bb796d452f4fe3060`<br>220e93935 (2026-09-07) feat(android): XR_DXR_android_surface_binding v2 — mini-window layout hint (#1396) (#1398) | `XR_DXR_android_surface_binding.h`, `XR_DXR_xlib_window_binding.h`, `openxr.h`, `openxr_extension_helpers.h`, `openxr_loader_negotiation.h`, `openxr_platform.h`, `openxr_platform_defines.h`, `openxr_reflection.h`, `openxr_reflection_parent_structs.h`, `openxr_reflection_structs.h` |
 
 ## Known drift vs runtime `main`
@@ -46,7 +53,6 @@ passes over the wire changed shape, so the app is correct as pinned.
 |---|---|
 | `XR_DXR_atlas_capture.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
 | `XR_DXR_cocoa_window_binding.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
-| `XR_DXR_display_info.h` | runtime main is spec v18: adds `XrDisplayDesktopInfoDXR` (panel desktop rect + device name, runtime#1301/#1317). Purely ADDITIVE — a NEW chained struct; `XrDisplayInfoDXR` itself is byte-identical. Nothing this app reads changed. |
 | `XR_DXR_display_zones.h` | runtime main is spec v3: adds `XrDisplayZoneFeatherDXR` (opt-in cosmetic edge feather, runtime#800) and `xrGetWorkspaceTileSizeDXR`. Additive; `XrDisplayZoneDXR` unchanged. |
 | `XR_DXR_local_3d_zone.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
 | `XR_DXR_macos_gl_binding.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
@@ -70,7 +76,8 @@ informational — only a pin *mismatch* fails CI).
 | `openxr/XR_DXR_win32_window_binding.h` | Windows HWND window binding (`XrWin32WindowBindingCreateInfoDXR`) |
 | `openxr/XR_DXR_xlib_window_binding.h` | Desktop-Linux X11 window binding (`XrXlibWindowBindingCreateInfoDXR`: Display* + Window XID) |
 | `openxr/XR_DXR_android_surface_binding.h` | Android app-owned Surface binding (`XrAndroidSurfaceBindingCreateInfoDXR`, `xrSetAndroidSurfaceDXR`, `xrSetAndroidWindowGeometryDXR`) + the spec-v2 `XrEventDataAndroidWindowLayoutHintDXR` mini-window layout hint |
-| `openxr/XR_DXR_display_info.h` | Display pixel dims / metadata used to size the swapchain |
+| `openxr/XR_DXR_display_info.h` | Display pixel dims / metadata used to size the swapchain, the rendering-mode enumerate/request calls, and (spec v19) `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` |
+| `dxr_view_config.h` | `DxrSelectViewConfigType()` / `DxrViewConfigTypeName()` — the one-call N-view opt-in, from the runtime's `test_apps/common/`. Both legs include it as `<dxr_view_config.h>`; **not** under `openxr/`, see Source above |
 | `openxr/XR_DXR_view_rig.h` | Declarative display rig — the app declares, the runtime returns render-ready views (no app-side Kooima) |
 | `openxr/XR_DXR_workspace_file_dialog.h` | Tier-1 spatial file picker (`xrRequestFilePickerDXR`) for Open; native dialog fallback when unsupported |
 | `openxr/XR_DXR_display_zones.h`, `XR_DXR_local_3d_zone.h` | Mixed 2D/3D region paradigm (ADR-027). Vendored for completeness; not used by this app yet |
@@ -87,6 +94,8 @@ informational — only a pin *mismatch* fails CI).
    `FetchContent` OpenXR `GIT_TAG` if the core headers moved.
 
 Refreshed in the #61 pass: `XR_DXR_xlib_window_binding.h`.
+Refreshed in the PRIMARY_MULTIVIEW_DXR opt-in pass: `XR_DXR_display_info.h`
+(spec 1 → 19), plus the new `dxr_view_config.h`.
 
 > When `DisplayXR/displayxr-extensions` (auto-synced from runtime main) is the
 > canonical publication point, re-pin from there instead of the runtime tree —
