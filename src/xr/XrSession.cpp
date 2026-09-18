@@ -175,6 +175,17 @@ bool XrSession::InitInstanceAndSystem() {
         }
     }
 
+    // N-view opt-in (runtime #1486/#1500) — MUST come before the first
+    // view-configuration-typed call. This player's per-frame view count comes
+    // from the active DXR rendering mode (ActiveViewCount()), so under
+    // PRIMARY_STEREO the runtime would report 2 views and reject a Quad-mode
+    // xrEndFrame carrying 4. DxrSelectViewConfigType returns
+    // PRIMARY_MULTIVIEW_DXR only when the runtime enumerates it (needs
+    // XR_DXR_display_info, which we always request); it degrades silently to
+    // PRIMARY_STEREO on an older runtime, so it is safe to call unconditionally.
+    viewConfigType_ = DxrSelectViewConfigType(instance_, systemId_);
+    LOG_INFO("View configuration type: %s", DxrViewConfigTypeName(viewConfigType_));
+
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(instance_, systemId_, viewConfigType_,
                                                0, &viewCount, nullptr));
@@ -556,9 +567,24 @@ const XrSession::RenderingMode* XrSession::CurrentMode() const {
 
 uint32_t XrSession::ActiveViewCount() const {
     const RenderingMode* m = CurrentMode();
-    uint32_t n = m ? m->viewCount : viewCount_;
+    const uint32_t want = m ? m->viewCount : viewCount_;
+    uint32_t n = want;
     if (n == 0) n = 1;
-    if (n > viewCount_ && viewCount_ > 0) n = viewCount_; // can't exceed located capacity
+    // Safety net, not the mechanism: with the PRIMARY_MULTIVIEW_DXR opt-in
+    // viewCount_ IS the device max across modes, so this never fires. It would
+    // fire on a runtime that refused the opt-in (viewCount_ == 2) while the
+    // active mode is Quad — and silently rendering half a Quad atlas is exactly
+    // the wrong-pixels-no-error failure #1486 was about, so say so once.
+    if (n > viewCount_ && viewCount_ > 0) {
+        if (!warnedViewClamp_) {
+            warnedViewClamp_ = true;
+            LOG_WARN("Active mode wants %u views but the %s view configuration reports only %u — "
+                     "clamping (expect wrong pixels; the runtime did not advertise "
+                     "PRIMARY_MULTIVIEW_DXR)",
+                     want, DxrViewConfigTypeName(viewConfigType_), viewCount_);
+        }
+        n = viewCount_;
+    }
     if (n > kMaxViews) n = kMaxViews;
     return n;
 }
@@ -1003,6 +1029,21 @@ bool XrSession::BeginFrame(Frame& frame) {
         (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
         frame.shouldRender = false;
         return true;
+    }
+    // Never submit a view we did not locate. Clamp rather than drop the frame:
+    // a short locate still yields a correct (if narrower) projection layer,
+    // whereas layerCount 0 is a black panel with no error anywhere.
+    if (viewCountOut < frame.viewCount) {
+        if (!warnedViewClamp_) {
+            warnedViewClamp_ = true;
+            LOG_WARN("xrLocateViews returned %u views, active mode wants %u — submitting %u",
+                     viewCountOut, frame.viewCount, viewCountOut);
+        }
+        frame.viewCount = viewCountOut;
+        if (frame.viewCount == 0) {
+            frame.shouldRender = false;
+            return true;
+        }
     }
 
     // Acquire + wait the SBS swapchain image the renderer will clear.
