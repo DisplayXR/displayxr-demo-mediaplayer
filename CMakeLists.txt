@@ -150,11 +150,10 @@ FetchContent_MakeAvailable(nlohmann_json)
 #     demo uses. Sources only: common's own CMake carries desktop app scaffolding
 #     this player does not use, so it is populated, not added. Keep this pin equal
 #     to android/src/main/cpp/CMakeLists.txt's.
-# TODO(runtime #1612): TEMPORARY pin to displayxr-common PR #50's commit. Repin to the release tag that contains DxrAliasInactiveViews (and restore GIT_SHALLOW TRUE) BEFORE this PR merges.
 FetchContent_Declare(displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG 7a5acac5b15b6826cd88aa9ef616a8b480270bed
-    GIT_SHALLOW FALSE
+    GIT_TAG v2.15.0
+    GIT_SHALLOW TRUE
     # No CMakeLists.txt there: MakeAvailable only populates, never add_subdirectory
     # (the non-deprecated form of a bare FetchContent_Populate).
     SOURCE_SUBDIR _headers_only_no_cmake)
