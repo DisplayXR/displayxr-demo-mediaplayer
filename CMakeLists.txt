@@ -145,6 +145,21 @@ FetchContent_Declare(nlohmann_json
     GIT_SHALLOW TRUE
     FIND_PACKAGE_ARGS NAMES nlohmann_json)
 FetchContent_MakeAvailable(nlohmann_json)
+# --- displayxr-common: header-only dxr_view_config.h (DxrSelectViewConfigType +
+#     DxrAliasInactiveViews, runtime ADR-041 / #1612) — the ONE shared copy every
+#     demo uses. Sources only: common's own CMake carries desktop app scaffolding
+#     this player does not use, so it is populated, not added. Keep this pin equal
+#     to android/src/main/cpp/CMakeLists.txt's.
+# TODO(runtime #1612): TEMPORARY pin to displayxr-common PR #50's commit. Repin to the release tag that contains DxrAliasInactiveViews (and restore GIT_SHALLOW TRUE) BEFORE this PR merges.
+FetchContent_Declare(displayxr_common
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG 7a5acac5b15b6826cd88aa9ef616a8b480270bed
+    GIT_SHALLOW FALSE
+    # No CMakeLists.txt there: MakeAvailable only populates, never add_subdirectory
+    # (the non-deprecated form of a bare FetchContent_Populate).
+    SOURCE_SUBDIR _headers_only_no_cmake)
+FetchContent_MakeAvailable(displayxr_common)
+
 set(MP_IMGUI_DIR "${imgui_SOURCE_DIR}")
 set(MP_IMGUI_SOURCES
     ${MP_IMGUI_DIR}/imgui.cpp
@@ -221,6 +236,10 @@ target_include_directories(${MP_TARGET} BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/displayxr-openxr  # vendored <openxr/...>
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb               # stb_image_write.h
 )
+# displayxr-common's header dir goes LAST (plain append, after the BEFORE block
+# above), so it only supplies what this repo does not: dxr_view_config.h.
+target_include_directories(${MP_TARGET} PRIVATE
+    ${displayxr_common_SOURCE_DIR}/common)
 
 target_link_libraries(${MP_TARGET} PRIVATE
     SDL3::SDL3

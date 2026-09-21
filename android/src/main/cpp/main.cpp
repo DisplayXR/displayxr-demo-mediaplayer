@@ -26,7 +26,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_display_info.h>  // display rendering-mode enumerate/request
-#include <dxr_view_config.h>             // DxrSelectViewConfigType (N-view opt-in, #1486)
+#include <dxr_view_config.h>             // displayxr-common: DxrSelectViewConfigType (#1486) + DxrAliasInactiveViews (ADR-041)
 #include <openxr/XR_DXR_view_rig.h>      // minimal display rig (OOP valid-views contingency)
 // XrCompositionLayerWindowSpaceDXR — the shared window-space layer struct is
 // declared (ifndef-guarded) in the window-binding headers; the cocoa one is plain
@@ -2273,7 +2273,8 @@ render_frame()
 	PROF_MARK(PROF_UPLOAD);
 
 	XrCompositionLayerProjectionView projection_views[kMaxViews] = {};
-	uint32_t submit_views = 0;
+	uint32_t submit_views = 0;  // views RENDERED (the active mode's, clamped)
+	uint32_t layer_views = 0;   // views the layer CARRIES: every located one (ADR-041)
 	bool rendered = false;
 	if (frame_state.shouldRender && g_scene_loaded.load(std::memory_order_relaxed) &&
 	    !g_pick_pending.load(std::memory_order_relaxed)) {
@@ -2391,6 +2392,17 @@ render_frame()
 					                                                  (int32_t)render_h};
 					projection_views[i].subImage.imageArrayIndex = 0;
 				}
+				// ADR-041 (runtime #1612): under PRIMARY_MULTIVIEW_DXR the layer
+				// must carry EVERY located view. A 2D mode renders one view;
+				// submitting only that one is rejected by xrEndFrame and the
+				// panel keeps the last woven 3D frame. Alias the unrendered tail
+				// onto view 0's tile — the runtime ignores inactive views' pixels.
+				layer_views = located < kMaxViews ? located : kMaxViews;
+				if (layer_views > submit_views) {
+					DxrAliasInactiveViews(projection_views, views, layer_views, submit_views);
+				} else {
+					layer_views = submit_views;
+				}
 				rendered = true;
 			} else {
 				log_xr_result("atlas acquire/wait/release", res);
@@ -2489,7 +2501,7 @@ render_frame()
 	XrCompositionLayerProjection projection_layer = {};
 	projection_layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
 	projection_layer.space = g_app_space;
-	projection_layer.viewCount = submit_views;
+	projection_layer.viewCount = layer_views;
 	projection_layer.views = projection_views;
 	if (hud_active) {
 		hud_layer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;

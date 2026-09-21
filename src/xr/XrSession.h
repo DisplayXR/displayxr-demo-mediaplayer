@@ -59,7 +59,10 @@ public:
         XrFrameState frameState{XR_TYPE_FRAME_STATE};
         bool shouldRender = false;
         uint32_t imageIndex = 0;       // acquired swapchain image
-        uint32_t viewCount = 0;        // == XrSession::ActiveViewCount()
+        uint32_t viewCount = 0;        // == XrSession::ActiveViewCount(): views RENDERED
+        // Views xrLocateViews reported. ADR-041: the projection layer carries ALL of
+        // them — EndFrame aliases [viewCount, locatedCount) onto view 0's tile.
+        uint32_t locatedCount = 0;
         XrView views[kMaxViews];       // per-view pose + fov from xrLocateViews
     };
 

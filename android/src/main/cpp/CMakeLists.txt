@@ -23,6 +23,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Repo root is four levels up from android/src/main/cpp.
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 
+# ── displayxr-common: header-only dxr_view_config.h (DxrSelectViewConfigType +
+# DxrAliasInactiveViews, runtime ADR-041 / #1612) — the ONE shared copy. Sources
+# only (don't run its CMake, which carries desktop platform deps); its common/
+# dir is appended LAST to the include path below. Same pin as the desktop build.
+include(FetchContent)
+# TODO(runtime #1612): TEMPORARY pin to displayxr-common PR #50's commit. Repin to the release tag that contains DxrAliasInactiveViews (and restore GIT_SHALLOW TRUE) BEFORE this PR merges.
+FetchContent_Declare(displayxr_common
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG 7a5acac5b15b6826cd88aa9ef616a8b480270bed
+    GIT_SHALLOW FALSE
+    # No CMakeLists.txt there: MakeAvailable only populates, never add_subdirectory
+    # (the non-deprecated form of a bare FetchContent_Populate).
+    SOURCE_SUBDIR _headers_only_no_cmake)
+FetchContent_MakeAvailable(displayxr_common)
+
 # ── nlohmann/json (header-only) for the SHARED LifLoader's container JSON ──
 # Same tag as the desktop build (top-level CMakeLists.txt).
 include(FetchContent)
@@ -136,7 +151,8 @@ target_include_directories(mediaplayer_vk_android PRIVATE
     ${REPO_ROOT}/src                            # Log.h (impl = lif_log_android.cpp)
     ${REPO_ROOT}/src/media                      # LifLoader.h, ImageDecoder.h, MediaSource.h
     ${REPO_ROOT}/third_party/displayxr-openxr  # DisplayXR XR_EXT_* headers
-    ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)  # Dear ImGui + the Vulkan backend
+    ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends   # Dear ImGui + the Vulkan backend
+    ${displayxr_common_SOURCE_DIR}/common)      # dxr_view_config.h — LAST on purpose
 
 set_target_properties(mediaplayer_vk_android PROPERTIES
     LINK_FLAGS "-u ANativeActivity_onCreate")

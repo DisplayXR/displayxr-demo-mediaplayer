@@ -1010,6 +1010,7 @@ bool XrSession::BeginFrame(Frame& frame) {
     // Only the active rendering mode's views are valid/used; the located array is
     // always sized to the max-over-all-modes capacity.
     frame.viewCount = ActiveViewCount();
+    frame.locatedCount = 0;
     if (!frame.shouldRender) return true;
 
     // Locate with the *max* capacity (the runtime requires it); use [0, viewCount).
@@ -1030,6 +1031,7 @@ bool XrSession::BeginFrame(Frame& frame) {
         frame.shouldRender = false;
         return true;
     }
+    frame.locatedCount = viewCountOut < kMaxViews ? viewCountOut : kMaxViews;
     // Never submit a view we did not locate. Clamp rather than drop the frame:
     // a short locate still yields a correct (if narrower) projection layer,
     // whereas layerCount 0 is a black panel with no error anywhere.
@@ -1083,8 +1085,19 @@ bool XrSession::EndFrame(Frame& frame, const ViewRect* rects, const HudSubmit* h
             projViews[v].subImage.imageRect.offset = {rects[v].x, rects[v].y};
             projViews[v].subImage.imageRect.extent = {(int32_t)rects[v].w, (int32_t)rects[v].h};
         }
+        // ADR-041 (runtime #1612): under PRIMARY_MULTIVIEW_DXR the layer must carry
+        // EVERY located view, not just the active mode's. A 2D mode renders one
+        // view; submitting only that one is rejected by xrEndFrame
+        // (XR_ERROR_VALIDATION_FAILURE) and the panel keeps the last woven 3D
+        // frame. Alias the unrendered tail onto view 0's tile — the runtime
+        // ignores inactive views' pixels.
+        uint32_t layerViews = frame.viewCount;
+        if (frame.locatedCount > layerViews) {
+            DxrAliasInactiveViews(projViews, frame.views, frame.locatedCount, frame.viewCount);
+            layerViews = frame.locatedCount;
+        }
         layer.space = localSpace_;
-        layer.viewCount = frame.viewCount;
+        layer.viewCount = layerViews;
         layer.views = projViews;
     }
 

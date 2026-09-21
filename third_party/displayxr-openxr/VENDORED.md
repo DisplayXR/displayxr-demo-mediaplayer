@@ -10,12 +10,14 @@ into the runtime tree.
 
     https://github.com/DisplayXR/displayxr-runtime
     src/external/openxr_includes/openxr/   ->  openxr/   (pinned, byte-identical)
-    test_apps/common/                      ->  ./        (dxr_view_config.h only)
 
 `openxr/` is a verbatim mirror and every file in it is pinned by
-`VENDORED.json`. `dxr_view_config.h` sits BESIDE it rather than inside it: it
-comes from a different runtime path and carries one local addition, so the
-byte-identity check would (correctly) reject it there.
+`VENDORED.json`.
+
+`dxr_view_config.h` (`DxrSelectViewConfigType()`, `DxrAliasInactiveViews()`) is
+**no longer vendored here** (runtime #1612): both legs take the one shared copy
+from `displayxr-common`'s `common/`, fetched by the top-level `CMakeLists.txt`
+and `android/src/main/cpp/CMakeLists.txt` and appended last to the include path.
 
 ## Pins — `VENDORED.json` is the source of truth
 
@@ -77,7 +79,6 @@ informational — only a pin *mismatch* fails CI).
 | `openxr/XR_DXR_xlib_window_binding.h` | Desktop-Linux X11 window binding (`XrXlibWindowBindingCreateInfoDXR`: Display* + Window XID) |
 | `openxr/XR_DXR_android_surface_binding.h` | Android app-owned Surface binding (`XrAndroidSurfaceBindingCreateInfoDXR`, `xrSetAndroidSurfaceDXR`, `xrSetAndroidWindowGeometryDXR`) + the spec-v2 `XrEventDataAndroidWindowLayoutHintDXR` mini-window layout hint |
 | `openxr/XR_DXR_display_info.h` | Display pixel dims / metadata used to size the swapchain, the rendering-mode enumerate/request calls, and (spec v19) `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` |
-| `dxr_view_config.h` | `DxrSelectViewConfigType()` / `DxrViewConfigTypeName()` — the one-call N-view opt-in, from the runtime's `test_apps/common/`. Both legs include it as `<dxr_view_config.h>`; **not** under `openxr/`, see Source above |
 | `openxr/XR_DXR_view_rig.h` | Declarative display rig — the app declares, the runtime returns render-ready views (no app-side Kooima) |
 | `openxr/XR_DXR_workspace_file_dialog.h` | Tier-1 spatial file picker (`xrRequestFilePickerDXR`) for Open; native dialog fallback when unsupported |
 | `openxr/XR_DXR_display_zones.h`, `XR_DXR_local_3d_zone.h` | Mixed 2D/3D region paradigm (ADR-027). Vendored for completeness; not used by this app yet |
@@ -95,7 +96,7 @@ informational — only a pin *mismatch* fails CI).
 
 Refreshed in the #61 pass: `XR_DXR_xlib_window_binding.h`.
 Refreshed in the PRIMARY_MULTIVIEW_DXR opt-in pass: `XR_DXR_display_info.h`
-(spec 1 → 19), plus the new `dxr_view_config.h`.
+(spec 1 → 19), plus the new `dxr_view_config.h` (since moved to displayxr-common, #1612).
 
 > When `DisplayXR/displayxr-extensions` (auto-synced from runtime main) is the
 > canonical publication point, re-pin from there instead of the runtime tree —
