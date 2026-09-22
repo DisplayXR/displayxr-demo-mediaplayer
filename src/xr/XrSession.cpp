@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "XrSession.h"
 
+#include "ColorPolicy.h"      // swapchain encoding choice (#78)
 #include "platform/Window.h"  // Window::X11Handles — the Linux native-handle shape
 
 #include <cstdlib>
@@ -702,8 +703,17 @@ bool XrSession::CreateSwapchain() {
         LOG_ERROR("Runtime reported no swapchain formats");
         return false;
     }
-    // Runtime's preferred format is first per the OpenXR spec.
-    int64_t selectedFormat = formats[0];
+    // Colour-encoding choice (#78). The runtime's first format is UNORM today, which
+    // DECLARES linear pixels — but everything this app writes is display-referred
+    // (encoded video / images). Prefer an _SRGB format so the declaration matches the
+    // bytes; DXR_SWAPCHAIN_ENCODING=unorm restores the old formats[0] behaviour.
+    // See src/ColorPolicy.h.
+    const color::Encoding encoding = color::EncodingFromEnv();
+    const char* why = nullptr;
+    const int64_t selectedFormat = color::ChooseColorFormat(formats, encoding, &why);
+    LOG_INFO("Colour swapchain format: %lld (%s) [DXR_SWAPCHAIN_ENCODING=%s] — %s",
+             (long long)selectedFormat, color::IsSrgb8(selectedFormat) ? "sRGB" : "UNORM",
+             color::EncodingName(encoding), why);
 
     // Size the swapchain to the display panel (the sim display's max atlas across
     // modes). Each active mode then tiles it as swapchain/(tileColumns x tileRows);
@@ -768,9 +778,32 @@ void XrSession::CreateHudSwapchain(uint32_t width, uint32_t height) {
     std::vector<int64_t> formats(formatCount);
     if (XR_FAILED(xrEnumerateSwapchainFormats(session_, formatCount, &formatCount, formats.data())))
         return;
-    // Prefer R8G8B8A8_UNORM (VK=37) so the CPU RGBA upload maps 1:1.
+    // Same encoding choice as the colour swapchain (#78), but the CHANNEL ORDER is
+    // load-bearing here and the generic first-_SRGB scan is not: what lands in this image
+    // is always encoded bytes (the CPU text HUD's RGBA raster via a straight
+    // vkCmdCopyBufferToImage, or ImGui's display-referred output copied across), and both
+    // producers — and DumpExternalImage — assume R,G,B,A byte order. So the order is
+    // R8G8B8A8_SRGB (43, honest AND 1:1) -> R8G8B8A8_UNORM (37, what this app used before
+    // #78) -> the runtime's first. Under =unorm, 37 first so the legacy path is unchanged.
+    const color::Encoding encoding = color::EncodingFromEnv();
+    const char* why = "runtime's first format";
+    const int64_t order[3] = {encoding == color::Encoding::Unorm ? color::kR8G8B8A8_UNORM
+                                                                : color::kR8G8B8A8_SRGB,
+                              encoding == color::Encoding::Unorm ? color::kR8G8B8A8_SRGB
+                                                                 : color::kR8G8B8A8_UNORM,
+                              0};
     int64_t fmt = formats[0];
-    for (int64_t f : formats) if (f == 37) { fmt = f; break; }
+    for (int64_t want : order) {
+        if (want == 0) break;
+        bool found = false;
+        for (int64_t f : formats) if (f == want) { found = true; break; }
+        if (found) {
+            fmt = want;
+            why = color::IsSrgb8(want) ? "encoding-honest, RGBA order (CPU upload stays 1:1)"
+                                       : "legacy passthrough, exactly as before #78";
+            break;
+        }
+    }
 
     XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
@@ -799,8 +832,10 @@ void XrSession::CreateHudSwapchain(uint32_t width, uint32_t height) {
     hudVkImages_.clear();
     for (auto& im : images) hudVkImages_.push_back(im.image);
     hasHud_ = true;
-    LOG_INFO("HUD swapchain: %ux%u, %u images, format=%lld", width, height, imageCount,
-             (long long)fmt);
+    LOG_INFO("HUD swapchain: %ux%u, %u images, format=%lld (%s) "
+             "[DXR_SWAPCHAIN_ENCODING=%s] — %s",
+             width, height, imageCount, (long long)fmt,
+             color::IsSrgb8(fmt) ? "sRGB" : "UNORM", color::EncodingName(encoding), why);
 }
 
 bool XrSession::AcquireHudImage(uint32_t& imageIndex) {

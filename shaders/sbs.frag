@@ -21,13 +21,28 @@ layout(push_constant) uniform PushConstants {
     vec2 uvScale;
     int mode;        // 0 = RGBA, 1 = I420, 2 = NV12
     float fullRange; // 1 = full/JPEG range, 0 = limited/MPEG range
+    float srgbTarget;// 1 = the colour attachment is an _SRGB view (encodes on store)
 } pc;
+
+// sRGB EOTF: display-referred (encoded) -> scene-linear. Every value this shader
+// produces is display-referred — the RGBA source is an encoded texture sampled through a
+// UNORM view, and the YUV path's matrix emits R'G'B', not RGB. When the attachment is
+// _SRGB the hardware encodes on store, so we decode first and the round trip is an
+// identity: the same encoded bytes land in the swapchain as on the UNORM path (#78).
+vec3 DisplayReferredToSceneLinear(vec3 c) {
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+
+vec4 EncodeForTarget(vec4 c) {
+    if (pc.srgbTarget > 0.5) c.rgb = DisplayReferredToSceneLinear(clamp(c.rgb, 0.0, 1.0));
+    return c;
+}
 
 void main() {
     vec2 uv = pc.uvOffset + vUV * pc.uvScale;
 
     if (pc.mode == 0) {
-        outColor = texture(plane0, uv);
+        outColor = EncodeForTarget(texture(plane0, uv));
         return;
     }
 
@@ -57,5 +72,5 @@ void main() {
     vec3 rgb = vec3(yb + 1.5748 * vb,
                     yb - 0.1873 * ub - 0.4681 * vb,
                     yb + 1.8556 * ub);
-    outColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+    outColor = EncodeForTarget(vec4(clamp(rgb, 0.0, 1.0), 1.0));
 }
