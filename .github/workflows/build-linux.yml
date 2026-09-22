@@ -136,44 +136,76 @@ jobs:
           grep -q "pkgcfg_lib_FFMPEG_avcodec" build/CMakeCache.txt || {
             echo "::error::FFmpeg was not found via pkg-config — media path compiled out"; exit 1; }
 
-  # Build the demo .deb and, on a v* tag, attach it to the GitHub Release — the
-  # asset the Linux meta-bundle fetches (runtime #781 Phase 3). Runs on every PR
-  # too (build-only) so a broken package_deb_linux.sh is caught before release.
-  # Single base (24.04) on a VM, not the tri-LTS matrix — one artifact. FFmpeg is
-  # NOT bundled: the binary links the distro's libav* shared libs (pkg-config),
-  # which compute_lib_depends() emits as .deb Depends (only the OpenXR loader is
-  # bundled, mirroring build_linux.sh).
+  # Build the ONE demo .deb and, on a v* tag, attach it to the GitHub Release —
+  # the asset the Linux meta-bundle fetches (runtime #781 Phase 3; the bundle's
+  # glob `displayxr-mediaplayer_*_amd64.deb` expects exactly one). Runs on every
+  # PR too so a broken package_deb_linux.sh is caught before release.
+  #
+  # PORTABLE BY CONSTRUCTION (#76): the same .deb must install and run on Ubuntu
+  # 22.04, 24.04 and 26.04, so it is built on the OLDEST (ubuntu:22.04 container:
+  # glibc 2.35 / GCC 11 floor), links SDL3 statically (24.04 has no libsdl3), and
+  # bundles a private slim FFmpeg (distro sonames are libavcodec58/60/62). The
+  # DebInstall job below proves it on all three.
   Deb:
     needs: DetectChanges
     runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    env:
+      FFMPEG_PREFIX: /tmp/ffmpeg-slim-linux
+      CMAKE_VERSION: "3.31.8"   # 22.04's apt cmake (3.22) is below CMakeLists' 3.24 floor
     steps:
       - name: Docs-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
         run: echo "Doc-only change — skipping .deb build."
+
+      # Bare image, root: git before checkout (else checkout falls back to a
+      # tarball with no tags and git describe cannot version the .deb).
+      - name: Bootstrap container (git for checkout)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl
 
       - uses: actions/checkout@v5
         if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           fetch-depth: 0 # git describe needs tags for the .deb version
 
+      # No system FFmpeg or SDL3 dev packages ON PURPOSE: neither may reach the
+      # .deb. nasm + libva-dev + zlib1g-dev build the private FFmpeg; the X11 /
+      # Wayland / PulseAudio / PipeWire / ALSA headers let the static SDL3
+      # compile those backends as runtime dlopen()s (package_deb_linux.sh fails
+      # if one is missing). python3 + libxxf86vm-dev + libxcb-glx0-dev: the
+      # from-source OpenXR loader (codegen; GLX platform support once GL headers
+      # are present).
       - name: Install dependencies
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config git ca-certificates curl \
-            libvulkan-dev vulkan-validationlayers glslang-tools \
-            libavformat-dev libavcodec-dev libavutil-dev \
-            libswscale-dev libswresample-dev \
-            libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
-            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
+          apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config python3 file binutils \
+            libvulkan-dev glslang-tools \
+            nasm libva-dev zlib1g-dev \
+            libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxfixes-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libegl-dev libgl-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libdbus-1-dev libudev-dev \
             libxxf86vm-dev libxcb-glx0-dev \
             dpkg-dev fakeroot
+          curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" \
+            | tar -xz -C /opt
+          echo "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Cache slim FFmpeg
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FFMPEG_PREFIX }}
+          key: ffmpeg-slim-linux-2204-${{ hashFiles('scripts/build_ffmpeg_linux.sh') }}
 
       - name: Build + package the demo .deb
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake --version | head -1
           ./scripts/package_deb_linux.sh
           ls -lh dist/*.deb
 
@@ -191,3 +223,45 @@ jobs:
         with:
           files: dist/*.deb
           fail_on_unmatched_files: true
+
+  # Install the .deb from the Deb job into a PRISTINE container of every
+  # supported release, with the latest released runtime .deb (Depends:
+  # displayxr-runtime). Fails if apt cannot resolve Depends there, if `ldd -r`
+  # shows any unresolved library / symbol / symbol version, if a system SDL3 or
+  # FFmpeg is picked up, or if a Recommends/Suggests name is not in that archive.
+  DebInstall:
+    name: DebInstall (Ubuntu ${{ matrix.lts }})
+    needs: [DetectChanges, Deb]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lts: ["22.04", "24.04", "26.04"]
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — no .deb to verify."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+
+      - uses: actions/download-artifact@v4
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          name: displayxr-mediaplayer-deb
+          path: dist
+
+      - name: Fetch the latest released runtime .deb
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo DisplayXR/displayxr-runtime \
+            --pattern 'displayxr-runtime_*_amd64.deb' --dir runtime-deb
+          ls runtime-deb
+
+      - name: apt install + ldd in clean ubuntu:${{ matrix.lts }}
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.lts }}" \
+            ./scripts/verify_deb_install_linux.sh dist/displayxr-mediaplayer_*_amd64.deb runtime-deb/*.deb

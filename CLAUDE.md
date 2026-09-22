@@ -84,6 +84,18 @@ is **non-required** and fires only on `workflow_dispatch` + `linux*` branches.
 (`XR_RUNTIME_JSON`, `XRT_PLUGIN_SEARCH_PATH`, `OXR_ENABLE_VK_NATIVE_COMPOSITOR=1`,
 `SIM_DISPLAY_OUTPUT=anaglyph`).
 
+**Linux `.deb` — one package for Ubuntu 22.04, 24.04 and 26.04 (#76).**
+`./scripts/package_deb_linux.sh` builds a *portable* variant in `build-deb/`
+(separate from the dev `build/`): SDL3 **statically** linked (24.04 has no
+`libsdl3`; SDL still `dlopen`s its X11/Wayland/audio backends), a **private slim
+FFmpeg** from `scripts/build_ffmpeg_linux.sh` bundled next to the binary
+(`RUNPATH=$ORIGIN`; distro sonames are `libavcodec58/60/62` across the three
+releases), and CI builds it in an `ubuntu:22.04` container for the glibc floor.
+Every `DT_NEEDED` must be bundled or on the script's `STABLE_SONAMES` list, and
+the `DebInstall` CI matrix apt-installs the result into clean 22.04/24.04/26.04
+containers (`scripts/verify_deb_install_linux.sh`). Never let a distro FFmpeg or
+SDL3 reach the `.deb` — it narrows the package to one Ubuntu release.
+
 **Status: BUILD-GREEN, window binding wired.** `XR_DXR_xlib_window_binding`
 (runtime Phase 3a) is fully wired: `Window.cpp` extracts the (Display*, XID)
 pair from SDL's X11 properties (bundled as `Window::X11Handles` behind the
