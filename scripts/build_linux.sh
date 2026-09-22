@@ -34,7 +34,9 @@ cd "$REPO_ROOT"
 # CMake package config are already present.
 OPENXR_VERSION="${OPENXR_VERSION:-1.1.51}"
 OPENXR_DIR="/tmp/openxr-install"
-if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.so" ] || \
+# The versioned .so is part of the cache key: a loader cached from an older pin
+# would otherwise be linked (and bundled into the .deb) forever.
+if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.so.$OPENXR_VERSION" ] || \
    [ ! -f "$OPENXR_DIR/lib/cmake/openxr/OpenXRConfig.cmake" ]; then
     echo "==> Building OpenXR loader $OPENXR_VERSION -> $OPENXR_DIR"
     rm -rf /tmp/openxr-sdk "$OPENXR_DIR"
@@ -52,13 +54,20 @@ else
 fi
 
 # --- 1. cmake build -------------------------------------------------------
-# FFmpeg resolves via pkg-config; Vulkan via the system libvulkan-dev.
-cmake -S . -B build -G Ninja \
+# Dev build: FFmpeg resolves via pkg-config; Vulkan via the system libvulkan-dev.
+# The .deb (scripts/package_deb_linux.sh) instead sets FFMPEG_ROOT to the private
+# slim FFmpeg + MP_LINUX_PORTABLE=ON, in its own BUILD_DIR (#76).
+BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
+EXTRA_ARGS=()
+[ -n "${FFMPEG_ROOT:-}" ] && EXTRA_ARGS+=("-DFFMPEG_ROOT=$FFMPEG_ROOT")
+[ -n "${MP_LINUX_PORTABLE:-}" ] && EXTRA_ARGS+=("-DMP_LINUX_PORTABLE=$MP_LINUX_PORTABLE")
+cmake -S . -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build build
+    -DCMAKE_PREFIX_PATH="$OPENXR_DIR" \
+    "${EXTRA_ARGS[@]}"
+cmake --build "$BUILD_DIR"
 
-BIN="$REPO_ROOT/build/mediaplayer_handle_vk_linux"
+BIN="$BUILD_DIR/mediaplayer_handle_vk_linux"
 [ -x "$BIN" ] || { echo "Error: expected binary not found at $BIN" >&2; exit 1; }
 
 echo ""

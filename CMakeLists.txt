@@ -69,11 +69,19 @@ endif()
 #     (~9 MB of DLLs vs ~103 MB for a stock full build). For local dev that script
 #     works too, or use any FFmpeg dev tree (a vcpkg 'installed/x64-windows' prefix,
 #     or a BtbN/gyan.dev prebuilt).
+#   * Linux portable .deb (MP_LINUX_PORTABLE, #76): a private slim FFmpeg built by
+#     scripts/build_ffmpeg_linux.sh, passed as FFMPEG_ROOT and bundled next to the
+#     binary — the distro libav* sonames differ on every Ubuntu release.
+# An explicit FFMPEG_ROOT always wins over pkg-config, and is searched exclusively
+# (NO_DEFAULT_PATH), so a system FFmpeg on the build host can never be linked instead.
 find_package(PkgConfig QUIET)
 set(MP_HAVE_FFMPEG FALSE)
 set(MP_FFMPEG_LINK "")           # what the target links against (pkg-config target or libs)
 set(MP_FFMPEG_DLL_DIR "")        # Windows: dir holding the runtime DLLs to stage by the exe
-if(PkgConfig_FOUND)
+if(NOT FFMPEG_ROOT AND DEFINED ENV{FFMPEG_ROOT})
+    set(FFMPEG_ROOT "$ENV{FFMPEG_ROOT}")
+endif()
+if(PkgConfig_FOUND AND NOT FFMPEG_ROOT)
     pkg_check_modules(FFMPEG IMPORTED_TARGET
         libavformat libavcodec libavutil libswscale libswresample)
     if(FFMPEG_FOUND)
@@ -83,17 +91,16 @@ if(PkgConfig_FOUND)
     endif()
 endif()
 if(NOT MP_HAVE_FFMPEG)
-    # Manual fallback. Honor FFMPEG_ROOT (cache or env); otherwise still let
-    # find_*/CMAKE_PREFIX_PATH (e.g. a vcpkg toolchain) resolve the libs.
-    if(NOT FFMPEG_ROOT AND DEFINED ENV{FFMPEG_ROOT})
-        set(FFMPEG_ROOT "$ENV{FFMPEG_ROOT}")
+    # Manual path. Honor FFMPEG_ROOT (cache or env) exclusively; without it, still
+    # let find_*/CMAKE_PREFIX_PATH (e.g. a vcpkg toolchain) resolve the libs.
+    set(_mp_ff_find_args)
+    if(FFMPEG_ROOT)
+        set(_mp_ff_find_args NO_DEFAULT_PATH)
     endif()
-    find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h HINTS "${FFMPEG_ROOT}/include")
-    find_library(FFMPEG_avcodec  avcodec  HINTS "${FFMPEG_ROOT}/lib")
-    find_library(FFMPEG_avformat avformat HINTS "${FFMPEG_ROOT}/lib")
-    find_library(FFMPEG_avutil   avutil   HINTS "${FFMPEG_ROOT}/lib")
-    find_library(FFMPEG_swscale  swscale  HINTS "${FFMPEG_ROOT}/lib")
-    find_library(FFMPEG_swresample swresample HINTS "${FFMPEG_ROOT}/lib")
+    find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h HINTS "${FFMPEG_ROOT}/include" ${_mp_ff_find_args})
+    foreach(_ff avcodec avformat avutil swscale swresample)
+        find_library(FFMPEG_${_ff} ${_ff} HINTS "${FFMPEG_ROOT}/lib" ${_mp_ff_find_args})
+    endforeach()
     if(FFMPEG_INCLUDE_DIR AND FFMPEG_avcodec AND FFMPEG_avformat AND FFMPEG_avutil AND FFMPEG_swscale AND FFMPEG_swresample)
         add_library(mp_ffmpeg INTERFACE)
         target_include_directories(mp_ffmpeg INTERFACE "${FFMPEG_INCLUDE_DIR}")
@@ -115,16 +122,37 @@ if(NOT MP_HAVE_FFMPEG)
                    "(Windows: pass -DFFMPEG_ROOT=<ffmpeg dev tree>)")
 endif()
 
-# --- SDL3 (window + input + native handle). Pinned; uses an installed SDL3 if one
-#     is already present, else builds the pinned source.
-set(SDL_SHARED ON CACHE BOOL "" FORCE)
-set(SDL_STATIC OFF CACHE BOOL "" FORCE)
-set(SDL_TEST OFF CACHE BOOL "" FORCE)
+# --- SDL3 (window + input + native handle + audio out + open-file dialog). Pinned.
+#   * Windows / macOS: uses an installed SDL3 if one is present, else builds the
+#     pinned source as a shared lib (the installers stage SDL3.dll / the dylib).
+#   * Linux: ALWAYS the pinned source, linked STATICALLY (#76). Ubuntu 24.04 ships
+#     no libsdl3 package at all (the archive has it from 25.04), so a shared SDL3
+#     can be neither bundled-by-distro nor declared in the .deb's Depends. Static
+#     costs nothing at runtime: SDL still dlopen()s its X11/Wayland/PulseAudio/
+#     PipeWire/ALSA backends (SDL_*_SHARED default ON), so the binary gains no
+#     DT_NEEDED on any of them. Never falls back to a system SDL3 here, so a 26.04
+#     build host with libsdl3-dev cannot silently reintroduce libSDL3.so.0.
+set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    # Subsystems the player never touches (it uses video, events, audio, dialog;
+    # joystick/gamepad stay because the ImGui SDL3 backend polls gamepads).
+    set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+    set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
+    set(_mp_sdl_find_args)
+else()
+    set(SDL_SHARED ON CACHE BOOL "" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+    set(_mp_sdl_find_args FIND_PACKAGE_ARGS NAMES SDL3)
+endif()
 FetchContent_Declare(SDL3
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
     GIT_TAG release-3.2.10
     GIT_SHALLOW TRUE
-    FIND_PACKAGE_ARGS NAMES SDL3)
+    ${_mp_sdl_find_args})
 FetchContent_MakeAvailable(SDL3)
 
 # --- Dear ImGui (subtle 3D UI, M4). No upstream CMake target — compile the core
@@ -267,6 +295,34 @@ if(TARGET OpenXR::openxr_loader)
                 "${_oxr_loc}" "$<TARGET_FILE_DIR:${MP_TARGET}>"
             COMMENT "Copying OpenXR loader next to ${MP_TARGET}")
     endif()
+endif()
+
+# Linux portable build (the .deb, #76): the binary finds its bundled libs (the
+# private FFmpeg, the OpenXR loader) in its own directory via RUNPATH=$ORIGIN — no
+# build-tree path baked in, no LD_LIBRARY_PATH needed. The same libs are staged
+# next to the binary here so the build tree runs exactly like the installed layout.
+option(MP_LINUX_PORTABLE "Linux: RUNPATH=\$ORIGIN + stage bundled libs next to the binary (for the .deb)" OFF)
+if(MP_LINUX_PORTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(NOT FFMPEG_ROOT)
+        message(FATAL_ERROR "MP_LINUX_PORTABLE needs FFMPEG_ROOT (scripts/build_ffmpeg_linux.sh): "
+                            "a distro FFmpeg cannot ship in a portable .deb")
+    endif()
+    set_target_properties(${MP_TARGET} PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "\$ORIGIN")
+    file(GLOB _mp_bundled_libs "${FFMPEG_ROOT}/lib/lib*.so.*")
+    if(TARGET OpenXR::openxr_loader AND _oxr_loc)
+        get_filename_component(_oxr_dir "${_oxr_loc}" DIRECTORY)
+        file(GLOB _oxr_libs "${_oxr_dir}/libopenxr_loader.so*")
+        list(APPEND _mp_bundled_libs ${_oxr_libs})
+    endif()
+    foreach(_lib ${_mp_bundled_libs})
+        # -P keeps soname symlinks as symlinks.
+        add_custom_command(TARGET ${MP_TARGET} POST_BUILD
+            COMMAND cp -P -f "${_lib}" "$<TARGET_FILE_DIR:${MP_TARGET}>/"
+            VERBATIM)
+    endforeach()
+    message(STATUS "MP_LINUX_PORTABLE: RUNPATH=$ORIGIN, bundling ${FFMPEG_ROOT}/lib + OpenXR loader")
 endif()
 
 # Stage dependent shared-library DLLs (SDL3 when built shared, an OpenXR loader DLL

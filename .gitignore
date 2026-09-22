@@ -1,5 +1,7 @@
 # Build output
 build/
+build-deb/
+dist/
 out/
 _package/
 cmake-build-*/
