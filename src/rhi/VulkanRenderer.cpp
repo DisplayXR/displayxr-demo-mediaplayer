@@ -16,6 +16,7 @@
 
 #include "VulkanRenderer.h"
 
+#include "ColorPolicy.h"  // swapchain encoding policy (#78)
 #include "Log.h"
 #include "rhi/Shaders.h"
 
@@ -40,6 +41,17 @@ namespace mp {
 
 VulkanRenderer::~VulkanRenderer() { Shutdown(); }
 
+// A clear value written through an _SRGB attachment is taken as scene-linear and encoded
+// by the hardware on store, so a display-referred colour (which is what every colour in
+// this app is — background_, the letterbox fill, the RED|BLUE test pattern) has to be
+// decoded first or it stores lighter than asked. Alpha is never encoded (#78).
+VkClearColorValue VulkanRenderer::ToTargetClear(const ClearColor& c) const {
+    if (!srgbTarget_) return VkClearColorValue{{c.r, c.g, c.b, c.a}};
+    return VkClearColorValue{{color::DisplayReferredToSceneLinear(c.r),
+                              color::DisplayReferredToSceneLinear(c.g),
+                              color::DisplayReferredToSceneLinear(c.b), c.a}};
+}
+
 bool VulkanRenderer::Initialize(VkPhysicalDevice physicalDevice, VkDevice device,
                                 VkQueue graphicsQueue, uint32_t queueFamilyIndex,
                                 VkFormat format, uint32_t width, uint32_t height,
@@ -49,6 +61,10 @@ bool VulkanRenderer::Initialize(VkPhysicalDevice physicalDevice, VkDevice device
     queue_ = graphicsQueue;
     queueFamilyIndex_ = queueFamilyIndex;
     format_ = format;
+    // An _SRGB swapchain view encodes on store (#78): the shader must hand it scene-
+    // linear values and clear colours must be decoded first. On the UNORM path nothing
+    // converts and every write is the byte-for-byte passthrough it always was.
+    srgbTarget_ = color::IsSrgb8((int64_t)format);
     width_ = width;
     height_ = height;
     images_ = images;
@@ -146,8 +162,10 @@ bool VulkanRenderer::Initialize(VkPhysicalDevice physicalDevice, VkDevice device
 
     if (!CreatePipeline()) return false;
 
-    LOG_INFO("VulkanRenderer ready (%u framebuffers, %ux%u)",
-             (uint32_t)framebuffers_.size(), width_, height_);
+    LOG_INFO("VulkanRenderer ready (%u framebuffers, %ux%u, format=%d %s)",
+             (uint32_t)framebuffers_.size(), width_, height_, (int)format_,
+             srgbTarget_ ? "sRGB — shader + clears converted to scene-linear"
+                         : "UNORM — passthrough");
     return true;
 }
 
@@ -181,11 +199,12 @@ bool VulkanRenderer::CreatePipeline() {
         return false;
     }
 
-    // Push constants: uvOffset(vec2)+uvScale(vec2)+mode(int)+fullRange(float) = 24 bytes.
+    // Push constants: uvOffset(vec2)+uvScale(vec2)+mode(int)+fullRange(float)
+    //                 +srgbTarget(float) = 28 bytes.
     VkPushConstantRange pcRange = {};
     pcRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     pcRange.offset = 0;
-    pcRange.size = sizeof(float) * 6;
+    pcRange.size = sizeof(float) * 7;
 
     VkPipelineLayoutCreateInfo plci = {};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -334,7 +353,7 @@ bool VulkanRenderer::ClearViews(uint32_t imageIndex, const ClearColor* colors,
     // LOAD_OP_CLEAR fills the whole image with view 0's color; any area not covered
     // by a tile keeps it.
     VkClearValue clear = {};
-    clear.color = {{colors[0].r, colors[0].g, colors[0].b, colors[0].a}};
+    clear.color = ToTargetClear(colors[0]);
 
     VkRenderPassBeginInfo rb = {};
     rb.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -351,7 +370,7 @@ bool VulkanRenderer::ClearViews(uint32_t imageIndex, const ClearColor* colors,
         VkClearAttachment att = {};
         att.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         att.colorAttachment = 0;
-        att.clearValue.color = {{colors[v].r, colors[v].g, colors[v].b, colors[v].a}};
+        att.clearValue.color = ToTargetClear(colors[v]);
         VkClearRect rect = {};
         rect.rect.offset = {rects[v].x, rects[v].y};
         rect.rect.extent = {rects[v].w, rects[v].h};
@@ -737,8 +756,8 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
     // Letterbox/background: the configured fill (opaque black by default, dark grey for
     // the idle logo); alpha 0 in transparent-bg mode so the runtime composes those
     // pixels through to the desktop.
-    clear.color = {{background_.r, background_.g, background_.b,
-                    transparentLetterbox_ ? 0.0f : background_.a}};
+    clear.color = ToTargetClear(ClearColor{background_.r, background_.g, background_.b,
+                                           transparentLetterbox_ ? 0.0f : background_.a});
     VkRenderPassBeginInfo rb = {};
     rb.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rb.renderPass = renderPass_;
@@ -781,10 +800,19 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         sc.extent = {(uint32_t)std::max(0, x1 - x0), (uint32_t)std::max(0, y1 - y0)};
         vkCmdSetScissor(commandBuffer_, 0, 1, &sc);
 
-        // uvOffset(vec2) + uvScale(vec2) + mode(int) + fullRange(float) = 24 bytes.
-        struct { float off[2]; float scale[2]; int32_t mode; float fullRange; } pc = {
-            {uvs[v].offX, uvs[v].offY}, {uvs[v].scaleX, uvs[v].scaleY},
-            sourceMode_, sourceFullRange_};
+        // uvOffset(vec2) + uvScale(vec2) + mode(int) + fullRange(float)
+        // + srgbTarget(float) = 28 bytes.
+        struct {
+            float off[2];
+            float scale[2];
+            int32_t mode;
+            float fullRange;
+            float srgbTarget;
+        } pc = {{uvs[v].offX, uvs[v].offY},
+                {uvs[v].scaleX, uvs[v].scaleY},
+                sourceMode_,
+                sourceFullRange_,
+                srgbTarget_ ? 1.0f : 0.0f};
         vkCmdPushConstants(commandBuffer_, activeLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(commandBuffer_, 3, 1, 0, 0);

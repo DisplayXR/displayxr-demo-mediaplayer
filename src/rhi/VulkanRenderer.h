@@ -48,6 +48,11 @@ public:
 
     // Copy an RGBA8 buffer into an external (e.g. HUD swapchain) VkImage, leaving it
     // in COLOR_ATTACHMENT_OPTIMAL (the layout the runtime expects at release).
+    //
+    // This is a vkCmdCopyBufferToImage — a raw byte store with no format conversion in
+    // either direction — so it is the matched transfer for ENCODED bytes into an _SRGB
+    // image (#78): the CPU raster hands over display-referred RGBA and the _SRGB format
+    // is simply the honest declaration of what those bytes are. A blit would convert.
     bool UploadToSwapchainImage(VkImage image, const uint8_t* rgba, uint32_t width,
                                 uint32_t height);
 
@@ -120,6 +125,9 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex_ = 0;  // graphics family; needed for the #28 external->graphics acquire
     VkFormat format_ = VK_FORMAT_UNDEFINED;
+    // format_ is an _SRGB format, i.e. the attachment encodes on store (#78). Drives the
+    // shader's display-referred -> scene-linear step and ToTargetClear().
+    bool srgbTarget_ = false;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     std::vector<VkImage> images_;
@@ -182,6 +190,9 @@ private:
 
     bool CreatePipeline();
     uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
+    // Display-referred ClearColor -> the value to hand the attachment (decoded to
+    // scene-linear when the attachment encodes on store, verbatim otherwise).
+    VkClearColorValue ToTargetClear(const ClearColor& c) const;
     // Record plane (re)creation + a staged copy into `cmd` (already recording). The
     // staging buffer/memory is appended to `staging` for the caller to free post-submit.
     // `recreated` is set when the image view changed (so the descriptor needs rebinding).

@@ -107,6 +107,7 @@ private:
     bool parkPointerNextFrame_ = false;
     double lastFrameSeconds_ = -1.0;  // internal dt source when there is no platform backend
 
+    VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;  // offscreen staging allocation (#78)
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t hudWidth_ = 0;
@@ -119,6 +120,24 @@ private:
     VkFence fence_ = VK_NULL_HANDLE;
     std::vector<VkImageView> imageViews_;
     std::vector<VkFramebuffer> framebuffers_;
+
+    // --- Encoded-bytes staging for an _SRGB HUD swapchain (#78).
+    //
+    // ImGui is a display-referred renderer: its style colours and vertex colours are
+    // encoded, and its alpha blending (AA edges, panel fills, the auto-hide fade) is
+    // meant to happen in that encoded space — which is exactly what a UNORM attachment
+    // does. Drawing it straight into an _SRGB view would blend in linear and change
+    // every glyph edge. So when the HUD swapchain is _SRGB we render ImGui into an
+    // offscreen image of the SAME channel order in UNORM (pixel-identical to the old
+    // path), then vkCmdCopyImage it into the swapchain image: UNORM and _SRGB of the
+    // same layout are in one Vulkan format-compatibility class, so a COPY moves the
+    // bytes untouched — the matched transfer for encoded content. (A blit would
+    // convert and double-apply.) On the UNORM path these stay null and ImGui renders
+    // directly into the swapchain image, byte for byte as before.
+    VkImage stagingImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory_ = VK_NULL_HANDLE;
+    VkImageView stagingView_ = VK_NULL_HANDLE;
+    std::vector<VkImage> hudImages_;  // borrowed; copy destinations when staging is on
 };
 
 } // namespace mp

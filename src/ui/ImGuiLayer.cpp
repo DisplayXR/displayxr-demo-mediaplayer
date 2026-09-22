@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ui/ImGuiLayer.h"
 
+#include "ColorPolicy.h"  // IsSrgb8 / UnormCounterpart (#78)
 #include "Log.h"
 #include "ui/TransportUI.h"
 
@@ -56,6 +57,15 @@ LRESULT CALLBACK MouseCaptureWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 }
 #endif  // _WIN32 && MEDIAPLAYER_IMGUI_SDL
 
+uint32_t FindMemoryType(VkPhysicalDevice pd, uint32_t typeBits, VkMemoryPropertyFlags props) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props) return i;
+    }
+    return UINT32_MAX;
+}
+
 } // namespace
 
 ImGuiLayer::~ImGuiLayer() { Shutdown(); }
@@ -66,40 +76,113 @@ bool ImGuiLayer::CreateTargetObjects(VkFormat hudFormat, uint32_t hudWidth,
     DestroyTargetObjects();
     hudWidth_ = hudWidth;
     hudHeight_ = hudHeight;
+    hudImages_ = hudImages;
 
-    // --- Render pass over the HUD image: clear to transparent, leave it in
-    //     COLOR_ATTACHMENT_OPTIMAL (what the runtime expects at swapchain release).
+    // --- #78: an _SRGB HUD swapchain gets an intermediate. See the staging* members in
+    //     the header for why ImGui must keep blending in the encoded (UNORM) space.
+    const bool stage = color::IsSrgb8((int64_t)hudFormat);
+    const VkFormat drawFormat =
+        stage ? (VkFormat)color::UnormCounterpart((int64_t)hudFormat) : hudFormat;
+
+    // --- Render pass over the draw target: clear to transparent. Direct to the HUD image
+    //     it ends in COLOR_ATTACHMENT_OPTIMAL (what the runtime expects at swapchain
+    //     release); staged it ends in TRANSFER_SRC_OPTIMAL ready for the copy.
     VkAttachmentDescription color{};
-    color.format = hudFormat;
+    color.format = drawFormat;
     color.samples = VK_SAMPLE_COUNT_1_BIT;
     color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.finalLayout = stage ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                              : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub{};
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 1;
     sub.pColorAttachments = &ref;
-    VkSubpassDependency dep{};
-    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dep.dstSubpass = 0;
-    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.srcAccessMask = 0;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkSubpassDependency deps[2]{};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[0].srcAccessMask = 0;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    // Staged: make the colour writes available to the copy that follows the render pass.
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     rpci.attachmentCount = 1;
     rpci.pAttachments = &color;
     rpci.subpassCount = 1;
     rpci.pSubpasses = &sub;
-    rpci.dependencyCount = 1;
-    rpci.pDependencies = &dep;
+    rpci.dependencyCount = stage ? 2u : 1u;
+    rpci.pDependencies = deps;
     if (vkCreateRenderPass(device_, &rpci, nullptr, &renderPass_) != VK_SUCCESS) {
         LOG_ERROR("ImGuiLayer: vkCreateRenderPass failed");
         return false;
+    }
+
+    if (stage) {
+        // One offscreen draw target shared by every HUD image: RenderToHud blocks on its
+        // own fence before reusing it, so there is never a second frame in flight.
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = drawFormat;
+        ici.extent = {hudWidth_, hudHeight_, 1};
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(device_, &ici, nullptr, &stagingImage_) != VK_SUCCESS) {
+            LOG_ERROR("ImGuiLayer: staging vkCreateImage failed");
+            return false;
+        }
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(device_, stagingImage_, &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex =
+            FindMemoryType(physicalDevice_, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mai.memoryTypeIndex == UINT32_MAX ||
+            vkAllocateMemory(device_, &mai, nullptr, &stagingMemory_) != VK_SUCCESS) {
+            LOG_ERROR("ImGuiLayer: staging memory alloc failed");
+            return false;
+        }
+        vkBindImageMemory(device_, stagingImage_, stagingMemory_, 0);
+
+        VkImageViewCreateInfo iv{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        iv.image = stagingImage_;
+        iv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        iv.format = drawFormat;
+        iv.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(device_, &iv, nullptr, &stagingView_) != VK_SUCCESS) {
+            LOG_ERROR("ImGuiLayer: staging vkCreateImageView failed");
+            return false;
+        }
+        VkFramebufferCreateInfo fb{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fb.renderPass = renderPass_;
+        fb.attachmentCount = 1;
+        fb.pAttachments = &stagingView_;
+        fb.width = hudWidth_;
+        fb.height = hudHeight_;
+        fb.layers = 1;
+        framebuffers_.resize(1, VK_NULL_HANDLE);
+        if (vkCreateFramebuffer(device_, &fb, nullptr, &framebuffers_[0]) != VK_SUCCESS) {
+            LOG_ERROR("ImGuiLayer: staging vkCreateFramebuffer failed");
+            return false;
+        }
+        LOG_INFO("ImGuiLayer: HUD is sRGB (format %d) — drawing into a %d staging image and "
+                 "copying the encoded bytes across (#78)",
+                 (int)hudFormat, (int)drawFormat);
+        return true;
     }
 
     // --- Per-image views + framebuffers.
@@ -135,6 +218,10 @@ void ImGuiLayer::DestroyTargetObjects() {
     for (VkImageView iv : imageViews_) if (iv) vkDestroyImageView(device_, iv, nullptr);
     framebuffers_.clear();
     imageViews_.clear();
+    if (stagingView_) { vkDestroyImageView(device_, stagingView_, nullptr); stagingView_ = VK_NULL_HANDLE; }
+    if (stagingImage_) { vkDestroyImage(device_, stagingImage_, nullptr); stagingImage_ = VK_NULL_HANDLE; }
+    if (stagingMemory_) { vkFreeMemory(device_, stagingMemory_, nullptr); stagingMemory_ = VK_NULL_HANDLE; }
+    hudImages_.clear();
     if (renderPass_) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
 }
 
@@ -161,6 +248,7 @@ bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice 
                       const std::vector<VkImage>& hudImages) {
     if (hudImages.empty() || hudWidth == 0 || hudHeight == 0) return false;
     nativeWindow_ = nativeWindow;
+    physicalDevice_ = physicalDevice;
     device_ = device;
     queue_ = queue;
 
@@ -400,7 +488,11 @@ void ImGuiLayer::PushPointer(int action, float hudX, float hudY) {
 void ImGuiLayer::RenderToHud(uint32_t imageIndex) {
     ImGui::Render();
     ImDrawData* drawData = ImGui::GetDrawData();
-    if (imageIndex >= framebuffers_.size()) return;
+    // Staged (#78): one shared offscreen framebuffer; the HUD image is the copy target.
+    const bool stage = (stagingImage_ != VK_NULL_HANDLE);
+    const uint32_t fbIndex = stage ? 0u : imageIndex;
+    if (fbIndex >= framebuffers_.size()) return;
+    if (stage && imageIndex >= hudImages_.size()) return;
 
     vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
     vkResetFences(device_, 1, &fence_);
@@ -414,13 +506,47 @@ void ImGuiLayer::RenderToHud(uint32_t imageIndex) {
     clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}};  // transparent: only widgets show
     VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rp.renderPass = renderPass_;
-    rp.framebuffer = framebuffers_[imageIndex];
+    rp.framebuffer = framebuffers_[fbIndex];
     rp.renderArea.extent = {hudWidth_, hudHeight_};
     rp.clearValueCount = 1;
     rp.pClearValues = &clear;
     vkCmdBeginRenderPass(cmd_, &rp, VK_SUBPASS_CONTENTS_INLINE);
     ImGui_ImplVulkan_RenderDrawData(drawData, cmd_);
     vkCmdEndRenderPass(cmd_);
+
+    if (stage) {
+        // vkCmdCopyImage, never vkCmdBlitImage: UNORM -> _SRGB of the same channel order
+        // is one format-compatibility class, so this moves the encoded bytes verbatim.
+        // A blit would treat the source as linear and re-encode them (#78).
+        VkImage dst = hudImages_[imageIndex];
+        VkImageMemoryBarrier toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;  // fully overwritten below
+        toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDst.image = dst;
+        toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        toDst.srcAccessMask = 0;
+        toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {hudWidth_, hudHeight_, 1};
+        vkCmdCopyImage(cmd_, stagingImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        // Leave it in COLOR_ATTACHMENT_OPTIMAL for the runtime at release time.
+        VkImageMemoryBarrier toColor = toDst;
+        toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toColor.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &toColor);
+    }
+
     vkEndCommandBuffer(cmd_);
 
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
