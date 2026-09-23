@@ -96,14 +96,27 @@ the `DebInstall` CI matrix apt-installs the result into clean 22.04/24.04/26.04
 containers (`scripts/verify_deb_install_linux.sh`). Never let a distro FFmpeg or
 SDL3 reach the `.deb` — it narrows the package to one Ubuntu release.
 
-**Status: BUILD-GREEN, window binding wired.** `XR_DXR_xlib_window_binding`
-(runtime Phase 3a) is fully wired: `Window.cpp` extracts the (Display*, XID)
-pair from SDL's X11 properties (bundled as `Window::X11Handles` behind the
-one-void* handle plumbing) and prefers SDL's x11 driver (XWayland on Wayland
-desktops); `XrSession.cpp` chains `XrXlibWindowBindingCreateInfoDXR` when the
-runtime advertises the extension. On-screen validation is gated on the
-runtime's Linux Phase 1b/3b hardware bring-up. Recipe: the runtime repo's
-`docs/guides/linux-demo-port.md`.
+**Window platform: X11 or native Wayland, one binary.** SDL still owns the
+window on Linux, because ImGui, drag-and-drop and live resize all hang off it.
+displayxr-common's `displayxr::linux_window` makes the *decision*: its
+capability probe is the one rule every DisplayXR app uses, and the helper is
+built on Linux only.
+
+- `--platform=x11|wayland|auto` selects the platform. The default `auto` picks
+  native Wayland when the compositor is ready and X11 otherwise. It never reads
+  session env vars.
+- The chosen platform becomes SDL's video driver hint. `Window.cpp` then
+  verifies the driver SDL actually opened and extracts the matching handles
+  into `Window::LinuxHandles`.
+- `XrSession.cpp` chains the matching binding. On X11 that is
+  `XrXlibWindowBindingCreateInfoDXR`.
+- On native Wayland it chains `XrWaylandSurfaceBindingCreateInfoDXR` +
+  `XrWaylandSurfaceGeometryDXR` (SDL's pixel size), and republishes resizes
+  every frame through `xrSetWaylandSurfaceGeometryDXR`
+  (`XrSession::DeclareSurfaceSize`).
+- On Wayland the window is created `SDL_WINDOW_VULKAN`, SDL's
+  external-Vulkan-WSI case, and shown **before** the session. The runtime's WSI
+  needs a surface that already has its role and an acked configure.
 
 ## Run / test
 

@@ -185,6 +185,7 @@ bool App::Initialize(const char* mediaPath) {
         LOG_INFO("Placed window on 3D panel at (%d, %d)%s", x, y,
                  (panelW > 0) ? " (centered)" : "");
     };
+    xr_.SetPixelSizeSource([this](uint32_t& w, uint32_t& h) { window_.PixelSize(w, h); });
     if (!xr_.Initialize(window_.NativeHandle(), placeOnPanel)) {
         LOG_ERROR("OpenXR initialization failed");
         return false;
@@ -460,6 +461,7 @@ void App::RenderOneFrame() {
         // and submit match what the runtime samples.
         uint32_t canvasW = 0, canvasH = 0;
         window_.PixelSize(canvasW, canvasH);
+        xr_.DeclareSurfaceSize(canvasW, canvasH);   // native Wayland: the runtime follows the window
         xr_.ComputeViewRects(canvasW, canvasH, rects);
 
         // Map the 2-view source onto the N display views by eye-X vs the views' center.

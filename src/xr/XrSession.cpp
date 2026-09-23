@@ -31,6 +31,9 @@ const char* SessionStateName(XrSessionState s) {
 XrSession::~XrSession() { Shutdown(); }
 
 bool XrSession::Initialize(void* nativeWindowHandle, const PlaceWindowFn& placeWindow) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (auto* h = static_cast<const Window::LinuxHandles*>(nativeWindowHandle)) linuxWayland_ = h->wayland;
+#endif
     if (!InitInstanceAndSystem()) return false;
     // Let the app move its window onto the 3D panel BEFORE the session binding
     // captures the native handle (the DP's phase tracking starts from the settled
@@ -62,7 +65,10 @@ bool XrSession::InitInstanceAndSystem() {
 #elif defined(_WIN32)
     const char* kWindowBindingExt = XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME;
 #elif defined(__linux__) && !defined(__ANDROID__)
-    const char* kWindowBindingExt = XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME;
+    // The binding follows the window's LIVE platform (Window::Create verified
+    // SDL's driver): native Wayland or X11.
+    const char* kWindowBindingExt = linuxWayland_ ? XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME
+                                                  : XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME;
 #else
     const char* kWindowBindingExt = nullptr;
 #endif
@@ -496,15 +502,38 @@ bool XrSession::CreateSessionWithWindowBinding(void* nativeWindowHandle) {
                  nativeWindowHandle, transparentBg_ ? "ON" : "off");
     }
 #elif defined(__linux__) && !defined(__ANDROID__)
+    auto* lh = static_cast<const Window::LinuxHandles*>(nativeWindowHandle);
     XrXlibWindowBindingCreateInfoDXR windowBinding = {};
     windowBinding.type = (XrStructureType)XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR;
-    auto* x11 = static_cast<const Window::X11Handles*>(nativeWindowHandle);
-    if (hasWindowBindingExt_ && x11 && x11->display && x11->window) {
-        windowBinding.xDisplay = static_cast<Display*>(x11->display);
-        windowBinding.window = x11->window;
+    XrWaylandSurfaceBindingCreateInfoDXR wlBinding = {};
+    wlBinding.type = XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR;
+    XrWaylandSurfaceGeometryDXR wlGeometry = {};
+    wlGeometry.type = XR_TYPE_WAYLAND_SURFACE_GEOMETRY_DXR;
+    if (hasWindowBindingExt_ && lh && lh->wayland && lh->display && lh->surface) {
+        // Native Wayland: the binding PLUS the surface's size (spec 2) — a
+        // wl_surface has none of its own, and without it the runtime would
+        // size its swapchain to the panel. The size is the SDL window's pixel
+        // size, the buffer SDL maps onto the logical window; later changes go
+        // through DeclareSurfaceSize().
+        uint32_t pw = 0, ph = 0;
+        if (pixelSizeFn_) pixelSizeFn_(pw, ph);
+        wlGeometry.width = pw;
+        wlGeometry.height = ph;
+        wlGeometry.refreshMilliHertz = 0; // unknown: the runtime keeps its default
+        wlGeometry.next = &vkBinding;
+        wlBinding.wlDisplay = static_cast<struct wl_display*>(lh->display);
+        wlBinding.wlSurface = static_cast<struct wl_surface*>(lh->surface);
+        wlBinding.next = &wlGeometry;
+        wlDeclaredW_ = pw;
+        wlDeclaredH_ = ph;
+        LOG_INFO("Using XR_DXR_wayland_surface_binding (wl_display=%p, wl_surface=%p, %ux%u px)",
+                 lh->display, lh->surface, pw, ph);
+    } else if (hasWindowBindingExt_ && lh && !lh->wayland && lh->display && lh->window) {
+        windowBinding.xDisplay = static_cast<Display*>(lh->display);
+        windowBinding.window = lh->window;
         vkBinding.next = &windowBinding;
         LOG_INFO("Using XR_DXR_xlib_window_binding (Display=%p, Window=0x%lx)",
-                 x11->display, x11->window);
+                 lh->display, lh->window);
     }
 #else
     (void)nativeWindowHandle;
@@ -512,10 +541,38 @@ bool XrSession::CreateSessionWithWindowBinding(void* nativeWindowHandle) {
 
     XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO};
     sci.next = &vkBinding;
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (wlBinding.wlSurface != nullptr) sci.next = &wlBinding;   // wlBinding -> geometry -> vkBinding
+#endif
     sci.systemId = systemId_;
     XR_CHECK(xrCreateSession(instance_, &sci, &session_));
     LOG_INFO("OpenXR session created");
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (wlBinding.wlSurface != nullptr) {
+        // Resolved, not linked: a spec-1 runtime has no such function, and then
+        // the size declared at session create simply stays.
+        PFN_xrVoidFunction fn = nullptr;
+        if (XR_SUCCEEDED(xrGetInstanceProcAddr(instance_, "xrSetWaylandSurfaceGeometryDXR", &fn)) && fn) {
+            pfnSetWlGeometry_ = reinterpret_cast<PFN_xrSetWaylandSurfaceGeometryDXR>(fn);
+        } else {
+            LOG_WARN("Runtime has no xrSetWaylandSurfaceGeometryDXR — window resizes will not be followed");
+        }
+    }
+#endif
     return true;
+}
+
+void XrSession::DeclareSurfaceSize(uint32_t width, uint32_t height) {
+    if (pfnSetWlGeometry_ == nullptr || session_ == XR_NULL_HANDLE || width == 0 || height == 0) return;
+    if (width == wlDeclaredW_ && height == wlDeclaredH_) return;
+    const XrResult r = pfnSetWlGeometry_(session_, width, height, 0);
+    if (XR_SUCCEEDED(r)) {
+        wlDeclaredW_ = width;
+        wlDeclaredH_ = height;
+        LOG_INFO("Wayland surface geometry declared: %ux%u px", width, height);
+    } else {
+        LOG_WARN("xrSetWaylandSurfaceGeometryDXR(%ux%u) failed: %d", width, height, (int)r);
+    }
 }
 
 void XrSession::EnumerateRenderingModes() {
