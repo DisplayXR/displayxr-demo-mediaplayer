@@ -190,7 +190,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     FetchContent_Declare(displayxr_common
         GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
         # v2.20.0 ships displayxr::linux_window.
-        GIT_TAG v2.20.0
+        # v2.21.0 adds the native-Wayland drag-lattice follow-ups: a table when a
+        # drag reaches the 3D panel, probing off the render thread, a per-drag
+        # summary (displayxr-common#59, runtime#1697).
+        GIT_TAG v2.21.0
         GIT_SHALLOW TRUE)
 else()
     FetchContent_Declare(displayxr_common
