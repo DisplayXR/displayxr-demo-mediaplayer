@@ -178,13 +178,29 @@ FetchContent_MakeAvailable(nlohmann_json)
 #     demo uses. Sources only: common's own CMake carries desktop app scaffolding
 #     this player does not use, so it is populated, not added. Keep this pin equal
 #     to android/src/main/cpp/CMakeLists.txt's.
-FetchContent_Declare(displayxr_common
-    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.15.0
-    GIT_SHALLOW TRUE
-    # No CMakeLists.txt there: MakeAvailable only populates, never add_subdirectory
-    # (the non-deprecated form of a bare FetchContent_Populate).
-    SOURCE_SUBDIR _headers_only_no_cmake)
+#
+#     Desktop Linux is the exception: it also needs displayxr::linux_window's
+#     compiled capability probe (the ONE rule that picks X11 or native Wayland —
+#     here it chooses SDL's video driver), so there common IS added, at the pin
+#     that ships it. Windows / macOS keep the headers-only v2.15.0 populate.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/displayxr-openxr" CACHE PATH
+        "DisplayXR OpenXR extension headers for displayxr-common")
+    FetchContent_Declare(displayxr_common
+        GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+        # v2.20.0 ships displayxr::linux_window.
+        GIT_TAG v2.20.0
+        GIT_SHALLOW TRUE)
+else()
+    FetchContent_Declare(displayxr_common
+        GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+        GIT_TAG v2.15.0
+        GIT_SHALLOW TRUE
+        # No CMakeLists.txt there: MakeAvailable only populates, never add_subdirectory
+        # (the non-deprecated form of a bare FetchContent_Populate).
+        SOURCE_SUBDIR _headers_only_no_cmake)
+endif()
 FetchContent_MakeAvailable(displayxr_common)
 
 set(MP_IMGUI_DIR "${imgui_SOURCE_DIR}")
@@ -274,6 +290,13 @@ target_link_libraries(${MP_TARGET} PRIVATE
     nlohmann_json::nlohmann_json
     ${MP_OPENXR_LOADER}
 )
+# Desktop Linux: the platform probe (X11 or native Wayland) — see the fetch above.
+if(TARGET displayxr::linux_window)
+    target_link_libraries(${MP_TARGET} PRIVATE displayxr::linux_window)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "displayxr::linux_window is not available — install libx11-dev "
+                        "(and libwayland-dev libxkbcommon-dev libdbus-1-dev)")
+endif()
 
 # Windows: SHGetKnownFolderPath (shell32) + CoTaskMemFree (ole32) for the 'I'-key
 # atlas-capture output path under the user's Pictures folder.

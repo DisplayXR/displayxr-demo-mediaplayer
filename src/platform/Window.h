@@ -5,9 +5,10 @@
 // platform-native view/window:
 //   macOS  -> NSView* (CAMetalLayer-backed) via SDL_Metal_CreateView
 //   Windows-> HWND via SDL window properties
-//   Linux  -> &X11Handles (Display* + XID pair) via SDL X11 window properties;
-//             XR_DXR_xlib_window_binding needs both, unlike the single-pointer
-//             handles of the other platforms
+//   Linux  -> &LinuxHandles via SDL window properties: X11 (Display* + XID,
+//             XR_DXR_xlib_window_binding) or native Wayland (wl_display* +
+//             wl_surface*, XR_DXR_wayland_surface_binding), whichever the
+//             capability probe chose and SDL actually opened
 // One SDL codebase; only the handle extraction is per-platform.
 #pragma once
 
@@ -23,14 +24,20 @@ namespace mp {
 class Window {
 public:
 #if defined(__linux__) && !defined(__ANDROID__)
-    // What NativeHandle() points at on desktop Linux. XR_DXR_xlib_window_binding
-    // takes the pair (Display*, Window XID); SDL exposes them as two window
-    // properties, so they're bundled here to fit the one-void* handle plumbing.
-    // Both are borrowed from SDL — valid until Destroy().
-    struct X11Handles {
-        void* display = nullptr;      // Display* (Xlib connection SDL opened)
+    // What NativeHandle() points at on desktop Linux: X11 (Display*, Window
+    // XID) for XR_DXR_xlib_window_binding, or native Wayland (wl_display*,
+    // wl_surface*) for XR_DXR_wayland_surface_binding — whichever SDL's video
+    // driver actually is. Bundled to fit the one-void* handle plumbing; all
+    // borrowed from SDL — valid until Destroy().
+    struct LinuxHandles {
+        bool wayland = false;         // true: display/surface are wl_*; false: X11
+        void* display = nullptr;      // Display* or wl_display*
         unsigned long window = 0;     // X11 Window (XID)
+        void* surface = nullptr;      // wl_surface*
     };
+    //! --platform=x11|wayland|auto from the command line (default auto). Read
+    //! by Create(); 0 = auto, 1 = x11, 2 = wayland.
+    static void SetLinuxPlatformRequest(int request);
 #endif
 
     Window() = default;
@@ -123,7 +130,7 @@ private:
     void* metalView_ = nullptr;   // SDL_MetalView (macOS only); owned, destroyed on Destroy
     void* nativeHandle_ = nullptr;
 #if defined(__linux__) && !defined(__ANDROID__)
-    X11Handles x11_;              // nativeHandle_ points here when X11 props resolve
+    LinuxHandles linux_;          // nativeHandle_ points here when the handles resolve
 #endif
     bool cycleModeRequested_ = false;
     bool toggleHudRequested_ = false;

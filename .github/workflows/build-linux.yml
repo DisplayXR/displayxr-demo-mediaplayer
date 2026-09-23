@@ -126,7 +126,7 @@ jobs:
             libavformat-dev libavcodec-dev libavutil-dev \
             libswscale-dev libswresample-dev \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
-            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libdbus-1-dev libegl-dev libgl-dev libasound2-dev \
             libxxf86vm-dev libxcb-glx0-dev
 
       - name: Build (build-green; app is not run — no display on CI)
@@ -191,7 +191,7 @@ jobs:
             libvulkan-dev glslang-tools \
             nasm libva-dev zlib1g-dev \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxfixes-dev \
-            libwayland-dev wayland-protocols libxkbcommon-dev libegl-dev libgl-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libdbus-1-dev libegl-dev libgl-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev libdbus-1-dev libudev-dev \
             libxxf86vm-dev libxcb-glx0-dev \
             dpkg-dev fakeroot

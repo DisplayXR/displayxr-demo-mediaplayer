@@ -21,6 +21,7 @@
 #  include <openxr/XR_DXR_win32_window_binding.h>
 #else
 #  include <openxr/XR_DXR_xlib_window_binding.h>
+#  include <openxr/XR_DXR_wayland_surface_binding.h>
 // The xlib binding header (spec v1) deliberately does NOT carry the
 // window-space layer block its cocoa/win32 siblings share — but EndFrame still
 // needs the type declared. Mirror the wire-shared #ifndef-guarded block here

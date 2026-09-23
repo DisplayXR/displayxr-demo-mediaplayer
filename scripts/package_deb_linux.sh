@@ -59,9 +59,14 @@ STABLE_SONAMES=(
   libvulkan.so.1
   libva.so.2 libva-drm.so.2      # FFmpeg VAAPI hwaccel (libva2 / libva-drm2)
   libz.so.1                      # FFmpeg zlib (zlib1g)
+  # displayxr-common's displayxr::linux_window (the X11-or-Wayland probe):
+  libX11.so.6 libXext.so.6 libXrandr.so.2   # libx11-6, libxext6, libxrandr2
+  libwayland-client.so.0         # libwayland-client0
+  libxkbcommon.so.0              # libxkbcommon0
+  libdbus-1.so.3                 # libdbus-1-3
 )
 # Loaded at RUNTIME by the static SDL3 (dlopen, so invisible to dpkg-shlibdeps).
-# X11 is required: the player binds its window via XR_DXR_xlib_window_binding.
+# The window is X11 or native Wayland (chosen by capability at startup).
 EXTRA_DEPENDS="libx11-6, libxext6"
 EXTRA_RECOMMENDS="libpulse0, libxcursor1, libxi6, libxrandr2, libxfixes3"
 # VAAPI drivers are hardware-specific; without one FFmpeg falls back to software.
