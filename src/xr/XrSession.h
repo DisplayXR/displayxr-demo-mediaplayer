@@ -313,6 +313,7 @@ private:
 
     // Capabilities discovered at instance creation.
     bool hasWindowBindingExt_ = false;
+#if defined(__linux__) && !defined(__ANDROID__)
     //! Linux: the window is a native-Wayland surface (else X11). Set from the
     //! window's handles before the instance is created (it decides which
     //! binding extension to enable).
@@ -320,6 +321,7 @@ private:
     //! xrSetWaylandSurfaceGeometryDXR (spec 2), and the size last declared.
     PFN_xrSetWaylandSurfaceGeometryDXR pfnSetWlGeometry_ = nullptr;
     uint32_t wlDeclaredW_ = 0, wlDeclaredH_ = 0;
+#endif
     std::function<void(uint32_t&, uint32_t&)> pixelSizeFn_;
     bool hasDisplayInfoExt_ = false;
     bool transparentBg_ = false;   // MEDIAPLAYER_TRANSPARENT — letterbox composes through

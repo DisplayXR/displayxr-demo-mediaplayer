@@ -563,6 +563,10 @@ bool XrSession::CreateSessionWithWindowBinding(void* nativeWindowHandle) {
 }
 
 void XrSession::DeclareSurfaceSize(uint32_t width, uint32_t height) {
+#if !(defined(__linux__) && !defined(__ANDROID__))
+    (void)width;
+    (void)height;
+#else
     if (pfnSetWlGeometry_ == nullptr || session_ == XR_NULL_HANDLE || width == 0 || height == 0) return;
     if (width == wlDeclaredW_ && height == wlDeclaredH_) return;
     const XrResult r = pfnSetWlGeometry_(session_, width, height, 0);
@@ -573,6 +577,7 @@ void XrSession::DeclareSurfaceSize(uint32_t width, uint32_t height) {
     } else {
         LOG_WARN("xrSetWaylandSurfaceGeometryDXR(%ux%u) failed: %d", width, height, (int)r);
     }
+#endif
 }
 
 void XrSession::EnumerateRenderingModes() {
