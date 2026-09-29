@@ -417,6 +417,14 @@ if(MP_BUILD_TESTS)
     target_include_directories(stereo_detect_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME stereo_detect COMMAND stereo_detect_test)
 
+    # Live camera source (#90): denylist / selector / format choice. Pure, no SDL.
+    add_executable(camera_select_test
+        tests/camera_select_test.cpp
+        src/media/CameraSelect.cpp
+        src/Log.cpp)
+    target_include_directories(camera_select_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME camera_select COMMAND camera_select_test)
+
     add_executable(mpo_parse_test
         tests/mpo_parse_test.cpp
         src/media/MpoLoader.cpp
@@ -457,5 +465,5 @@ if(MP_BUILD_TESTS)
              ${CMAKE_CURRENT_SOURCE_DIR}/assets/media/detect)
 
     message(STATUS
-        "Tests enabled: lif_roundtrip_test stereo_detect_test mpo_parse_test stereo_sweep")
+        "Tests enabled: lif_roundtrip_test stereo_detect_test mpo_parse_test camera_select_test stereo_sweep")
 endif()
