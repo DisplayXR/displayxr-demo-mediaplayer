@@ -212,6 +212,25 @@ bool App::Initialize(const char* mediaPath) {
     // supported asset (sorted), and LoadMedia builds the prev/next list from it.
     ReadStereoEnv();   // must precede the first LoadMedia below
 
+    // Live camera (#90). The command line (main.cpp) wins over the env vars. The picker
+    // and 'C' key are desktop-only: Android's TransportCaps leave caps.camera false.
+    uiState_.caps.camera = true;
+    if (!launch_.camera) {
+        if (const char* e = std::getenv("MEDIAPLAYER_CAMERA")) {
+            launch_.camera = true;          // "auto" / "" = default pick; "0" = index 0
+            launch_.cameraSelector = e;
+        }
+    }
+    if (launch_.cameraFps <= 0) {
+        if (const char* e = std::getenv("MEDIAPLAYER_CAMERA_FPS")) launch_.cameraFps = std::atoi(e);
+    }
+    if (launch_.camera) {
+        if (mediaPath && *mediaPath)
+            LOG_WARN("--camera given: ignoring the media path '%s'", mediaPath);
+        mediaPath = nullptr;
+        if (!LoadLive(launch_.cameraSelector)) LOG_WARN("Live camera did not start");
+    }
+
     if (mediaPath && *mediaPath) {
         namespace fs = std::filesystem;
         std::error_code ec;
@@ -337,7 +356,8 @@ int App::Run() {
         }
         if (window_.TakeCaptureRequest()) {                           // 'I' — atlas snapshot
             if (xr_.HasAtlasCapture()) {
-                const std::string stem = currentMediaPath_.empty()
+                const std::string stem = isLive_ ? std::string("live")
+                    : currentMediaPath_.empty()
                     ? std::string("capture")
                     : std::filesystem::path(currentMediaPath_).stem().string();
                 const std::string prefix = MakeCaptureAtlasPrefix(
@@ -361,6 +381,20 @@ int App::Run() {
         if (window_.TakeToggleSlideshowRequest()) { ToggleSlideshow(); activity = true; } // 'S'
         if (window_.TakeToggleMuteRequest()) { ToggleMute(); activity = true; }            // 'M'
         if (window_.TakeCycleLayoutRequest()) { CycleLayoutOverride(); activity = true; }  // 'L'
+        if (window_.TakeToggleCameraRequest()) { ToggleLive(); activity = true; }          // 'C'
+        // Camera hot-plug events (only arrive once the camera subsystem is up).
+        if (std::vector<std::pair<uint32_t, uint32_t>> camEv; window_.TakeCameraEvents(camEv)) {
+            for (const auto& ev : camEv) {
+                if (ev.first == SDL_EVENT_CAMERA_DEVICE_REMOVED && isLive_ &&
+                    ev.second == camera_.DeviceId()) {
+                    camera_.NotifyRemoved();
+                } else if (ev.first == SDL_EVENT_CAMERA_DEVICE_ADDED &&
+                           uiState_.cameraComboWasOpen) {
+                    RefreshCameraList(false);
+                }
+            }
+            activity = true;
+        }
         if (window_.TakeMouseLeft()) {
             // Cursor left the window — drop the UI now (push idle past the hide threshold).
             lastActivity_ =
@@ -395,6 +429,7 @@ int App::Run() {
             ReloadMedia(openAfterPath_);
         }
 
+        PollLive();
         if (xr_.IsRunning()) RenderOneFrame();
     }
 
@@ -430,8 +465,13 @@ void App::RenderOneFrame() {
 
     // Pull the latest decoded video frame (if any) and upload its YUV planes — the GPU
     // does the colour convert + downscale, so no swscale ran on the decode thread.
-    if (isVideo_) {
-        if (const FrameRing::Frame* vf = video_.Ring().AcquireLatest()) {
+    // The live camera (#90) publishes into a FrameRing of its own, so it rides the same
+    // upload path. Freeze = stop acquiring: the last uploaded texture keeps drawing.
+    FrameRing* ring = isLive_ ? (livePaused_ ? nullptr : &camera_.Ring())
+                              : (isVideo_ ? &video_.Ring() : nullptr);
+    if (ring) {
+        if (const FrameRing::Frame* vf = ring->AcquireLatest()) {
+            if (isLive_) OnLiveFrame(*vf);
             bool bound = false;
 #if defined(_WIN32)
             // Zero-copy (#28): a GPU frame carries a shared RGBA texture handle (the producer
@@ -664,12 +704,21 @@ void App::RenderOneFrame() {
                 char stereo[64];
                 std::snprintf(stereo, sizeof(stereo), "conv %+.3f  eyes %s%s", convergence_,
                               swapEyes_ ? "swapped" : "normal",
-                              (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "");
+                              (isLive_ && livePaused_) ? "  [FROZEN]"
+                              : (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "");
                 // The layout label carries its provenance ("— detected" / "— from
                 // filename" / ...), so the buffer needs headroom over the old 320.
                 const std::string layoutLabel = LayoutLabel();
                 char text[512];
-                if (isVideo_) {
+                if (isLive_) {
+                    const CameraSource::Stats cs = camera_.GetStats();
+                    std::snprintf(text, sizeof(text),
+                                  "%.0f FPS   %s\nLIVE %s %dx%d  %s  cam %.0f fps  age %.0f ms\n"
+                                  "win %ux%u  tile %ux%u\n%s",
+                                  fps_, xr_.ActiveModeName(), camera_.DeviceName().c_str(),
+                                  mediaW_, mediaH_, layoutLabel.c_str(), cs.deliveredFps,
+                                  liveAgeMs_, cw, ch, tileW, tileH, stereo);
+                } else if (isVideo_) {
                     std::snprintf(text, sizeof(text),
                                   "%.0f FPS   %s\nsrc %dx%d  %s  %s/%s\nwin %ux%u  tile %ux%u\n%s",
                                   fps_, xr_.ActiveModeName(), mediaW_, mediaH_,
@@ -727,6 +776,21 @@ void App::BuildTransportUI() {
     uiState_.loop = video_.Loop();
     uiState_.openFilePending = openFilePending_;
 
+    // Live camera (#90). Slideshow has nothing to advance through while live, so its
+    // icon is hidden; the bottom transport hides itself because isVideo is false.
+    uiState_.caps.slideshow = !isLive_;
+    uiState_.isLive = isLive_;
+    uiState_.livePaused = livePaused_;
+    uiState_.liveDevice = isLive_ ? camera_.DeviceName() : std::string();
+    uiState_.liveStatus = isLive_ ? LiveStatusText() : std::string();
+    uiState_.cameraFps = isLive_ ? camera_.GetStats().deliveredFps : 0.0f;
+    uiState_.panelFps = fps_;
+    uiState_.frameAgeMs = (float)liveAgeMs_;
+    uiState_.cameraCurrent = -1;
+    for (size_t i = 0; isLive_ && i < cameraDevs_.size(); ++i)
+        if (cameraDevs_[i].id == camera_.DeviceId()) uiState_.cameraCurrent = (int)i;
+    if (isLive_) uiState_.mediaFilename.clear();
+
     ui::TransportActions actions;
     actions.Open = [this] { RequestOpenFile(); };
     actions.NextMode = [this] { xr_.RequestNextMode(); };
@@ -745,6 +809,15 @@ void App::BuildTransportUI() {
         audio_.Seek(sec);
         if (!video_.Paused()) audio_.SetPaused(false);
     };
+
+    actions.RefreshCameras = [this](bool rescan) { RefreshCameraList(rescan); };
+    actions.OpenCamera = [this](int row) {
+        if (row >= 0 && row < (int)cameraDevs_.size()) {
+            const CameraDevice dev = cameraDevs_[row];  // copy: a refresh may reallocate
+            LoadLiveDevice(dev);
+        }
+    };
+    actions.StopCamera = [this] { StopLive(/*showIdleIfEmpty=*/true); };
 
     ui::BuildTransportUI(uiState_, actions);
 }
@@ -769,6 +842,7 @@ void App::UpdateFps() {
 }
 
 void App::Shutdown() {
+    camera_.Stop();       // join the camera worker + SDL_CloseCamera before SDL_Quit
     video_.Stop();        // join the decode thread (reads the audio clock) before audio,
     audio_.Stop();        // and before tearing down the GPU
     imgui_.Shutdown();    // before xr_ destroys the Vulkan device ImGui borrows
@@ -1063,6 +1137,10 @@ void App::CycleLayoutOverride() {
 }
 
 void App::ReloadMedia(const std::string& path) {
+    // Every file path (Open, drop, open_file, navigation) lands here, so this is the one
+    // place a file replaces the live camera.
+    const bool wasLive = isLive_;
+    if (isLive_) StopLive(/*showIdleIfEmpty=*/false);
     video_.Stop();   // joins the decode thread (which reads the audio clock) FIRST,
     audio_.Stop();   // then tear down audio so the clock callback can't outlive it.
 #if defined(_WIN32)
@@ -1076,6 +1154,224 @@ void App::ReloadMedia(const std::string& path) {
     slideshowImageElapsed_ = 0.0;
     if (!LoadMedia(path)) {
         LOG_WARN("Open: keeping previous view (failed to open '%s')", path.c_str());
+        if (wasLive) {
+            // The "previous view" was a camera that is now closed: a frozen frame with no
+            // source behind it would read as a hung feed. Fall back to the idle screen.
+            hasMedia_ = false;
+            mediaW_ = mediaH_ = 0;
+            LoadIdleLogo();
+        }
+    }
+}
+
+// --- Live camera (#90) -----------------------------------------------------------------
+
+void App::RefreshCameraList(bool rescan) {
+    cameraDevs_.clear();
+    uiState_.cameraNames.clear();
+    for (CameraDevice& d : CameraSource::Enumerate(rescan)) {
+        if (d.denied) continue;  // the picker never even shows a tracking camera
+        uiState_.cameraNames.push_back(d.name);
+        cameraDevs_.push_back(std::move(d));
+    }
+}
+
+bool App::LoadLive(const std::string& selector) {
+    RefreshCameraList(false);
+    const int idx = SelectCamera(cameraDevs_, selector);
+    if (idx < 0) {
+        LOG_WARN("Live: no camera matches '%s' (%zu selectable)",
+                 selector.empty() ? "auto" : selector.c_str(), cameraDevs_.size());
+        ShowToast("No camera found");
+        return false;
+    }
+    const CameraDevice dev = cameraDevs_[(size_t)idx];
+    return LoadLiveDevice(dev);
+}
+
+bool App::LoadLiveDevice(const CameraDevice& dev) {
+    // Open FIRST (it validates synchronously and returns at once — the device itself
+    // opens on the worker): a refused device leaves the current media playing.
+    if (!camera_.Open(dev, 0, 0, launch_.cameraFps)) {
+        ShowToast("Camera: " + camera_.LastError());
+        if (isLive_) StopLive(/*showIdleIfEmpty=*/true);  // the old camera was closed by Open
+        return false;
+    }
+    video_.Stop();   // joins the decode thread before audio (see ReloadMedia)
+    audio_.Stop();
+#if defined(_WIN32)
+    renderer_.ClearSharedImports();
+#endif
+    isLive_ = true;
+    livePaused_ = false;
+    isVideo_ = false;
+    hasMedia_ = true;
+    // No folder behind a camera: ←/→ and the slideshow have nothing to step through.
+    currentMediaPath_.clear();
+    folderFiles_.clear();
+    folderIndex_ = 0;
+    playlistFromDrop_ = false;
+    if (uiState_.slideshowActive) SetSlideshow(false);
+    uiState_.scrubValue = 0.0f;
+    uiState_.scrubActive = false;
+    uiState_.scrubTarget = -1.0f;
+    slideshowImageElapsed_ = 0.0;
+    // Raw footage: no baked reconvergence; the user's -/= convergence still applies.
+    mediaConvergence_ = 0.0f;
+    mediaAutoConvAvailable_ = false;
+    mediaEyeSwap_ = false;
+    // Unknown until the first frame — OnLiveFrame settles the layout (and leaves the idle
+    // screen) then, so the previous picture stays up for the ~0.5 s the device takes.
+    mediaW_ = mediaH_ = 0;
+    liveAgeMs_ = 0.0;
+    liveSlowSince_ = -1.0;
+    liveSlowWarned_ = false;
+    liveStateSeen_ = CameraSource::State::Opening;
+    liveSelector_ = dev.name;
+    LOG_INFO("Live: opening '%s'", dev.name.c_str());
+    ShowToast("Live: " + dev.name);
+    return true;
+}
+
+void App::StopLive(bool showIdleIfEmpty) {
+    camera_.Stop();
+    isLive_ = false;
+    livePaused_ = false;
+    liveStateSeen_ = CameraSource::State::Closed;
+    liveAgeMs_ = 0.0;
+    if (showIdleIfEmpty) {
+        hasMedia_ = false;
+        isVideo_ = false;
+        mediaW_ = mediaH_ = 0;
+        LoadIdleLogo();
+    }
+}
+
+void App::ToggleLive() {
+    if (isLive_) {
+        StopLive(/*showIdleIfEmpty=*/true);
+        ShowToast("Live off");
+        return;
+    }
+    LoadLive(liveSelector_.empty() ? launch_.cameraSelector : liveSelector_);
+}
+
+std::string App::LiveStatusText() const {
+    if (!isLive_) return std::string();
+    switch (camera_.GetState()) {
+        case CameraSource::State::Opening: return "OPENING";
+        case CameraSource::State::Streaming: return livePaused_ ? "FROZEN" : "LIVE";
+        case CameraSource::State::Stalled: return "NO SIGNAL";
+        case CameraSource::State::Lost: return "NO CAMERA";
+        case CameraSource::State::Denied: return "BLOCKED";
+        case CameraSource::State::Failed: return "ERROR";
+        case CameraSource::State::Closed: break;
+    }
+    return "OFF";
+}
+
+void App::OnLiveFrame(const FrameRing::Frame& f) {
+    liveAgeMs_ = (CameraSource::NowSeconds() - camera_.GetStats().lastPublishSec) * 1000.0;
+    if (f.width == mediaW_ && f.height == mediaH_) return;
+    // First frame, or a mid-stream size change (a capture box switching inputs): settle
+    // the layout from the frame aspect. No content detector and no metadata for a live
+    // feed — 3840x2160 (the Eyes) is 16:9, which ChooseFullOrHalf reads as SBS-half.
+    const bool firstFrame = (mediaW_ == 0);
+    if (firstFrame) ClearIdleLogo();
+    mediaW_ = f.width;
+    mediaH_ = f.height;
+    bool ambiguous = false;
+    MediaInfo li;
+    li.kind = MediaKind::Video;
+    li.signal = StereoSignal::Aspect;
+    li.confidence = 0.5f;
+    li.layout = StereoDetect::ChooseFullOrHalf((float)mediaW_ / (float)mediaH_, ambiguous);
+    autoInfo_ = li;  // ApplyLayout skips autoInfo_ for Manual; L -> auto must land here
+    if (layoutForced_) {  // MEDIAPLAYER_LAYOUT
+        li.layout = layoutForcedValue_;
+        li.signal = StereoSignal::Manual;
+        li.confidence = 1.0f;
+    }
+    const bool keepPin = layoutPinned_ && !firstFrame;  // a size change keeps a user pin
+    const StereoLayout pinned = layoutPinnedValue_;
+    ApplyLayout(li);  // clears layoutPinned_
+    if (layoutForced_) {
+        layoutPinned_ = true;
+        layoutPinnedValue_ = layoutForcedValue_;
+    }
+    if (keepPin) {
+        layoutPinned_ = true;
+        layoutPinnedValue_ = pinned;
+        layout_ = pinned;
+        layoutSignal_ = StereoSignal::Manual;
+    }
+    contentAspect_ = PerEyeAspect(layout_, mediaW_, mediaH_);
+    LOG_INFO("Live: %dx%d %s frames, %s, per-eye aspect %.3f", mediaW_, mediaH_,
+             f.format == PixFormat::NV12 ? "NV12" : "I420", LayoutLabel().c_str(),
+             contentAspect_);
+}
+
+void App::PollLive() {
+    if (!isLive_) return;
+    const CameraSource::State st = camera_.GetState();
+    const double now = CameraSource::NowSeconds();
+    if (st != liveStateSeen_) {
+        const CameraSource::State was = liveStateSeen_;
+        liveStateSeen_ = st;
+        using S = CameraSource::State;
+        switch (st) {
+            case S::Streaming: {
+                const CameraSource::Stats cs = camera_.GetStats();
+                LOG_INFO("Live: '%s' streaming %dx%d NV12 @%d requested (%s range)%s",
+                         camera_.DeviceName().c_str(), cs.w, cs.h, cs.fpsReq,
+                         cs.fullRange ? "full" : "limited",
+                         cs.mjpgPath ? " via MJPG decoders" : "");
+                if (was == S::Stalled) ShowToast("Live");
+                break;
+            }
+            case S::Stalled:
+                ShowToast("No camera signal");
+                break;
+            case S::Lost:
+                ShowToast("Camera disconnected");
+                break;
+            case S::Denied:
+            case S::Failed: {
+                const std::string err = camera_.LastError();
+                const bool denied = (st == S::Denied);
+                LOG_WARN("Live: '%s' %s: %s", camera_.DeviceName().c_str(),
+                         denied ? "blocked" : "failed", err.c_str());
+                ShowToast(denied ? "Camera blocked by Windows privacy settings - "
+                                   "Settings > Privacy & security > Camera"
+                                 : "Camera: " + err);
+                // Never got a frame: there is nothing to freeze on, so go back to idle
+                // rather than leave a dead source up. After frames, keep the last one.
+                if (mediaW_ == 0) StopLive(/*showIdleIfEmpty=*/true);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    // Ladder rung 4: the device delivers well under what was asked (CPU-bound decode on
+    // a weak box). Hint once; no automatic re-open (that re-negotiates the device).
+    if (isLive_ && st == CameraSource::State::Streaming && !liveSlowWarned_) {
+        const CameraSource::Stats cs = camera_.GetStats();
+        const bool warm = cs.fpsReq > 0 && cs.published > (uint64_t)cs.fpsReq * 2;
+        if (warm && cs.deliveredFps < 0.8f * (float)cs.fpsReq) {
+            if (liveSlowSince_ < 0.0) liveSlowSince_ = now;
+            if (now - liveSlowSince_ >= 3.0) {
+                liveSlowWarned_ = true;
+                LOG_WARN("Live: camera delivers %.0f of %d fps requested", cs.deliveredFps,
+                         cs.fpsReq);
+                char t[96];
+                std::snprintf(t, sizeof(t), "Camera: CPU-bound at %.0f fps; try --camera-fps=30",
+                              cs.deliveredFps);
+                ShowToast(t);
+            }
+        } else {
+            liveSlowSince_ = -1.0;
+        }
     }
 }
 
@@ -1231,6 +1527,10 @@ void App::ShowToast(const std::string& msg) { ui::ShowTransportToast(uiState_, m
 void App::ToggleSlideshow() { SetSlideshow(!uiState_.slideshowActive); }
 
 void App::SetSlideshow(bool on) {
+    if (on && isLive_) {
+        ShowToast("Slideshow unavailable while live");
+        return;
+    }
     uiState_.slideshowActive = on;
     slideshowImageElapsed_ = 0.0;
     transition_ = Transition::Playing;
@@ -1326,6 +1626,14 @@ void App::RequestFlatModeForIdle() {
 }
 
 void App::TogglePlayback() {
+    if (isLive_) {
+        // Freeze, not pause: the camera keeps streaming (no re-negotiation on resume);
+        // RenderOneFrame just stops acquiring, so the last frame stays up.
+        livePaused_ = !livePaused_;
+        LOG_INFO("live %s", livePaused_ ? "frozen" : "resumed");
+        ShowToast(livePaused_ ? "Live - frozen" : "Live");
+        return;
+    }
     if (!isVideo_) return;
     if (video_.Ended()) {
         video_.Seek(0.0);          // restart a clip that already ran to the end

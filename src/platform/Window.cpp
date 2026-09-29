@@ -244,6 +244,13 @@ bool Window::PumpEvents() {
                 mouseActivity_ = true;   // a drop is input: wake the auto-hide UI
             }
         }
+        // Live camera (#90): forward hot-plug / permission events to the app.
+        if (e.type == SDL_EVENT_CAMERA_DEVICE_ADDED || e.type == SDL_EVENT_CAMERA_DEVICE_REMOVED ||
+            e.type == SDL_EVENT_CAMERA_DEVICE_APPROVED || e.type == SDL_EVENT_CAMERA_DEVICE_DENIED) {
+            cameraEvents_.emplace_back((uint32_t)e.type, (uint32_t)e.cdevice.which);
+            if (e.type == SDL_EVENT_CAMERA_DEVICE_REMOVED || e.type == SDL_EVENT_CAMERA_DEVICE_DENIED)
+                mouseActivity_ = true;  // wake the UI so the status change is seen
+        }
         if (e.type == SDL_EVENT_KEY_DOWN) {
             // Convergence nudges repeat while held; everything else is one-shot. The
             // convergence keys form the contiguous `0 - =` cluster: `=`/`-` nudge, `0` resets.
@@ -264,6 +271,8 @@ bool Window::PumpEvents() {
                 if (e.key.key == SDLK_S) toggleSlideshowRequested_ = true;
                 if (e.key.key == SDLK_M) toggleMuteRequested_ = true;
                 if (e.key.key == SDLK_L) cycleLayoutRequested_ = true;  // stereo layout override
+                if (e.key.key == SDLK_C && !(e.key.mod & SDL_KMOD_CTRL))
+                    toggleCameraRequested_ = true;  // live camera on/off (#90)
                 if (e.key.key == SDLK_I) captureRequested_ = true;  // snapshot the atlas
                 if (e.key.key == SDLK_O && (e.key.mod & SDL_KMOD_CTRL)) openFileRequested_ = true; // Ctrl+O — open
                 if (e.key.key == SDLK_F || e.key.key == SDLK_F11) ToggleFullscreen();
@@ -343,6 +352,19 @@ bool Window::TakeCycleLayoutRequest() {
     bool v = cycleLayoutRequested_;
     cycleLayoutRequested_ = false;
     return v;
+}
+
+bool Window::TakeToggleCameraRequest() {
+    bool v = toggleCameraRequested_;
+    toggleCameraRequested_ = false;
+    return v;
+}
+
+bool Window::TakeCameraEvents(std::vector<std::pair<uint32_t, uint32_t>>& out) {
+    if (cameraEvents_.empty()) return false;
+    out.swap(cameraEvents_);
+    cameraEvents_.clear();
+    return true;
 }
 
 bool Window::TakeDroppedPaths(std::vector<std::string>& out) {

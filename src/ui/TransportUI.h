@@ -19,6 +19,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace mp::ui {
 
@@ -31,6 +32,9 @@ struct TransportCaps {
     bool slideshow = true;  // needs folder enumeration
     bool mute = true;
     bool loop = true;
+    // Live camera picker + LIVE pill (#90). DEFAULT FALSE: a leg that never sets it
+    // (Android) compiles and renders exactly as before.
+    bool camera = false;
 };
 
 // Everything the widgets read, and the little bit of state they own.
@@ -55,6 +59,16 @@ struct TransportState {
     bool openFilePending = false;  // gates the Open button while a picker is up
     bool slideshowActive = false;
     float transitionAlpha = 0.0f;  // dip-to-black; owned by the caller's nav machine
+    // Live camera (#90) - only read when caps.camera.
+    bool isLive = false;
+    bool livePaused = false;
+    std::string liveStatus;                // LIVE | FROZEN | OPENING | NO SIGNAL | NO CAMERA | BLOCKED | ERROR
+    std::string liveDevice;                // e.g. "SpatialLabs Eyes"
+    std::vector<std::string> cameraNames;  // picker rows (tracking cameras already removed)
+    int cameraCurrent = -1;                // row of the live device, -1 = none
+    float cameraFps = 0.0f;                // frames the camera delivered per second
+    float panelFps = 0.0f;                 // frames the app submitted per second
+    float frameAgeMs = 0.0f;               // camera publish -> GPU upload age
 
     // ---- UI owns (do not clobber) ------------------------------------------
     // Scrubber. The displayed knob tracks playback EXCEPT while dragging, or
@@ -65,6 +79,8 @@ struct TransportState {
     float scrubTarget = -1.0f;
     float lastScrubValue = 0.0f;
     bool scrubWasPreview = false;
+    // Camera picker: open-edge detector, so RefreshCameras fires once per opening.
+    bool cameraComboWasOpen = false;
 
     // Auto-hide fade (whole-UI alpha) and the independent toast fade.
     float fadeAlpha = 0.0f;
@@ -97,6 +113,13 @@ struct TransportActions {
     std::function<void(float seconds, bool preview)> Seek;
     std::function<void()> ScrubHeld;
     std::function<void(float seconds)> ScrubReleased;
+
+    // Live camera (#90), used only when caps.camera. RefreshCameras(rescan) re-lists
+    // the devices into TransportState::cameraNames; OpenCamera(row) opens that row;
+    // StopCamera returns to the idle screen. The LIVE pill fires TogglePlayback (freeze).
+    std::function<void(bool rescan)> RefreshCameras;
+    std::function<void(int row)> OpenCamera;
+    std::function<void()> StopCamera;
 };
 
 // The player's "dark glass" look. `metricScale` is the ONE sanctioned divergence

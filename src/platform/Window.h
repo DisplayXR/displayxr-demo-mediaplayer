@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct SDL_Window;
@@ -112,6 +113,11 @@ public:
     bool TakeToggleSlideshowRequest(); // `S` — toggle slideshow ("diaporama")
     bool TakeToggleMuteRequest();      // `M` — toggle audio mute
     bool TakeCycleLayoutRequest();     // `L` — cycle the stereo-layout override (#45)
+    bool TakeToggleCameraRequest();    // `C` — live camera on/off (#90)
+    // SDL camera events since the last read, as {SDL event type, SDL_CameraID} pairs
+    // (ADDED / REMOVED / APPROVED / DENIED). Moved into `out`; false if none. They only
+    // arrive once the app has initialised SDL's camera subsystem.
+    bool TakeCameraEvents(std::vector<std::pair<uint32_t, uint32_t>>& out);
 
     // Discrete pointer activity (click / wheel / window-enter) since last read — wakes
     // the auto-hide UI. Continuous motion is detected by polling (jitter-immune).
@@ -147,6 +153,8 @@ private:
     bool toggleSlideshowRequested_ = false;
     bool toggleMuteRequested_ = false;
     bool cycleLayoutRequested_ = false;
+    bool toggleCameraRequested_ = false;
+    std::vector<std::pair<uint32_t, uint32_t>> cameraEvents_;
     std::vector<std::string> dropBatch_;
     bool mouseActivity_ = false;
     bool mouseLeft_ = false;
