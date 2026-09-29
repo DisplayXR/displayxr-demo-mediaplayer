@@ -1170,8 +1170,10 @@ void App::RefreshCameraList(bool rescan) {
     // A rescan re-inits SDL's camera subsystem, which CameraSource refuses while a device
     // is open. After an unplug the dead handle is still held, so the user's "Rescan" to
     // find the replugged camera would be refused forever: release it first. The last
-    // frame stays on screen (the renderer keeps its last upload) and isLive_ stays set,
-    // so the pill keeps reading NO CAMERA until a device is picked again.
+    // frame stays on screen (the renderer keeps its last upload) and isLive_ stays set.
+    // When the same device is back in the fresh list it is re-opened at once: a Rescan
+    // after an unplug means "reconnect", not "show me a list" (David, first hardware run).
+    bool reconnect = false;
     if (rescan && isLive_) {
         const CameraSource::State st = camera_.GetState();
         if (st == CameraSource::State::Lost || st == CameraSource::State::Failed ||
@@ -1181,6 +1183,7 @@ void App::RefreshCameraList(bool rescan) {
             camera_.Stop();
             liveStateSeen_ = CameraSource::State::Closed;
         }
+        reconnect = (camera_.GetState() == CameraSource::State::Closed) && !liveSelector_.empty();
     }
     cameraDevs_.clear();
     uiState_.cameraNames.clear();
@@ -1188,6 +1191,18 @@ void App::RefreshCameraList(bool rescan) {
         if (d.denied) continue;  // the picker never even shows a tracking camera
         uiState_.cameraNames.push_back(d.name);
         cameraDevs_.push_back(std::move(d));
+    }
+    if (reconnect) {
+        for (const CameraDevice& d : cameraDevs_) {
+            if (d.name == liveSelector_) {
+                LOG_INFO("Live: '%s' is back — reconnecting", d.name.c_str());
+                const CameraDevice dev = d;  // copy: LoadLiveDevice may not touch the list
+                LoadLiveDevice(dev);
+                return;
+            }
+        }
+        LOG_WARN("Live: '%s' not found after rescan", liveSelector_.c_str());
+        ShowToast("Camera not found - plug it in (webcam mode) and Rescan");
     }
 }
 
@@ -1264,6 +1279,14 @@ void App::StopLive(bool showIdleIfEmpty) {
 
 void App::ToggleLive() {
     if (isLive_) {
+        // 'C' on a lost/blocked camera = reconnect (rescan + re-open the same device),
+        // not "live off": the user is trying to get the picture back.
+        const CameraSource::State st = camera_.GetState();
+        if (st == CameraSource::State::Lost || st == CameraSource::State::Failed ||
+            st == CameraSource::State::Denied || st == CameraSource::State::Closed) {
+            RefreshCameraList(/*rescan=*/true);
+            return;
+        }
         StopLive(/*showIdleIfEmpty=*/true);
         ShowToast("Live off");
         return;
