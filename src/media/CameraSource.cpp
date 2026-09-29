@@ -210,6 +210,9 @@ bool CameraSource::Open(const CameraDevice& dev, int wantW, int wantH, int wantF
         Fail(State::Failed, why);
         return false;
     }
+    // Drop a frame the previous device published but nobody consumed, so the first frame
+    // shown for this device is really from it (Open runs on the consumer's thread).
+    ring_.AcquireLatest();
     fpsReq_ = FormatFps(fmt);
     w_ = fmt.w;
     h_ = fmt.h;
@@ -284,10 +287,13 @@ void CameraSource::WorkerMain(uint32_t id, CameraFormat fmt) {
         stats_.fullRange = fullRange;
     }
     const char* gotName = SDL_GetPixelFormatName(got.format);
-    LOG_INFO("camera: '%s' open in %.0f ms: %s %dx%d @ %d/%d, colorspace 0x%08x (%s range)",
+    LOG_INFO("camera: '%s' open in %.0f ms: %s %dx%d @ %d/%d, colorspace 0x%08x (%s)",
              name_.c_str(), (NowSeconds() - t0) * 1000.0, gotName ? gotName : "?", got.width,
              got.height, got.framerate_numerator, got.framerate_denominator,
-             (unsigned)got.colorspace, fullRange ? "full" : "limited");
+             (unsigned)got.colorspace,
+             got.colorspace == SDL_COLORSPACE_UNKNOWN ? "range: from frames"
+             : fullRange                              ? "full range"
+                                                      : "limited range");
 
     double lastFrame = NowSeconds();
     double lastStatsLog = lastFrame;
@@ -350,9 +356,17 @@ void CameraSource::WorkerMain(uint32_t id, CameraFormat fmt) {
                 continue;
             }
             // The surface's own colorspace is authoritative once frames flow.
+            // (SDL_GetCameraFormat often reports UNKNOWN — the Eyes do — while the
+            // surfaces carry the real JPEG full-range colorspace.)
             const SDL_Colorspace cs = SDL_GetSurfaceColorspace(s);
-            if (cs != SDL_COLORSPACE_UNKNOWN)
-                fullRange = SDL_COLORSPACERANGE(cs) == SDL_COLOR_RANGE_FULL;
+            if (cs != SDL_COLORSPACE_UNKNOWN) {
+                const bool fr = SDL_COLORSPACERANGE(cs) == SDL_COLOR_RANGE_FULL;
+                if (fr != fullRange || !loggedFirst) {
+                    fullRange = fr;
+                    std::lock_guard<std::mutex> lk(statsMutex_);
+                    stats_.fullRange = fr;
+                }
+            }
             if (!loggedFirst) {
                 LOG_INFO("camera: first frame %dx%d pitch %d (%s range), %.0f ms after open",
                          s->w, s->h, s->pitch, fullRange ? "full" : "limited",
