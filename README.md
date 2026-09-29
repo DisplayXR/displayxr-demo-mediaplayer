@@ -111,8 +111,9 @@ Such devices show as `[blocked]` in `--camera-list` and are absent from the pick
 Capture uses SDL3's camera API and requests NV12. On Windows the Camera Frame Server
 decodes the Eyes' MJPG, giving 60 fps at 3840x2160. A device that offers **only** MJPG is
 not supported yet (follow-up). The same code builds on macOS; Linux compiles it with SDL's
-camera backend off, so there no camera is found. There is no auto-reconnect after an
-unplug: use **Rescan** in the Camera menu.
+camera backend off, so there no camera is found. SDL's Windows driver has no hot-plug,
+so after an unplug use **Rescan** in the Camera menu (or press `C`): it re-lists the
+devices and re-opens the same camera as soon as it is back.
 
 ## Requirements
 
