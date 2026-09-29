@@ -14,6 +14,12 @@
 # fallback uses FFmpeg's native decoder (no libdav1d) — only slower on GPUs that
 # lack AV1 hardware decode.
 #
+# Network input (#93, the live stream-URL source): network + the protocols and
+# demuxers a live stream needs — RTSP (+ RTP/SDP depacketizers), RTMP(S), UDP/RTP
+# MPEG-TS, HTTP(S) progressive and HLS. TLS (https://, rtmps://, HLS over https)
+# uses SChannel: a Windows system API (secur32/ncrypt/crypt32), so no new DLL
+# ships. SRT is deliberately absent (it would need libsrt).
+#
 # Requirements: run under a POSIX shell (MSYS2 / Git bash) with MSVC `cl` and
 # `nasm` on PATH and GNU `make` available, FFmpeg source already checked out.
 #
@@ -41,15 +47,25 @@ cd "$SRC"
   --disable-everything \
   --disable-programs --disable-doc \
   --disable-avdevice --disable-avfilter \
-  --disable-network --disable-autodetect --disable-debug \
+  --enable-network --disable-autodetect --disable-debug \
   --enable-swscale --enable-swresample \
-  --enable-protocol=file,pipe \
-  --enable-demuxer=mov,matroska,mpegts,avi,flv,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v \
+  --enable-protocol=file,pipe,tcp,udp,rtp,http,https,tls,rtmp,rtmps,hls,crypto,data \
+  --enable-demuxer=mov,matroska,mpegts,avi,flv,live_flv,rtsp,rtp,sdp,hls,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v \
   --enable-decoder=h264,hevc,av1,vp9,vp8,mpeg4,mpeg2video,mpeg1video,mjpeg,png,bmp,tiff,webp,gif,aac,aac_latm,mp3,ac3,eac3,flac,opus,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8 \
   --enable-parser=h264,hevc,av1,vp9,vp8,mpeg4video,mpegvideo,aac,aac_latm,ac3,flac,opus,vorbis,mjpeg,png \
   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,av1_frame_split,vp9_superframe,vp9_superframe_split,aac_adtstoasc,extract_extradata,mpeg4_unpack_bframes,null \
   --enable-hwaccel=h264_d3d11va,h264_d3d11va2,h264_dxva2,hevc_d3d11va,hevc_d3d11va2,hevc_dxva2,av1_d3d11va,av1_d3d11va2,av1_dxva2,vp9_d3d11va,vp9_d3d11va2,vp9_dxva2 \
-  --enable-d3d11va --enable-dxva2
+  --enable-d3d11va --enable-dxva2 \
+  --enable-schannel
+
+# configure silently drops a feature whose dependency is missing (schannel is an
+# explicit enable under --disable-autodetect and soft-disables when its headers or
+# libs are absent): fail instead of shipping a player whose https:// is dead.
+for want in CONFIG_NETWORK CONFIG_SCHANNEL CONFIG_TLS_PROTOCOL CONFIG_HTTPS_PROTOCOL \
+            CONFIG_RTSP_DEMUXER CONFIG_HLS_DEMUXER CONFIG_UDP_PROTOCOL CONFIG_RTMP_PROTOCOL; do
+    # (component switches live in config_components.h on FFmpeg >= 6)
+    cat config.h config_components.h 2>/dev/null | grep -q "^#define $want 1" || { echo "ERROR: FFmpeg configure disabled $want" >&2; exit 1; }
+done
 
 make -j"$(nproc)"
 make install

@@ -30,6 +30,8 @@ vcpkg_installed/
 
 # Prebuilt FFmpeg dev tree (Windows; downloaded locally, see README build section)
 third_party/ffmpeg-win64/
+# Full shared FFmpeg for local dev/test of network input (#93; the slim tree has no network)
+third_party/ffmpeg-win64-full/
 
 # Editor / OS
 .vscode/

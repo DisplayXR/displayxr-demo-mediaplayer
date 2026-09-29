@@ -19,6 +19,13 @@
 #   * NVDEC (NVIDIA) — via the header-only nv-codec-headers, which dlopen()
 #     libcuda/libnvcuvid at runtime: no DT_NEEDED, no build- or run-time CUDA dep.
 #   * zlib — libz.so.1 (zlib1g, stable everywhere).
+#   * Network input (#93): the same protocols/demuxers as Windows (RTSP/RTP/SDP,
+#     RTMP, UDP, HTTP, HLS) but NO TLS. Every Linux TLS backend adds a DT_NEEDED
+#     whose PACKAGE differs across 22.04/24.04/26.04 (the 24.04 64-bit time_t
+#     transition renamed libssl3 -> libssl3t64 and libgnutls30 -> libgnutls30t64;
+#     mbedtls changes soname), which breaks the .deb's one-package rule
+#     (package_deb_linux.sh STABLE_SONAMES). So on Linux https://, rtmps:// and
+#     HLS-over-https are unavailable; plain http / rtsp / rtmp / udp / rtp work.
 # --disable-autodetect keeps anything else on the build host from sneaking in.
 #
 # Build it on the OLDEST supported release (the .deb's glibc floor comes from
@@ -74,11 +81,11 @@ rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
   --disable-everything \
   --disable-programs --disable-doc \
   --disable-avdevice --disable-avfilter \
-  --disable-network --disable-autodetect --disable-debug \
+  --enable-network --disable-autodetect --disable-debug \
   --enable-swscale --enable-swresample \
   --enable-zlib \
-  --enable-protocol=file,pipe \
-  --enable-demuxer=mov,matroska,mpegts,avi,flv,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v \
+  --enable-protocol=file,pipe,tcp,udp,rtp,http,rtmp,hls,crypto,data \
+  --enable-demuxer=mov,matroska,mpegts,avi,flv,live_flv,rtsp,rtp,sdp,hls,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v \
   --enable-decoder=h264,hevc,av1,vp9,vp8,mpeg4,mpeg2video,mpeg1video,mjpeg,png,bmp,tiff,webp,gif,aac,aac_latm,mp3,ac3,eac3,flac,opus,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8 \
   --enable-parser=h264,hevc,av1,vp9,vp8,mpeg4video,mpegvideo,aac,aac_latm,ac3,flac,opus,vorbis,mjpeg,png \
   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,av1_frame_split,vp9_superframe,vp9_superframe_split,aac_adtstoasc,extract_extradata,mpeg4_unpack_bframes,null \
@@ -88,7 +95,8 @@ rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
 
 # configure silently drops a feature whose dependency is missing: fail instead
 # of shipping a player without hardware decode.
-for want in CONFIG_VAAPI CONFIG_NVDEC CONFIG_H264_VAAPI_HWACCEL CONFIG_HEVC_NVDEC_HWACCEL CONFIG_ZLIB; do
+for want in CONFIG_VAAPI CONFIG_NVDEC CONFIG_H264_VAAPI_HWACCEL CONFIG_HEVC_NVDEC_HWACCEL CONFIG_ZLIB \
+            CONFIG_NETWORK CONFIG_RTSP_DEMUXER CONFIG_HLS_DEMUXER CONFIG_UDP_PROTOCOL CONFIG_HTTP_PROTOCOL; do
     # (component switches live in config_components.h on FFmpeg >= 6)
     cat config.h config_components.h 2>/dev/null | grep -q "^#define $want 1" || { echo "error: FFmpeg configure disabled $want" >&2; exit 1; }
 done
