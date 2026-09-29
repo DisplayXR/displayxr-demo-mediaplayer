@@ -16,16 +16,20 @@
 #include "sbs.frag.h"         // sbs_frag_data (SPIR-V)
 #include "sbs_ahb.frag.h"     // sbs_ahb_frag_data (SPIR-V) — zero-copy ycbcr blit
 
+#include "ColorPolicy.h"  // IsSrgb8 / DisplayReferredToSceneLinear (#78, shared with desktop)
+
 #define LOG_TAG "mediaplayer_vk_android"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// Must match shaders/sbs.frag's push_constant block (24 bytes).
+// Must match the push_constant block of shaders/sbs.frag AND shaders/sbs_ahb.frag
+// (28 bytes).
 struct SbsPush {
 	float uvOffset[2];
 	float uvScale[2];
-	int32_t mode;     // 0 = RGBA, 1 = I420, 2 = NV12
-	float fullRange;  // 1 = full/JPEG range, 0 = limited/MPEG range
+	int32_t mode;      // 0 = RGBA, 1 = I420, 2 = NV12
+	float fullRange;   // 1 = full/JPEG range, 0 = limited/MPEG range
+	float srgbTarget;  // 1 = the atlas attachment is _SRGB (encodes on store)
 };
 
 uint32_t
@@ -51,6 +55,11 @@ SbsRenderer::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 	queue_ = queue;
 	queueFamily_ = queueFamily;
 	format_ = format;
+	// Runtime #1589 / #1623: an _SRGB atlas attachment encodes on store, so both frag
+	// shaders decode their display-referred output (srgbTarget) and the clear colour is
+	// decoded the same way — the round trip stores the authored bytes. On a UNORM
+	// atlas nothing converts (the pre-fix passthrough, for A/B).
+	srgbTarget_ = mp::color::IsSrgb8((int64_t)format);
 
 	// ── Color-only render pass. Swapchain image arrives undefined (we CLEAR),
 	// and the runtime expects COLOR_ATTACHMENT_OPTIMAL at release. ──
@@ -252,7 +261,8 @@ SbsRenderer::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 	if (pfnGetAhbProps_ == nullptr) {
 		LOGE("vkGetAndroidHardwareBufferPropertiesANDROID unavailable (AHB zero-copy off)");
 	}
-	LOGI("SbsRenderer initialized (format=0x%x)", (uint32_t)format_);
+	LOGI("SbsRenderer initialized (format=0x%x, %s)", (uint32_t)format_,
+	     srgbTarget_ ? "sRGB — shaders + clear converted to scene-linear" : "UNORM — passthrough");
 	return true;
 }
 
@@ -1134,7 +1144,12 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	// bars inside each tile are this cleared black), then render every view's
 	// tile into a sub-rect via per-tile viewport + scissor.
 	VkClearValue clear = {};
-	clear.color = {{clearRgb[0], clearRgb[1], clearRgb[2], 1.0f}};
+	// A clear value is taken in the attachment's own space: an _SRGB attachment
+	// encodes it, so decode the display-referred fill first. Alpha never converts.
+	auto toTarget = [&](float c) {
+		return srgbTarget_ ? mp::color::DisplayReferredToSceneLinear(c) : c;
+	};
+	clear.color = {{toTarget(clearRgb[0]), toTarget(clearRgb[1]), toTarget(clearRgb[2]), 1.0f}};
 	VkRenderPassBeginInfo rpbi = {};
 	rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 	rpbi.renderPass = renderPass_;
@@ -1192,6 +1207,7 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		push.uvScale[1] = 1.0f;
 		push.mode = sourceMode_;
 		push.fullRange = sourceFullRange_;
+		push.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
 		vkCmdPushConstants(cmd_, pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 		vkCmdDraw(cmd_, 3, 1, 0, 0);
 	}

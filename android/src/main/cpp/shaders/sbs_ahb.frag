@@ -23,9 +23,19 @@ layout(push_constant) uniform PushConstants {
     vec2 uvScale;
     int mode;
     float fullRange;
+    float srgbTarget; // 1 = the colour attachment is an _SRGB view (encodes on store)
 } pc;
+
+// sRGB EOTF, same as sbs.frag. The ycbcr conversion emits R'G'B' — display-referred —
+// so on an _SRGB attachment decode first and the hardware's encode on store restores
+// the same bytes the UNORM path stored (runtime #1589 / #1623).
+vec3 DisplayReferredToSceneLinear(vec3 c) {
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
 
 void main() {
     vec2 uv = pc.uvOffset + vUV * pc.uvScale;
-    outColor = vec4(texture(src, uv).rgb, 1.0);
+    vec3 rgb = texture(src, uv).rgb;
+    if (pc.srgbTarget > 0.5) rgb = DisplayReferredToSceneLinear(clamp(rgb, 0.0, 1.0));
+    outColor = vec4(rgb, 1.0);
 }

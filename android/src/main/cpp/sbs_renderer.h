@@ -133,6 +133,7 @@ private:
 	VkQueue queue_ = VK_NULL_HANDLE;
 	uint32_t queueFamily_ = 0;
 	VkFormat format_ = VK_FORMAT_UNDEFINED;
+	bool srgbTarget_ = false;  // format_ is an 8-bit _SRGB format (#1623)
 
 	VkRenderPass renderPass_ = VK_NULL_HANDLE;
 	VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;

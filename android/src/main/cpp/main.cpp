@@ -64,6 +64,7 @@
 #include "sbs_renderer.h"
 #include "video_decoder.h"
 #include "audio_player.h"
+#include "ColorPolicy.h"  // swapchain encoding policy, shared with the desktop leg (#78)
 #include "ui/ImGuiLayer.h"
 #include "ui/TransportUI.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
@@ -1475,6 +1476,26 @@ fill_transport_state()
 	mp::ui::TickTransportUI(g_ui_state, dt, awake);
 }
 
+// Swapchain colour-encoding choice (#78 on desktop; runtime #1589 / #1623). Since
+// runtime v2.21.7 vk_native composes in linear light and takes a UNORM swapchain at its
+// word (linear values, encoded on output). Everything this player writes is
+// display-referred, so a UNORM swapchain double-encodes it (washed out). Default: prefer
+// `_SRGB`. `adb shell setprop debug.dxr.mp.swapchain_encoding unorm` (or the desktop's
+// DXR_SWAPCHAIN_ENCODING=unorm) restores the old UNORM choice for A/B. Read once.
+mp::color::Encoding
+swapchain_encoding()
+{
+	static const mp::color::Encoding e = [] {
+		char prop[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.dxr.mp.swapchain_encoding", prop) > 0 &&
+		    strcasecmp(prop, "unorm") == 0) {
+			return mp::color::Encoding::Unorm;
+		}
+		return mp::color::EncodingFromEnv();
+	}();
+	return e;
+}
+
 // Create (or recreate) the HUD swapchain at the current per-eye tile size, and
 // point ImGui at it. Mirrors XrSession::CreateHudSwapchain on the desktop leg.
 // Non-fatal: a failure just means no chrome this session.
@@ -1497,18 +1518,33 @@ create_hud_swapchain()
 	    XR_SUCCESS) {
 		return false;
 	}
-	// Prefer R8G8B8A8_UNORM (VK 37) — straight alpha, matches the desktop HUD.
+	// Same choice as the desktop XrSession::CreateHudSwapchain: RGBA channel order is
+	// load-bearing (ImGui's pipeline + DumpExternalImage assume R,G,B,A bytes), so
+	// R8G8B8A8_SRGB (43) -> R8G8B8A8_UNORM (37) -> formats[0]; =unorm swaps the first two.
+	// On an _SRGB HUD, ImGuiLayer draws into a UNORM staging image (blending stays in
+	// encoded space) and vkCmdCopyImage's the bytes across — hence TRANSFER_DST below.
+	const bool legacy_unorm = swapchain_encoding() == mp::color::Encoding::Unorm;
+	const int64_t order[2] = {legacy_unorm ? mp::color::kR8G8B8A8_UNORM : mp::color::kR8G8B8A8_SRGB,
+	                          legacy_unorm ? mp::color::kR8G8B8A8_SRGB : mp::color::kR8G8B8A8_UNORM};
 	int64_t fmt = formats[0];
-	for (int64_t f : formats) {
-		if (f == 37) {
-			fmt = f;
+	bool found = false;
+	for (int64_t want : order) {
+		for (int64_t f : formats) {
+			if (f == want) {
+				fmt = f;
+				found = true;
+				break;
+			}
+		}
+		if (found) {
 			break;
 		}
 	}
 
 	XrSwapchainCreateInfo ci = {};
 	ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
-	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+	                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
 	ci.format = fmt;
 	ci.sampleCount = 1;
 	ci.width = render_w;
@@ -1548,8 +1584,8 @@ create_hud_swapchain()
 	g_hud_w = render_w;
 	g_hud_h = render_h;
 	g_hud_format = (VkFormat)fmt;
-	LOGI("HUD swapchain: %ux%u, %u images, format=%lld", g_hud_w, g_hud_h, image_count,
-	     (long long)fmt);
+	LOGI("HUD swapchain: %ux%u, %u images, format=%lld (%s)", g_hud_w, g_hud_h, image_count,
+	     (long long)fmt, mp::color::IsSrgb8(fmt) ? "sRGB" : "UNORM");
 	return true;
 }
 
@@ -1664,8 +1700,15 @@ create_swapchains()
 		log_xr_result("xrEnumerateSwapchainFormats(fill)", res);
 		return false;
 	}
-	const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
-	for (int64_t pref : preferred) {
+	// Prefer an honest `_SRGB` atlas (see swapchain_encoding()): SbsRenderer then decodes
+	// its display-referred shader output + clear colour and the attachment re-encodes,
+	// so the stored bytes are exactly the ones the UNORM path used to store.
+	const bool legacy_unorm = swapchain_encoding() == mp::color::Encoding::Unorm;
+	const int64_t preferred_srgb[] = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB,
+	                                  VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
+	const int64_t preferred_unorm[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
+	                                   VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB};
+	for (int64_t pref : legacy_unorm ? preferred_unorm : preferred_srgb) {
 		for (uint32_t i = 0; i < format_count && g_swapchain_format == VK_FORMAT_UNDEFINED; ++i) {
 			if (formats[i] == pref) {
 				g_swapchain_format = (VkFormat)pref;
@@ -1678,7 +1721,11 @@ create_swapchains()
 	if (g_swapchain_format == VK_FORMAT_UNDEFINED) {
 		g_swapchain_format = (VkFormat)formats[0];
 	}
-	LOGI("Chose swapchain format: 0x%x", (uint32_t)g_swapchain_format);
+	// One-off WARN (never per frame): tells a washed-out capture apart from a
+	// mis-selected format without a rebuild.
+	LOGW("[color] atlas format=%d (%s) [swapchain_encoding=%s]", (int)g_swapchain_format,
+	     mp::color::IsSrgb8(g_swapchain_format) ? "sRGB" : "UNORM",
+	     mp::color::EncodingName(swapchain_encoding()));
 
 	// Atlas = worst case over the active mode × both orientations. (The media
 	// player adopts a single active mode; sizing both orientations is what makes
