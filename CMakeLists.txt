@@ -247,6 +247,8 @@ add_executable(${MP_TARGET}
     src/media/VideoStereoProbe.cpp
     src/media/VideoDecoder.cpp
     src/media/AudioPlayer.cpp
+    src/media/CameraSelect.cpp
+    src/media/CameraSource.cpp   # live camera (#90): SDL3 camera -> FrameRing
     src/ui/Hud.cpp
     src/ui/ImGuiLayer.cpp
     # The player's ImGui chrome, shared VERBATIM with the Android leg. If you add or
