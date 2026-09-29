@@ -6,6 +6,7 @@
 #pragma once
 
 #include "media/AudioPlayer.h"
+#include "media/CameraSource.h"
 #include "media/MediaSource.h"
 #include "media/VideoDecoder.h"
 #include "platform/Window.h"
@@ -24,6 +25,16 @@ namespace mp {
 
 class App {
 public:
+    // Command-line launch options (main.cpp), applied by Initialize(). The live-camera
+    // fields mirror MEDIAPLAYER_CAMERA / MEDIAPLAYER_CAMERA_FPS, which fill them when the
+    // command line did not.
+    struct LaunchOptions {
+        bool camera = false;         // --camera[=<selector>]: start on the live camera
+        std::string cameraSelector;  // "" / auto | index | name substring (CameraSelect)
+        int cameraFps = 0;           // --camera-fps=<N>; 0 = highest <= 60
+    };
+    void SetLaunchOptions(const LaunchOptions& o) { launch_ = o; }  // before Initialize()
+
     // `mediaPath` may be null/empty — then the app falls back to the RED|BLUE
     // L/R test pattern instead of a loaded stereo image/video.
     bool Initialize(const char* mediaPath);
@@ -101,6 +112,19 @@ private:
     void TogglePlayback();   // play/pause (video+audio); restarts if the clip already ended
     void ToggleMute();       // silence audio (keeps playing); persists across clips
     void StepFrame(int n);   // pause + step n frames (']' +1 / '[' -1)
+
+    // Live camera source (#90). The camera is a SOURCE like a file: it replaces the
+    // current media and publishes into a FrameRing the render path already consumes.
+    // LoadLive resolves a selector (CameraSelect grammar) against a fresh device list;
+    // LoadLiveDevice opens one device (asynchronously — PollLive reports the outcome).
+    bool LoadLive(const std::string& selector);
+    bool LoadLiveDevice(const CameraDevice& dev);
+    void StopLive(bool showIdleIfEmpty);  // tear down; idle logo if nothing replaces it
+    void ToggleLive();                    // 'C': off -> LoadLive(last or auto); on -> StopLive
+    void PollLive();                      // per-frame: camera state edges -> toasts / log
+    void OnLiveFrame(const FrameRing::Frame& f);  // first frame / size change -> layout
+    void RefreshCameraList(bool rescan);  // fills cameraDevs_ + uiState_.cameraNames
+    std::string LiveStatusText() const;   // the top-bar pill's status word
 
     // Agent tools (XR_DXR_mcp_tools). SetupAgentTools registers the player's controls as
     // MCP tools on the runtime's per-process server (no-op when the MCP gate is off);
@@ -190,6 +214,19 @@ private:
     // list instead of rescanning the parent directory, which would otherwise destroy the
     // dropped set on the very next load. Cleared by any later single-target open.
     bool playlistFromDrop_ = false;
+
+    // Live camera (#90). isLive_ is mutually exclusive with file media: every file load
+    // goes through ReloadMedia, which stops the camera first.
+    CameraSource camera_;
+    LaunchOptions launch_{};
+    bool isLive_ = false;               // the live camera is the current source
+    bool livePaused_ = false;           // Space = freeze (the camera keeps streaming)
+    std::vector<CameraDevice> cameraDevs_;  // NON-denied only, same order as uiState_.cameraNames
+    std::string liveSelector_;          // last opened device name, for the 'C' re-open
+    CameraSource::State liveStateSeen_ = CameraSource::State::Closed;  // PollLive edge detector
+    double liveAgeMs_ = 0.0;            // publish -> upload age of the last uploaded frame
+    double liveSlowSince_ = -1.0;       // start of a delivered-fps shortfall (rung-4 hint)
+    bool liveSlowWarned_ = false;
 
     int mediaW_ = 0;              // full frame dims, for the HUD label
     int mediaH_ = 0;
