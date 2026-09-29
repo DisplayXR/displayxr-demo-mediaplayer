@@ -242,6 +242,85 @@ bool ScrubBar(const char* id, float* v, float vmax, float width, bool* outActive
 }
 
 void Fire(const std::function<void()>& fn) { if (fn) fn(); }
+
+// The top bar's live-camera picker (#90): a combo next to Open. Refreshes the device
+// list once each time it opens, so enumeration stays lazy (never on a file-only run).
+void CameraCombo(TransportState& s, const TransportActions& a) {
+    const char* preview = s.isLive ? "Camera" : "Live...";
+    const ImGuiStyle& st = ImGui::GetStyle();
+    ImGui::SetNextItemWidth(ImGui::CalcTextSize("Live...").x + st.FramePadding.x * 2.0f +
+                            ImGui::GetFrameHeight());
+    const bool open = ImGui::BeginCombo("##camera", preview, ImGuiComboFlags_HeightLarge);
+    if (open) {
+        if (!s.cameraComboWasOpen && a.RefreshCameras) a.RefreshCameras(false);
+        if (s.cameraNames.empty()) {
+            ImGui::BeginDisabled();
+            ImGui::Selectable("No cameras found", false);
+            ImGui::EndDisabled();
+        }
+        for (int row = 0; row < (int)s.cameraNames.size(); ++row) {
+            ImGui::PushID(row);
+            if (ImGui::Selectable(s.cameraNames[(size_t)row].c_str(),
+                                  s.isLive && row == s.cameraCurrent) &&
+                a.OpenCamera)
+                a.OpenCamera(row);
+            ImGui::PopID();
+        }
+        ImGui::Separator();
+        if (ImGui::Selectable("Rescan", false, ImGuiSelectableFlags_DontClosePopups) &&
+            a.RefreshCameras)
+            a.RefreshCameras(true);
+        if (s.isLive && ImGui::Selectable("Stop live")) Fire(a.StopCamera);
+        ImGui::EndCombo();
+    }
+    s.cameraComboWasOpen = open;
+}
+
+// The LIVE pill (#90): replaces the centred filename while a camera is the source.
+// A status dot (red = live, amber = frozen / opening / no signal, grey = gone), the
+// device, and the three numbers that matter for a live feed. Click = freeze/resume.
+void LivePill(const TransportState& s, const TransportActions& a) {
+    char text[192];
+    const bool streaming = (s.liveStatus == "LIVE" || s.liveStatus == "FROZEN");
+    if (streaming) {
+        // U+00B7 middle dot, spelled as UTF-8 bytes (ImGui's default font covers Latin-1).
+        std::snprintf(text, sizeof(text),
+                      "%s  %s  \xC2\xB7  cam %.0f  \xC2\xB7  panel %.0f fps  \xC2\xB7  %.0f ms",
+                      s.liveStatus.c_str(), s.liveDevice.c_str(), s.cameraFps, s.panelFps,
+                      s.frameAgeMs);
+    } else {
+        std::snprintf(text, sizeof(text), "%s  %s", s.liveStatus.c_str(), s.liveDevice.c_str());
+    }
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float h = ImGui::GetFrameHeight();
+    const float dotR = ImGui::GetFontSize() * 0.22f;
+    const float gap = st.ItemInnerSpacing.x * 2.0f;
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const float w = st.FramePadding.x * 2.0f + dotR * 2.0f + gap + ts.x;
+
+    ImGui::SameLine();
+    // Same centre-clamp as the filename: it may only ever slide right of the buttons.
+    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), (ImGui::GetWindowWidth() - w) * 0.5f));
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    if (ImGui::InvisibleButton("##livepill", ImVec2(w, h))) Fire(a.TogglePlayback);
+    const bool hovered = ImGui::IsItemHovered();
+    if (hovered) ImGui::SetTooltip("%s", s.livePaused ? "Space: resume" : "Space: freeze");
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h),
+                      ImGui::GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg),
+                      st.FrameRounding);
+    ImVec4 dot(0.55f, 0.57f, 0.60f, 1.0f);  // grey: no camera / blocked / error
+    if (s.liveStatus == "LIVE")
+        dot = ImVec4(235.0f / 255.0f, 64.0f / 255.0f, 52.0f / 255.0f, 1.0f);  // red
+    else if (s.liveStatus == "FROZEN" || s.liveStatus == "OPENING" || s.liveStatus == "NO SIGNAL")
+        dot = ImVec4(0.96f, 0.70f, 0.20f, 1.0f);  // amber
+    const float cx = p.x + st.FramePadding.x + dotR;
+    const float cy = p.y + h * 0.5f;
+    dl->AddCircleFilled(ImVec2(cx, cy), dotR, ImGui::GetColorU32(dot));
+    dl->AddText(ImVec2(cx + dotR + gap, p.y + (h - ts.y) * 0.5f), ImGui::GetColorU32(ImGuiCol_Text),
+                text);
+}
 }  // namespace
 
 void BuildTransportUI(TransportState& s, const TransportActions& a) {
@@ -267,6 +346,10 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             ImGui::BeginDisabled(s.openFilePending);
             if (ImGui::Button("Open")) Fire(a.Open);
             ImGui::EndDisabled();
+            if (s.caps.camera) {
+                ImGui::SameLine();
+                CameraCombo(s, a);
+            }
             if (s.caps.mode) {
                 ImGui::SameLine();
                 char modeLabel[96];
@@ -285,8 +368,10 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                                       s.layoutTooltip.c_str());
                 }
             }
-            // Current filename, centered in the bar.
-            if (!s.mediaFilename.empty()) {
+            // Current filename, centered in the bar - or the LIVE pill in its place.
+            if (s.caps.camera && s.isLive) {
+                LivePill(s, a);
+            } else if (!s.mediaFilename.empty()) {
                 const float tw = ImGui::CalcTextSize(s.mediaFilename.c_str()).x;
                 ImGui::SameLine();
                 // Clamp, don't set: with a third button on the left the centred position
