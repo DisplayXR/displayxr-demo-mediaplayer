@@ -81,6 +81,39 @@ loads the first and makes the dropped set the list the arrow keys and the slides
 Dropping a **folder** opens its first asset and starts the slideshow, with the folder as
 that list — the same thing as passing the folder on the command line, plus playback.
 
+## Live camera (#90)
+
+A live **stereo camera** can stand in for a file: a side-by-side UVC webcam such as the
+Acer **SpatialLabs Eyes**, or an HDMI/SDI rig behind a UVC capture box. Pick it from the
+**Camera** menu next to **Open**, press **C**, or launch with `--camera`. The frame is
+shown raw, with the left half going to the left eye. The layout is guessed from the frame
+aspect (16:9 means SBS-half, so the Eyes' 3840x2160 shows as two 16:9 eyes), and **L**
+cycles it as usual. **X** swaps the eyes, **Space** (or a click on the LIVE pill) freezes
+the picture, and opening or dropping a file replaces the camera. While live, the top bar
+shows the device, the camera and panel frame rates, and the frame age.
+
+```bash
+mediaplayer_handle_vk_win.exe --camera-list        # devices + formats; no runtime needed
+mediaplayer_handle_vk_win.exe --camera             # default pick (SpatialLabs Eyes first)
+mediaplayer_handle_vk_win.exe --camera=webcam      # index or name substring
+mediaplayer_handle_vk_win.exe --camera --camera-fps=30
+```
+
+| flag / env | meaning |
+|---|---|
+| `--camera[=<sel>]`, `MEDIAPLAYER_CAMERA=<sel>` | start live. `<sel>` is empty or `auto` for the default pick, a number for an index from `--camera-list`, or a case-insensitive name substring. The CLI wins over the env var. |
+| `--camera-fps=<N>`, `MEDIAPLAYER_CAMERA_FPS` | requested rate. The default is the highest rate at or below 60. |
+| `MEDIAPLAYER_CAMERA_DENY="a;b"` | extra name substrings that are never opened |
+
+A 3D panel's own **eye-tracking camera** (e.g. "SpatialLabs Tracking Camera") is never
+opened: opening it would stop eye tracking. The same applies to IR and depth cameras.
+Such devices show as `[blocked]` in `--camera-list` and are absent from the picker.
+Capture uses SDL3's camera API and requests NV12. On Windows the Camera Frame Server
+decodes the Eyes' MJPG, giving 60 fps at 3840x2160. A device that offers **only** MJPG is
+not supported yet (follow-up). The same code builds on macOS; Linux compiles it with SDL's
+camera backend off, so there no camera is found. There is no auto-reconnect after an
+unplug: use **Rescan** in the Camera menu.
+
 ## Requirements
 
 - A working DisplayXR runtime install (or dev build) — this app cannot run without it.
