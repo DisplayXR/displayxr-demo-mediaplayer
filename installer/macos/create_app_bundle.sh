@@ -67,6 +67,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>Show a live stereo camera (e.g. a side-by-side webcam or a capture box) on the 3D display.</string>
 </dict>
 </plist>
 EOF
