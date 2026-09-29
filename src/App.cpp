@@ -1734,6 +1734,29 @@ void App::SetupAgentTools() {
         "\"description\":\"Layout to pin, or 'auto' to restore detection.\"}},"
         "\"required\":[\"layout\"]}");
 
+    xr_.RegisterMcpTool(
+        "list_cameras",
+        "List the live cameras the player can open (index + name), in the order open_camera's "
+        "numeric selector uses. Tracking/IR cameras (e.g. a 3D panel's eye-tracking camera) "
+        "are never openable and are reported separately under 'blocked'. Enumerating wakes "
+        "the camera subsystem; it does not open any device.",
+        "{\"type\":\"object\"}");
+
+    xr_.RegisterMcpTool(
+        "open_camera",
+        "Switch the player to a live camera, replacing the current media. The device opens "
+        "asynchronously: poll get_status (camera_state becomes 'streaming'). The layout is "
+        "guessed from the frame aspect (16:9 -> SBS-half); set_layout overrides it and "
+        "play_pause freezes/resumes the picture.",
+        "{\"type\":\"object\",\"properties\":{\"selector\":{\"type\":\"string\","
+        "\"description\":\"'auto' (default: SpatialLabs Eyes first), an index from "
+        "list_cameras, or a case-insensitive name substring.\"}}}");
+
+    xr_.RegisterMcpTool(
+        "close_camera",
+        "Stop the live camera and return to the idle screen. Errors if no camera is live.",
+        "{\"type\":\"object\"}");
+
     xr_.SetMcpToolHandler([this](const std::string& tool, const std::string& args,
                                  bool& success) {
         return DispatchAgentTool(tool, args, success);
@@ -1762,14 +1785,14 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         }
     }
 
-    const bool playing = isVideo_ && !video_.Paused();
+    const bool playing = isLive_ ? !livePaused_ : (isVideo_ && !video_.Paused());
     const double positionS = isVideo_ ? video_.PositionSeconds() : 0.0;
     const double durationS = isVideo_ ? video_.DurationSeconds() : 0.0;
 
     json out;
     if (tool == "play_pause") {
         TogglePlayback();
-        out["playing"] = isVideo_ && !video_.Paused();
+        out["playing"] = isLive_ ? !livePaused_ : (isVideo_ && !video_.Paused());
         out["position_s"] = isVideo_ ? video_.PositionSeconds() : 0.0;
         return out.dump();
     }
@@ -1840,6 +1863,24 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["layout_confidence"] = layoutConfidence_;
         out["layout_pinned"] = layoutPinned_;
         out["eye_swap"] = mediaEyeSwap_;
+        out["swap_eyes"] = swapEyes_;
+        out["live"] = isLive_;
+        out["live_paused"] = livePaused_;
+        out["camera"] = isLive_ ? camera_.DeviceName() : std::string();
+        out["camera_state"] = isLive_ ? CameraSource::StateName(camera_.GetState()) : "closed";
+        if (isLive_) {
+            const CameraSource::Stats cs = camera_.GetStats();
+            out["camera_fps"] = cs.deliveredFps;
+            out["camera_fps_requested"] = cs.fpsReq;
+            out["camera_width"] = cs.w;
+            out["camera_height"] = cs.h;
+            out["camera_full_range"] = cs.fullRange;
+            out["camera_frames"] = cs.published;
+            out["camera_dropped"] = cs.dropped;
+            out["frame_age_ms"] = liveAgeMs_;
+            out["panel_fps"] = fps_;
+            out["camera_error"] = camera_.LastError();
+        }
         return out.dump();
     }
     if (tool == "set_layout") {
@@ -1867,6 +1908,50 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["layout"] = MediaSource::LayoutName(layout_);
         out["layout_signal"] = MediaSource::SignalName(layoutSignal_);
         out["layout_pinned"] = layoutPinned_;
+        return out.dump();
+    }
+
+    if (tool == "list_cameras") {
+        json cams = json::array(), blocked = json::array();
+        cameraDevs_.clear();
+        uiState_.cameraNames.clear();
+        for (CameraDevice& d : CameraSource::Enumerate(false)) {
+            if (d.denied) {
+                blocked.push_back(d.name);
+                continue;
+            }
+            cams.push_back({{"index", (uint64_t)cameraDevs_.size()}, {"name", d.name}});
+            uiState_.cameraNames.push_back(d.name);
+            cameraDevs_.push_back(std::move(d));
+        }
+        out["cameras"] = cams;
+        out["blocked"] = blocked;
+        return out.dump();
+    }
+    if (tool == "open_camera") {
+        std::string sel;
+        if (args.contains("selector")) {
+            if (args["selector"].is_string()) sel = args["selector"].get<std::string>();
+            else if (args["selector"].is_number_integer())
+                sel = std::to_string(args["selector"].get<int>());
+        }
+        if (!LoadLive(sel)) {
+            success = false;
+            out["error"] = uiState_.toastText.empty() ? std::string("camera did not open")
+                                                      : uiState_.toastText;
+            return out.dump();
+        }
+        out["camera"] = camera_.DeviceName();
+        out["camera_state"] = CameraSource::StateName(camera_.GetState());
+        return out.dump();
+    }
+    if (tool == "close_camera") {
+        if (!isLive_) {
+            success = false;
+            return "{\"error\":\"no camera is live\"}";
+        }
+        StopLive(/*showIdleIfEmpty=*/true);
+        out["live"] = false;
         return out.dump();
     }
 
