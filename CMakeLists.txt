@@ -249,6 +249,7 @@ add_executable(${MP_TARGET}
     src/media/AudioPlayer.cpp
     src/media/CameraSelect.cpp
     src/media/CameraSource.cpp   # live camera (#90): SDL3 camera -> FrameRing
+    src/media/AutoConvergence.cpp  # live auto-convergence (#92): disparity.js port
     src/ui/Hud.cpp
     src/ui/ImGuiLayer.cpp
     # The player's ImGui chrome, shared VERBATIM with the Android leg. If you add or
@@ -427,6 +428,13 @@ if(MP_BUILD_TESTS)
     target_include_directories(camera_select_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME camera_select COMMAND camera_select_test)
 
+    # Auto-convergence (#92): synthetic SBS pairs with known disparity. Pure, no SDL.
+    add_executable(auto_convergence_test
+        tests/auto_convergence_test.cpp
+        src/media/AutoConvergence.cpp)
+    target_include_directories(auto_convergence_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME auto_convergence COMMAND auto_convergence_test)
+
     add_executable(mpo_parse_test
         tests/mpo_parse_test.cpp
         src/media/MpoLoader.cpp
@@ -467,5 +475,5 @@ if(MP_BUILD_TESTS)
              ${CMAKE_CURRENT_SOURCE_DIR}/assets/media/detect)
 
     message(STATUS
-        "Tests enabled: lif_roundtrip_test stereo_detect_test mpo_parse_test camera_select_test stereo_sweep")
+        "Tests enabled: lif_roundtrip_test stereo_detect_test mpo_parse_test camera_select_test auto_convergence_test stereo_sweep")
 endif()
