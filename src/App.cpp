@@ -1167,6 +1167,21 @@ void App::ReloadMedia(const std::string& path) {
 // --- Live camera (#90) -----------------------------------------------------------------
 
 void App::RefreshCameraList(bool rescan) {
+    // A rescan re-inits SDL's camera subsystem, which CameraSource refuses while a device
+    // is open. After an unplug the dead handle is still held, so the user's "Rescan" to
+    // find the replugged camera would be refused forever: release it first. The last
+    // frame stays on screen (the renderer keeps its last upload) and isLive_ stays set,
+    // so the pill keeps reading NO CAMERA until a device is picked again.
+    if (rescan && isLive_) {
+        const CameraSource::State st = camera_.GetState();
+        if (st == CameraSource::State::Lost || st == CameraSource::State::Failed ||
+            st == CameraSource::State::Denied) {
+            LOG_INFO("Live: releasing '%s' (%s) before rescan", camera_.DeviceName().c_str(),
+                     CameraSource::StateName(st));
+            camera_.Stop();
+            liveStateSeen_ = CameraSource::State::Closed;
+        }
+    }
     cameraDevs_.clear();
     uiState_.cameraNames.clear();
     for (CameraDevice& d : CameraSource::Enumerate(rescan)) {
@@ -1265,9 +1280,9 @@ std::string App::LiveStatusText() const {
         case CameraSource::State::Lost: return "NO CAMERA";
         case CameraSource::State::Denied: return "BLOCKED";
         case CameraSource::State::Failed: return "ERROR";
-        case CameraSource::State::Closed: break;
+        case CameraSource::State::Closed: break;  // released after a loss (see RefreshCameraList)
     }
-    return "OFF";
+    return "NO CAMERA";
 }
 
 void App::OnLiveFrame(const FrameRing::Frame& f) {
