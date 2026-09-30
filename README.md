@@ -155,6 +155,82 @@ The measurement is a port of displayxr-web's `js/call/disparity.js` (the 3D vide
 auto-convergence), and it keeps that file's thresholds so web and native converge the
 same way. See `src/media/AutoConvergence.h`.
 
+## Streaming URL (live) (#93)
+
+A **network stream** can stand in for a file or the camera, for example a studio's stereo
+camera put online by an encoder. Open it from **Live... > Stream URL...** in the top bar
+(or **Ctrl+U**), type or paste the URL and press **Enter**. The field remembers the last
+URL. You can also launch with `--url <u>`, pass the URL as the media path, or set
+`MEDIAPLAYER_URL`. The stream is played **live**, like the camera: there is no seek, loop
+or duration, and every frame is shown as soon as it is decoded, with late ones dropped
+rather than queued. The layout is guessed from the frame aspect (16:9 means SBS-half);
+**L** cycles it and **X** swaps the eyes. **Space** (or a click on the pill) freezes the
+picture while the stream keeps decoding. Opening a file or the camera replaces the stream,
+and **Stop live** in the same menu ends it. Audio in a stream is ignored for now.
+
+| scheme | notes |
+|---|---|
+| `rtsp://` / `rtsps://` | RTSP is forced over **TCP** (no UDP loss or NAT trouble). Put credentials in the URL: `rtsp://user:pass@cam/stream1`. |
+| `rtmp://` / `rtmps://` | RTMP pull, for example from a local nginx-rtmp or a media server. |
+| `udp://` / `rtp://` | MPEG-TS over UDP (unicast or multicast, `udp://@239.0.0.1:1234`). |
+| `http://` / `https://` | progressive MPEG-TS / FLV / fragmented MP4. |
+| `*.m3u8` | HLS, local or remote. Its latency is the playlist's (seconds), not the player's. |
+| `srt://` | **not supported** (needs libsrt); refused with a message. |
+
+**Latency.** Demuxing runs with `fflags=nobuffer`, a 0.5 s `max_delay`, a small probe
+(1 MB / 1.5 s, enough for a 4K SPS/PPS + IDR) and a low-delay decoder. The player adds
+about one decoded frame of latency. Most of what remains is the sender's encoder and GOP:
+use a zerolatency tune and a short keyframe interval (`-g 30`). The first picture shows at
+the next keyframe.
+
+**Reconnect.** A stream that stops (the sender is killed or the network drops) is detected
+after 5 s without data (15 s for HLS). The pill turns amber (RECONNECTING) and the player
+retries with a 1, 2, 4, 8 s backoff (capped) until the stream is back. The last picture
+stays up in the meantime. A URL that never connects gives up after three attempts
+(connect budget 8 s each) and returns to the idle screen with the error.
+
+While streaming, the top bar shows `STREAM host · fps · Mbit/s`: a blue dot while streaming,
+amber while connecting, reconnecting or frozen, grey once the stream has failed. The
+SHIFT+TAB text HUD has the same line. Agents drive it with the MCP tool
+`open_url {url}`. `get_status` reports `stream`, `stream_state`, `stream_url`
+(password redacted), `stream_fps`, `stream_kbps` and `reconnects`, and `close_camera`
+stops a stream too.
+
+**FFmpeg must have network input.** The installer's slim FFmpeg (`scripts/build-ffmpeg-slim.sh`,
+`scripts/build_ffmpeg_linux.sh`) enables it. An older slim tree used as a local
+`-DFFMPEG_ROOT` does not, and every URL then fails with "Protocol not found". For local
+work, point `FFMPEG_ROOT` at any full shared FFmpeg 8.x dev build instead; the gitignored
+`third_party/ffmpeg-win64-full/` is the conventional place for it.
+
+**Linux: no TLS.** The `.deb` bundles a private FFmpeg whose every library must install on
+Ubuntu 22.04, 24.04 and 26.04. Each Linux TLS backend adds a library whose package name
+differs across those releases (`libssl3` / `libssl3t64`), so the Linux build has no TLS:
+`https://`, `rtsps://`, `rtmps://` and HLS over https are **Windows and macOS only**. Plain
+`http`, `rtsp`, `rtmp`, `udp` and `rtp` work everywhere. Windows uses the system SChannel
+(no extra DLL). macOS uses Homebrew's full FFmpeg.
+
+Test it with no infrastructure by serving a camera from a second `ffmpeg` on the same box:
+
+```bash
+# sender: the Eyes over UDP MPEG-TS (scale keeps a laptop's x264 real-time; check speed>=1x)
+ffmpeg -f dshow -rtbufsize 200M -video_size 3840x2160 -framerate 30 -i video="SpatialLabs Eyes" \
+       -vf scale=1920:-2 -c:v libx264 -preset ultrafast -tune zerolatency -g 30 -pix_fmt yuv420p \
+       -f mpegts "udp://127.0.0.1:5004?pkt_size=1316"
+mediaplayer_handle_vk_win.exe --url udp://127.0.0.1:5004
+
+# or over HTTP (the sender serves one client, then exits)
+ffmpeg ...same input/encode... -listen 1 -f mpegts http://127.0.0.1:8080
+mediaplayer_handle_vk_win.exe --url http://127.0.0.1:8080
+```
+
+Kill the sender to watch it reconnect, then start it again and the picture comes back.
+
+| flag / env / key | meaning |
+|---|---|
+| `--url <u>`, `--url=<u>`, a URL as the path | start on the stream (`--camera` wins if both are given) |
+| `MEDIAPLAYER_URL=<u>` | opens at launch when the command line names nothing else, and prefills the Stream URL field |
+| **Ctrl+U** | the Stream URL field |
+
 ## Requirements
 
 - A working DisplayXR runtime install (or dev build) — this app cannot run without it.
