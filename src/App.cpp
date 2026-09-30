@@ -243,7 +243,8 @@ bool App::Initialize(const char* mediaPath) {
             LOG_WARN("auto-conv: unknown policy '%s' (nearest|sharp|centre) - using nearest",
                      launch_.autoConvPolicy.c_str());
     }
-    // Comfort-clamp tunables (percent of eye width; CLAMP=0 turns the clamp off).
+    // Comfort-clamp tunables (percent of eye width; CLAMP=1 turns the clamp on — it is
+    // off by default, see AutoConvergenceController::Config).
     {
         autoconv::AutoConvergenceController::Config& cc = autoConvCtl_.MutableConfig();
         if (const char* e = std::getenv("MEDIAPLAYER_AUTO_CONV_FRONT")) cc.frontBudget = (float)std::atof(e) / 100.f;

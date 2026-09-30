@@ -353,7 +353,10 @@ Result Synthetic(float d, float nearF, float farF) {
 }
 
 void TestComfortClamp() {
-    AutoConvergenceController c;
+    CHECK(!AutoConvergenceController::Config{}.comfortClamp, "the comfort clamp is opt-in (default off)");
+    AutoConvergenceController::Config on;
+    on.comfortClamp = true;  // opt-in: the default is off
+    AutoConvergenceController c(on);
     const char* why = "";
     // Scene spans 0.02 .. 0.12, subject at 0.10: rear pulls forward, front then wins.
     float s = c.TargetFor(Synthetic(0.10f, 0.12f, 0.02f), &why);

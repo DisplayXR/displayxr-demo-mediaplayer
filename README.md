@@ -129,7 +129,7 @@ face detection and no calibration. Manual `-` / `=` convergence still applies on
 | `Shift+A` | subject policy: nearest -> sharp -> centre |
 | `Ctrl+click` on the picture | pin the subject under the cursor (policy `focus`, template-tracked) |
 | `--auto-conv[=nearest\|sharp\|centre]`, `MEDIAPLAYER_AUTO_CONV=<policy>` | start with it on. The CLI wins over the env var. `1`/`on` = the default policy, `0`/`off` = off. |
-| `MEDIAPLAYER_AUTO_CONV_FRONT` / `_REAR` (percent), `MEDIAPLAYER_AUTO_CONV_CLAMP=0` | comfort-clamp budgets / clamp off |
+| `MEDIAPLAYER_AUTO_CONV_CLAMP=1`, `MEDIAPLAYER_AUTO_CONV_FRONT` / `_REAR` (percent) | opt-in comfort clamp + its budgets. Off by default: with a deep scene the clamp parks the nearest content at the plane and pushes the subject far behind it; the default keeps the subject at the plane. |
 | MCP `set_auto_convergence {enabled, policy, focus_x, focus_y}` | same, for agents; `get_status` reports the `auto_conv_*` fields |
 
 Subject policies:

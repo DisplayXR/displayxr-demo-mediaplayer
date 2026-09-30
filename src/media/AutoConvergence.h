@@ -253,7 +253,11 @@ public:
         float updateHz = 5.f;        // the rate alpha is defined at
         float ratePerSec = 0.002f;   // max |d shift| / s, fraction of eye width
         float maxShift = 0.12f;      // web: CONVERGENCE_MAX_FRACTION
-        bool comfortClamp = true;
+        // OFF by default: on a real scene (desk at ~20 % disparity, subject at ~2 %) a
+        // 0.5 % front budget pins the desk at the plane and pushes the subject ~17 %
+        // behind it. Subject-at-the-plane (the 3D call's behaviour) is the default; the
+        // clamp stays as an opt-in experiment (MEDIAPLAYER_AUTO_CONV_CLAMP=1).
+        bool comfortClamp = false;
     };
     AutoConvergenceController() = default;
     explicit AutoConvergenceController(const Config& c) : cfg_(c) {}
