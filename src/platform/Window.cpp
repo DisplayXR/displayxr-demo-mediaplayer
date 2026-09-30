@@ -257,7 +257,7 @@ bool Window::PumpEvents() {
             if (e.type == SDL_EVENT_CAMERA_DEVICE_REMOVED || e.type == SDL_EVENT_CAMERA_DEVICE_DENIED)
                 mouseActivity_ = true;  // wake the UI so the status change is seen
         }
-        if (e.type == SDL_EVENT_KEY_DOWN) {
+        if (e.type == SDL_EVENT_KEY_DOWN && !keyboardCaptured_) {
             // Convergence nudges repeat while held; everything else is one-shot. The
             // convergence keys form the contiguous `0 - =` cluster: `=`/`-` nudge, `0` resets.
             if (e.key.key == SDLK_EQUALS) ++convergenceSteps_;
@@ -285,6 +285,7 @@ bool Window::PumpEvents() {
                     else toggleAutoConvRequested_ = true;
                 }
                 if (e.key.key == SDLK_O && (e.key.mod & SDL_KMOD_CTRL)) openFileRequested_ = true; // Ctrl+O — open
+                if (e.key.key == SDLK_U && (e.key.mod & SDL_KMOD_CTRL)) openUrlRequested_ = true;  // Ctrl+U — stream URL (#93)
                 if (e.key.key == SDLK_F || e.key.key == SDLK_F11) ToggleFullscreen();
             }
         }
@@ -388,6 +389,13 @@ bool Window::TakeCtrlClick(float& x, float& y) {
     x = ctrlClickX_;
     y = ctrlClickY_;
     return true;
+}
+
+
+bool Window::TakeOpenUrlRequest() {
+    bool v = openUrlRequested_;
+    openUrlRequested_ = false;
+    return v;
 }
 
 bool Window::TakeCameraEvents(std::vector<std::pair<uint32_t, uint32_t>>& out) {

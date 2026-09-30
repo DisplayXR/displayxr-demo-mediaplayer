@@ -243,38 +243,117 @@ bool ScrubBar(const char* id, float* v, float vmax, float width, bool* outActive
 
 void Fire(const std::function<void()>& fn) { if (fn) fn(); }
 
-// The top bar's live-camera picker (#90): a combo next to Open. Refreshes the device
-// list once each time it opens, so enumeration stays lazy (never on a file-only run).
+// The top bar's live-source picker: a combo next to Open. Live cameras (#90, refreshed
+// once each time it opens, so enumeration stays lazy) and the "Stream URL..." row
+// (#93), each behind its own cap.
 void CameraCombo(TransportState& s, const TransportActions& a) {
-    const char* preview = s.isLive ? "Camera" : "Live...";
+    const bool live = s.caps.camera && s.isLive;
+    const bool stream = s.caps.url && s.isStream;
+    const char* preview = live ? "Camera" : stream ? "Stream" : "Live...";
     const ImGuiStyle& st = ImGui::GetStyle();
     ImGui::SetNextItemWidth(ImGui::CalcTextSize("Live...").x + st.FramePadding.x * 2.0f +
                             ImGui::GetFrameHeight());
     const bool open = ImGui::BeginCombo("##camera", preview, ImGuiComboFlags_HeightLarge);
     if (open) {
-        if (!s.cameraComboWasOpen && a.RefreshCameras) a.RefreshCameras(false);
-        if (s.cameraNames.empty()) {
-            ImGui::BeginDisabled();
-            ImGui::Selectable("No cameras found", false);
-            ImGui::EndDisabled();
+        if (s.caps.camera) {
+            if (!s.cameraComboWasOpen && a.RefreshCameras) a.RefreshCameras(false);
+            if (s.cameraNames.empty()) {
+                ImGui::BeginDisabled();
+                ImGui::Selectable("No cameras found", false);
+                ImGui::EndDisabled();
+            }
+            for (int row = 0; row < (int)s.cameraNames.size(); ++row) {
+                ImGui::PushID(row);
+                if (ImGui::Selectable(s.cameraNames[(size_t)row].c_str(),
+                                      live && row == s.cameraCurrent) &&
+                    a.OpenCamera)
+                    a.OpenCamera(row);
+                ImGui::PopID();
+            }
+            ImGui::Separator();
         }
-        for (int row = 0; row < (int)s.cameraNames.size(); ++row) {
-            ImGui::PushID(row);
-            if (ImGui::Selectable(s.cameraNames[(size_t)row].c_str(),
-                                  s.isLive && row == s.cameraCurrent) &&
-                a.OpenCamera)
-                a.OpenCamera(row);
-            ImGui::PopID();
-        }
-        ImGui::Separator();
-        if (ImGui::Selectable("Rescan", false, ImGuiSelectableFlags_DontClosePopups) &&
+        // Opens the URL popup (drawn at top level by UrlPopup, after this combo closes).
+        if (s.caps.url && ImGui::Selectable("Stream URL...", stream)) s.urlPopupRequest = true;
+        if (s.caps.camera &&
+            ImGui::Selectable("Rescan", false, ImGuiSelectableFlags_DontClosePopups) &&
             a.RefreshCameras)
             a.RefreshCameras(true);
-        if (s.isLive && ImGui::Selectable("Stop live")) Fire(a.StopCamera);
+        if ((live || stream) && ImGui::Selectable("Stop live")) Fire(a.StopCamera);
         ImGui::EndCombo();
     }
     s.cameraComboWasOpen = open;
 }
+
+// Stream URL popup (#93): a text field prefilled with the last URL, Enter / Connect
+// opens it, Esc / Cancel closes. Top level (outside the fading bars), so Ctrl+U works
+// while the chrome is hidden.
+void UrlPopup(TransportState& s, const TransportActions& a) {
+    const char* kTitle = "Stream URL";
+    if (s.urlPopupRequest) {
+        s.urlPopupRequest = false;
+        std::snprintf(s.urlBuf, sizeof(s.urlBuf), "%s", s.urlSeed.c_str());
+        ImGui::OpenPopup(kTitle);
+    }
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.35f),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal(kTitle, nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
+        return;
+    ImGui::TextUnformatted("rtsp:// rtmp:// udp:// rtp:// http(s):// or .m3u8");
+    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 30.0f);
+    bool connect = ImGui::InputText("##url", s.urlBuf, sizeof(s.urlBuf),
+                                    ImGuiInputTextFlags_EnterReturnsTrue |
+                                        ImGuiInputTextFlags_AutoSelectAll);
+    const bool empty = (s.urlBuf[0] == '\0');
+    ImGui::BeginDisabled(empty);
+    connect = ImGui::Button("Connect") || connect;
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    const bool cancel = ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+    if (connect && !empty) {
+        const std::string url = s.urlBuf;
+        ImGui::CloseCurrentPopup();
+        if (a.OpenUrl) a.OpenUrl(url);
+    } else if (cancel) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+// A status pill in the filename slot: dot + text, click = TogglePlayback (freeze).
+// Shared by the LIVE (camera, #90) and STREAM (#93) pills.
+void StatusPill(const char* id, const char* text, const ImVec4& dot, bool frozen,
+                const TransportActions& a) {
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float h = ImGui::GetFrameHeight();
+    const float dotR = ImGui::GetFontSize() * 0.22f;
+    const float gap = st.ItemInnerSpacing.x * 2.0f;
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const float w = st.FramePadding.x * 2.0f + dotR * 2.0f + gap + ts.x;
+
+    ImGui::SameLine();
+    // Same centre-clamp as the filename: it may only ever slide right of the buttons.
+    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), (ImGui::GetWindowWidth() - w) * 0.5f));
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    if (ImGui::InvisibleButton(id, ImVec2(w, h))) Fire(a.TogglePlayback);
+    const bool hovered = ImGui::IsItemHovered();
+    if (hovered) ImGui::SetTooltip("%s", frozen ? "Space: resume" : "Space: freeze");
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h),
+                      ImGui::GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg),
+                      st.FrameRounding);
+    const float cx = p.x + st.FramePadding.x + dotR;
+    const float cy = p.y + h * 0.5f;
+    dl->AddCircleFilled(ImVec2(cx, cy), dotR, ImGui::GetColorU32(dot));
+    dl->AddText(ImVec2(cx + dotR + gap, p.y + (h - ts.y) * 0.5f), ImGui::GetColorU32(ImGuiCol_Text),
+                text);
+}
+
+const ImVec4 kDotGrey(0.55f, 0.57f, 0.60f, 1.0f);   // gone / blocked / error / failed
+const ImVec4 kDotAmber(0.96f, 0.70f, 0.20f, 1.0f);  // frozen / opening / (re)connecting
 
 // The LIVE pill (#90): replaces the centred filename while a camera is the source.
 // A status dot (red = live, amber = frozen / opening / no signal, grey = gone), the
@@ -291,35 +370,31 @@ void LivePill(const TransportState& s, const TransportActions& a) {
     } else {
         std::snprintf(text, sizeof(text), "%s  %s", s.liveStatus.c_str(), s.liveDevice.c_str());
     }
-    const ImGuiStyle& st = ImGui::GetStyle();
-    const float h = ImGui::GetFrameHeight();
-    const float dotR = ImGui::GetFontSize() * 0.22f;
-    const float gap = st.ItemInnerSpacing.x * 2.0f;
-    const ImVec2 ts = ImGui::CalcTextSize(text);
-    const float w = st.FramePadding.x * 2.0f + dotR * 2.0f + gap + ts.x;
-
-    ImGui::SameLine();
-    // Same centre-clamp as the filename: it may only ever slide right of the buttons.
-    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), (ImGui::GetWindowWidth() - w) * 0.5f));
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    if (ImGui::InvisibleButton("##livepill", ImVec2(w, h))) Fire(a.TogglePlayback);
-    const bool hovered = ImGui::IsItemHovered();
-    if (hovered) ImGui::SetTooltip("%s", s.livePaused ? "Space: resume" : "Space: freeze");
-
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h),
-                      ImGui::GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg),
-                      st.FrameRounding);
-    ImVec4 dot(0.55f, 0.57f, 0.60f, 1.0f);  // grey: no camera / blocked / error
+    ImVec4 dot = kDotGrey;
     if (s.liveStatus == "LIVE")
         dot = ImVec4(235.0f / 255.0f, 64.0f / 255.0f, 52.0f / 255.0f, 1.0f);  // red
     else if (s.liveStatus == "FROZEN" || s.liveStatus == "OPENING" || s.liveStatus == "NO SIGNAL")
-        dot = ImVec4(0.96f, 0.70f, 0.20f, 1.0f);  // amber
-    const float cx = p.x + st.FramePadding.x + dotR;
-    const float cy = p.y + h * 0.5f;
-    dl->AddCircleFilled(ImVec2(cx, cy), dotR, ImGui::GetColorU32(dot));
-    dl->AddText(ImVec2(cx + dotR + gap, p.y + (h - ts.y) * 0.5f), ImGui::GetColorU32(ImGuiCol_Text),
-                text);
+        dot = kDotAmber;
+    StatusPill("##livepill", text, dot, s.livePaused, a);
+}
+
+// The STREAM pill (#93): host, decoded fps and bitrate. Blue-ish dot while streaming,
+// amber while frozen / connecting / reconnecting, grey once the stream failed.
+void StreamPill(const TransportState& s, const TransportActions& a) {
+    char text[192];
+    if (s.streamStatus == "STREAM" || s.streamStatus == "FROZEN") {
+        std::snprintf(text, sizeof(text), "%s  %s  \xC2\xB7  %.0f fps  \xC2\xB7  %.1f Mbit/s",
+                      s.streamStatus.c_str(), s.streamHost.c_str(), s.streamFps,
+                      s.streamKbps / 1000.0f);
+    } else {
+        std::snprintf(text, sizeof(text), "%s  %s", s.streamStatus.c_str(), s.streamHost.c_str());
+    }
+    ImVec4 dot = kDotGrey;
+    if (s.streamStatus == "STREAM")
+        dot = ImVec4(0.30f, 0.62f, 1.00f, 1.0f);  // blue
+    else if (s.streamStatus != "FAILED")
+        dot = kDotAmber;
+    StatusPill("##streampill", text, dot, s.streamStatus == "FROZEN", a);
 }
 }  // namespace
 
@@ -346,7 +421,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             ImGui::BeginDisabled(s.openFilePending);
             if (ImGui::Button("Open")) Fire(a.Open);
             ImGui::EndDisabled();
-            if (s.caps.camera) {
+            if (s.caps.camera || s.caps.url) {
                 ImGui::SameLine();
                 CameraCombo(s, a);
             }
@@ -382,6 +457,8 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             // Current filename, centered in the bar - or the LIVE pill in its place.
             if (s.caps.camera && s.isLive) {
                 LivePill(s, a);
+            } else if (s.caps.url && s.isStream) {
+                StreamPill(s, a);
             } else if (!s.mediaFilename.empty()) {
                 const float tw = ImGui::CalcTextSize(s.mediaFilename.c_str()).x;
                 ImGui::SameLine();
@@ -492,6 +569,9 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
         }
         ImGui::PopStyleVar();
     }
+
+    // --- Stream URL popup (#93): independent of the bar fade, like the toast ---
+    if (s.caps.url) UrlPopup(s, a);
 
     // --- Toast (convergence readout, nav filename): own alpha, shows even when hidden ---
     if (s.toastAlpha > 0.001f && !s.toastText.empty()) {

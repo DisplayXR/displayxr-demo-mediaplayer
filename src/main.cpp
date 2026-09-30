@@ -40,10 +40,17 @@ namespace {
 //   --camera-fps=<N>                 requested capture rate
 //   --camera-list                    print the cameras and exit (no window, no runtime)
 //   --auto-conv[=nearest|sharp|centre]  live auto-convergence on (#92; default OFF)
+// and the stream-URL flag (#93):
+//   --url <u> / --url=<u>            start on a live network stream
 bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, bool& list) {
     std::vector<std::string> rest;
-    for (const std::string& a : args) {
-        if (a == "--camera") {
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--url" && i + 1 < args.size()) {
+            o.url = args[++i];
+        } else if (a.rfind("--url=", 0) == 0) {
+            o.url = a.substr(6);
+        } else if (a == "--camera") {
             o.camera = true;
         } else if (a.rfind("--camera=", 0) == 0) {
             o.camera = true;
