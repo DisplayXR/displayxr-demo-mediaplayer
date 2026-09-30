@@ -122,6 +122,7 @@ player measures how far apart the subject sits in the two eyes and shifts the ey
 opposite directions so the subject lands at the display plane. It measures the pixels
 (NCC block matching on a downsampled luma plane, ~5 Hz, on a side thread). There is no
 face detection and no calibration. Manual `-` / `=` convergence still applies on top.
+It works the same on the live camera and on a stream URL.
 
 | control | effect |
 |---|---|

@@ -444,7 +444,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 }
             }
             // Auto-convergence (#92): live only. Highlighted while on.
-            if (s.caps.camera && s.isLive && !s.autoConvLabel.empty()) {
+            if (((s.caps.camera && s.isLive) || (s.caps.url && s.isStream)) && !s.autoConvLabel.empty()) {
                 ImGui::SameLine();
                 if (s.autoConvOn)
                     ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));

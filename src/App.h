@@ -284,6 +284,9 @@ private:
     // Stream URL (#93). isStream_ excludes isLive_ and isVideo_ (a stream is not a
     // seekable video: no transport bar, no scrub, no slideshow).
     bool isStream_ = false;
+    // Live sources (camera #90 or stream #93) share freeze, the pill and auto-convergence.
+    bool LiveSource() const { return isLive_ || isStream_; }
+    bool LivePaused() const { return isLive_ ? livePaused_ : streamPaused_; }
     bool streamPaused_ = false;         // Space = freeze (the stream keeps decoding)
     std::string streamUrl_;             // what is open (raw, may carry credentials)
     VideoDecoder::StreamState streamStateSeen_ = VideoDecoder::StreamState::Idle;

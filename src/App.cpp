@@ -423,7 +423,7 @@ int App::Run() {
             uint32_t pw = 0, ph = 0, cw = 0, ch = 0;
             window_.PointSize(pw, ph);
             window_.PixelSize(cw, ch);
-            if (isLive_ && hasMedia_ && pw && ph && cw && ch) {
+            if (LiveSource() && hasMedia_ && pw && ph && cw && ch) {
                 const XrSession::ViewRect fit = MatchMinRect({0, 0, cw, ch}, contentAspect_);
                 const float px = cx * (float)cw / (float)pw, py = cy * (float)ch / (float)ph;
                 const float u = (px - (float)fit.x) / (float)std::max(1u, fit.w);
@@ -560,6 +560,7 @@ void App::RenderOneFrame() {
                 SampleAutoConv(*vf);  // ~5 Hz; downsample only, measured on the worker
             } else if (isStream_) {
                 SettleLiveLayout(*vf, "Stream");
+                SampleAutoConv(*vf);  // streams converge like the camera (#93 follow-up)
             }
             bool bound = false;
 #if defined(_WIN32)
@@ -802,8 +803,8 @@ void App::RenderOneFrame() {
                               swapEyes_ ? "swapped" : "normal",
                               ((isLive_ && livePaused_) || (isStream_ && streamPaused_)) ? "  [FROZEN]"
                               : (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "",
-                              isLive_ ? "\n" : "",
-                              isLive_ ? AutoConvHudText().c_str() : "");  // #92
+                              LiveSource() ? "\n" : "",
+                              LiveSource() ? AutoConvHudText().c_str() : "");  // #92
                 // The layout label carries its provenance ("— detected" / "— from
                 // filename" / ...), so the buffer needs headroom over the old 320.
                 const std::string layoutLabel = LayoutLabel();
@@ -1524,6 +1525,7 @@ bool App::LoadUrl(const std::string& url) {
         return false;
     }
     isStream_ = true;
+    autoConvWorker_.RequestReset();  // a new stream is a new scene
     streamPaused_ = false;
     streamUrl_ = url;
     isVideo_ = false;
@@ -1733,7 +1735,7 @@ void App::SetAutoConvFocus(float u, float v) {
 }
 
 void App::SampleAutoConv(const FrameRing::Frame& f) {
-    if (!autoConvEnabled_ || !isLive_ || livePaused_) return;
+    if (!autoConvEnabled_ || !LiveSource() || LivePaused()) return;
     if (layout_ != StereoLayout::SbsFull && layout_ != StereoLayout::SbsHalf) return;
     if (f.gpu || f.plane[0].empty() || f.width < 64 || f.height < 32) return;
     const double nowMs = CameraSource::NowSeconds() * 1000.0;
@@ -1759,10 +1761,10 @@ void App::TickAutoConv() {
         ++autoConvMeasures_;
         autoConvMsSum_ += r.ms;
         autoConvMsMax_ = std::max(autoConvMsMax_, r.ms);
-        if (autoConvEnabled_ && isLive_) autoConvCtl_.Update(r);
+        if (autoConvEnabled_ && LiveSource()) autoConvCtl_.Update(r);
     }
     const bool stereo = layout_ == StereoLayout::SbsFull || layout_ == StereoLayout::SbsHalf;
-    autoConvCtl_.Tick(dt, autoConvEnabled_ && isLive_ && stereo);
+    autoConvCtl_.Tick(dt, autoConvEnabled_ && LiveSource() && stereo);
     autoConvergence_ = autoConvCtl_.Value();
     if (!autoConvEnabled_) return;
     autoConvMin_ = std::min(autoConvMin_, autoConvergence_);
