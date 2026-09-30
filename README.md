@@ -115,6 +115,46 @@ camera backend off, so there no camera is found. SDL's Windows driver has no hot
 so after an unplug use **Rescan** in the Camera menu (or press `C`): it re-lists the
 devices and re-opens the same camera as soon as it is back.
 
+## Auto-convergence (live, #92)
+
+**Off by default**: the live picture is shown raw unless you turn this on. When on, the
+player measures how far apart the subject sits in the two eyes and shifts the eyes in
+opposite directions so the subject lands at the display plane. It measures the pixels
+(NCC block matching on a downsampled luma plane, ~5 Hz, on a side thread). There is no
+face detection and no calibration. Manual `-` / `=` convergence still applies on top.
+
+| control | effect |
+|---|---|
+| `A` / the **Auto-conv** button in the live top bar | on / off (turning it off glides the shift back to 0) |
+| `Shift+A` | subject policy: nearest -> sharp -> centre |
+| `Ctrl+click` on the picture | pin the subject under the cursor (policy `focus`, template-tracked) |
+| `--auto-conv[=nearest\|sharp\|centre]`, `MEDIAPLAYER_AUTO_CONV=<policy>` | start with it on. The CLI wins over the env var. `1`/`on` = the default policy, `0`/`off` = off. |
+| `MEDIAPLAYER_AUTO_CONV_FRONT` / `_REAR` (percent), `MEDIAPLAYER_AUTO_CONV_CLAMP=0` | comfort-clamp budgets / clamp off |
+| MCP `set_auto_convergence {enabled, policy, focus_x, focus_y}` | same, for agents; `get_status` reports the `auto_conv_*` fields |
+
+Subject policies:
+- **nearest** (default): the nearest strong depth plane. This is right for a person in
+  front of the camera, and it is the 3D call's rule.
+- **sharp**: the sharpest quarter of the matched blocks. With a shallow depth of field
+  the sharp region is the subject. If sharpness is flat across the frame it falls back to
+  centre.
+- **centre**: blocks weighted towards the middle of the frame.
+- **focus**: a point you pinned with Ctrl+click.
+
+On top of that measurement:
+- A **comfort clamp** limits the nearest content (95th percentile of the block
+  disparities) to 0.5 % of eye width in front of the plane, and the farthest content
+  (5th percentile) to 1.5 % behind it. When both limits cannot hold, the front limit wins.
+- A median-of-3 hold rides through dropouts such as a hand over the lens.
+- A low-pass and a 0.2 %-of-eye-width-per-second rate limit smooth the shift. A scene cut
+  is the exception: the shift snaps to the new scene.
+
+The HUD shows `autoconv ON nearest  d=…  conv=…  ncc …  … ms`.
+
+The measurement is a port of displayxr-web's `js/call/disparity.js` (the 3D video call's
+auto-convergence), and it keeps that file's thresholds so web and native converge the
+same way. See `src/media/AutoConvergence.h`.
+
 ## Requirements
 
 - A working DisplayXR runtime install (or dev build) — this app cannot run without it.
