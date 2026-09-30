@@ -231,7 +231,31 @@ jobs:
           $prefixU = (& C:\msys64\usr\bin\cygpath.exe -u "$env:FFMPEG_PREFIX").Trim()
           $scriptU = (& C:\msys64\usr\bin\cygpath.exe -u "$PWD\scripts\build-ffmpeg-slim.sh").Trim()
           C:\msys64\usr\bin\bash.exe -lc "FFMPEG_SRC='$srcU' FFMPEG_PREFIX='$prefixU' bash '$scriptU'"
-          if ($LASTEXITCODE -ne 0) { Write-Host '::error::slim FFmpeg build failed'; exit 1 }
+          if ($LASTEXITCODE -ne 0) {
+            # configure's own error is one line ("X requested but not found"); the
+            # WHY is only in ffbuild/config.log. Print the probe transcripts that
+            # matter for the network/TLS build (#93) so a failure carries evidence.
+            $log = Join-Path $src 'ffbuild\config.log'
+            if (Test-Path $log) {
+              Write-Host '::group::ffbuild/config.log - schannel / network probes'
+              Select-String -Path $log -Pattern 'schannel|secur32|ncrypt|crypt32|SEC_I_CONTEXT_EXPIRED|check_func_headers windows.h' -Context 0,40 |
+                ForEach-Object { $_.Line; $_.Context.PostContext } | Select-Object -First 600
+              Write-Host '::endgroup::'
+              Write-Host '::group::ffbuild/config.log - tail'
+              Get-Content $log -Tail 120
+              Write-Host '::endgroup::'
+              Copy-Item $log "$env:RUNNER_TEMP\ffmpeg-config.log"
+            }
+            Write-Host '::error::slim FFmpeg build failed'; exit 1
+          }
+
+      - name: Upload FFmpeg config.log (on failure)
+        if: failure() && needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-config-log
+          path: ${{ runner.temp }}/ffmpeg-config.log
+          if-no-files-found: ignore
 
       - name: Configure + build
         if: needs.DetectChanges.outputs.docs_only != 'true'
