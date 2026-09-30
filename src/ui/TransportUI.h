@@ -35,6 +35,9 @@ struct TransportCaps {
     // Live camera picker + LIVE pill (#90). DEFAULT FALSE: a leg that never sets it
     // (Android) compiles and renders exactly as before.
     bool camera = false;
+    // Stream URL source (#93): the "Stream URL..." row in the Live combo, its popup and
+    // the STREAM pill. DEFAULT FALSE for the same reason as `camera`.
+    bool url = false;
 };
 
 // Everything the widgets read, and the little bit of state they own.
@@ -72,6 +75,14 @@ struct TransportState {
     // Auto-convergence toggle (#92), shown next to Layout while live.
     bool autoConvOn = false;
     std::string autoConvLabel;             // "Auto-conv: off" / "Auto-conv: nearest -1.6%"
+    // Stream URL source (#93) - only read when caps.url.
+    bool isStream = false;
+    std::string streamStatus;  // STREAM | FROZEN | CONNECTING | RECONNECTING | FAILED
+    std::string streamHost;    // "host:port" (no credentials)
+    float streamFps = 0.0f;    // frames decoded per second
+    float streamKbps = 0.0f;   // demuxed bitrate
+    std::string urlSeed;       // last URL (or MEDIAPLAYER_URL): prefills the popup
+    bool urlPopupRequest = false;  // owner (Ctrl+U) or the combo row asks to open it
 
     // ---- UI owns (do not clobber) ------------------------------------------
     // Scrubber. The displayed knob tracks playback EXCEPT while dragging, or
@@ -84,6 +95,8 @@ struct TransportState {
     bool scrubWasPreview = false;
     // Camera picker: open-edge detector, so RefreshCameras fires once per opening.
     bool cameraComboWasOpen = false;
+    // Stream URL popup's edit buffer (#93), seeded from urlSeed each time it opens.
+    char urlBuf[1024] = {};
 
     // Auto-hide fade (whole-UI alpha) and the independent toast fade.
     float fadeAlpha = 0.0f;
@@ -122,8 +135,11 @@ struct TransportActions {
     // StopCamera returns to the idle screen. The LIVE pill fires TogglePlayback (freeze).
     std::function<void(bool rescan)> RefreshCameras;
     std::function<void(int row)> OpenCamera;
-    std::function<void()> StopCamera;
+    std::function<void()> StopCamera;  // "Stop live": stops the camera OR the stream
     std::function<void()> ToggleAutoConv;  // #92, the live top bar's Auto-conv button
+
+    // Stream URL (#93), used only when caps.url: Connect in the URL popup.
+    std::function<void(const std::string& url)> OpenUrl;
 };
 
 // The player's "dark glass" look. `metricScale` is the ONE sanctioned divergence

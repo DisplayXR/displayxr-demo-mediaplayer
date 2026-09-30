@@ -37,6 +37,7 @@ public:
         // command line did not. Empty policy = nearest.
         bool autoConv = false;
         std::string autoConvPolicy;
+        std::string url;             // --url <u> (#93); MEDIAPLAYER_URL fills it otherwise
     };
     void SetLaunchOptions(const LaunchOptions& o) { launch_ = o; }  // before Initialize()
 
@@ -130,6 +131,20 @@ private:
     void OnLiveFrame(const FrameRing::Frame& f);  // first frame / size change -> layout
     void RefreshCameraList(bool rescan);  // fills cameraDevs_ + uiState_.cameraNames
     std::string LiveStatusText() const;   // the top-bar pill's status word
+    // Settle layout_ from a live frame's aspect (camera AND stream): first frame or a
+    // mid-stream size change. `tag` prefixes the log line.
+    void SettleLiveLayout(const FrameRing::Frame& f, const char* tag);
+
+    // Stream URL source (#93) — the network sibling of the live camera. It rides
+    // video_ in live mode (VideoDecoder::OpenLive), so a file, the camera and a stream
+    // are mutually exclusive by construction. LoadUrl classifies (media/StreamUrl.h),
+    // refuses SRT & co. with a toast, and connects asynchronously; PollStream turns
+    // state edges into toasts / log lines.
+    bool LoadUrl(const std::string& url);
+    void StopStream(bool showIdleIfEmpty);
+    void PollStream();
+    void OpenUrlPrompt();                 // Ctrl+U / the combo row: the URL popup
+    std::string StreamStatusText() const; // STREAM | FROZEN | CONNECTING | RECONNECTING | FAILED
 
     // Auto-convergence (#92). DEFAULT OFF: raw footage stays raw unless the operator turns
     // it on. SetAutoConv toggles; the policy cycles nearest -> sharp -> centre (Focus is
@@ -265,6 +280,14 @@ private:
     float autoConvMin_ = 0.0f, autoConvMax_ = 0.0f;
     double autoConvSum_ = 0.0, autoConvMsSum_ = 0.0, autoConvMsMax_ = 0.0;
     uint64_t autoConvTicks_ = 0, autoConvMeasures_ = 0;
+
+    // Stream URL (#93). isStream_ excludes isLive_ and isVideo_ (a stream is not a
+    // seekable video: no transport bar, no scrub, no slideshow).
+    bool isStream_ = false;
+    bool streamPaused_ = false;         // Space = freeze (the stream keeps decoding)
+    std::string streamUrl_;             // what is open (raw, may carry credentials)
+    VideoDecoder::StreamState streamStateSeen_ = VideoDecoder::StreamState::Idle;
+    double streamLogAt_ = 0.0;          // next periodic stats log line (steady seconds)
 
     int mediaW_ = 0;              // full frame dims, for the HUD label
     int mediaH_ = 0;

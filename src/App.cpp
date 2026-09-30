@@ -7,6 +7,7 @@
 #include "media/MediaSource.h"
 #include "media/MpoLoader.h"
 #include "media/StereoDetect.h"
+#include "media/StreamUrl.h"
 #include "media/VideoStereoProbe.h"
 #include "ui/Hud.h"
 
@@ -263,6 +264,24 @@ bool App::Initialize(const char* mediaPath) {
         if (!LoadLive(launch_.cameraSelector)) LOG_WARN("Live camera did not start");
     }
 
+    // Stream URL (#93): --url, a URL given as the media path, or MEDIAPLAYER_URL (which
+    // only auto-opens when the command line named nothing else, and always seeds the
+    // Stream URL popup). Desktop-only UI: Android's TransportCaps leave caps.url false.
+    uiState_.caps.url = true;
+    const char* envUrl = std::getenv("MEDIAPLAYER_URL");
+    uiState_.urlSeed = !launch_.url.empty() ? launch_.url : (envUrl ? envUrl : "");
+    if (!launch_.camera) {
+        std::string url = launch_.url;
+        if (url.empty() && mediaPath && stream::IsNetworkUrl(mediaPath)) url = mediaPath;
+        if (url.empty() && !(mediaPath && *mediaPath) && envUrl && *envUrl) url = envUrl;
+        if (!url.empty()) {
+            if (mediaPath && *mediaPath && url != mediaPath)
+                LOG_WARN("--url given: ignoring the media path '%s'", mediaPath);
+            mediaPath = nullptr;
+            if (!LoadUrl(url)) LOG_WARN("Stream did not start");
+        }
+    }
+
     if (mediaPath && *mediaPath) {
         namespace fs = std::filesystem;
         std::error_code ec;
@@ -416,6 +435,7 @@ int App::Run() {
         if (window_.TakeCaptureRequest()) {                           // 'I' — atlas snapshot
             if (xr_.HasAtlasCapture()) {
                 const std::string stem = isLive_ ? std::string("live")
+                    : isStream_ ? std::string("stream")
                     : currentMediaPath_.empty()
                     ? std::string("capture")
                     : std::filesystem::path(currentMediaPath_).stem().string();
@@ -441,6 +461,7 @@ int App::Run() {
         if (window_.TakeToggleMuteRequest()) { ToggleMute(); activity = true; }            // 'M'
         if (window_.TakeCycleLayoutRequest()) { CycleLayoutOverride(); activity = true; }  // 'L'
         if (window_.TakeToggleCameraRequest()) { ToggleLive(); activity = true; }          // 'C'
+        if (window_.TakeOpenUrlRequest()) { OpenUrlPrompt(); activity = true; }            // Ctrl+U
         // Camera hot-plug events (only arrive once the camera subsystem is up).
         if (std::vector<std::pair<uint32_t, uint32_t>> camEv; window_.TakeCameraEvents(camEv)) {
             for (const auto& ev : camEv) {
@@ -489,6 +510,7 @@ int App::Run() {
         }
 
         PollLive();
+        PollStream();
         if (xr_.IsRunning()) RenderOneFrame();
     }
 
@@ -526,13 +548,18 @@ void App::RenderOneFrame() {
     // does the colour convert + downscale, so no swscale ran on the decode thread.
     // The live camera (#90) publishes into a FrameRing of its own, so it rides the same
     // upload path. Freeze = stop acquiring: the last uploaded texture keeps drawing.
-    FrameRing* ring = isLive_ ? (livePaused_ ? nullptr : &camera_.Ring())
-                              : (isVideo_ ? &video_.Ring() : nullptr);
+    // A stream (#93) is video_ in live mode: same ring, same freeze-by-not-acquiring.
+    window_.SetKeyboardCaptured(false);  // BuildTransportUI re-asserts it while a field is focused
+    FrameRing* ring = isLive_     ? (livePaused_ ? nullptr : &camera_.Ring())
+                      : isStream_ ? (streamPaused_ ? nullptr : &video_.Ring())
+                                  : (isVideo_ ? &video_.Ring() : nullptr);
     if (ring) {
         if (const FrameRing::Frame* vf = ring->AcquireLatest()) {
             if (isLive_) {
                 OnLiveFrame(*vf);
                 SampleAutoConv(*vf);  // ~5 Hz; downsample only, measured on the worker
+            } else if (isStream_) {
+                SettleLiveLayout(*vf, "Stream");
             }
             bool bound = false;
 #if defined(_WIN32)
@@ -773,7 +800,7 @@ void App::RenderOneFrame() {
                 char stereo[200];
                 std::snprintf(stereo, sizeof(stereo), "conv %+.3f  eyes %s%s%s%s", convergence_,
                               swapEyes_ ? "swapped" : "normal",
-                              (isLive_ && livePaused_) ? "  [FROZEN]"
+                              ((isLive_ && livePaused_) || (isStream_ && streamPaused_)) ? "  [FROZEN]"
                               : (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "",
                               isLive_ ? "\n" : "",
                               isLive_ ? AutoConvHudText().c_str() : "");  // #92
@@ -789,6 +816,14 @@ void App::RenderOneFrame() {
                                   fps_, xr_.ActiveModeName(), camera_.DeviceName().c_str(),
                                   mediaW_, mediaH_, layoutLabel.c_str(), cs.deliveredFps,
                                   liveAgeMs_, cw, ch, tileW, tileH, stereo);
+                } else if (isStream_) {
+                    const VideoDecoder::StreamStats ss = video_.GetStreamStats();
+                    std::snprintf(text, sizeof(text),
+                                  "%.0f FPS   %s\nSTREAM %s %dx%d  %.0f fps  %.0f kbit/s  %s\n"
+                                  "win %ux%u  tile %ux%u\n%s",
+                                  fps_, xr_.ActiveModeName(), stream::UrlHost(streamUrl_).c_str(),
+                                  mediaW_, mediaH_, ss.fpsIn, ss.kbps, LayoutLabel().c_str(), cw,
+                                  ch, tileW, tileH, stereo);
                 } else if (isVideo_) {
                     std::snprintf(text, sizeof(text),
                                   "%.0f FPS   %s\nsrc %dx%d  %s  %s/%s\nwin %ux%u  tile %ux%u\n%s",
@@ -849,7 +884,7 @@ void App::BuildTransportUI() {
 
     // Live camera (#90). Slideshow has nothing to advance through while live, so its
     // icon is hidden; the bottom transport hides itself because isVideo is false.
-    uiState_.caps.slideshow = !isLive_;
+    uiState_.caps.slideshow = !isLive_ && !isStream_;
     uiState_.isLive = isLive_;
     uiState_.livePaused = livePaused_;
     uiState_.liveDevice = isLive_ ? camera_.DeviceName() : std::string();
@@ -870,6 +905,16 @@ void App::BuildTransportUI() {
         else
             std::snprintf(t, sizeof(t), "Auto-conv: off");
         uiState_.autoConvLabel = t;
+    }
+    // Stream URL (#93).
+    uiState_.isStream = isStream_;
+    uiState_.streamStatus = isStream_ ? StreamStatusText() : std::string();
+    uiState_.streamHost = isStream_ ? stream::UrlHost(streamUrl_) : std::string();
+    if (isStream_) {
+        const VideoDecoder::StreamStats ss = video_.GetStreamStats();
+        uiState_.streamFps = ss.fpsIn;
+        uiState_.streamKbps = ss.kbps;
+        uiState_.mediaFilename.clear();
     }
 
     ui::TransportActions actions;
@@ -898,10 +943,18 @@ void App::BuildTransportUI() {
             LoadLiveDevice(dev);
         }
     };
-    actions.StopCamera = [this] { StopLive(/*showIdleIfEmpty=*/true); };
+    actions.StopCamera = [this] {
+        if (isStream_) StopStream(/*showIdleIfEmpty=*/true);
+        else StopLive(/*showIdleIfEmpty=*/true);
+    };
+    actions.OpenUrl = [this](const std::string& url) { LoadUrl(url); };
     actions.ToggleAutoConv = [this] { SetAutoConv(!autoConvEnabled_, "ui"); };
 
     ui::BuildTransportUI(uiState_, actions);
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    // A focused text field (the Stream URL popup) owns the keyboard: no hotkeys.
+    window_.SetKeyboardCaptured(ImGui::GetIO().WantTextInput);
+#endif
 }
 
 void App::UpdateFps() {
@@ -1222,8 +1275,9 @@ void App::CycleLayoutOverride() {
 void App::ReloadMedia(const std::string& path) {
     // Every file path (Open, drop, open_file, navigation) lands here, so this is the one
     // place a file replaces the live camera.
-    const bool wasLive = isLive_;
+    const bool wasLive = isLive_ || isStream_;
     if (isLive_) StopLive(/*showIdleIfEmpty=*/false);
+    if (isStream_) StopStream(/*showIdleIfEmpty=*/false);  // #93: a file replaces the stream
     video_.Stop();   // joins the decode thread (which reads the audio clock) FIRST,
     audio_.Stop();   // then tear down audio so the clock callback can't outlive it.
 #if defined(_WIN32)
@@ -1310,6 +1364,7 @@ bool App::LoadLiveDevice(const CameraDevice& dev) {
         if (isLive_) StopLive(/*showIdleIfEmpty=*/true);  // the old camera was closed by Open
         return false;
     }
+    if (isStream_) StopStream(/*showIdleIfEmpty=*/false);  // #93: the camera replaces it
     video_.Stop();   // joins the decode thread before audio (see ReloadMedia)
     audio_.Stop();
 #if defined(_WIN32)
@@ -1395,6 +1450,10 @@ std::string App::LiveStatusText() const {
 
 void App::OnLiveFrame(const FrameRing::Frame& f) {
     liveAgeMs_ = (CameraSource::NowSeconds() - camera_.GetStats().lastPublishSec) * 1000.0;
+    SettleLiveLayout(f, "Live");
+}
+
+void App::SettleLiveLayout(const FrameRing::Frame& f, const char* tag) {
     if (f.width == mediaW_ && f.height == mediaH_) return;
     // First frame, or a mid-stream size change (a capture box switching inputs): settle
     // the layout from the frame aspect. No content detector and no metadata for a live
@@ -1429,9 +1488,147 @@ void App::OnLiveFrame(const FrameRing::Frame& f) {
         layoutSignal_ = StereoSignal::Manual;
     }
     contentAspect_ = PerEyeAspect(layout_, mediaW_, mediaH_);
-    LOG_INFO("Live: %dx%d %s frames, %s, per-eye aspect %.3f", mediaW_, mediaH_,
+    LOG_INFO("%s: %dx%d %s frames, %s, per-eye aspect %.3f", tag, mediaW_, mediaH_,
              f.format == PixFormat::NV12 ? "NV12" : "I420", LayoutLabel().c_str(),
              contentAspect_);
+}
+
+// --- Stream URL (#93) ------------------------------------------------------------------
+
+bool App::LoadUrl(const std::string& url) {
+    const stream::UrlVerdict v = stream::ClassifyUrl(url);
+    const std::string shown = stream::RedactUrl(url);
+    if (v.cls == stream::UrlClass::Unsupported) {
+        LOG_WARN("Stream: refusing '%s': %s", shown.c_str(), v.reason.c_str());
+        ShowToast(v.reason);
+        return false;
+    }
+    if (v.cls == stream::UrlClass::File) {
+        LOG_WARN("Stream: '%s' is not a stream URL", shown.c_str());
+        ShowToast("Not a stream URL: " + shown);
+        return false;
+    }
+    uiState_.urlSeed = url;  // remembered for the popup, even if the connect fails
+    if (isLive_) StopLive(/*showIdleIfEmpty=*/false);
+    video_.Stop();   // joins the decode thread (reads the audio clock) before audio
+    audio_.Stop();
+#if defined(_WIN32)
+    renderer_.ClearSharedImports();
+#endif
+    if (!video_.OpenLive(url)) {  // only without FFmpeg
+        ShowToast("Streams unavailable in this build");
+        isStream_ = false;
+        hasMedia_ = false;
+        mediaW_ = mediaH_ = 0;
+        LoadIdleLogo();
+        return false;
+    }
+    isStream_ = true;
+    streamPaused_ = false;
+    streamUrl_ = url;
+    isVideo_ = false;
+    hasMedia_ = true;
+    // No folder behind a stream: arrows and the slideshow have nothing to step through.
+    currentMediaPath_.clear();
+    folderFiles_.clear();
+    folderIndex_ = 0;
+    playlistFromDrop_ = false;
+    if (uiState_.slideshowActive) SetSlideshow(false);
+    uiState_.scrubValue = 0.0f;
+    uiState_.scrubActive = false;
+    uiState_.scrubTarget = -1.0f;
+    slideshowImageElapsed_ = 0.0;
+    mediaConvergence_ = 0.0f;
+    mediaAutoConvAvailable_ = false;
+    mediaEyeSwap_ = false;
+    // Layout is settled from the first frame (SettleLiveLayout); until then the previous
+    // picture stays up, exactly like the camera.
+    mediaW_ = mediaH_ = 0;
+    streamStateSeen_ = VideoDecoder::StreamState::Connecting;
+    streamLogAt_ = 0.0;
+    LOG_INFO("Stream: connecting to '%s'", shown.c_str());
+    ShowToast("Connecting: " + stream::UrlHost(url));
+    return true;
+}
+
+void App::StopStream(bool showIdleIfEmpty) {
+    video_.Stop();
+    isStream_ = false;
+    streamPaused_ = false;
+    streamStateSeen_ = VideoDecoder::StreamState::Idle;
+    if (showIdleIfEmpty) {
+        hasMedia_ = false;
+        isVideo_ = false;
+        mediaW_ = mediaH_ = 0;
+        LoadIdleLogo();
+    }
+}
+
+void App::OpenUrlPrompt() {
+    showHud_ = true;  // the popup lives on the HUD layer
+    uiState_.urlPopupRequest = true;
+}
+
+std::string App::StreamStatusText() const {
+    if (!isStream_) return std::string();
+    using S = VideoDecoder::StreamState;
+    switch (video_.GetStreamState()) {
+        case S::Streaming: return streamPaused_ ? "FROZEN" : "STREAM";
+        case S::Connecting: return "CONNECTING";
+        case S::Reconnecting: return "RECONNECTING";
+        case S::Failed: return "FAILED";
+        case S::Idle: break;
+    }
+    return "FAILED";
+}
+
+void App::PollStream() {
+    if (!isStream_) return;
+    using S = VideoDecoder::StreamState;
+    const S st = video_.GetStreamState();
+    const std::string host = stream::UrlHost(streamUrl_);
+    if (st != streamStateSeen_) {
+        const S was = streamStateSeen_;
+        streamStateSeen_ = st;
+        const VideoDecoder::StreamStats ss = video_.GetStreamStats();
+        switch (st) {
+            case S::Streaming:
+                LOG_INFO("Stream: '%s' streaming %dx%d %s/%s, first frame %.0f ms after open, "
+                         "reconnects=%d",
+                         host.c_str(), ss.width, ss.height, ss.codec.c_str(), ss.backend.c_str(),
+                         ss.connectMs, ss.reconnects);
+                if (was == S::Reconnecting) ShowToast("Stream back: " + host);
+                break;
+            case S::Reconnecting:
+                LOG_WARN("Stream: '%s' lost (%s) - reconnecting", host.c_str(),
+                         ss.lastError.c_str());
+                ShowToast("Stream lost - reconnecting");
+                break;
+            case S::Failed:
+                LOG_WARN("Stream: '%s' failed: %s", host.c_str(), ss.lastError.c_str());
+                ShowToast("Stream: " + (ss.lastError.empty() ? std::string("failed") : ss.lastError));
+                // Never got a frame: nothing to freeze on, back to the idle screen.
+                if (mediaW_ == 0) StopStream(/*showIdleIfEmpty=*/true);
+                break;
+            default:
+                break;
+        }
+    }
+    // Throttled stats line (every 5 s while streaming) — the log is the headless hook.
+    if (isStream_ && st == S::Streaming) {
+        const double now = CameraSource::NowSeconds();
+        if (now >= streamLogAt_) {
+            if (streamLogAt_ > 0.0) {
+                const VideoDecoder::StreamStats ss = video_.GetStreamStats();
+                LOG_INFO("Stream: %s %dx%d in %.1f fps %.0f kbit/s, panel %.0f fps, frames=%llu "
+                         "dropped=%llu reconnects=%d, %s",
+                         host.c_str(), ss.width, ss.height, ss.fpsIn, ss.kbps, fps_,
+                         (unsigned long long)ss.frames, (unsigned long long)ss.dropped,
+                         ss.reconnects, LayoutLabel().c_str());
+            }
+            streamLogAt_ = now + 5.0;
+        }
+    }
 }
 
 void App::PollLive() {
@@ -1750,7 +1947,7 @@ void App::ShowToast(const std::string& msg) { ui::ShowTransportToast(uiState_, m
 void App::ToggleSlideshow() { SetSlideshow(!uiState_.slideshowActive); }
 
 void App::SetSlideshow(bool on) {
-    if (on && isLive_) {
+    if (on && (isLive_ || isStream_)) {
         ShowToast("Slideshow unavailable while live");
         return;
     }
@@ -1855,6 +2052,13 @@ void App::TogglePlayback() {
         livePaused_ = !livePaused_;
         LOG_INFO("live %s", livePaused_ ? "frozen" : "resumed");
         ShowToast(livePaused_ ? "Live - frozen" : "Live");
+        return;
+    }
+    if (isStream_) {
+        // Same freeze as the camera: the stream keeps decoding (no reconnect on resume).
+        streamPaused_ = !streamPaused_;
+        LOG_INFO("stream %s", streamPaused_ ? "frozen" : "resumed");
+        ShowToast(streamPaused_ ? "Stream - frozen" : "Stream");
         return;
     }
     if (!isVideo_) return;
@@ -1991,8 +2195,21 @@ void App::SetupAgentTools() {
         "\"focus_y\":{\"type\":\"number\",\"minimum\":0,\"maximum\":1}}}");
 
     xr_.RegisterMcpTool(
+        "open_url",
+        "Open a live network stream by URL, replacing the current media: rtsp://, rtmp(s)://, "
+        "udp:// or rtp:// (MPEG-TS), http(s):// (progressive TS/FLV/fMP4) or an HLS .m3u8. "
+        "Connects asynchronously: poll get_status (stream_state becomes 'streaming'; "
+        "'reconnecting' after a loss, 'failed' once it gives up). srt:// is refused. The "
+        "layout is guessed from the frame aspect; set_layout overrides it and play_pause "
+        "freezes/resumes the picture. Stop it with close_camera, or by opening anything else.",
+        "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\","
+        "\"description\":\"Stream URL, e.g. rtsp://192.168.1.10:554/stream1 or "
+        "udp://127.0.0.1:5004.\"}},\"required\":[\"url\"]}");
+
+    xr_.RegisterMcpTool(
         "close_camera",
-        "Stop the live camera and return to the idle screen. Errors if no camera is live.",
+        "Stop the live camera (or live stream) and return to the idle screen. Errors if "
+        "neither is live.",
         "{\"type\":\"object\"}");
 
     xr_.SetMcpToolHandler([this](const std::string& tool, const std::string& args,
@@ -2023,7 +2240,9 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         }
     }
 
-    const bool playing = isLive_ ? !livePaused_ : (isVideo_ && !video_.Paused());
+    const bool playing = isLive_     ? !livePaused_
+                         : isStream_ ? !streamPaused_
+                                     : (isVideo_ && !video_.Paused());
     const double positionS = isVideo_ ? video_.PositionSeconds() : 0.0;
     const double durationS = isVideo_ ? video_.DurationSeconds() : 0.0;
 
@@ -2083,7 +2302,9 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
     }
     if (tool == "play_pause") {
         TogglePlayback();
-        out["playing"] = isLive_ ? !livePaused_ : (isVideo_ && !video_.Paused());
+        out["playing"] = isLive_     ? !livePaused_
+                         : isStream_ ? !streamPaused_
+                                     : (isVideo_ && !video_.Paused());
         out["position_s"] = isVideo_ ? video_.PositionSeconds() : 0.0;
         return out.dump();
     }
@@ -2173,6 +2394,27 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
             out["panel_fps"] = fps_;
             out["camera_error"] = camera_.LastError();
         }
+        // Stream URL (#93).
+        out["stream"] = isStream_;
+        out["stream_paused"] = streamPaused_;
+        out["stream_url"] = isStream_ ? stream::RedactUrl(streamUrl_) : std::string();
+        out["stream_state"] =
+            isStream_ ? VideoDecoder::StreamStateName(video_.GetStreamState()) : "closed";
+        if (isStream_) {
+            const VideoDecoder::StreamStats ss = video_.GetStreamStats();
+            out["stream_fps"] = ss.fpsIn;
+            out["stream_kbps"] = ss.kbps;
+            out["reconnects"] = ss.reconnects;
+            out["stream_width"] = ss.width;
+            out["stream_height"] = ss.height;
+            out["stream_frames"] = ss.frames;
+            out["stream_dropped"] = ss.dropped;
+            out["stream_connect_ms"] = ss.connectMs;
+            out["stream_codec"] = ss.codec;
+            out["stream_backend"] = ss.backend;
+            out["stream_error"] = ss.lastError;
+            out["panel_fps"] = fps_;
+        }
         return out.dump();
     }
     if (tool == "set_layout") {
@@ -2237,12 +2479,29 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["camera_state"] = CameraSource::StateName(camera_.GetState());
         return out.dump();
     }
-    if (tool == "close_camera") {
-        if (!isLive_) {
+    if (tool == "open_url") {
+        if (!args.contains("url") || !args["url"].is_string() ||
+            args["url"].get<std::string>().empty()) {
             success = false;
-            return "{\"error\":\"no camera is live\"}";
+            return "{\"error\":\"missing required string arg 'url'\"}";
         }
-        StopLive(/*showIdleIfEmpty=*/true);
+        if (!LoadUrl(args["url"].get<std::string>())) {
+            success = false;
+            out["error"] = uiState_.toastText.empty() ? std::string("stream did not open")
+                                                      : uiState_.toastText;
+            return out.dump();
+        }
+        out["stream_url"] = stream::RedactUrl(streamUrl_);
+        out["stream_state"] = VideoDecoder::StreamStateName(video_.GetStreamState());
+        return out.dump();
+    }
+    if (tool == "close_camera") {
+        if (!isLive_ && !isStream_) {
+            success = false;
+            return "{\"error\":\"no camera or stream is live\"}";
+        }
+        if (isStream_) StopStream(/*showIdleIfEmpty=*/true);
+        else StopLive(/*showIdleIfEmpty=*/true);
         out["live"] = false;
         return out.dump();
     }

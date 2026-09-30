@@ -119,6 +119,11 @@ public:
     // Ctrl+left-click since the last read, in window POINT coordinates (#92: pin the
     // auto-convergence subject). False if none.
     bool TakeCtrlClick(float& x, float& y);
+    bool TakeOpenUrlRequest();         // Ctrl+U — the stream-URL popup (#93)
+    // While an ImGui text field has focus the app's single-key shortcuts (Space, L, V,
+    // ESC-quits, ...) must not fire on what the user types. The app sets this each frame
+    // from ImGui's WantTextInput; PumpEvents then leaves key-downs to ImGui alone.
+    void SetKeyboardCaptured(bool c) { keyboardCaptured_ = c; }
     // SDL camera events since the last read, as {SDL event type, SDL_CameraID} pairs
     // (ADDED / REMOVED / APPROVED / DENIED). Moved into `out`; false if none. They only
     // arrive once the app has initialised SDL's camera subsystem.
@@ -163,6 +168,8 @@ private:
     bool cycleAutoConvPolicyRequested_ = false;
     bool ctrlClick_ = false;
     float ctrlClickX_ = 0.0f, ctrlClickY_ = 0.0f;
+    bool openUrlRequested_ = false;
+    bool keyboardCaptured_ = false;
     std::vector<std::pair<uint32_t, uint32_t>> cameraEvents_;
     std::vector<std::string> dropBatch_;
     bool mouseActivity_ = false;
