@@ -223,6 +223,12 @@ bool Window::PumpEvents() {
         // of tiny MOTION events that would otherwise pin the UI permanently visible.
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_WHEEL)
             mouseActivity_ = true;
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT &&
+            (SDL_GetModState() & SDL_KMOD_CTRL)) {
+            ctrlClick_ = true;  // #92: pin the auto-convergence subject
+            ctrlClickX_ = e.button.x;
+            ctrlClickY_ = e.button.y;
+        }
         if (e.type == SDL_EVENT_WINDOW_MOUSE_ENTER) { mouseInWindow_ = true; mouseActivity_ = true; }
         if (e.type == SDL_EVENT_WINDOW_MOUSE_LEAVE) { mouseInWindow_ = false; mouseLeft_ = true; }
         // Drag and drop (#44). SDL3 delivers this on Windows, macOS and X11 through the
@@ -274,6 +280,10 @@ bool Window::PumpEvents() {
                 if (e.key.key == SDLK_C && !(e.key.mod & SDL_KMOD_CTRL))
                     toggleCameraRequested_ = true;  // live camera on/off (#90)
                 if (e.key.key == SDLK_I) captureRequested_ = true;  // snapshot the atlas
+                if (e.key.key == SDLK_A && !(e.key.mod & SDL_KMOD_CTRL)) {  // auto-conv (#92)
+                    if (e.key.mod & SDL_KMOD_SHIFT) cycleAutoConvPolicyRequested_ = true;
+                    else toggleAutoConvRequested_ = true;
+                }
                 if (e.key.key == SDLK_O && (e.key.mod & SDL_KMOD_CTRL)) openFileRequested_ = true; // Ctrl+O — open
                 if (e.key.key == SDLK_F || e.key.key == SDLK_F11) ToggleFullscreen();
             }
@@ -358,6 +368,26 @@ bool Window::TakeToggleCameraRequest() {
     bool v = toggleCameraRequested_;
     toggleCameraRequested_ = false;
     return v;
+}
+
+bool Window::TakeToggleAutoConvRequest() {
+    bool v = toggleAutoConvRequested_;
+    toggleAutoConvRequested_ = false;
+    return v;
+}
+
+bool Window::TakeCycleAutoConvPolicyRequest() {
+    bool v = cycleAutoConvPolicyRequested_;
+    cycleAutoConvPolicyRequested_ = false;
+    return v;
+}
+
+bool Window::TakeCtrlClick(float& x, float& y) {
+    if (!ctrlClick_) return false;
+    ctrlClick_ = false;
+    x = ctrlClickX_;
+    y = ctrlClickY_;
+    return true;
 }
 
 bool Window::TakeCameraEvents(std::vector<std::pair<uint32_t, uint32_t>>& out) {

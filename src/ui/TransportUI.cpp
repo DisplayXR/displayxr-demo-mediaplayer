@@ -368,6 +368,17 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                                       s.layoutTooltip.c_str());
                 }
             }
+            // Auto-convergence (#92): live only. Highlighted while on.
+            if (s.caps.camera && s.isLive && !s.autoConvLabel.empty()) {
+                ImGui::SameLine();
+                if (s.autoConvOn)
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                if (ImGui::Button(s.autoConvLabel.c_str())) Fire(a.ToggleAutoConv);
+                if (s.autoConvOn) ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("A: auto-convergence on/off\nShift+A: nearest / sharp / centre\n"
+                                      "Ctrl+click the picture: pin the subject");
+            }
             // Current filename, centered in the bar - or the LIVE pill in its place.
             if (s.caps.camera && s.isLive) {
                 LivePill(s, a);

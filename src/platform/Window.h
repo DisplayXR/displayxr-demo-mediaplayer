@@ -114,6 +114,11 @@ public:
     bool TakeToggleMuteRequest();      // `M` — toggle audio mute
     bool TakeCycleLayoutRequest();     // `L` — cycle the stereo-layout override (#45)
     bool TakeToggleCameraRequest();    // `C` — live camera on/off (#90)
+    bool TakeToggleAutoConvRequest();  // `A` — auto-convergence on/off (#92)
+    bool TakeCycleAutoConvPolicyRequest();  // Shift+A — next subject policy (#92)
+    // Ctrl+left-click since the last read, in window POINT coordinates (#92: pin the
+    // auto-convergence subject). False if none.
+    bool TakeCtrlClick(float& x, float& y);
     // SDL camera events since the last read, as {SDL event type, SDL_CameraID} pairs
     // (ADDED / REMOVED / APPROVED / DENIED). Moved into `out`; false if none. They only
     // arrive once the app has initialised SDL's camera subsystem.
@@ -154,6 +159,10 @@ private:
     bool toggleMuteRequested_ = false;
     bool cycleLayoutRequested_ = false;
     bool toggleCameraRequested_ = false;
+    bool toggleAutoConvRequested_ = false;
+    bool cycleAutoConvPolicyRequested_ = false;
+    bool ctrlClick_ = false;
+    float ctrlClickX_ = 0.0f, ctrlClickY_ = 0.0f;
     std::vector<std::pair<uint32_t, uint32_t>> cameraEvents_;
     std::vector<std::string> dropBatch_;
     bool mouseActivity_ = false;

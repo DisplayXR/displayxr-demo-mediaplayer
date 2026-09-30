@@ -6,6 +6,7 @@
 #pragma once
 
 #include "media/AudioPlayer.h"
+#include "media/AutoConvergence.h"
 #include "media/CameraSource.h"
 #include "media/MediaSource.h"
 #include "media/VideoDecoder.h"
@@ -32,6 +33,10 @@ public:
         bool camera = false;         // --camera[=<selector>]: start on the live camera
         std::string cameraSelector;  // "" / auto | index | name substring (CameraSelect)
         int cameraFps = 0;           // --camera-fps=<N>; 0 = highest <= 60
+        // --auto-conv[=nearest|sharp|centre] (#92); MEDIAPLAYER_AUTO_CONV fills it when the
+        // command line did not. Empty policy = nearest.
+        bool autoConv = false;
+        std::string autoConvPolicy;
     };
     void SetLaunchOptions(const LaunchOptions& o) { launch_ = o; }  // before Initialize()
 
@@ -125,6 +130,18 @@ private:
     void OnLiveFrame(const FrameRing::Frame& f);  // first frame / size change -> layout
     void RefreshCameraList(bool rescan);  // fills cameraDevs_ + uiState_.cameraNames
     std::string LiveStatusText() const;   // the top-bar pill's status word
+
+    // Auto-convergence (#92). DEFAULT OFF: raw footage stays raw unless the operator turns
+    // it on. SetAutoConv toggles; the policy cycles nearest -> sharp -> centre (Focus is
+    // entered by Ctrl+click / the MCP tool). SampleAutoConv hands the frame the renderer
+    // just acquired to the worker (~5 Hz, downsampled in place, no full-frame copy);
+    // TickAutoConv advances the smoothed shift every rendered frame.
+    void SetAutoConv(bool on, const char* why);
+    void SetAutoConvPolicy(autoconv::SubjectPolicy p);
+    void SetAutoConvFocus(float u, float v);  // left-eye normalised; switches to Focus
+    void SampleAutoConv(const FrameRing::Frame& f);
+    void TickAutoConv();
+    std::string AutoConvHudText() const;
 
     // Agent tools (XR_DXR_mcp_tools). SetupAgentTools registers the player's controls as
     // MCP tools on the runtime's per-process server (no-op when the MCP gate is off);
@@ -227,6 +244,27 @@ private:
     double liveAgeMs_ = 0.0;            // publish -> upload age of the last uploaded frame
     double liveSlowSince_ = -1.0;       // start of a delivered-fps shortfall (rung-4 hint)
     bool liveSlowWarned_ = false;
+
+    // Auto-convergence (#92). autoConvergence_ is the smoothed per-eye shift as a fraction
+    // of the EYE's on-screen width (not the tile's), applied on top of convergence_ and
+    // mediaConvergence_. It is exactly 0 while the feature has never been enabled.
+    bool autoConvEnabled_ = false;
+    autoconv::SubjectPolicy autoConvPolicy_ = autoconv::SubjectPolicy::Nearest;
+    bool autoConvHasFocus_ = false;
+    float autoConvFocus_[2] = {0.5f, 0.5f};
+    float autoConvergence_ = 0.0f;
+    autoconv::AutoConvergenceWorker autoConvWorker_;
+    autoconv::AutoConvergenceController autoConvCtl_;
+    autoconv::Result autoConvLast_{};
+    bool autoConvHaveResult_ = false;
+    double autoConvLastSubmitMs_ = -1e9;  // steady ms of the last worker submission
+    double autoConvDownsampleMs_ = 0.0;   // render-thread cost of the last submission
+    double autoConvLastTickSec_ = -1.0;
+    double autoConvLastLogSec_ = 0.0;
+    // Applied-value stats since the last enable (get_status / the 1 s log line).
+    float autoConvMin_ = 0.0f, autoConvMax_ = 0.0f;
+    double autoConvSum_ = 0.0, autoConvMsSum_ = 0.0, autoConvMsMax_ = 0.0;
+    uint64_t autoConvTicks_ = 0, autoConvMeasures_ = 0;
 
     int mediaW_ = 0;              // full frame dims, for the HUD label
     int mediaH_ = 0;
