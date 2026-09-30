@@ -3,9 +3,12 @@
 
 #include "Log.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
 
 // Include the D3D/DXGI C++ headers first (with C++ linkage): FFmpeg's
@@ -329,7 +332,7 @@ bool VideoDecoder::TryEnableHwAccel(const void* decoder) {
         // Prefer a D3D11 device pinned to the Vulkan adapter so decoded surfaces can be
         // shared into Vulkan zero-copy (issue #28). Falls through to FFmpeg's own device
         // if the LUID isn't set or the pinned device can't be created.
-        if (type == AV_HWDEVICE_TYPE_D3D11VA && haveInteropLUID_) {
+        if (type == AV_HWDEVICE_TYPE_D3D11VA && haveInteropLUID_ && !live_) {  // #93: no zero-copy live
             dev = CreateD3D11VADeviceOnLUID(interopLUID_);
             if (dev) {
                 interopActive_ = true;
@@ -385,42 +388,11 @@ bool VideoDecoder::Open(const std::string& path) {
         return false;
     }
     codecName_ = dec->name;
-    AVStream* st = impl_->fmt->streams[impl_->videoStream];
-
-    // Build the codec context; try hardware decode, fall back to software if either
-    // the device won't init or the hw-configured decoder won't open.
-    impl_->codec = avcodec_alloc_context3(dec);
-    avcodec_parameters_to_context(impl_->codec, st->codecpar);
-    const bool wantHw = TryEnableHwAccel(dec);
-    // Always allow auto multithreading. Hardware decode ignores thread_count; but when a
-    // stream is too wide for the GPU (PickHwFormat falls back to software PER FRAME), this
-    // is what keeps that fallback multithreaded instead of crawling on one core — the case
-    // for 7680-wide SBS clips, where single-threaded software decode misses the budget.
-    impl_->codec->thread_count = 0;
-
-    int rc = avcodec_open2(impl_->codec, dec, nullptr);
-    if (rc < 0 && wantHw) {
-        LOG_WARN("VideoDecoder: hwaccel '%s' failed to open decoder; retrying software",
-                 hwName_);
-        // Drop the hw context entirely and rebuild a clean software decoder.
-        avcodec_free_context(&impl_->codec);
-        av_buffer_unref(&impl_->hwDevice);
-        impl_->hwPixFmt = AV_PIX_FMT_NONE;
-        hardware_ = false;
-        hwName_ = "software";
-#if defined(_WIN32)
-        interopActive_ = false;  // no hw device -> no zero-copy
-#endif
-        impl_->codec = avcodec_alloc_context3(dec);
-        avcodec_parameters_to_context(impl_->codec, st->codecpar);
-        impl_->codec->thread_count = 0;
-        rc = avcodec_open2(impl_->codec, dec, nullptr);
-    }
-    if (rc < 0) {
-        LOG_ERROR("VideoDecoder: cannot open decoder for '%s'", path.c_str());
+    if (!OpenVideoCodec(dec, path)) {
         impl_.reset();
         return false;
     }
+    AVStream* st = impl_->fmt->streams[impl_->videoStream];
 
     width_ = impl_->codec->width;
     height_ = impl_->codec->height;
@@ -453,10 +425,56 @@ bool VideoDecoder::Open(const std::string& path) {
     return true;
 }
 
+bool VideoDecoder::OpenVideoCodec(const void* decoder, const std::string& label) {
+    const AVCodec* dec = static_cast<const AVCodec*>(decoder);
+    AVStream* st = impl_->fmt->streams[impl_->videoStream];
+
+    // Build the codec context; try hardware decode, fall back to software if either
+    // the device won't init or the hw-configured decoder won't open.
+    impl_->codec = avcodec_alloc_context3(dec);
+    avcodec_parameters_to_context(impl_->codec, st->codecpar);
+    const bool wantHw = TryEnableHwAccel(dec);
+    // Always allow auto multithreading. Hardware decode ignores thread_count; but when a
+    // stream is too wide for the GPU (PickHwFormat falls back to software PER FRAME), this
+    // is what keeps that fallback multithreaded instead of crawling on one core — the case
+    // for 7680-wide SBS clips, where single-threaded software decode misses the budget.
+    impl_->codec->thread_count = 0;
+    // Live (#93): output each frame as soon as it is decodable (no frame-thread delay
+    // queue beyond what the codec needs).
+    if (live_) impl_->codec->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+    int rc = avcodec_open2(impl_->codec, dec, nullptr);
+    if (rc < 0 && wantHw) {
+        LOG_WARN("VideoDecoder: hwaccel '%s' failed to open decoder; retrying software",
+                 hwName_);
+        // Drop the hw context entirely and rebuild a clean software decoder.
+        avcodec_free_context(&impl_->codec);
+        av_buffer_unref(&impl_->hwDevice);
+        impl_->hwPixFmt = AV_PIX_FMT_NONE;
+        hardware_ = false;
+        hwName_ = "software";
+#if defined(_WIN32)
+        interopActive_ = false;  // no hw device -> no zero-copy
+#endif
+        impl_->codec = avcodec_alloc_context3(dec);
+        avcodec_parameters_to_context(impl_->codec, st->codecpar);
+        impl_->codec->thread_count = 0;
+        if (live_) impl_->codec->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        rc = avcodec_open2(impl_->codec, dec, nullptr);
+    }
+    if (rc < 0) {
+        LOG_ERROR("VideoDecoder: cannot open decoder for '%s'", label.c_str());
+        return false;
+    }
+    return true;
+}
+
 void VideoDecoder::DecodeLoop() {
     using clock = std::chrono::steady_clock;
-    AVStream* st = impl_->fmt->streams[impl_->videoStream];
-    const double timeBase = av_q2d(st->time_base);
+    // Live (#93): impl_ does not exist yet — LiveLoop connects on this thread and
+    // re-points timeBase at each connection's stream.
+    double timeBase = 0.0;
+    if (!live_) timeBase = av_q2d(impl_->fmt->streams[impl_->videoStream]->time_base);
 
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
@@ -689,6 +707,13 @@ void VideoDecoder::DecodeLoop() {
         return (ticks != AV_NOPTS_VALUE) ? (double)ticks * timeBase : -1.0;
     };
 
+    if (live_) {
+        av_frame_free(&frame);
+        av_packet_free(&pkt);
+        LiveLoop([&](void* f) { return fillFrame(static_cast<AVFrame*>(f)); }, timeBase);
+        return;
+    }
+
     while (!stop_.load()) {
         // Seek (serviced even while paused). A decoder needs several packets after a
         // flush to emit a frame, so we DECODE FORWARD from the keyframe to the exact
@@ -842,6 +867,7 @@ void VideoDecoder::DecodeLoop() {
 }
 
 void VideoDecoder::Seek(double seconds, bool preview) {
+    if (live_) return;  // a live stream has no timeline (#93)
     if (seconds < 0.0) seconds = 0.0;
     // Leave a little headroom before EOF so the forward-decode always finds a frame at
     // or after the target (otherwise a seek to the very end lands nothing to display).
@@ -872,6 +898,307 @@ void VideoDecoder::Stop() {
     }
 #endif
     impl_.reset();
+    live_ = false;
+    streamState_.store(StreamState::Idle);
+    ioDeadlineNs_.store(0);
+}
+
+// ---- Live network stream (#93) --------------------------------------------------------
+
+namespace {
+int64_t SteadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::string AvErrorText(int err) {
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {};
+    av_strerror(err, buf, sizeof(buf));
+    return buf;
+}
+
+// Errors a retry cannot fix: the build lacks the protocol/demuxer/decoder, or the
+// server said no.
+bool IsFatalOpenError(int err) {
+    return err == AVERROR_PROTOCOL_NOT_FOUND || err == AVERROR_DEMUXER_NOT_FOUND ||
+           err == AVERROR_DECODER_NOT_FOUND || err == AVERROR_STREAM_NOT_FOUND ||
+           err == AVERROR_HTTP_BAD_REQUEST || err == AVERROR_HTTP_UNAUTHORIZED ||
+           err == AVERROR_HTTP_FORBIDDEN || err == AVERROR_HTTP_NOT_FOUND;
+}
+
+std::string LowerScheme(const std::string& url) {
+    const size_t p = url.find("://");
+    std::string s = (p == std::string::npos) ? std::string() : url.substr(0, p);
+    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
+}
+
+bool IsHls(const std::string& url) {
+    std::string path = url.substr(0, url.find_first_of("?#"));
+    if (path.size() < 5) return false;
+    std::string ext = path.substr(path.size() - 5);
+    for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+    return ext == ".m3u8";
+}
+
+constexpr int64_t kSec = 1000000000LL;
+}  // namespace
+
+const char* VideoDecoder::StreamStateName(StreamState s) {
+    switch (s) {
+        case StreamState::Idle: return "idle";
+        case StreamState::Connecting: return "connecting";
+        case StreamState::Streaming: return "streaming";
+        case StreamState::Reconnecting: return "reconnecting";
+        case StreamState::Failed: return "failed";
+    }
+    return "idle";
+}
+
+int VideoDecoder::InterruptCallback(void* self) {
+    auto* d = static_cast<VideoDecoder*>(self);
+    if (d->stop_.load()) return 1;
+    const int64_t dl = d->ioDeadlineNs_.load();
+    return (dl != 0 && SteadyNowNs() > dl) ? 1 : 0;
+}
+
+VideoDecoder::StreamStats VideoDecoder::GetStreamStats() const {
+    std::lock_guard<std::mutex> lk(statsMutex_);
+    return stats_;
+}
+
+bool VideoDecoder::OpenLive(const std::string& url) {
+    Stop();
+    static std::once_flag netInit;
+    std::call_once(netInit, [] { avformat_network_init(); });
+    live_ = true;
+    streamUrl_ = url;
+    {
+        std::lock_guard<std::mutex> lk(statsMutex_);
+        stats_ = StreamStats{};
+    }
+    durationSec_ = 0.0;
+    frameRate_ = 0.0;
+    width_ = height_ = 0;
+    positionSec_.store(0.0);
+    seekRequest_.store(-1.0);
+    ended_.store(false);
+    paused_.store(false);
+    streamState_.store(StreamState::Connecting);
+    open_ = true;
+    stop_ = false;
+    thread_ = std::thread(&VideoDecoder::DecodeLoop, this);
+    return true;
+}
+
+bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
+    fatal = false;
+    impl_ = std::make_unique<Impl>();
+    hardware_ = false;
+    hwName_ = "software";
+#if defined(_WIN32)
+    interopActive_ = false;
+#endif
+    impl_->fmt = avformat_alloc_context();
+    impl_->fmt->interrupt_callback.callback = &VideoDecoder::InterruptCallback;
+    impl_->fmt->interrupt_callback.opaque = this;
+
+    // Low-latency demux. Unknown keys are simply left unconsumed by protocols/demuxers
+    // that don't have them, so one dictionary serves every scheme.
+    const std::string scheme = LowerScheme(streamUrl_);
+    const bool hls = IsHls(streamUrl_);
+    AVDictionary* opts = nullptr;
+    av_dict_set(&opts, "fflags", "nobuffer", 0);
+    av_dict_set(&opts, "max_delay", "500000", 0);           // demuxer reorder window, us
+    if (!hls) {
+        // Small, but enough to see an SPS/PPS + the first IDR of a 4K SBS stream.
+        av_dict_set(&opts, "probesize", "1000000", 0);
+        av_dict_set(&opts, "analyzeduration", "1500000", 0);
+    }
+    av_dict_set(&opts, "rw_timeout", "5000000", 0);          // any protocol: dead peer, us
+    if (scheme == "rtsp" || scheme == "rtsps") {
+        av_dict_set(&opts, "rtsp_transport", "tcp", 0);      // no UDP loss / NAT trouble
+        av_dict_set(&opts, "reorder_queue_size", "16", 0);
+        av_dict_set(&opts, "timeout", "5000000", 0);         // socket I/O timeout, us
+    } else if (scheme == "udp" || scheme == "rtp") {
+        av_dict_set(&opts, "timeout", "5000000", 0);         // raise an error after 5 s silence
+        av_dict_set(&opts, "buffer_size", "16777216", 0);    // 4K I-frames arrive in bursts
+        av_dict_set(&opts, "overrun_nonfatal", "1", 0);
+        av_dict_set(&opts, "fifo_size", "1000000", 0);
+    } else if (scheme == "http" || scheme == "https" || scheme == "tcp") {
+        av_dict_set(&opts, "timeout", "5000000", 0);
+        if (scheme != "tcp") {
+            av_dict_set(&opts, "reconnect", "1", 0);
+            av_dict_set(&opts, "reconnect_streamed", "1", 0);
+            av_dict_set(&opts, "reconnect_on_network_error", "1", 0);
+            av_dict_set(&opts, "reconnect_delay_max", "2", 0);
+        }
+    }
+
+    // Connect + probe must finish inside this budget (a dead server fails fast; Stop()
+    // interrupts it at once through the callback).
+    ioDeadlineNs_.store(SteadyNowNs() + (hls ? 15 : 8) * kSec);
+    int rc = avformat_open_input(&impl_->fmt, streamUrl_.c_str(), nullptr, &opts);
+    av_dict_free(&opts);
+    if (rc < 0) {
+        impl_->fmt = nullptr;  // avformat_open_input frees it on failure
+        err = (rc == AVERROR_EXIT && !stop_.load()) ? "connect timed out" : AvErrorText(rc);
+        fatal = IsFatalOpenError(rc);
+        ioDeadlineNs_.store(0);
+        return false;
+    }
+    rc = avformat_find_stream_info(impl_->fmt, nullptr);
+    if (rc < 0) {
+        err = (rc == AVERROR_EXIT) ? "no stream info (timed out)" : AvErrorText(rc);
+        ioDeadlineNs_.store(0);
+        return false;
+    }
+    ioDeadlineNs_.store(0);
+
+#if LIBAVFORMAT_VERSION_MAJOR >= 59
+    const AVCodec* dec = nullptr;
+#else
+    AVCodec* dec = nullptr;
+#endif
+    impl_->videoStream = av_find_best_stream(impl_->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
+    if (impl_->videoStream < 0 || !dec) {
+        err = (impl_->videoStream == AVERROR_DECODER_NOT_FOUND) ? "no decoder for the video codec"
+                                                                 : "no video stream";
+        fatal = true;
+        return false;
+    }
+    // Audio / data streams are dropped at the demuxer (v1: no audio for streams).
+    for (unsigned i = 0; i < impl_->fmt->nb_streams; ++i)
+        if ((int)i != impl_->videoStream) impl_->fmt->streams[i]->discard = AVDISCARD_ALL;
+    codecName_ = dec->name;
+    if (!OpenVideoCodec(dec, streamUrl_)) {
+        err = "cannot open the video decoder";
+        fatal = true;
+        return false;
+    }
+    AVStream* st = impl_->fmt->streams[impl_->videoStream];
+    frameRate_ = av_q2d(st->avg_frame_rate);
+    if (frameRate_ <= 0.0) frameRate_ = av_q2d(st->r_frame_rate);
+    return true;
+}
+
+void VideoDecoder::LiveLoop(const std::function<double(void*)>& fill, double& timeBase) {
+    using clock = std::chrono::steady_clock;
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    const bool hls = IsHls(streamUrl_);
+    const int64_t readTimeoutNs = (hls ? 15 : 5) * kSec;
+
+    // Before the first successful stream a dead URL gives up after kMaxInitialFailures
+    // (1 + 2 + 4 s of backoff); once it has streamed, it retries forever (the sender
+    // may come back) with backoff capped at 8 s.
+    constexpr int kMaxInitialFailures = 3;
+    int initialFailures = 0;
+    bool everStreamed = false;
+    int backoffSec = 1;
+
+    auto setError = [&](const std::string& e) {
+        std::lock_guard<std::mutex> lk(statsMutex_);
+        stats_.lastError = e;
+    };
+
+    while (!stop_.load()) {
+        const auto t0 = clock::now();
+        std::string err;
+        bool fatal = false;
+        if (OpenLiveInput(err, fatal)) {
+            timeBase = av_q2d(impl_->fmt->streams[impl_->videoStream]->time_base);
+            LOG_INFO("VideoDecoder: stream opened in %.0f ms (codec=%s backend=%s)",
+                     std::chrono::duration<double, std::milli>(clock::now() - t0).count(),
+                     codecName_, hwName_);
+            {
+                std::lock_guard<std::mutex> lk(statsMutex_);
+                stats_.codec = codecName_;
+                stats_.backend = hwName_;
+            }
+            bool gotFrame = false;
+            auto winStart = clock::now();
+            uint64_t winFrames = 0, winBytes = 0;
+            for (;;) {
+                if (stop_.load()) break;
+                ioDeadlineNs_.store(SteadyNowNs() + readTimeoutNs);
+                const int r = av_read_frame(impl_->fmt, pkt);
+                if (r < 0) {
+                    if (stop_.load()) break;
+                    err = (r == AVERROR_EOF) ? "stream ended"
+                          : (r == AVERROR_EXIT) ? "no data for 5 s"
+                                                : AvErrorText(r);
+                    break;
+                }
+                winBytes += (uint64_t)pkt->size;
+                if (pkt->stream_index == impl_->videoStream &&
+                    avcodec_send_packet(impl_->codec, pkt) == 0) {
+                    while (!stop_.load() && avcodec_receive_frame(impl_->codec, frame) == 0) {
+                        const double pts = fill(frame);
+                        if (pts <= -2.0) continue;  // hw download failed: dropped
+                        if (pts >= 0.0) positionSec_.store(pts);
+                        const bool overwrote = ring_.Publish();
+                        ++winFrames;
+                        std::lock_guard<std::mutex> lk(statsMutex_);
+                        ++stats_.frames;
+                        if (overwrote) ++stats_.dropped;
+                        stats_.width = frame->width;
+                        stats_.height = frame->height;
+                        stats_.backend = hwName_;  // PickHwFormat may fall back per frame
+                        if (!gotFrame) {
+                            gotFrame = true;
+                            stats_.connectMs =
+                                std::chrono::duration<double, std::milli>(clock::now() - t0)
+                                    .count();
+                            stats_.lastError.clear();
+                            if (everStreamed) ++stats_.reconnects;
+                            everStreamed = true;
+                            backoffSec = 1;
+                            width_ = frame->width;
+                            height_ = frame->height;
+                            streamState_.store(StreamState::Streaming);
+                        }
+                    }
+                }
+                av_packet_unref(pkt);
+                const double winSec =
+                    std::chrono::duration<double>(clock::now() - winStart).count();
+                if (winSec >= 1.0) {
+                    std::lock_guard<std::mutex> lk(statsMutex_);
+                    stats_.fpsIn = (float)(winFrames / winSec);
+                    stats_.kbps = (float)(winBytes * 8.0 / 1000.0 / winSec);
+                    winStart = clock::now();
+                    winFrames = winBytes = 0;
+                }
+            }
+            ioDeadlineNs_.store(0);
+        }
+        impl_.reset();  // close the input + decoder; the next attempt starts clean
+        if (stop_.load()) break;
+
+        LOG_WARN("VideoDecoder: stream %s: %s", everStreamed ? "lost" : "connect failed",
+                 err.c_str());
+        setError(err);
+        {
+            std::lock_guard<std::mutex> lk(statsMutex_);
+            stats_.fpsIn = 0.0f;
+            stats_.kbps = 0.0f;
+        }
+        if (fatal || (!everStreamed && ++initialFailures >= kMaxInitialFailures)) {
+            streamState_.store(StreamState::Failed);
+            break;
+        }
+        streamState_.store(everStreamed ? StreamState::Reconnecting : StreamState::Connecting);
+        // Interruptible backoff sleep.
+        const auto until = clock::now() + std::chrono::seconds(backoffSec);
+        while (!stop_.load() && clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        backoffSec = (std::min)(backoffSec * 2, 8);  // parenthesised: windows.h min()
+    }
+
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
 }
 
 #else  // !MEDIAPLAYER_WITH_FFMPEG
@@ -886,6 +1213,16 @@ bool VideoDecoder::Open(const std::string&) {
 void VideoDecoder::DecodeLoop() {}
 void VideoDecoder::Seek(double, bool) {}
 void VideoDecoder::Stop() {}
+bool VideoDecoder::OpenLive(const std::string&) {
+    LOG_WARN("VideoDecoder: built without FFmpeg — streams unavailable");
+    return false;
+}
+const char* VideoDecoder::StreamStateName(StreamState) { return "idle"; }
+VideoDecoder::StreamStats VideoDecoder::GetStreamStats() const { return StreamStats{}; }
+void VideoDecoder::LiveLoop(const std::function<double(void*)>&, double&) {}
+bool VideoDecoder::OpenLiveInput(std::string&, bool&) { return false; }
+bool VideoDecoder::OpenVideoCodec(const void*, const std::string&) { return false; }
+int VideoDecoder::InterruptCallback(void*) { return 0; }
 
 #endif
 
