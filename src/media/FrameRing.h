@@ -47,11 +47,15 @@ public:
     // --- Producer (decode thread) ---
     // The buffer to fill, then Publish() to hand it to the consumer.
     Frame& WriteBuffer() { return buffers_[producer_]; }
-    void Publish() {
+    // Returns true when this publish replaced a frame the consumer never acquired (a
+    // drop) — live sources (#93) count it; everyone else ignores the result.
+    bool Publish() {
         std::lock_guard<std::mutex> lk(mutex_);
         buffers_[producer_].serial = ++serial_;
         std::swap(producer_, middle_);
+        const bool dropped = hasNew_;
         hasNew_ = true;
+        return dropped;
     }
 
     // --- Consumer (render thread) ---

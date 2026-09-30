@@ -9,13 +9,24 @@
 //
 // FFmpeg types are hidden behind a pimpl so this header carries no libav* include.
 // Built without FFmpeg (MEDIAPLAYER_WITH_FFMPEG undefined), Open() simply fails.
+//
+// Live mode (#93, OpenLive): a network stream URL (RTSP / RTMP / UDP / RTP / HTTP /
+// HLS). Connecting happens on the decode thread, so OpenLive returns at once and the
+// caller follows GetStreamState(). Live semantics like the camera: no PTS sleeping
+// (every decoded frame is published as it arrives; the ring keeps only the newest),
+// no seek / loop / duration, audio packets DROPPED (v1: a live feed never has an A/V
+// clock to pace to), and automatic reconnect with 1-2-4-8 s backoff after a loss.
+// Zero-copy interop (#28) is off for streams: a reconnect rebuilds the whole decoder,
+// and the renderer's imports of the old device's shared textures must not dangle.
 #pragma once
 
 #include "media/FrameRing.h"
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -33,6 +44,29 @@ public:
     // or the file can't be opened/decoded.
     bool Open(const std::string& path);
     void Stop();
+
+    // ---- Live network stream (#93) ------------------------------------------------
+    enum class StreamState { Idle, Connecting, Streaming, Reconnecting, Failed };
+    static const char* StreamStateName(StreamState s);
+    struct StreamStats {
+        int width = 0, height = 0;   // of the last decoded frame
+        float fpsIn = 0.0f;          // frames decoded per second (1 s window)
+        float kbps = 0.0f;           // demuxed bitrate, all streams (1 s window)
+        uint64_t frames = 0;         // decoded + published this session
+        uint64_t dropped = 0;        // published over a frame the renderer never took
+        int reconnects = 0;          // times the stream came back after a loss
+        double connectMs = 0.0;      // open -> first frame of the current connection
+        std::string lastError;       // last connect / read failure ("" = none)
+        std::string codec, backend;  // "h264", "d3d11va" / "software"
+    };
+    // Start connecting to `url` on the decode thread (returns false only when FFmpeg is
+    // absent). Stop() ends it. Any URL string FFmpeg accepts works; callers classify
+    // first (media/StreamUrl.h) so SRT & co. are refused with a proper message.
+    bool OpenLive(const std::string& url);
+    bool IsLive() const { return live_; }
+    bool Seekable() const { return !live_; }
+    StreamState GetStreamState() const { return streamState_.load(); }
+    StreamStats GetStreamStats() const;
 
     // Play/pause: when paused the decode thread holds the current frame and the
     // presentation clock is frozen, so resume continues seamlessly (no fast-forward).
@@ -82,6 +116,20 @@ public:
 
 private:
     void DecodeLoop();
+    // Live (#93): the connect / read / reconnect loop, run from DecodeLoop. `fill` is
+    // DecodeLoop's frame->ring copier (AVFrame* passed as void*, header stays libav-free);
+    // `timeBase` is re-pointed at each connection's video stream.
+    void LiveLoop(const std::function<double(void*)>& fill, double& timeBase);
+    // Open impl_->fmt on streamUrl_ with the low-latency options + the video decoder.
+    // Returns false with `err` set; `fatal` = retrying cannot help (no such protocol /
+    // demuxer / decoder, no video stream, HTTP 4xx).
+    bool OpenLiveInput(std::string& err, bool& fatal);
+    // Codec context for impl_->videoStream (hwaccel first, software fallback) —
+    // shared by Open() and OpenLiveInput(). `label` is only for logs.
+    bool OpenVideoCodec(const void* decoder, const std::string& label);
+    // AVIOInterruptCB: aborts blocking network I/O on Stop() or when ioDeadlineNs_ passes.
+    static int InterruptCallback(void* self);
+    void SetStreamState(StreamState s) { streamState_.store(s); }
     // Attach a per-OS hwaccel device to the codec context. `decoder` is the FFmpeg
     // AVCodec* (void here so the header stays libav-free). Returns false → software.
     bool TryEnableHwAccel(const void* decoder);
@@ -104,6 +152,15 @@ private:
     std::atomic<double> seekRequest_{-1.0};   // target seconds, <0 = none pending
     std::atomic<bool> seekPreview_{false};    // current seek wants the nearest keyframe
     std::atomic<double> positionSec_{0.0};     // last published frame's PTS
+
+    // Live stream (#93). streamUrl_ is written before the thread starts; the stats block
+    // is written by the decode thread and read by the UI under statsMutex_.
+    bool live_ = false;
+    std::string streamUrl_;
+    std::atomic<StreamState> streamState_{StreamState::Idle};
+    std::atomic<int64_t> ioDeadlineNs_{0};      // steady-clock ns; 0 = no deadline
+    mutable std::mutex statsMutex_;
+    StreamStats stats_;
     double durationSec_ = 0.0;                  // set in Open()
     double frameRate_ = 0.0;                    // fps, for frame stepping
     bool open_ = false;
