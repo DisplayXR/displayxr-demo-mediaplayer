@@ -224,6 +224,28 @@ bool App::Initialize(const char* mediaPath) {
     if (launch_.cameraFps <= 0) {
         if (const char* e = std::getenv("MEDIAPLAYER_CAMERA_FPS")) launch_.cameraFps = std::atoi(e);
     }
+    // Auto-convergence (#92): DEFAULT OFF. --auto-conv wins over MEDIAPLAYER_AUTO_CONV,
+    // whose value is the policy ("1"/"on" = the default policy, "0"/"off" = off).
+    if (!launch_.autoConv) {
+        if (const char* e = std::getenv("MEDIAPLAYER_AUTO_CONV")) {
+            const std::string v = e;
+            if (!v.empty() && v != "0" && v != "off") {
+                launch_.autoConv = true;
+                if (v != "1" && v != "on") launch_.autoConvPolicy = v;
+            }
+        }
+    }
+    if (!launch_.autoConvPolicy.empty()) {
+        autoconv::SubjectPolicy p = autoconv::SubjectPolicy::Nearest;
+        if (autoconv::ParsePolicy(launch_.autoConvPolicy, p) && p != autoconv::SubjectPolicy::Focus)
+            autoConvPolicy_ = p;
+        else
+            LOG_WARN("auto-conv: unknown policy '%s' (nearest|sharp|centre) - using nearest",
+                     launch_.autoConvPolicy.c_str());
+    }
+    if (launch_.autoConv) SetAutoConv(true, "launch");
+    LOG_INFO("auto-conv: %s at start (policy %s)", autoConvEnabled_ ? "ON" : "OFF",
+             autoconv::PolicyName(autoConvPolicy_));
     if (launch_.camera) {
         if (mediaPath && *mediaPath)
             LOG_WARN("--camera given: ignoring the media path '%s'", mediaPath);
@@ -354,6 +376,33 @@ int App::Run() {
             LOG_INFO("swap eyes %s", swapEyes_ ? "on" : "off");
             activity = true;
         }
+        if (window_.TakeToggleAutoConvRequest()) {                    // 'A' (#92)
+            SetAutoConv(!autoConvEnabled_, "key");
+            activity = true;
+        }
+        if (window_.TakeCycleAutoConvPolicyRequest()) {               // Shift+A (#92)
+            using P = autoconv::SubjectPolicy;
+            const P next = autoConvPolicy_ == P::Nearest     ? P::Sharpness
+                           : autoConvPolicy_ == P::Sharpness ? P::Centre
+                                                             : P::Nearest;
+            SetAutoConvPolicy(next);
+            activity = true;
+        }
+        if (float cx = 0.f, cy = 0.f; window_.TakeCtrlClick(cx, cy)) {  // Ctrl+click (#92)
+            // Window points -> canvas pixels -> the eye image under the cursor (the content
+            // rect before the convergence shift, which is at most a few percent).
+            uint32_t pw = 0, ph = 0, cw = 0, ch = 0;
+            window_.PointSize(pw, ph);
+            window_.PixelSize(cw, ch);
+            if (isLive_ && hasMedia_ && pw && ph && cw && ch) {
+                const XrSession::ViewRect fit = MatchMinRect({0, 0, cw, ch}, contentAspect_);
+                const float px = cx * (float)cw / (float)pw, py = cy * (float)ch / (float)ph;
+                const float u = (px - (float)fit.x) / (float)std::max(1u, fit.w);
+                const float v = (py - (float)fit.y) / (float)std::max(1u, fit.h);
+                if (u >= 0.f && u <= 1.f && v >= 0.f && v <= 1.f) SetAutoConvFocus(u, v);
+            }
+            activity = true;
+        }
         if (window_.TakeCaptureRequest()) {                           // 'I' — atlas snapshot
             if (xr_.HasAtlasCapture()) {
                 const std::string stem = isLive_ ? std::string("live")
@@ -471,7 +520,10 @@ void App::RenderOneFrame() {
                               : (isVideo_ ? &video_.Ring() : nullptr);
     if (ring) {
         if (const FrameRing::Frame* vf = ring->AcquireLatest()) {
-            if (isLive_) OnLiveFrame(*vf);
+            if (isLive_) {
+                OnLiveFrame(*vf);
+                SampleAutoConv(*vf);  // ~5 Hz; downsample only, measured on the worker
+            }
             bool bound = false;
 #if defined(_WIN32)
             // Zero-copy (#28): a GPU frame carries a shared RGBA texture handle (the producer
@@ -489,6 +541,8 @@ void App::RenderOneFrame() {
             }
         }
     }
+
+    TickAutoConv();  // smoothed auto-convergence shift (#92); exactly 0 while never enabled
 
     XrSession::Frame frame;
     if (!xr_.BeginFrame(frame)) return;
@@ -558,10 +612,15 @@ void App::RenderOneFrame() {
             // oppositely within their tiles, moving the zero-disparity plane. A LIF's
             // baked convergence (mediaConvergence_, scaled 0.5 to match the reference
             // per-eye shift) lands it at the author's intended plane; convergence_ trims.
-            const float conv = convergence_ + 0.5f * mediaConvergence_;
+            // Auto-convergence (#92) adds its own shift, which is a fraction of the EYE's
+            // on-screen width (contentW), converted here to the tile fraction the others use.
+            const float convBase = convergence_ + 0.5f * mediaConvergence_;
+            const float contentW = (float)viewFit.w * sx;
             int32_t cdx[XrSession::kMaxViews];
             for (uint32_t v = 0; v < frame.viewCount; ++v) {
-                cdx[v] = (int32_t)(conv * (float)rects[v].w * (isLeftView[v] ? 1.0f : -1.0f));
+                const float conv =
+                    convBase + autoConvergence_ * contentW / (float)std::max(1u, rects[v].w);
+                cdx[v] = autoconv::ConvergenceShiftPx(conv, rects[v].w, isLeftView[v]);
                 contentRects[v].x = rects[v].x + cdx[v] + lbx;
                 contentRects[v].y = rects[v].y + (int32_t)((float)viewFit.y * sy + 0.5f);
                 contentRects[v].w = (uint32_t)((float)viewFit.w * sx + 0.5f);
@@ -701,11 +760,13 @@ void App::RenderOneFrame() {
             } else {
                 // CPU text-HUD fallback: top-left stats panel (pre-M4 behavior).
                 const uint32_t tileW = rects[0].w, tileH = rects[0].h;
-                char stereo[64];
-                std::snprintf(stereo, sizeof(stereo), "conv %+.3f  eyes %s%s", convergence_,
+                char stereo[200];
+                std::snprintf(stereo, sizeof(stereo), "conv %+.3f  eyes %s%s%s%s", convergence_,
                               swapEyes_ ? "swapped" : "normal",
                               (isLive_ && livePaused_) ? "  [FROZEN]"
-                              : (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "");
+                              : (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "",
+                              isLive_ ? "\n" : "",
+                              isLive_ ? AutoConvHudText().c_str() : "");  // #92
                 // The layout label carries its provenance ("— detected" / "— from
                 // filename" / ...), so the buffer needs headroom over the old 320.
                 const std::string layoutLabel = LayoutLabel();
@@ -790,6 +851,16 @@ void App::BuildTransportUI() {
     for (size_t i = 0; isLive_ && i < cameraDevs_.size(); ++i)
         if (cameraDevs_[i].id == camera_.DeviceId()) uiState_.cameraCurrent = (int)i;
     if (isLive_) uiState_.mediaFilename.clear();
+    uiState_.autoConvOn = autoConvEnabled_;
+    {
+        char t[64];
+        if (autoConvEnabled_)
+            std::snprintf(t, sizeof(t), "Auto-conv: %s %+.1f%%",
+                          autoconv::PolicyName(autoConvPolicy_), autoConvergence_ * 100.0f);
+        else
+            std::snprintf(t, sizeof(t), "Auto-conv: off");
+        uiState_.autoConvLabel = t;
+    }
 
     ui::TransportActions actions;
     actions.Open = [this] { RequestOpenFile(); };
@@ -818,6 +889,7 @@ void App::BuildTransportUI() {
         }
     };
     actions.StopCamera = [this] { StopLive(/*showIdleIfEmpty=*/true); };
+    actions.ToggleAutoConv = [this] { SetAutoConv(!autoConvEnabled_, "ui"); };
 
     ui::BuildTransportUI(uiState_, actions);
 }
@@ -842,6 +914,7 @@ void App::UpdateFps() {
 }
 
 void App::Shutdown() {
+    autoConvWorker_.Stop();  // #92
     camera_.Stop();       // join the camera worker + SDL_CloseCamera before SDL_Quit
     video_.Stop();        // join the decode thread (reads the audio clock) before audio,
     audio_.Stop();        // and before tearing down the GPU
@@ -1258,6 +1331,7 @@ bool App::LoadLiveDevice(const CameraDevice& dev) {
     liveSlowWarned_ = false;
     liveStateSeen_ = CameraSource::State::Opening;
     liveSelector_ = dev.name;
+    autoConvWorker_.RequestReset();  // #92: a new camera is a new scene
     LOG_INFO("Live: opening '%s'", dev.name.c_str());
     ShowToast("Live: " + dev.name);
     return true;
@@ -1265,6 +1339,7 @@ bool App::LoadLiveDevice(const CameraDevice& dev) {
 
 void App::StopLive(bool showIdleIfEmpty) {
     camera_.Stop();
+    autoConvWorker_.RequestReset();  // #92: the next source is a new scene
     isLive_ = false;
     livePaused_ = false;
     liveStateSeen_ = CameraSource::State::Closed;
@@ -1411,6 +1486,106 @@ void App::PollLive() {
             liveSlowSince_ = -1.0;
         }
     }
+}
+
+// --- Auto-convergence (#92) ----------------------------------------------------------
+
+void App::SetAutoConv(bool on, const char* why) {
+    if (on == autoConvEnabled_) return;
+    autoConvEnabled_ = on;
+    if (on) {
+        autoConvWorker_.Start();  // idles on a condition variable while off
+        autoConvWorker_.RequestReset();
+        autoConvHaveResult_ = false;
+        autoConvLastSubmitMs_ = -1e9;
+        autoConvMin_ = autoConvMax_ = autoConvergence_;
+        autoConvSum_ = autoConvMsSum_ = autoConvMsMax_ = 0.0;
+        autoConvTicks_ = autoConvMeasures_ = 0;
+    }
+    LOG_INFO("auto-conv %s (%s, policy %s)", on ? "ON" : "OFF", why,
+             autoconv::PolicyName(autoConvPolicy_));
+    ShowToast(on ? std::string("Auto-convergence: ") + autoconv::PolicyName(autoConvPolicy_)
+                 : std::string("Auto-convergence off"));
+}
+
+void App::SetAutoConvPolicy(autoconv::SubjectPolicy p) {
+    autoConvPolicy_ = p;
+    if (p != autoconv::SubjectPolicy::Focus) autoConvHasFocus_ = false;
+    LOG_INFO("auto-conv policy %s", autoconv::PolicyName(p));
+    ShowToast(std::string("Auto-conv policy: ") + autoconv::PolicyName(p));
+}
+
+void App::SetAutoConvFocus(float u, float v) {
+    autoConvFocus_[0] = std::min(1.0f, std::max(0.0f, u));
+    autoConvFocus_[1] = std::min(1.0f, std::max(0.0f, v));
+    autoConvHasFocus_ = true;
+    autoConvPolicy_ = autoconv::SubjectPolicy::Focus;
+    LOG_INFO("auto-conv focus pinned at (%.3f, %.3f)", autoConvFocus_[0], autoConvFocus_[1]);
+    if (!autoConvEnabled_) SetAutoConv(true, "focus");
+    else ShowToast("Auto-conv: subject pinned");
+}
+
+void App::SampleAutoConv(const FrameRing::Frame& f) {
+    if (!autoConvEnabled_ || !isLive_ || livePaused_) return;
+    if (layout_ != StereoLayout::SbsFull && layout_ != StereoLayout::SbsHalf) return;
+    if (f.gpu || f.plane[0].empty() || f.width < 64 || f.height < 32) return;
+    const double nowMs = CameraSource::NowSeconds() * 1000.0;
+    if (nowMs - autoConvLastSubmitMs_ < 200.0) return;  // ~5 Hz
+    autoConvLastSubmitMs_ = nowMs;
+    // Measure on the halves the viewer's eyes actually see (X / container swap).
+    const bool swap = (swapEyes_ != mediaEyeSwap_);
+    const bool focus = autoConvPolicy_ == autoconv::SubjectPolicy::Focus && autoConvHasFocus_;
+    autoConvDownsampleMs_ =
+        autoConvWorker_.Submit(f.plane[0].data(), f.width, f.width, f.height, swap,
+                               autoConvPolicy_, focus ? autoConvFocus_ : nullptr, nowMs);
+}
+
+void App::TickAutoConv() {
+    const double now = CameraSource::NowSeconds();
+    double dt = autoConvLastTickSec_ < 0.0 ? 0.0 : now - autoConvLastTickSec_;
+    autoConvLastTickSec_ = now;
+    if (dt > 0.25) dt = 0.25;  // a stall is not a reason to jump
+    autoconv::Result r;
+    if (autoConvWorker_.Running() && autoConvWorker_.TakeResult(r)) {
+        autoConvLast_ = r;
+        autoConvHaveResult_ = true;
+        ++autoConvMeasures_;
+        autoConvMsSum_ += r.ms;
+        autoConvMsMax_ = std::max(autoConvMsMax_, r.ms);
+        if (autoConvEnabled_ && isLive_) autoConvCtl_.Update(r);
+    }
+    const bool stereo = layout_ == StereoLayout::SbsFull || layout_ == StereoLayout::SbsHalf;
+    autoConvCtl_.Tick(dt, autoConvEnabled_ && isLive_ && stereo);
+    autoConvergence_ = autoConvCtl_.Value();
+    if (!autoConvEnabled_) return;
+    autoConvMin_ = std::min(autoConvMin_, autoConvergence_);
+    autoConvMax_ = std::max(autoConvMax_, autoConvergence_);
+    autoConvSum_ += autoConvergence_;
+    ++autoConvTicks_;
+    if (now - autoConvLastLogSec_ >= 1.0) {
+        autoConvLastLogSec_ = now;
+        const autoconv::Result& l = autoConvLast_;
+        LOG_INFO("autoconv: %s d=%+.2f%% conv=%+.3f%% target=%+.3f%% ncc %.2f blocks %d "
+                 "rule %s%s%s ok=%d meas %.2f ms (max %.2f) ds %.2f ms near %+.2f%% far %+.2f%% "
+                 "mad %.1f eye %dx%d",
+                 autoconv::PolicyName(autoConvPolicy_), l.disparityFrac * 100.0f,
+                 autoConvergence_ * 100.0f, autoConvCtl_.Target() * 100.0f, l.ncc,
+                 l.blocksMatched, l.rule, *autoConvCtl_.Clamp() ? " clamp-" : "",
+                 autoConvCtl_.Clamp(), l.ok ? 1 : 0, l.ms, autoConvMsMax_, autoConvDownsampleMs_,
+                 l.nearFrac * 100.0f, l.farFrac * 100.0f, l.sceneMad, l.eyeW, l.eyeH);
+    }
+}
+
+std::string App::AutoConvHudText() const {
+    char t[128];
+    if (!autoConvEnabled_) {
+        std::snprintf(t, sizeof(t), "autoconv OFF");
+    } else {
+        std::snprintf(t, sizeof(t), "autoconv ON %s  d=%+.1f%%  conv=%+.1f%%  ncc %.2f  %.1f ms",
+                      autoconv::PolicyName(autoConvPolicy_), autoConvLast_.disparityFrac * 100.0f,
+                      autoConvergence_ * 100.0f, autoConvLast_.ncc, autoConvLast_.ms);
+    }
+    return t;
 }
 
 void App::HandleDroppedPaths(std::vector<std::string> paths) {
@@ -1791,6 +1966,21 @@ void App::SetupAgentTools() {
         "list_cameras, or a case-insensitive name substring.\"}}}");
 
     xr_.RegisterMcpTool(
+        "set_auto_convergence",
+        "Live auto-convergence (#92): measure the subject's stereo disparity and shift the "
+        "eyes so it sits at the display plane. DEFAULT OFF. 'enabled' turns it on/off (the "
+        "shift ramps back to 0 when off). 'policy' picks the subject: nearest (the nearest "
+        "strong depth plane - a person at the camera), sharp (the sharpest blocks - shallow "
+        "depth of field), centre (centre-weighted), focus (needs focus_x/focus_y). "
+        "focus_x/focus_y (0..1, normalised over one eye's picture) pin the subject and imply "
+        "policy focus. Returns the auto_conv_* fields of get_status.",
+        "{\"type\":\"object\",\"properties\":{"
+        "\"enabled\":{\"type\":\"boolean\"},"
+        "\"policy\":{\"type\":\"string\",\"enum\":[\"nearest\",\"sharp\",\"centre\",\"focus\"]},"
+        "\"focus_x\":{\"type\":\"number\",\"minimum\":0,\"maximum\":1},"
+        "\"focus_y\":{\"type\":\"number\",\"minimum\":0,\"maximum\":1}}}");
+
+    xr_.RegisterMcpTool(
         "close_camera",
         "Stop the live camera and return to the idle screen. Errors if no camera is live.",
         "{\"type\":\"object\"}");
@@ -1828,6 +2018,59 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
     const double durationS = isVideo_ ? video_.DurationSeconds() : 0.0;
 
     json out;
+    auto fillAutoConv = [this](json& o) {
+        const autoconv::Result& l = autoConvLast_;
+        o["auto_conv_enabled"] = autoConvEnabled_;
+        o["auto_conv_policy"] = autoconv::PolicyName(autoConvPolicy_);
+        o["auto_conv_value"] = autoConvergence_;  // applied per-eye shift, fraction of eye width
+        o["auto_conv_target"] = autoConvCtl_.Target();
+        o["auto_conv_clamp"] = autoConvCtl_.Clamp();
+        o["auto_conv_disparity_frac"] = l.disparityFrac;  // x_left - x_right, + = in front
+        o["auto_conv_ok"] = l.ok;
+        o["auto_conv_ncc"] = l.ncc;
+        o["auto_conv_ms"] = l.ms;
+        o["auto_conv_rule"] = l.rule;
+        o["auto_conv_blocks"] = l.blocksMatched;
+        o["auto_conv_near_frac"] = l.nearFrac;
+        o["auto_conv_far_frac"] = l.farFrac;
+        o["auto_conv_downsample_ms"] = autoConvDownsampleMs_;
+        o["auto_conv_measurements"] = autoConvMeasures_;
+        o["auto_conv_ms_mean"] = autoConvMeasures_ ? autoConvMsSum_ / (double)autoConvMeasures_ : 0.0;
+        o["auto_conv_ms_max"] = autoConvMsMax_;
+        o["auto_conv_value_min"] = autoConvMin_;
+        o["auto_conv_value_max"] = autoConvMax_;
+        o["auto_conv_value_mean"] = autoConvTicks_ ? autoConvSum_ / (double)autoConvTicks_ : 0.0;
+        if (autoConvHasFocus_) {
+            o["auto_conv_focus_x"] = autoConvFocus_[0];
+            o["auto_conv_focus_y"] = autoConvFocus_[1];
+        }
+    };
+    if (tool == "set_auto_convergence") {
+        const bool hasFx = args.contains("focus_x") && args["focus_x"].is_number();
+        const bool hasFy = args.contains("focus_y") && args["focus_y"].is_number();
+        if (hasFx != hasFy) {
+            success = false;
+            return "{\"error\":\"focus_x and focus_y go together\"}";
+        }
+        if (args.contains("policy")) {
+            autoconv::SubjectPolicy p;
+            if (!args["policy"].is_string() || !autoconv::ParsePolicy(args["policy"].get<std::string>(), p)) {
+                success = false;
+                return "{\"error\":\"policy must be nearest|sharp|centre|focus\"}";
+            }
+            if (p == autoconv::SubjectPolicy::Focus && !hasFx && !autoConvHasFocus_) {
+                success = false;
+                return "{\"error\":\"policy focus needs focus_x/focus_y\"}";
+            }
+            if (p != autoconv::SubjectPolicy::Focus) SetAutoConvPolicy(p);
+            else autoConvPolicy_ = p;
+        }
+        if (hasFx) SetAutoConvFocus(args["focus_x"].get<float>(), args["focus_y"].get<float>());
+        if (args.contains("enabled") && args["enabled"].is_boolean())
+            SetAutoConv(args["enabled"].get<bool>(), "mcp");
+        fillAutoConv(out);
+        return out.dump();
+    }
     if (tool == "play_pause") {
         TogglePlayback();
         out["playing"] = isLive_ ? !livePaused_ : (isVideo_ && !video_.Paused());
@@ -1904,6 +2147,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["swap_eyes"] = swapEyes_;
         out["live"] = isLive_;
         out["live_paused"] = livePaused_;
+        fillAutoConv(out);
         out["camera"] = isLive_ ? camera_.DeviceName() : std::string();
         out["camera_state"] = isLive_ ? CameraSource::StateName(camera_.GetState()) : "closed";
         if (isLive_) {

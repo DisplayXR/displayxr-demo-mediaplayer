@@ -69,6 +69,9 @@ struct TransportState {
     float cameraFps = 0.0f;                // frames the camera delivered per second
     float panelFps = 0.0f;                 // frames the app submitted per second
     float frameAgeMs = 0.0f;               // camera publish -> GPU upload age
+    // Auto-convergence toggle (#92), shown next to Layout while live.
+    bool autoConvOn = false;
+    std::string autoConvLabel;             // "Auto-conv: off" / "Auto-conv: nearest -1.6%"
 
     // ---- UI owns (do not clobber) ------------------------------------------
     // Scrubber. The displayed knob tracks playback EXCEPT while dragging, or
@@ -120,6 +123,7 @@ struct TransportActions {
     std::function<void(bool rescan)> RefreshCameras;
     std::function<void(int row)> OpenCamera;
     std::function<void()> StopCamera;
+    std::function<void()> ToggleAutoConv;  // #92, the live top bar's Auto-conv button
 };
 
 // The player's "dark glass" look. `metricScale` is the ONE sanctioned divergence

@@ -39,6 +39,7 @@ namespace {
 //   --camera / --camera=<selector>   start live (selector: auto | index | name substring)
 //   --camera-fps=<N>                 requested capture rate
 //   --camera-list                    print the cameras and exit (no window, no runtime)
+//   --auto-conv[=nearest|sharp|centre]  live auto-convergence on (#92; default OFF)
 bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, bool& list) {
     std::vector<std::string> rest;
     for (const std::string& a : args) {
@@ -49,6 +50,11 @@ bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, b
             o.cameraSelector = a.substr(9);
         } else if (a.rfind("--camera-fps=", 0) == 0) {
             o.cameraFps = std::atoi(a.c_str() + 13);
+        } else if (a == "--auto-conv") {  // #92: auto-convergence on (default policy)
+            o.autoConv = true;
+        } else if (a.rfind("--auto-conv=", 0) == 0) {
+            o.autoConv = true;
+            o.autoConvPolicy = a.substr(12);
         } else if (a == "--camera-list") {
             list = true;
         } else {
