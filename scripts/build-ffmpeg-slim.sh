@@ -40,6 +40,18 @@ echo "nasm=$(command -v nasm || echo MISSING)"
 echo "make=$(command -v make || echo MISSING)"
 
 cd "$SRC"
+
+# configure (at the pinned commit and on master, 2026-09-30) hands compile-only
+# -D defines to the LINKER in test_ld, and since ~2024 it treats link.exe's
+# "LNK4044: unrecognized option" warning as a failed probe. The schannel probe
+# (`-DSECURITY_WIN32 -lsecur32`) therefore always fails under --toolchain=msvc:
+# "schannel requested but not found" (#93; the four probes pass when run by hand).
+# Drop -D* from the linker's flags — defines mean nothing to a linker anywhere.
+if ! grep -q "filter_out '-D\*' \$flags" configure; then
+    sed -i "s|^    flags=\$(\$ldflags_filter \$flags)\$|    flags=\$(\$ldflags_filter \$(filter_out '-D*' \$flags))|" configure
+    grep -q "filter_out '-D\*' \$flags" configure || { echo "ERROR: test_ld patch did not apply (configure changed upstream?)" >&2; exit 1; }
+    echo "patched configure: test_ld drops -D* from linker flags"
+fi
 ./configure \
   --toolchain=msvc \
   --prefix="$PREFIX" \
