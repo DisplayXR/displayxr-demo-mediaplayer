@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -913,6 +914,11 @@ int64_t SteadyNowNs() {
 }
 
 std::string AvErrorText(int err) {
+    // Socket errnos have no strerror text on MSVC ("Error number -138 occurred").
+    if (err == AVERROR(ECONNREFUSED)) return "connection refused";
+    if (err == AVERROR(ETIMEDOUT)) return "connection timed out";
+    if (err == AVERROR(ECONNRESET)) return "connection reset";
+    if (err == AVERROR(EHOSTUNREACH) || err == AVERROR(ENETUNREACH)) return "host unreachable";
     char buf[AV_ERROR_MAX_STRING_SIZE] = {};
     av_strerror(err, buf, sizeof(buf));
     return buf;
@@ -1031,7 +1037,9 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
         if (scheme != "tcp") {
             av_dict_set(&opts, "reconnect", "1", 0);
             av_dict_set(&opts, "reconnect_streamed", "1", 0);
-            av_dict_set(&opts, "reconnect_on_network_error", "1", 0);
+            // NOT reconnect_on_network_error: it makes a refused connect (a typo'd URL,
+            // a sender not up yet) retry inside the protocol until the 8 s budget, so a
+            // dead URL took ~30 s to report. LiveLoop's own backoff handles that case.
             av_dict_set(&opts, "reconnect_delay_max", "2", 0);
         }
     }
