@@ -104,7 +104,7 @@ jobs:
           set -euo pipefail
           cmake -S . -B build -DMP_BUILD_TESTS=ON
           cmake --build build --target lif_roundtrip_test stereo_detect_test \
-                                     mpo_parse_test camera_select_test auto_convergence_test \
+                                     mpo_parse_test camera_select_test auto_convergence_test stream_url_test \
                                      stereo_sweep
           ctest --test-dir build --output-on-failure
 
