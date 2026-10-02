@@ -210,12 +210,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # maximise (displayxr-common#64-#68, runtime#1748).
         # v2.25.1: the Wayland surface scale is separate from the window-geometry
         # stage factor in mutter's PHYSICAL layout mode (displayxr-common#69).
-        # The player's window moved onto DxrLinuxWindow here, which needs key
-        # text, file drops and cursor shapes from it (displayxr-common#70).
-        # TEMPORARY: pinned to #70's head commit until it is merged and tagged;
-        # then this becomes that tag, with GIT_SHALLOW TRUE again.
-        GIT_TAG 0bd970d9c6f88da0131a2b084c21f87f244aa259
-        GIT_SHALLOW FALSE)
+        # v2.26.0: key text, file drops and app cursor shapes, which the player's
+        # window needs now that it runs on DxrLinuxWindow (displayxr-common#70).
+        GIT_TAG v2.26.0
+        GIT_SHALLOW TRUE)
 else()
     FetchContent_Declare(displayxr_common
         GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
