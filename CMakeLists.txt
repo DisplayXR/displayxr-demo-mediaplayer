@@ -179,10 +179,12 @@ FetchContent_MakeAvailable(nlohmann_json)
 #     this player does not use, so it is populated, not added. Keep this pin equal
 #     to android/src/main/cpp/CMakeLists.txt's.
 #
-#     Desktop Linux is the exception: it also needs displayxr::linux_window's
-#     compiled capability probe (the ONE rule that picks X11 or native Wayland —
-#     here it chooses SDL's video driver), so there common IS added, at the pin
-#     that ships it. Windows / macOS keep the headers-only v2.15.0 populate.
+#     Desktop Linux is the exception: the player's WINDOW is displayxr::linux_window
+#     (DxrLinuxWindow — the one Linux window every DisplayXR demo uses: X11 or
+#     native Wayland by its capability probe, the client-side title bar, the
+#     phase-snapped title-bar and right-button drags, F11 onto the panel, key
+#     text, file drops, cursor shapes), so there common IS added, at the pin that
+#     ships all of that. Windows / macOS keep the headers-only v2.15.0 populate.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/displayxr-openxr" CACHE PATH
@@ -206,8 +208,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # while the runtime move-syncs the window, a drag that ends on its button's
         # release, X11 drag steps that land exactly, and X11 header-bar double-click
         # maximise (displayxr-common#64-#68, runtime#1748).
-        GIT_TAG v2.25.0
-        GIT_SHALLOW TRUE)
+        # v2.25.1: the Wayland surface scale is separate from the window-geometry
+        # stage factor in mutter's PHYSICAL layout mode (displayxr-common#69).
+        # The player's window moved onto DxrLinuxWindow here, which needs key
+        # text, file drops and cursor shapes from it (displayxr-common#70).
+        # TEMPORARY: pinned to #70's head commit until it is merged and tagged;
+        # then this becomes that tag, with GIT_SHALLOW TRUE again.
+        GIT_TAG 0bd970d9c6f88da0131a2b084c21f87f244aa259
+        GIT_SHALLOW FALSE)
 else()
     FetchContent_Declare(displayxr_common
         GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
@@ -236,6 +244,7 @@ add_executable(${MP_TARGET}
     src/App.cpp
     src/Log.cpp
     src/platform/Window.cpp
+    $<$<PLATFORM_ID:Linux>:src/platform/WindowLinux.cpp>  # desktop Linux: displayxr-common window
     src/xr/XrSession.cpp
     src/rhi/VulkanRenderer.cpp
     src/media/ImageDecoder.cpp
@@ -274,10 +283,16 @@ endif()
 
 target_include_directories(${MP_TARGET} PRIVATE
     ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)
-# MEDIAPLAYER_IMGUI_SDL selects the SDL3 ImGui *platform* backend (input + dt).
-# The Android leg defines MEDIAPLAYER_WITH_IMGUI only: it has no SDL, and feeds
-# input through ImGuiLayer::PushPointer() instead. See src/ui/ImGuiLayer.h.
-target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_IMGUI=1 MEDIAPLAYER_IMGUI_SDL=1)
+# MEDIAPLAYER_IMGUI_SDL selects the SDL3 ImGui *platform* backend (input + dt) on
+# Windows / macOS. Desktop Linux has no SDL window: MEDIAPLAYER_IMGUI_DXRWIN feeds
+# ImGui from displayxr-common's window events instead. The Android leg defines
+# MEDIAPLAYER_WITH_IMGUI only: it has no SDL, and feeds input through
+# ImGuiLayer::PushPointer() instead. See src/ui/ImGuiLayer.h.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_IMGUI=1 MEDIAPLAYER_IMGUI_DXRWIN=1)
+else()
+    target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_IMGUI=1 MEDIAPLAYER_IMGUI_SDL=1)
+endif()
 
 if(MP_HAVE_FFMPEG)
     target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
@@ -310,7 +325,7 @@ target_link_libraries(${MP_TARGET} PRIVATE
     nlohmann_json::nlohmann_json
     ${MP_OPENXR_LOADER}
 )
-# Desktop Linux: the platform probe (X11 or native Wayland) — see the fetch above.
+# Desktop Linux: the app window (X11 or native Wayland) — see the fetch above.
 if(TARGET displayxr::linux_window)
     target_link_libraries(${MP_TARGET} PRIVATE displayxr::linux_window)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")

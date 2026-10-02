@@ -19,8 +19,14 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
+
+#if defined(__linux__) && !defined(__ANDROID__)
+class DxrLinuxWindow;  // displayxr-common (dxr_linux_window.h)
+class DxrWeaveSnap;    // displayxr-common (dxr_weave_snap.h)
+#endif
 
 namespace mp {
 
@@ -66,7 +72,7 @@ public:
         XrView views[kMaxViews];       // per-view pose + fov from xrLocateViews
     };
 
-    XrSession() = default;
+    XrSession();   // out of line: members of incomplete type (desktop Linux)
     ~XrSession();
 
     XrSession(const XrSession&) = delete;
@@ -88,16 +94,6 @@ public:
                                              uint32_t panelW, uint32_t panelH)>;
     bool Initialize(void* nativeWindowHandle, const PlaceWindowFn& placeWindow = {});
 
-    //! Native Wayland only (a no-op elsewhere): declare the surface's current
-    //! pixel size to the runtime when it changed. A wl_surface has no size of
-    //! its own — the runtime sizes its swapchain to what the app declares
-    //! (XR_DXR_wayland_surface_binding spec 2) — so call it every frame with
-    //! the window's pixel size.
-    void DeclareSurfaceSize(uint32_t width, uint32_t height);
-
-    //! Where the window's current pixel size comes from (the session-create
-    //! declaration on native Wayland). Set before Initialize().
-    void SetPixelSizeSource(std::function<void(uint32_t&, uint32_t&)> fn) { pixelSizeFn_ = std::move(fn); }
     void Shutdown();
 
     // Drain the OpenXR event queue, driving the session state machine
@@ -318,11 +314,10 @@ private:
     //! window's handles before the instance is created (it decides which
     //! binding extension to enable).
     bool linuxWayland_ = false;
-    //! xrSetWaylandSurfaceGeometryDXR (spec 2), and the size last declared.
-    PFN_xrSetWaylandSurfaceGeometryDXR pfnSetWlGeometry_ = nullptr;
-    uint32_t wlDeclaredW_ = 0, wlDeclaredH_ = 0;
+    bool hasWeaveExt_ = false;          //!< XR_DXR_weave: the drag's phase snap
+    DxrLinuxWindow* linuxWin_ = nullptr; //!< the bound window (snap provider installed)
+    std::unique_ptr<DxrWeaveSnap> weaveSnap_;
 #endif
-    std::function<void(uint32_t&, uint32_t&)> pixelSizeFn_;
     bool hasDisplayInfoExt_ = false;
     bool transparentBg_ = false;   // MEDIAPLAYER_TRANSPARENT — letterbox composes through
     uint32_t displayPixelWidth_ = 0;

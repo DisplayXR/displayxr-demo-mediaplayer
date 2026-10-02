@@ -6,23 +6,9 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
 
-#if defined(__linux__) && !defined(__ANDROID__)
-// The platform DECISION is displayxr-common's (displayxr::linux_window's
-// capability probe — the one rule every DisplayXR app uses: an explicit
-// --platform wins; auto = native Wayland when the compositor is ready, else
-// X11; never read from session env vars). SDL still owns the window: the probe
-// only picks SDL's video driver, and the handles below feed the runtime.
-#include "dxr_linux_window.h"
-#include <openxr/openxr.h>
-#include <openxr/XR_DXR_xlib_window_binding.h>
-#include <openxr/XR_DXR_wayland_surface_binding.h>
-#include <cstring>
-#include <string>
-#include <vector>
-#endif
-
 namespace mp {
 
+#if !(defined(__linux__) && !defined(__ANDROID__))
 namespace {
 // SDL event watch — fires synchronously on the main thread as events are pumped,
 // INCLUDING during the macOS modal live-resize loop. We re-render from here so the
@@ -37,52 +23,15 @@ bool SDLCALL ResizeEventWatch(void* userdata, SDL_Event* e) {
     return true;  // keep the event in the queue for normal handling
 }
 } // namespace
-
-#if defined(__linux__) && !defined(__ANDROID__)
-static int s_linuxPlatformRequest = 0; // 0 auto, 1 x11, 2 wayland
-void Window::SetLinuxPlatformRequest(int request) { s_linuxPlatformRequest = request; }
-
-//! Which window platform to give SDL: the helper's capability probe, fed by
-//! which binding extensions the runtime advertises (no instance needed).
-static DxrWindowBackend ResolveLinuxPlatform() {
-    bool hasXlib = false, hasWayland = false;
-    uint32_t n = 0;
-    if (XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr, 0, &n, nullptr)) && n > 0) {
-        std::vector<XrExtensionProperties> exts(n, {XR_TYPE_EXTENSION_PROPERTIES});
-        if (XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr, n, &n, exts.data()))) {
-            for (const auto& e : exts) {
-                if (strcmp(e.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) hasXlib = true;
-                if (strcmp(e.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0) hasWayland = true;
-            }
-        }
-    }
-    const DxrWindowBackend requested = s_linuxPlatformRequest == 1   ? DxrWindowBackend::X11
-                                       : s_linuxPlatformRequest == 2 ? DxrWindowBackend::Wayland
-                                                                     : DxrWindowBackend::Auto;
-    std::string why;
-    const DxrWindowBackend b = DxrLinuxWindow::select(requested, hasXlib, hasWayland, &why);
-    if (b == DxrWindowBackend::Auto) {
-        LOG_WARN("No usable window platform (%s) — SDL picks its own driver; no window binding", why.c_str());
-    } else {
-        LOG_INFO("Window platform: %s (requested %s) — %s", DxrLinuxWindow::backend_name(b),
-                 DxrLinuxWindow::backend_name(requested), why.c_str());
-    }
-    return b;
-}
 #endif
 
+
+#if !(defined(__linux__) && !defined(__ANDROID__))
+// Desktop Linux implements these in WindowLinux.cpp (displayxr-common's window).
+Window::Window() = default;
 Window::~Window() { Destroy(); }
 
 bool Window::Create(const char* title, int width, int height) {
-#if defined(__linux__) && !defined(__ANDROID__)
-    // SDL's video driver = the platform the capability probe chose (X11 —
-    // XWayland included — or native Wayland; see ResolveLinuxPlatform). A
-    // hint, so a user's own SDL_VIDEO_DRIVER still wins; what SDL actually
-    // picked is verified after SDL_Init.
-    const DxrWindowBackend linuxPlatform = ResolveLinuxPlatform();
-    if (linuxPlatform == DxrWindowBackend::X11) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
-    if (linuxPlatform == DxrWindowBackend::Wayland) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "wayland");
-#endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         LOG_ERROR("SDL_Init failed: %s", SDL_GetError());
         return false;
@@ -98,22 +47,6 @@ bool Window::Create(const char* title, int width, int height) {
     Uint32 flags = SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN;
 #if defined(__APPLE__)
     flags |= SDL_WINDOW_METAL;
-#endif
-#if defined(__linux__) && !defined(__ANDROID__)
-    // Verify what SDL actually picked (GLFW-style): the handles and the
-    // binding follow the live driver, not the request.
-    const char* driver = SDL_GetCurrentVideoDriver();
-    const bool onWayland = driver != nullptr && strcmp(driver, "wayland") == 0;
-    if (linuxPlatform != DxrWindowBackend::Auto &&
-        onWayland != (linuxPlatform == DxrWindowBackend::Wayland)) {
-        LOG_WARN("SDL video driver is '%s', not the %s the probe chose (SDL_VIDEO_DRIVER set?) — "
-                 "binding what SDL actually opened",
-                 driver ? driver : "?", DxrLinuxWindow::backend_name(linuxPlatform));
-    }
-    // Native Wayland: the runtime's Vulkan WSI presents into SDL's surface —
-    // SDL's supported external-Vulkan case, which makes SDL map the pixel-size
-    // buffer onto the logical window and never attach a buffer of its own.
-    if (onWayland) flags |= SDL_WINDOW_VULKAN;
 #endif
     window_ = SDL_CreateWindow(title, width, height, flags);
     if (!window_) {
@@ -136,35 +69,6 @@ bool Window::Create(const char* title, int width, int height) {
     if (!nativeHandle_) {
         LOG_ERROR("Could not get Win32 HWND from SDL window");
         return false;
-    }
-#elif defined(__linux__) && !defined(__ANDROID__)
-    // Bundle the live driver's handles behind the single void* the XR plumbing
-    // carries: X11 (Display*, Window XID) or Wayland (wl_display*, wl_surface*).
-    SDL_PropertiesID props = SDL_GetWindowProperties(window_);
-    if (onWayland) {
-        linux_.wayland = true;
-        linux_.display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr);
-        linux_.surface = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr);
-        // The runtime creates its VkSurfaceKHR inside xrCreateSession and the
-        // WSI attaches a buffer on the first present, so the surface must
-        // already have its xdg role and an acked configure: SDL gives it both
-        // on show. (The X11 window stays hidden until XR setup is done; on
-        // Wayland it has to be up first.)
-        SDL_ShowWindow(window_);
-        SDL_SyncWindow(window_);
-        if (linux_.display && linux_.surface) nativeHandle_ = &linux_;
-    } else {
-        linux_.display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr);
-        linux_.window =
-            (unsigned long)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
-        if (linux_.display && linux_.window) nativeHandle_ = &linux_;
-    }
-    if (nativeHandle_ == nullptr) {
-        LOG_WARN("No %s window handles from SDL (driver '%s') — window binding unavailable",
-                 onWayland ? "Wayland" : "X11", driver ? driver : "?");
-    } else {
-        LOG_INFO("Window platform: SDL driver '%s' verified — %s", driver ? driver : "?",
-                 onWayland ? "XR_DXR_wayland_surface_binding" : "XR_DXR_xlib_window_binding");
     }
 #else
     LOG_WARN("No native window-handle extraction for this platform");
@@ -200,18 +104,29 @@ void Window::Show() {
     if (window_) SDL_ShowWindow(window_);
 }
 
+void Window::RealizeOnPanel(int32_t, int32_t, uint32_t, uint32_t) {}   // Create() made it
+void Window::SetImGuiCursor(int) {}   // the SDL ImGui backend owns the cursor here
+
+void Window::MousePosition(float& x, float& y) const { SDL_GetMouseState(&x, &y); }
+
+#endif  // !desktop Linux
+
 void Window::SetEventHook(std::function<void(void*)> hook) {
     eventHook_ = std::move(hook);
 }
 
 void Window::SetLiveResizeCallback(std::function<void()> cb) {
     liveResizeCb_ = std::move(cb);
+    // A macOS modal-resize concern; the desktop-Linux window has no SDL window.
+#if !(defined(__linux__) && !defined(__ANDROID__))
     if (!eventWatchAdded_) {
         SDL_AddEventWatch(ResizeEventWatch, &liveResizeCb_);
         eventWatchAdded_ = true;
     }
+#endif
 }
 
+#if !(defined(__linux__) && !defined(__ANDROID__))
 bool Window::PumpEvents() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -298,6 +213,7 @@ void Window::ToggleFullscreen() {
     if (window_) SDL_SetWindowFullscreen(window_, fullscreen_);
     LOG_INFO("Fullscreen %s", fullscreen_ ? "on" : "off");
 }
+#endif  // !desktop Linux
 
 bool Window::TakeCycleModeRequest() {
     bool v = cycleModeRequested_;
@@ -448,6 +364,7 @@ bool Window::TakeMouseLeft() {
     return v;
 }
 
+#if !(defined(__linux__) && !defined(__ANDROID__))
 void Window::Destroy() {
     if (eventWatchAdded_) {
         SDL_RemoveEventWatch(ResizeEventWatch, &liveResizeCb_);
@@ -466,5 +383,6 @@ void Window::Destroy() {
     }
     SDL_Quit();
 }
+#endif  // !desktop Linux
 
 } // namespace mp

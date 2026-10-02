@@ -174,19 +174,21 @@ bool App::Initialize(const char* mediaPath) {
             window_.SetPosition(forceX, forceY);
             LOG_INFO("MEDIAPLAYER_WINDOW override: placed window at absolute (%d, %d)",
                      forceX, forceY);
-            return;
+        } else if (left != 0 || top != 0) {
+            int x = left, y = top;
+            if (panelW > 0 && panelH > 0) {
+                x = left + ((int)panelW - winW) / 2;
+                y = top + ((int)panelH - winH) / 2;
+            }
+            window_.SetPosition(x, y);
+            LOG_INFO("Placed window on 3D panel at (%d, %d)%s", x, y,
+                     (panelW > 0) ? " (centered)" : "");
         }
-        if (left == 0 && top == 0) return;
-        int x = left, y = top;
-        if (panelW > 0 && panelH > 0) {
-            x = left + ((int)panelW - winW) / 2;
-            y = top + ((int)panelH - winH) / 2;
-        }
-        window_.SetPosition(x, y);
-        LOG_INFO("Placed window on 3D panel at (%d, %d)%s", x, y,
-                 (panelW > 0) ? " (centered)" : "");
+        // Desktop Linux: the window is created HERE, now that the panel is known
+        // (displayxr-common's window helper: after the system properties, before
+        // xrCreateSession). A no-op elsewhere, where Create() already made it.
+        window_.RealizeOnPanel(left, top, panelW, panelH);
     };
-    xr_.SetPixelSizeSource([this](uint32_t& w, uint32_t& h) { window_.PixelSize(w, h); });
     if (!xr_.Initialize(window_.NativeHandle(), placeOnPanel)) {
         LOG_ERROR("OpenXR initialization failed");
         return false;
@@ -593,7 +595,6 @@ void App::RenderOneFrame() {
         // and submit match what the runtime samples.
         uint32_t canvasW = 0, canvasH = 0;
         window_.PixelSize(canvasW, canvasH);
-        xr_.DeclareSurfaceSize(canvasW, canvasH);   // native Wayland: the runtime follows the window
         xr_.ComputeViewRects(canvasW, canvasH, rects);
 
         // Map the 2-view source onto the N display views by eye-X vs the views' center.
@@ -790,6 +791,9 @@ void App::RenderOneFrame() {
                 imgui_.BeginFrame((float)pw, (float)phh, hud.x, hud.y, hud.width, hud.height);
                 BuildTransportUI();
                 imgui_.RenderToHud(hudIdx);
+                // Desktop Linux: the pointer shape ImGui wants (I-beam over the URL
+                // field, ...). The SDL backend does this itself elsewhere.
+                window_.SetImGuiCursor(imgui_.MouseCursor());
                 if (dumpHudPath_ && !dumpedHud_ && rendered_ >= 100) {
                     renderer_.DumpExternalImage(xr_.HudImages()[hudIdx], xr_.HudWidth(),
                                                 xr_.HudHeight(), dumpHudPath_);
@@ -2524,7 +2528,7 @@ void App::TickUi() {
     // wakes the UI and re-bases the resting point.
     if (window_.MouseInWindow()) {
         float mx = 0.0f, my = 0.0f;
-        SDL_GetMouseState(&mx, &my);
+        window_.MousePosition(mx, my);
         if (restMouseX_ < 0.0f ||
             std::fabs(mx - restMouseX_) + std::fabs(my - restMouseY_) > 3.0f) {
             restMouseX_ = mx;

@@ -96,27 +96,36 @@ the `DebInstall` CI matrix apt-installs the result into clean 22.04/24.04/26.04
 containers (`scripts/verify_deb_install_linux.sh`). Never let a distro FFmpeg or
 SDL3 reach the `.deb` — it narrows the package to one Ubuntu release.
 
-**Window platform: X11 or native Wayland, one binary.** SDL still owns the
-window on Linux, because ImGui, drag-and-drop and live resize all hang off it.
-displayxr-common's `displayxr::linux_window` makes the *decision*: its
-capability probe is the one rule every DisplayXR app uses, and the helper is
-built on Linux only.
+**Window: displayxr-common's `DxrLinuxWindow` (X11 or native Wayland, one binary).**
+On desktop Linux the window is NOT SDL's. It is `displayxr::linux_window`, the one Linux
+window every DisplayXR demo uses (`src/platform/WindowLinux.cpp`). SDL stays the audio,
+camera and file-dialog layer and opens no window (`SDL_INIT_EVENTS` only).
 
-- `--platform=x11|wayland|auto` selects the platform. The default `auto` picks
-  native Wayland when the compositor is ready and X11 otherwise. It never reads
-  session env vars.
-- The chosen platform becomes SDL's video driver hint. `Window.cpp` then
-  verifies the driver SDL actually opened and extracts the matching handles
-  into `Window::LinuxHandles`.
-- `XrSession.cpp` chains the matching binding. On X11 that is
-  `XrXlibWindowBindingCreateInfoDXR`.
-- On native Wayland it chains `XrWaylandSurfaceBindingCreateInfoDXR` +
-  `XrWaylandSurfaceGeometryDXR` (SDL's pixel size), and republishes resizes
-  every frame through `xrSetWaylandSurfaceGeometryDXR`
-  (`XrSession::DeclareSurfaceSize`).
-- On Wayland the window is created `SDL_WINDOW_VULKAN`, SDL's
-  external-Vulkan-WSI case, and shown **before** the session. The runtime's WSI
-  needs a surface that already has its role and an acked configure.
+Why: an SDL window on GNOME's native Wayland has **no title bar**. mutter offers no
+server-side decorations, and the static SDL3 is built without libdecor. It also had no
+content drag, so only Super+drag moved it, and on X11 the WM's drag is not phase-snapped.
+
+- `--platform=x11|wayland|auto` picks the platform through the helper's capability probe.
+  The default `auto` picks native Wayland when the compositor is ready and X11 otherwise.
+  It never reads session env vars.
+- `Window::Create()` only records the probe's verdict, which picks the binding extension
+  before the instance exists. The window itself is made in `Window::RealizeOnPanel()`, which
+  `XrSession` runs through `placeWindow` after the system properties and before
+  `xrCreateSession`. That is the helper's ordering contract, and it knows the panel rect then.
+- `XrSession.cpp` chains `DxrLinuxWindow::session_binding_chain()`: the xlib binding, or the
+  Wayland binding + `XrWaylandSurfaceGeometryDXR`. It then calls `attach_session()`, which
+  republishes the Wayland surface size on every configure, and installs the
+  `xrWeaveSnapWindowRectDXR` snap (`XR_DXR_weave`) for the phase-snapped drag.
+- Moving: the title bar (Wayland client-side bar / X11 header bar) and **right-drag**
+  anywhere in the content (`*_drag_button = 3`). The left button, the wheel and the keys stay
+  the player's.
+- Input: `PumpEvents()` maps `DxrWindowEvent` keysyms to the player's keys. Wayland has no
+  key repeat, so the nudge keys are repeated here.
+- ImGui is fed by `ImGuiLayer::ProcessEvent(DxrWindowEvent*)` (`MEDIAPLAYER_IMGUI_DXRWIN`):
+  mouse, wheel, keys, and UTF-8 `text` for the stream-URL field (`set_text_input(true)`:
+  compose / dead keys). The cursor shape goes back through `Window::SetImGuiCursor()` ->
+  `set_cursor()`.
+- File drops arrive as the helper's `Drop` event (Wayland `wl_data_device`, X11 XDND).
 
 ## Run / test
 
