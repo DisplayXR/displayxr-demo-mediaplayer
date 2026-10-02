@@ -19,6 +19,13 @@
 #include "imgui_impl_sdl3.h"
 #endif
 
+// Desktop Linux: the window is displayxr-common's DxrLinuxWindow, whose event
+// stream (DxrWindowEvent) is this layer's input — ProcessEvent() takes one.
+#if defined(MEDIAPLAYER_IMGUI_DXRWIN)
+#include "dxr_linux_window.h"
+#include <X11/keysym.h>
+#endif
+
 // The Win32 cursor subclass is a strict subset of the SDL desktop path.
 #if defined(_WIN32) && defined(MEDIAPLAYER_IMGUI_SDL)
 #  define WIN32_LEAN_AND_MEAN
@@ -301,6 +308,12 @@ bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice 
         ImGui::DestroyContext();
         return false;
     }
+#elif defined(MEDIAPLAYER_IMGUI_DXRWIN)
+    // Desktop Linux: we are the platform backend, fed by the window helper's
+    // events (ProcessEvent). The cursor shape goes back through MouseCursor().
+    io.BackendPlatformName = "displayxr_linux_window";
+    io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
+    io.MouseDrawCursor = false;
 #else
     // No platform backend: we are the platform. Name ourselves so ImGui's asserts and
     // any debug UI report something sane, and drive dt + input by hand (BeginFrame /
@@ -349,8 +362,95 @@ bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice 
     return true;
 }
 
+#if defined(MEDIAPLAYER_IMGUI_DXRWIN)
+namespace {
+ImGuiKey KeyFromKeysym(uint32_t ks) {
+    switch (ks) {
+        case XK_Tab: return ImGuiKey_Tab;
+        case XK_Left: return ImGuiKey_LeftArrow;
+        case XK_Right: return ImGuiKey_RightArrow;
+        case XK_Up: return ImGuiKey_UpArrow;
+        case XK_Down: return ImGuiKey_DownArrow;
+        case XK_Page_Up: return ImGuiKey_PageUp;
+        case XK_Page_Down: return ImGuiKey_PageDown;
+        case XK_Home: return ImGuiKey_Home;
+        case XK_End: return ImGuiKey_End;
+        case XK_Insert: return ImGuiKey_Insert;
+        case XK_Delete: return ImGuiKey_Delete;
+        case XK_BackSpace: return ImGuiKey_Backspace;
+        case XK_space: return ImGuiKey_Space;
+        case XK_Return: return ImGuiKey_Enter;
+        case XK_KP_Enter: return ImGuiKey_KeypadEnter;
+        case XK_Escape: return ImGuiKey_Escape;
+        case XK_a: return ImGuiKey_A;
+        case XK_c: return ImGuiKey_C;
+        case XK_v: return ImGuiKey_V;
+        case XK_x: return ImGuiKey_X;
+        case XK_y: return ImGuiKey_Y;
+        case XK_z: return ImGuiKey_Z;
+        default: return ImGuiKey_None;
+    }
+}
+}  // namespace
+#endif
+
 void ImGuiLayer::ProcessEvent(const void* sdlEvent) {
-#if !defined(MEDIAPLAYER_IMGUI_SDL)
+#if defined(MEDIAPLAYER_IMGUI_DXRWIN)
+    // Desktop Linux: `sdlEvent` is a DxrWindowEvent (the window helper's stream).
+    // Positions are content px — the PointSize() space BeginFrame remaps from.
+    if (!ready_ || sdlEvent == nullptr) return;
+    const DxrWindowEvent& ev = *static_cast<const DxrWindowEvent*>(sdlEvent);
+    ImGuiIO& io = ImGui::GetIO();
+    auto queuePos = [&](float mx, float my) {
+        if (remapRectW_ > 0.0f && remapRectH_ > 0.0f && remapDivW_ > 0.0f && remapDivH_ > 0.0f) {
+            const float u = ((mx / remapDivW_) - remapRectX_) / remapRectW_;
+            const float v = ((my / remapDivH_) - remapRectY_) / remapRectH_;
+            io.AddMousePosEvent(u * (float)hudWidth_, v * (float)hudHeight_);
+        }
+    };
+    switch (ev.type) {
+        case DxrWindowEvent::Type::Motion:
+            lastMouseX_ = (float)ev.x;
+            lastMouseY_ = (float)ev.y;
+            queuePos(lastMouseX_, lastMouseY_);
+            break;
+        case DxrWindowEvent::Type::PointerLeave:
+            lastMouseX_ = lastMouseY_ = -1.0f;
+            io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+            break;
+        case DxrWindowEvent::Type::ButtonDown:
+        case DxrWindowEvent::Type::ButtonUp: {
+            // The drag button's press / release moves the WINDOW: never a click.
+            if (ev.window_drag) break;
+            const int b = ev.button == 1 ? 0 : ev.button == 3 ? 1 : ev.button == 2 ? 2 : -1;
+            if (b < 0) break;
+            lastMouseX_ = (float)ev.x;
+            lastMouseY_ = (float)ev.y;
+            queuePos(lastMouseX_, lastMouseY_);  // the click latches where the cursor is
+            io.AddMouseButtonEvent(b, ev.type == DxrWindowEvent::Type::ButtonDown);
+            break;
+        }
+        case DxrWindowEvent::Type::Scroll:
+            // ImGui's wheel_x > 0 scrolls LEFT; the helper's +x is right.
+            io.AddMouseWheelEvent(-(float)ev.scroll_steps_x, (float)ev.scroll_steps);
+            break;
+        case DxrWindowEvent::Type::KeyDown:
+        case DxrWindowEvent::Type::KeyUp: {
+            const bool down = ev.type == DxrWindowEvent::Type::KeyDown;
+            io.AddKeyEvent(ImGuiMod_Ctrl, (ev.mods & DxrModCtrl) != 0);
+            io.AddKeyEvent(ImGuiMod_Shift, (ev.mods & DxrModShift) != 0);
+            io.AddKeyEvent(ImGuiMod_Alt, (ev.mods & DxrModAlt) != 0);
+            io.AddKeyEvent(ImGuiMod_Super, (ev.mods & DxrModSuper) != 0);
+            const ImGuiKey k = KeyFromKeysym(ev.keysym);
+            if (k != ImGuiKey_None) io.AddKeyEvent(k, down);
+            if (down && ev.text[0] != '\0') io.AddInputCharactersUTF8(ev.text);
+            break;
+        }
+        case DxrWindowEvent::Type::FocusGained: io.AddFocusEvent(true); break;
+        case DxrWindowEvent::Type::FocusLost: io.AddFocusEvent(false); break;
+        default: break;
+    }
+#elif !defined(MEDIAPLAYER_IMGUI_SDL)
     (void)sdlEvent;  // no platform backend — input arrives via PushPointer()
 #else
     if (!ready_) return;
@@ -391,7 +491,32 @@ void ImGuiLayer::BeginFrame(float winPointW, float winPointH,
     io.DisplaySize = ImVec2((float)hudWidth_, (float)hudHeight_);
     io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
 
-#if !defined(MEDIAPLAYER_IMGUI_SDL)
+#if defined(MEDIAPLAYER_IMGUI_DXRWIN)
+    // Desktop Linux: we own dt; input arrived through ProcessEvent().
+    {
+        const double now = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now().time_since_epoch()).count();
+        double dt = (lastFrameSeconds_ < 0.0) ? (1.0 / 60.0) : (now - lastFrameSeconds_);
+        lastFrameSeconds_ = now;
+        if (!(dt > 0.001)) dt = 0.001;
+        if (dt > 0.25) dt = 0.25;
+        io.DeltaTime = (float)dt;
+    }
+    // Cache the window -> HUD remap (the same rect the HUD layer is drawn in) for
+    // ProcessEvent, and re-queue the cursor through it: the HUD rect follows a
+    // resize, so a cursor that has not moved still lands on the right widget.
+    if (rectW > 0.0f && rectH > 0.0f && winPointW > 0.0f && winPointH > 0.0f) {
+        remapRectX_ = rectX; remapRectY_ = rectY; remapRectW_ = rectW; remapRectH_ = rectH;
+        remapDivW_ = winPointW; remapDivH_ = winPointH;
+        if (lastMouseX_ >= 0.0f && lastMouseY_ >= 0.0f) {
+            const float u = ((lastMouseX_ / winPointW) - rectX) / rectW;
+            const float v = ((lastMouseY_ / winPointH) - rectY) / rectH;
+            io.AddMousePosEvent(u * (float)hudWidth_, v * (float)hudHeight_);
+        }
+    }
+    ImGui::NewFrame();
+    return;
+#elif !defined(MEDIAPLAYER_IMGUI_SDL)
     // No platform backend, so we own dt and input.
     //
     // dt: ImGui::NewFrame() asserts DeltaTime > 0, so clamp rather than trust the clock
@@ -556,6 +681,10 @@ void ImGuiLayer::RenderToHud(uint32_t imageIndex) {
     vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
 }
 
+int ImGuiLayer::MouseCursor() const {
+    return ready_ ? (int)ImGui::GetMouseCursor() : 0;
+}
+
 bool ImGuiLayer::WantCaptureMouse() const {
     return ready_ && ImGui::GetIO().WantCaptureMouse;
 }
@@ -603,6 +732,7 @@ void ImGuiLayer::ProcessEvent(const void*) {}
 void ImGuiLayer::BeginFrame(float, float, float, float, float, float) {}
 void ImGuiLayer::RenderToHud(uint32_t) {}
 bool ImGuiLayer::WantCaptureMouse() const { return false; }
+int ImGuiLayer::MouseCursor() const { return 0; }
 void ImGuiLayer::Shutdown() {}
 
 #endif

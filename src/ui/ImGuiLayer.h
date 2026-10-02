@@ -12,8 +12,13 @@
 //
 // PLATFORM SPLIT. The render side is platform-neutral — it targets whatever VkImages
 // the caller hands it. Only the *input/timing* side differs:
-//   MEDIAPLAYER_IMGUI_SDL defined  -> desktop: imgui_impl_sdl3 pumps input and dt
-//                                     (plus a Win32 WM_MOUSEMOVE subclass, see the .cpp)
+//   MEDIAPLAYER_IMGUI_SDL defined  -> desktop Windows / macOS: imgui_impl_sdl3 pumps
+//                                     input and dt (plus a Win32 WM_MOUSEMOVE subclass,
+//                                     see the .cpp)
+//   MEDIAPLAYER_IMGUI_DXRWIN       -> desktop Linux: ProcessEvent() takes the window
+//                                     helper's DxrWindowEvent (displayxr-common); dt is
+//                                     measured internally, the cursor shape goes back
+//                                     through MouseCursor()
 //   not defined                    -> Android: no platform backend at all. The caller
 //                                     feeds pointer events via PushPointer() and dt is
 //                                     measured internally.
@@ -44,8 +49,8 @@ public:
     void Shutdown();
     bool Ready() const { return ready_; }
 
-    // Forward one SDL event (argument is an `SDL_Event*`) to the ImGui backend.
-    // No-op where there is no platform backend.
+    // Forward one window event to ImGui: an `SDL_Event*` on Windows / macOS, a
+    // `DxrWindowEvent*` on desktop Linux. No-op where there is no platform backend.
     void ProcessEvent(const void* sdlEvent);
 
     // Platforms with no ImGui platform backend (Android) queue pointer events here.
@@ -73,6 +78,9 @@ public:
 
     // True while the pointer is over an ImGui widget (so the app can ignore the click).
     bool WantCaptureMouse() const;
+
+    // The pointer shape ImGui wants this frame (an ImGuiMouseCursor value).
+    int MouseCursor() const;
 
 private:
     // Build the render pass / views / framebuffers over `hudImages`. Shared by Init()

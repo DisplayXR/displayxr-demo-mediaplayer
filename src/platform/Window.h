@@ -1,47 +1,66 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Window — SDL3 window + native-handle extraction. The DisplayXR runtime renders
-// into a handle the app owns (the `_handle` app class), so we must hand it the
-// platform-native view/window:
+// Window — the app window + native-handle extraction. The DisplayXR runtime
+// renders into a handle the app owns (the `_handle` app class), so we must hand
+// it the platform-native view/window:
 //   macOS  -> NSView* (CAMetalLayer-backed) via SDL_Metal_CreateView
 //   Windows-> HWND via SDL window properties
-//   Linux  -> &LinuxHandles via SDL window properties: X11 (Display* + XID,
-//             XR_DXR_xlib_window_binding) or native Wayland (wl_display* +
-//             wl_surface*, XR_DXR_wayland_surface_binding), whichever the
-//             capability probe chose and SDL actually opened
-// One SDL codebase; only the handle extraction is per-platform.
+//   Linux  -> &LinuxHandles: displayxr-common's DxrLinuxWindow — THE desktop-
+//             Linux window every DisplayXR demo uses (X11 or native Wayland,
+//             picked by its capability probe). It owns the window chrome
+//             (the client-side title bar on GNOME Wayland, the X11 header bar),
+//             the phase-snapped drags (title bar, right-drag anywhere), F11 to
+//             the panel and the Wayland geometry feed. SDL still provides audio,
+//             camera and the file dialog on Linux, but no window.
+// macOS / Windows: one SDL codebase; only the handle extraction is per-platform.
+// Desktop Linux: src/platform/WindowLinux.cpp.
 #pragma once
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 struct SDL_Window;
+#if defined(__linux__) && !defined(__ANDROID__)
+class DxrLinuxWindow;   // displayxr-common (dxr_linux_window.h)
+#endif
 
 namespace mp {
 
 class Window {
 public:
 #if defined(__linux__) && !defined(__ANDROID__)
-    // What NativeHandle() points at on desktop Linux: X11 (Display*, Window
-    // XID) for XR_DXR_xlib_window_binding, or native Wayland (wl_display*,
-    // wl_surface*) for XR_DXR_wayland_surface_binding — whichever SDL's video
-    // driver actually is. Bundled to fit the one-void* handle plumbing; all
-    // borrowed from SDL — valid until Destroy().
+    // What NativeHandle() points at on desktop Linux. `wayland` is known from
+    // Create() (the capability probe's verdict — it picks the binding extension
+    // before the instance exists); `win` exists from RealizeOnPanel() on, which
+    // XrSession runs after the system-properties query and before
+    // xrCreateSession — the window helper's ordering contract.
     struct LinuxHandles {
-        bool wayland = false;         // true: display/surface are wl_*; false: X11
-        void* display = nullptr;      // Display* or wl_display*
-        unsigned long window = 0;     // X11 Window (XID)
-        void* surface = nullptr;      // wl_surface*
+        bool wayland = false;           // true: XR_DXR_wayland_surface_binding; false: xlib
+        DxrLinuxWindow* win = nullptr;  // null until RealizeOnPanel(), or with no platform
     };
     //! --platform=x11|wayland|auto from the command line (default auto). Read
     //! by Create(); 0 = auto, 1 = x11, 2 = wayland.
     static void SetLinuxPlatformRequest(int request);
 #endif
 
-    Window() = default;
+    // Create the native window now that the 3D panel is known (desktop Linux;
+    // a no-op elsewhere, where Create() already made it). (left, top) is the
+    // panel's top-left in virtual-desktop px, (panelW, panelH) its size (0 =
+    // unknown). The window opens where SetPosition() last asked, if it did.
+    void RealizeOnPanel(int32_t left, int32_t top, uint32_t panelW, uint32_t panelH);
+
+    // Pointer position in window points (the PointSize() space).
+    void MousePosition(float& x, float& y) const;
+
+    // The pointer shape ImGui wants (an ImGuiMouseCursor value; -1 = none).
+    // Desktop Linux only — the SDL ImGui backend sets cursors itself elsewhere.
+    void SetImGuiCursor(int imguiCursor);
+
+    Window();   // out of line: a member of incomplete type (desktop Linux)
     ~Window();
 
     Window(const Window&) = delete;
@@ -146,7 +165,21 @@ private:
     void* metalView_ = nullptr;   // SDL_MetalView (macOS only); owned, destroyed on Destroy
     void* nativeHandle_ = nullptr;
 #if defined(__linux__) && !defined(__ANDROID__)
-    LinuxHandles linux_;          // nativeHandle_ points here when the handles resolve
+    LinuxHandles linux_;          // nativeHandle_ points here when a platform resolved
+    std::unique_ptr<DxrLinuxWindow> lwin_;
+    int linuxBackend_ = 0;        // the probe's verdict: 0 none, 1 X11, 2 Wayland
+    std::string title_;
+    int reqW_ = 0, reqH_ = 0;     // requested content size (px)
+    bool hasPos_ = false;
+    int posX_ = 0, posY_ = 0;     // SetPosition() before RealizeOnPanel()
+    float mouseX_ = -1.0f, mouseY_ = -1.0f;
+    int lastCursor_ = -2;
+    // Wayland sends no key repeat (the client repeats): the held key that
+    // repeats the app's nudge keys, and when it next fires.
+    uint32_t heldKeysym_ = 0;
+    uint32_t heldMods_ = 0;
+    int64_t heldNextNs_ = 0;
+    void HandleLinuxKey(uint32_t keysym, uint32_t mods, bool repeat, bool* quit);
 #endif
     bool cycleModeRequested_ = false;
     bool toggleHudRequested_ = false;
