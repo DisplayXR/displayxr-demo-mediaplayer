@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -31,7 +32,14 @@ struct ANativeWindow;
 // an import the descriptor set still points at, every frame. Raising this from
 // 6 to 10 for #54's lookahead silently broke that invariant against a hardcoded
 // cache of 8, which showed up as heavy flicker. Derive, never re-type.
-inline constexpr int32_t kVideoReaderMaxImages = 10;
+//
+// Frames in flight on the render thread (dxr::VkFrameRing, runtime INV-4.10): the
+// renderer no longer waits each frame's GPU work, so an image it sampled is handed
+// back to the reader only once that frame's fence has passed (setImageRetirer) --
+// up to this many extra images sit outside the pool. The pool grows by exactly
+// that, so the codec keeps the working set #54 sized it for.
+inline constexpr int32_t kVideoRenderFramesInFlight = 3;
+inline constexpr int32_t kVideoReaderMaxImages = 10 + kVideoRenderFramesInFlight;
 
 struct VideoDecoder {
 	~VideoDecoder() { stop(); }
@@ -44,6 +52,18 @@ struct VideoDecoder {
 	// the first `video/*` track the extractor lists. A two-track stereo file ("LVF
 	// v2", one full view per track) opens TWO decoders on the same file, one per eye,
 	// naming the track each should take.
+	// Where an image that was ON SCREEN goes once a newer one replaces it. Unset, it
+	// is AImage_delete()d at once, which returns its buffer to the pool -- and the
+	// codec refills it immediately (see kLookaheadUs in the .cpp: an overwrite during
+	// a sample is L/R mixing). That was only safe while the renderer waited every
+	// frame. With frames in flight the render thread installs a hook that defers the
+	// delete until the GPU has finished every frame that may still sample the buffer.
+	// Called on the render thread (the acquire* calls), never the decode thread.
+	// Images that were never handed out (pending / discarded) are still deleted at
+	// once. stop() deletes the held image directly, so the caller must have drained
+	// the GPU (and run the deferred deletes) BEFORE stop() -- the reader dies there.
+	void setImageRetirer(std::function<void(AImage *)> fn) { retirer_ = std::move(fn); }
+
 	bool openPath(const std::string &path, int videoTrackIndex = -1);
 	bool openFd(int fd, int64_t offset, int64_t length, int videoTrackIndex = -1);
 	void stop();
@@ -241,6 +261,8 @@ private:
 	int width_ = 0;
 	int height_ = 0;
 
+	std::function<void(AImage *)> retirer_;  // see setImageRetirer()
+	void retireHeld();                // hand heldImage_ to retirer_ (or delete it) and clear it
 	AImage *heldImage_ = nullptr;     // most-recently-acquired image (kept alive until next acquire)
 	AImage *pendingImage_ = nullptr;  // acquired but not yet due (held for a later display time)
 

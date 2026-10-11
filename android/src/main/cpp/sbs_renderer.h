@@ -13,8 +13,17 @@
 //                      AMediaCodec video path; the GPU does the BT.709 convert.
 //
 // Planes are reused frame-to-frame (reallocated only on a size/format change)
-// with a persistent host-visible staging buffer each, so per-frame video upload
-// is a memcpy + one transfer submit — no per-frame Vulkan object churn.
+// with a persistent host-visible staging buffer each.
+//
+// Frame submission (runtime INV-4.10, displayxr-common dxr::VkFrameRing): the
+// renderer keeps N frames in flight (default 3) and submits ONCE per frame — the
+// atlas pass and the HUD pass share one command buffer, opened by drawAtlas() /
+// frameCmd() and submitted by endFrame(), which never waits. On Adreno a
+// submit-then-wait loop never looks busy to the GPU governor, which parks the
+// clock at ~1/3 (modelviewer #170: 13 -> 30 fps). Consequences the code below
+// honours: descriptor sets are per ring slot (written each frame, never one set
+// rewritten under a queued frame), and anything a queued frame may still read —
+// an evicted AHB import, a decoder image — is released through deferDestroy().
 #pragma once
 
 #define VK_USE_PLATFORM_ANDROID_KHR  // vulkan_android.h: AHardwareBuffer import structs + PFNs
@@ -23,11 +32,31 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
 
+#include <vk_frame_ring.h>  // displayxr-common: dxr::VkFrameRing (INV-4.10)
+
 struct SbsRenderer {
+	// `framesInFlight` is passed explicitly (Android processes have no usable env, so
+	// DXR_VK_FRAMES_IN_FLIGHT does not reach us); 1 reproduces the old submit->wait.
 	bool init(VkPhysicalDevice phys, VkDevice device, VkQueue queue,
-	          uint32_t queueFamily, VkFormat format);
+	          uint32_t queueFamily, VkFormat format, uint32_t framesInFlight);
+
+	// ── Frame ring ─────────────────────────────────────────────────────────
+	// The open frame's command buffer, opening one if none is (drawAtlas() opens it
+	// too). Record the HUD pass into it after drawAtlas().
+	VkCommandBuffer frameCmd() { return ring_.beginFrame(); }
+	// ONE vkQueueSubmit for everything recorded this frame; never waits. Call BEFORE
+	// releasing the atlas / HUD swapchain images. No-op when no frame is open.
+	void endFrame();
+	// Run `fn` once the GPU has finished every frame submitted so far (or the open
+	// one). For anything a queued frame may still read.
+	void deferDestroy(std::function<void()> fn) { ring_.deferDestroy(std::move(fn)); }
+	// Block until every submitted frame is done and run the deferred releases.
+	// Stream teardown / shutdown only — never per frame.
+	void waitAll() { ring_.waitAll(); }
+	uint32_t framesInFlight() const { return ring_.framesInFlight(); }
 
 	// RGBA8 still image (mode 0). Replaces the current source.
 	bool uploadTexture(const uint8_t *rgba, uint32_t width, uint32_t height);
@@ -78,16 +107,16 @@ struct SbsRenderer {
 	// opened. Without this the old reader's imports stay cached alongside the
 	// new reader's, the cache overflows, and importAhb() evicts -- destroys --
 	// a live import under the descriptor set every frame: the picture tears
-	// between eyes. Blocks until the GPU is idle; render-thread only.
+	// between eyes. Waits every frame in flight; render-thread only.
 	void resetVideoAhb();
 
 	bool hasSource() const {
 		return planes_[0].view != VK_NULL_HANDLE || ahbActiveView_ != VK_NULL_HANDLE;
 	}
 
-	// Render the active mode's `viewCount` views into TILES of the single atlas
-	// image (size atlasW x atlasH) in ONE render pass, then blocks until the GPU
-	// finishes. Each view v occupies tile (v%cols, v/cols) sized renderW x
+	// Record the active mode's `viewCount` views into TILES of the single atlas
+	// image (size atlasW x atlasH) in ONE render pass, into the frame command
+	// buffer (opened here if needed). Records only: endFrame() submits. Each view v occupies tile (v%cols, v/cols) sized renderW x
 	// renderH; its content is min-to-min fit (MatchMinRect) within the tile
 	// (shorter side matched, longer axis cropped/letterboxed), scissor-clipped
 	// to the tile, with the transport overlay drawn per tile. Stereo SBS slices
@@ -125,7 +154,7 @@ private:
 	void recordPlaneCopy(VkCommandBuffer cmd, int idx, const uint8_t *src, uint32_t w,
 	                     uint32_t h, uint32_t bytesPerTexel);
 	bool ensureDummy();
-	void bindDescriptors();  // point the 3 sampler slots at planes_/dummy
+	void bindDescriptors(VkDescriptorSet set);  // point the 3 sampler slots at planes_/dummy
 	void destroyPlane(Plane &p);
 
 	VkPhysicalDevice phys_ = VK_NULL_HANDLE;
@@ -141,10 +170,14 @@ private:
 	VkPipeline pipeline_ = VK_NULL_HANDLE;
 	VkSampler sampler_ = VK_NULL_HANDLE;
 	VkDescriptorPool descPool_ = VK_NULL_HANDLE;
-	VkDescriptorSet descSet_ = VK_NULL_HANDLE;
-	VkCommandPool cmdPool_ = VK_NULL_HANDLE;
-	VkCommandBuffer cmd_ = VK_NULL_HANDLE;
-	VkFence fence_ = VK_NULL_HANDLE;
+	// One set PER RING SLOT, rewritten by drawAtlas() for the slot it records into.
+	// Updating a descriptor set that a queued command buffer still references is
+	// undefined, so one shared set (the pre-ring design) is not an option.
+	static constexpr uint32_t kMaxSlots = dxr::detail::kMaxFramesInFlight;
+	VkDescriptorSet descSets_[kMaxSlots] = {};
+
+	dxr::VkFrameRing ring_;
+	bool endFrameErrLogged_ = false;
 
 	Plane planes_[3];
 	int sourceMode_ = 0;          // 0 RGBA, 1 I420, 2 NV12, 3 AHB-ycbcr (pushed to the shader)
@@ -171,8 +204,9 @@ private:
 	VkPipelineLayout ahbPipeLayout_ = VK_NULL_HANDLE;
 	VkPipeline ahbPipeline_ = VK_NULL_HANDLE;
 	VkDescriptorPool ahbDescPool_ = VK_NULL_HANDLE;
-	VkDescriptorSet ahbDescSet_ = VK_NULL_HANDLE;   // single source, or the LEFT eye
-	VkDescriptorSet ahbDescSetR_ = VK_NULL_HANDLE;  // RIGHT eye (dual-source only)
+	// Per ring slot, written by drawAtlas() from ahbActiveView_/ahbActiveViewR_.
+	VkDescriptorSet ahbDescSets_[kMaxSlots] = {};   // single source, or the LEFT eye
+	VkDescriptorSet ahbDescSetsR_[kMaxSlots] = {};  // RIGHT eye (dual-source only)
 	uint64_t ahbExternalFormat_ = 0;  // VkExternalFormatANDROID.externalFormat for this stream
 	bool ahbInited_ = false;
 	PFN_vkGetAndroidHardwareBufferPropertiesANDROID pfnGetAhbProps_ = nullptr;

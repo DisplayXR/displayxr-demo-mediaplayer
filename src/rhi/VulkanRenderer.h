@@ -7,10 +7,20 @@
 //
 // The Vulkan instance/device/queue are owned by XrSession (the runtime selects
 // them); this class only creates the per-image views + framebuffers, a color-only
-// render pass, and a command buffer/fence.
+// render pass, and the frame ring.
+//
+// Frame submission (runtime INV-4.10, displayxr-common dxr::VkFrameRing): N frames in
+// flight (default 3; DXR_VK_FRAMES_IN_FLIGHT overrides, 1 = the old submit->wait) and
+// ONE vkQueueSubmit per frame. Uploads, the atlas pass and the HUD pass all RECORD into
+// the open frame's command buffer (FrameCmd()); App calls SubmitFrame() once, before it
+// releases the HUD / atlas swapchain images. Nothing on the frame path waits the frame
+// it just submitted. Descriptor sets are per ring slot (written each frame), and
+// anything a queued frame may still read is released through the ring's deferDestroy().
 #pragma once
 
 #include <vulkan/vulkan.h>
+
+#include <vk_frame_ring.h>  // displayxr-common: dxr::VkFrameRing (INV-4.10)
 
 #include <cstdint>
 #include <utility>
@@ -39,15 +49,26 @@ public:
     VulkanRenderer& operator=(const VulkanRenderer&) = delete;
 
     // `images` are the VkImages backing the OpenXR SBS swapchain; `format`/`width`/
-    // `height` describe it. Builds image views, framebuffers, render pass, command
-    // pool/buffer and a fence.
+    // `height` describe it. Builds image views, framebuffers, render pass, pipeline and
+    // the frame ring (command buffers + fences allocated once).
     bool Initialize(VkPhysicalDevice physicalDevice, VkDevice device, VkQueue graphicsQueue,
                     uint32_t queueFamilyIndex, VkFormat format, uint32_t width, uint32_t height,
                     const std::vector<VkImage>& images);
     void Shutdown();
 
-    // Copy an RGBA8 buffer into an external (e.g. HUD swapchain) VkImage, leaving it
-    // in COLOR_ATTACHMENT_OPTIMAL (the layout the runtime expects at release).
+    // The open frame's command buffer, opening one (waiting only the fence of the frame
+    // that used its ring slot N frames ago) if none is open. Every per-frame recording
+    // below goes through it; ImGuiLayer::RenderToHud records into it too.
+    VkCommandBuffer FrameCmd() { return ring_.beginFrame(); }
+    // Submit everything recorded this frame: EXACTLY one vkQueueSubmit, no wait. Call
+    // BEFORE releasing the HUD / atlas swapchain images (the runtime composes on the same
+    // queue, so our work must be queued ahead of it). No-op when no frame is open.
+    void SubmitFrame();
+    uint32_t FramesInFlight() const { return ring_.framesInFlight(); }
+
+    // Record a copy of an RGBA8 buffer into an external (e.g. HUD swapchain) VkImage into
+    // the frame command buffer, leaving it in COLOR_ATTACHMENT_OPTIMAL (the layout the
+    // runtime expects at release). Submitted by SubmitFrame().
     //
     // This is a vkCmdCopyBufferToImage — a raw byte store with no format conversion in
     // either direction — so it is the matched transfer for ENCODED bytes into an _SRGB
@@ -57,8 +78,9 @@ public:
                                 uint32_t height);
 
     // Debug: read the given swapchain image back and write it to `path` as PNG.
-    // Must be called after ClearViews and before the image is released. Proves
-    // exactly what the app submitted to the runtime. Returns false on failure.
+    // Must be called after ClearViews/DrawViews and before the image is released. Proves
+    // exactly what the app submitted to the runtime. Returns false on failure. Debug-only
+    // and deliberately blocking: it submits the open frame early and drains the ring.
     bool DumpImage(uint32_t imageIndex, const char* path);
 
     // Debug: read back an arbitrary RGBA8 image (e.g. the HUD swapchain image, left
@@ -66,14 +88,15 @@ public:
     // rendered into an off-screen target. Returns false on failure.
     bool DumpExternalImage(VkImage image, uint32_t width, uint32_t height, const char* path);
 
-    // Record + submit a clear of the acquired swapchain image: each of the N views
-    // gets its own color written into its `rects[v]` tile (the same rect submitted
-    // to the runtime). Blocks until the GPU finishes (the runtime samples the image
-    // right after we release it), mirroring the reference handle apps.
+    // Record a clear of the acquired swapchain image into the frame command buffer: each
+    // of the N views gets its own color written into its `rects[v]` tile (the same rect
+    // submitted to the runtime). Submitted by SubmitFrame() before the release.
     bool ClearViews(uint32_t imageIndex, const ClearColor* colors,
                     const XrSession::ViewRect* rects, uint32_t viewCount);
 
-    // Upload an RGBA8 image as the source for DrawViews (images / test patterns).
+    // Upload an RGBA8 image as the source for DrawViews (images / test patterns). Records
+    // into the frame command buffer (opening one if needed); the staging buffer and any
+    // replaced plane image are released once the GPU is past them.
     bool UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t height);
 
     // Upload a planar YUV frame (the video decoder's native output): the shader does the
@@ -102,7 +125,8 @@ public:
     }
 
     // Draw the uploaded texture into each view's tile, sampling the UV sub-region in
-    // `uvs[v]`. Clears the rest of the image to black. Blocks until the GPU finishes.
+    // `uvs[v]`. Clears the rest of the image to black. Records into the frame command
+    // buffer; SubmitFrame() submits it.
     // When true, DrawViews clears the letterbox region to alpha 0 (instead of opaque
     // black) so the runtime composes it through to the desktop (MEDIAPLAYER_TRANSPARENT).
     void SetTransparentLetterbox(bool t) { transparentLetterbox_ = t; }
@@ -133,9 +157,8 @@ private:
     std::vector<VkImage> images_;
 
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
-    VkCommandPool commandPool_ = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
+    dxr::VkFrameRing ring_;
+    bool submitErrLogged_ = false;
 
     std::vector<VkImageView> imageViews_;
     std::vector<VkFramebuffer> framebuffers_;
@@ -145,7 +168,10 @@ private:
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool descPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet descSet_ = VK_NULL_HANDLE;
+    // One set PER RING SLOT, written by DrawViews for the slot it records into: updating
+    // a set that a queued command buffer still references is undefined behaviour.
+    static constexpr uint32_t kMaxSlots = dxr::detail::kMaxFramesInFlight;
+    VkDescriptorSet descSets_[kMaxSlots] = {};
     VkSampler sampler_ = VK_NULL_HANDLE;
 
     // Up to three source planes. RGBA images use plane 0 only (mode 0); video uses Y +
@@ -180,6 +206,11 @@ private:
     VkImage sharedImage_ = VK_NULL_HANDLE;
     VkImageView sharedView_ = VK_NULL_HANDLE;  // bound import's RGBA view
     bool* sharedLayoutReady_ = nullptr;        // -> bound import's layoutReady
+    // The open frame samples a shared import. The D3D11 producer has no GPU-side sync
+    // with us (it CPU-waits its own copy, then publishes) and may refill a texture as
+    // soon as we move on, so SubmitFrame() keeps that path frame-synchronous (drains
+    // the ring) exactly as before — the frame ring buys nothing there that is safe.
+    bool sharedSampledThisFrame_ = false;
     SharedImport* ImportSharedRGBA(void* handle, uint32_t w, uint32_t h);
 #endif
     VkImage dummyImage_ = VK_NULL_HANDLE;       // 1x1, bound to unused plane slots
@@ -193,14 +224,13 @@ private:
     // Display-referred ClearColor -> the value to hand the attachment (decoded to
     // scene-linear when the attachment encodes on store, verbatim otherwise).
     VkClearColorValue ToTargetClear(const ClearColor& c) const;
-    // Record plane (re)creation + a staged copy into `cmd` (already recording). The
-    // staging buffer/memory is appended to `staging` for the caller to free post-submit.
-    // `recreated` is set when the image view changed (so the descriptor needs rebinding).
+    // Record plane (re)creation + a staged copy into `cmd` (the open frame). The staging
+    // buffer and a replaced plane's image/view/memory go to the ring's deferDestroy (a
+    // queued frame may still read them). `recreated` = the image view changed.
     bool RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8_t* data, uint32_t w,
-                           uint32_t h, VkFormat fmt, uint32_t bytesPerTexel, bool& recreated,
-                           std::vector<std::pair<VkBuffer, VkDeviceMemory>>& staging);
+                           uint32_t h, VkFormat fmt, uint32_t bytesPerTexel, bool& recreated);
     bool EnsureDummy();
-    void BindDescriptors();          // point the 3 sampler bindings at planes_/dummy
+    void BindDescriptors(VkDescriptorSet set);  // point the 3 sampler bindings at planes_/dummy
     void DestroyTexture();
 };
 

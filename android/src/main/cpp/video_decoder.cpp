@@ -942,7 +942,7 @@ VideoDecoder::acquireFrameForDisplayTime(int64_t displayTimeNs, int *width, int 
 			}
 		}
 		if (!due) break;  // not due yet — keep it for a later display time
-		if (heldImage_ != nullptr) AImage_delete(heldImage_);
+		retireHeld();
 		if (promoted && selecting) {
 			// We had already taken a due frame this tick and found a newer one
 			// also due: the first one never reached the panel.
@@ -1069,7 +1069,7 @@ VideoDecoder::acquireFrameByPts(int64_t ptsUs, int *width, int *height)
 				     "pairing is impossible on this device; falling back to newest-frame, "
 				     "so the eyes may be up to a frame apart");
 			}
-			if (heldImage_ != nullptr) AImage_delete(heldImage_);
+			retireHeld();
 			heldImage_ = pendingImage_;
 			pendingImage_ = nullptr;
 			continue;  // keep draining: we want the NEWEST, not the oldest
@@ -1077,7 +1077,7 @@ VideoDecoder::acquireFrameByPts(int64_t ptsUs, int *width, int *height)
 		const int64_t d = tsNs / 1000 - ptsUs;
 		if (d >= -kPairSlackUs && d <= kPairSlackUs) {  // the twin
 			diagLine(tsNs / 1000, d, "match");
-			if (heldImage_ != nullptr) AImage_delete(heldImage_);
+			retireHeld();
 			heldImage_ = pendingImage_;
 			pendingImage_ = nullptr;
 			pairedFrames_.fetch_add(1, std::memory_order_relaxed);
@@ -1130,6 +1130,18 @@ VideoDecoder::acquireFrameByPts(int64_t ptsUs, int *width, int *height)
 	return nullptr;  // caller keeps the right eye it already has
 }
 
+void
+VideoDecoder::retireHeld()
+{
+	if (heldImage_ == nullptr) return;
+	if (retirer_) {
+		retirer_(heldImage_);
+	} else {
+		AImage_delete(heldImage_);
+	}
+	heldImage_ = nullptr;
+}
+
 AHardwareBuffer *
 VideoDecoder::acquireLatestBuffer(int *width, int *height)
 {
@@ -1139,12 +1151,9 @@ VideoDecoder::acquireLatestBuffer(int *width, int *height)
 	if (r != AMEDIA_OK || img == nullptr) {
 		return nullptr;  // nothing new — caller keeps displaying the previous buffer
 	}
-	// The previously-held image's AHardwareBuffer is kept alive by the renderer's
-	// own AHardwareBuffer_acquire() on import, so releasing it back to the pool
-	// here is safe (the GPU finished sampling it — drawAtlas waits idle).
-	if (heldImage_ != nullptr) {
-		AImage_delete(heldImage_);
-	}
+	// The previously-held image may still be sampled by a frame in flight, so it is
+	// retired (deferred past that frame's fence), not deleted here.
+	retireHeld();
 	heldImage_ = img;
 
 	AHardwareBuffer *ahb = nullptr;

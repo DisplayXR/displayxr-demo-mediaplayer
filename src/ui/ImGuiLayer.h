@@ -43,9 +43,13 @@ public:
     // Bring up ImGui + the Vulkan backend targeting the HUD swapchain images.
     // `nativeWindow` is an `SDL_Window*` on desktop and nullptr on platforms without
     // a platform backend (Android) — it is only used to reach the Win32 HWND.
+    // `framesInFlight` is the caller's frame-ring depth (dxr::VkFrameRing): ImGui's
+    // Vulkan backend rotates its vertex/index buffers once per RenderToHud(), so it
+    // needs at least that many sets or it rewrites a buffer a queued frame still reads.
     bool Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice physicalDevice,
               VkDevice device, VkQueue queue, uint32_t queueFamily, VkFormat hudFormat,
-              uint32_t hudWidth, uint32_t hudHeight, const std::vector<VkImage>& hudImages);
+              uint32_t hudWidth, uint32_t hudHeight, const std::vector<VkImage>& hudImages,
+              uint32_t framesInFlight = 3);
     void Shutdown();
     bool Ready() const { return ready_; }
 
@@ -72,9 +76,11 @@ public:
     void BeginFrame(float winPointW, float winPointH,
                     float rectX, float rectY, float rectW, float rectH);
 
-    // Render the built UI into hudImages[imageIndex]; blocks until the GPU finishes
-    // (the runtime samples the HUD image right after the caller releases it).
-    void RenderToHud(uint32_t imageIndex);
+    // Record the built UI into hudImages[imageIndex] on `cmd` — the caller's FRAME
+    // command buffer (dxr::VkFrameRing::current()), after the atlas pass. Records
+    // only: no submit, no wait. The caller submits the frame once (endFrame) and only
+    // THEN releases the HUD image, so the runtime never samples it early (INV-4.10).
+    void RenderToHud(uint32_t imageIndex, VkCommandBuffer cmd);
 
     // True while the pointer is over an ImGui widget (so the app can ignore the click).
     bool WantCaptureMouse() const;
@@ -123,9 +129,6 @@ private:
 
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkDescriptorPool descPool_ = VK_NULL_HANDLE;
-    VkCommandPool cmdPool_ = VK_NULL_HANDLE;
-    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
     std::vector<VkImageView> imageViews_;
     std::vector<VkFramebuffer> framebuffers_;
 

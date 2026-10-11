@@ -317,7 +317,7 @@ bool App::Initialize(const char* mediaPath) {
         if (imgui_.Init((void*)window_.SdlWindow(), xr_.VkInstanceHandle(), xr_.PhysicalDevice(),
                         xr_.Device(), xr_.GraphicsQueue(), xr_.GraphicsQueueFamily(),
                         (VkFormat)xr_.HudFormat(), xr_.HudWidth(), xr_.HudHeight(),
-                        xr_.HudImages())) {
+                        xr_.HudImages(), renderer_.FramesInFlight())) {
             window_.SetEventHook([this](void* ev) { imgui_.ProcessEvent(ev); });
         } else {
             LOG_WARN("ImGui unavailable — using the text HUD");
@@ -529,6 +529,12 @@ void App::RenderOneFrame() {
     if (!xr_.IsRunning() || inRenderFrame_) return;
     inRenderFrame_ = true;
     struct Guard { bool& f; ~Guard() { f = false; } } guard{inRenderFrame_};
+    // INV-4.10: the video upload, the atlas pass and the HUD pass all record into ONE
+    // frame command buffer that is submitted once. The normal path calls SubmitFrame()
+    // explicitly before releasing the HUD / atlas images; this backstop covers every
+    // early return (e.g. xrBeginFrame failing after an upload was recorded) so a
+    // recorded frame is never left open. No-op when nothing is open.
+    struct SubmitGuard { VulkanRenderer& r; ~SubmitGuard() { r.SubmitFrame(); } } submitGuard{renderer_};
 
     // Advance UI fades + the slideshow machine (may swap media at a fade's mid-black).
     TickUi();
@@ -790,7 +796,7 @@ void App::RenderOneFrame() {
                 window_.PointSize(pw, phh);
                 imgui_.BeginFrame((float)pw, (float)phh, hud.x, hud.y, hud.width, hud.height);
                 BuildTransportUI();
-                imgui_.RenderToHud(hudIdx);
+                imgui_.RenderToHud(hudIdx, renderer_.FrameCmd());  // joins the frame's command buffer
                 // Desktop Linux: the pointer shape ImGui wants (I-beam over the URL
                 // field, ...). The SDL backend does this itself elsewhere.
                 window_.SetImGuiCursor(imgui_.MouseCursor());
@@ -857,10 +863,15 @@ void App::RenderOneFrame() {
                 hud.width = hud.height * hudAR / winAR;
                 hud.disparity = 0.0f;
             }
+            // The frame's ONE submit (upload + atlas + HUD), no wait — BEFORE the HUD
+            // image is released (the runtime composes on this same queue).
+            renderer_.SubmitFrame();
             xr_.ReleaseHudImage();
         }
     }
 
+    // No HUD this frame: the same single submit, before EndFrame releases the atlas image.
+    renderer_.SubmitFrame();
     xr_.EndFrame(frame, rects, &hud);
     ++frames_;
     UpdateFps();

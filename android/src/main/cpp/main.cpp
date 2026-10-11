@@ -74,6 +74,7 @@
 #include "video_stereo_probe_android.h"
 #include "lvf_probe_android.h"  // two-track ("LVF v2") container detection + convergence
 
+#include <media/NdkImage.h>  // AImage_delete (deferred decoder-image retirement)
 #include <mutex>
 #include <strings.h>
 
@@ -281,6 +282,48 @@ VideoDecoder g_video;
 // eyes can be guaranteed to be the same instant -- two independently paced
 // decoders drift a frame apart and that reads as shimmer, not as depth.
 VideoDecoder g_video_right;
+
+// Frames in flight for the render thread's Vulkan frame ring (dxr::VkFrameRing,
+// runtime INV-4.10). Default kVideoRenderFramesInFlight (3): on Adreno a
+// submit-then-wait frame never looks busy to the GPU governor, which parks the
+// clock at ~1/3 (modelviewer #170: 13 -> 30 fps). `setprop
+// debug.dxr.mp.frames_in_flight 1` restores the old fully-synchronous loop for an
+// A/B on the SAME APK (read once per process). Clamped to the reader-pool headroom:
+// each frame in flight can pin one retired decoder image outside the pool.
+static uint32_t
+frames_in_flight()
+{
+	static uint32_t n = 0;
+	if (n == 0) {
+		n = (uint32_t)kVideoRenderFramesInFlight;
+		char v[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.dxr.mp.frames_in_flight", v) > 0 && v[0]) {
+			const long p = std::strtol(v, nullptr, 10);
+			if (p >= 1 && p <= kVideoRenderFramesInFlight) n = (uint32_t)p;
+		}
+		LOGI("render frames in flight: %u (debug.dxr.mp.frames_in_flight)", n);
+	}
+	return n;
+}
+
+// The renderer keeps frames in flight, so an image the decoder replaces may still
+// be sampled by a queued frame. Hand it back to the reader only once the GPU is
+// past every frame submitted so far (VideoDecoder::setImageRetirer).
+static void
+retire_decoder_image(AImage *img)
+{
+	g_sbs.deferDestroy([img]() { AImage_delete(img); });
+}
+
+// Drain the frames in flight and run their deferred releases -- including the
+// retired decoder images -- BEFORE a decoder is stopped: stop() destroys the reader
+// (a deferred AImage_delete after that is a use-after-free), and its drain-while-
+// joining needs every image we hold back in the pool or the codec cannot exit.
+static void
+quiesce_render()
+{
+	g_sbs.waitAll();
+}
 // Set at open when the container really is two-track; cleared on every other open
 // path, so nothing else can accidentally take the dual branch.
 bool g_stereo_dual = false;
@@ -447,6 +490,7 @@ apply_layout(mp::StereoLayout layout, int w, int h)
 static void
 stop_dual()
 {
+	quiesce_render();  // the right eye's retired images go back before its reader dies
 	if (g_stereo_dual) {
 		// Final tally while the numbers still belong to THIS clip: the decoder's
 		// counters are zeroed by the next start(), and g_dual_* just below.
@@ -757,10 +801,11 @@ now_ns()
 uint64_t g_frame_count = 0;
 
 // ─── Per-frame CPU phase profiler (perf analysis / tuning) ────────────────
-// Wall-clock times each render_frame() phase via now_ns(). uploadYUV() and
-// drawAtlas() both vkQueueSubmit + vkWaitForFences (synchronous), so their CPU
-// wall time INCLUDES the GPU upload/blit — a first-order breakdown needs no GPU
-// timestamp pool. Phases the runtime owns: 'wait' is the xrWaitFrame pacing
+// Wall-clock times each render_frame() phase via now_ns(). Since the frame ring
+// (INV-4.10) drawAtlas() only RECORDS and the frame's one submit never waits, so
+// 'draw' is CPU recording + submit, NOT the GPU blit: GPU time now shows up as
+// backpressure in the next ring slot's fence wait (inside 'draw') or in 'end'.
+// Run with debug.dxr.mp.frames_in_flight=1 to get the old synchronous breakdown. Phases the runtime owns: 'wait' is the xrWaitFrame pacing
 // block (large here = display-rate-bound, not work-bound); 'end' is xrEndFrame
 // (can block on the runtime weave). Averaged + logged every 120 frames beside
 // the fps line. Phases inside the render block (locate/acquire/draw) only run
@@ -777,7 +822,7 @@ enum ProfPhase {
 	PROF_UPLOAD,  // acquireLatest + uploadYUV (decode-frame fetch + GPU YUV upload)
 	PROF_LOCATE,  // xrLocateViews
 	PROF_ACQUIRE, // xrAcquire + xrWaitSwapchainImage
-	PROF_DRAW,    // drawAtlas (SBS blit + overlay) + release
+	PROF_DRAW,    // drawAtlas + HUD record + the frame's ONE submit + releases
 	PROF_END,     // xrEndFrame (submit to runtime / weave)
 	PROF_COUNT
 };
@@ -1603,7 +1648,8 @@ hud_init()
 		return false;
 	}
 	if (!g_imgui.Init(nullptr, g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
-	                  g_vk_queue_family, g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images)) {
+	                  g_vk_queue_family, g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images,
+	                  frames_in_flight())) {
 		LOGW("ImGuiLayer init failed — no chrome this session");
 		xrDestroySwapchain(g_hud_swapchain);
 		g_hud_swapchain = XR_NULL_HANDLE;
@@ -1816,10 +1862,12 @@ bool
 sbs_init()
 {
 	if (!g_sbs.init(g_vk_phys_device, g_vk_device, g_vk_queue, g_vk_queue_family,
-	                g_swapchain_format)) {
+	                g_swapchain_format, frames_in_flight())) {
 		LOGE("SbsRenderer::init failed");
 		return false;
 	}
+	g_video.setImageRetirer(retire_decoder_image);
+	g_video_right.setImageRetirer(retire_decoder_image);
 	g_sbs_ready = true;
 	LOGI("SbsRenderer ready (atlas %ux%u)", g_atlas.width, g_atlas.height);
 	return true;
@@ -2319,6 +2367,46 @@ render_frame()
 	}
 	PROF_MARK(PROF_UPLOAD);
 
+	// ── ImGui chrome ─────────────────────────────────────────────────────
+	// Same widget code as the desktop (ui::BuildTransportUI), rendered into the
+	// HUD swapchain and composited by the runtime as a window-space layer.
+	XrCompositionLayerWindowSpaceDXR hud_layer = {};
+	bool hud_active = false;
+	// "Available" is about whether the chrome EXISTS this session, not whether we
+	// drew it this frame — a frame the runtime told us to skip must not make the
+	// app forget it has an Open button.
+	const bool chrome_available = g_hud_ready && g_imgui.Ready() &&
+	                              !g_ws_layer_unsupported.load(std::memory_order_relaxed);
+	// Records the chrome into the FRAME command buffer, right after the atlas pass
+	// (INV-4.10: one submit per frame — no second submit+wait for the HUD any more).
+	// Called with the atlas image acquired; returns true when it acquired a HUD
+	// image, which the caller releases only AFTER g_sbs.endFrame() has submitted.
+	auto record_hud = [&]() -> bool {
+		if (!chrome_available) return false;
+		fill_transport_state();
+		// Skip the whole HUD path when nothing is visible — steady playback must
+		// cost nothing. Same gate as the desktop.
+		const bool anything_visible = g_ui_state.fadeAlpha > 0.001f ||
+		                              g_ui_state.toastAlpha > 0.001f ||
+		                              g_ui_state.transitionAlpha > 0.001f;
+		if (!anything_visible) return false;
+		XrSwapchainImageAcquireInfo hacq = {};
+		hacq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+		uint32_t hud_idx = 0;
+		if (xrAcquireSwapchainImage(g_hud_swapchain, &hacq, &hud_idx) != XR_SUCCESS) return false;
+		XrSwapchainImageWaitInfo hwait = {};
+		hwait.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
+		hwait.timeout = XR_INFINITE_DURATION;
+		if (xrWaitSwapchainImage(g_hud_swapchain, &hwait) == XR_SUCCESS) {
+			// The HUD IS the tile, so the remap is the identity rect.
+			g_imgui.BeginFrame((float)g_hud_w, (float)g_hud_h, 0.0f, 0.0f, 1.0f, 1.0f);
+			mp::ui::BuildTransportUI(g_ui_state, g_ui_actions);
+			g_imgui.RenderToHud(hud_idx, g_sbs.frameCmd());
+			hud_active = true;
+		}
+		return true;  // acquired: always released, even if the wait failed
+	};
+
 	XrCompositionLayerProjectionView projection_views[kMaxViews] = {};
 	uint32_t submit_views = 0;  // views RENDERED (the active mode's, clamped)
 	uint32_t layer_views = 0;   // views the layer CARRIES: every located one (ADR-041)
@@ -2419,6 +2507,16 @@ render_frame()
 				g_sbs.drawAtlas(g_atlas.images[img_idx].image, g_atlas.width, g_atlas.height,
 				                render_w, render_h, cols, rows, submit_views, aC, g_image_mono,
 				                g_clear_rgb);
+				const bool hud_held = record_hud();
+				// The frame's ONE vkQueueSubmit (atlas + HUD), no wait — and BEFORE
+				// either image is released: the runtime composes on this same queue,
+				// so our work must be queued ahead of it (INV-4.10).
+				g_sbs.endFrame();
+				if (hud_held) {
+					XrSwapchainImageReleaseInfo hrel = {};
+					hrel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
+					xrReleaseSwapchainImage(g_hud_swapchain, &hrel);
+				}
 
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
@@ -2469,47 +2567,6 @@ render_frame()
 				LOGW("plain xrLocateViews invalid for %d frames -> enabling minimal "
 				     "XrDisplayRigDXR (identity pose, factors=1)",
 				     kInvalidLocateThreshold);
-			}
-		}
-	}
-
-	// ── ImGui chrome ─────────────────────────────────────────────────────
-	// Same widget code as the desktop (ui::BuildTransportUI), rendered into the
-	// HUD swapchain and composited by the runtime as a window-space layer.
-	XrCompositionLayerWindowSpaceDXR hud_layer = {};
-	bool hud_active = false;
-	// "Available" is about whether the chrome EXISTS this session, not whether we
-	// drew it this frame — a frame the runtime told us to skip must not make the
-	// app forget it has an Open button.
-	const bool chrome_available = g_hud_ready && g_imgui.Ready() &&
-	                              !g_ws_layer_unsupported.load(std::memory_order_relaxed);
-	if (rendered && chrome_available) {
-		fill_transport_state();
-		// Skip the whole HUD path (and its blocking submit) when nothing is
-		// visible — steady playback must cost nothing. Same gate as the desktop.
-		const bool anything_visible = g_ui_state.fadeAlpha > 0.001f ||
-		                              g_ui_state.toastAlpha > 0.001f ||
-		                              g_ui_state.transitionAlpha > 0.001f;
-		if (anything_visible) {
-			XrSwapchainImageAcquireInfo hacq = {};
-			hacq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
-			uint32_t hud_idx = 0;
-			if (xrAcquireSwapchainImage(g_hud_swapchain, &hacq, &hud_idx) == XR_SUCCESS) {
-				XrSwapchainImageWaitInfo hwait = {};
-				hwait.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
-				hwait.timeout = XR_INFINITE_DURATION;
-				if (xrWaitSwapchainImage(g_hud_swapchain, &hwait) == XR_SUCCESS) {
-					// The HUD IS the tile, so the remap is the identity rect.
-					g_imgui.BeginFrame((float)g_hud_w, (float)g_hud_h, 0.0f, 0.0f, 1.0f,
-					                   1.0f);
-					mp::ui::BuildTransportUI(g_ui_state, g_ui_actions);
-					g_imgui.RenderToHud(hud_idx);
-					hud_active = true;
-				}
-				// Always release what we acquired, even if the wait failed.
-				XrSwapchainImageReleaseInfo hrel = {};
-				hrel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
-				xrReleaseSwapchainImage(g_hud_swapchain, &hrel);
 			}
 		}
 	}

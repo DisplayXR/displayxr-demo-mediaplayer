@@ -48,7 +48,7 @@ SbsRenderer::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) cons
 
 bool
 SbsRenderer::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue,
-                  uint32_t queueFamily, VkFormat format)
+                  uint32_t queueFamily, VkFormat format, uint32_t framesInFlight)
 {
 	phys_ = phys;
 	device_ = device;
@@ -208,49 +208,39 @@ SbsRenderer::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 		return false;
 	}
 
-	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3};
+	// The frame ring: N command buffers + N fences + the one-off upload buffer, all
+	// allocated ONCE (INV-4.10). Created before anything below submits.
+	dxr::VkFrameRing::Config rc;
+	rc.framesInFlight = framesInFlight;
+	if (!ring_.init(device_, phys_, queue_, queueFamily_, rc)) {
+		LOGE("VkFrameRing init failed");
+		return false;
+	}
+
+	// One descriptor set per ring slot (see descSets_).
+	const uint32_t nSlots = ring_.framesInFlight();
+	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * nSlots};
 	VkDescriptorPoolCreateInfo dpci = {};
 	dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	dpci.maxSets = 1;
+	dpci.maxSets = nSlots;
 	dpci.poolSizeCount = 1;
 	dpci.pPoolSizes = &ps;
 	if (vkCreateDescriptorPool(device_, &dpci, nullptr, &descPool_) != VK_SUCCESS) {
 		LOGE("vkCreateDescriptorPool failed");
 		return false;
 	}
+	VkDescriptorSetLayout layouts[kMaxSlots];
+	for (uint32_t i = 0; i < nSlots; ++i) layouts[i] = setLayout_;
 	VkDescriptorSetAllocateInfo dsai = {};
 	dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 	dsai.descriptorPool = descPool_;
-	dsai.descriptorSetCount = 1;
-	dsai.pSetLayouts = &setLayout_;
-	if (vkAllocateDescriptorSets(device_, &dsai, &descSet_) != VK_SUCCESS) {
+	dsai.descriptorSetCount = nSlots;
+	dsai.pSetLayouts = layouts;
+	if (vkAllocateDescriptorSets(device_, &dsai, descSets_) != VK_SUCCESS) {
 		LOGE("vkAllocateDescriptorSets failed");
 		return false;
 	}
 
-	VkCommandPoolCreateInfo cpci = {};
-	cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-	cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-	cpci.queueFamilyIndex = queueFamily_;
-	if (vkCreateCommandPool(device_, &cpci, nullptr, &cmdPool_) != VK_SUCCESS) {
-		LOGE("vkCreateCommandPool failed");
-		return false;
-	}
-	VkCommandBufferAllocateInfo cbai = {};
-	cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	cbai.commandPool = cmdPool_;
-	cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	cbai.commandBufferCount = 1;
-	if (vkAllocateCommandBuffers(device_, &cbai, &cmd_) != VK_SUCCESS) {
-		LOGE("vkAllocateCommandBuffers failed");
-		return false;
-	}
-	VkFenceCreateInfo fci = {};
-	fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-	if (vkCreateFence(device_, &fci, nullptr, &fence_) != VK_SUCCESS) {
-		LOGE("vkCreateFence failed");
-		return false;
-	}
 	if (!ensureDummy()) {
 		return false;
 	}
@@ -261,8 +251,9 @@ SbsRenderer::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 	if (pfnGetAhbProps_ == nullptr) {
 		LOGE("vkGetAndroidHardwareBufferPropertiesANDROID unavailable (AHB zero-copy off)");
 	}
-	LOGI("SbsRenderer initialized (format=0x%x, %s)", (uint32_t)format_,
-	     srgbTarget_ ? "sRGB — shaders + clear converted to scene-linear" : "UNORM — passthrough");
+	LOGI("SbsRenderer initialized (format=0x%x, %s, %u frames in flight)", (uint32_t)format_,
+	     srgbTarget_ ? "sRGB — shaders + clear converted to scene-linear" : "UNORM — passthrough",
+	     ring_.framesInFlight());
 	return true;
 }
 
@@ -416,12 +407,8 @@ SbsRenderer::ensureDummy()
 	vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 	if (vkCreateImageView(device_, &vci, nullptr, &dummyView_) != VK_SUCCESS) return false;
 
-	// Transition UNDEFINED → SHADER_READ_ONLY so it's valid to sample.
-	vkResetCommandBuffer(cmd_, 0);
-	VkCommandBufferBeginInfo cbbi = {};
-	cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd_, &cbbi);
+	// Transition UNDEFINED → SHADER_READ_ONLY so it's valid to sample. A genuine
+	// one-off at init: the ring's sanctioned blocking submit.
 	VkImageMemoryBarrier bar = {};
 	bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
 	bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -431,21 +418,15 @@ SbsRenderer::ensureDummy()
 	bar.image = dummyImage_;
 	bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 	bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-	vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-	                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
-	vkEndCommandBuffer(cmd_);
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd_;
-	vkResetFences(device_, 1, &fence_);
-	vkQueueSubmit(queue_, 1, &si, fence_);
-	vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-	return true;
+	return ring_.submitImmediate([&](VkCommandBuffer cmd) {
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+		                     1, &bar);
+	}) == VK_SUCCESS;
 }
 
 void
-SbsRenderer::bindDescriptors()
+SbsRenderer::bindDescriptors(VkDescriptorSet set)
 {
 	VkDescriptorImageInfo info[3] = {};
 	for (uint32_t i = 0; i < 3; ++i) {
@@ -459,7 +440,7 @@ SbsRenderer::bindDescriptors()
 	VkWriteDescriptorSet w[3] = {};
 	for (uint32_t i = 0; i < 3; ++i) {
 		w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		w[i].dstSet = descSet_;
+		w[i].dstSet = set;
 		w[i].dstBinding = i;
 		w[i].descriptorCount = 1;
 		w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -471,26 +452,16 @@ SbsRenderer::bindDescriptors()
 bool
 SbsRenderer::uploadTexture(const uint8_t *rgba, uint32_t width, uint32_t height)
 {
-	vkDeviceWaitIdle(device_);
+	// A one-off (image open), not the frame path: drain the frames in flight first —
+	// ensurePlane() may destroy the image they sample and the staging buffer is
+	// reused — then upload through the ring's sanctioned blocking submit. The
+	// descriptor sets pick the new view up on the next drawAtlas().
+	ring_.waitAll();
 	ensurePlane(0, width, height, VK_FORMAT_R8G8B8A8_UNORM, 4);
 	sourceMode_ = 0;
 	sourceFullRange_ = 1.0f;
-
-	vkResetCommandBuffer(cmd_, 0);
-	VkCommandBufferBeginInfo cbbi = {};
-	cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd_, &cbbi);
-	recordPlaneCopy(cmd_, 0, rgba, width, height, 4);
-	vkEndCommandBuffer(cmd_);
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd_;
-	vkResetFences(device_, 1, &fence_);
-	vkQueueSubmit(queue_, 1, &si, fence_);
-	vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-	bindDescriptors();
+	ring_.submitImmediate(
+	    [&](VkCommandBuffer cmd) { recordPlaneCopy(cmd, 0, rgba, width, height, 4); });
 	LOGI("uploadTexture %ux%u (RGBA)", width, height);
 	return true;
 }
@@ -499,6 +470,11 @@ bool
 SbsRenderer::uploadYUV(const uint8_t *y, const uint8_t *uv_or_u, const uint8_t *v,
                        uint32_t width, uint32_t height, bool nv12, bool fullRange)
 {
+	// NOT the playback path: Android video is zero-copy (setVideoAhb), and nothing in
+	// main.cpp calls this. Kept for a CPU-plane fallback, and kept trivially correct:
+	// the persistent staging buffers and planes are shared by every frame, so drain
+	// the ring before touching them, then upload with the one-off blocking submit.
+	ring_.waitAll();
 	const uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
 	bool recreated = false;
 	recreated |= ensurePlane(0, width, height, VK_FORMAT_R8_UNORM, 1);   // Y
@@ -508,33 +484,19 @@ SbsRenderer::uploadYUV(const uint8_t *y, const uint8_t *uv_or_u, const uint8_t *
 		recreated |= ensurePlane(1, cw, ch, VK_FORMAT_R8_UNORM, 1);     // U
 		recreated |= ensurePlane(2, cw, ch, VK_FORMAT_R8_UNORM, 1);     // V
 	}
-	const int prevMode = sourceMode_;
 	sourceMode_ = nv12 ? 2 : 1;
 	sourceFullRange_ = fullRange ? 1.0f : 0.0f;
+	(void)recreated;  // descriptor sets are rewritten per frame in drawAtlas()
 
-	vkResetCommandBuffer(cmd_, 0);
-	VkCommandBufferBeginInfo cbbi = {};
-	cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd_, &cbbi);
-	recordPlaneCopy(cmd_, 0, y, width, height, 1);
-	if (nv12) {
-		recordPlaneCopy(cmd_, 1, uv_or_u, cw, ch, 2);
-	} else {
-		recordPlaneCopy(cmd_, 1, uv_or_u, cw, ch, 1);
-		recordPlaneCopy(cmd_, 2, v, cw, ch, 1);
-	}
-	vkEndCommandBuffer(cmd_);
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd_;
-	vkResetFences(device_, 1, &fence_);
-	vkQueueSubmit(queue_, 1, &si, fence_);
-	vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-	if (recreated || prevMode != sourceMode_) {
-		bindDescriptors();
-	}
+	ring_.submitImmediate([&](VkCommandBuffer cmd) {
+		recordPlaneCopy(cmd, 0, y, width, height, 1);
+		if (nv12) {
+			recordPlaneCopy(cmd, 1, uv_or_u, cw, ch, 2);
+		} else {
+			recordPlaneCopy(cmd, 1, uv_or_u, cw, ch, 1);
+			recordPlaneCopy(cmd, 2, v, cw, ch, 1);
+		}
+	});
 	return true;
 }
 
@@ -584,7 +546,9 @@ SbsRenderer::ensureAhbPipeline(const VkAndroidHardwareBufferFormatPropertiesANDR
 		// the old conversion is undefined, and in practice wrong colours.
 		LOGI("AHB external format changed %llu -> %llu; rebuilding the ycbcr pipeline",
 		     (unsigned long long)ahbExternalFormat_, (unsigned long long)fmt.externalFormat);
-		vkDeviceWaitIdle(device_);
+		// Frames in flight still sample through the old chain; drain them (rare: a
+		// codec switch / FORMAT_CHANGED), then tear down.
+		ring_.waitAll();
 		for (int i = 0; i < ahbCacheCount_; ++i) destroyAhbImport(ahbCache_[i]);
 		ahbCacheCount_ = 0;
 		ahbActiveImage_ = VK_NULL_HANDLE;
@@ -743,29 +707,37 @@ SbsRenderer::ensureAhbPipeline(const VkAndroidHardwareBufferFormatPropertiesANDR
 	// vkUpdateDescriptorSets would apply to both draws, not to the second one.
 	// Allocating the pair unconditionally keeps the single-source path byte-identical
 	// (it just never touches set 1) and costs one descriptor.
-	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
+	//
+	// ...and that pair exists once PER RING SLOT: drawAtlas() writes the slot it is
+	// recording into, so a queued frame's sets are never rewritten under it.
+	const uint32_t nSlots = ring_.framesInFlight();
+	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * nSlots};
 	VkDescriptorPoolCreateInfo dpci = {};
 	dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	dpci.maxSets = 2;
+	dpci.maxSets = 2 * nSlots;
 	dpci.poolSizeCount = 1;
 	dpci.pPoolSizes = &ps;
 	if (vkCreateDescriptorPool(device_, &dpci, nullptr, &ahbDescPool_) != VK_SUCCESS) {
 		LOGE("ahb desc pool failed");
 		return false;
 	}
-	const VkDescriptorSetLayout layouts[2] = {ahbSetLayout_, ahbSetLayout_};
-	VkDescriptorSet sets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	VkDescriptorSetLayout layouts[2 * kMaxSlots];
+	VkDescriptorSet sets[2 * kMaxSlots] = {};
+	const uint32_t nSets = 2 * nSlots;  // (left, right) per slot
+	for (uint32_t i = 0; i < nSets; ++i) layouts[i] = ahbSetLayout_;
 	VkDescriptorSetAllocateInfo dsai = {};
 	dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 	dsai.descriptorPool = ahbDescPool_;
-	dsai.descriptorSetCount = 2;
+	dsai.descriptorSetCount = nSets;
 	dsai.pSetLayouts = layouts;
 	if (vkAllocateDescriptorSets(device_, &dsai, sets) != VK_SUCCESS) {
 		LOGE("ahb desc set alloc failed");
 		return false;
 	}
-	ahbDescSet_ = sets[0];
-	ahbDescSetR_ = sets[1];
+	for (uint32_t i = 0; i < nSlots; ++i) {
+		ahbDescSets_[i] = sets[2 * i];
+		ahbDescSetsR_[i] = sets[2 * i + 1];
+	}
 	ahbInited_ = true;
 	LOGI("AHB ycbcr pipeline ready (externalFormat=%llu model=%d range=%d)",
 	     (unsigned long long)fmt.externalFormat, (int)fmt.suggestedYcbcrModel,
@@ -887,7 +859,10 @@ SbsRenderer::importAhb(struct AHardwareBuffer *ahb, uint32_t w, uint32_t h)
 			     "kAhbCacheCap must exceed the AImageReader pool depth",
 			     kAhbCacheCap);
 		}
-		destroyAhbImport(ahbCache_[0]);
+		// A frame in flight may still sample the evicted import: release it only once
+		// the GPU is past every frame submitted so far.
+		AhbImport evicted = ahbCache_[0];
+		ring_.deferDestroy([this, evicted]() mutable { destroyAhbImport(evicted); });
 		for (int i = 1; i < ahbCacheCount_; ++i) ahbCache_[i - 1] = ahbCache_[i];
 		ahbCacheCount_--;
 	}
@@ -914,19 +889,9 @@ SbsRenderer::setVideoAhb(struct AHardwareBuffer *ahb, uint32_t width, uint32_t h
 {
 	const AhbImport *imp = importAhb(ahb, width, height);
 	if (imp == nullptr) return false;
-	// Point the (immutable-sampler) descriptor at this frame's view. Safe to
-	// rewrite each frame: drawAtlas waits idle, so the prior submit is done.
-	VkDescriptorImageInfo dii = {};
-	dii.imageView = imp->view;
-	dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-	VkWriteDescriptorSet wr = {};
-	wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	wr.dstSet = ahbDescSet_;
-	wr.dstBinding = 0;
-	wr.descriptorCount = 1;
-	wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	wr.pImageInfo = &dii;
-	vkUpdateDescriptorSets(device_, 1, &wr, 0, nullptr);
+	// Only RECORD the active view: drawAtlas() writes it into the descriptor set of
+	// the ring slot it records into. Writing a shared set here would rewrite it under
+	// a frame that is still queued (frames are in flight now, nothing waits idle).
 	ahbActiveImage_ = imp->image;
 	ahbActiveView_ = imp->view;
 	ahbActiveW_ = width;
@@ -952,7 +917,7 @@ SbsRenderer::setVideoAhbStereo(struct AHardwareBuffer *ahbL, uint32_t wL, uint32
 			LOGE("[LVF] stereo bind FAILED (%s): L=%ux%u R=%ux%u extFmt=%llu inited=%d "
 			     "setL=%p setR=%p — showing the LEFT eye in both views",
 			     why, wL, hL, wR, hR, (unsigned long long)ahbExternalFormat_, (int)ahbInited_,
-			     (void *)ahbDescSet_, (void *)ahbDescSetR_);
+			     (void *)ahbDescSets_[0], (void *)ahbDescSetsR_[0]);
 		}
 		return false;
 	};
@@ -992,25 +957,15 @@ SbsRenderer::setVideoAhbStereo(struct AHardwareBuffer *ahbL, uint32_t wL, uint32
 		}
 	}
 
-	VkDescriptorImageInfo dii = {};
-	dii.imageView = impR->view;
-	dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-	VkWriteDescriptorSet wr = {};
-	wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	wr.dstSet = ahbDescSetR_;
-	wr.dstBinding = 0;
-	wr.descriptorCount = 1;
-	wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	wr.pImageInfo = &dii;
-	vkUpdateDescriptorSets(device_, 1, &wr, 0, nullptr);
+	// As for the left eye: drawAtlas() writes the slot's right-eye set from this.
 	ahbActiveImageR_ = impR->image;
 	ahbActiveViewR_ = impR->view;
 	ahbStereo_ = true;
 	if (!stereoBindLogged_) {
 		stereoBindLogged_ = true;
 		LOGI("[LVF] first stereo pair BOUND: %ux%u per eye, extFmt=%llu, setL=%p setR=%p",
-		     wL, hL, (unsigned long long)ahbExternalFormat_, (void *)ahbDescSet_,
-		     (void *)ahbDescSetR_);
+		     wL, hL, (unsigned long long)ahbExternalFormat_, (void *)ahbDescSets_[0],
+		     (void *)ahbDescSetsR_[0]);
 	}
 	return true;
 }
@@ -1022,24 +977,23 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 {
 	// EVERY handle the AHB path is about to bind is checked, not just the view. The
 	// failure this prevents is not a wrong picture, it is a HANG: binding a destroyed
-	// pipeline/descriptor set faults the GPU, and this function's own
-	// vkWaitForFences(UINT64_MAX) then never returns, which presents as the app
-	// freezing with no error anywhere. resetVideoAhb() destroys all of these together
+	// pipeline/descriptor set faults the GPU, and the next fence wait on that frame's
+	// ring slot (VkFrameRing::beginFrame, N frames later) then never returns, which
+	// presents as the app freezing with no error anywhere. resetVideoAhb() destroys all of these together
 	// when a stream ends, so any one of them being null means "the stream this state
 	// belonged to is gone" and the right answer is to draw nothing.
 	const bool useAhb = (sourceMode_ == 3 && ahbActiveView_ != VK_NULL_HANDLE &&
 	                     ahbActiveImage_ != VK_NULL_HANDLE && ahbPipeline_ != VK_NULL_HANDLE &&
-	                     ahbDescSet_ != VK_NULL_HANDLE);
+	                     ahbDescSets_[0] != VK_NULL_HANDLE);
 	if (!useAhb && planes_[0].view == VK_NULL_HANDLE) return;
 	// Dual-source (LVF v2): each eye has its OWN imported image, so `mono` and the
 	// SBS column split do not apply -- every view samples its own image whole. Falls
 	// back to the single-source draw (left eye to both views: flat, but correct and
 	// never a fault) unless BOTH eyes' images and BOTH descriptor sets are live.
 	const bool dual = useAhb && ahbStereo_ && ahbActiveViewR_ != VK_NULL_HANDLE &&
-	                  ahbActiveImageR_ != VK_NULL_HANDLE && ahbDescSetR_ != VK_NULL_HANDLE;
+	                  ahbActiveImageR_ != VK_NULL_HANDLE && ahbDescSetsR_[0] != VK_NULL_HANDLE;
 	VkPipeline pipe = useAhb ? ahbPipeline_ : pipeline_;
 	VkPipelineLayout pl = useAhb ? ahbPipeLayout_ : pipeLayout_;
-	VkDescriptorSet ds = useAhb ? ahbDescSet_ : descSet_;
 	const Target &t = targetFor(image, atlasW, atlasH);
 	const uint32_t c = cols ? cols : 1;
 
@@ -1108,11 +1062,38 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	// the derivation above.
 	const float convHalf = dual ? convergence_ * convSign_ * convScale_ * 0.5f : 0.0f;
 
-	vkResetCommandBuffer(cmd_, 0);
-	VkCommandBufferBeginInfo cbbi = {};
-	cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd_, &cbbi);
+	// The frame's ONE command buffer (opened here unless frameCmd() already did). Its
+	// ring slot's fence — the frame that used this slot N frames ago — has passed, so
+	// that slot's descriptor sets are free to rewrite now, and only now.
+	VkCommandBuffer cmd = ring_.beginFrame();
+	if (cmd == VK_NULL_HANDLE) return;
+	const uint32_t slot = ring_.slotIndex();
+	VkDescriptorSet ds = VK_NULL_HANDLE;
+	VkDescriptorSet dsR = VK_NULL_HANDLE;
+	if (useAhb) {
+		auto writeAhb = [&](VkDescriptorSet set, VkImageView view) {
+			VkDescriptorImageInfo dii = {};
+			dii.imageView = view;
+			dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			VkWriteDescriptorSet wr = {};
+			wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			wr.dstSet = set;
+			wr.dstBinding = 0;
+			wr.descriptorCount = 1;
+			wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			wr.pImageInfo = &dii;
+			vkUpdateDescriptorSets(device_, 1, &wr, 0, nullptr);
+		};
+		ds = ahbDescSets_[slot];
+		writeAhb(ds, ahbActiveView_);
+		if (dual) {
+			dsR = ahbDescSetsR_[slot];
+			writeAhb(dsR, ahbActiveViewR_);
+		}
+	} else {
+		ds = descSets_[slot];
+		bindDescriptors(ds);
+	}
 
 	// Zero-copy AHB: acquire the imported image from the FOREIGN queue (the video
 	// decoder/display engine wrote it) to our graphics family before sampling.
@@ -1135,7 +1116,7 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		bars[0].image = ahbActiveImage_;
 		bars[1].image = ahbActiveImageR_;
 		const uint32_t nbars = dual ? 2u : 1u;
-		vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
 		                     nbars, bars);
 	}
@@ -1157,7 +1138,7 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	rpbi.renderArea.extent = {atlasW, atlasH};
 	rpbi.clearValueCount = 1;
 	rpbi.pClearValues = &clear;
-	vkCmdBeginRenderPass(cmd_, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
 	for (uint32_t v = 0; v < viewCount; ++v) {
 		const uint32_t tile_x = v % c;
@@ -1191,15 +1172,15 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		const float boxW = (dual || mono) ? 1.0f : 1.0f / (float)c;
 		float offBase = (dual || mono) ? 0.0f : (float)tile_x / (float)c;
 		if (dual) offBase += rightEye ? convHalf : -convHalf;
-		VkDescriptorSet dsv = (dual && rightEye) ? ahbDescSetR_ : ds;
+		VkDescriptorSet dsv = (dual && rightEye) ? dsR : ds;
 
 		// Content quad, scissor-clipped to the tile.
 		VkViewport vp = {vx, vy, cqW, cqH, 0.0f, 1.0f};
 		VkRect2D sc = {{(int32_t)tx, (int32_t)ty}, {renderW, renderH}};
-		vkCmdSetViewport(cmd_, 0, 1, &vp);
-		vkCmdSetScissor(cmd_, 0, 1, &sc);
-		vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-		vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &dsv, 0, nullptr);
+		vkCmdSetViewport(cmd, 0, 1, &vp);
+		vkCmdSetScissor(cmd, 0, 1, &sc);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &dsv, 0, nullptr);
 		SbsPush push = {};
 		push.uvOffset[0] = offBase;
 		push.uvOffset[1] = 0.0f;
@@ -1208,20 +1189,24 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		push.mode = sourceMode_;
 		push.fullRange = sourceFullRange_;
 		push.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
-		vkCmdPushConstants(cmd_, pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
-		vkCmdDraw(cmd_, 3, 1, 0, 0);
+		vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+		vkCmdDraw(cmd, 3, 1, 0, 0);
 	}
 
-	vkCmdEndRenderPass(cmd_);
-	vkEndCommandBuffer(cmd_);
+	vkCmdEndRenderPass(cmd);
+	// No submit, no wait: the HUD pass joins this command buffer, and endFrame()
+	// submits it once before the swapchain images are released (INV-4.10).
+}
 
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd_;
-	vkResetFences(device_, 1, &fence_);
-	vkQueueSubmit(queue_, 1, &si, fence_);
-	vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+void
+SbsRenderer::endFrame()
+{
+	if (!ring_.frameOpen()) return;
+	const VkResult r = ring_.endFrame();
+	if (r != VK_SUCCESS && !endFrameErrLogged_) {
+		endFrameErrLogged_ = true;
+		LOGE("frame vkQueueSubmit failed: %d (logged once)", (int)r);
+	}
 }
 
 void
@@ -1229,15 +1214,14 @@ SbsRenderer::destroyAhbPipeline()
 {
 	if (ahbPipeline_) vkDestroyPipeline(device_, ahbPipeline_, nullptr);
 	if (ahbPipeLayout_) vkDestroyPipelineLayout(device_, ahbPipeLayout_, nullptr);
-	if (ahbDescPool_) vkDestroyDescriptorPool(device_, ahbDescPool_, nullptr);  // frees ahbDescSet_
+	if (ahbDescPool_) vkDestroyDescriptorPool(device_, ahbDescPool_, nullptr);  // frees ahbDescSets*_
 	if (ahbSetLayout_) vkDestroyDescriptorSetLayout(device_, ahbSetLayout_, nullptr);
 	if (ahbSampler_) vkDestroySampler(device_, ahbSampler_, nullptr);
 	if (ahbYcbcr_) vkDestroySamplerYcbcrConversion(device_, ahbYcbcr_, nullptr);
 	ahbPipeline_ = VK_NULL_HANDLE;
 	ahbPipeLayout_ = VK_NULL_HANDLE;
 	ahbDescPool_ = VK_NULL_HANDLE;
-	ahbDescSet_ = VK_NULL_HANDLE;
-	ahbDescSetR_ = VK_NULL_HANDLE;
+	for (uint32_t i = 0; i < kMaxSlots; ++i) ahbDescSets_[i] = ahbDescSetsR_[i] = VK_NULL_HANDLE;
 	ahbSetLayout_ = VK_NULL_HANDLE;
 	ahbSampler_ = VK_NULL_HANDLE;
 	ahbYcbcr_ = VK_NULL_HANDLE;
@@ -1249,10 +1233,10 @@ void
 SbsRenderer::resetVideoAhb()
 {
 	if (device_ == VK_NULL_HANDLE) return;
-	// drawAtlas() is synchronous (fence wait before return), so nothing is in
-	// flight on the render thread -- but this is a once-per-open path and an
-	// idle wait costs nothing here, whereas a stale-image guess costs a tear.
-	vkDeviceWaitIdle(device_);
+	// Frames are in flight now and every one of them may sample these imports.
+	// Once per stream, so draining the ring (and running its deferred releases,
+	// which include the old decoder's retired images) costs nothing here.
+	ring_.waitAll();
 	for (int i = 0; i < ahbCacheCount_; ++i) destroyAhbImport(ahbCache_[i]);
 	ahbCacheCount_ = 0;
 	ahbActiveImage_ = VK_NULL_HANDLE;
@@ -1272,6 +1256,7 @@ SbsRenderer::cleanup()
 {
 	if (device_ == VK_NULL_HANDLE) return;
 	vkDeviceWaitIdle(device_);
+	ring_.destroy();  // waits its fences, runs the deferred releases, frees cmds/fences
 	// Zero-copy AHB resources.
 	for (int i = 0; i < ahbCacheCount_; ++i) destroyAhbImport(ahbCache_[i]);
 	ahbCacheCount_ = 0;
@@ -1290,8 +1275,6 @@ SbsRenderer::cleanup()
 	if (dummyView_) vkDestroyImageView(device_, dummyView_, nullptr);
 	if (dummyImage_) vkDestroyImage(device_, dummyImage_, nullptr);
 	if (dummyMemory_) vkFreeMemory(device_, dummyMemory_, nullptr);
-	if (fence_) vkDestroyFence(device_, fence_, nullptr);
-	if (cmdPool_) vkDestroyCommandPool(device_, cmdPool_, nullptr);
 	if (descPool_) vkDestroyDescriptorPool(device_, descPool_, nullptr);
 	if (sampler_) vkDestroySampler(device_, sampler_, nullptr);
 	if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
@@ -1301,9 +1284,8 @@ SbsRenderer::cleanup()
 	dummyView_ = VK_NULL_HANDLE;
 	dummyImage_ = VK_NULL_HANDLE;
 	dummyMemory_ = VK_NULL_HANDLE;
-	fence_ = VK_NULL_HANDLE;
-	cmdPool_ = VK_NULL_HANDLE;
 	descPool_ = VK_NULL_HANDLE;
+	for (uint32_t i = 0; i < kMaxSlots; ++i) descSets_[i] = VK_NULL_HANDLE;
 	sampler_ = VK_NULL_HANDLE;
 	pipeline_ = VK_NULL_HANDLE;
 	pipeLayout_ = VK_NULL_HANDLE;
