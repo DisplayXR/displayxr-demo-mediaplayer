@@ -24,13 +24,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 
 # ── displayxr-common: header-only dxr_view_config.h (DxrSelectViewConfigType +
-# DxrAliasInactiveViews, runtime ADR-041 / #1612) — the ONE shared copy. Sources
-# only (don't run its CMake, which carries desktop platform deps); its common/
-# dir is appended LAST to the include path below. Same pin as the desktop build.
+# DxrAliasInactiveViews, runtime ADR-041 / #1612) and vk_frame_ring.h
+# (dxr::VkFrameRing — N frames in flight, one submit per frame; runtime INV-4.10,
+# #1942). Sources only (don't run its CMake, which carries desktop platform deps);
+# its common/ dir reaches the target through a local displayxr::rules below, so it
+# lands LAST on the include path. Same pin as the desktop build (v2.28.0).
 include(FetchContent)
 FetchContent_Declare(displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.15.0
+    GIT_TAG v2.28.0
     GIT_SHALLOW TRUE
     # No CMakeLists.txt there: MakeAvailable only populates, never add_subdirectory
     # (the non-deprecated form of a bare FetchContent_Populate).
@@ -150,8 +152,13 @@ target_include_directories(mediaplayer_vk_android PRIVATE
     ${REPO_ROOT}/src                            # Log.h (impl = lif_log_android.cpp)
     ${REPO_ROOT}/src/media                      # LifLoader.h, ImageDecoder.h, MediaSource.h
     ${REPO_ROOT}/third_party/displayxr-openxr  # DisplayXR XR_EXT_* headers
-    ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends   # Dear ImGui + the Vulkan backend
-    ${displayxr_common_SOURCE_DIR}/common)      # dxr_view_config.h — LAST on purpose
+    ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)  # Dear ImGui + the Vulkan backend
+
+# displayxr-common's header-only rules — the same target name the desktop links. A
+# linked target's include dirs come AFTER the target's own, so common/ stays LAST.
+add_library(mp_displayxr_rules INTERFACE)
+target_include_directories(mp_displayxr_rules INTERFACE ${displayxr_common_SOURCE_DIR}/common)
+add_library(displayxr::rules ALIAS mp_displayxr_rules)
 
 set_target_properties(mediaplayer_vk_android PROPERTIES
     LINK_FLAGS "-u ANativeActivity_onCreate")
@@ -160,6 +167,7 @@ set_target_properties(mediaplayer_vk_android PROPERTIES
 target_compile_definitions(mediaplayer_vk_android PRIVATE MEDIAPLAYER_WITH_IMGUI=1)
 
 target_link_libraries(mediaplayer_vk_android
+    displayxr::rules   # dxr_view_config.h + vk_frame_ring.h (header-only)
     native_app_glue
     OpenXR::openxr_loader
     nlohmann_json::nlohmann_json

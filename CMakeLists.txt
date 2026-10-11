@@ -212,12 +212,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # stage factor in mutter's PHYSICAL layout mode (displayxr-common#69).
         # v2.26.0: key text, file drops and app cursor shapes, which the player's
         # window needs now that it runs on DxrLinuxWindow (displayxr-common#70).
-        GIT_TAG v2.26.0
+        # v2.28.0: dxr::VkFrameRing (common/vk_frame_ring.h) — N frames in flight,
+        # one submit per frame (runtime INV-4.10, #1942). ONE pin on every leg now.
+        GIT_TAG v2.28.0
         GIT_SHALLOW TRUE)
 else()
     FetchContent_Declare(displayxr_common
         GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-        GIT_TAG v2.15.0
+        GIT_TAG v2.28.0
         GIT_SHALLOW TRUE
         # No CMakeLists.txt there: MakeAvailable only populates, never add_subdirectory
         # (the non-deprecated form of a bare FetchContent_Populate).
@@ -312,10 +314,17 @@ target_include_directories(${MP_TARGET} BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/displayxr-openxr  # vendored <openxr/...>
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb               # stb_image_write.h
 )
-# displayxr-common's header dir goes LAST (plain append, after the BEFORE block
-# above), so it only supplies what this repo does not: dxr_view_config.h.
-target_include_directories(${MP_TARGET} PRIVATE
-    ${displayxr_common_SOURCE_DIR}/common)
+# displayxr-common's header-only rules (dxr_view_config.h, vk_frame_ring.h) come
+# through displayxr::rules. A linked target's include dirs land AFTER this target's
+# own (the BEFORE block above), so common only supplies what this repo does not.
+# Desktop Linux add_subdirectory's common and gets the real target; the
+# headers-only populate (Windows / macOS) gets an equivalent local one.
+if(NOT TARGET displayxr::rules)
+    add_library(mp_displayxr_rules INTERFACE)
+    target_include_directories(mp_displayxr_rules INTERFACE ${displayxr_common_SOURCE_DIR}/common)
+    add_library(displayxr::rules ALIAS mp_displayxr_rules)
+endif()
+target_link_libraries(${MP_TARGET} PRIVATE displayxr::rules)
 
 target_link_libraries(${MP_TARGET} PRIVATE
     SDL3::SDL3
