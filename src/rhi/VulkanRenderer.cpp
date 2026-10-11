@@ -134,38 +134,22 @@ bool VulkanRenderer::Initialize(VkPhysicalDevice physicalDevice, VkDevice device
         }
     }
 
-    VkCommandPoolCreateInfo cp = {};
-    cp.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    cp.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    cp.queueFamilyIndex = queueFamilyIndex;
-    if (vkCreateCommandPool(device_, &cp, nullptr, &commandPool_) != VK_SUCCESS) {
-        LOG_ERROR("vkCreateCommandPool failed");
-        return false;
-    }
-
-    VkCommandBufferAllocateInfo cb = {};
-    cb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cb.commandPool = commandPool_;
-    cb.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cb.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(device_, &cb, &commandBuffer_) != VK_SUCCESS) {
-        LOG_ERROR("vkAllocateCommandBuffers failed");
-        return false;
-    }
-
-    VkFenceCreateInfo fc = {};
-    fc.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    if (vkCreateFence(device_, &fc, nullptr, &fence_) != VK_SUCCESS) {
-        LOG_ERROR("vkCreateFence failed");
+    // The frame ring: N command buffers + N fences + a one-off upload buffer, all
+    // allocated ONCE (INV-4.10). Frames in flight: default 3, DXR_VK_FRAMES_IN_FLIGHT
+    // overrides (1 = the old submit->wait, for an A/B). Before CreatePipeline, which
+    // sizes the per-slot descriptor sets from it.
+    if (!ring_.init(device_, physicalDevice_, queue_, queueFamilyIndex, dxr::VkFrameRing::Config{})) {
+        LOG_ERROR("VkFrameRing init failed");
         return false;
     }
 
     if (!CreatePipeline()) return false;
 
-    LOG_INFO("VulkanRenderer ready (%u framebuffers, %ux%u, format=%d %s)",
+    LOG_INFO("VulkanRenderer ready (%u framebuffers, %ux%u, format=%d %s, %u frames in flight)",
              (uint32_t)framebuffers_.size(), width_, height_, (int)format_,
              srgbTarget_ ? "sRGB — shader + clears converted to scene-linear"
-                         : "UNORM — passthrough");
+                         : "UNORM — passthrough",
+             ring_.framesInFlight());
     return true;
 }
 
@@ -311,25 +295,29 @@ bool VulkanRenderer::CreatePipeline() {
         return false;
     }
 
-    // Descriptor pool + a single set (3 samplers, rebound in UploadTexture/UploadYUV).
+    // Descriptor pool + one set per ring slot (3 samplers each), written by DrawViews for
+    // the slot it records into — never a set a queued frame still references.
+    const uint32_t nSlots = ring_.framesInFlight();
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = 3;
+    poolSize.descriptorCount = 3 * nSlots;
     VkDescriptorPoolCreateInfo dpci = {};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = 1;
+    dpci.maxSets = nSlots;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = &poolSize;
     if (vkCreateDescriptorPool(device_, &dpci, nullptr, &descPool_) != VK_SUCCESS) {
         LOG_ERROR("vkCreateDescriptorPool failed");
         return false;
     }
+    VkDescriptorSetLayout layouts[kMaxSlots];
+    for (uint32_t i = 0; i < nSlots; ++i) layouts[i] = descSetLayout_;
     VkDescriptorSetAllocateInfo dsai = {};
     dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     dsai.descriptorPool = descPool_;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &descSetLayout_;
-    if (vkAllocateDescriptorSets(device_, &dsai, &descSet_) != VK_SUCCESS) {
+    dsai.descriptorSetCount = nSlots;
+    dsai.pSetLayouts = layouts;
+    if (vkAllocateDescriptorSets(device_, &dsai, descSets_) != VK_SUCCESS) {
         LOG_ERROR("vkAllocateDescriptorSets failed");
         return false;
     }
@@ -344,11 +332,8 @@ bool VulkanRenderer::ClearViews(uint32_t imageIndex, const ClearColor* colors,
     }
     if (viewCount == 0) return false;
 
-    vkResetCommandBuffer(commandBuffer_, 0);
-    VkCommandBufferBeginInfo bi = {};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(commandBuffer_, &bi);
+    VkCommandBuffer cmd = FrameCmd();  // the frame's one command buffer
+    if (cmd == VK_NULL_HANDLE) return false;
 
     // LOAD_OP_CLEAR fills the whole image with view 0's color; any area not covered
     // by a tile keeps it.
@@ -363,7 +348,7 @@ bool VulkanRenderer::ClearViews(uint32_t imageIndex, const ClearColor* colors,
     rb.renderArea.extent = {width_, height_};
     rb.clearValueCount = 1;
     rb.pClearValues = &clear;
-    vkCmdBeginRenderPass(commandBuffer_, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
 
     // Paint each view's tile (the exact rect submitted to the runtime) with its color.
     for (uint32_t v = 0; v < viewCount; ++v) {
@@ -376,37 +361,37 @@ bool VulkanRenderer::ClearViews(uint32_t imageIndex, const ClearColor* colors,
         rect.rect.extent = {rects[v].w, rects[v].h};
         rect.baseArrayLayer = 0;
         rect.layerCount = 1;
-        vkCmdClearAttachments(commandBuffer_, 1, &att, 1, &rect);
+        vkCmdClearAttachments(cmd, 1, &att, 1, &rect);
     }
 
-    vkCmdEndRenderPass(commandBuffer_);
-    vkEndCommandBuffer(commandBuffer_);
-
-    vkResetFences(device_, 1, &fence_);
-    VkSubmitInfo si = {};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &commandBuffer_;
-    if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) {
-        LOG_ERROR("vkQueueSubmit failed");
-        return false;
-    }
-    // Block until done — the runtime reads the image immediately after release.
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    vkCmdEndRenderPass(cmd);
+    // No submit, no wait: SubmitFrame() submits the frame once, before the release.
     return true;
 }
 
 bool VulkanRenderer::RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8_t* data,
-        uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel, bool& recreated,
-        std::vector<std::pair<VkBuffer, VkDeviceMemory>>& staging) {
+        uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel, bool& recreated) {
     Plane& p = planes_[idx];
     const VkDeviceSize bytes = (VkDeviceSize)w * h * bytesPerTexel;
 
     recreated = (p.image == VK_NULL_HANDLE || p.w != w || p.h != h || p.fmt != fmt);
     if (recreated) {
-        if (p.view) { vkDestroyImageView(device_, p.view, nullptr); p.view = VK_NULL_HANDLE; }
-        if (p.image) { vkDestroyImage(device_, p.image, nullptr); p.image = VK_NULL_HANDLE; }
-        if (p.memory) { vkFreeMemory(device_, p.memory, nullptr); p.memory = VK_NULL_HANDLE; }
+        // A queued frame may still sample the old plane: release it only once the GPU
+        // is past every frame submitted so far (and the open one).
+        if (p.view || p.image || p.memory) {
+            VkDevice dev = device_;
+            VkImageView oldView = p.view;
+            VkImage oldImage = p.image;
+            VkDeviceMemory oldMem = p.memory;
+            ring_.deferDestroy([dev, oldView, oldImage, oldMem]() {
+                if (oldView) vkDestroyImageView(dev, oldView, nullptr);
+                if (oldImage) vkDestroyImage(dev, oldImage, nullptr);
+                if (oldMem) vkFreeMemory(dev, oldMem, nullptr);
+            });
+            p.view = VK_NULL_HANDLE;
+            p.image = VK_NULL_HANDLE;
+            p.memory = VK_NULL_HANDLE;
+        }
 
         VkImageCreateInfo ici = {};
         ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -452,7 +437,8 @@ bool VulkanRenderer::RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8
         }
     }
 
-    // Host-visible staging buffer with the plane's pixels (freed by the caller post-submit).
+    // Host-visible staging buffer with the plane's pixels (released via deferDestroy once
+    // the frame that copies from it has executed).
     VkBuffer sbuf = VK_NULL_HANDLE;
     VkDeviceMemory smem = VK_NULL_HANDLE;
     VkBufferCreateInfo bci = {};
@@ -474,7 +460,13 @@ bool VulkanRenderer::RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8
     vkMapMemory(device_, smem, 0, bytes, 0, &mapped);
     memcpy(mapped, data, (size_t)bytes);
     vkUnmapMemory(device_, smem);
-    staging.emplace_back(sbuf, smem);
+    {
+        VkDevice dev = device_;
+        ring_.deferDestroy([dev, sbuf, smem]() {
+            vkDestroyBuffer(dev, sbuf, nullptr);
+            vkFreeMemory(dev, smem, nullptr);
+        });
+    }
 
     VkImageMemoryBarrier toDst = {};
     toDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -506,8 +498,9 @@ bool VulkanRenderer::RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8
     return true;
 }
 
-// Record N plane uploads into one command buffer, submit once, wait, free staging. Blocks
-// (the runtime samples the result right after) — one GPU round-trip per frame, not per plane.
+// Record N plane uploads into the FRAME command buffer, ahead of the DrawViews pass that
+// samples them (queue order + the barriers in RecordPlaneUpload). No submit of its own, no
+// wait: the frame's single submit carries upload + draw + HUD (INV-4.10).
 namespace {
 struct PlaneSpec { const uint8_t* data; uint32_t w, h; VkFormat fmt; uint32_t bpt; };
 }
@@ -519,38 +512,17 @@ bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t
 #endif
     if (!EnsureDummy()) return false;
 
-    std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging;
-    vkResetCommandBuffer(commandBuffer_, 0);
-    VkCommandBufferBeginInfo cbi = {};
-    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(commandBuffer_, &cbi);
+    VkCommandBuffer cmd = FrameCmd();
+    if (cmd == VK_NULL_HANDLE) return false;
     bool rec = false;
-    const bool ok = RecordPlaneUpload(commandBuffer_, 0, rgba, width, height,
-                                      VK_FORMAT_R8G8B8A8_UNORM, 4, rec, staging);
-    vkEndCommandBuffer(commandBuffer_);
-    if (ok) {
-        vkResetFences(device_, 1, &fence_);
-        VkSubmitInfo si = {};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &commandBuffer_;
-        vkQueueSubmit(queue_, 1, &si, fence_);
-        vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-    }
-    for (auto& s : staging) {
-        vkDestroyBuffer(device_, s.first, nullptr);
-        vkFreeMemory(device_, s.second, nullptr);
-    }
+    const bool ok = RecordPlaneUpload(cmd, 0, rgba, width, height, VK_FORMAT_R8G8B8A8_UNORM, 4,
+                                      rec);
     if (!ok) return false;
 
-    const bool modeChanged = (sourceMode_ != 0);
     sourceMode_ = 0;
     sourceFullRange_ = 0.0f;
-    if (rec || modeChanged) {
-        BindDescriptors();
-        if (rec) LOG_INFO("VulkanRenderer: RGBA texture (re)created %ux%u", width, height);
-    }
+    // Descriptor sets are written per frame (DrawViews), so nothing to rebind here.
+    if (rec) LOG_INFO("VulkanRenderer: RGBA texture (re)created %ux%u", width, height);
     return true;
 }
 
@@ -580,41 +552,20 @@ bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, con
         mode = 1;
     }
 
-    std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging;
-    vkResetCommandBuffer(commandBuffer_, 0);
-    VkCommandBufferBeginInfo cbi = {};
-    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(commandBuffer_, &cbi);
+    VkCommandBuffer cmd = FrameCmd();
+    if (cmd == VK_NULL_HANDLE) return false;
     bool rec[3] = {false, false, false};
     bool ok = true;
     for (int i = 0; i < count && ok; ++i) {
-        ok = RecordPlaneUpload(commandBuffer_, i, specs[i].data, specs[i].w, specs[i].h,
-                               specs[i].fmt, specs[i].bpt, rec[i], staging);
-    }
-    vkEndCommandBuffer(commandBuffer_);
-    if (ok) {
-        vkResetFences(device_, 1, &fence_);
-        VkSubmitInfo si = {};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &commandBuffer_;
-        vkQueueSubmit(queue_, 1, &si, fence_);
-        vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-    }
-    for (auto& s : staging) {
-        vkDestroyBuffer(device_, s.first, nullptr);
-        vkFreeMemory(device_, s.second, nullptr);
+        ok = RecordPlaneUpload(cmd, i, specs[i].data, specs[i].w, specs[i].h, specs[i].fmt,
+                               specs[i].bpt, rec[i]);
     }
     if (!ok) return false;
 
-    const bool modeChanged = (sourceMode_ != mode);
     sourceMode_ = mode;
     sourceFullRange_ = fullRange ? 1.0f : 0.0f;
-    if (rec[0] || rec[1] || rec[2] || modeChanged) {
-        BindDescriptors();
-        if (rec[0]) LOG_INFO("VulkanRenderer: YUV source %ux%u mode=%d", width, height, mode);
-    }
+    // Descriptor sets are written per frame (DrawViews), so nothing to rebind here.
+    if (rec[0]) LOG_INFO("VulkanRenderer: YUV source %ux%u mode=%d", width, height, mode);
     return true;
 }
 
@@ -643,11 +594,8 @@ bool VulkanRenderer::EnsureDummy() {
 
     // Transition UNDEFINED -> SHADER_READ_ONLY (content unused: the shader never samples
     // a dummy-bound plane, but the descriptor still needs a valid view in a read layout).
-    vkResetCommandBuffer(commandBuffer_, 0);
-    VkCommandBufferBeginInfo cbi = {};
-    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(commandBuffer_, &cbi);
+    // A genuine one-off: the ring's sanctioned blocking submit, ahead of any frame that
+    // binds the dummy.
     VkImageMemoryBarrier b = {};
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -655,16 +603,11 @@ bool VulkanRenderer::EnsureDummy() {
     b.image = dummyImage_;
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
-    vkEndCommandBuffer(commandBuffer_);
-    vkResetFences(device_, 1, &fence_);
-    VkSubmitInfo si = {};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &commandBuffer_;
-    vkQueueSubmit(queue_, 1, &si, fence_);
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    ring_.submitImmediate([&](VkCommandBuffer cmd) {
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &b);
+    });
 
     VkImageViewCreateInfo vci = {};
     vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -675,7 +618,7 @@ bool VulkanRenderer::EnsureDummy() {
     return vkCreateImageView(device_, &vci, nullptr, &dummyView_) == VK_SUCCESS;
 }
 
-void VulkanRenderer::BindDescriptors() {
+void VulkanRenderer::BindDescriptors(VkDescriptorSet set) {
     // Bind the planes the current mode samples; everything else gets the dummy.
     VkImageView views[3] = {planes_[0].view, dummyView_, dummyView_};
     VkImageLayout layouts[3] = {VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -702,7 +645,7 @@ void VulkanRenderer::BindDescriptors() {
         dii[i].imageView = views[i] ? views[i] : dummyView_;
         dii[i].imageLayout = layouts[i];
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = descSet_;
+        writes[i].dstSet = set;
         writes[i].dstBinding = i;
         writes[i].descriptorCount = 1;
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -720,11 +663,18 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
 #endif
     if (imageIndex >= framebuffers_.size() || !haveSource) return false;
 
-    vkResetCommandBuffer(commandBuffer_, 0);
-    VkCommandBufferBeginInfo bi = {};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(commandBuffer_, &bi);
+    // Unused plane bindings point at the 1x1 dummy; BindSharedRGBA's DestroyTexture() drops
+    // it, so make sure it exists before this frame writes its descriptor set (a one-off
+    // blocking init the first time, a no-op after).
+    if (!EnsureDummy()) return false;
+
+    // The frame's one command buffer (uploads may already have opened it). Its ring
+    // slot's fence — the frame that used this slot N frames ago — has passed, so that
+    // slot's descriptor set is free to rewrite now.
+    VkCommandBuffer cmd = FrameCmd();
+    if (cmd == VK_NULL_HANDLE) return false;
+    VkDescriptorSet descSet = descSets_[ring_.slotIndex()];
+    BindDescriptors(descSet);
 
 #if defined(_WIN32)
     // Zero-copy (#28): the imported NV12 image is written by the D3D11 producer on the
@@ -745,11 +695,12 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         b.dstQueueFamilyIndex = queueFamilyIndex_;
         b.image = sharedImage_;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                              &b);
         *sharedLayoutReady_ = true;
     }
+    if (sharedActive_) sharedSampledThisFrame_ = true;  // SubmitFrame keeps this path synchronous
 #endif
 
     VkClearValue clear = {};
@@ -766,15 +717,15 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
     rb.renderArea.extent = {width_, height_};
     rb.clearValueCount = 1;
     rb.pClearValues = &clear;
-    vkCmdBeginRenderPass(commandBuffer_, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
 
     // Both the CPU planar path and the zero-copy (#28) RGBA path use the main pipeline; the
     // shared RGBA import just binds its view into binding 0 as mode 0 (see BindDescriptors).
     VkPipelineLayout activeLayout = pipelineLayout_;
     {
-        vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
-                                0, 1, &descSet_, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
+                                0, 1, &descSet, 0, nullptr);
     }
 
     for (uint32_t v = 0; v < viewCount; ++v) {
@@ -785,7 +736,7 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         vp.height = (float)rects[v].h;
         vp.minDepth = 0.0f;
         vp.maxDepth = 1.0f;
-        vkCmdSetViewport(commandBuffer_, 0, 1, &vp);
+        vkCmdSetViewport(cmd, 0, 1, &vp);
 
         // Scissor to the eye's tile (intersected with the content rect). The content
         // rect may be convergence-shifted past the tile edge; clipping here truncates
@@ -798,7 +749,7 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         VkRect2D sc = {};
         sc.offset = {x0, y0};
         sc.extent = {(uint32_t)std::max(0, x1 - x0), (uint32_t)std::max(0, y1 - y0)};
-        vkCmdSetScissor(commandBuffer_, 0, 1, &sc);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
 
         // uvOffset(vec2) + uvScale(vec2) + mode(int) + fullRange(float)
         // + srgbTarget(float) = 28 bytes.
@@ -813,54 +764,36 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
                 sourceMode_,
                 sourceFullRange_,
                 srgbTarget_ ? 1.0f : 0.0f};
-        vkCmdPushConstants(commandBuffer_, activeLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+        vkCmdPushConstants(cmd, activeLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
-        vkCmdDraw(commandBuffer_, 3, 1, 0, 0);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
-    vkCmdEndRenderPass(commandBuffer_);
-    vkEndCommandBuffer(commandBuffer_);
+    vkCmdEndRenderPass(cmd);
+    // No submit, no wait: SubmitFrame() submits the frame once (with the HUD pass), before
+    // the swapchain images are released.
+    return true;
+}
 
-    vkResetFences(device_, 1, &fence_);
-    VkSubmitInfo si = {};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &commandBuffer_;
+void VulkanRenderer::SubmitFrame() {
+    if (!ring_.frameOpen()) return;
+    const VkResult r = ring_.endFrame();  // EXACTLY one vkQueueSubmit, slot fence, no wait
+    if (r != VK_SUCCESS && !submitErrLogged_) {
+        submitErrLogged_ = true;
+        LOG_ERROR("frame vkQueueSubmit failed: %d (logged once)", (int)r);
+    }
 #if defined(_WIN32)
-    // Zero-copy (#28): take the shared texture's keyed mutex (key 0) for this submit so the
-    // GPU waits for the D3D11 producer's CopySubresourceRegion to finish before sampling,
-    // and hands it back (key 0) when done. Same key both sides -> drop-safe (a published-but-
-    // never-sampled frame leaves the mutex released, so the producer can re-acquire it).
-    const uint64_t kmAcqKey = 1;      // producer released with key 1
-    const uint64_t kmRelKey = 0;      // hand back to the producer with key 0
-    const uint32_t kmTimeout = 2000;  // ms; a stuck producer shouldn't hang the render thread
-    VkWin32KeyedMutexAcquireReleaseInfoKHR km = {
-        VK_STRUCTURE_TYPE_WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR};
-    // Keyed mutex disabled: the producer CPU-waits for the copy before publishing (coarse
-    // sync), so no cross-API mutex is needed here. Kept behind a flag to re-enable for
-    // experiments (MEDIAPLAYER_ZC_KM=1).
-    static const bool kmOn = [] {
-        const char* e = std::getenv("MEDIAPLAYER_ZC_KM");
-        return e && *e && *e != '0';
-    }();
-    if (sharedActive_ && sharedMemory_ && kmOn) {
-        km.acquireCount = 1;
-        km.pAcquireSyncs = &sharedMemory_;
-        km.pAcquireKeys = &kmAcqKey;
-        km.pAcquireTimeouts = &kmTimeout;
-        km.releaseCount = 1;
-        km.pReleaseSyncs = &sharedMemory_;
-        km.pReleaseKeys = &kmRelKey;
-        si.pNext = &km;
+    // Zero-copy (#28): the D3D11 producer refills its shared textures with no GPU-side
+    // sync against our sample (it CPU-waits its own copy, then publishes), so a frame that
+    // sampled one stays synchronous — the pre-ring behaviour, now via the ring. Windows
+    // desktop GPUs have no Adreno-style busy-% governor, and this path cannot be made
+    // asynchronous safely without a cross-API semaphore. The keyed-mutex experiment
+    // (MEDIAPLAYER_ZC_KM, off by default) was dropped: it needed its own submit pNext.
+    if (sharedSampledThisFrame_) {
+        ring_.waitAll();
+        sharedSampledThisFrame_ = false;
     }
 #endif
-    if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) {
-        LOG_ERROR("DrawViews vkQueueSubmit failed");
-        return false;
-    }
-    // 2s cap (not infinite) so a wedged zero-copy import can't hang the render thread.
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, 2000000000ULL);
-    return true;
 }
 
 #if defined(_WIN32)
@@ -969,12 +902,14 @@ bool VulkanRenderer::BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t
     sharedView_ = imp->view;
     sourceMode_ = 0;  // packed RGBA (producer already did YUV->RGB); sampled by the main pipeline
     sourceFullRange_ = 0.0f;
-    BindDescriptors();  // binds sharedView_ at binding 0, GENERAL layout (see sharedActive_ branch)
+    // DrawViews writes sharedView_ into the frame's descriptor set (GENERAL layout, see the
+    // sharedActive_ branch of BindDescriptors).
     return true;
 }
 
 void VulkanRenderer::ClearSharedImports() {
-    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    // Media change / shutdown: every frame in flight may reference these imports.
+    ring_.waitAll();
     for (auto& kv : imports_) {
         SharedImport& s = kv.second;
         if (s.view) vkDestroyImageView(device_, s.view, nullptr);
@@ -991,15 +926,35 @@ void VulkanRenderer::ClearSharedImports() {
 #endif  // _WIN32
 
 void VulkanRenderer::DestroyTexture() {
+    // Queued frames may still sample these: release them once the GPU is past every frame
+    // submitted so far (immediately when the ring is not up).
+    VkDevice dev = device_;
     for (Plane& p : planes_) {
-        if (p.view) vkDestroyImageView(device_, p.view, nullptr);
-        if (p.image) vkDestroyImage(device_, p.image, nullptr);
-        if (p.memory) vkFreeMemory(device_, p.memory, nullptr);
+        if (p.view || p.image || p.memory) {
+            const VkImageView v = p.view;
+            const VkImage i = p.image;
+            const VkDeviceMemory m = p.memory;
+            ring_.deferDestroy([dev, v, i, m]() {
+                if (v) vkDestroyImageView(dev, v, nullptr);
+                if (i) vkDestroyImage(dev, i, nullptr);
+                if (m) vkFreeMemory(dev, m, nullptr);
+            });
+        }
         p = Plane{};
     }
-    if (dummyView_) { vkDestroyImageView(device_, dummyView_, nullptr); dummyView_ = VK_NULL_HANDLE; }
-    if (dummyImage_) { vkDestroyImage(device_, dummyImage_, nullptr); dummyImage_ = VK_NULL_HANDLE; }
-    if (dummyMemory_) { vkFreeMemory(device_, dummyMemory_, nullptr); dummyMemory_ = VK_NULL_HANDLE; }
+    if (dummyView_ || dummyImage_ || dummyMemory_) {
+        const VkImageView v = dummyView_;
+        const VkImage i = dummyImage_;
+        const VkDeviceMemory m = dummyMemory_;
+        ring_.deferDestroy([dev, v, i, m]() {
+            if (v) vkDestroyImageView(dev, v, nullptr);
+            if (i) vkDestroyImage(dev, i, nullptr);
+            if (m) vkFreeMemory(dev, m, nullptr);
+        });
+        dummyView_ = VK_NULL_HANDLE;
+        dummyImage_ = VK_NULL_HANDLE;
+        dummyMemory_ = VK_NULL_HANDLE;
+    }
 }
 
 bool VulkanRenderer::UploadToSwapchainImage(VkImage image, const uint8_t* rgba,
@@ -1028,12 +983,18 @@ bool VulkanRenderer::UploadToSwapchainImage(VkImage image, const uint8_t* rgba,
     vkMapMemory(device_, stagingMem, 0, bytes, 0, &mapped);
     memcpy(mapped, rgba, (size_t)bytes);
     vkUnmapMemory(device_, stagingMem);
+    {
+        VkDevice dev = device_;
+        ring_.deferDestroy([dev, staging, stagingMem]() {
+            vkDestroyBuffer(dev, staging, nullptr);
+            vkFreeMemory(dev, stagingMem, nullptr);
+        });
+    }
 
-    vkResetCommandBuffer(commandBuffer_, 0);
-    VkCommandBufferBeginInfo cbi = {};
-    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(commandBuffer_, &cbi);
+    // Recorded into the frame command buffer (after the atlas pass); SubmitFrame()
+    // submits it before the HUD image is released.
+    VkCommandBuffer cmd = FrameCmd();
+    if (cmd == VK_NULL_HANDLE) return false;
 
     // We overwrite the whole image, so UNDEFINED old layout is fine each frame.
     VkImageMemoryBarrier toDst = {};
@@ -1044,13 +1005,13 @@ bool VulkanRenderer::UploadToSwapchainImage(VkImage image, const uint8_t* rgba,
     toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     toDst.srcAccessMask = 0;
     toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDst);
 
     VkBufferImageCopy copy = {};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {width, height, 1};
-    vkCmdCopyBufferToImage(commandBuffer_, staging, image,
+    vkCmdCopyBufferToImage(cmd, staging, image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
     // Leave it in COLOR_ATTACHMENT_OPTIMAL for the runtime at release time.
@@ -1059,21 +1020,9 @@ bool VulkanRenderer::UploadToSwapchainImage(VkImage image, const uint8_t* rgba,
     toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     toColor.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr,
                          0, nullptr, 1, &toColor);
-    vkEndCommandBuffer(commandBuffer_);
-
-    vkResetFences(device_, 1, &fence_);
-    VkSubmitInfo si = {};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &commandBuffer_;
-    vkQueueSubmit(queue_, 1, &si, fence_);
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-
-    vkDestroyBuffer(device_, staging, nullptr);
-    vkFreeMemory(device_, stagingMem, nullptr);
     return true;
 }
 
@@ -1119,11 +1068,12 @@ bool VulkanRenderer::DumpImage(uint32_t imageIndex, const char* path) {
     vkBindBufferMemory(device_, buf, mem, 0);
 
     // Copy the image (left in COLOR_ATTACHMENT_OPTIMAL by ClearViews) into the buffer.
-    vkResetCommandBuffer(commandBuffer_, 0);
-    VkCommandBufferBeginInfo cbi = {};
-    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(commandBuffer_, &cbi);
+    // Debug-only readback, deliberately blocking: submit the open frame now (so the copy
+    // below sees this frame's draw), drain the ring, then copy with the ring's one-off
+    // blocking submit. A HUD recorded after this lands in a second frame submit — only on
+    // the one frame a dump is taken.
+    SubmitFrame();
+    ring_.waitAll();
 
     VkImageMemoryBarrier toSrc = {};
     toSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1133,33 +1083,26 @@ bool VulkanRenderer::DumpImage(uint32_t imageIndex, const char* path) {
     toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     toSrc.image = images_[imageIndex];
     toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+    ring_.submitImmediate([&](VkCommandBuffer cmd) {
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
 
-    VkBufferImageCopy region = {};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {width_, height_, 1};
-    vkCmdCopyImageToBuffer(commandBuffer_, images_[imageIndex],
-                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
+        VkBufferImageCopy region = {};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {width_, height_, 1};
+        vkCmdCopyImageToBuffer(cmd, images_[imageIndex],
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
 
-    // Restore the layout the runtime expects at release time.
-    VkImageMemoryBarrier toColor = toSrc;
-    toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toColor.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr,
-                         0, nullptr, 1, &toColor);
-    vkEndCommandBuffer(commandBuffer_);
-
-    vkResetFences(device_, 1, &fence_);
-    VkSubmitInfo si = {};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &commandBuffer_;
-    vkQueueSubmit(queue_, 1, &si, fence_);
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        // Restore the layout the runtime expects at release time.
+        VkImageMemoryBarrier toColor = toSrc;
+        toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toColor.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr,
+                             0, nullptr, 1, &toColor);
+    });
 
     // Map + write PNG. Swizzle BGRA->RGBA when the swapchain format is BGRA.
     void* mapped = nullptr;
@@ -1221,11 +1164,12 @@ bool VulkanRenderer::DumpExternalImage(VkImage image, uint32_t width, uint32_t h
     }
     vkBindBufferMemory(device_, buf, mem, 0);
 
-    vkResetCommandBuffer(commandBuffer_, 0);
-    VkCommandBufferBeginInfo cbi = {};
-    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(commandBuffer_, &cbi);
+    // Debug-only readback, deliberately blocking: submit the open frame now (so the copy
+    // below sees this frame's draw), drain the ring, then copy with the ring's one-off
+    // blocking submit. A HUD recorded after this lands in a second frame submit — only on
+    // the one frame a dump is taken.
+    SubmitFrame();
+    ring_.waitAll();
 
     VkImageMemoryBarrier toSrc = {};
     toSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1235,32 +1179,25 @@ bool VulkanRenderer::DumpExternalImage(VkImage image, uint32_t width, uint32_t h
     toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     toSrc.image = image;
     toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+    ring_.submitImmediate([&](VkCommandBuffer cmd) {
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
 
-    VkBufferImageCopy region = {};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {width, height, 1};
-    vkCmdCopyImageToBuffer(commandBuffer_, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           buf, 1, &region);
+        VkBufferImageCopy region = {};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {width, height, 1};
+        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               buf, 1, &region);
 
-    VkImageMemoryBarrier toColor = toSrc;
-    toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toColor.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr,
-                         0, nullptr, 1, &toColor);
-    vkEndCommandBuffer(commandBuffer_);
-
-    vkResetFences(device_, 1, &fence_);
-    VkSubmitInfo si = {};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &commandBuffer_;
-    vkQueueSubmit(queue_, 1, &si, fence_);
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        VkImageMemoryBarrier toColor = toSrc;
+        toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toColor.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr,
+                             0, nullptr, 1, &toColor);
+    });
 
     void* mapped = nullptr;
     vkMapMemory(device_, mem, 0, bytes, 0, &mapped);  // HUD is R8G8B8A8 — no swizzle
@@ -1281,8 +1218,10 @@ void VulkanRenderer::Shutdown() {
     ClearSharedImports();  // zero-copy (#28) imported textures
 #endif
     DestroyTexture();
+    ring_.destroy();  // waits its fences, runs the deferred releases, frees cmds/fences
     if (sampler_) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
     if (descPool_) { vkDestroyDescriptorPool(device_, descPool_, nullptr); descPool_ = VK_NULL_HANDLE; }
+    for (uint32_t i = 0; i < kMaxSlots; ++i) descSets_[i] = VK_NULL_HANDLE;
     if (pipeline_) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
     if (pipelineLayout_) { vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr); pipelineLayout_ = VK_NULL_HANDLE; }
     if (descSetLayout_) { vkDestroyDescriptorSetLayout(device_, descSetLayout_, nullptr); descSetLayout_ = VK_NULL_HANDLE; }
@@ -1290,8 +1229,6 @@ void VulkanRenderer::Shutdown() {
     for (auto iv : imageViews_) if (iv) vkDestroyImageView(device_, iv, nullptr);
     framebuffers_.clear();
     imageViews_.clear();
-    if (fence_) { vkDestroyFence(device_, fence_, nullptr); fence_ = VK_NULL_HANDLE; }
-    if (commandPool_) { vkDestroyCommandPool(device_, commandPool_, nullptr); commandPool_ = VK_NULL_HANDLE; }
     if (renderPass_) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
     device_ = VK_NULL_HANDLE;
 }

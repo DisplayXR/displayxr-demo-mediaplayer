@@ -5,6 +5,8 @@
 #include "Log.h"
 #include "ui/TransportUI.h"
 
+#include <vk_frame_ring.h>  // displayxr-common: dxr::VkFrameRing::tileBarrier (INV-4.10)
+
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include <cfloat>
 #include <chrono>
@@ -252,7 +254,7 @@ bool ImGuiLayer::RecreateTarget(VkFormat hudFormat, uint32_t hudWidth, uint32_t 
 bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice physicalDevice,
                       VkDevice device, VkQueue queue, uint32_t queueFamily, VkFormat hudFormat,
                       uint32_t hudWidth, uint32_t hudHeight,
-                      const std::vector<VkImage>& hudImages) {
+                      const std::vector<VkImage>& hudImages, uint32_t framesInFlight) {
     if (hudImages.empty() || hudWidth == 0 || hudHeight == 0) return false;
     nativeWindow_ = nativeWindow;
     physicalDevice_ = physicalDevice;
@@ -262,7 +264,8 @@ bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice 
     if (!CreateTargetObjects(hudFormat, hudWidth, hudHeight, hudImages)) return false;
 
 
-    // --- Descriptor pool (font atlas + any user textures) and a command buffer/fence.
+    // --- Descriptor pool (font atlas + any user textures). No command buffer or fence
+    // of our own: RenderToHud() records into the caller's frame command buffer.
     VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16};
     VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dp.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -273,25 +276,6 @@ bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice 
         LOG_ERROR("ImGuiLayer: vkCreateDescriptorPool failed");
         return false;
     }
-
-    VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    cp.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    cp.queueFamilyIndex = queueFamily;
-    if (vkCreateCommandPool(device_, &cp, nullptr, &cmdPool_) != VK_SUCCESS) {
-        LOG_ERROR("ImGuiLayer: vkCreateCommandPool failed");
-        return false;
-    }
-    VkCommandBufferAllocateInfo cba{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cba.commandPool = cmdPool_;
-    cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cba.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(device_, &cba, &cmd_) != VK_SUCCESS) {
-        LOG_ERROR("ImGuiLayer: vkAllocateCommandBuffers failed");
-        return false;
-    }
-    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    vkCreateFence(device_, &fci, nullptr, &fence_);
 
     // --- ImGui context + backends.
     IMGUI_CHECKVERSION();
@@ -330,7 +314,14 @@ bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice 
     vi.DescriptorPool = descPool_;
     vi.RenderPass = renderPass_;
     vi.MinImageCount = 2;
-    vi.ImageCount = (uint32_t)hudImages.size() < 2 ? 2 : (uint32_t)hudImages.size();
+    // ImageCount is how many vertex/index buffer sets the backend rotates through, one
+    // per RenderDrawData(). With frames in flight (dxr::VkFrameRing) a set is reused
+    // only after `ImageCount` frames, so it must cover the ring depth — +1 for the
+    // frame being recorded while the oldest one is still on the GPU.
+    uint32_t imageCount = (uint32_t)hudImages.size();
+    if (imageCount < framesInFlight + 1) imageCount = framesInFlight + 1;
+    if (imageCount < 2) imageCount = 2;
+    vi.ImageCount = imageCount;
     vi.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     vi.CheckVkResultFn = CheckVk;
     if (!ImGui_ImplVulkan_Init(&vi)) {
@@ -610,7 +601,7 @@ void ImGuiLayer::PushPointer(int action, float hudX, float hudY) {
     pointerQueue_.push_back(PointerEvent{action, hudX, hudY});
 }
 
-void ImGuiLayer::RenderToHud(uint32_t imageIndex) {
+void ImGuiLayer::RenderToHud(uint32_t imageIndex, VkCommandBuffer cmd) {
     ImGui::Render();
     ImDrawData* drawData = ImGui::GetDrawData();
     // Staged (#78): one shared offscreen framebuffer; the HUD image is the copy target.
@@ -618,14 +609,16 @@ void ImGuiLayer::RenderToHud(uint32_t imageIndex) {
     const uint32_t fbIndex = stage ? 0u : imageIndex;
     if (fbIndex >= framebuffers_.size()) return;
     if (stage && imageIndex >= hudImages_.size()) return;
+    if (cmd == VK_NULL_HANDLE) return;
 
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-    vkResetFences(device_, 1, &fence_);
-    vkResetCommandBuffer(cmd_, 0);
-
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd_, &bi);
+    // Recorded into the FRAME command buffer, after the atlas pass (INV-4.10: one
+    // submit per frame). Nothing waits on the CPU any more, so order on the GPU: the
+    // staged path reuses ONE offscreen image every frame, and the previous frame's
+    // copy out of it may still be in flight on this queue — this render pass must not
+    // start clearing it until that read is done. It also orders this pass after the
+    // atlas pass recorded just above (different images, but one barrier is cheaper
+    // than reasoning about it).
+    dxr::VkFrameRing::tileBarrier(cmd);
 
     VkClearValue clear{};
     clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}};  // transparent: only widgets show
@@ -635,9 +628,9 @@ void ImGuiLayer::RenderToHud(uint32_t imageIndex) {
     rp.renderArea.extent = {hudWidth_, hudHeight_};
     rp.clearValueCount = 1;
     rp.pClearValues = &clear;
-    vkCmdBeginRenderPass(cmd_, &rp, VK_SUBPASS_CONTENTS_INLINE);
-    ImGui_ImplVulkan_RenderDrawData(drawData, cmd_);
-    vkCmdEndRenderPass(cmd_);
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
+    vkCmdEndRenderPass(cmd);
 
     if (stage) {
         // vkCmdCopyImage, never vkCmdBlitImage: UNORM -> _SRGB of the same channel order
@@ -651,14 +644,14 @@ void ImGuiLayer::RenderToHud(uint32_t imageIndex) {
         toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         toDst.srcAccessMask = 0;
         toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDst);
 
         VkImageCopy region{};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.extent = {hudWidth_, hudHeight_, 1};
-        vkCmdCopyImage(cmd_, stagingImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+        vkCmdCopyImage(cmd, stagingImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
         // Leave it in COLOR_ATTACHMENT_OPTIMAL for the runtime at release time.
@@ -667,18 +660,11 @@ void ImGuiLayer::RenderToHud(uint32_t imageIndex) {
         toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         toColor.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0,
                              nullptr, 1, &toColor);
     }
 
-    vkEndCommandBuffer(cmd_);
-
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd_;
-    CheckVk(vkQueueSubmit(queue_, 1, &si, fence_));
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
 }
 
 int ImGuiLayer::MouseCursor() const {
@@ -707,8 +693,6 @@ void ImGuiLayer::Shutdown() {
         ready_ = false;
     }
     DestroyTargetObjects();
-    if (fence_) { vkDestroyFence(device_, fence_, nullptr); fence_ = VK_NULL_HANDLE; }
-    if (cmdPool_) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
     if (descPool_) { vkDestroyDescriptorPool(device_, descPool_, nullptr); descPool_ = VK_NULL_HANDLE; }
     device_ = VK_NULL_HANDLE;
 }
@@ -717,7 +701,7 @@ void ImGuiLayer::Shutdown() {
 
 ImGuiLayer::~ImGuiLayer() {}
 bool ImGuiLayer::Init(void*, VkInstance, VkPhysicalDevice, VkDevice, VkQueue, uint32_t,
-                      VkFormat, uint32_t, uint32_t, const std::vector<VkImage>&) {
+                      VkFormat, uint32_t, uint32_t, const std::vector<VkImage>&, uint32_t) {
     return false;
 }
 bool ImGuiLayer::CreateTargetObjects(VkFormat, uint32_t, uint32_t, const std::vector<VkImage>&) {
@@ -730,7 +714,7 @@ bool ImGuiLayer::RecreateTarget(VkFormat, uint32_t, uint32_t, const std::vector<
 void ImGuiLayer::PushPointer(int, float, float) {}
 void ImGuiLayer::ProcessEvent(const void*) {}
 void ImGuiLayer::BeginFrame(float, float, float, float, float, float) {}
-void ImGuiLayer::RenderToHud(uint32_t) {}
+void ImGuiLayer::RenderToHud(uint32_t, VkCommandBuffer) {}
 bool ImGuiLayer::WantCaptureMouse() const { return false; }
 int ImGuiLayer::MouseCursor() const { return 0; }
 void ImGuiLayer::Shutdown() {}
