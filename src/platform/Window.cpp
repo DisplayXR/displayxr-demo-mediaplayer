@@ -107,6 +107,14 @@ void Window::Show() {
 void Window::RealizeOnPanel(int32_t, int32_t, uint32_t, uint32_t) {}   // Create() made it
 void Window::SetImGuiCursor(int) {}   // the SDL ImGui backend owns the cursor here
 
+void Window::SetOsCursorHidden(bool hidden) {
+    // The caller also locks ImGui's cursor (ImGuiLayer::SetCursorLocked), or the SDL
+    // backend would SDL_ShowCursor() again on the next ImGui frame.
+    osCursorHidden_ = hidden;
+    if (hidden) SDL_HideCursor();
+    else SDL_ShowCursor();
+}
+
 void Window::MousePosition(float& x, float& y) const { SDL_GetMouseState(&x, &y); }
 
 #endif  // !desktop Linux

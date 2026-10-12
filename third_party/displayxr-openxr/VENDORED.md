@@ -40,6 +40,7 @@ Pins in force:
 
 | Runtime commit | Headers |
 |---|---|
+| `1d7fd8b2a9795d804dfaa3326faa68dbb942f399`<br>1d7fd8b2a (2026-10-12) — carries the `XR_DXR_cursor_depth` **spec v7** train (runtime #1976, ADR-046 Amendment 3: `XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR`) | `XR_DXR_cursor_depth.h` |
 | `98d46018d16f226e021fb4e6b9ac6e8ee9cd3647`<br>98d46018d (2026-09-22) fix(d3d11_service): run the combine pass's draws under immediate_ctx_mutex (#1589/#1610) | `XR_DXR_wayland_surface_binding.h` |
 | `a71979a4d1385841a224eccd64ae973385300b1f`<br>a71979a4d (2026-07-12) feat(#734): fold planned XR_EXT_android_surface_binding → XR_DXR_ (docs/comments); post-rename-safe map regen | `XR_DXR_atlas_capture.h`, `XR_DXR_cocoa_window_binding.h`, `XR_DXR_display_zones.h`, `XR_DXR_local_3d_zone.h`, `XR_DXR_macos_gl_binding.h`, `XR_DXR_mcp_tools.h`, `XR_DXR_spatial_workspace.h`, `XR_DXR_view_rig.h`, `XR_DXR_weave.h`, `XR_DXR_win32_window_binding.h`, `XR_DXR_workspace_file_dialog.h` |
 | `c1e4fe00da0f189122eca14e61e9faaa88e4b38e`<br>c1e4fe00d (2026-09-17) — the `XR_DXR_display_info` **spec v19** train (runtime #1486/#1500), which adds `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` | `XR_DXR_display_info.h` |
@@ -83,6 +84,7 @@ informational — only a pin *mismatch* fails CI).
 | `openxr/XR_DXR_view_rig.h` | Declarative display rig — the app declares, the runtime returns render-ready views (no app-side Kooima) |
 | `openxr/XR_DXR_workspace_file_dialog.h` | Tier-1 spatial file picker (`xrRequestFilePickerDXR`) for Open; native dialog fallback when unsupported |
 | `openxr/XR_DXR_display_zones.h`, `XR_DXR_local_3d_zone.h` | Mixed 2D/3D region paradigm (ADR-027). Vendored for completeness; not used by this app yet |
+| `openxr/XR_DXR_cursor_depth.h` | Depth-aware cursor (spec v7). The player asks the runtime to MEASURE the disparity under the pointer in stereo media (`MEASURED_DISPARITY`) and the runtime draws the cursor; consumed through displayxr-common's `dxr::CursorDepth` |
 | `openxr/XR_DXR_atlas_capture.h` | `xrCaptureAtlasDXR` composed-atlas capture (agent-side debugging) |
 | `openxr/XR_DXR_weave.h` | Browser/inline-3D weave surface. Vendored for completeness; not used by this app |
 | `openxr/XR_DXR_macos_gl_binding.h`, `XR_DXR_mcp_tools.h`, `XR_DXR_spatial_workspace.h` | Rest of the extension surface, vendored so the snapshot is a whole directory rather than a hand-picked subset. Not used by this app |

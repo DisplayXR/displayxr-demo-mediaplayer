@@ -95,6 +95,11 @@ private:
 
     // Per-frame UI state: advance the auto-hide fade, toast fade, and slideshow machine.
     void TickUi();
+    // Depth-aware cursor (XR_DXR_cursor_depth spec v7, ADR-046 Amendment 3): while the
+    // player shows STEREO media, ask the runtime to measure the disparity under the
+    // pointer and draw the cursor lifted over popped-out content. Called once per
+    // frame before BeginFrame. Off (and costing nothing) for mono / the idle logo.
+    void UpdateDepthCursor();
     void ToggleSlideshow();
     // Idempotent form of the above — a dropped folder starts the slideshow, and must not
     // stop it when one is already running. Call AFTER the first asset is loaded: it reads
@@ -303,6 +308,10 @@ private:
     std::chrono::steady_clock::time_point fpsWindowStart_{};
     uint32_t fpsWindowFrames_ = 0;
     float fps_ = 0.0f;
+    bool depthCursorOn_ = false;        // measured-disparity request is live (stereo media)
+    bool depthCursorAllowed_ = true;    // MEDIAPLAYER_DEPTH_CURSOR=0 turns it off
+    bool depthCursorPinned_ = false;    // MEDIAPLAYER_DEPTH_CURSOR_UV="u,v": test pointer
+    float depthCursorPinU_ = 0.0f, depthCursorPinV_ = 0.0f;
     bool showHud_ = true;         // master UI enable (SHIFT+TAB); auto-hide governs the rest
     bool inRenderFrame_ = false;  // reentrancy guard (live-resize watch vs main loop)
 

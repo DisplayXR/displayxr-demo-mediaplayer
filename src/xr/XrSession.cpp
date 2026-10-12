@@ -92,6 +92,8 @@ bool XrSession::InitInstanceAndSystem() {
             hasAtlasCaptureExt_ = true;
         if (strcmp(e.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0)
             hasMcpToolsExt_ = true;
+        if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0)
+            cursorDepthSpec_ = e.extensionVersion;
 #if defined(__linux__) && !defined(__ANDROID__)
         if (strcmp(e.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) hasWeaveExt_ = true;
 #endif
@@ -105,6 +107,7 @@ bool XrSession::InitInstanceAndSystem() {
     LOG_INFO("XR_DXR_workspace_file_dialog: %s", hasFilePickerExt_ ? "yes" : "no");
     LOG_INFO("XR_DXR_atlas_capture: %s", hasAtlasCaptureExt_ ? "yes" : "no");
     LOG_INFO("XR_DXR_mcp_tools: %s", hasMcpToolsExt_ ? "yes" : "no");
+    LOG_INFO("XR_DXR_cursor_depth: %s (spec %u)", cursorDepthSpec_ ? "yes" : "no", cursorDepthSpec_);
 
     if (!hasVulkan) {
         LOG_ERROR("Runtime does not expose XR_KHR_vulkan_enable2");
@@ -118,6 +121,7 @@ bool XrSession::InitInstanceAndSystem() {
     if (hasFilePickerExt_) enabled.push_back(XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
     if (hasAtlasCaptureExt_) enabled.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
     if (hasMcpToolsExt_) enabled.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
+    if (cursorDepthSpec_) enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
 #if defined(__linux__) && !defined(__ANDROID__)
     // The window drag's phase snap (xrWeaveSnapWindowRectDXR): the X11 drag
     // lands each step on a phase-correct origin. Optional — identity without.
@@ -1099,6 +1103,9 @@ bool XrSession::BeginFrame(Frame& frame) {
     XrViewState viewState = {XR_TYPE_VIEW_STATE};
     for (uint32_t i = 0; i < kMaxViews; ++i) frame.views[i] = {XR_TYPE_VIEW};
     uint32_t viewCountOut = 0;
+    // Depth cursor: prepends the hint (+ the measured-disparity request) and the draw
+    // state to the two chains. A no-op unless the App enabled the helper.
+    cursor_.chain(locate, viewState);
     if (XR_FAILED(xrLocateViews(session_, &locate, &viewState, viewCount_,
                                &viewCountOut, frame.views))) {
         frame.shouldRender = false;
@@ -1110,6 +1117,8 @@ bool XrSession::BeginFrame(Frame& frame) {
         return true;
     }
     frame.locatedCount = viewCountOut < kMaxViews ? viewCountOut : kMaxViews;
+    // Hides the OS cursor exactly while the runtime draws the depth cursor.
+    cursor_.afterLocate(frame.views, frame.viewCount < frame.locatedCount ? frame.viewCount : frame.locatedCount);
     // Never submit a view we did not locate. Clamp rather than drop the frame:
     // a short locate still yields a correct (if narrower) projection layer,
     // whereas layerCount 0 is a black panel with no error anywhere.
