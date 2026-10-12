@@ -17,6 +17,8 @@
 
 #include "XrCommon.h"
 
+#include <cursor_depth.h>  // displayxr-common: dxr::CursorDepth (XR_DXR_cursor_depth helper)
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -140,6 +142,14 @@ public:
     // Ask the runtime to snapshot the composed multi-view atlas to "<pathPrefix>_atlas.png".
     // Non-blocking: the readback runs at the next EndFrame, so the PNG lands shortly after.
     bool CaptureAtlas(const std::string& pathPrefix);
+
+    // --- Depth-aware cursor (XR_DXR_cursor_depth, ADR-046 Amendments 2 + 3) ---
+    // The extension is enabled whenever the runtime offers it (enabling costs the
+    // runtime nothing, ADR-046 §0). CursorDepthSpec() is the runtime's spec version,
+    // 0 when absent. The helper stays INERT until the app calls Cursor().enable(); while
+    // enabled, BeginFrame chains its structs around xrLocateViews.
+    uint32_t CursorDepthSpec() const { return cursorDepthSpec_; }
+    dxr::CursorDepth& Cursor() { return cursor_; }
 
     // --- Agent tools (XR_DXR_mcp_tools) ---
     // The app exposes its playback controls as MCP tools on the per-process server the
@@ -301,6 +311,8 @@ private:
     // or the MCP capability gate is off — the whole feature is then inert.
     void HandleMcpToolCall(const XrEventDataMCPToolCallDXR* call);
     bool hasMcpToolsExt_ = false;
+    uint32_t cursorDepthSpec_ = 0;   // XR_DXR_cursor_depth extensionVersion (0 = absent)
+    dxr::CursorDepth cursor_;        // inert until App enables it (stereo media only)
     PFN_xrSetMCPAppInfoDXR pfnSetMcpAppInfo_ = nullptr;
     PFN_xrRegisterMCPToolDXR pfnRegisterMcpTool_ = nullptr;
     PFN_xrGetMCPToolCallArgsDXR pfnGetMcpToolCallArgs_ = nullptr;

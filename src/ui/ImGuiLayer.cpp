@@ -675,6 +675,13 @@ bool ImGuiLayer::WantCaptureMouse() const {
     return ready_ && ImGui::GetIO().WantCaptureMouse;
 }
 
+void ImGuiLayer::SetCursorLocked(bool locked) {
+    if (!ready_) return;
+    ImGuiIO& io = ImGui::GetIO();
+    if (locked) io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    else io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
+}
+
 void ImGuiLayer::Shutdown() {
     if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
 #if defined(_WIN32) && defined(MEDIAPLAYER_IMGUI_SDL)
@@ -716,6 +723,7 @@ void ImGuiLayer::ProcessEvent(const void*) {}
 void ImGuiLayer::BeginFrame(float, float, float, float, float, float) {}
 void ImGuiLayer::RenderToHud(uint32_t, VkCommandBuffer) {}
 bool ImGuiLayer::WantCaptureMouse() const { return false; }
+void ImGuiLayer::SetCursorLocked(bool) {}
 int ImGuiLayer::MouseCursor() const { return 0; }
 void ImGuiLayer::Shutdown() {}
 

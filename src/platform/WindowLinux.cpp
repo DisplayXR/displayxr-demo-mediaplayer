@@ -203,7 +203,13 @@ void Window::MousePosition(float& x, float& y) const {
 void Window::SetImGuiCursor(int imguiCursor) {
     if (!lwin_ || imguiCursor == lastCursor_) return;
     lastCursor_ = imguiCursor;
-    lwin_->set_cursor(CursorFromImGui(imguiCursor));
+    if (!osCursorHidden_) lwin_->set_cursor(CursorFromImGui(imguiCursor));
+}
+
+void Window::SetOsCursorHidden(bool hidden) {
+    osCursorHidden_ = hidden;
+    if (!lwin_) return;
+    lwin_->set_cursor(hidden ? DxrCursor::Hidden : CursorFromImGui(lastCursor_ < -1 ? 0 : lastCursor_));
 }
 
 void Window::ToggleFullscreen() {

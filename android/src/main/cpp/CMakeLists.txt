@@ -28,14 +28,17 @@ get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOL
 # (dxr::VkFrameRing — N frames in flight, one submit per frame; runtime INV-4.10,
 # #1942). Sources only (don't run its CMake, which carries desktop platform deps);
 # its common/ dir reaches the target through a local displayxr::rules below, so it
-# lands LAST on the include path. Same pin as the desktop build (v2.30.1).
+# lands LAST on the include path. Same pin as the desktop build.
 include(FetchContent)
 FetchContent_Declare(displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
     # v2.30.1: the Wayland geometry payload is read by structure, in any key order
     # (displayxr-common#76; a sorted-key KWin publisher crashed the old parser).
-    GIT_TAG v2.30.1
-    GIT_SHALLOW TRUE
+    # v2.31.0-pre (displayxr-common#77, UNTAGGED — repin to v2.31.0 once it is tagged):
+    # dxr::CursorDepth::useMeasuredDisparity(), the XR_DXR_cursor_depth v7
+    # measured-disparity source (runtime#1976). A SHA pin cannot be shallow.
+    GIT_TAG 74a0390d938f0f80da4dcc19577cd08483cba9dc
+    GIT_SHALLOW FALSE
     # No CMakeLists.txt there: MakeAvailable only populates, never add_subdirectory
     # (the non-deprecated form of a bare FetchContent_Populate).
     SOURCE_SUBDIR _headers_only_no_cmake)

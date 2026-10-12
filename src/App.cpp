@@ -348,6 +348,18 @@ int App::Run() {
     // prove convergence/swap without keystrokes). Interactive keys still apply on top.
     if (const char* c = std::getenv("MEDIAPLAYER_CONV")) convergence_ = (float)std::atof(c);
     if (const char* s = std::getenv("MEDIAPLAYER_SWAP")) swapEyes_ = (*s && *s != '0');
+    // Depth cursor kill switch, and a pinned pointer (canvas UV) for headless tests.
+    if (const char* d = std::getenv("MEDIAPLAYER_DEPTH_CURSOR")) depthCursorAllowed_ = (*d && *d != '0');
+    if (const char* p = std::getenv("MEDIAPLAYER_DEPTH_CURSOR_UV"))
+        depthCursorPinned_ = std::sscanf(p, "%f,%f", &depthCursorPinU_, &depthCursorPinV_) == 2;
+    xr_.Cursor().onDepthCursorShownChanged([this](bool shown) {
+        // The runtime draws the cursor now: hide the OS pointer (and keep ImGui's SDL
+        // backend from re-showing it every frame), or give it back.
+        imgui_.SetCursorLocked(shown);
+        window_.SetOsCursorHidden(shown);
+        LOG_DEBUG("depth cursor: %s", shown ? "runtime draws (lifted over popped-out content; OS cursor hidden)"
+                                           : "on the glass (OS cursor)");
+    });
     const auto bootNow = std::chrono::steady_clock::now();
     fpsWindowStart_ = bootNow;
     lastFrameTime_ = bootNow;
@@ -589,6 +601,7 @@ void App::RenderOneFrame() {
     }
 
     TickAutoConv();  // smoothed auto-convergence shift (#92); exactly 0 while never enabled
+    UpdateDepthCursor();
 
     XrSession::Frame frame;
     if (!xr_.BeginFrame(frame)) return;
@@ -971,6 +984,42 @@ void App::BuildTransportUI() {
     // A focused text field (the Stream URL popup) owns the keyboard: no hotkeys.
     window_.SetKeyboardCaptured(ImGui::GetIO().WantTextInput);
 #endif
+}
+
+void App::UpdateDepthCursor() {
+    dxr::CursorDepth& cursor = xr_.Cursor();
+    // Measured disparity is spec v7. Only stereo media qualifies: mono content (and the
+    // idle logo) is on the glass by construction, so asking would be pure cost. There
+    // is no depth map or lifted-content path in this player to prefer over it.
+    const bool want = depthCursorAllowed_ && xr_.CursorDepthSpec() >= 7 && hasMedia_ && !isLogo_ &&
+                      layout_ != StereoLayout::Mono;
+    if (want != depthCursorOn_) {
+        depthCursorOn_ = want;
+        // enable(0) makes the helper inert: nothing is chained on xrLocateViews, so the
+        // runtime does no copy, readback or match, and the OS cursor is restored.
+        cursor.enable(want ? xr_.CursorDepthSpec() : 0);
+        cursor.useMeasuredDisparity(want);
+        LOG_INFO("depth cursor: measured-disparity %s", want ? "ON (stereo media)" : "off");
+    }
+    if (!want) return;
+
+    // The pointer as a canvas UV (the canvas is the window's client area). Off the
+    // canvas, or over the transport UI, nothing is requested this frame and the OS
+    // cursor stays, so the buttons keep their normal pointer.
+    if (depthCursorPinned_) {
+        cursor.setPointerUV(depthCursorPinU_, depthCursorPinV_);
+        return;
+    }
+    uint32_t pw = 0, ph = 0;
+    window_.PointSize(pw, ph);
+    float mx = 0.0f, my = 0.0f;
+    window_.MousePosition(mx, my);
+    XrVector2f uv{};
+    if (window_.MouseInWindow() && !imgui_.WantCaptureMouse() &&
+        dxr::cursorCanvasUV(mx, my, pw, ph, /*yUp=*/false, uv))
+        cursor.setPointerUV(uv.x, uv.y);
+    else
+        cursor.setPointerUV(-1.0f, -1.0f);
 }
 
 void App::UpdateFps() {

@@ -88,6 +88,11 @@ public:
     // The pointer shape ImGui wants this frame (an ImGuiMouseCursor value).
     int MouseCursor() const;
 
+    // While true, ImGui leaves the OS cursor alone (ImGuiConfigFlags_NoMouseCursorChange):
+    // the SDL backend otherwise re-shows it every frame, which would undo the hide while
+    // the runtime draws the depth cursor (XR_DXR_cursor_depth).
+    void SetCursorLocked(bool locked);
+
 private:
     // Build the render pass / views / framebuffers over `hudImages`. Shared by Init()
     // and RecreateTarget(); tears down any previous target first.

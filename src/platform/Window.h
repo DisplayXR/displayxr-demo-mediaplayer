@@ -60,6 +60,10 @@ public:
     // Desktop Linux only — the SDL ImGui backend sets cursors itself elsewhere.
     void SetImGuiCursor(int imguiCursor);
 
+    // Hide / show the OS pointer over the window. The runtime-drawn depth cursor
+    // (XR_DXR_cursor_depth) replaces it while it draws; called on transitions only.
+    void SetOsCursorHidden(bool hidden);
+
     Window();   // out of line: a member of incomplete type (desktop Linux)
     ~Window();
 
@@ -181,6 +185,7 @@ private:
     int64_t heldNextNs_ = 0;
     void HandleLinuxKey(uint32_t keysym, uint32_t mods, bool repeat, bool* quit);
 #endif
+    bool osCursorHidden_ = false;   // SetOsCursorHidden(): the depth cursor replaces it
     bool cycleModeRequested_ = false;
     bool toggleHudRequested_ = false;
     int convergenceSteps_ = 0;
