@@ -34,11 +34,10 @@ FetchContent_Declare(displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
     # v2.30.1: the Wayland geometry payload is read by structure, in any key order
     # (displayxr-common#76; a sorted-key KWin publisher crashed the old parser).
-    # v2.31.0-pre (displayxr-common#77, UNTAGGED — repin to v2.31.0 once it is tagged):
-    # dxr::CursorDepth::useMeasuredDisparity(), the XR_DXR_cursor_depth v7
-    # measured-disparity source (runtime#1976). A SHA pin cannot be shallow.
-    GIT_TAG 74a0390d938f0f80da4dcc19577cd08483cba9dc
-    GIT_SHALLOW FALSE
+    # v2.31.0: dxr::CursorDepth::useMeasuredDisparity(), the XR_DXR_cursor_depth v7
+    # measured-disparity source (displayxr-common#77, runtime#1976).
+    GIT_TAG v2.31.0
+    GIT_SHALLOW TRUE
     # No CMakeLists.txt there: MakeAvailable only populates, never add_subdirectory
     # (the non-deprecated form of a bare FetchContent_Populate).
     SOURCE_SUBDIR _headers_only_no_cmake)
