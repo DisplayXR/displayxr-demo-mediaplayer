@@ -312,6 +312,7 @@ private:
     bool depthCursorAllowed_ = true;    // MEDIAPLAYER_DEPTH_CURSOR=0 turns it off
     bool depthCursorPinned_ = false;    // MEDIAPLAYER_DEPTH_CURSOR_UV="u,v": test pointer
     float depthCursorPinU_ = 0.0f, depthCursorPinV_ = 0.0f;
+    uint32_t depthCursorLogTick_ = 0;
     bool showHud_ = true;         // master UI enable (SHIFT+TAB); auto-hide governs the rest
     bool inRenderFrame_ = false;  // reentrancy guard (live-resize watch vs main loop)
 

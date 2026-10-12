@@ -15,6 +15,7 @@ endif()
 # Platform-suffixed binary name: mediaplayer_handle_vk_{macos,win,linux}.
 if(APPLE)
     set(MP_PLATFORM "macos")
+    enable_language(OBJCXX)   # displayxr-common's cursor_depth_macos.mm (see below)
 elseif(WIN32)
     set(MP_PLATFORM "win")
 else()
@@ -355,6 +356,15 @@ endif()
 # d3d11 + dxgi: zero-copy D3D11VA->Vulkan decode interop (issue #28).
 if(WIN32)
     target_link_libraries(${MP_TARGET} PRIVATE shell32 ole32 d3d11 dxgi d3dcompiler)
+endif()
+
+# macOS: displayxr-common's Cocoa adapter for dxr::CursorDepth hides the OS pointer
+# with +[NSCursor hide] while the runtime draws the depth cursor. SDL_HideCursor would
+# not do: SDL swaps in an INVISIBLE NSCursor, and the runtime's default cursor look
+# mirrors +[NSCursor currentCursor] — it would draw that invisible sprite.
+if(APPLE)
+    target_sources(${MP_TARGET} PRIVATE ${displayxr_common_SOURCE_DIR}/common/cursor_depth_macos.mm)
+    target_link_libraries(${MP_TARGET} PRIVATE "-framework AppKit")
 endif()
 
 # Copy the OpenXR loader dylib/dll next to the binary when it's an imported target,
