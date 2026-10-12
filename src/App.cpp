@@ -352,11 +352,20 @@ int App::Run() {
     if (const char* d = std::getenv("MEDIAPLAYER_DEPTH_CURSOR")) depthCursorAllowed_ = (*d && *d != '0');
     if (const char* p = std::getenv("MEDIAPLAYER_DEPTH_CURSOR_UV"))
         depthCursorPinned_ = std::sscanf(p, "%f,%f", &depthCursorPinU_, &depthCursorPinV_) == 2;
+#if defined(__APPLE__)
+    // macOS hides the pointer through displayxr-common's Cocoa adapter (+[NSCursor
+    // hide]), NOT SDL_HideCursor: SDL's hide installs an invisible NSCursor, and the
+    // runtime's default cursor look mirrors the CURRENT NSCursor — it would draw
+    // nothing. The pointer UV still comes from us (setPointerUV overrides the adapter).
+    xr_.Cursor().setWindowCocoa(window_.NativeHandle());
+#endif
     xr_.Cursor().onDepthCursorShownChanged([this](bool shown) {
         // The runtime draws the cursor now: hide the OS pointer (and keep ImGui's SDL
         // backend from re-showing it every frame), or give it back.
         imgui_.SetCursorLocked(shown);
+#if !defined(__APPLE__)
         window_.SetOsCursorHidden(shown);
+#endif
         LOG_DEBUG("depth cursor: %s", shown ? "runtime draws (lifted over popped-out content; OS cursor hidden)"
                                            : "on the glass (OS cursor)");
     });
@@ -1007,7 +1016,15 @@ void App::UpdateDepthCursor() {
     // canvas, or over the transport UI, nothing is requested this frame and the OS
     // cursor stays, so the buttons keep their normal pointer.
     if (depthCursorPinned_) {
+        // Test mode: also read back the placement and log it ~1/s (last frame's result).
+        cursor.setWantPlacement(true);
         cursor.setPointerUV(depthCursorPinU_, depthCursorPinV_);
+        if (++depthCursorLogTick_ % 60 == 0) {
+            const XrCursorDepthPlacementDXR& pl = cursor.placement();
+            LOG_INFO("depth cursor @uv(%.3f,%.3f): willDraw=%d active=%d disparity=%.4f target=%.4f z=%.4f",
+                     depthCursorPinU_, depthCursorPinV_, (int)cursor.drawState().willDraw, (int)pl.isActive,
+                     pl.disparity, pl.targetDisparity, pl.pose.position.z);
+        }
         return;
     }
     uint32_t pw = 0, ph = 0;
