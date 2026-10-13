@@ -36,7 +36,9 @@ FetchContent_Declare(displayxr_common
     # (displayxr-common#76; a sorted-key KWin publisher crashed the old parser).
     # v2.31.0: dxr::CursorDepth::useMeasuredDisparity(), the XR_DXR_cursor_depth v7
     # measured-disparity source (displayxr-common#77, runtime#1976).
-    GIT_TAG v2.31.0
+    # v2.31.2: a right-button content drag runs on KWin (displayxr-common#78, only
+    # gtk_shell1 says mutter) + the buffer_device helper in u_wayland_geom.h (#81).
+    GIT_TAG v2.31.2
     GIT_SHALLOW TRUE
     # No CMakeLists.txt there: MakeAvailable only populates, never add_subdirectory
     # (the non-deprecated form of a bare FetchContent_Populate).
