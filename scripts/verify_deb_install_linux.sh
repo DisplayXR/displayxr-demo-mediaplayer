@@ -15,7 +15,9 @@
 #   * `ldd -r` on the installed binary or any bundled lib reports a missing
 #     library, symbol or symbol version (e.g. a glibc floor above the release);
 #   * a system libSDL3 / libav* is linked instead of the static / bundled copy;
-#   * a Recommends / Suggests name does not exist on that release.
+#   * a Recommends / Suggests name does not exist on that release;
+#   * the DisplayXR Shell registration (/usr/share/displayxr/apps) is missing,
+#     or its exe_path / icons are not installed files.
 # Does NOT run the app: CI has no display or GPU (on-screen checks are manual).
 set -euo pipefail
 
@@ -36,7 +38,8 @@ apt-get install -y -qq --no-install-recommends "${DEBS[@]}"
 APPDIR=/usr/lib/displayxr-demos/mediaplayer
 BIN="$APPDIR/mediaplayer_handle_vk_linux"
 [ -x "$BIN" ] || { echo "error: $BIN not installed." >&2; exit 1; }
-dpkg-query -W -f='==> installed ${Package} ${Version}\nDepends: ${Depends}\n' displayxr-mediaplayer
+PKG=displayxr-mediaplayer
+dpkg-query -W -f='==> installed ${Package} ${Version}\nDepends: ${Depends}\n' "$PKG"
 
 fail=0
 for elf in "$BIN" $(find "$APPDIR" -maxdepth 1 -type f -name 'lib*.so*'); do
@@ -69,6 +72,36 @@ for field in Recommends Suggests; do
       echo "error: $field '$pkg' does not exist on $PRETTY_NAME." >&2; fail=1
     fi
   done
+done
+
+# DisplayXR Shell registration: the Linux shell's Ctrl+L launcher lists only
+# apps with a registered manifest in /usr/share/displayxr/apps, whose exe_path
+# and icons must be absolute paths to installed files (a missing icon makes the
+# shell drop the app). Plain sed, no JSON tool: this container is pristine, and
+# package_deb_linux.sh writes one key per line.
+mapfile -t REGS < <(dpkg -L "$PKG" | grep -E '^/usr/share/displayxr/apps/[^/]+\.displayxr\.json$' || true)
+if [ "${#REGS[@]}" -lt 1 ]; then
+    echo "error: $PKG installs no /usr/share/displayxr/apps/*.displayxr.json (not in the shell launcher)." >&2
+    fail=1
+fi
+for reg in "${REGS[@]}"; do
+    echo "    shell registration: $reg"
+    grep -Eq '^ *"schema_version": *1,?$' "$reg" || { echo "error: $reg: schema_version is not 1." >&2; fail=1; }
+    for key in exe_path icon icon_3d; do
+        val="$(sed -n "s/^ *\"$key\": *\"\\([^\"]*\\)\",\\{0,1\\}\$/\\1/p" "$reg" | head -1)"
+        if [ -z "$val" ]; then
+            [ "$key" = exe_path ] && { echo "error: $reg has no exe_path." >&2; fail=1; }
+            continue
+        fi
+        case "$val" in /*) : ;; *) echo "error: $reg: $key '$val' is not absolute." >&2; fail=1; continue ;; esac
+        if [ ! -f "$val" ]; then
+            echo "error: $reg: $key '$val' is not an installed file." >&2; fail=1
+        elif [ "$key" = exe_path ] && [ ! -x "$val" ]; then
+            echo "error: $reg: exe_path '$val' is not executable." >&2; fail=1
+        else
+            echo "      $key $val: ok"
+        fi
+    done
 done
 
 [ "$fail" = 0 ] || { echo "==> FAIL on $PRETTY_NAME" >&2; exit 1; }
