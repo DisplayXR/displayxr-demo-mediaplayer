@@ -3471,6 +3471,16 @@ void App::InitPro() {
     };
     sh.toast = [this](const std::string& t) { ShowToast(t); };
     sh.displayPeriodMs = [this] { return fps_ > 1.0f ? 1000.0 / fps_ : 1000.0 / 60.0; };
+    // Input-list thumbnails: one small ImGui texture per input slot, created on first use.
+    auto thumbIds = std::make_shared<std::vector<int>>(pro::Station::kMaxThumbs, -1);
+    sh.thumbTexture = [this, thumbIds](int slot, const uint8_t* rgba) -> void* {
+        if (slot < 0 || slot >= (int)thumbIds->size() || !imgui_.Ready()) return nullptr;
+        int& id = (*thumbIds)[slot];
+        if (id < 0 && rgba) id = imgui_.CreateTexture(pro::Station::kThumbW, pro::Station::kThumbH);
+        if (id < 0) return nullptr;
+        if (rgba) imgui_.UpdateTexture(id, rgba);
+        return imgui_.TextureId(id);
+    };
     pro::StationOptions so;
     so.inputs = launch_.proInputs;
     so.budget.nearPct = launch_.proBudget[0];

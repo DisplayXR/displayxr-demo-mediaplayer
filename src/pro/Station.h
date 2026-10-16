@@ -36,6 +36,9 @@ struct StationHost {
     std::function<bool(const std::string& prefix)> captureAtlas;
     std::function<void(const std::string&)> toast;
     std::function<double()> displayPeriodMs;  // one panel frame, for the delay readout
+    // Input-list thumbnails (kThumbW x kThumbH RGBA): upload `rgba` for thumbnail `slot`
+    // (nullptr = no change) and return its ImTextureID, nullptr when there is none.
+    std::function<void*(int slot, const uint8_t* rgba)> thumbTexture;
 };
 
 struct StationOptions {
@@ -48,6 +51,8 @@ struct StationOptions {
 
 class Station {
 public:
+    static constexpr int kThumbW = 192, kThumbH = 108;  // thumbnail pixels (16:9)
+    static constexpr int kMaxThumbs = 8;                // inputs with a thumbnail
     ~Station();
     void Init(StationHost host, const StationOptions& opt);
     void Shutdown();
@@ -103,6 +108,9 @@ private:
     rig::RigMonitor rig_;
     struct Input {
         std::string name, spec;
+        std::vector<uint8_t> thumb;   // kThumbW x kThumbH RGBA, empty until first seen
+        double thumbSec = -1.0;       // when it was taken (LiveProducer::NowSeconds)
+        bool thumbDirty = false;      // not uploaded yet
     };
     std::vector<Input> inputs_;
     int inputIndex_ = -1;
