@@ -5,6 +5,14 @@ name: Build macOS
 # the .pkg is attached to the GitHub Release. Mirrors the sibling demos'
 # build-macos.yml. (versions.json is bumped by the Windows workflow only.)
 #
+# Media Player Pro (docs/PRO.md) is built (with OpenColorIO) and packaged on every
+# run too, so its .pkg is validated on every PR. Release tags are separate:
+#   v*      -> Stereo Media Player .pkg only (unchanged)
+#   pro-v*  -> Media Player Pro .pkg only, attached to the SAME "Media Player Pro X.Y.Z"
+#              release build-windows.yml creates (identical name / prerelease /
+#              make_latest:false, so whichever job reaches softprops first creates it
+#              and the other only adds its asset; never "latest", no versions.json).
+#
 # The DetectChanges job + docs_only step gating let this workflow be a required
 # status check (the "Build macOS" job always runs and reports success in ~30s
 # on doc-only PRs, skipping the heavy build) without blocking doc PRs. Mirrors
@@ -14,7 +22,7 @@ on:
   pull_request: {}
   push:
     branches: [ main ]
-    tags: [ 'v*' ]
+    tags: [ 'v*', 'pro-v*' ]
   workflow_dispatch: {}
 
 concurrency:
@@ -56,7 +64,7 @@ jobs:
     name: Build macOS
     needs: DetectChanges
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 45   # base + Pro (+ OpenColorIO) and two .pkgs
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -72,26 +80,32 @@ jobs:
         # formula). FFmpeg via Homebrew (pkg-config). The app's dylib closure is
         # bundled by a recursive otool/install_name_tool walk in create_app_bundle.sh.
         run: |
-          brew install cmake ninja ffmpeg pkg-config vulkan-headers vulkan-loader molten-vk
+          brew install cmake ninja ffmpeg pkg-config vulkan-headers vulkan-loader molten-vk opencolorio
           echo "VULKAN_SDK=$(brew --prefix)" >> "$GITHUB_ENV"
 
       - name: Derive installer version
         if: needs.DetectChanges.outputs.docs_only != 'true'
         id: version
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          # v1.2.3 -> base 1.2.3; pro-v0.2.0 -> Pro 0.2.0. The product NOT being released
+          # is still built + packaged (validation only) with a dev version, never published.
+          DEV="0.0.0-dev.${GITHUB_SHA::8}"
+          VERSION="$DEV"; PRO_VERSION="$DEV"
+          if [[ "$GITHUB_REF" == refs/tags/pro-v* ]]; then
+            PRO_VERSION="${GITHUB_REF#refs/tags/pro-v}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
-          else
-            VERSION="0.0.0-dev.${GITHUB_SHA::8}"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "VERSION=$VERSION"
+          echo "pro_version=$PRO_VERSION" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION PRO_VERSION=$PRO_VERSION"
 
-      - name: Build demo + installer
+      - name: Build demo + Pro + installers
         if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
           DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
-        run: ./scripts/build_macos.sh --installer
+          MP_PRO_VERSION: ${{ steps.version.outputs.pro_version }}
+        run: ./scripts/build_macos.sh --installer --pro --ocio
 
       # MP_BUILD_TESTS defaults OFF, so nothing ran ctest before this — the unit tests
       # existed but never executed in CI. Re-configure the tree build_macos.sh already
@@ -145,6 +159,52 @@ jobs:
           if [ "$MISSING" -ne 0 ]; then echo "Payload listing:"; cat "$EXPAND_DIR/files"; exit 1; fi
           echo "PASS: .pkg payload contains app + MoltenVK/Vulkan/OpenXR + FFmpeg dylibs + DisplayXR manifest/icons."
 
+      - name: Assert Pro .pkg payload (regression guard)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          PKG=$(find _package -maxdepth 1 -name "DisplayXRMediaPlayerPro-*.pkg" -type f | head -1)
+          if [ -z "$PKG" ] || [ ! -f "$PKG" ]; then
+            echo "::error::DisplayXRMediaPlayerPro-*.pkg missing from _package/"; ls -la _package/ || true; exit 1
+          fi
+          echo "Found Pro installer: $PKG"
+          EXPAND_DIR=$(mktemp -d)
+          pkgutil --expand "$PKG" "$EXPAND_DIR/expand"
+          PAYLOAD="$EXPAND_DIR/expand/mediaplayer_pro.pkg/Payload"
+          if [ ! -f "$PAYLOAD" ]; then
+            echo "::error::mediaplayer_pro.pkg/Payload not found inside .pkg"; ls -la "$EXPAND_DIR/expand/" || true; exit 1
+          fi
+          # Own component id, so it installs alongside the Stereo Media Player.
+          grep -q 'identifier="com.displayxr.mediaplayer.pro"' "$EXPAND_DIR/expand/mediaplayer_pro.pkg/PackageInfo" \
+            || { echo "::error::Pro component identifier is not com.displayxr.mediaplayer.pro"; exit 1; }
+          gunzip -c "$PAYLOAD" | cpio -i -t > "$EXPAND_DIR/files" 2>/dev/null
+
+          MISSING=0
+          assert_present() {
+            if ! grep -q "$1" "$EXPAND_DIR/files"; then
+              echo "::error::$2 missing from Pro .pkg payload (pattern: $1)"; MISSING=1
+            fi
+          }
+          APP='Applications/Media Player Pro\.app/Contents'
+          assert_present "$APP/MacOS/Media Player Pro" "launcher"
+          assert_present "$APP/Resources/mediaplayer_pro_handle_vk_macos" "Pro binary"
+          assert_present "$APP/Resources/lib/libMoltenVK" "MoltenVK"
+          assert_present "$APP/Resources/lib/libvulkan" "Vulkan loader"
+          assert_present "$APP/Resources/lib/libopenxr_loader" "OpenXR loader"
+          assert_present "$APP/Resources/lib/libavcodec" "FFmpeg avcodec"
+          assert_present "$APP/Resources/lib/libavformat" "FFmpeg avformat"
+          assert_present "$APP/Resources/lib/libOpenColorIO" "OpenColorIO"
+          assert_present "$APP/Resources/lib/libImath" "Imath (OpenColorIO dep)"
+          assert_present "$APP/Resources/lib/libyaml-cpp" "yaml-cpp (OpenColorIO dep)"
+          assert_present "$APP/Resources/displayxr/mediaplayer_pro_handle_vk_macos\.displayxr\.json" "DisplayXR app manifest"
+          assert_present "$APP/Resources/displayxr/icon\.png" "manifest 2D icon"
+          assert_present "$APP/Resources/displayxr/icon_sbs\.png" "manifest 3D icon"
+          if grep -q 'Stereo Media Player\.app' "$EXPAND_DIR/files"; then
+            echo "::error::Pro .pkg carries the Stereo Media Player app"; MISSING=1
+          fi
+          if [ "$MISSING" -ne 0 ]; then echo "Payload listing:"; cat "$EXPAND_DIR/files"; exit 1; fi
+          echo "PASS: Pro .pkg payload contains Media Player Pro.app + MoltenVK/Vulkan/OpenXR + FFmpeg + OpenColorIO dylibs + manifest/icons."
+
       - name: Upload installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v6
@@ -153,6 +213,32 @@ jobs:
           name: DisplayXRMediaPlayer-macOS
           if-no-files-found: error
           path: _package/DisplayXRMediaPlayer-*.pkg
+
+      - name: Upload Pro installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          retention-days: 3
+          name: DisplayXRMediaPlayerPro-macOS
+          if-no-files-found: error
+          path: _package/DisplayXRMediaPlayerPro-*.pkg
+
+      # Pro releases: same release as build-windows.yml's pro-v* step. Mirrors its name /
+      # draft / prerelease / make_latest EXACTLY (make_latest must be spelled out: an
+      # update without it could flip "latest" to Pro). No generate_release_notes: only the
+      # Windows workflow sets it (the action appends notes to the body on update, so a
+      # second setter would repeat them). Only the Pro .pkg glob is uploaded, so the
+      # Windows .exe already on the release is never touched.
+      - name: Attach Pro .pkg to GitHub release on pro-v* tag
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/pro-v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: _package/DisplayXRMediaPlayerPro-*.pkg
+          fail_on_unmatched_files: true
+          name: Media Player Pro ${{ steps.version.outputs.pro_version }}
+          draft: false
+          prerelease: false
+          make_latest: false
 
       - name: Attach .pkg to GitHub release on tag
         if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')

@@ -242,13 +242,16 @@ Kill the sender to watch it reconnect, then start it again and the picture comes
 | `MEDIAPLAYER_URL=<u>` | opens at launch when the command line names nothing else, and prefills the Stream URL field |
 | **Ctrl+U** | the Stream URL field |
 
-## Media Player Pro (Windows)
+## Media Player Pro (Windows, macOS)
 
-The same source tree also builds **Media Player Pro** (`mediaplayer_pro_handle_vk_win`), a
+The same source tree also builds **Media Player Pro** (`mediaplayer_pro_handle_vk_<plat>`), a
 3D monitoring and review player: everything above plus an inspector panel, QC views (left,
 right, eye difference, anaglyph), pan/zoom, and a grade (exposure, ASC CDL, `.cube` 3D
-LUT). It has its own installer (`DisplayXRMediaPlayerProSetup-*.exe`, released on
-`pro-v*` tags) and is not part of the DisplayXR bundle. See [`docs/PRO.md`](docs/PRO.md).
+LUT, OpenColorIO). It has its own installers (`DisplayXRMediaPlayerProSetup-*.exe` and
+`DisplayXRMediaPlayerPro-*.pkg`, released together on `pro-v*` tags), installs alongside
+the Media Player (its own app, bundle id and package id), and is not part of the DisplayXR
+bundle. macOS: `./scripts/build_macos.sh --pro --ocio --installer`. See
+[`docs/PRO.md`](docs/PRO.md).
 
 ## Requirements
 

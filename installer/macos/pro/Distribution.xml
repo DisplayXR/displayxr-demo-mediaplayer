@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Media Player Pro</title>
+    <organization>com.displayxr</organization>
+    <os-version min="13.0" />
+    <license file="LICENSE" />
+    <welcome file="welcome.html" />
+    <choices-outline>
+        <line choice="pro" />
+    </choices-outline>
+    <choice id="pro" visible="true" start_selected="true" enabled="false"
+        title="Media Player Pro"
+        description="DisplayXR Media Player Pro: 3D monitoring and review for stereo productions on glasses-free 3D displays. Live stereo inputs, LUT / ASC CDL / OpenColorIO looks, QC views, rig checks and snapshots. Installs alongside the Stereo Media Player. Requires the DisplayXR runtime to be installed.">
+        <pkg-ref id="com.displayxr.mediaplayer.pro" />
+    </choice>
+    <pkg-ref id="com.displayxr.mediaplayer.pro" version="1.0" onConclusion="none">mediaplayer_pro.pkg</pkg-ref>
+</installer-gui-script>

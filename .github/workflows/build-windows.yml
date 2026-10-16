@@ -267,8 +267,18 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DFFMPEG_ROOT="$env:FFMPEG_ROOT"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DFFMPEG_ROOT="$env:FFMPEG_ROOT" -DMP_BUILD_TESTS=ON
           cmake --build build
+
+      # The unit tests are built above (MP_BUILD_TESTS=ON) next to the staged FFmpeg /
+      # SDL3 DLLs in build/. decode_formats is excluded: it ENCODES EXR / DPX / ProRes
+      # fixtures, and this job's slim FFmpeg is decode-only (scripts/build-ffmpeg-slim.sh),
+      # so it can only fail here; macOS CI runs it against Homebrew's full FFmpeg.
+      # short_clip and ocio_bake skip themselves (no ProRes encoder / no OCIO).
+      - name: Unit tests
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure -E "^decode_formats$"
 
       - name: Sanity-check app artifacts
         if: needs.DetectChanges.outputs.docs_only != 'true'

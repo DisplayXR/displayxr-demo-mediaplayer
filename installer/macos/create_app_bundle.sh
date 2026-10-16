@@ -1,5 +1,6 @@
 #!/bin/bash
-# Create a macOS .app bundle for the Stereo Media Player demo.
+# Create a macOS .app bundle for the Stereo Media Player demo, or (MP_PRODUCT=pro)
+# for Media Player Pro (docs/PRO.md) — same bundler, different names/ids/manifest.
 #
 # Adapted from the model/gauss demo bundles. The media player additionally links
 # FFmpeg (libav*/libsw*), whose Homebrew build drags in a deep tree of transitive
@@ -15,19 +16,36 @@
 #
 # Usage: ./create_app_bundle.sh <binary-path> [output.app]
 # Env:
+#   MP_PRODUCT          "base" (default) = Stereo Media Player.app, com.displayxr.mediaplayer,
+#                       binary mediaplayer_handle_vk_macos, launcher opens the sample image;
+#                       "pro" = Media Player Pro.app, com.displayxr.mediaplayer.pro, binary
+#                       mediaplayer_pro_handle_vk_macos, launcher opens nothing (idle screen).
 #   DISPLAYXR_VERSION   version baked into Info.plist (default 0.0.0-dev)
 #   OPENXR_DIR          prefix of the source-built OpenXR loader (for dylibbundler
 #                       search path); default /tmp/openxr-install
 set -euo pipefail
 
+MP_PRODUCT="${MP_PRODUCT:-base}"
+case "$MP_PRODUCT" in
+    base)
+        BINARY_NAME="mediaplayer_handle_vk_macos"
+        BUNDLE_DISPLAY_NAME="Stereo Media Player"
+        BUNDLE_ID="com.displayxr.mediaplayer"
+        MANIFEST_BASENAME="mediaplayer_handle_vk_win.displayxr.json"
+        LAUNCH_SAMPLE=1 ;;
+    pro)
+        BINARY_NAME="mediaplayer_pro_handle_vk_macos"
+        BUNDLE_DISPLAY_NAME="Media Player Pro"
+        BUNDLE_ID="com.displayxr.mediaplayer.pro"
+        MANIFEST_BASENAME="mediaplayer_pro_handle_vk_win.displayxr.json"
+        LAUNCH_SAMPLE=0 ;;
+    *) echo "Error: MP_PRODUCT must be base or pro (got '$MP_PRODUCT')" >&2; exit 2 ;;
+esac
+
 BIN_SRC="${1:?Usage: $0 <binary-path> [output.app]}"
-APP_BUNDLE="${2:-Stereo Media Player.app}"
-BINARY_NAME="mediaplayer_handle_vk_macos"
+APP_BUNDLE="${2:-${BUNDLE_DISPLAY_NAME}.app}"
 VERSION="${DISPLAYXR_VERSION:-0.0.0-dev}"
 OPENXR_DIR="${OPENXR_DIR:-/tmp/openxr-install}"
-
-BUNDLE_DISPLAY_NAME="Stereo Media Player"
-BUNDLE_ID="com.displayxr.mediaplayer"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
@@ -76,26 +94,34 @@ EOF
 # --- Shell launcher (CFBundleExecutable) ---
 # Sets DYLD/VK env so the bundled loader + MoltenVK ICD are found; does NOT set
 # XR_RUNTIME_JSON so the bundled OpenXR loader discovers the system runtime via
-# /etc/xdg/openxr/1/active_runtime.json. With no CLI arg, auto-loads the bundled
-# sample stereo image (matching the app's "no arg → test pattern" otherwise).
-cat > "$APP_BUNDLE/Contents/MacOS/$BUNDLE_DISPLAY_NAME" <<'LAUNCHER'
+# /etc/xdg/openxr/1/active_runtime.json. Base player: with no CLI arg, auto-loads
+# the bundled sample stereo image (matching the app's "no arg → test pattern"
+# otherwise). Pro: no sample — it starts on its idle screen, waiting for an input.
+LAUNCHER_PATH="$APP_BUNDLE/Contents/MacOS/$BUNDLE_DISPLAY_NAME"
+cat > "$LAUNCHER_PATH" <<'LAUNCHER'
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export VK_ICD_FILENAMES="$DIR/MoltenVK_icd.json"
 export VK_DRIVER_FILES="$DIR/MoltenVK_icd.json"
 cd "$DIR"
-if [ "$#" -eq 0 ] && [ -f "$DIR/test_LR_2x1.png" ]; then
-    exec "$DIR/mediaplayer_handle_vk_macos" "$DIR/test_LR_2x1.png"
+LAUNCHER
+if [ "$LAUNCH_SAMPLE" = "1" ]; then
+    cat >> "$LAUNCHER_PATH" <<LAUNCHER
+if [ "\$#" -eq 0 ] && [ -f "\$DIR/test_LR_2x1.png" ]; then
+    exec "\$DIR/${BINARY_NAME}" "\$DIR/test_LR_2x1.png"
 fi
-exec "$DIR/mediaplayer_handle_vk_macos" "$@"
+LAUNCHER
+fi
+cat >> "$LAUNCHER_PATH" <<LAUNCHER
+exec "\$DIR/${BINARY_NAME}" "\$@"
 LAUNCHER
 chmod +x "$APP_BUNDLE/Contents/MacOS/$BUNDLE_DISPLAY_NAME"
 
 # --- Resources: binary + bundled sample image ---
 cp "$BIN_SRC" "$APP_BUNDLE/Contents/Resources/$BINARY_NAME"
 chmod u+w "$APP_BUNDLE/Contents/Resources/$BINARY_NAME"
-if [ -f "$REPO_ROOT/assets/test_LR_2x1.png" ]; then
+if [ "$LAUNCH_SAMPLE" = "1" ] && [ -f "$REPO_ROOT/assets/test_LR_2x1.png" ]; then
     cp "$REPO_ROOT/assets/test_LR_2x1.png" "$APP_BUNDLE/Contents/Resources/"
 fi
 
@@ -110,7 +136,7 @@ fi
 # player's idle logo resolves at <exe-dir>/displayxr/ instead of the test pattern.
 DXR_SRC="$REPO_ROOT/displayxr"
 DXR_DST="$APP_BUNDLE/Contents/Resources/displayxr"
-DXR_MANIFEST_SRC="$DXR_SRC/mediaplayer_handle_vk_win.displayxr.json"
+DXR_MANIFEST_SRC="$DXR_SRC/$MANIFEST_BASENAME"
 mkdir -p "$DXR_DST"
 for f in icon.png icon_sbs.png idle.png logo.png; do
     if [ ! -f "$DXR_SRC/$f" ]; then
