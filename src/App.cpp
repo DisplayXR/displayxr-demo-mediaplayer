@@ -3414,6 +3414,9 @@ void App::InitPro() {
         video_.Seek(s);
         if (paused && !video_.Paused()) TogglePlayback();
     };
+    h.setMediaPaused = [this](bool paused) {
+        if (isVideo_ && video_.Paused() != paused) TogglePlayback();
+    };
     h.isFullscreen = [this] { return window_.IsFullscreen(); };
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
     pro_.Init(&renderer_, window_.SdlWindow(), std::move(h));

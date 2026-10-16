@@ -65,6 +65,10 @@ public:
     // Agent tools for the station (called from ProController::DispatchTool).
     bool DispatchTool(const std::string& tool, const std::string& argsJson, std::string& result, bool& success);
     bool TakeSnapshot(const std::string& note);
+    // The rig checks as JSON (get_rig_status; also in the Resolve panel's status file).
+    std::string RigStatusJson() const;
+    // Where snapshots, notes, alerts and the Resolve link files live (Pictures/DisplayXR).
+    std::string Folder() const;
 
     // Inspector sections and the bottom history strip (ImGui).
     void BuildInputsSection(const std::string& liveName, bool live);

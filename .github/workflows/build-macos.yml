@@ -119,7 +119,7 @@ jobs:
           cmake -S . -B build -DMP_BUILD_TESTS=ON
           cmake --build build --target lif_roundtrip_test stereo_detect_test \
                                      mpo_parse_test camera_select_test auto_convergence_test stream_url_test lift_client_test input_provider_client_test color_test \
-                                     stereo_sweep live_pixels_test timecode_pairer_test rig_check_test                                      image_sequence_test decode_formats_test ocio_bake_test short_clip_test
+                                     stereo_sweep live_pixels_test timecode_pairer_test resolve_link_test rig_check_test                                      image_sequence_test decode_formats_test ocio_bake_test short_clip_test
           ctest --test-dir build --output-on-failure
 
       - name: Assert .pkg payload (regression guard)
