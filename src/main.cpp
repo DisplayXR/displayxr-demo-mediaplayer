@@ -100,6 +100,28 @@ bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, b
             o.proBudget[3] = (float)std::atof(a.c_str() + 15);
         } else if (a == "--no-timecode") {
             o.proTimecode = false;
+        } else if (a.rfind("--seq-fps=", 0) == 0) {
+            o.proSeqFps = std::atof(a.c_str() + 10);
+            if (!(o.proSeqFps > 0.0 && o.proSeqFps <= 240.0)) {
+                LOG_ERROR("--seq-fps: expected a rate in fps, e.g. 24 or 23.976");
+                return false;
+            }
+        } else if (a.rfind("--compare=", 0) == 0) {
+            o.proCompare = a.substr(10);
+        } else if (a.rfind("--ocio=", 0) == 0) {
+            o.ocio = true;
+            o.ocioConfig = a.substr(7);
+        } else if (a.rfind("--ocio-src=", 0) == 0) {
+            o.ocio = true;
+            o.ocioSrc = a.substr(11);
+        } else if (a.rfind("--ocio-display=", 0) == 0) {
+            o.ocioDisplay = a.substr(15);
+        } else if (a.rfind("--ocio-view=", 0) == 0) {
+            o.ocioView = a.substr(12);
+        } else if (a.rfind("--ocio-dst=", 0) == 0) {
+            o.ocioDst = a.substr(11);
+        } else if (a.rfind("--ocio-looks=", 0) == 0) {
+            o.ocioLooks = a.substr(13);
         } else if (a == "--lut" && i + 1 < args.size()) {   // Media Player Pro look
             o.lutPath = args[++i];
         } else if (a.rfind("--lut=", 0) == 0) {

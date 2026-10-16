@@ -18,6 +18,7 @@
 
 #include "color/Cdl.h"
 #include "color/CubeLut.h"
+#include "pro/OcioBake.h"
 #include "pro/Station.h"
 #include "rhi/VulkanRenderer.h"
 
@@ -64,6 +65,13 @@ struct Host {
     std::function<float()> oneToOneZoom;
     // The unzoomed picture as fractions (0..1) of the HUD layer ImGui draws into.
     std::function<bool(float& x, float& y, float& w, float& h)> pictureInHud;
+    // A/B compare: the open file ("" when live / streaming), reload a file (true when it
+    // opened), the playback position (-1 = not a video) / pause state, and seek.
+    std::function<std::string()> currentMedia;
+    std::function<bool(const std::string&)> reloadMedia;
+    std::function<double()> mediaPosition;
+    std::function<bool()> mediaPaused;
+    std::function<void(double seconds, bool paused)> seekMedia;
     std::function<bool()> isFullscreen;
     std::function<void()> toggleFullscreen;
 };
@@ -79,6 +87,11 @@ public:
     // Launch-time looks (--lut / --cdl, or MEDIAPLAYER_LUT / MEDIAPLAYER_CDL).
     void LoadLut(const std::string& path);
     void LoadCdl(const std::string& path);
+    // An OpenColorIO transform baked into the grade's 3D LUT (needs a build with MP_OCIO_ROOT).
+    bool LoadOcio(const ocio::Request& req, std::string* err = nullptr);
+    // A/B compare: the B clip; B (key) swaps to the other at the same position.
+    void SetCompareB(const std::string& path) { compare_[1] = path; }
+    void ToggleCompare();
 
     // Raw SDL event, after ImGui has seen it. Returns true when Pro consumed it.
     bool HandleEvent(const void* sdlEvent, bool imguiWantsMouse, bool imguiWantsKeyboard);
@@ -158,6 +171,8 @@ private:
     bool inspectorPinned_ = true;  // Tab toggles
     Station station_;
     bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture
+    std::string compare_[2];       // A (what was open) and B
+    int compareSide_ = 0;          // 0 = A showing
     bool stereoSource_ = false;
 };
 

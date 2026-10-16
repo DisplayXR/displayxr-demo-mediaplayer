@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "MediaSource.h"
+#include <cstring>
 
 #include "Log.h"
 #include "StereoDetect.h"   // ChooseFullOrHalf — pure aspect policy, no pixels involved
@@ -80,6 +81,16 @@ bool MediaSource::LayoutFromFilename(const std::string& path, StereoLayout& out)
     return false;
 }
 
+namespace {
+// Media Player Pro review formats (docs/PRO.md Next 6), off in the base player.
+bool IsProReviewExt(const std::string& lower) {
+    for (const char* e : {".mxf", ".exr", ".dpx", ".tif", ".tiff"})
+        if (lower.size() >= std::strlen(e) && lower.compare(lower.size() - std::strlen(e), std::string::npos, e) == 0)
+            return true;
+    return false;
+}
+}  // namespace
+
 MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int imageHeight) {
     const std::string lower = Lower(path);
     MediaInfo info;
@@ -90,8 +101,9 @@ MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int ima
         // report the authoritative layout, so the layout decided below is unused for
         // those paths.
         info.kind = MediaKind::Image;
-    } else if (EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov")) {
-        info.kind = MediaKind::Video;
+    } else if (EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov") ||
+               (proFormats_ && IsProReviewExt(lower))) {
+        info.kind = MediaKind::Video;  // (Pro: MXF, and EXR / DPX / TIFF played as a sequence)
     }
 
     // Stereo layout: filename suffix first (matches the `*_2x1` naming convention).
@@ -173,7 +185,8 @@ bool MediaSource::IsSupported(const std::string& path) {
     const std::string lower = Lower(path);
     return EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png") ||
            EndsWith(lower, ".lif") || EndsWith(lower, ".mpo") ||
-           EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov");
+           EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov") ||
+           (proFormats_ && IsProReviewExt(lower));
 }
 
 const char* MediaSource::KindName(MediaKind k) {

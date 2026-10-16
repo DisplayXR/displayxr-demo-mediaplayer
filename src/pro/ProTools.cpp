@@ -53,6 +53,19 @@ void ProController::RegisterTools(const RegisterFn& reg) {
         "{\"type\":\"object\"}");
     reg("select_input", "Switch to a configured input, by index (from list_inputs) or name.",
         "{\"type\":\"object\",\"properties\":{\"index\":{\"type\":\"integer\"},\"name\":{\"type\":\"string\"}}}");
+    reg("set_ocio",
+        "Bake an OpenColorIO transform into the grade's LUT: config (a path, an ocio:// built-in, or "
+        "empty for $OCIO), src = the picture's colour space, then display + view (default: the "
+        "config's) or dst = a target colour space; optional looks. Needs a build with OpenColorIO.",
+        "{\"type\":\"object\",\"properties\":{\"config\":{\"type\":\"string\"},\"src\":{\"type\":\"string\"},"
+        "\"display\":{\"type\":\"string\"},\"view\":{\"type\":\"string\"},\"dst\":{\"type\":\"string\"},"
+        "\"looks\":{\"type\":\"string\"}},\"required\":[\"src\"]}");
+    reg("describe_ocio", "List an OpenColorIO config's colour spaces, displays and the default display's views.",
+        "{\"type\":\"object\",\"properties\":{\"config\":{\"type\":\"string\"}}}");
+    reg("set_compare",
+        "A/B compare: set the B clip (a file path); toggle=true (or no path) swaps to the other clip "
+        "at the current position.",
+        "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"toggle\":{\"type\":\"boolean\"}}}");
     reg("open_decklink",
         "Open a Blackmagic DeckLink SDI/HDMI input as the live source. device = index or part of "
         "the name; right = the right eye's device (two inputs paired by timecode); stereo = "
@@ -127,6 +140,38 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             float z;
             if (Num(a, "zoom", z)) SetZoom(std::max(1.0f, z));
             result = json{{"view", ViewModeName(mode_)}, {"zoom", zoom_}}.dump();
+            return true;
+        }
+        if (tool == "set_ocio") {
+            ocio::Request req;
+            Str(a, "config", req.config);
+            Str(a, "src", req.src);
+            Str(a, "display", req.display);
+            Str(a, "view", req.view);
+            Str(a, "dst", req.dst);
+            Str(a, "looks", req.looks);
+            std::string e;
+            if (!LoadOcio(req, &e)) return err(e);
+            result = json{{"lut", lutName_}, {"lut_size", lut_.size}}.dump();
+            return true;
+        }
+        if (tool == "describe_ocio") {
+            std::string cfg, e;
+            Str(a, "config", cfg);
+            ocio::ConfigInfo info;
+            if (!ocio::Describe(cfg, info, e)) return err(e);
+            result = json{{"name", info.name}, {"color_spaces", info.colorSpaces}, {"displays", info.displays},
+                          {"default_display", info.defaultDisplay}, {"default_view", info.defaultView},
+                          {"views", info.views}}.dump();
+            return true;
+        }
+        if (tool == "set_compare") {
+            std::string path;
+            const bool hasPath = Str(a, "path", path);
+            if (hasPath) compare_[1] = path;
+            const bool toggle = a.contains("toggle") && a["toggle"].is_boolean() && a["toggle"].get<bool>();
+            if (!hasPath || toggle) ToggleCompare();
+            result = json{{"a", compare_[0]}, {"b", compare_[1]}, {"showing", compareSide_ ? "B" : "A"}}.dump();
             return true;
         }
         if (tool == "set_depth_overlay") {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "App.h"
+#include "media/ImageSequence.h"
 
 #include "Log.h"
 #include "media/ImageDecoder.h"
@@ -226,6 +227,12 @@ bool App::Initialize(const char* mediaPath) {
     // argument may be a single file OR a folder — for a folder we load the first
     // supported asset (sorted), and LoadMedia builds the prev/next list from it.
     ReadStereoEnv();   // must precede the first LoadMedia below
+#if MEDIAPLAYER_PRO
+    // Pro review formats (MXF, EXR / DPX / TIFF sequences, 10-bit kept): before any load.
+    VideoDecoder::SetProFormats(true);
+    MediaSource::SetProFormats(true);
+    video_.SetSequenceFps(launch_.proSeqFps);
+#endif
 
     // Live camera (#90). The command line (main.cpp) wins over the env vars. The picker
     // and 'C' key are desktop-only: Android's TransportCaps leave caps.camera false.
@@ -2080,6 +2087,20 @@ void App::RebuildFolderList(std::string path) {
         if (MediaSource::IsSupported(s)) folderFiles_.push_back(s);
     }
     std::sort(folderFiles_.begin(), folderFiles_.end());
+    {
+        // An EXR / DPX / TIFF sequence (Pro) is one clip: keep its first frame only. The
+        // current file stays listed so the index below still finds it.
+        std::vector<std::string> kept;
+        std::string lastKey;
+        for (const std::string& f : folderFiles_) {
+            const std::string k = imageseq::Key(f);
+            std::error_code e3;
+            if (!k.empty() && k == lastKey && !fs::equivalent(fs::path(f), p, e3)) continue;
+            lastKey = k;
+            kept.push_back(f);
+        }
+        folderFiles_.swap(kept);
+    }
     for (size_t i = 0; i < folderFiles_.size(); ++i) {
         std::error_code e2;
         if (fs::equivalent(fs::path(folderFiles_[i]), p, e2) && !e2) {
@@ -2831,6 +2852,19 @@ void App::InitPro() {
         hh = (proPicH_ / (float)ph) / proHud_[3];
         return true;
     };
+    // A/B compare (Pro, B): reload the other clip at the same position.
+    h.currentMedia = [this] { return (isLive_ || isStream_) ? std::string() : currentMediaPath_; };
+    h.reloadMedia = [this](const std::string& path) {
+        ReloadMedia(path);
+        return currentMediaPath_ == path;
+    };
+    h.mediaPosition = [this] { return isVideo_ ? video_.PositionSeconds() : -1.0; };
+    h.mediaPaused = [this] { return isVideo_ && video_.Paused(); };
+    h.seekMedia = [this](double s, bool paused) {
+        if (!isVideo_) return;
+        video_.Seek(s);
+        if (paused && !video_.Paused()) TogglePlayback();
+    };
     h.isFullscreen = [this] { return window_.IsFullscreen(); };
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
     pro_.Init(&renderer_, window_.SdlWindow(), std::move(h));
@@ -2856,6 +2890,17 @@ void App::InitPro() {
     pro_.ApplyTestEnv();
     if (!launch_.lutPath.empty()) pro_.LoadLut(launch_.lutPath);
     if (!launch_.cdlPath.empty()) pro_.LoadCdl(launch_.cdlPath);
+    if (launch_.ocio) {
+        ocio::Request req;
+        req.config = launch_.ocioConfig;
+        req.src = launch_.ocioSrc;
+        req.display = launch_.ocioDisplay;
+        req.view = launch_.ocioView;
+        req.dst = launch_.ocioDst;
+        req.looks = launch_.ocioLooks;
+        pro_.LoadOcio(req);
+    }
+    if (!launch_.proCompare.empty()) pro_.SetCompareB(launch_.proCompare);
 
     // The monitoring station (inputs, timecode / delay, rig checks, snapshots).
     pro::StationHost sh;

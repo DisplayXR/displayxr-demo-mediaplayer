@@ -49,6 +49,11 @@ public:
         std::vector<std::string> proInputs;  // --input="Name=spec", --decklink..., --test-signal
         float proBudget[4] = {-2.0f, 1.0f, 1.0f, 2.0f};  // near %, far %, vertical px, dE
         bool proTimecode = true;             // --no-timecode
+        double proSeqFps = 24.0;             // --seq-fps: EXR / DPX / TIFF sequence rate
+        std::string proCompare;              // --compare=<file>: the B clip (B swaps A/B)
+        // --ocio=<config> --ocio-src= --ocio-display= --ocio-view= --ocio-dst= --ocio-looks=
+        std::string ocioConfig, ocioSrc, ocioDisplay, ocioView, ocioDst, ocioLooks;
+        bool ocio = false;
     };
     void SetLaunchOptions(const LaunchOptions& o) { launch_ = o; }  // before Initialize()
 

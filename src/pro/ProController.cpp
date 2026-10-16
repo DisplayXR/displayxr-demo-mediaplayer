@@ -110,6 +110,45 @@ void ProController::LoadCdl(const std::string& path) {
     if (host_.toast) host_.toast("CDL: " + cdlName_);
 }
 
+bool ProController::LoadOcio(const ocio::Request& req, std::string* errOut) {
+    color::CubeLut lut;
+    std::string err;
+    if (!ocio::Bake(req, lut, err)) {
+        LOG_WARN("Pro: OCIO bake failed: %s", err.c_str());
+        if (host_.toast) host_.toast("OCIO: " + err);
+        if (errOut) *errOut = err;
+        return false;
+    }
+    lut_ = std::move(lut);
+    lutPath_ = req.config.empty() ? "$OCIO" : req.config;
+    lutName_ = lut_.title;
+    lutPending_ = true;  // uploaded on the render thread in Tick()
+    grade_.lutOn = true;
+    LOG_INFO("Pro: %s (%d^3 baked)", lutName_.c_str(), lut_.size);
+    if (host_.toast) host_.toast(lutName_);
+    return true;
+}
+
+void ProController::ToggleCompare() {
+    if (compare_[1].empty()) {
+        if (host_.toast) host_.toast("No B clip to compare (--compare=<file> or set_compare)");
+        return;
+    }
+    const std::string cur = host_.currentMedia ? host_.currentMedia() : std::string();
+    if (cur.empty()) {
+        if (host_.toast) host_.toast("A/B compare works on files");
+        return;
+    }
+    if (compareSide_ == 0) compare_[0] = cur;
+    const double pos = host_.mediaPosition ? host_.mediaPosition() : -1.0;
+    const bool paused = host_.mediaPaused && host_.mediaPaused();
+    const int next = 1 - compareSide_;
+    if (!host_.reloadMedia || !host_.reloadMedia(compare_[next])) return;  // kept the old view
+    compareSide_ = next;
+    if (pos >= 0.0 && host_.seekMedia) host_.seekMedia(pos, paused);
+    if (host_.toast) host_.toast(std::string(compareSide_ ? "B: " : "A: ") + BaseName(compare_[next]));
+}
+
 bool ProController::HandleDroppedPath(const std::string& path) {
     if (IsLutPath(path)) { LoadLut(path); return true; }
     if (IsCdlPath(path)) { LoadCdl(path); return true; }
@@ -296,6 +335,9 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
                     if (host_.toast) host_.toast(t);
                     return true;
                 }
+                case SDLK_B:
+                    ToggleCompare();
+                    return true;
                 case SDLK_D:
                     depthOverlay_ = !depthOverlay_;
                     if (host_.toast) host_.toast(depthOverlay_ ? "Depth overlay on" : "Depth overlay off");

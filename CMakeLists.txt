@@ -285,6 +285,7 @@ function(mp_add_player tgt is_pro)
         src/media/AudioPlayer.cpp
         src/media/CameraSelect.cpp
         src/media/CameraSource.cpp   # live camera (#90): SDL3 camera -> FrameRing
+        src/media/ImageSequence.cpp  # EXR / DPX / TIFF frames as one clip (Pro formats only)
         src/media/AutoConvergence.cpp  # live auto-convergence (#92): disparity.js port
         src/media/StreamUrl.cpp      # stream-URL classifier (#93)
         src/ui/Hud.cpp
@@ -455,8 +456,17 @@ function(mp_add_player tgt is_pro)
             src/pro/TimecodePairer.cpp   # two-input stereo pairing by SMPTE timecode
             src/pro/DeckLinkSource.cpp   # Blackmagic DeckLink SDI / HDMI input
             src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
-            src/pro/Station.cpp)         # inputs, timecode / delay, rig UI, snapshots
+            src/pro/Station.cpp          # inputs, timecode / delay, rig UI, snapshots
+            src/pro/OcioBake.cpp)        # OpenColorIO -> the grade's LUT (MP_OCIO_ROOT)
         target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=1)
+        if(MP_HAVE_OCIO)
+            target_link_libraries(${tgt} PRIVATE OpenColorIO::OpenColorIO)
+            target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_WITH_OCIO=1)
+            foreach(_d ${MP_OCIO_DLLS})
+                add_custom_command(TARGET ${tgt} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_d}" "$<TARGET_FILE_DIR:${tgt}>")
+            endforeach()
+        endif()
         if(MP_DECKLINK_INCLUDE)
             target_sources(${tgt} PRIVATE "${MP_DECKLINK_INCLUDE}/DeckLinkAPIDispatch.cpp")
             target_include_directories(${tgt} PRIVATE "${MP_DECKLINK_INCLUDE}")
@@ -508,6 +518,31 @@ if(WIN32 AND MP_DECKLINK_SDK_DIR)
     endif()
 else()
     message(STATUS "DeckLink input (Pro): OFF (set MP_DECKLINK_SDK_DIR to the Desktop Video SDK)")
+endif()
+
+# OpenColorIO (Pro, optional): an OCIO 2.x install prefix (e.g. Open RV's build,
+# <OpenRV>/_build/RV_DEPS_OCIO/install) and, on Windows, the folder holding its runtime
+# DLLs (Imath, expat, zlib: <OpenRV>/_build/stage/app/bin). Off by default.
+set(MP_OCIO_ROOT "" CACHE PATH "OpenColorIO 2.x install prefix (Pro, optional)")
+set(MP_OCIO_DLL_DIR "" CACHE PATH "Folder with OpenColorIO's dependency DLLs (Windows)")
+set(MP_HAVE_OCIO FALSE)
+set(MP_OCIO_DLLS "")
+if(MP_OCIO_ROOT)
+    find_package(OpenColorIO CONFIG PATHS "${MP_OCIO_ROOT}" NO_DEFAULT_PATH)
+    if(OpenColorIO_FOUND)
+        set(MP_HAVE_OCIO TRUE)
+        if(WIN32)
+            file(GLOB MP_OCIO_DLLS "${MP_OCIO_ROOT}/bin/OpenColorIO*.dll")
+            if(MP_OCIO_DLL_DIR)
+                file(GLOB _ocio_dep "${MP_OCIO_DLL_DIR}/Imath*.dll" "${MP_OCIO_DLL_DIR}/libexpat*.dll"
+                                    "${MP_OCIO_DLL_DIR}/zlib*.dll")
+                list(APPEND MP_OCIO_DLLS ${_ocio_dep})
+            endif()
+        endif()
+        message(STATUS "OpenColorIO (Pro): ON (${OpenColorIO_VERSION})")
+    else()
+        message(WARNING "MP_OCIO_ROOT=${MP_OCIO_ROOT}: no OpenColorIO package found; OCIO off")
+    endif()
 endif()
 
 mp_add_player(${MP_TARGET} OFF)
@@ -595,9 +630,41 @@ if(MP_BUILD_TESTS)
     target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME rig_check COMMAND rig_check_test)
 
+    # Pro review formats: sequences, EXR display encoding, 10-bit -> P016 (real decodes).
+    add_executable(image_sequence_test tests/image_sequence_test.cpp src/media/ImageSequence.cpp)
+    target_include_directories(image_sequence_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME image_sequence COMMAND image_sequence_test)
+    if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
+        add_executable(decode_formats_test tests/decode_formats_test.cpp src/media/VideoDecoder.cpp
+            src/media/ImageSequence.cpp src/Log.cpp)
+        target_include_directories(decode_formats_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(decode_formats_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
+        if(TARGET PkgConfig::FFMPEG)
+            target_link_libraries(decode_formats_test PRIVATE PkgConfig::FFMPEG)
+        else()
+            target_link_libraries(decode_formats_test PRIVATE mp_ffmpeg)
+        endif()
+        if(WIN32)
+            target_link_libraries(decode_formats_test PRIVATE d3d11 dxgi d3dcompiler)
+        endif()
+        add_test(NAME decode_formats COMMAND decode_formats_test)
+    endif()
+    # OpenColorIO in the grade (Pro): skips cleanly without OCIO.
+    add_executable(ocio_bake_test tests/ocio_bake_test.cpp src/pro/OcioBake.cpp)
+    target_include_directories(ocio_bake_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(MP_HAVE_OCIO)
+        target_link_libraries(ocio_bake_test PRIVATE OpenColorIO::OpenColorIO)
+        target_compile_definitions(ocio_bake_test PRIVATE MEDIAPLAYER_WITH_OCIO=1)
+        if(MP_BUILD_PRO)
+            add_dependencies(ocio_bake_test ${MP_PRO_TARGET})  # the Pro build copies the DLLs
+        endif()
+    endif()
+    add_test(NAME ocio_bake COMMAND ocio_bake_test)
+
     # The decoder drains at EOF (short clips, last frames): writes a 5-frame ProRes clip.
     if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
-        add_executable(short_clip_test tests/short_clip_test.cpp src/media/VideoDecoder.cpp src/Log.cpp)
+        add_executable(short_clip_test tests/short_clip_test.cpp src/media/VideoDecoder.cpp
+            src/media/ImageSequence.cpp src/Log.cpp)
         target_include_directories(short_clip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_compile_definitions(short_clip_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
         if(TARGET PkgConfig::FFMPEG)
