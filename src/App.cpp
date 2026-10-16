@@ -961,6 +961,7 @@ void App::RenderOneFrame() {
                 }
                 hud.windowPxW = cw;
                 hud.windowPxH = ch;
+                pro_.ClearFlatRects();
 #endif
                 imgui_.RenderToHud(hudIdx, renderer_.FrameCmd());  // joins the frame's command buffer
                 // Desktop Linux: the pointer shape ImGui wants (I-beam over the URL
@@ -3430,6 +3431,7 @@ void App::InitPro() {
         video_.Seek(s);
         if (paused && !video_.Paused()) TogglePlayback();
     };
+    h.mediaStart = [this] { return isVideo_ ? video_.StartSeconds() : 0.0; };
     h.setMediaPaused = [this](bool paused) {
         if (isVideo_ && video_.Paused() != paused) TogglePlayback();
     };
@@ -3492,8 +3494,11 @@ void App::InitPro() {
     auto thumbIds = std::make_shared<std::vector<int>>(pro::Station::kMaxThumbs, -1);
     sh.thumbTexture = [this, thumbIds](int slot, const uint8_t* rgba) -> void* {
         if (slot < 0 || slot >= (int)thumbIds->size() || !imgui_.Ready()) return nullptr;
-        int& id = (*thumbIds)[slot];
-        if (id < 0 && rgba) id = imgui_.CreateTexture(pro::Station::kThumbW, pro::Station::kThumbH);
+        int& id = (*thumbIds)[slot];  // -1 not made yet, -2 creation failed (never retried)
+        if (id == -1 && rgba) {
+            id = imgui_.CreateTexture(pro::Station::kThumbW, pro::Station::kThumbH);
+            if (id < 0) id = -2;
+        }
         if (id < 0) return nullptr;
         if (rgba) imgui_.UpdateTexture(id, rgba);
         return imgui_.TextureId(id);

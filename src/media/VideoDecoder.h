@@ -90,6 +90,10 @@ public:
     void Seek(double seconds, bool preview = false);
     double PositionSeconds() const { return positionSec_.load(); }   // current frame PTS
     double DurationSeconds() const { return durationSec_; }           // 0 if unknown
+    // The container's first timestamp (MXF / TS / MOV edit lists start above 0): Position
+    // and Seek are in the stream's own timestamps, so "t seconds into the file" is
+    // StartSeconds() + t. 0 for most files.
+    double StartSeconds() const { return startSec_; }
     double FrameRate() const { return frameRate_; }                  // fps, 0 if unknown
     // Media Player Pro review formats (docs/PRO.md Next 6), OFF in the base player:
     // EXR / DPX / TIFF sequences (image2), EXR's scene-linear float encoded for display,
@@ -173,6 +177,7 @@ private:
     mutable std::mutex statsMutex_;
     StreamStats stats_;
     double durationSec_ = 0.0;                  // set in Open()
+    double startSec_ = 0.0;                     // set in Open()
     double frameRate_ = 0.0;                    // fps, for frame stepping
     bool open_ = false;
     static inline bool proFormats_ = false;

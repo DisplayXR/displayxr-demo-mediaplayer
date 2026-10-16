@@ -54,16 +54,39 @@ def get_resolve():
         return None
 
 
+def _windows_pictures():
+    """The Windows known Pictures folder (OneDrive-redirected or not) - the same lookup the
+    station makes (SHGetKnownFolderPath(FOLDERID_Pictures)), so both sides meet."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import uuid
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("d1", wintypes.DWORD), ("d2", wintypes.WORD), ("d3", wintypes.WORD),
+                        ("d4", ctypes.c_ubyte * 8)]
+
+        u = uuid.UUID("33E28130-4E1E-4676-835A-98395C3BC3BB")  # FOLDERID_Pictures
+        g = GUID(u.fields[0], u.fields[1], u.fields[2], (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+        out = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(g), 0, None, ctypes.byref(out)) != 0:
+            return None
+        path = out.value
+        ctypes.windll.ole32.CoTaskMemFree(out)
+        return path
+    except Exception:  # noqa: BLE001 - not Windows, or no ctypes in this Python
+        return None
+
+
 def station_dir():
+    # DISPLAYXR_STATION_DIR is for tests: the station itself always uses Pictures/DisplayXR.
     d = os.environ.get("DISPLAYXR_STATION_DIR")
     if d:
         return d
-    home = os.path.expanduser("~")
-    for pics in (os.path.join(home, "Pictures"), os.path.join(home, "OneDrive", "Pictures")):
-        cand = os.path.join(pics, "DisplayXR")
-        if os.path.isdir(cand):
-            return cand
-    return os.path.join(home, "Pictures", "DisplayXR")
+    pics = _windows_pictures() if os.name == "nt" else None
+    if not pics:
+        pics = os.path.join(os.path.expanduser("~"), "Pictures")
+    return os.path.join(pics, "DisplayXR")
 
 
 # ----------------------------------------------------------------------------- timecode
@@ -112,6 +135,21 @@ def frames_to_tc(frames, fps, drop=False):
     return "%02d:%02d:%02d%s%02d" % (h, m, s, ";" if drop else ":", f)
 
 
+def tc_on_timeline(tc, tc_fps, fps):
+    """A station timecode -> frames at the TIMELINE's rate. The station's timecode runs at
+    its signal's rate (tc_fps, e.g. 50 for a 50p rig), which may differ from the timeline's
+    (25): convert through seconds. Without tc_fps the rates are taken as equal."""
+    if not tc_fps or round(tc_fps) == round(fps):
+        return tc_to_frames(tc, fps)
+    src = float(tc_fps)
+    if ";" in tc and round(src) in (30, 60):
+        src = round(src) * 1000.0 / 1001.0  # a drop-frame signal runs at 29.97 / 59.94
+    f = tc_to_frames(tc, src)
+    if f is None:
+        return None
+    return int(round(f / src * fps))
+
+
 # ----------------------------------------------------------------------------- markers
 
 def load_items(folder):
@@ -133,6 +171,7 @@ def load_items(folder):
             detail.append("look: %s" % j["look"])
         items.append({
             "tc": j.get("timecode", ""),
+            "tc_fps": j.get("tc_fps", 0),
             "color": "Blue",
             "name": note[:60],
             "note": "; ".join(detail) + ("\n" + j.get("image", "") if j.get("image") else ""),
@@ -149,6 +188,7 @@ def load_items(folder):
                     continue
                 items.append({
                     "tc": j.get("timecode", ""),
+                    "tc_fps": j.get("tc_fps", 0),
                     "color": "Red",
                     "name": j.get("what", "Rig alert")[:60],
                     "note": "%s (%s)" % (j.get("what", ""), j.get("time", "")),
@@ -158,21 +198,32 @@ def load_items(folder):
     return items
 
 
-def timeline_fps(timeline):
+def parse_fps(value, default=24.0):
+    """Resolve frame rates are strings: "24", "23.976", and for drop-frame "29.97 DF"."""
     try:
-        return float(timeline.GetSetting("timelineFrameRate") or 24)
-    except (TypeError, ValueError):
-        return 24.0
+        return float(str(value).split()[0])
+    except (IndexError, TypeError, ValueError):
+        return default
 
 
-def sync_markers(timeline, folder):
-    """Add the station's notes and alerts that are not on `timeline` yet. Returns counts."""
+def timeline_fps(timeline):
+    return parse_fps(timeline.GetSetting("timelineFrameRate"), 24.0)
+
+
+def sync_markers(timeline, folder, done=None, items=None):
+    """Add the station's notes and alerts that are not on `timeline` yet. Returns counts.
+    `done` (a set the caller keeps between calls) remembers keys already on the timeline or
+    refused by it (Resolve keeps one marker per frame: a note and an alert on the same
+    frame cannot both go on), so neither is asked about again."""
     fps = timeline_fps(timeline)
     start = tc_to_frames(timeline.GetStartTimecode(), fps) or 0
     length = timeline.GetEndFrame() - timeline.GetStartFrame()
-    added = skipped = outside = untimed = 0
-    for it in load_items(folder):
-        frames = tc_to_frames(it["tc"], fps)
+    added = skipped = outside = untimed = refused = 0
+    for it in (load_items(folder) if items is None else items):
+        if done is not None and it["key"] in done:
+            skipped += 1
+            continue
+        frames = tc_on_timeline(it["tc"], it.get("tc_fps"), fps)
         if frames is None:
             untimed += 1  # a note taken with no timecode on the signal
             continue
@@ -182,10 +233,16 @@ def sync_markers(timeline, folder):
             continue
         if timeline.GetMarkerByCustomData(it["key"]):
             skipped += 1
+            if done is not None:
+                done.add(it["key"])
             continue
         if timeline.AddMarker(offset, it["color"], it["name"], it["note"], 1, it["key"]):
             added += 1
-    return {"added": added, "skipped": skipped, "outside": outside, "untimed": untimed}
+        else:
+            refused += 1  # another marker already sits on that frame
+        if done is not None:
+            done.add(it["key"])
+    return {"added": added, "skipped": skipped, "outside": outside, "untimed": untimed, "refused": refused}
 
 
 # ----------------------------------------------------------------------------- link files
@@ -249,10 +306,7 @@ def playhead(timeline):
             src_start = None
     if src_start is None:
         src_start = float(item.GetLeftOffset()) / fps
-    try:
-        clip_fps = float(mpi.GetClipProperty("FPS") or fps)
-    except (TypeError, ValueError):
-        clip_fps = fps
+    clip_fps = parse_fps(mpi.GetClipProperty("FPS"), fps)
     out["clip"] = {"path": path, "seconds": max(0.0, src_start + into), "fps": clip_fps}
     return out
 
@@ -270,6 +324,9 @@ class Link:
         self.auto_markers = True
         self.next_marker_sync = 0.0
         self.last_counts = None
+        self.items = []         # the station's notes + alerts, re-read once a second
+        self.done = set()       # marker keys settled on the current timeline
+        self.done_for = None    # ... which timeline
 
     def timeline(self):
         try:
@@ -289,10 +346,18 @@ class Link:
             ph["follow"] = self.follow
             ph["written"] = now
             write_atomically(os.path.join(self.folder, "resolve_link.json"), json.dumps(ph))
-            if self.auto_markers and now >= self.next_marker_sync:
+            if now >= self.next_marker_sync:
                 self.next_marker_sync = now + 1.0
-                self.last_counts = sync_markers(tl, self.folder)
+                self.items = load_items(self.folder)
+                if self.auto_markers:
+                    self.sync(tl)
         return tl
+
+    def sync(self, tl):
+        tid = tl.GetUniqueId() if hasattr(tl, "GetUniqueId") else tl.GetName()
+        if tid != self.done_for:  # another timeline: its markers are its own
+            self.done, self.done_for = set(), tid
+        self.last_counts = sync_markers(tl, self.folder, self.done, self.items)
 
     def command(self, cmd, note=""):
         self.cmd_id += 1
@@ -305,6 +370,14 @@ class Link:
         tc = (status or {}).get("timecode") or ""
         if tl is None or not tc:
             return False
+        fps = timeline_fps(tl)
+        tc_fps = (status or {}).get("tc_fps") or 0
+        if tc_fps and round(tc_fps) != round(fps):  # the signal's rate is not the timeline's
+            frames = tc_on_timeline(tc, tc_fps, fps)
+            if frames is None:
+                return False
+            drop = "DF" in str(tl.GetSetting("timelineFrameRate") or "")
+            tc = frames_to_tc(frames, fps, drop)
         return bool(tl.SetCurrentTimecode(tc))
 
 
@@ -368,7 +441,7 @@ def run_ui(resolve, folder):
     state = {"status": None, "listed": None}
 
     def refresh_list():
-        items = load_items(folder)
+        items = link.items  # re-read once a second by link.tick()
         sig = [i["key"] for i in items]
         if sig == state["listed"]:
             return
@@ -411,7 +484,8 @@ def run_ui(resolve, folder):
     def on_sync(ev):
         tl = link.timeline()
         if tl is not None:
-            link.last_counts = sync_markers(tl, folder)
+            link.items = load_items(folder)
+            link.sync(tl)
 
     def on_item(ev):
         tc = ev["item"].Text[0]
