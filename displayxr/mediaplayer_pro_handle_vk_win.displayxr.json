@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "mediaplayer-pro",
+  "name": "Media Player Pro",
+  "type": "3d",
+  "category": "app",
+  "display_mode": "auto",
+  "description": "3D monitoring and review: live stereo inputs, LUT and CDL looks, convergence, QC views",
+  "icon": "icon.png",
+  "icon_3d": "icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}

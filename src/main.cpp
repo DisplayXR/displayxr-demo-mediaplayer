@@ -62,6 +62,14 @@ bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, b
         } else if (a.rfind("--auto-conv=", 0) == 0) {
             o.autoConv = true;
             o.autoConvPolicy = a.substr(12);
+        } else if (a == "--lut" && i + 1 < args.size()) {   // Media Player Pro look
+            o.lutPath = args[++i];
+        } else if (a.rfind("--lut=", 0) == 0) {
+            o.lutPath = a.substr(6);
+        } else if (a == "--cdl" && i + 1 < args.size()) {
+            o.cdlPath = args[++i];
+        } else if (a.rfind("--cdl=", 0) == 0) {
+            o.cdlPath = a.substr(6);
         } else if (a == "--camera-list") {
             list = true;
         } else {

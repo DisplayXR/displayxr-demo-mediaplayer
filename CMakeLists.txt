@@ -252,188 +252,226 @@ set(MP_IMGUI_SOURCES
 # ---------------------------------------------------------------------------
 # Target
 # ---------------------------------------------------------------------------
-add_executable(${MP_TARGET}
-    src/main.cpp
-    src/App.cpp
-    src/Log.cpp
-    src/platform/Window.cpp
-    $<$<PLATFORM_ID:Linux>:src/platform/WindowLinux.cpp>  # desktop Linux: displayxr-common window
-    src/xr/XrSession.cpp
-    src/rhi/VulkanRenderer.cpp
-    src/media/ImageDecoder.cpp
-    src/media/LifLoader.cpp
-    src/media/MpoLoader.cpp
-    src/media/MediaSource.cpp
-    src/media/StereoCompose.cpp
-    src/media/StereoDetect.cpp
-    src/media/VideoStereoProbe.cpp
-    src/media/VideoDecoder.cpp
-    src/media/AudioPlayer.cpp
-    src/media/CameraSelect.cpp
-    src/media/CameraSource.cpp   # live camera (#90): SDL3 camera -> FrameRing
-    src/media/AutoConvergence.cpp  # live auto-convergence (#92): disparity.js port
-    src/media/StreamUrl.cpp      # stream-URL classifier (#93)
-    src/ui/Hud.cpp
-    src/ui/ImGuiLayer.cpp
-    # The player's ImGui chrome, shared VERBATIM with the Android leg. If you add or
-    # split a TU here, mirror it into android/src/main/cpp/CMakeLists.txt — that list
-    # is hand-curated and desktop CI cannot catch the resulting Android link error.
-    src/ui/TransportUI.cpp
-    src/media/FrameRing.h  # header-only triple buffer
-    ${MP_IMGUI_SOURCES}
-)
-
-# Windows: link as a GUI (WINDOWS subsystem) app so launching the player never
-# pops a console window — neither standalone (Explorer) nor under the shell. SDL3's
-# <SDL3/SDL_main.h> supplies the WinMain entry that forwards to our main(), so the
-# console subsystem is unnecessary. stderr still works when a console is attached
-# (e.g. the shell's CREATE_NEW_CONSOLE) or redirected.
-if(WIN32)
-    set_target_properties(${MP_TARGET} PROPERTIES WIN32_EXECUTABLE TRUE)
-    # Embedded Explorer icon + version info (icon from the 2D workspace logo).
-    target_sources(${MP_TARGET} PRIVATE windows/resource.rc)
-endif()
-
-target_include_directories(${MP_TARGET} PRIVATE
-    ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)
-# MEDIAPLAYER_IMGUI_SDL selects the SDL3 ImGui *platform* backend (input + dt) on
-# Windows / macOS. Desktop Linux has no SDL window: MEDIAPLAYER_IMGUI_DXRWIN feeds
-# ImGui from displayxr-common's window events instead. The Android leg defines
-# MEDIAPLAYER_WITH_IMGUI only: it has no SDL, and feeds input through
-# ImGuiLayer::PushPointer() instead. See src/ui/ImGuiLayer.h.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_IMGUI=1 MEDIAPLAYER_IMGUI_DXRWIN=1)
-else()
-    target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_IMGUI=1 MEDIAPLAYER_IMGUI_SDL=1)
-endif()
-
-if(MP_HAVE_FFMPEG)
-    target_compile_definitions(${MP_TARGET} PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
-    target_link_libraries(${MP_TARGET} PRIVATE ${MP_FFMPEG_LINK})
-    # Windows shared FFmpeg: copy the runtime DLLs next to the binary post-build.
-    if(MP_FFMPEG_DLL_DIR)
-        file(GLOB _ffmpeg_dlls "${MP_FFMPEG_DLL_DIR}/*.dll")
-        foreach(_dll ${_ffmpeg_dlls})
-            add_custom_command(TARGET ${MP_TARGET} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_dll}" "$<TARGET_FILE_DIR:${MP_TARGET}>"
-                COMMENT "Staging FFmpeg DLL $<PATH:GET_FILENAME,${_dll}> next to ${MP_TARGET}")
-        endforeach()
-    endif()
-endif()
-
-target_include_directories(${MP_TARGET} BEFORE PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/displayxr-openxr  # vendored <openxr/...>
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb               # stb_image_write.h
-)
-# displayxr-common's header-only rules (dxr_view_config.h, vk_frame_ring.h) come
-# through displayxr::rules. A linked target's include dirs land AFTER this target's
-# own (the BEFORE block above), so common only supplies what this repo does not.
-# Desktop Linux add_subdirectory's common and gets the real target; the
-# headers-only populate (Windows / macOS) gets an equivalent local one.
-if(NOT TARGET displayxr::rules)
-    add_library(mp_displayxr_rules INTERFACE)
-    target_include_directories(mp_displayxr_rules INTERFACE ${displayxr_common_SOURCE_DIR}/common)
-    add_library(displayxr::rules ALIAS mp_displayxr_rules)
-endif()
-target_link_libraries(${MP_TARGET} PRIVATE displayxr::rules)
-
-target_link_libraries(${MP_TARGET} PRIVATE
-    SDL3::SDL3
-    Vulkan::Vulkan
-    nlohmann_json::nlohmann_json
-    ${MP_OPENXR_LOADER}
-)
-# Desktop Linux: the app window (X11 or native Wayland) — see the fetch above.
-if(TARGET displayxr::linux_window)
-    target_link_libraries(${MP_TARGET} PRIVATE displayxr::linux_window)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "displayxr::linux_window is not available — install libx11-dev "
-                        "(and libwayland-dev libxkbcommon-dev libdbus-1-dev)")
-endif()
-
-# Windows: SHGetKnownFolderPath (shell32) + CoTaskMemFree (ole32) for the 'I'-key
-# atlas-capture output path under the user's Pictures folder.
-# d3d11 + dxgi: zero-copy D3D11VA->Vulkan decode interop (issue #28).
-if(WIN32)
-    target_link_libraries(${MP_TARGET} PRIVATE shell32 ole32 d3d11 dxgi d3dcompiler)
-endif()
-
-# macOS: displayxr-common's Cocoa adapter for dxr::CursorDepth hides the OS pointer
-# with +[NSCursor hide] while the runtime draws the depth cursor. SDL_HideCursor would
-# not do: SDL swaps in an INVISIBLE NSCursor, and the runtime's default cursor look
-# mirrors +[NSCursor currentCursor] — it would draw that invisible sprite.
-if(APPLE)
-    target_sources(${MP_TARGET} PRIVATE ${displayxr_common_SOURCE_DIR}/common/cursor_depth_macos.mm)
-    target_link_libraries(${MP_TARGET} PRIVATE "-framework AppKit")
-endif()
-
-# Copy the OpenXR loader dylib/dll next to the binary when it's an imported target,
-# so the app runs without extra PATH/DYLD setup.
-if(TARGET OpenXR::openxr_loader)
-    get_target_property(_oxr_loc OpenXR::openxr_loader IMPORTED_LOCATION)
-    if(NOT _oxr_loc)
-        get_target_property(_oxr_loc OpenXR::openxr_loader IMPORTED_LOCATION_RELEASE)
-    endif()
-    if(_oxr_loc)
-        add_custom_command(TARGET ${MP_TARGET} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${_oxr_loc}" "$<TARGET_FILE_DIR:${MP_TARGET}>"
-            COMMENT "Copying OpenXR loader next to ${MP_TARGET}")
-    endif()
-endif()
-
-# Linux portable build (the .deb, #76): the binary finds its bundled libs (the
-# private FFmpeg, the OpenXR loader) in its own directory via RUNPATH=$ORIGIN — no
-# build-tree path baked in, no LD_LIBRARY_PATH needed. The same libs are staged
-# next to the binary here so the build tree runs exactly like the installed layout.
+# ---------------------------------------------------------------------------
+# Targets — ONE trunk, two products (docs/PRO.md).
+#   mediaplayer_handle_vk_<plat>      the Media Player (demo bundle, versions.json)
+#   mediaplayer_pro_handle_vk_<plat>  Media Player Pro: the same sources + src/pro/,
+#                                     built with MEDIAPLAYER_PRO=1; own installer and
+#                                     own release tags (pro-v*), NOT in the DisplayXR bundle.
+# Every trunk change lands in both. Pro-only code lives in src/pro/ behind the
+# `#if MEDIAPLAYER_PRO` hooks in App.cpp — never fork a trunk file for Pro.
+# ---------------------------------------------------------------------------
 option(MP_LINUX_PORTABLE "Linux: RUNPATH=\$ORIGIN + stage bundled libs next to the binary (for the .deb)" OFF)
-if(MP_LINUX_PORTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    if(NOT FFMPEG_ROOT)
-        message(FATAL_ERROR "MP_LINUX_PORTABLE needs FFMPEG_ROOT (scripts/build_ffmpeg_linux.sh): "
-                            "a distro FFmpeg cannot ship in a portable .deb")
-    endif()
-    set_target_properties(${MP_TARGET} PROPERTIES
-        BUILD_WITH_INSTALL_RPATH TRUE
-        INSTALL_RPATH "\$ORIGIN")
-    file(GLOB _mp_bundled_libs "${FFMPEG_ROOT}/lib/lib*.so.*")
-    if(TARGET OpenXR::openxr_loader AND _oxr_loc)
-        get_filename_component(_oxr_dir "${_oxr_loc}" DIRECTORY)
-        file(GLOB _oxr_libs "${_oxr_dir}/libopenxr_loader.so*")
-        list(APPEND _mp_bundled_libs ${_oxr_libs})
-    endif()
-    foreach(_lib ${_mp_bundled_libs})
-        # -P keeps soname symlinks as symlinks.
-        add_custom_command(TARGET ${MP_TARGET} POST_BUILD
-            COMMAND cp -P -f "${_lib}" "$<TARGET_FILE_DIR:${MP_TARGET}>/"
-            VERBATIM)
-    endforeach()
-    message(STATUS "MP_LINUX_PORTABLE: RUNPATH=$ORIGIN, bundling ${FFMPEG_ROOT}/lib + OpenXR loader")
-endif()
 
-# Stage dependent shared-library DLLs (SDL3 when built shared, an OpenXR loader DLL
-# if the loader is dynamic, etc.) next to the binary so it runs in-place on Windows
-# without PATH munging. FFmpeg's DLLs come via MP_FFMPEG_DLL_DIR above (raw .lib
-# paths, not CMake targets, so they're not in TARGET_RUNTIME_DLLS).
+function(mp_add_player tgt is_pro)
+    add_executable(${tgt}
+        src/main.cpp
+        src/color/CubeLut.cpp    # Pro looks; compiled into both so the trunk stays one source list
+        src/color/Cdl.cpp
+        src/App.cpp
+        src/Log.cpp
+        src/platform/Window.cpp
+        $<$<PLATFORM_ID:Linux>:src/platform/WindowLinux.cpp>  # desktop Linux: displayxr-common window
+        src/xr/XrSession.cpp
+        src/rhi/VulkanRenderer.cpp
+        src/media/ImageDecoder.cpp
+        src/media/LifLoader.cpp
+        src/media/MpoLoader.cpp
+        src/media/MediaSource.cpp
+        src/media/StereoCompose.cpp
+        src/media/StereoDetect.cpp
+        src/media/VideoStereoProbe.cpp
+        src/media/VideoDecoder.cpp
+        src/media/AudioPlayer.cpp
+        src/media/CameraSelect.cpp
+        src/media/CameraSource.cpp   # live camera (#90): SDL3 camera -> FrameRing
+        src/media/AutoConvergence.cpp  # live auto-convergence (#92): disparity.js port
+        src/media/StreamUrl.cpp      # stream-URL classifier (#93)
+        src/ui/Hud.cpp
+        src/ui/ImGuiLayer.cpp
+        # The player's ImGui chrome, shared VERBATIM with the Android leg. If you add or
+        # split a TU here, mirror it into android/src/main/cpp/CMakeLists.txt — that list
+        # is hand-curated and desktop CI cannot catch the resulting Android link error.
+        src/ui/TransportUI.cpp
+        src/media/FrameRing.h  # header-only triple buffer
+        ${MP_IMGUI_SOURCES}
+    )
+
+    # Windows: link as a GUI (WINDOWS subsystem) app so launching the player never
+    # pops a console window — neither standalone (Explorer) nor under the shell. SDL3's
+    # <SDL3/SDL_main.h> supplies the WinMain entry that forwards to our main(), so the
+    # console subsystem is unnecessary. stderr still works when a console is attached
+    # (e.g. the shell's CREATE_NEW_CONSOLE) or redirected.
+    if(WIN32)
+        set_target_properties(${tgt} PROPERTIES WIN32_EXECUTABLE TRUE)
+        # Embedded Explorer icon + version info (icon from the 2D workspace logo).
+        target_sources(${tgt} PRIVATE windows/resource.rc)
+    endif()
+
+    target_include_directories(${tgt} PRIVATE
+        ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)
+    # MEDIAPLAYER_IMGUI_SDL selects the SDL3 ImGui *platform* backend (input + dt) on
+    # Windows / macOS. Desktop Linux has no SDL window: MEDIAPLAYER_IMGUI_DXRWIN feeds
+    # ImGui from displayxr-common's window events instead. The Android leg defines
+    # MEDIAPLAYER_WITH_IMGUI only: it has no SDL, and feeds input through
+    # ImGuiLayer::PushPointer() instead. See src/ui/ImGuiLayer.h.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_WITH_IMGUI=1 MEDIAPLAYER_IMGUI_DXRWIN=1)
+    else()
+        target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_WITH_IMGUI=1 MEDIAPLAYER_IMGUI_SDL=1)
+    endif()
+
+    if(MP_HAVE_FFMPEG)
+        target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
+        target_link_libraries(${tgt} PRIVATE ${MP_FFMPEG_LINK})
+        # Windows shared FFmpeg: copy the runtime DLLs next to the binary post-build.
+        if(MP_FFMPEG_DLL_DIR)
+            file(GLOB _ffmpeg_dlls "${MP_FFMPEG_DLL_DIR}/*.dll")
+            foreach(_dll ${_ffmpeg_dlls})
+                add_custom_command(TARGET ${tgt} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_dll}" "$<TARGET_FILE_DIR:${tgt}>"
+                    COMMENT "Staging FFmpeg DLL $<PATH:GET_FILENAME,${_dll}> next to ${tgt}")
+            endforeach()
+        endif()
+    endif()
+
+    target_include_directories(${tgt} BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/displayxr-openxr  # vendored <openxr/...>
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb               # stb_image_write.h
+    )
+    # displayxr-common's header-only rules (dxr_view_config.h, vk_frame_ring.h) come
+    # through displayxr::rules. A linked target's include dirs land AFTER this target's
+    # own (the BEFORE block above), so common only supplies what this repo does not.
+    # Desktop Linux add_subdirectory's common and gets the real target; the
+    # headers-only populate (Windows / macOS) gets an equivalent local one.
+    if(NOT TARGET displayxr::rules)
+        add_library(mp_displayxr_rules INTERFACE)
+        target_include_directories(mp_displayxr_rules INTERFACE ${displayxr_common_SOURCE_DIR}/common)
+        add_library(displayxr::rules ALIAS mp_displayxr_rules)
+    endif()
+    target_link_libraries(${tgt} PRIVATE displayxr::rules)
+
+    target_link_libraries(${tgt} PRIVATE
+        SDL3::SDL3
+        Vulkan::Vulkan
+        nlohmann_json::nlohmann_json
+        ${MP_OPENXR_LOADER}
+    )
+    # Desktop Linux: the app window (X11 or native Wayland) — see the fetch above.
+    if(TARGET displayxr::linux_window)
+        target_link_libraries(${tgt} PRIVATE displayxr::linux_window)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "displayxr::linux_window is not available — install libx11-dev "
+                            "(and libwayland-dev libxkbcommon-dev libdbus-1-dev)")
+    endif()
+
+    # Windows: SHGetKnownFolderPath (shell32) + CoTaskMemFree (ole32) for the 'I'-key
+    # atlas-capture output path under the user's Pictures folder.
+    # d3d11 + dxgi: zero-copy D3D11VA->Vulkan decode interop (issue #28).
+    if(WIN32)
+        target_link_libraries(${tgt} PRIVATE shell32 ole32 d3d11 dxgi d3dcompiler)
+    endif()
+
+    # macOS: displayxr-common's Cocoa adapter for dxr::CursorDepth hides the OS pointer
+    # with +[NSCursor hide] while the runtime draws the depth cursor. SDL_HideCursor would
+    # not do: SDL swaps in an INVISIBLE NSCursor, and the runtime's default cursor look
+    # mirrors +[NSCursor currentCursor] — it would draw that invisible sprite.
+    if(APPLE)
+        target_sources(${tgt} PRIVATE ${displayxr_common_SOURCE_DIR}/common/cursor_depth_macos.mm)
+        target_link_libraries(${tgt} PRIVATE "-framework AppKit")
+    endif()
+
+    # Copy the OpenXR loader dylib/dll next to the binary when it's an imported target,
+    # so the app runs without extra PATH/DYLD setup.
+    if(TARGET OpenXR::openxr_loader)
+        get_target_property(_oxr_loc OpenXR::openxr_loader IMPORTED_LOCATION)
+        if(NOT _oxr_loc)
+            get_target_property(_oxr_loc OpenXR::openxr_loader IMPORTED_LOCATION_RELEASE)
+        endif()
+        if(_oxr_loc)
+            add_custom_command(TARGET ${tgt} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_oxr_loc}" "$<TARGET_FILE_DIR:${tgt}>"
+                COMMENT "Copying OpenXR loader next to ${tgt}")
+        endif()
+    endif()
+
+    # Linux portable build (the .deb, #76): the binary finds its bundled libs (the
+    # private FFmpeg, the OpenXR loader) in its own directory via RUNPATH=$ORIGIN — no
+    # build-tree path baked in, no LD_LIBRARY_PATH needed. The same libs are staged
+    # next to the binary here so the build tree runs exactly like the installed layout.
+    if(MP_LINUX_PORTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        if(NOT FFMPEG_ROOT)
+            message(FATAL_ERROR "MP_LINUX_PORTABLE needs FFMPEG_ROOT (scripts/build_ffmpeg_linux.sh): "
+                                "a distro FFmpeg cannot ship in a portable .deb")
+        endif()
+        set_target_properties(${tgt} PROPERTIES
+            BUILD_WITH_INSTALL_RPATH TRUE
+            INSTALL_RPATH "\$ORIGIN")
+        file(GLOB _mp_bundled_libs "${FFMPEG_ROOT}/lib/lib*.so.*")
+        if(TARGET OpenXR::openxr_loader AND _oxr_loc)
+            get_filename_component(_oxr_dir "${_oxr_loc}" DIRECTORY)
+            file(GLOB _oxr_libs "${_oxr_dir}/libopenxr_loader.so*")
+            list(APPEND _mp_bundled_libs ${_oxr_libs})
+        endif()
+        foreach(_lib ${_mp_bundled_libs})
+            # -P keeps soname symlinks as symlinks.
+            add_custom_command(TARGET ${tgt} POST_BUILD
+                COMMAND cp -P -f "${_lib}" "$<TARGET_FILE_DIR:${tgt}>/"
+                VERBATIM)
+        endforeach()
+        message(STATUS "MP_LINUX_PORTABLE: RUNPATH=$ORIGIN, bundling ${FFMPEG_ROOT}/lib + OpenXR loader")
+    endif()
+
+    # Stage dependent shared-library DLLs (SDL3 when built shared, an OpenXR loader DLL
+    # if the loader is dynamic, etc.) next to the binary so it runs in-place on Windows
+    # without PATH munging. FFmpeg's DLLs come via MP_FFMPEG_DLL_DIR above (raw .lib
+    # paths, not CMake targets, so they're not in TARGET_RUNTIME_DLLS).
+    if(WIN32)
+        add_custom_command(TARGET ${tgt} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:${tgt}> "$<TARGET_FILE_DIR:${tgt}>"
+            COMMAND_EXPAND_LISTS
+            COMMENT "Staging dependent runtime DLLs next to ${tgt}")
+    endif()
+
+    # Sidecar workspace manifest + real logos (generated by /make-app-logos from a
+    # live atlas capture). Staged next to the binary on every platform so dev builds
+    # and the installer's BIN_DIR both carry them, and the idle logo resolves at
+    # <exe-dir>/displayxr/ (manifest spec) instead of falling back to the test pattern.
+    add_custom_command(TARGET ${tgt} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/displayxr" "$<TARGET_FILE_DIR:${tgt}>/displayxr"
+        COMMENT "Staging displayxr/ sidecar (manifest + logos) next to ${tgt}")
+    if(is_pro)
+        target_sources(${tgt} PRIVATE src/pro/ProController.cpp)
+        target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=1)
+    else()
+        target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=0)
+    endif()
+    message(STATUS "Configured target: ${tgt}")
+endfunction()
+
+mp_add_player(${MP_TARGET} OFF)
+
+# Media Player Pro builds on Windows first (the 3D-panel monitoring station); the
+# other platforms can opt in with -DMP_BUILD_PRO=ON once they are validated.
 if(WIN32)
-    add_custom_command(TARGET ${MP_TARGET} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_RUNTIME_DLLS:${MP_TARGET}> "$<TARGET_FILE_DIR:${MP_TARGET}>"
-        COMMAND_EXPAND_LISTS
-        COMMENT "Staging dependent runtime DLLs next to ${MP_TARGET}")
+    set(_mp_pro_default ON)
+else()
+    set(_mp_pro_default OFF)
+endif()
+option(MP_BUILD_PRO "Also build Media Player Pro (mediaplayer_pro_handle_vk_<plat>)" ${_mp_pro_default})
+set(MP_PRO_TARGET "mediaplayer_pro_handle_vk_${MP_PLATFORM}")
+if(MP_BUILD_PRO)
+    mp_add_player(${MP_PRO_TARGET} ON)
+    # Both targets stage DLLs + the displayxr/ sidecar into the same build dir in their
+    # POST_BUILD steps; serialise them so the two copies never race.
+    add_dependencies(${MP_PRO_TARGET} ${MP_TARGET})
 endif()
 
-# Sidecar workspace manifest + real logos (generated by /make-app-logos from a
-# live atlas capture). Staged next to the binary on every platform so dev builds
-# and the installer's BIN_DIR both carry them, and the idle logo resolves at
-# <exe-dir>/displayxr/ (manifest spec) instead of falling back to the test pattern.
-add_custom_command(TARGET ${MP_TARGET} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/displayxr" "$<TARGET_FILE_DIR:${MP_TARGET}>/displayxr"
-    COMMENT "Staging displayxr/ sidecar (manifest + logos) next to ${MP_TARGET}")
-
-message(STATUS "Configured target: ${MP_TARGET}")
 
 # ---------------------------------------------------------------------------
 # Tests (opt-in: -DMP_BUILD_TESTS=ON). LifLoader container round-trip — builds
@@ -486,6 +524,14 @@ if(MP_BUILD_TESTS)
         src/media/StreamUrl.cpp)
     target_include_directories(stream_url_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME stream_url COMMAND stream_url_test)
+
+    # Media Player Pro looks: .cube LUT + ASC CDL loaders (pure C++).
+    add_executable(color_test
+        tests/color_test.cpp
+        src/color/CubeLut.cpp
+        src/color/Cdl.cpp)
+    target_include_directories(color_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME color COMMAND color_test)
 
     add_executable(mpo_parse_test
         tests/mpo_parse_test.cpp

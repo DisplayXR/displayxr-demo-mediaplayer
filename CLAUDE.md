@@ -14,6 +14,21 @@ never links a vendor SR SDK.
 The minimal, un-bloated counterpart to Leia's `LeiaPlayerWin` (Qt6 + VLC + OpenCV +
 TensorRT/CUDA). We shed all of that.
 
+## Media Player Pro — same trunk, second product (read `docs/PRO.md`)
+
+This repo builds TWO apps from ONE source tree: the Media Player (`mediaplayer_handle_vk_*`,
+the demo-bundle app) and **Media Player Pro** (`mediaplayer_pro_handle_vk_*`, a 3D
+monitoring/review player with its own installer and `pro-v*` tags, NOT in the DisplayXR
+bundle or `versions.json`). `mp_add_player()` in `CMakeLists.txt` builds both;
+`MEDIAPLAYER_PRO=1` + `src/pro/` make the difference.
+
+- Pro-only code goes in `src/pro/`, reached only through the `#if MEDIAPLAYER_PRO` hooks in
+  `App.cpp`. Never fork a trunk file for Pro.
+- Trunk capabilities Pro needs are added identity-by-default (e.g. `GradeParams`), so the
+  base player is unchanged.
+- `shaders/sbs.frag` is shared with Android: Pro shader features stay behind
+  `#ifdef MP_GRADE` (desktop compiles with `-DMP_GRADE`, Android without).
+
 ## THE GOLDEN RULE — extension-wire-protocol only
 
 This app is coupled to the runtime **only by the OpenXR extension wire protocol**,

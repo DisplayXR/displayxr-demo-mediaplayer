@@ -21,6 +21,8 @@
 #include "rhi/Shaders.h"
 
 #include <algorithm>  // std::max / std::min (scissor clamp)
+#include <cstring>    // std::memcpy (half-float LUT pack, staging copies)
+#include <vector>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
@@ -38,6 +40,50 @@ VkShaderModule MakeShaderModule(VkDevice device, const uint32_t* spv, size_t byt
 } // namespace
 
 namespace mp {
+
+namespace {
+// Fragment push constants - must match `PushConstants` in shaders/sbs.frag (std430
+// push-constant offsets: vec2 at 8, vec4 at 16).
+struct DrawPush {
+    float off[2];        //  0
+    float scale[2];      //  8
+    int32_t mode;        // 16
+    float fullRange;     // 20
+    float srgbTarget;    // 24
+    int32_t qcMode;      // 28
+    float otherDelta[2]; // 32
+    float exposure;      // 40
+    float lutOn;         // 44
+    float cdlSlope[4];   // 48  .a = saturation
+    float cdlOffset[4];  // 64  .a = CDL on
+    float cdlPower[4];   // 80
+    float lutDomain[4];  // 96  x = min, y = 1/(max-min), z = N
+};
+static_assert(sizeof(DrawPush) == 112, "DrawPush must match the shader's PushConstants");
+
+// IEEE 754 binary32 -> binary16 (round half up on the dropped bits), for the RGBA16F LUT.
+uint16_t FloatToHalf(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const uint32_t e32 = (x >> 23) & 0xffu;
+    int32_t exp = (int32_t)e32 - 127 + 15;
+    uint32_t mant = x & 0x7fffffu;
+    if (e32 == 0xffu) return (uint16_t)(sign | 0x7c00u | (mant ? 0x200u : 0));
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        const uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t h = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) h += 1;
+        return (uint16_t)(sign | h);
+    }
+    uint32_t h = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    if (mant & 0x1000u) h += 1;  // a carry into the exponent is the correct rounding
+    return (uint16_t)h;
+}
+}  // namespace
 
 VulkanRenderer::~VulkanRenderer() { Shutdown(); }
 
@@ -166,9 +212,9 @@ uint32_t VulkanRenderer::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags
 
 bool VulkanRenderer::CreatePipeline() {
     // Descriptor set layout: bindings 0..2 = combined image samplers (RGBA in plane 0,
-    // or Y + chroma planes for YUV video).
-    VkDescriptorSetLayoutBinding bindings[3] = {};
-    for (uint32_t i = 0; i < 3; ++i) {
+    // or Y + chroma planes for YUV video); binding 3 = the Pro grade's 3D LUT.
+    VkDescriptorSetLayoutBinding bindings[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[i].descriptorCount = 1;
@@ -176,19 +222,18 @@ bool VulkanRenderer::CreatePipeline() {
     }
     VkDescriptorSetLayoutCreateInfo dslci = {};
     dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslci.bindingCount = 3;
+    dslci.bindingCount = 4;
     dslci.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device_, &dslci, nullptr, &descSetLayout_) != VK_SUCCESS) {
         LOG_ERROR("vkCreateDescriptorSetLayout failed");
         return false;
     }
 
-    // Push constants: uvOffset(vec2)+uvScale(vec2)+mode(int)+fullRange(float)
-    //                 +srgbTarget(float) = 28 bytes.
+    // Push constants: see DrawPush (112 bytes; the spec guarantees 128).
     VkPushConstantRange pcRange = {};
     pcRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     pcRange.offset = 0;
-    pcRange.size = sizeof(float) * 7;
+    pcRange.size = sizeof(DrawPush);
 
     VkPipelineLayoutCreateInfo plci = {};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -300,7 +345,7 @@ bool VulkanRenderer::CreatePipeline() {
     const uint32_t nSlots = ring_.framesInFlight();
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = 3 * nSlots;
+    poolSize.descriptorCount = 4 * nSlots;
     VkDescriptorPoolCreateInfo dpci = {};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.maxSets = nSlots;
@@ -638,12 +683,17 @@ void VulkanRenderer::BindDescriptors(VkDescriptorSet set) {
     } else if (sourceMode_ == 2) {     // NV12: Y, interleaved UV
         views[1] = planes_[1].view;
     }
-    VkDescriptorImageInfo dii[3] = {};
-    VkWriteDescriptorSet writes[3] = {};
-    for (uint32_t i = 0; i < 3; ++i) {
+    VkDescriptorImageInfo dii[4] = {};
+    VkWriteDescriptorSet writes[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
         dii[i].sampler = sampler_;
-        dii[i].imageView = views[i] ? views[i] : dummyView_;
-        dii[i].imageLayout = layouts[i];
+        if (i == 3) {   // the Pro grade LUT, or its 1x1x1 dummy
+            dii[i].imageView = lut_.view ? lut_.view : lutDummy_.view;
+            dii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        } else {
+            dii[i].imageView = views[i] ? views[i] : dummyView_;
+            dii[i].imageLayout = layouts[i];
+        }
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = set;
         writes[i].dstBinding = i;
@@ -651,7 +701,7 @@ void VulkanRenderer::BindDescriptors(VkDescriptorSet set) {
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[i].pImageInfo = &dii[i];
     }
-    vkUpdateDescriptorSets(device_, 3, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device_, 4, writes, 0, nullptr);
 }
 
 bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* rects,
@@ -667,6 +717,10 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
     // it, so make sure it exists before this frame writes its descriptor set (a one-off
     // blocking init the first time, a no-op after).
     if (!EnsureDummy()) return false;
+    if (!lutDummy_.view) {
+        const uint16_t one[4] = {0, 0, 0, 0x3c00u};
+        if (!CreateLutImage(lutDummy_, 1, one)) return false;
+    }
 
     // The frame's one command buffer (uploads may already have opened it). Its ring
     // slot's fence — the frame that used this slot N frames ago — has passed, so that
@@ -751,19 +805,29 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         sc.extent = {(uint32_t)std::max(0, x1 - x0), (uint32_t)std::max(0, y1 - y0)};
         vkCmdSetScissor(cmd, 0, 1, &sc);
 
-        // uvOffset(vec2) + uvScale(vec2) + mode(int) + fullRange(float)
-        // + srgbTarget(float) = 28 bytes.
-        struct {
-            float off[2];
-            float scale[2];
-            int32_t mode;
-            float fullRange;
-            float srgbTarget;
-        } pc = {{uvs[v].offX, uvs[v].offY},
-                {uvs[v].scaleX, uvs[v].scaleY},
-                sourceMode_,
-                sourceFullRange_,
-                srgbTarget_ ? 1.0f : 0.0f};
+        DrawPush pc = {};
+        pc.off[0] = uvs[v].offX;
+        pc.off[1] = uvs[v].offY;
+        pc.scale[0] = uvs[v].scaleX;
+        pc.scale[1] = uvs[v].scaleY;
+        pc.mode = sourceMode_;
+        pc.fullRange = sourceFullRange_;
+        pc.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
+        pc.qcMode = grade_.qcMode;
+        pc.otherDelta[0] = uvs[v].otherDX;
+        pc.otherDelta[1] = uvs[v].otherDY;
+        pc.exposure = grade_.exposure;
+        pc.lutOn = (grade_.lutOn && lut_.view) ? 1.0f : 0.0f;
+        for (int k = 0; k < 3; ++k) {
+            pc.cdlSlope[k] = grade_.slope[k];
+            pc.cdlOffset[k] = grade_.offset[k];
+            pc.cdlPower[k] = grade_.power[k];
+        }
+        pc.cdlSlope[3] = grade_.saturation;
+        pc.cdlOffset[3] = grade_.cdlOn ? 1.0f : 0.0f;
+        pc.lutDomain[0] = lut_.domainMin;
+        pc.lutDomain[1] = 1.0f / std::max(1e-6f, lut_.domainMax - lut_.domainMin);
+        pc.lutDomain[2] = (float)std::max(1u, lut_.size);
         vkCmdPushConstants(cmd, activeLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -1218,6 +1282,8 @@ void VulkanRenderer::Shutdown() {
     ClearSharedImports();  // zero-copy (#28) imported textures
 #endif
     DestroyTexture();
+    DestroyLut(lut_, false);
+    DestroyLut(lutDummy_, false);
     ring_.destroy();  // waits its fences, runs the deferred releases, frees cmds/fences
     if (sampler_) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
     if (descPool_) { vkDestroyDescriptorPool(device_, descPool_, nullptr); descPool_ = VK_NULL_HANDLE; }
@@ -1232,5 +1298,139 @@ void VulkanRenderer::Shutdown() {
     if (renderPass_) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
     device_ = VK_NULL_HANDLE;
 }
+
+// ---------------------------------------------------------------------------
+// Pro grade: 3D LUT texture (binding 3)
+// ---------------------------------------------------------------------------
+
+bool VulkanRenderer::CreateLutImage(Lut3D& dst, uint32_t n, const uint16_t* rgba16f) {
+    const VkFormat fmt = VK_FORMAT_R16G16B16A16_SFLOAT;  // linear filtering is mandatory for it
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_3D;
+    ici.format = fmt;
+    ici.extent = {n, n, n};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    Lut3D l;
+    if (vkCreateImage(device_, &ici, nullptr, &l.image) != VK_SUCCESS) {
+        LOG_ERROR("LUT: vkCreateImage(%u^3) failed", n);
+        return false;
+    }
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(device_, l.image, &req);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX ||
+        vkAllocateMemory(device_, &ai, nullptr, &l.memory) != VK_SUCCESS) {
+        vkDestroyImage(device_, l.image, nullptr);
+        LOG_ERROR("LUT: memory alloc failed");
+        return false;
+    }
+    vkBindImageMemory(device_, l.image, l.memory, 0);
+
+    // Staging buffer, copied with a one-off blocking submit (LUT loads are user actions,
+    // never per frame).
+    const VkDeviceSize bytes = (VkDeviceSize)n * n * n * 4 * sizeof(uint16_t);
+    VkBuffer sbuf = VK_NULL_HANDLE;
+    VkDeviceMemory smem = VK_NULL_HANDLE;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    vkCreateBuffer(device_, &bci, nullptr, &sbuf);
+    VkMemoryRequirements breq;
+    vkGetBufferMemoryRequirements(device_, sbuf, &breq);
+    VkMemoryAllocateInfo bai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    bai.allocationSize = breq.size;
+    bai.memoryTypeIndex = FindMemoryType(
+        breq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vkAllocateMemory(device_, &bai, nullptr, &smem);
+    vkBindBufferMemory(device_, sbuf, smem, 0);
+    void* mapped = nullptr;
+    vkMapMemory(device_, smem, 0, bytes, 0, &mapped);
+    std::memcpy(mapped, rgba16f, (size_t)bytes);
+    vkUnmapMemory(device_, smem);
+
+    ring_.submitImmediate([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = l.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             0, nullptr, 0, nullptr, 1, &b);
+        VkBufferImageCopy r = {};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageExtent = {n, n, n};
+        vkCmdCopyBufferToImage(cmd, sbuf, l.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &b);
+    });
+    vkDestroyBuffer(device_, sbuf, nullptr);
+    vkFreeMemory(device_, smem, nullptr);
+
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = l.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    vci.format = fmt;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(device_, &vci, nullptr, &l.view) != VK_SUCCESS) {
+        vkDestroyImage(device_, l.image, nullptr);
+        vkFreeMemory(device_, l.memory, nullptr);
+        LOG_ERROR("LUT: image view failed");
+        return false;
+    }
+    l.size = n;
+    DestroyLut(dst, /*deferred=*/true);  // a queued frame may still sample the old one
+    dst = l;
+    return true;
+}
+
+void VulkanRenderer::DestroyLut(Lut3D& l, bool deferred) {
+    if (l.view || l.image || l.memory) {
+        VkDevice dev = device_;
+        const VkImageView v = l.view;
+        const VkImage i = l.image;
+        const VkDeviceMemory m = l.memory;
+        auto destroy = [dev, v, i, m]() {
+            if (v) vkDestroyImageView(dev, v, nullptr);
+            if (i) vkDestroyImage(dev, i, nullptr);
+            if (m) vkFreeMemory(dev, m, nullptr);
+        };
+        if (deferred) ring_.deferDestroy(destroy);
+        else destroy();
+    }
+    l = Lut3D{};
+}
+
+bool VulkanRenderer::UploadLut3D(const float* rgb, uint32_t size, float domainMin, float domainMax) {
+    if (!rgb || size < 2 || size > 256 || device_ == VK_NULL_HANDLE) return false;
+    const size_t count = (size_t)size * size * size;
+    std::vector<uint16_t> px(count * 4);
+    for (size_t i = 0; i < count; ++i) {
+        px[i * 4 + 0] = FloatToHalf(rgb[i * 3 + 0]);
+        px[i * 4 + 1] = FloatToHalf(rgb[i * 3 + 1]);
+        px[i * 4 + 2] = FloatToHalf(rgb[i * 3 + 2]);
+        px[i * 4 + 3] = 0x3c00u;  // 1.0
+    }
+    if (!CreateLutImage(lut_, size, px.data())) return false;
+    lut_.domainMin = domainMin;
+    lut_.domainMax = domainMax;
+    LOG_INFO("LUT: uploaded %u^3 (domain %.3f..%.3f)", size, domainMin, domainMax);
+    return true;
+}
+
+void VulkanRenderer::ClearLut3D() { DestroyLut(lut_, /*deferred=*/true); }
 
 } // namespace mp

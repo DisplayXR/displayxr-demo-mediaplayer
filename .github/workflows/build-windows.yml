@@ -5,6 +5,12 @@ name: Build Windows
 # the installer is attached to the GitHub Release and the runtime's versions.json
 # is bumped. Mirrors the sibling demos' build-windows.yml.
 #
+# Media Player Pro (docs/PRO.md) is the same trunk built as a second target. Every
+# run builds and validates BOTH apps + BOTH installers. Release tags are separate:
+#   v*      -> Media Player installer + versions.json bump (the demo bundle)
+#   pro-v*  -> Media Player Pro installer only, on a release that is never marked
+#              "latest" and never bumps versions.json (Pro is not in the bundle).
+#
 # The DetectChanges job + docs_only step gating let this workflow be a required
 # status check (the "Build Windows" job always runs and reports success in ~30s
 # on doc-only PRs, skipping the heavy build) without blocking doc PRs. Mirrors
@@ -14,7 +20,7 @@ on:
   pull_request: {}
   push:
     branches: [ main ]
-    tags: [ 'v*' ]
+    tags: [ 'v*', 'pro-v*' ]
   workflow_dispatch: {}
 
 concurrency:
@@ -268,8 +274,8 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
         run: |
-          if (-not (Test-Path "build/mediaplayer_handle_vk_win.exe")) {
-            Write-Host "::error::mediaplayer_handle_vk_win.exe not produced"; exit 1 }
+          foreach ($exe in @("mediaplayer_handle_vk_win.exe","mediaplayer_pro_handle_vk_win.exe")) {
+            if (-not (Test-Path "build/$exe")) { Write-Host "::error::$exe not produced"; exit 1 } }
           foreach ($pat in @("avcodec-*.dll","avformat-*.dll","avutil-*.dll","swscale-*.dll","SDL3.dll")) {
             if (-not (Get-ChildItem build -Filter $pat -ErrorAction SilentlyContinue)) {
               Write-Host "::error::missing staged runtime DLL: $pat"; exit 1 } }
@@ -282,7 +288,11 @@ jobs:
         run: |
           # v1.2.3 -> 1.2.3 for the installer filename + VIProductVersion. Untagged
           # builds use 0.0.0 (valid version; never published).
-          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+          # pro-v0.2.0 -> 0.2.0 for the Pro installer; the base installer is then built
+          # (validation only) as 0.0.0 and not published.
+          if ($env:GITHUB_REF -like 'refs/tags/pro-v*') {
+            $version = $env:GITHUB_REF -replace '^refs/tags/pro-v',''
+          } elseif ($env:GITHUB_REF -like 'refs/tags/v*') {
             $version = $env:GITHUB_REF -replace '^refs/tags/v',''
           } else { $version = "0.0.0" }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -294,6 +304,13 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: call installer\build-installer.bat
+
+      - name: Build Media Player Pro installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: cmd
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: call installer\build-installer.bat pro
 
       - name: Assert installer payload (regression guard)
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -313,6 +330,16 @@ jobs:
               Write-Host "::error::installer payload missing $need"; exit 1 } }
           Write-Host "PASS: installer payload OK (app + SDL3 + FFmpeg, no vendor SR DLL)."
 
+          $pro = Get-ChildItem installer\DisplayXRMediaPlayerProSetup-*.exe | Select-Object -First 1
+          if (-not $pro) { Write-Host "::error::Pro installer .exe not produced"; exit 1 }
+          $plist = & 7z l "$($pro.FullName)" 2>&1 | Out-String
+          if ($plist -match 'SimulatedReality') {
+            Write-Host "::error::Pro installer bundles a SimulatedReality* DLL."; exit 1 }
+          foreach ($need in @("mediaplayer_pro_handle_vk_win.exe","mediaplayer_pro_handle_vk_win.displayxr.json","SDL3.dll","avcodec","avformat","avutil","swscale","swresample")) {
+            if ($plist -notmatch [regex]::Escape($need)) {
+              Write-Host "::error::Pro installer payload missing $need"; exit 1 } }
+          Write-Host "PASS: Pro installer payload OK."
+
       - name: Upload installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v6
@@ -321,6 +348,30 @@ jobs:
           name: DisplayXRMediaPlayer-Windows
           if-no-files-found: error
           path: installer/DisplayXRMediaPlayerSetup-*.exe
+
+      - name: Upload Pro installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          retention-days: 3
+          name: DisplayXRMediaPlayerPro-Windows
+          if-no-files-found: error
+          path: installer/DisplayXRMediaPlayerProSetup-*.exe
+
+      # Pro releases: own tag (pro-v*), own release, never "latest" (so the demo's
+      # latest release, which the website and setup scripts read, stays the Media
+      # Player), and no versions.json dispatch (DispatchVersionsBump matches v* only).
+      - name: Attach Pro installer to GitHub release on pro-v* tag
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/pro-v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: installer/DisplayXRMediaPlayerProSetup-*.exe
+          fail_on_unmatched_files: true
+          name: Media Player Pro ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          make_latest: false
+          generate_release_notes: true
 
       - name: Attach installer to GitHub release on tag
         if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')

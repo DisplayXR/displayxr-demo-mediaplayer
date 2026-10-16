@@ -15,6 +15,9 @@
 #include "ui/ImGuiLayer.h"
 #include "ui/TransportUI.h"
 #include "xr/XrSession.h"
+#if MEDIAPLAYER_PRO
+#include "pro/ProController.h"
+#endif
 
 #include <chrono>
 #include <cstdint>
@@ -38,6 +41,10 @@ public:
         bool autoConv = false;
         std::string autoConvPolicy;
         std::string url;             // --url <u> (#93); MEDIAPLAYER_URL fills it otherwise
+        // Media Player Pro looks: --lut <file.cube> / --cdl <file.cc|.ccc|.cdl>
+        // (MEDIAPLAYER_LUT / MEDIAPLAYER_CDL fill them otherwise). Ignored by the base player.
+        std::string lutPath;
+        std::string cdlPath;
     };
     void SetLaunchOptions(const LaunchOptions& o) { launch_ = o; }  // before Initialize()
 
@@ -338,6 +345,18 @@ private:
     int32_t pendingModeRequest_ = -1;
     int32_t modeBeforeIdle_ = -1;
     int32_t idleModeRequested_ = -1;
+
+#if MEDIAPLAYER_PRO
+    // Media Player Pro (src/pro/, docs/PRO.md). Everything Pro adds hangs off pro_;
+    // the trunk only calls into it from the `#if MEDIAPLAYER_PRO` hooks in App.cpp.
+    pro::ProController pro_;
+    void InitPro();
+    pro::Status ProStatus() const;
+    // Last frame's on-screen picture rect in window POINTS (pre-convergence), and the
+    // per-eye content width in tile pixels: Pro's pointer->picture mapping and 1:1 zoom.
+    float proPicX_ = 0.f, proPicY_ = 0.f, proPicW_ = 0.f, proPicH_ = 0.f;
+    float proTileContentW_ = 0.f;
+#endif
 
     // Test scaffolding (env-gated).
     int startMode_ = -1;
