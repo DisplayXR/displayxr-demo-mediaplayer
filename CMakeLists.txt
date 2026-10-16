@@ -471,8 +471,13 @@ function(mp_add_player tgt is_pro)
         endif()
         if(MP_DECKLINK_INCLUDE)
             target_sources(${tgt} PRIVATE "${MP_DECKLINK_INCLUDE}/DeckLinkAPIDispatch.cpp")
-            target_include_directories(${tgt} PRIVATE "${MP_DECKLINK_INCLUDE}")
+            target_include_directories(${tgt} PRIVATE "${MP_DECKLINK_INCLUDE}" "${MP_DECKLINK_SDK_INCLUDE}")
             target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_WITH_DECKLINK=1)
+            if(APPLE)
+                target_link_libraries(${tgt} PRIVATE "-framework CoreFoundation")
+            elseif(NOT WIN32)
+                target_link_libraries(${tgt} PRIVATE ${CMAKE_DL_LIBS} pthread)
+            endif()
         endif()
     else()
         target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=0)
@@ -480,14 +485,19 @@ function(mp_add_player tgt is_pro)
     message(STATUS "Configured target: ${tgt}")
 endfunction()
 
-# Blackmagic DeckLink input (Pro, docs/PRO.md Next 1). The Desktop Video SDK is a
-# registration download and is never committed: point MP_DECKLINK_SDK_DIR (or the env
-# var of the same name) at the SDK zip or its extracted folder. The COM headers are
-# generated from its IDL with midl at configure time, as Open RV does. Without it Pro
-# builds and its DeckLink input reports "no DeckLink support".
-set(MP_DECKLINK_SDK_DIR "$ENV{MP_DECKLINK_SDK_DIR}" CACHE PATH "Blackmagic DeckLink SDK zip or folder (Pro, Windows)")
+# Blackmagic DeckLink input (Pro, docs/PRO.md). The Desktop Video SDK is a registration
+# download and is never committed: point MP_DECKLINK_SDK_DIR (or the env var of the same
+# name) at the SDK zip or its extracted folder. Windows generates the COM header from the
+# SDK's IDL with midl at configure time (as Open RV does); macOS and Linux use the ready
+# headers in Mac/include and Linux/include plus the SDK's DeckLinkAPIDispatch.cpp, which
+# loads the installed DeckLinkAPI framework / libDeckLinkAPI.so at run time. Without the
+# SDK, Pro builds and its DeckLink input reports "no DeckLink support". The SDK's own
+# include folder stays on the include path everywhere for DeckLinkAPIVersion.h, which
+# DeckLinkSource.cpp uses to pick the 14.3+ frame-buffer API.
+set(MP_DECKLINK_SDK_DIR "$ENV{MP_DECKLINK_SDK_DIR}" CACHE PATH "Blackmagic DeckLink SDK zip or folder (Pro)")
 set(MP_DECKLINK_INCLUDE "")
-if(WIN32 AND MP_DECKLINK_SDK_DIR)
+set(MP_DECKLINK_SDK_INCLUDE "")
+if(MP_DECKLINK_SDK_DIR)
     set(_dl_root "${MP_DECKLINK_SDK_DIR}")
     if(_dl_root MATCHES "\.zip$")
         set(_dl_extract "${CMAKE_BINARY_DIR}/decklink_sdk")
@@ -496,14 +506,27 @@ if(WIN32 AND MP_DECKLINK_SDK_DIR)
         endif()
         set(_dl_root "${_dl_extract}")
     endif()
-    file(GLOB_RECURSE _dl_idl "${_dl_root}/*/Win/include/DeckLinkAPI.idl" "${_dl_root}/Win/include/DeckLinkAPI.idl")
-    list(LENGTH _dl_idl _dl_n)
-    if(_dl_n EQUAL 0)
-        message(FATAL_ERROR "MP_DECKLINK_SDK_DIR=${MP_DECKLINK_SDK_DIR}: no Win/include/DeckLinkAPI.idl in it. Point it at the Blackmagic DeckLink SDK (folder or .zip), or leave it unset for a build without DeckLink.")
+    if(WIN32)
+        set(_dl_plat "Win")
+        set(_dl_probe "DeckLinkAPI.idl")
+    elseif(APPLE)
+        set(_dl_plat "Mac")
+        set(_dl_probe "DeckLinkAPI.h")
     else()
-        list(GET _dl_idl 0 _dl_idl)
-        get_filename_component(_dl_inc "${_dl_idl}" DIRECTORY)
+        set(_dl_plat "Linux")
+        set(_dl_probe "DeckLinkAPI.h")
+    endif()
+    file(GLOB_RECURSE _dl_found "${_dl_root}/*/${_dl_plat}/include/${_dl_probe}" "${_dl_root}/${_dl_plat}/include/${_dl_probe}")
+    list(LENGTH _dl_found _dl_n)
+    if(_dl_n EQUAL 0)
+        message(FATAL_ERROR "MP_DECKLINK_SDK_DIR=${MP_DECKLINK_SDK_DIR}: no ${_dl_plat}/include/${_dl_probe} in it. Point it at the Blackmagic DeckLink SDK (folder or .zip), or leave it unset for a build without DeckLink.")
+    endif()
+    list(GET _dl_found 0 _dl_found)
+    get_filename_component(_dl_inc "${_dl_found}" DIRECTORY)
+    set(MP_DECKLINK_SDK_INCLUDE "${_dl_inc}")
+    if(WIN32)
         set(_dl_gen "${CMAKE_BINARY_DIR}/decklink_gen")
+        # midl runs once per build tree; delete decklink_gen/ after an SDK upgrade.
         if(NOT EXISTS "${_dl_gen}/DeckLinkAPI.h")
             file(MAKE_DIRECTORY "${_dl_gen}")
             execute_process(
@@ -515,8 +538,14 @@ if(WIN32 AND MP_DECKLINK_SDK_DIR)
         endif()
         if(EXISTS "${_dl_gen}/DeckLinkAPI.h")
             set(MP_DECKLINK_INCLUDE "${_dl_gen}")
-            message(STATUS "DeckLink input (Pro): ON (${_dl_inc})")
         endif()
+    else()
+        set(MP_DECKLINK_INCLUDE "${_dl_inc}")  # headers + DeckLinkAPIDispatch.cpp ship ready-made
+    endif()
+    if(MP_DECKLINK_INCLUDE)
+        file(STRINGS "${_dl_inc}/DeckLinkAPIVersion.h" _dl_ver REGEX "BLACKMAGIC_DECKLINK_API_VERSION_STRING")
+        string(REGEX REPLACE ".*\"([0-9.]+)\".*" "\\1" _dl_ver "${_dl_ver}")
+        message(STATUS "DeckLink input (Pro): ON (SDK ${_dl_ver}, ${_dl_inc})")
     endif()
 else()
     message(STATUS "DeckLink input (Pro): OFF (set MP_DECKLINK_SDK_DIR to the Desktop Video SDK)")
@@ -525,11 +554,20 @@ endif()
 # OpenColorIO (Pro, optional): an OCIO 2.x install prefix (e.g. Open RV's build,
 # <OpenRV>/_build/RV_DEPS_OCIO/install) and, on Windows, the folder holding its runtime
 # DLLs (Imath, expat, zlib: <OpenRV>/_build/stage/app/bin). Off by default.
+# macOS: the Homebrew keg, -DMP_OCIO_ROOT="$(brew --prefix opencolorio)"
+# (scripts/build_macos.sh --ocio). The .app bundler collects the dylibs; no DLL dir.
 set(MP_OCIO_ROOT "" CACHE PATH "OpenColorIO 2.x install prefix (Pro, optional)")
 set(MP_OCIO_DLL_DIR "" CACHE PATH "Folder with OpenColorIO's dependency DLLs (Windows)")
 set(MP_HAVE_OCIO FALSE)
 set(MP_OCIO_DLLS "")
 if(MP_OCIO_ROOT)
+    # OpenColorIOConfig.cmake find_dependency()s Imath, yaml-cpp, pystring, minizip-ng,
+    # expat and ZLIB through the normal search path. A Homebrew keg (<brew>/opt/<f> or
+    # <brew>/Cellar/<f>/<v>) keeps those in sibling kegs, so add the Homebrew prefix.
+    if(APPLE AND MP_OCIO_ROOT MATCHES "/(opt|Cellar)/opencolorio")
+        string(REGEX REPLACE "/(opt|Cellar)/opencolorio.*$" "" _ocio_brew "${MP_OCIO_ROOT}")
+        list(APPEND CMAKE_PREFIX_PATH "${_ocio_brew}")
+    endif()
     find_package(OpenColorIO CONFIG PATHS "${MP_OCIO_ROOT}" NO_DEFAULT_PATH)
     if(OpenColorIO_FOUND)
         set(MP_HAVE_OCIO TRUE)

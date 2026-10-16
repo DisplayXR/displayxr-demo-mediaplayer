@@ -29,7 +29,8 @@ void LiveSourceBase::ResetStats(int fpsReq, double fps) {
     stats_.fpsReq = fpsReq;
     stats_.fps = fps;
     lastError_.clear();
-    fpsWindowStart_ = NowSeconds();
+    openedAt_ = NowSeconds();
+    fpsWindowStart_ = openedAt_;
     fpsWindowCount_ = 0;
 }
 
@@ -53,6 +54,8 @@ void LiveSourceBase::Publish(const livepix::Nv12& src, bool fullRange, double ca
     f.gpuSharedTexture = nullptr;
     f.gpuSharedHandle = nullptr;
     f.captureSec = captureSec;
+    f.matrix = src.matrix;
+    f.transfer = src.transfer;
     std::memset(f.timecode, 0, sizeof(f.timecode));
     if (timecode) std::strncpy(f.timecode, timecode, sizeof(f.timecode) - 1);
     Published(src.width, src.height, fullRange, eyeOffsetFrames, ring_.Publish());
@@ -74,6 +77,8 @@ void LiveSourceBase::Publish(const livepix::P016& src, bool fullRange, double ca
     f.gpuSharedTexture = nullptr;
     f.gpuSharedHandle = nullptr;
     f.captureSec = captureSec;
+    f.matrix = src.matrix;
+    f.transfer = src.transfer;
     std::memset(f.timecode, 0, sizeof(f.timecode));
     if (timecode) std::strncpy(f.timecode, timecode, sizeof(f.timecode) - 1);
     Published(src.width, src.height, fullRange, eyeOffsetFrames, ring_.Publish());
@@ -99,14 +104,20 @@ void LiveSourceBase::Published(int w, int h, bool fullRange, int eyeOffsetFrames
     if (state_ == LiveState::Opening || state_ == LiveState::Stalled) state_ = LiveState::Streaming;
 }
 
+void LiveSourceBase::SetNoSignal(int eye, bool on) {
+    std::lock_guard<std::mutex> lk(statsMutex_);
+    const int bit = 1 << (eye & 1);
+    stats_.noSignalEyes = on ? (stats_.noSignalEyes | bit) : (stats_.noSignalEyes & ~bit);
+}
+
 void LiveSourceBase::CheckStall(double stallSec) {
     double last;
     {
         std::lock_guard<std::mutex> lk(statsMutex_);
-        last = stats_.lastPublishSec;
+        last = stats_.lastPublishSec > 0.0 ? stats_.lastPublishSec : openedAt_;
     }
     const LiveState st = state_.load();
-    if (st == LiveState::Streaming && last > 0.0 && NowSeconds() - last > stallSec)
+    if ((st == LiveState::Streaming || st == LiveState::Opening) && last > 0.0 && NowSeconds() - last > stallSec)
         state_ = LiveState::Stalled;
 }
 
