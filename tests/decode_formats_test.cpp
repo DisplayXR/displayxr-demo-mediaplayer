@@ -3,7 +3,8 @@
 // Pro review formats through the real VideoDecoder: writes tiny EXR and DPX sequences
 // and a 10-bit ProRes clip with FFmpeg's own encoders into a temp folder, plays each
 // back and checks what reaches the frame ring - the sequence opens as one clip, EXR is
-// encoded for display (not dark), 10-bit sources keep 16 bits (P016).
+// encoded for display (not dark) at 16 bits, 10-bit sources keep 16 bits (P016), and the
+// stream's colour matrix / transfer reach the frame's tags.
 
 #include "media/FrameRing.h"
 #include "media/VideoDecoder.h"
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -39,7 +41,8 @@ int g_failures = 0;
 // Encode `frames` frames of a flat picture to `path` (an image2 pattern or a .mov).
 // fill(frame) sets the pixel values.
 bool Write(const std::string& path, const char* muxer, AVCodecID codecId, AVPixelFormat pf, int w, int h,
-           int frames, int startNumber, void (*fill)(AVFrame*)) {
+           int frames, int startNumber, void (*fill)(AVFrame*), AVColorSpace cs = AVCOL_SPC_UNSPECIFIED,
+           AVColorTransferCharacteristic trc = AVCOL_TRC_UNSPECIFIED) {
     AVFormatContext* oc = nullptr;
     if (avformat_alloc_output_context2(&oc, nullptr, muxer, path.c_str()) < 0) return false;
     const AVCodec* codec = avcodec_find_encoder(codecId);
@@ -50,6 +53,14 @@ bool Write(const std::string& path, const char* muxer, AVCodecID codecId, AVPixe
     c->height = h;
     c->pix_fmt = pf;
     c->time_base = AVRational{1, 24};
+    // The mov muxer writes its 'colr' atom only when all three are known, so primaries
+    // follow the matrix.
+    const AVColorPrimaries prim = cs == AVCOL_SPC_BT2020_NCL ? AVCOL_PRI_BT2020
+                                  : cs == AVCOL_SPC_BT709    ? AVCOL_PRI_BT709
+                                                             : AVCOL_PRI_UNSPECIFIED;
+    c->colorspace = cs;
+    c->color_trc = trc;
+    c->color_primaries = prim;
     st->time_base = c->time_base;
     if (oc->oformat->flags & AVFMT_GLOBALHEADER) c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     if (avcodec_open2(c, codec, nullptr) < 0) return false;
@@ -61,6 +72,9 @@ bool Write(const std::string& path, const char* muxer, AVCodecID codecId, AVPixe
     f->format = pf;
     f->width = w;
     f->height = h;
+    f->colorspace = cs;
+    f->color_trc = trc;
+    f->color_primaries = prim;
     av_frame_get_buffer(f, 32);
     AVPacket* pkt = av_packet_alloc();
     for (int i = 0; i <= frames; ++i) {
@@ -125,6 +139,8 @@ bool FirstFrame(const std::string& path, mp::FrameRing::Frame& out, double& dura
             out.height = f->height;
             out.format = f->format;
             out.fullRange = f->fullRange;
+            out.matrix = f->matrix;
+            out.transfer = f->transfer;
             out.plane[0] = f->plane[0];
             out.plane[1] = f->plane[1];
             dec.Stop();
@@ -158,12 +174,19 @@ int main() {
     bool seq = false;
     CHECK(FirstFrame((dir / "exr" / "plate.1003.exr").string(), f, dur, seq), "EXR sequence decodes");
     CHECK(seq && std::fabs(dur - 5.0 / 24.0) < 0.02, "5 frames at 24 fps = one clip");
-    CHECK(f.format == mp::PixFormat::I420 && f.width == W, "EXR -> I420 at full size");
-    if (!f.plane[0].empty()) {
-        // linear 0.18 -> sRGB 0.461 -> limited-range Y = 16 + 0.461*219 = 117
-        const int y = f.plane[0][(size_t)(H / 2) * W + W / 2];
-        std::printf("  EXR 18%% grey -> Y %d\n", y);
-        CHECK(std::abs(y - 117) <= 2, "scene-linear 18% grey encoded for display (Y ~117, not ~55)");
+    CHECK(f.format == mp::PixFormat::P016 && f.width == W, "EXR -> P016 (16-bit) at full size");
+    CHECK(f.matrix == mp::ColorMatrix::BT709 && !f.fullRange, "EXR encoded as BT.709 limited, and tagged so");
+    if (f.format == mp::PixFormat::P016 && f.plane[0].size() >= (size_t)W * H * 2 &&
+        f.plane[1].size() >= (size_t)W * (H / 2) * 2) {
+        // linear 0.18 -> sRGB 0.46135 -> 10-bit limited Y = 64 + 0.46135*876 = 468.14, kept
+        // with its fraction at 16 bits (x64 = 29961); grey chroma is neutral 512 (32768).
+        const uint16_t y = reinterpret_cast<const uint16_t*>(f.plane[0].data())[(size_t)(H / 2) * W + W / 2];
+        const uint16_t* uv = reinterpret_cast<const uint16_t*>(f.plane[1].data()) + (size_t)(H / 4) * W + W / 2;
+        std::printf("  EXR 18%% grey -> P016 Y %u (%.2f in 10-bit), Cb %.2f Cr %.2f\n", y, y / 64.0, uv[0] / 64.0,
+                    uv[1] / 64.0);
+        CHECK(std::fabs(y / 64.0 - 468.14) < 0.25, "scene-linear 18% grey encoded for display at 16 bits (Y10 ~468.1)");
+        CHECK(std::fabs(uv[0] / 64.0 - 512.0) < 0.25 && std::fabs(uv[1] / 64.0 - 512.0) < 0.25,
+              "EXR grey chroma neutral");
     }
 
     // --- DPX sequence (10-bit RGB) -------------------------------------------------------
@@ -194,7 +217,24 @@ int main() {
         CHECK(std::fabs(y / 64.0 - 600.0) < 3.0, "10-bit luma value kept");
     }
 
-    fs::remove_all(dir, ec);
+    CHECK(f.matrix == mp::ColorMatrix::BT601 && f.transfer == mp::ColorTransfer::SDR,
+          "untagged SD (64-line) clip -> BT.601 by the SD rule, SDR");
+
+    // --- Colour tags: the stream's matrix + transfer reach the frame -------------------
+    CHECK(Write((dir / "hlg2020.mov").string(), "mov", AV_CODEC_ID_PRORES, AV_PIX_FMT_YUV422P10LE, W, H, 2, -1,
+                FillYuv10, AVCOL_SPC_BT2020_NCL, AVCOL_TRC_ARIB_STD_B67),
+          "write BT.2020 HLG ProRes");
+    CHECK(FirstFrame((dir / "hlg2020.mov").string(), f, dur, seq), "BT.2020 HLG ProRes decodes");
+    std::printf("  tagged clip -> %s / %s\n", mp::ColorMatrixName(f.matrix), mp::ColorTransferName(f.transfer));
+    CHECK(f.matrix == mp::ColorMatrix::BT2020, "BT.2020 NCL stream tagged BT.2020");
+    CHECK(f.transfer == mp::ColorTransfer::HLG, "HLG transfer carried as a tag");
+    CHECK(Write((dir / "sd709.mov").string(), "mov", AV_CODEC_ID_PRORES, AV_PIX_FMT_YUV422P10LE, W, H, 2, -1,
+                FillYuv10, AVCOL_SPC_BT709, AVCOL_TRC_BT709),
+          "write BT.709 ProRes");
+    CHECK(FirstFrame((dir / "sd709.mov").string(), f, dur, seq), "BT.709 ProRes decodes");
+    CHECK(f.matrix == mp::ColorMatrix::BT709, "an explicit BT.709 tag wins over the SD rule");
+
+    if (!std::getenv("MP_KEEP_TEST_FILES")) fs::remove_all(dir, ec);
     if (g_failures) {
         std::fprintf(stderr, "decode_formats_test: %d failure(s)\n", g_failures);
         return 1;

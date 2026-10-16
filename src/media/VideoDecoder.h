@@ -98,7 +98,8 @@ public:
     static bool ProFormats() { return proFormats_; }
     void SetSequenceFps(double fps) { seqFps_ = fps > 0.0 ? fps : 24.0; }  // before Open()
     bool IsSequence() const { return isSequence_; }
-    ::AVFrame* FloatToI420(::AVFrame* src);  // decode thread: float EXR -> sRGB-encoded I420
+    // decode thread: float EXR -> sRGB-encoded BT.709 limited P016 (16-bit; >1.0 clips)
+    ::AVFrame* FloatToP016(::AVFrame* src);
 
     // Optional A/V master clock (audio position in seconds, or <0 when unavailable). When
     // set and returning >=0, the decode thread presents each frame when the clock reaches

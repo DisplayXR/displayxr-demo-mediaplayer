@@ -10,7 +10,7 @@
 //
 // MP_GRADE (defined for the DESKTOP build by scripts/gen_shaders.sh) adds the Media
 // Player Pro grade (exposure, ASC CDL, 3D LUT at binding 3) and the QC views, and
-// grows the push block to 112 bytes. The Android leg compiles this same file WITHOUT
+// grows the push block to 116 bytes (yuvMatrix last). The Android leg compiles this same file WITHOUT
 // it, so its 3-binding layout and 28-byte push block (sbs_renderer.cpp) are unchanged.
 #version 450
 
@@ -40,6 +40,7 @@ layout(push_constant) uniform PushConstants {
     vec4 cdlOffset;  // .rgb = ASC offset, .a = 1 when the CDL is on
     vec4 cdlPower;   // .rgb = ASC power
     vec4 lutDomain;  // .x = domain min, .y = 1/(max-min), .z = LUT size N, .w = 1 for P016
+    int yuvMatrix;   // 0 = BT.709 (default: base content unchanged), 1 = BT.601, 2 = BT.2020 NCL
 #endif
 } pc;
 
@@ -57,6 +58,20 @@ vec4 EncodeForTarget(vec4 c) {
     return c;
 }
 
+// Range-expanded Y'CbCr (Y 0..1, Cb/Cr -0.5..0.5) -> R'G'B'. Without MP_GRADE (Android)
+// and for yuvMatrix 0 this is exactly the BT.709 expression the shader always used.
+vec3 YuvToRgb(float yb, float ub, float vb) {
+#ifdef MP_GRADE
+    if (pc.yuvMatrix == 1)         // BT.601 (Kr .299, Kb .114): SD video, JPEG-era sources
+        return vec3(yb + 1.402 * vb, yb - 0.344136 * ub - 0.714136 * vb, yb + 1.772 * ub);
+    if (pc.yuvMatrix == 2)         // BT.2020 non-constant luminance (Kr .2627, Kb .0593)
+        return vec3(yb + 1.4746 * vb, yb - 0.164553 * ub - 0.571353 * vb, yb + 1.8814 * ub);
+#endif
+    return vec3(yb + 1.5748 * vb,
+                yb - 0.1873 * ub - 0.4681 * vb,
+                yb + 1.8556 * ub);
+}
+
 // Fetch the display-referred RGB at `uv` (RGBA texture or planar YUV).
 vec3 SampleSource(vec2 uv) {
     if (pc.mode == 0) return texture(plane0, uv).rgb;
@@ -72,7 +87,7 @@ vec3 SampleSource(vec2 uv) {
         v = texture(plane2, uv).r;
     }
 
-    // Range-expand, then BT.709. Full range uses the samples directly; limited range
+    // Range-expand, then the frame's matrix (YuvToRgb). Full range uses the samples directly; limited range
     // remaps Y [16,235]->[0,1] and chroma [16,240]->[-0.5,0.5] (8-bit).
     float yb, ub, vb;
 #ifdef MP_GRADE
@@ -82,7 +97,7 @@ vec3 SampleSource(vec2 uv) {
         yb = (y * 65535.0 / 64.0 - 64.0) / 876.0;
         ub = (u * 65535.0 / 64.0 - 512.0) / 896.0;
         vb = (v * 65535.0 / 64.0 - 512.0) / 896.0;
-        return clamp(vec3(yb + 1.5748 * vb, yb - 0.1873 * ub - 0.4681 * vb, yb + 1.8556 * ub), 0.0, 1.0);
+        return clamp(YuvToRgb(yb, ub, vb), 0.0, 1.0);
     }
 #endif
     if (pc.fullRange > 0.5) {
@@ -94,10 +109,7 @@ vec3 SampleSource(vec2 uv) {
         ub = (u - 128.0 / 255.0) * (255.0 / 224.0);
         vb = (v - 128.0 / 255.0) * (255.0 / 224.0);
     }
-    vec3 rgb = vec3(yb + 1.5748 * vb,
-                    yb - 0.1873 * ub - 0.4681 * vb,
-                    yb + 1.8556 * ub);
-    return clamp(rgb, 0.0, 1.0);
+    return clamp(YuvToRgb(yb, ub, vb), 0.0, 1.0);
 }
 
 #ifdef MP_GRADE

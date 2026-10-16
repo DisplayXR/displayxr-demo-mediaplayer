@@ -20,6 +20,25 @@ namespace mp {
 // 10-bit capture (DeckLink v210) publishes it; the base player never does.
 enum class PixFormat { I420, NV12, RGBA, P016 };  // 3-plane, 2-plane, packed RGBA (zero-copy #28), 16-bit 2-plane
 
+// Y'CbCr -> R'G'B' matrix of a YUV frame. The value is what the renderer pushes to the
+// MP_GRADE shader (`yuvMatrix`), so BT709 must stay 0: every producer that never sets it
+// gets today's BT.709 convert, bit for bit. BT2020 is the non-constant-luminance matrix.
+enum class ColorMatrix : int { BT709 = 0, BT601 = 1, BT2020 = 2 };
+// Transfer characteristic, carried as a TAG ONLY (for the UI): the renderer treats every
+// frame as SDR display-referred. HLG / PQ are not tone-mapped (docs/PRO.md).
+enum class ColorTransfer : int { SDR = 0, HLG = 1, PQ = 2 };
+
+// The usual rule when a stream does not say: SD (576 lines and below) is BT.601, HD+ BT.709.
+inline ColorMatrix DefaultMatrixForHeight(int height) {
+    return height > 0 && height <= 576 ? ColorMatrix::BT601 : ColorMatrix::BT709;
+}
+inline const char* ColorMatrixName(ColorMatrix m) {
+    return m == ColorMatrix::BT601 ? "BT.601" : m == ColorMatrix::BT2020 ? "BT.2020" : "BT.709";
+}
+inline const char* ColorTransferName(ColorTransfer t) {
+    return t == ColorTransfer::HLG ? "HLG" : t == ColorTransfer::PQ ? "PQ" : "SDR";
+}
+
 class FrameRing {
 public:
     struct Frame {
@@ -30,6 +49,8 @@ public:
         int height = 0;
         PixFormat format = PixFormat::I420;
         bool fullRange = false;       // JPEG/full vs MPEG/limited range
+        ColorMatrix matrix = ColorMatrix::BT709;      // YUV matrix (ignored for RGBA)
+        ColorTransfer transfer = ColorTransfer::SDR;  // tag only - never tone-mapped
         int64_t serial = 0;           // monotonic; lets the consumer detect newness
         // Live sources: when the frame was captured (steady seconds, LiveProducer::
         // NowSeconds) and its source timecode ("HH:MM:SS:FF", empty when it has none).

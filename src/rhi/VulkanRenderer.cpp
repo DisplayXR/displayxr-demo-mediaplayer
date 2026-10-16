@@ -58,8 +58,10 @@ struct DrawPush {
     float cdlOffset[4];  // 64  .a = CDL on
     float cdlPower[4];   // 80
     float lutDomain[4];  // 96  x = min, y = 1/(max-min), z = N
+    int32_t yuvMatrix;   // 112 0 = BT.709 (default), 1 = BT.601, 2 = BT.2020 NCL
 };
-static_assert(sizeof(DrawPush) == 112, "DrawPush must match the shader's PushConstants");
+static_assert(sizeof(DrawPush) == 116, "DrawPush must match the shader's PushConstants");
+static_assert(sizeof(DrawPush) <= 128, "push block over the guaranteed 128-byte minimum");
 
 // IEEE 754 binary32 -> binary16 (round half up on the dropped bits), for the RGBA16F LUT.
 uint16_t FloatToHalf(float f) {
@@ -572,7 +574,8 @@ bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t
 }
 
 bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2,
-                               uint32_t width, uint32_t height, int format, bool fullRange) {
+                               uint32_t width, uint32_t height, int format, bool fullRange,
+                               int matrix) {
     if (!plane0 || !plane1 || width == 0 || height == 0) return false;
 #if defined(_WIN32)
     sharedActive_ = false;  // CPU-plane upload -> leave the zero-copy path
@@ -615,6 +618,7 @@ bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, con
     sourceMode_ = mode;
     sourceFullRange_ = fullRange ? 1.0f : 0.0f;
     source16_ = (format == 2);
+    sourceMatrix_ = (matrix == 1 || matrix == 2) ? matrix : 0;  // anything else -> BT.709
     // Descriptor sets are written per frame (DrawViews), so nothing to rebind here.
     if (rec[0]) LOG_INFO("VulkanRenderer: YUV source %ux%u mode=%d", width, height, mode);
     return true;
@@ -835,6 +839,7 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         pc.lutDomain[1] = 1.0f / std::max(1e-6f, lut_.domainMax - lut_.domainMin);
         pc.lutDomain[2] = (float)std::max(1u, lut_.size);
         pc.lutDomain[3] = source16_ ? 1.0f : 0.0f;  // MP_GRADE: 10-bit levels for P016
+        pc.yuvMatrix = sourceMode_ == 0 ? 0 : sourceMatrix_;  // RGBA sources ignore it
         vkCmdPushConstants(cmd, activeLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 3, 1, 0, 0);

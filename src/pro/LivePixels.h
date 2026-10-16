@@ -6,6 +6,8 @@
 // no extra copy. Pure functions, unit-tested (tests/live_pixels_test.cpp).
 #pragma once
 
+#include "media/FrameRing.h"  // ColorMatrix
+
 #include <cstdint>
 #include <vector>
 
@@ -16,13 +18,20 @@ namespace mp::livepix {
 struct Nv12 {
     int width = 0, height = 0;
     std::vector<uint8_t> y, uv;
+    // The Y'CbCr matrix of the samples - publish it as FrameRing::Frame::matrix. The
+    // converters below set it (BGRA: the matrix they encode with; UYVY: the SDI rule, SD =
+    // BT.601, HD = BT.709); a source that knows better (the card reports the signal's
+    // colorimetry) overwrites it after converting.
+    ColorMatrix matrix = ColorMatrix::BT709;
+    ColorTransfer transfer = ColorTransfer::SDR;  // tag only (FrameRing::Frame::transfer)
     void Resize(int w, int h);
 };
 
 // Convert one eye (w x h) into dst at column x0 (even). UYVY: Cb Y0 Cr Y1 per 2 pixels.
 // 4:2:2 -> 4:2:0 averages each vertical chroma pair.
 void UyvyToNv12(const uint8_t* src, int srcRowBytes, int w, int h, Nv12& dst, int x0);
-// BGRA (an RGB 4:4:4 signal) -> limited-range BT.709 NV12 (BT.601 below 720 lines).
+// BGRA (an RGB 4:4:4 signal) -> limited-range BT.709 NV12 (BT.601 below 720 lines; dst.matrix
+// says which).
 void BgraToNv12(const uint8_t* src, int srcRowBytes, int w, int h, Nv12& dst, int x0);
 // Copy one eye of dst (columns [x0, x0+w)) onto columns [x1, x1+w) (repeat an eye).
 void CopyEye(Nv12& dst, int x0, int x1, int w);
@@ -32,6 +41,8 @@ void CopyEye(Nv12& dst, int x0, int x1, int w);
 struct P016 {
     int width = 0, height = 0;
     std::vector<uint16_t> y, uv;  // y: width*height; uv: width*(height/2) (U,V pairs)
+    ColorMatrix matrix = ColorMatrix::BT709;  // as Nv12::matrix
+    ColorTransfer transfer = ColorTransfer::SDR;
     void Resize(int w, int h);
 };
 // v210: 10-bit 4:2:2, 6 pixels in four little-endian 32-bit words (Cb Y Cr | Y Cb Y |
