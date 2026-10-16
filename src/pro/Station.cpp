@@ -84,7 +84,7 @@ void Station::Init(StationHost host, const StationOptions& opt) {
         d.spec = eq == std::string::npos ? in : in.substr(eq + 1);
         inputs_.push_back(d);
     }
-    if (!inputs_.empty()) SwitchInput(0);
+    if (!inputs_.empty() && opt.startFirstInput) SwitchInput(0);
 }
 
 void Station::Shutdown() {
@@ -110,27 +110,28 @@ bool Station::SwitchInput(int index) {
             if (host_.toast) host_.toast("Input '" + d.name + "': bad spec " + d.spec);
             return false;
         }
-        testSignal_.Stop();
+        // EnterLive stops the previous source only once the new one opened. Re-opening the
+        // card that is live stops it first, so a failure there must leave live mode.
+        const LiveState was = decklink_.GetState();
+        const bool wasLive = was != LiveState::Closed && was != LiveState::Failed && was != LiveState::Denied;
         ok = decklink_.Open(c);
         if (ok && host_.enterLive) host_.enterLive(&decklink_, decklink_.DeviceName());
-        if (!ok && host_.toast) host_.toast("DeckLink: " + decklink_.LastError());
+        if (!ok) {
+            if (wasLive && host_.stopLive) host_.stopLive();
+            if (host_.toast) host_.toast("DeckLink: " + decklink_.LastError());
+        }
     } else if (kind == "test") {
         TestSignalConfig c = opt_.testCfg;
         if (!c.ParseSpec(args)) {
             if (host_.toast) host_.toast("Input '" + d.name + "': bad test spec " + args);
             return false;
         }
-        decklink_.Stop();
         ok = testSignal_.Open(c);
         if (ok && host_.enterLive) host_.enterLive(&testSignal_, testSignal_.DeviceName());
     } else if (kind == "camera") {
-        decklink_.Stop();
-        testSignal_.Stop();
-        ok = host_.openCamera && host_.openCamera(args);
+        ok = host_.openCamera && host_.openCamera(args);  // EnterLive stops a Pro source on success
     } else if (kind == "url") {
-        decklink_.Stop();
-        testSignal_.Stop();
-        ok = host_.openUrl && host_.openUrl(args);
+        ok = host_.openUrl && host_.openUrl(args);        // LoadUrl stops any live source
     } else {
         if (host_.toast) host_.toast("Input '" + d.name + "': unknown kind '" + kind + "'");
         return false;
@@ -154,13 +155,24 @@ bool Station::HandleKey(int key) {
             if (host_.toast) host_.toast(showHistory_ ? "Rig history shown" : "Rig history hidden");
             return true;
         case SDLK_N:
-            TakeSnapshot("");
+            pendingSnapshot_ = true;  // done in Tick(), outside the SDL event hook
             return true;
         case SDLK_J:
-            SwitchInput(inputIndex_ + 1);
+            pendingSwitch_ = true;
             return true;
         default:
             return false;
+    }
+}
+
+void Station::Tick() {
+    if (pendingSnapshot_) {
+        pendingSnapshot_ = false;
+        TakeSnapshot("");
+    }
+    if (pendingSwitch_) {
+        pendingSwitch_ = false;
+        SwitchInput(inputIndex_ + 1);
     }
 }
 

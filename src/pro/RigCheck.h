@@ -127,6 +127,7 @@ private:
     std::vector<Alert> alerts_;
     Budget budget_;
     double measureMs_ = 0.0;
+    uint64_t generation_ = 0;  // bumped by Reset: a measurement started before it is dropped
     // open alert runs
     double nearSince_ = -1, farSince_ = -1, vertSince_ = -1, colSince_ = -1;
     float nearWorst_ = 0, farWorst_ = 0, vertWorst_ = 0, colWorst_ = 0;

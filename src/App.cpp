@@ -1910,8 +1910,16 @@ void App::SampleAutoConv(const FrameRing::Frame& f) {
     // Measure on the halves the viewer's eyes actually see (X / container swap).
     const bool swap = (swapEyes_ != mediaEyeSwap_);
     const bool focus = autoConvPolicy_ == autoconv::SubjectPolicy::Focus && autoConvHasFocus_;
+    const uint8_t* luma = f.plane[0].data();
+    if (f.format == PixFormat::P016) {  // 16-bit (Pro's 10-bit path): the measurement is 8-bit
+        const size_t n = (size_t)f.width * (size_t)f.height;
+        autoConvLuma8_.resize(n);
+        const uint16_t* s16 = reinterpret_cast<const uint16_t*>(f.plane[0].data());
+        for (size_t i = 0; i < n; ++i) autoConvLuma8_[i] = (uint8_t)(s16[i] >> 8);
+        luma = autoConvLuma8_.data();
+    }
     autoConvDownsampleMs_ =
-        autoConvWorker_.Submit(f.plane[0].data(), f.width, f.width, f.height, swap,
+        autoConvWorker_.Submit(luma, f.width, f.width, f.height, swap,
                                autoConvPolicy_, focus ? autoConvFocus_ : nullptr, nowMs);
 }
 
@@ -2091,12 +2099,13 @@ void App::RebuildFolderList(std::string path) {
         // An EXR / DPX / TIFF sequence (Pro) is one clip: keep its first frame only. The
         // current file stays listed so the index below still finds it.
         std::vector<std::string> kept;
-        std::string lastKey;
+        std::vector<std::string> seen;  // sequence keys already listed (a folder may interleave two)
         for (const std::string& f : folderFiles_) {
             const std::string k = imageseq::Key(f);
             std::error_code e3;
-            if (!k.empty() && k == lastKey && !fs::equivalent(fs::path(f), p, e3)) continue;
-            lastKey = k;
+            const bool dup = !k.empty() && std::find(seen.begin(), seen.end(), k) != seen.end();
+            if (dup && !fs::equivalent(fs::path(f), p, e3)) continue;
+            if (!k.empty() && !dup) seen.push_back(k);
             kept.push_back(f);
         }
         folderFiles_.swap(kept);
@@ -2908,6 +2917,7 @@ void App::InitPro() {
         if (isStream_) StopStream(/*showIdleIfEmpty=*/false);
         EnterLive(p, name);
     };
+    sh.stopLive = [this] { if (isLive_) StopLive(/*showIdleIfEmpty=*/true); };
     sh.openCamera = [this](const std::string& sel) { return LoadLive(sel); };
     sh.openUrl = [this](const std::string& url) { return LoadUrl(url); };
     sh.capturePrefix = [this](const std::string& stem) {
@@ -2925,6 +2935,7 @@ void App::InitPro() {
     so.budget.maxVerticalPx = launch_.proBudget[2];
     so.budget.maxDeltaE = launch_.proBudget[3];
     so.timecode = launch_.proTimecode;
+    so.startFirstInput = !hasMedia_ || isLogo_;  // a file / camera / URL from the command line wins
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_VSHIFT")) so.testCfg.vShiftPx = (float)std::atof(e);
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_EYE_DELAY")) so.testCfg.eyeDelay = std::atoi(e);
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_GAIN_R")) so.testCfg.gainR = (float)std::atof(e);
@@ -2943,6 +2954,7 @@ pro::Status App::ProStatus() const {
     st.panelFps = fps_;
     st.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
     st.live = isLive_;
+    st.eyesSwapped = swapEyes_ != mediaEyeSwap_;
     st.hasPicture = hasMedia_ && !isLogo_ && (isLive_ || isStream_ || isVideo_);
     if (isLive_) {
         st.sourceKind = LiveIsCamera() ? "Camera" : live_->Kind();

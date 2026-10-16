@@ -26,6 +26,7 @@ namespace mp::pro {
 struct StationHost {
     // Make `p` (opened) the live source - App::EnterLive.
     std::function<void(LiveProducer* p, const std::string& name)> enterLive;
+    std::function<void()> stopLive;  // leave live mode (a re-opened input failed)
     // The trunk's own live sources, by input spec.
     std::function<bool(const std::string& selector)> openCamera;
     std::function<bool(const std::string& url)> openUrl;
@@ -42,6 +43,7 @@ struct StationOptions {
     rig::Budget budget;
     bool timecode = true;
     TestSignalConfig testCfg;         // faults from MEDIAPLAYER_TEST_*
+    bool startFirstInput = true;      // false when the command line already opened media
 };
 
 class Station {
@@ -50,8 +52,9 @@ public:
     void Init(StationHost host, const StationOptions& opt);
     void Shutdown();
 
-    // Keys (SDL keycode); true when consumed.
+    // Keys (SDL keycode); true when consumed. Actions that change the player run in Tick().
     bool HandleKey(int sdlKey);
+    void Tick();  // per frame, from ProController::Tick (outside the SDL event hook)
     // Every frame the trunk uploads (live or file): timecode, delay, rig checks.
     void OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live, int eyeOffsetFrames);
 
@@ -89,6 +92,7 @@ private:
     int inputIndex_ = -1;
     bool showTimecode_ = true;
     bool showHistory_ = true;
+    bool pendingSnapshot_ = false, pendingSwitch_ = false;
     std::string timecode_;
     double delayMs_ = 0.0;
     double alertsLoggedUntil_ = 0.0;

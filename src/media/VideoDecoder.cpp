@@ -809,7 +809,13 @@ void VideoDecoder::DecodeLoop() {
                 impl_->convFrame->format = AV_PIX_FMT_P016LE;
                 impl_->convFrame->width = src->width;
                 impl_->convFrame->height = src->height;
-                av_frame_get_buffer(impl_->convFrame, 32);
+                if (!impl_->sws || av_frame_get_buffer(impl_->convFrame, 32) < 0) {
+                    if (impl_->sws) sws_freeContext(impl_->sws);
+                    impl_->sws = nullptr;
+                    impl_->swsFmt = -1;
+                    LOG_ERROR("VideoDecoder: cannot convert %s to 16-bit", av_get_pix_fmt_name(sf));
+                    return -2.0;
+                }
             }
             sws_scale(impl_->sws, src->data, src->linesize, 0, src->height, impl_->convFrame->data,
                       impl_->convFrame->linesize);
@@ -967,8 +973,22 @@ void VideoDecoder::DecodeLoop() {
                 if (ptsSec >= 0.0) {
                     positionSec_.store(ptsSec);
                     if (firstPtsSec < 0.0) { firstPtsSec = ptsSec; wallStart = clock::now(); }
-                    std::this_thread::sleep_until(wallStart + std::chrono::duration_cast<clock::duration>(
-                                                                  std::chrono::duration<double>(ptsSec - firstPtsSec)));
+                    // Wait for the frame's time in short steps: a stop or seek cuts it short,
+                    // and a pause holds it (moving the wall clock on, as the main loop does).
+                    const auto due = std::chrono::duration_cast<clock::duration>(
+                        std::chrono::duration<double>(ptsSec - firstPtsSec));
+                    while (!stop_.load() && seekRequest_.load() < 0.0) {
+                        if (paused_.load()) {
+                            const auto pauseBegin = clock::now();
+                            while (paused_.load() && seekRequest_.load() < 0.0 && !stop_.load())
+                                std::this_thread::sleep_for(std::chrono::milliseconds(8));
+                            wallStart += clock::now() - pauseBegin;
+                            continue;
+                        }
+                        const auto left = wallStart + due - clock::now();
+                        if (left <= clock::duration::zero()) break;
+                        std::this_thread::sleep_for(std::min<clock::duration>(left, std::chrono::milliseconds(8)));
+                    }
                 }
                 ring_.Publish();
             }

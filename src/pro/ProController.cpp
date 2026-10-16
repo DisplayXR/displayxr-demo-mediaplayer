@@ -336,7 +336,7 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
                     return true;
                 }
                 case SDLK_B:
-                    ToggleCompare();
+                    pendingCompare_ = true;  // done in Tick(), outside the SDL event hook
                     return true;
                 case SDLK_D:
                     depthOverlay_ = !depthOverlay_;
@@ -363,6 +363,12 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
 
 void ProController::Tick(const Status& st) {
     stereoSource_ = st.stereo;
+    station_.Tick();
+    if (pendingCompare_) {
+        pendingCompare_ = false;
+        ToggleCompare();
+    }
+    rightOnlyView_ = mode_ == ViewMode::RightOnly;
     std::string path;
     bool isCdl = false;
     {
@@ -406,7 +412,9 @@ void ProController::Tick(const Status& st) {
 // it, blue behind - and ringed red when it breaks the depth budget. Follows pan / zoom.
 void ProController::BuildDepthOverlay(const Status& st) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
-    if (!depthOverlay_ || !st.stereo || !st.hasPicture || !host_.pictureInHud) return;
+    // The matches are left-eye positions: shown in 3D / left / difference / anaglyph, not
+    // in the right-eye view, and not while the eyes are swapped (they would sit off).
+    if (!depthOverlay_ || !st.stereo || !st.hasPicture || !host_.pictureInHud || rightOnlyView_ || st.eyesSwapped) return;
     float px, py, pw, ph;
     if (!host_.pictureInHud(px, py, pw, ph)) return;
     const rig::Result r = station_.RigLast();

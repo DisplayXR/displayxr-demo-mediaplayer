@@ -299,6 +299,7 @@ void RigMonitor::Worker() {
         cv_.wait(lk, [this] { return stop_ || pending_; });
         if (stop_) return;
         EyePair e = std::move(work_);
+        const uint64_t gen = generation_;
         const int eyeOffset = pendingEyeOffset_;
         const std::string tc = pendingTimecode_;
         lk.unlock();
@@ -307,6 +308,7 @@ void RigMonitor::Worker() {
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         lk.lock();
         pending_ = false;
+        if (gen != generation_) continue;  // Reset() ran meanwhile: this was the old input
         measureMs_ = ms;
         last_ = r;
         Sample s;
@@ -389,6 +391,7 @@ Budget RigMonitor::GetBudget() const {
 
 void RigMonitor::Reset() {
     std::lock_guard<std::mutex> lk(m_);
+    ++generation_;
     history_.clear();
     alerts_.clear();
     last_ = Result{};

@@ -46,6 +46,7 @@ struct Status {
     float frameAgeMs = 0.0f;    // live: publish -> upload age
     bool live = false;          // a live source (camera, DeckLink, test rig) is showing
     bool hasPicture = false;    // live, video or stream: rig checks + history apply
+    bool eyesSwapped = false;   // the user's swap XOR the container's (R|L packing)
     std::string modeName;       // display mode, e.g. "LeiaSR"
 };
 
@@ -173,6 +174,8 @@ private:
     bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture
     std::string compare_[2];       // A (what was open) and B
     int compareSide_ = 0;          // 0 = A showing
+    bool pendingCompare_ = false;  // B pressed: swap in Tick()
+    bool rightOnlyView_ = false;
     bool stereoSource_ = false;
 };
 

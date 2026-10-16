@@ -277,6 +277,7 @@ private:
     // goes through ReloadMedia, which stops the camera first.
     CameraSource camera_;
     LiveProducer* live_ = &camera_;     // the producer live mode reads (isLive_)
+    std::vector<uint8_t> autoConvLuma8_;  // P016 frames: 8-bit luma for auto-convergence
     LaunchOptions launch_{};
     bool isLive_ = false;               // the live camera is the current source
     bool livePaused_ = false;           // Space = freeze (the camera keeps streaming)
