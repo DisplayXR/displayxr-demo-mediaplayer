@@ -29,6 +29,10 @@ public:
         PixFormat format = PixFormat::I420;
         bool fullRange = false;       // JPEG/full vs MPEG/limited range
         int64_t serial = 0;           // monotonic; lets the consumer detect newness
+        // Live sources: when the frame was captured (steady seconds, LiveProducer::
+        // NowSeconds) and its source timecode ("HH:MM:SS:FF", empty when it has none).
+        double captureSec = 0.0;
+        char timecode[16] = {0};
 
         // Zero-copy interop (#28, Windows). When gpu==true the pixels live in a shared
         // D3D11 NV12 texture (below) instead of the CPU plane[] buffers; the decode thread

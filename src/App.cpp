@@ -503,7 +503,7 @@ int App::Run() {
         // Camera hot-plug events (only arrive once the camera subsystem is up).
         if (std::vector<std::pair<uint32_t, uint32_t>> camEv; window_.TakeCameraEvents(camEv)) {
             for (const auto& ev : camEv) {
-                if (ev.first == SDL_EVENT_CAMERA_DEVICE_REMOVED && isLive_ &&
+                if (ev.first == SDL_EVENT_CAMERA_DEVICE_REMOVED && isLive_ && LiveIsCamera() &&
                     ev.second == camera_.DeviceId()) {
                     camera_.NotifyRemoved();
                 } else if (ev.first == SDL_EVENT_CAMERA_DEVICE_ADDED &&
@@ -594,7 +594,7 @@ void App::RenderOneFrame() {
     // upload path. Freeze = stop acquiring: the last uploaded texture keeps drawing.
     // A stream (#93) is video_ in live mode: same ring, same freeze-by-not-acquiring.
     window_.SetKeyboardCaptured(false);  // BuildTransportUI re-asserts it while a field is focused
-    FrameRing* ring = isLive_     ? (livePaused_ ? nullptr : &camera_.Ring())
+    FrameRing* ring = isLive_     ? (livePaused_ ? nullptr : &live_->Ring())
                       : isStream_ ? (streamPaused_ ? nullptr : &video_.Ring())
                                   : (isVideo_ ? &video_.Ring() : nullptr);
     if (ring) {
@@ -886,11 +886,11 @@ void App::RenderOneFrame() {
                 const std::string layoutLabel = LayoutLabel();
                 char text[512];
                 if (isLive_) {
-                    const CameraSource::Stats cs = camera_.GetStats();
+                    const LiveStats cs = live_->GetStats();
                     std::snprintf(text, sizeof(text),
                                   "%.0f FPS   %s\nLIVE %s %dx%d  %s  cam %.0f fps  age %.0f ms\n"
                                   "win %ux%u  tile %ux%u\n%s",
-                                  fps_, xr_.ActiveModeName(), camera_.DeviceName().c_str(),
+                                  fps_, xr_.ActiveModeName(), live_->DeviceName().c_str(),
                                   mediaW_, mediaH_, layoutLabel.c_str(), cs.deliveredFps,
                                   liveAgeMs_, cw, ch, tileW, tileH, stereo);
                 } else if (isStream_) {
@@ -969,13 +969,13 @@ void App::BuildTransportUI() {
     uiState_.caps.slideshow = !isLive_ && !isStream_;
     uiState_.isLive = isLive_;
     uiState_.livePaused = livePaused_;
-    uiState_.liveDevice = isLive_ ? camera_.DeviceName() : std::string();
+    uiState_.liveDevice = isLive_ ? live_->DeviceName() : std::string();
     uiState_.liveStatus = isLive_ ? LiveStatusText() : std::string();
-    uiState_.cameraFps = isLive_ ? camera_.GetStats().deliveredFps : 0.0f;
+    uiState_.cameraFps = isLive_ ? live_->GetStats().deliveredFps : 0.0f;
     uiState_.panelFps = fps_;
     uiState_.frameAgeMs = (float)liveAgeMs_;
     uiState_.cameraCurrent = -1;
-    for (size_t i = 0; isLive_ && i < cameraDevs_.size(); ++i)
+    for (size_t i = 0; isLive_ && LiveIsCamera() && i < cameraDevs_.size(); ++i)
         if (cameraDevs_[i].id == camera_.DeviceId()) uiState_.cameraCurrent = (int)i;
     if (isLive_) uiState_.mediaFilename.clear();
     uiState_.autoConvOn = autoConvEnabled_;
@@ -1440,7 +1440,7 @@ void App::RefreshCameraList(bool rescan) {
     // When the same device is back in the fresh list it is re-opened at once: a Rescan
     // after an unplug means "reconnect", not "show me a list" (David, first hardware run).
     bool reconnect = false;
-    if (rescan && isLive_) {
+    if (rescan && isLive_ && LiveIsCamera()) {
         const CameraSource::State st = camera_.GetState();
         if (st == CameraSource::State::Lost || st == CameraSource::State::Failed ||
             st == CameraSource::State::Denied) {
@@ -1449,7 +1449,8 @@ void App::RefreshCameraList(bool rescan) {
             camera_.Stop();
             liveStateSeen_ = CameraSource::State::Closed;
         }
-        reconnect = (camera_.GetState() == CameraSource::State::Closed) && !liveSelector_.empty();
+        reconnect = LiveIsCamera() && (camera_.GetState() == CameraSource::State::Closed) &&
+                    !liveSelector_.empty();
     }
     cameraDevs_.clear();
     uiState_.cameraNames.clear();
@@ -1490,9 +1491,19 @@ bool App::LoadLiveDevice(const CameraDevice& dev) {
     // opens on the worker): a refused device leaves the current media playing.
     if (!camera_.Open(dev, 0, 0, launch_.cameraFps)) {
         ShowToast("Camera: " + camera_.LastError());
-        if (isLive_) StopLive(/*showIdleIfEmpty=*/true);  // the old camera was closed by Open
+        if (isLive_ && LiveIsCamera()) StopLive(/*showIdleIfEmpty=*/true);  // closed by Open
         return false;
     }
+    liveSelector_ = dev.name;
+    EnterLive(&camera_, dev.name);
+    return true;
+}
+
+void App::EnterLive(LiveProducer* p, const std::string& name) {
+    // One live producer at a time: a previous one (the camera, or a Pro input) stops.
+    if (live_ != p && isLive_) live_->Stop();
+    if (p != &camera_) camera_.Stop();
+    live_ = p;
     if (isStream_) StopStream(/*showIdleIfEmpty=*/false);  // #93: the camera replaces it
     video_.Stop();   // joins the decode thread before audio (see ReloadMedia)
     audio_.Stop();
@@ -1524,15 +1535,13 @@ bool App::LoadLiveDevice(const CameraDevice& dev) {
     liveSlowSince_ = -1.0;
     liveSlowWarned_ = false;
     liveStateSeen_ = CameraSource::State::Opening;
-    liveSelector_ = dev.name;
     autoConvWorker_.RequestReset();  // #92: a new camera is a new scene
-    LOG_INFO("Live: opening '%s'", dev.name.c_str());
-    ShowToast("Live: " + dev.name);
-    return true;
+    LOG_INFO("Live: opening %s '%s'", p->Kind(), name.c_str());
+    ShowToast("Live: " + name);
 }
 
 void App::StopLive(bool showIdleIfEmpty) {
-    camera_.Stop();
+    live_->Stop();
     autoConvWorker_.RequestReset();  // #92: the next source is a new scene
     isLive_ = false;
     livePaused_ = false;
@@ -1550,9 +1559,9 @@ void App::ToggleLive() {
     if (isLive_) {
         // 'C' on a lost/blocked camera = reconnect (rescan + re-open the same device),
         // not "live off": the user is trying to get the picture back.
-        const CameraSource::State st = camera_.GetState();
-        if (st == CameraSource::State::Lost || st == CameraSource::State::Failed ||
-            st == CameraSource::State::Denied || st == CameraSource::State::Closed) {
+        const CameraSource::State st = live_->GetState();
+        if (LiveIsCamera() && (st == CameraSource::State::Lost || st == CameraSource::State::Failed ||
+                               st == CameraSource::State::Denied || st == CameraSource::State::Closed)) {
             RefreshCameraList(/*rescan=*/true);
             return;
         }
@@ -1565,11 +1574,11 @@ void App::ToggleLive() {
 
 std::string App::LiveStatusText() const {
     if (!isLive_) return std::string();
-    switch (camera_.GetState()) {
+    switch (live_->GetState()) {
         case CameraSource::State::Opening: return "OPENING";
         case CameraSource::State::Streaming: return livePaused_ ? "FROZEN" : "LIVE";
         case CameraSource::State::Stalled: return "NO SIGNAL";
-        case CameraSource::State::Lost: return "NO CAMERA";
+        case CameraSource::State::Lost: return LiveIsCamera() ? "NO CAMERA" : "NO INPUT";
         case CameraSource::State::Denied: return "BLOCKED";
         case CameraSource::State::Failed: return "ERROR";
         case CameraSource::State::Closed: break;  // released after a loss (see RefreshCameraList)
@@ -1578,7 +1587,7 @@ std::string App::LiveStatusText() const {
 }
 
 void App::OnLiveFrame(const FrameRing::Frame& f) {
-    liveAgeMs_ = (CameraSource::NowSeconds() - camera_.GetStats().lastPublishSec) * 1000.0;
+    liveAgeMs_ = (CameraSource::NowSeconds() - live_->GetStats().lastPublishSec) * 1000.0;
     SettleLiveLayout(f, "Live");
 }
 
@@ -1597,6 +1606,13 @@ void App::SettleLiveLayout(const FrameRing::Frame& f, const char* tag) {
     li.signal = StereoSignal::Aspect;
     li.confidence = 0.5f;
     li.layout = StereoDetect::ChooseFullOrHalf((float)mediaW_ / (float)mediaH_, ambiguous);
+    // A live source that knows its packing (two inputs side by side, a mono input) says
+    // so; the aspect guess is only for sources that cannot tell (the camera: -1).
+    if (isLive_ && live_->LayoutHint() >= 0) {
+        li.layout = (StereoLayout)live_->LayoutHint();
+        li.signal = StereoSignal::Metadata;
+        li.confidence = 1.0f;
+    }
     autoInfo_ = li;  // ApplyLayout skips autoInfo_ for Manual; L -> auto must land here
     if (layoutForced_) {  // MEDIAPLAYER_LAYOUT
         li.layout = layoutForcedValue_;
@@ -1763,37 +1779,38 @@ void App::PollStream() {
 
 void App::PollLive() {
     if (!isLive_) return;
-    const CameraSource::State st = camera_.GetState();
+    const CameraSource::State st = live_->GetState();
     const double now = CameraSource::NowSeconds();
+    const bool cam = LiveIsCamera();
     if (st != liveStateSeen_) {
         const CameraSource::State was = liveStateSeen_;
         liveStateSeen_ = st;
         using S = CameraSource::State;
         switch (st) {
             case S::Streaming: {
-                const CameraSource::Stats cs = camera_.GetStats();
+                const CameraSource::Stats cs = live_->GetStats();
                 LOG_INFO("Live: '%s' streaming %dx%d NV12 @%d requested (%s range)%s",
-                         camera_.DeviceName().c_str(), cs.w, cs.h, cs.fpsReq,
+                         live_->DeviceName().c_str(), cs.w, cs.h, cs.fpsReq,
                          cs.fullRange ? "full" : "limited",
                          cs.mjpgPath ? " via MJPG decoders" : "");
                 if (was == S::Stalled) ShowToast("Live");
                 break;
             }
             case S::Stalled:
-                ShowToast("No camera signal");
+                ShowToast(cam ? "No camera signal" : "No input signal");
                 break;
             case S::Lost:
-                ShowToast("Camera disconnected");
+                ShowToast(cam ? "Camera disconnected" : "Input lost");
                 break;
             case S::Denied:
             case S::Failed: {
-                const std::string err = camera_.LastError();
+                const std::string err = live_->LastError();
                 const bool denied = (st == S::Denied);
-                LOG_WARN("Live: '%s' %s: %s", camera_.DeviceName().c_str(),
+                LOG_WARN("Live: '%s' %s: %s", live_->DeviceName().c_str(),
                          denied ? "blocked" : "failed", err.c_str());
                 ShowToast(denied ? "Camera blocked by Windows privacy settings - "
                                    "Settings > Privacy & security > Camera"
-                                 : "Camera: " + err);
+                                 : std::string(cam ? "Camera: " : "Input: ") + err);
                 // Never got a frame: there is nothing to freeze on, so go back to idle
                 // rather than leave a dead source up. After frames, keep the last one.
                 if (mediaW_ == 0) StopLive(/*showIdleIfEmpty=*/true);
@@ -1805,7 +1822,7 @@ void App::PollLive() {
     }
     // Ladder rung 4: the device delivers well under what was asked (CPU-bound decode on
     // a weak box). Hint once; no automatic re-open (that re-negotiates the device).
-    if (isLive_ && st == CameraSource::State::Streaming && !liveSlowWarned_) {
+    if (isLive_ && cam && st == CameraSource::State::Streaming && !liveSlowWarned_) {
         const CameraSource::Stats cs = camera_.GetStats();
         const bool warm = cs.fpsReq > 0 && cs.published > (uint64_t)cs.fpsReq * 2;
         if (warm && cs.deliveredFps < 0.8f * (float)cs.fpsReq) {
@@ -2512,10 +2529,11 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["live"] = isLive_;
         out["live_paused"] = livePaused_;
         fillAutoConv(out);
-        out["camera"] = isLive_ ? camera_.DeviceName() : std::string();
-        out["camera_state"] = isLive_ ? CameraSource::StateName(camera_.GetState()) : "closed";
+        out["camera"] = isLive_ ? live_->DeviceName() : std::string();
+        out["live_kind"] = isLive_ ? live_->Kind() : "";
+        out["camera_state"] = isLive_ ? CameraSource::StateName(live_->GetState()) : "closed";
         if (isLive_) {
-            const CameraSource::Stats cs = camera_.GetStats();
+            const CameraSource::Stats cs = live_->GetStats();
             out["camera_fps"] = cs.deliveredFps;
             out["camera_fps_requested"] = cs.fpsReq;
             out["camera_width"] = cs.w;
@@ -2525,7 +2543,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
             out["camera_dropped"] = cs.dropped;
             out["frame_age_ms"] = liveAgeMs_;
             out["panel_fps"] = fps_;
-            out["camera_error"] = camera_.LastError();
+            out["camera_error"] = live_->LastError();
         }
         // Stream URL (#93).
         out["stream"] = isStream_;
@@ -2817,9 +2835,9 @@ pro::Status App::ProStatus() const {
     st.panelFps = fps_;
     st.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
     if (isLive_) {
-        st.sourceKind = "Camera";
-        st.sourceLabel = camera_.DeviceName();
-        st.sourceFps = camera_.GetStats().deliveredFps;
+        st.sourceKind = LiveIsCamera() ? "Camera" : live_->Kind();
+        st.sourceLabel = live_->DeviceName();
+        st.sourceFps = live_->GetStats().deliveredFps;
         st.frameAgeMs = (float)liveAgeMs_;
     } else if (isStream_) {
         st.sourceKind = "Stream";

@@ -137,6 +137,11 @@ private:
     // LoadLiveDevice opens one device (asynchronously — PollLive reports the outcome).
     bool LoadLive(const std::string& selector);
     bool LoadLiveDevice(const CameraDevice& dev);
+    // Make `p` (already opened) the live source: stop the camera if `p` is something
+    // else, reset the per-source state and wait for its first frame to settle the
+    // layout. The camera goes through here; so can another LiveProducer (Pro: DeckLink).
+    void EnterLive(LiveProducer* p, const std::string& name);
+    bool LiveIsCamera() const { return live_ == &camera_; }
     void StopLive(bool showIdleIfEmpty);  // tear down; idle logo if nothing replaces it
     void ToggleLive();                    // 'C': off -> LoadLive(last or auto); on -> StopLive
     void PollLive();                      // per-frame: camera state edges -> toasts / log
@@ -262,6 +267,7 @@ private:
     // Live camera (#90). isLive_ is mutually exclusive with file media: every file load
     // goes through ReloadMedia, which stops the camera first.
     CameraSource camera_;
+    LiveProducer* live_ = &camera_;     // the producer live mode reads (isLive_)
     LaunchOptions launch_{};
     bool isLive_ = false;               // the live camera is the current source
     bool livePaused_ = false;           // Space = freeze (the camera keeps streaming)
