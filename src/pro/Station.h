@@ -95,6 +95,10 @@ public:
     rig::Result RigLast() const { return rig_.Last(); }
     rig::Budget RigBudget() const { return rig_.GetBudget(); }
     const std::string& Timecode() const { return timecode_; }
+    // The live signal's frame rate (rounded), written with every timecode (notes, alerts,
+    // the Resolve link) so a 50p timecode can be placed on a 25p timeline. 0 = unknown.
+    void SetSignalFps(float fps) { signalFps_ = fps > 1.0f ? (int)(fps + 0.5f) : 0; }
+    int SignalFps() const { return signalFps_; }
     double DelayMs() const { return delayMs_; }
 
 private:
@@ -132,10 +136,12 @@ private:
     bool OpenDeckLinkSpec(const std::string& spec);
     int testFrames_ = 0, testSnapshotFrame_ = -1;
     std::string timecode_;
+    int signalFps_ = 0;
     double delayMs_ = 0.0;
     double alertsLoggedUntil_ = 0.0;
     struct Snapshot {
         std::string image, notePath, timecode, clock;
+        int tcFps = 0;
         std::string prefix;        // capture prefix; the runtime picks the image's suffix
         double takenSec = 0.0;     // until the image is found (Tick), `image` is a guess
         bool imageFound = false;

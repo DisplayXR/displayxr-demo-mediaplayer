@@ -76,6 +76,7 @@ struct Host {
     std::function<bool()> mediaPaused;
     std::function<void(double seconds, bool paused)> seekMedia;
     std::function<void(bool paused)> setMediaPaused;
+    std::function<double()> mediaStart;  // the file's first timestamp (Position/Seek are in it)
     std::function<bool()> isFullscreen;
     std::function<void()> toggleFullscreen;
 };
@@ -125,6 +126,9 @@ public:
     // never cut by a half-transparent card) or MEDIAPLAYER_PRO_PANELS_3D=1.
     struct FlatRect { float x, y, w, h; };
     const std::vector<FlatRect>& FlatRects() const { return flatRects_; }
+    // App takes the rects once per frame: a frame that skips BuildUI (Shift+Tab hid the
+    // UI while pinned) must not resubmit last frame's cards over a HUD with no panels.
+    void ClearFlatRects() { flatRects_.clear(); }
     void SetFlatPanelsAvailable(bool on) { flatAvailable_ = on; }
 
     // True while Pro wants the HUD kept alive (pinned inspector).
@@ -210,6 +214,8 @@ private:
     long long linkFileStamp_ = -1;  // last_write_time of resolve_link.json last read
     long long commandsOffset_ = -1; // bytes of resolve_commands.jsonl already handled (-1 = skip history)
     long long lastCommandId_ = 0;
+    std::string stationDir_;        // resolved once (the lookup walks the folder)
+    void TickResolveImpl(const Status& st);
 };
 
 }  // namespace mp::pro

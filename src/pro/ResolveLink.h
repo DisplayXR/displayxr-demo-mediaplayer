@@ -37,6 +37,7 @@ struct LinkSample {
     double clipSeconds = -1.0; // source time inside clipPath (-1 = unknown)
     double clipFps = 0.0;
     bool follow = true;        // the panel's "Station follows Resolve" box
+    double written = -1.0;     // the panel's clock when it wrote this sample (s), -1 = absent
 };
 
 // Parse resolve_link.json text; `ok` false when it is not one.
@@ -71,6 +72,10 @@ public:
     double movingRatio = 0.5;
     // A sample older than this (the panel stopped / Resolve quit) means "not following".
     double staleAfter = 2.0;  // s
+    // Parked: the station lands within this many frames of Resolve's (a decoder lands on
+    // the first frame at or after the target, so half a frame would re-seek forever when
+    // Resolve's source time falls between the file's frames).
+    double parkedToleranceFrames = 1.0;
 
     // `now` = station clock (s). `localPath` / `localSeconds` / `localPaused` = what the
     // station's player shows (localSeconds < 0 = not a video). `fileExists` lets the caller
@@ -82,10 +87,16 @@ public:
     bool Active(double now) const { return lastSeen_ >= 0.0 && now - lastSeen_ <= staleAfter; }
     bool ResolvePlaying() const { return playing_; }
     void Reset() { *this = Follower(); }
+    // The station could not open `path` (it exists but will not decode: BRAW, R3D...):
+    // stop asking until Resolve moves to another clip.
+    void OpenFailed(const std::string& path) { failed_ = path; }
 
 private:
     long long lastSeq_ = -1;
     double lastSeen_ = -1.0;      // station clock when the last NEW sample arrived
+    double lastStamp_ = -1.0;     // its clock for movement: the panel's `written`, else lastSeen_
+    double lastSeekTarget_ = -1.0;  // parked: where the station was last sent
+    std::string failed_;
     double lastClipSec_ = -1.0;   // its clipSeconds
     std::string lastClip_;
     bool playing_ = false;

@@ -11,6 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -55,24 +56,40 @@ long long Stamp(const fs::path& p) {
     return ec ? -1 : (long long)t.time_since_epoch().count();
 }
 
+// Paths travel as UTF-8 (JSON, the trunk's currentMediaPath_); MSVC's narrow fs::path
+// would read them in the ANSI code page and miss (or throw on) any non-ASCII name.
+fs::path U8(const std::string& p) { return fs::u8path(p); }
+
 std::string Absolute(const std::string& p) {
     if (p.empty()) return p;
     std::error_code ec;
-    const fs::path a = fs::absolute(fs::path(p), ec);
-    return ec ? p : a.lexically_normal().generic_string();
+    const fs::path a = fs::absolute(U8(p), ec);
+    return ec ? p : a.lexically_normal().generic_u8string();
 }
 
 }  // namespace
 
 void ProController::TickResolve(const Status& st) {
-    const std::string dirStr = station_.Folder();
-    if (dirStr.empty()) return;
-    const fs::path dir(dirStr);
+    // File and JSON trouble (a locked file, an odd path, a malformed sample) must never
+    // take the player down: the link is a convenience.
+    try {
+        TickResolveImpl(st);
+    } catch (const std::exception& e) {
+        LOG_WARN("Resolve panel link: %s", e.what());
+        nextLinkPollSec_ = LiveProducer::NowSeconds() + 1.0;
+    }
+}
+
+void ProController::TickResolveImpl(const Status& st) {
+    if (stationDir_.empty()) stationDir_ = station_.Folder();
+    if (stationDir_.empty()) return;
+    const fs::path dir = U8(stationDir_);
     const double now = LiveProducer::NowSeconds();
 
-    // Status -> panel.
+    // Status -> panel: 4x a second while the panel is up, every 2 s otherwise (enough for
+    // a panel that starts to see the station; no churn on a OneDrive-synced folder).
     if (now >= nextStatusSec_) {
-        nextStatusSec_ = now + 0.25;
+        nextStatusSec_ = now + (follower_.Active(now) ? 0.25 : 2.0);
         std::error_code ec;
         fs::create_directories(dir, ec);
         json s;
@@ -83,6 +100,7 @@ void ProController::TickResolve(const Status& st) {
         s["kind"] = st.sourceKind;
         s["live"] = st.live;
         s["timecode"] = station_.Timecode();
+        s["tc_fps"] = station_.SignalFps();
         s["rig"] = json::parse(station_.RigStatusJson(), nullptr, false);
         const std::string media = host_.currentMedia ? Absolute(host_.currentMedia()) : std::string();
         if (!media.empty()) {
@@ -94,7 +112,7 @@ void ProController::TickResolve(const Status& st) {
         s["following"] = followResolve_ && follower_.Active(now) && link_.follow;
         s["view"] = ViewModeName(mode_);
         s["look"] = lutName_;
-        WriteAtomically(dir / "station_status.json", s.dump(2));
+        WriteAtomically(dir / "station_status.json", s.dump(2, ' ', false, json::error_handler_t::replace));
     }
 
     if (now < nextLinkPollSec_) return;
@@ -144,18 +162,28 @@ void ProController::TickResolve(const Status& st) {
     const std::string clip = Absolute(s.clipPath);
     resolve::LinkSample abs = s;
     abs.clipPath = clip;
-    const bool exists = !clip.empty() && fs::exists(fs::path(clip), ec);
-    const double pos = host_.mediaPosition ? host_.mediaPosition() : -1.0;
+    const bool exists = !clip.empty() && fs::exists(U8(clip), ec);
+    // Resolve counts source time from the file's start; the decoder counts in the stream's
+    // own timestamps, which start above 0 in MXF / TS / edit-listed MOV.
+    const double start = host_.mediaStart ? host_.mediaStart() : 0.0;
+    double pos = host_.mediaPosition ? host_.mediaPosition() : -1.0;
+    if (pos >= 0.0) pos = std::max(0.0, pos - start);
     const bool paused = host_.mediaPaused && host_.mediaPaused();
     const resolve::Action a = follower_.Update(abs, now, local, pos, paused, exists);
     switch (a.kind) {
     case resolve::Action::Open:
-        if (host_.reloadMedia && host_.reloadMedia(a.path) && host_.seekMedia) host_.seekMedia(a.seconds, a.paused);
-        if (!a.paused && host_.setMediaPaused) host_.setMediaPaused(false);
-        if (host_.toast) host_.toast("Following Resolve: " + fs::path(a.path).filename().string());
+        if (host_.reloadMedia && host_.reloadMedia(a.path)) {
+            const double st0 = host_.mediaStart ? host_.mediaStart() : 0.0;
+            if (host_.seekMedia) host_.seekMedia(st0 + a.seconds, a.paused);
+            if (!a.paused && host_.setMediaPaused) host_.setMediaPaused(false);
+            if (host_.toast) host_.toast("Following Resolve: " + U8(a.path).filename().u8string());
+        } else {
+            follower_.OpenFailed(a.path);  // asked once; not again until Resolve moves on
+            if (host_.toast) host_.toast("Resolve's clip will not open here: " + U8(a.path).filename().u8string());
+        }
         break;
     case resolve::Action::Seek:
-        if (host_.seekMedia) host_.seekMedia(a.seconds, a.paused);
+        if (host_.seekMedia) host_.seekMedia(start + a.seconds, a.paused);
         if (!a.paused && host_.setMediaPaused) host_.setMediaPaused(false);
         break;
     case resolve::Action::Play:
