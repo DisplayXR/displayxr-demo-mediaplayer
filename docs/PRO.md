@@ -63,6 +63,11 @@ streams, auto-convergence, MCP tools. Plus:
 | Timecode + delay | Source timecode and measured capture → screen delay (the card's or camera's arrival → the panel frame it is shown in; the camera's and panel's own delays come on top). In the inspector's Source section; `T` toggles. |
 | Rig checks | `src/pro/RigCheck`: vertical error (sub-pixel 2D block matching, full-res px) + roll, eye sync (frames between the paired inputs' timecodes), colour match (CIE76 ΔE between the eyes), depth range (2nd / 98th percentile parallax, % of eye width, negative = in front) against `--depth-budget=-2,1`; `--vertical-limit=1` `--colour-limit=2`. Overruns ≥ 0.5 s become alerts with timecode, also appended to `Pictures/DisplayXR/station_alerts.jsonl`. 60-second history strip (depth band vs budget, vertical error); `R` toggles. |
 | Snapshots | `N` or the inspector: both eyes as shown (graded) via the runtime's atlas capture, plus `<name>_note.json` (note, timecode, rig numbers, budget); notes are editable in the inspector. |
+| Depth overlay | `D`: the rig check's matches drawn on the picture, coloured by parallax (warm in front, white on the screen, blue behind), ringed red outside the budget; follows pan / zoom. |
+| Review formats | MXF; EXR / DPX / TIFF **sequences** (open any frame; `--seq-fps=24`); EXR's scene-linear float encoded for display; 10/12-bit sources (ProRes, DNxHR HQX, HEVC 10, DPX, 16-bit TIFF) kept at 16 bits (P016) into the grade. Trunk code, switched on only by Pro (`VideoDecoder::SetProFormats` / `MediaSource::SetProFormats`). |
+| A/B compare | `B` swaps to the other clip at the same position (`--compare=<file>` or `set_compare`). |
+| OpenColorIO | Optional (`-DMP_OCIO_ROOT=<OCIO 2.x install>`, e.g. Open RV's `_build/RV_DEPS_OCIO/install`, plus `MP_OCIO_DLL_DIR` for its DLLs): `--ocio=<config\|ocio://default> --ocio-src=<space>` and `--ocio-display= --ocio-view=` or `--ocio-dst=`, `--ocio-looks=`; baked to a 65³ LUT in the grade's LUT slot. |
+| Agent tools | `set_grade`, `get_grade`, `set_view`, `set_depth_overlay`, `get_rig_status`, `set_depth_budget`, `snapshot`, `list_inputs`, `select_input`, `open_decklink`, `set_ocio`, `describe_ocio`, `set_compare` (next to the player's own). |
 | Resolve markers | `tools/resolve/DisplayXR_Station_Markers.py` (Resolve: Workspace > Scripts): snapshot notes → blue markers, rig alerts → red markers at their timecodes on the current timeline. |
 
 Grade order is exposure → CDL → LUT, the order an on-set chain applies a CDL under a
@@ -95,9 +100,11 @@ once the UI settles.
 
 Ordered by what the customer needs first.
 
-Items 1-4 below are built (see the table above) and unit-tested; **none has run with a
-DeckLink card, a stereo rig or Resolve yet** - that needs the card. Item 6 has its first
-step (the marker script). Kept for the record:
+Items 1-6 below are built (see the table above) and unit-tested; **none of the DeckLink,
+rig or Resolve parts has run with a card, a stereo rig or Resolve yet** - that needs the
+hardware. Still open: a Resolve *panel* inside Resolve (timecode follow + markers live;
+today the marker script runs after the fact, and the station follows Resolve's timecode
+over SDI); RP188 at 50/60p (frame/field counting) to confirm on a card. Kept for the record:
 
 1. **Blackmagic DeckLink input (Phase 1).** A `src/pro/DeckLinkSource.{h,cpp}` that
    publishes into the same `FrameRing` the camera uses, so the render path is untouched.
