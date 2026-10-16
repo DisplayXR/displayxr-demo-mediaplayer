@@ -57,6 +57,13 @@ streams, auto-convergence, MCP tools. Plus:
 | Exposure | ±4 stops in linear light. Right-click the slider to reset. |
 | Grade bypass | `G` |
 | Full screen | `F` / `F11` / double-click the picture. Escape leaves full screen and never quits. |
+| Live inputs | `src/pro/Station`: named inputs, `J` or the inspector's **Inputs** switches. `--input="Rig=decklink:0+1,sdi"`, `--input="Resolve=decklink:2,sbs"`, `--input="Witness=camera:Integrated"`, `--input="Test=test:1920x1080@24"`, `url:<u>`; shorthands `--decklink[=<dev>]` `--decklink-right=` `--decklink-input=sdi\|hdmi` `--decklink-stereo=auto\|mono\|sbs\|dual\|pair` `--decklink-mode=Hp25`, `--test-signal[=WxH@fps]`; `--decklink-list` prints the cards. |
+| DeckLink input | `src/pro/DeckLinkSource`: one cable (mono / SBS), the card's dual-stream 3D mode (switches automatically when the card detects it), or two inputs paired by SMPTE timecode (`TimecodePairer`). Format detection follows the signal. Captures 10-bit v210 and keeps 16 bits (P016) into the grade. Publishes into the same live path as the camera (`LiveProducer` / `App::EnterLive`). |
+| Test rig | `src/pro/TestSignalSource`: synthetic stereo with known disparities and timecode; faults `MEDIAPLAYER_TEST_VSHIFT` (px), `_EYE_DELAY` (frames), `_GAIN_R`, `_DEPTH`. Exercises everything below without hardware. |
+| Timecode + delay | Source timecode and measured capture → screen delay (the card's or camera's arrival → the panel frame it is shown in; the camera's and panel's own delays come on top). In the inspector's Source section; `T` toggles. |
+| Rig checks | `src/pro/RigCheck`: vertical error (sub-pixel 2D block matching, full-res px) + roll, eye sync (frames between the paired inputs' timecodes), colour match (CIE76 ΔE between the eyes), depth range (2nd / 98th percentile parallax, % of eye width, negative = in front) against `--depth-budget=-2,1`; `--vertical-limit=1` `--colour-limit=2`. Overruns ≥ 0.5 s become alerts with timecode, also appended to `Pictures/DisplayXR/station_alerts.jsonl`. 60-second history strip (depth band vs budget, vertical error); `R` toggles. |
+| Snapshots | `N` or the inspector: both eyes as shown (graded) via the runtime's atlas capture, plus `<name>_note.json` (note, timecode, rig numbers, budget); notes are editable in the inspector. |
+| Resolve markers | `tools/resolve/DisplayXR_Station_Markers.py` (Resolve: Workspace > Scripts): snapshot notes → blue markers, rig alerts → red markers at their timecodes on the current timeline. |
 
 Grade order is exposure → CDL → LUT, the order an on-set chain applies a CDL under a
 show LUT. The grade is skipped on the idle screen.
@@ -87,6 +94,10 @@ once the UI settles.
 ## Next (from the plan)
 
 Ordered by what the customer needs first.
+
+Items 1-4 below are built (see the table above) and unit-tested; **none has run with a
+DeckLink card, a stereo rig or Resolve yet** - that needs the card. Item 6 has its first
+step (the marker script). Kept for the record:
 
 1. **Blackmagic DeckLink input (Phase 1).** A `src/pro/DeckLinkSource.{h,cpp}` that
    publishes into the same `FrameRing` the camera uses, so the render path is untouched.
