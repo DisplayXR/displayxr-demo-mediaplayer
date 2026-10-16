@@ -9,9 +9,12 @@
 //   eyeDelay     right eye shows the scene this many frames late (eye sync)
 //   gainR        right eye brightness x this (colour match; photo mode: red channel)
 //   depthScale   scene disparities x this (photo mode: extra crossed parallax)
+//   rollDeg      right eye rotated about its centre by this many degrees (+ = clockwise
+//                on screen: its right side lower), the rig check's roll
 // Photo mode (image=<side-by-side still>): the rig shows a real stereo photo, panned
 // slowly so there is motion for the eye-sync check, with the same faults applied.
-// --test-signal[=WxH@fps][,image=<path>] and the MEDIAPLAYER_TEST_* env vars set it.
+// --test-signal[=WxH@fps][,image=<path>] and the MEDIAPLAYER_TEST_* env vars set it
+// (MEDIAPLAYER_TEST_ROLL is read by Open itself).
 #pragma once
 
 #include "pro/LiveSourceBase.h"
@@ -30,6 +33,7 @@ struct TestSignalConfig {
     int eyeDelay = 0;
     float gainR = 1.0f;
     float depthScale = 1.0f;       // multiplies every disc's disparity
+    float rollDeg = 0.0f;          // right-eye roll, degrees (+ = clockwise on screen)
     std::string startTimecode = "01:00:00:00";
     std::string image;             // photo mode: a side-by-side stereo still
 

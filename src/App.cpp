@@ -647,7 +647,8 @@ void App::RenderOneFrame() {
         if (const FrameRing::Frame* vf = ring->AcquireLatest()) {
 #if MEDIAPLAYER_PRO
             // Pro: timecode, measured delay and the rig checks see every uploaded frame.
-            pro_.GetStation().OnFrame(*vf, layout_, isLive_, isLive_ ? live_->GetStats().eyeOffsetFrames : -1);
+            pro_.GetStation().OnFrame(*vf, layout_, isLive_, isLive_ ? live_->GetStats().eyeOffsetFrames : -1,
+                                      swapEyes_ != mediaEyeSwap_);  // rig checks measure the eyes as shown
 #endif
             if (isLive_) {
                 OnLiveFrame(*vf);
@@ -674,7 +675,8 @@ void App::RenderOneFrame() {
                 renderer_.UploadYUV(vf->plane[0].data(), vf->plane[1].data(),
                                     i420 ? vf->plane[2].data() : nullptr, (uint32_t)vf->width,
                                     (uint32_t)vf->height,
-                                    i420 ? 0 : vf->format == PixFormat::P016 ? 2 : 1, vf->fullRange);
+                                    i420 ? 0 : vf->format == PixFormat::P016 ? 2 : 1, vf->fullRange,
+                                    (int)vf->matrix);  // the frame's colour tag (BT.709 default)
             }
         }
     }
@@ -1515,6 +1517,20 @@ void App::ApplyLayout(const MediaInfo& info) {
     // make the slideshow look broken. Cleared HERE — at the point a load commits — rather
     // than at LoadMedia entry, so a failed open leaves the still-displayed media's pin on.
     layoutPinned_ = false;
+#if MEDIAPLAYER_PRO
+    // A monitoring station shows stereo content in 3D: when the panel is in a flat mode
+    // that nobody chose (a runtime that starts in 2D, e.g. the sim display), ask for the
+    // first 3D mode. A V press or the Mode button is a choice and is left alone; so is
+    // MEDIAPLAYER_START_MODE. The base player keeps the panel's mode as it finds it.
+    if (layout_ != StereoLayout::Mono && !isLogo_ && !userModeChoice_ && startMode_ < 0 &&
+        pendingModeRequest_ < 0 && xr_.CurrentModeIsFlat()) {
+        const int32_t m = xr_.FindStereoMode();
+        if (m >= 0) {
+            pendingModeRequest_ = m;
+            LOG_INFO("Pro: stereo content on a flat panel - requesting the first 3D mode [%d]", m);
+        }
+    }
+#endif
     // Toast only for a genuine content verdict. The aspect rung is now the routine
     // default rather than an exception, so toasting it would fire on nearly every load
     // and on every slideshow step; the HUD label carries that state persistently instead.
