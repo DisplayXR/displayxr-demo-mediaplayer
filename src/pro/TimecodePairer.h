@@ -12,7 +12,32 @@
 // frame of each is shown, paced by the left eye, and the offset reported.
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+
 namespace mp {
+
+// A frame's pairing key from SMPTE timecode components: frames since midnight. Above
+// 30 fps (47.95/48/50/59.94/60) RP188 counts frame PAIRS, 0..fps/2-1, and the field
+// mark tells the two frames of a pair apart - without it every other pair of frames
+// shares a key and the eyes pair one frame apart. A card that already counts to fps-1
+// (ff >= fps/2 seen) is taken as full-rate.
+inline int TimecodeKey(int hh, int mm, int ss, int ff, bool fieldMark, int fpsInt) {
+    const int fps = std::max(1, fpsInt);
+    const int base = ((hh * 60 + mm) * 60 + ss) * fps;
+    if (fps > 30 && ff < fps / 2) return base + 2 * ff + (fieldMark ? 1 : 0);
+    return base + ff;
+}
+
+// A frame's pairing key from the card's hardware reference clock, when both inputs
+// share one card (one clock): frames since t0 at the card's reported frame duration,
+// both in nanoseconds. Using the exact duration at that resolution, not a rounded fps
+// or microseconds, keeps 23.976 / 29.97 / 59.94 from drifting across a rounding
+// boundary and mispairing (a 1 us rounding drifts half a frame in 7 min at 59.94).
+inline int HwClockKey(int64_t tNs, int64_t t0Ns, int64_t durNs) {
+    return (int)std::llround((double)(tNs - t0Ns) / (double)std::max<int64_t>(1, durNs));
+}
 
 class TimecodePairer {
 public:

@@ -24,6 +24,7 @@
 #include "pro/LiveSourceBase.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <cstdio>
@@ -63,7 +64,10 @@ public:
         uint64_t pairs = 0;
         uint64_t unpaired = 0;
         double lastSkewMs = 0.0, maxAbsSkewMs = 0.0;
-        bool hwClockPairing = false;  // no timecode: paired by the hardware clock
+        bool hwClockPairing = false;  // no timecode: paired by the card's hardware clock
+        bool timecode = false;        // paired by SMPTE timecode
+        bool separateCards = false;   // the two inputs are on different cards: two clocks,
+                                      // so without timecode only the newest frames pair
     };
     PairStats GetPairStats() const;
     bool IsPair() const { return cfg_.stereo == DeckLinkConfig::Stereo::Pair && GetState() != LiveState::Closed; }
@@ -71,6 +75,9 @@ public:
 
     // Non-blocking: spawns the worker, which finds the device(s) and starts capture.
     // GetState(): Opening -> Streaming | Stalled (no signal) | Failed (LastError()).
+    // Refuses the same device for both eyes; needs the installed Desktop Video to be at
+    // least the SDK version this build used (14.3+ reads frames through interfaces an
+    // older driver lacks).
     bool Open(const DeckLinkConfig& cfg);
     void Stop() override;
     const char* Kind() const override { return "decklink"; }
@@ -85,6 +92,8 @@ private:
     PairStats pairStats_;
     DeckLinkConfig cfg_;
     std::thread worker_;
+    std::mutex stopMutex_;
+    std::condition_variable stopCv_;  // Stop() wakes the worker's watchdog loop at once
     std::atomic<bool> stop_{false};
     std::atomic<bool> dualActive_{false};  // Auto switched to the card's dual-stream mode
 };

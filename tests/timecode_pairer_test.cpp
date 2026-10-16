@@ -7,6 +7,8 @@
 
 #include "pro/TimecodePairer.h"
 
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -200,6 +202,80 @@ void OneEyeMissing() {
     CHECK(s.shown.empty(), "nothing to show until both eyes have a frame");
 }
 
+// RP188 above 30 fps counts frame pairs and marks the second frame with the field flag:
+// the key must be distinct for every frame and in frame order, at 48, 50 and 60.
+void HighRateTimecodeKeys() {
+    using mp::TimecodeKey;
+    for (int fps : {48, 50, 60}) {
+        int prev = -1;
+        bool strictlyIncreasing = true, consecutive = true;
+        for (int ss = 0; ss < 3; ++ss)
+            for (int ff = 0; ff < fps / 2; ++ff)
+                for (int field = 0; field < 2; ++field) {
+                    const int k = TimecodeKey(1, 2, ss, ff, field != 0, fps);
+                    if (prev >= 0 && k != prev + 1) consecutive = false;
+                    if (k <= prev) strictlyIncreasing = false;
+                    prev = k;
+                }
+        CHECK(strictlyIncreasing && consecutive, "high-rate keys are consecutive and distinct per frame");
+    }
+    // Two frames of a pair at 60p: same components, field mark set on the second.
+    CHECK(TimecodeKey(0, 0, 0, 7, false, 60) + 1 == TimecodeKey(0, 0, 0, 7, true, 60),
+          "field mark separates the two frames of a pair");
+    // A card that counts to fps-1 itself (ff >= fps/2 seen) is taken as full-rate.
+    CHECK(TimecodeKey(0, 0, 0, 45, false, 60) == 45, "full-rate count at 60 is used as is");
+    // At or below 30 fps nothing changes.
+    CHECK(TimecodeKey(0, 0, 1, 3, false, 25) == 28, "25 fps key is seconds*25 + ff");
+    CHECK(TimecodeKey(0, 0, 1, 3, true, 25) == 28, "field mark ignored at 25 fps");
+    // The two frames of a 48p pair must pair with each other, not one frame apart.
+    Sim s;
+    for (int i = 0; i < 48; ++i) {
+        const int k = TimecodeKey(0, 0, 0, i / 2, (i & 1) != 0, 48);
+        s.Frame(1, k);
+        s.Frame(0, k);
+    }
+    bool allMatch = true;
+    for (const auto& pr : s.shown) allMatch = allMatch && pr.first == pr.second;
+    CHECK(s.shown.size() == 48 && allMatch, "48p: every frame pairs with its own instant");
+}
+
+// The hardware-clock key uses the card's exact frame duration, so two genlocked inputs
+// a little apart never drift onto different keys at 23.976 / 59.94 over a long run.
+void HardwareClockKeys() {
+    using mp::HwClockKey;
+    // Nanoseconds, as the source asks the card for; 2.6 M frames = 12 h at 60 fps.
+    for (double fps : {23.976, 29.97, 59.94, 24.0, 48.0}) {
+        const int64_t dur = (int64_t)std::llround(1e9 / fps);
+        const double exactDur = 1e9 / fps;
+        const int64_t t0 = 123456789;
+        int mismatches = 0, skips = 0, prev = -1;
+        for (int i = 0; i < 2600000; ++i) {
+            const int64_t tl = t0 + (int64_t)std::llround(i * exactDur);
+            const int64_t tr = tl + dur / 4;  // right eye a quarter frame late (genlocked, skewed)
+            const int kl = HwClockKey(tl, t0, dur), kr = HwClockKey(tr, t0, dur);
+            if (kl != kr) ++mismatches;
+            if (prev >= 0 && kl != prev + 1) ++skips;
+            prev = kl;
+        }
+        CHECK(mismatches == 0, "quarter-frame skew never mispairs");
+        CHECK(skips == 0, "no skipped or repeated keys over a 12-hour shift");
+    }
+    // Half a frame or more apart is a different frame.
+    CHECK(HwClockKey(1000 + 600, 1000, 1000) == 1, "0.6 frame late is the next frame");
+    // Rounded fps would drift: at 23.976 the integer-fps period is 0.1% short, so after
+    // ~500 frames the quarter-frame skew lands on the other side of a rounding boundary.
+    {
+        const int64_t badDur = 1000000000 / 24;  // what the old code used for 23.976
+        const double exactDur = 1e9 / 23.976;
+        int mismatches = 0;
+        for (int i = 0; i < 20000; ++i) {
+            const int64_t tl = (int64_t)std::llround(i * exactDur), tr = tl + badDur / 4;
+            if (HwClockKey(tl, 0, badDur) != HwClockKey(tr, 0, badDur)) ++mismatches;
+        }
+        CHECK(mismatches > 0, "sanity: a rounded period does mispair (the bug this guards)");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -218,6 +294,8 @@ int main() {
     Unsynced();
     NoTimecode();
     OneEyeMissing();
+    HighRateTimecodeKeys();
+    HardwareClockKeys();
     if (g_failures) {
         std::fprintf(stderr, "timecode_pairer_test: %d failure(s)\n", g_failures);
         return 1;

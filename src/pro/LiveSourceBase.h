@@ -32,9 +32,13 @@ protected:
     // The 16-bit (P016) twin: 10-bit capture kept to the GPU.
     void Publish(const livepix::P016& f, bool fullRange, double captureSec, const char* timecode,
                  int eyeOffsetFrames);
-    // Streaming -> Stalled when nothing was published for stallSec (call periodically).
+    // Streaming (or Opening) -> Stalled when nothing was published for stallSec since
+    // the last frame (or since the open): an input with no cable never streams at all.
     void CheckStall(double stallSec);
     void SetFps(double fps);
+    // An input reports no signal (DeckLink's bmdFrameHasNoInputSource, a missing right
+    // eye in dual-stream 3D): shown in the stats; the stall watchdog does the state.
+    void SetNoSignal(int eye, bool on);
 
     std::string name_;
     std::atomic<LiveState> state_{LiveState::Closed};
@@ -45,6 +49,7 @@ private:
     mutable std::mutex statsMutex_;
     LiveStats stats_;
     std::string lastError_;
+    double openedAt_ = 0.0;
     double fpsWindowStart_ = 0.0;
     uint64_t fpsWindowCount_ = 0;
 };

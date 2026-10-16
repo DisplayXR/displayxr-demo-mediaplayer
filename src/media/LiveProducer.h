@@ -50,6 +50,7 @@ struct LiveStats {
     // eyes' frames were when paired, in frames (0 = same instant). -1 = not measured.
     int eyeOffsetFrames = -1;
     double fps = 0.0;             // the signal's nominal rate (DeckLink / test), 0 = unknown
+    int noSignalEyes = 0;         // DeckLink: bit 0 = left / only input dark, bit 1 = right
 };
 
 class LiveProducer {
