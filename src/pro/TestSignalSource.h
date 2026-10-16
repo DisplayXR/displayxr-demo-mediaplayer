@@ -7,13 +7,17 @@
 // have something to find:
 //   vShiftPx     right eye moved down by this many pixels (vertical misalignment)
 //   eyeDelay     right eye shows the scene this many frames late (eye sync)
-//   gainR        right eye brightness x this (colour match)
-// --test-signal[=WxH@fps] and the MEDIAPLAYER_TEST_* env vars (main.cpp) set it.
+//   gainR        right eye brightness x this (colour match; photo mode: red channel)
+//   depthScale   scene disparities x this (photo mode: extra crossed parallax)
+// Photo mode (image=<side-by-side still>): the rig shows a real stereo photo, panned
+// slowly so there is motion for the eye-sync check, with the same faults applied.
+// --test-signal[=WxH@fps][,image=<path>] and the MEDIAPLAYER_TEST_* env vars set it.
 #pragma once
 
 #include "pro/LiveSourceBase.h"
 
 #include <atomic>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -27,9 +31,20 @@ struct TestSignalConfig {
     float gainR = 1.0f;
     float depthScale = 1.0f;       // multiplies every disc's disparity
     std::string startTimecode = "01:00:00:00";
+    std::string image;             // photo mode: a side-by-side stereo still
 
-    // "1920x1080@60" (any part may be omitted). False on a malformed spec.
+    // "1920x1080@60", ",image=<path>" (every part may be omitted; the path runs to the
+    // end of the spec). False on a malformed spec.
     bool ParseSpec(const std::string& spec);
+
+    // Photo mode: both eyes of the still, scaled to cover the eye with a margin for the
+    // pan, faults baked into the right eye. Built by Open() (or a test).
+    struct Plate {
+        int margin = 0;
+        livepix::Nv12 left, right;  // (eyeW + 2*margin) x (eyeH + 2*margin) each
+    };
+    std::shared_ptr<const Plate> plate;
+    static std::shared_ptr<const Plate> BuildPlate(const TestSignalConfig& cfg, std::string* err);
 };
 
 class TestSignalSource : public LiveSourceBase {

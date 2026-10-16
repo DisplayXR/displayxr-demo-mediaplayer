@@ -619,15 +619,17 @@ if(MP_BUILD_TESTS)
     # Media Player Pro looks: .cube LUT + ASC CDL loaders (pure C++).
     # Pro live sources, two-input pairing and rig checks (src/pro/, pure: no SDK, no GPU).
     add_executable(live_pixels_test tests/live_pixels_test.cpp src/pro/LivePixels.cpp
-        src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/Log.cpp)
-    target_include_directories(live_pixels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
+    target_include_directories(live_pixels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
     add_test(NAME live_pixels COMMAND live_pixels_test)
     add_executable(timecode_pairer_test tests/timecode_pairer_test.cpp src/pro/TimecodePairer.cpp)
     target_include_directories(timecode_pairer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME timecode_pairer COMMAND timecode_pairer_test)
     add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/LivePixels.cpp
-        src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/Log.cpp)
-    target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
+    target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
     add_test(NAME rig_check COMMAND rig_check_test)
 
     # Pro review formats: sequences, EXR display encoding, 10-bit -> P016 (real decodes).

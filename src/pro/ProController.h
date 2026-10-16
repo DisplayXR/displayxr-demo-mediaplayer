@@ -136,7 +136,7 @@ public:
 private:
     void SetMode(ViewMode m, bool announce);
     void BuildDepthOverlay(const Status& st);
-    void BuildStatusBar(const Status& st);
+    void BuildStatusBar(const Status& st, float alpha);
     void ZoomAt(float factor, float u, float v);
     void SetZoom(float z);
     void ClampPan();
@@ -170,7 +170,7 @@ private:
     bool dialogOpen_ = false;
     bool pendingDialogIsCdl_ = false;
 
-    bool inspectorPinned_ = true;  // Tab toggles
+    bool inspectorPinned_ = false;  // Tab / the Pin box: panels stay up; unpinned they follow the UI fade
     Station station_;
     bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture
     std::string compare_[2];       // A (what was open) and B

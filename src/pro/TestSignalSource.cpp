@@ -9,13 +9,23 @@
 #include <cstdio>
 #include <cstring>
 
+#include "stb_image.h"  // implementation compiled in src/media/ImageDecoder.cpp
+
 namespace mp {
 
 // Front to back: one disc 2% in front of the screen, one on it, two behind.
 const float TestSignalSource::kDisparity[TestSignalSource::kDiscs] = {-0.020f, 0.0f, 0.006f,
                                                                       0.012f};
 
-bool TestSignalConfig::ParseSpec(const std::string& spec) {
+bool TestSignalConfig::ParseSpec(const std::string& specIn) {
+    std::string spec = specIn;
+    const size_t img = spec.find("image=");
+    if (img != std::string::npos) {
+        image = spec.substr(img + 6);
+        spec = spec.substr(0, img);
+        if (!spec.empty() && spec.back() == ',') spec.pop_back();
+        if (image.empty()) return false;
+    }
     if (spec.empty()) return true;
     int w = 0, h = 0;
     double f = 0.0;
@@ -34,13 +44,82 @@ bool TestSignalConfig::ParseSpec(const std::string& spec) {
     return true;
 }
 
+std::shared_ptr<const TestSignalConfig::Plate> TestSignalConfig::BuildPlate(const TestSignalConfig& cfg,
+                                                                            std::string* err) {
+    int iw = 0, ih = 0, ch = 0;
+    stbi_uc* px = stbi_load(cfg.image.c_str(), &iw, &ih, &ch, 4);
+    if (!px || iw < 4 || ih < 2) {
+        if (px) stbi_image_free(px);
+        if (err) *err = "cannot read " + cfg.image;
+        return nullptr;
+    }
+    auto plate = std::make_shared<Plate>();
+    const int ew = cfg.eyeW, eh = cfg.eyeH;
+    const int m = std::max(16, (ew / 16) & ~1);
+    plate->margin = m;
+    const int pw = ew + 2 * m, ph = eh + 2 * m;
+    const int sw = iw / 2;  // one eye of the side-by-side still
+    // Cover-scale each eye onto the plate (bilinear), as BGRA for BgraToNv12.
+    const float scale = std::max((float)pw / sw, (float)ph / ih);
+    const float ox = (sw - pw / scale) * 0.5f, oy = (ih - ph / scale) * 0.5f;
+    // Right-eye faults: red gain, vertical shift (down), extra crossed parallax (the right
+    // eye moves left, so everything comes forward by (depthScale - 1) x 2 % of the width).
+    const float dx = (cfg.depthScale - 1.0f) * 0.02f * ew;
+    std::vector<uint8_t> bgra((size_t)pw * ph * 4);
+    for (int eye = 0; eye < 2; ++eye) {
+        const bool right = eye == 1;
+        for (int y = 0; y < ph; ++y) {
+            const float sy = std::clamp(oy + (y - (right ? cfg.vShiftPx : 0.0f) + 0.5f) / scale - 0.5f, 0.0f, ih - 1.001f);
+            const int y0 = (int)sy;
+            const float fy = sy - y0;
+            for (int x = 0; x < pw; ++x) {
+                const float sx = std::clamp(ox + (x + (right ? dx : 0.0f) + 0.5f) / scale - 0.5f, 0.0f, sw - 1.001f);
+                const int x0 = (int)sx;
+                const float fx = sx - x0;
+                float c[3];
+                for (int k = 0; k < 3; ++k) {
+                    auto at = [&](int xx, int yy) { return (float)px[((size_t)yy * iw + eye * sw + xx) * 4 + k]; };
+                    c[k] = (at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) +
+                           (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+                }
+                if (right) c[0] *= cfg.gainR;
+                uint8_t* o = &bgra[((size_t)y * pw + x) * 4];
+                o[0] = (uint8_t)std::clamp((int)(c[2] + 0.5f), 0, 255);
+                o[1] = (uint8_t)std::clamp((int)(c[1] + 0.5f), 0, 255);
+                o[2] = (uint8_t)std::clamp((int)(c[0] + 0.5f), 0, 255);
+                o[3] = 255;
+            }
+        }
+        livepix::Nv12& dst = right ? plate->right : plate->left;
+        dst.Resize(pw, ph);
+        livepix::BgraToNv12(bgra.data(), pw * 4, pw, ph, dst, 0);
+    }
+    stbi_image_free(px);
+    return plate;
+}
+
 TestSignalSource::~TestSignalSource() { Stop(); }
 
-bool TestSignalSource::Open(const TestSignalConfig& cfg) {
+bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
     Stop();
+    TestSignalConfig cfg = cfgIn;
+    if (!cfg.image.empty() && !cfg.plate) {
+        std::string err;
+        cfg.plate = TestSignalConfig::BuildPlate(cfg, &err);
+        if (!cfg.plate) {
+            Fail(LiveState::Failed, err);
+            return false;
+        }
+    }
     cfg_ = cfg;
-    char n[64];
-    std::snprintf(n, sizeof(n), "Test signal %dx%d@%g", cfg.eyeW, cfg.eyeH, cfg.fps);
+    char n[160];
+    if (cfg.plate) {
+        const size_t slash = cfg.image.find_last_of("/\\");
+        std::snprintf(n, sizeof(n), "Test rig (%s) %dx%d@%g",
+                      cfg.image.substr(slash == std::string::npos ? 0 : slash + 1).c_str(), cfg.eyeW, cfg.eyeH, cfg.fps);
+    } else {
+        std::snprintf(n, sizeof(n), "Test signal %dx%d@%g", cfg.eyeW, cfg.eyeH, cfg.fps);
+    }
     name_ = n;
     ResetStats((int)(cfg.fps + 0.5), cfg.fps);
     SetState(LiveState::Opening);
@@ -146,11 +225,29 @@ void FormatTc(int frames, int fpsInt, char* out, size_t n) {
 
 }  // namespace
 
+// Photo mode: copy one eye's window out of its plate; the window drifts sideways slowly
+// (the pan), so a late eye shows a different window.
+void PhotoEye(const TestSignalConfig::Plate& p, const livepix::Nv12& src, livepix::Nv12& dst, int x0, int w, int h, double t) {
+    const int m = p.margin;
+    const int ox = (m + (int)std::lround(0.8 * m * std::sin(t * 0.7))) & ~1;
+    const int oy = (m + (int)std::lround(0.3 * m * std::sin(t * 0.45))) & ~1;
+    for (int row = 0; row < h; ++row)
+        std::memcpy(dst.y.data() + (size_t)row * dst.width + x0, src.y.data() + (size_t)(oy + row) * src.width + ox, (size_t)w);
+    for (int row = 0; row < h / 2; ++row)
+        std::memcpy(dst.uv.data() + (size_t)row * dst.width + x0,
+                    src.uv.data() + (size_t)(oy / 2 + row) * src.width + ox, (size_t)w);
+}
+
 void TestSignalSource::Render(const TestSignalConfig& cfg, int64_t n, livepix::Nv12& frame) {
     const int w = cfg.eyeW, h = cfg.eyeH;
     if (frame.width != 2 * w || frame.height != h) frame.Resize(2 * w, h);
     const double t = (double)n / cfg.fps;
     const double tR = (double)std::max<int64_t>(0, n - cfg.eyeDelay) / cfg.fps;
+    if (cfg.plate) {
+        PhotoEye(*cfg.plate, cfg.plate->left, frame, 0, w, h, t);
+        PhotoEye(*cfg.plate, cfg.plate->right, frame, w, w, h, tR);
+        return;
+    }
     DrawEye(frame, 0, w, h, t, cfg.depthScale, 0.0f, 1.0f, false);
     DrawEye(frame, w, w, h, tR, cfg.depthScale, cfg.vShiftPx, cfg.gainR, true);
 }

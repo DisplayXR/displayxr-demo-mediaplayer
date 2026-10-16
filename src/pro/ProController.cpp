@@ -69,6 +69,7 @@ void ProController::ApplyTestEnv() {
     if (const char* e = std::getenv("MEDIAPLAYER_PRO_EXPOSURE")) grade_.exposure = std::clamp((float)std::atof(e), -4.0f, 4.0f);
     if (const char* b = std::getenv("MEDIAPLAYER_PRO_BYPASS")) bypass_ = (*b && *b != '0');
     if (const char* c = std::getenv("MEDIAPLAYER_PRO_COMPARE_FRAME")) testCompareFrame_ = std::atoi(c);
+    if (const char* p = std::getenv("MEDIAPLAYER_PRO_PIN")) inspectorPinned_ = (*p && *p != '0');
 }
 
 // ---------------------------------------------------------------------------
@@ -464,16 +465,16 @@ void ProController::BuildDepthOverlay(const Status& st) {
 }
 
 // The status bar along the bottom of the picture (the plan's mockup: LIVE, input, format,
-// look, timecode, depth range, convergence shift). In full screen only the timecode stays
-// (the "SDI timecode overlay"); T hides it.
-void ProController::BuildStatusBar(const Status& st) {
+// look, timecode, depth range, convergence shift). It fades with the panels; in full screen
+// or faded, only the timecode stays (the "SDI timecode overlay"); T hides it.
+void ProController::BuildStatusBar(const Status& st, float alpha) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     if (st.isLogo || !host_.pictureInHud) return;
     float px, py, pw, ph;
     if (!host_.pictureInHud(px, py, pw, ph)) return;
     const ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
-    const bool fs = host_.isFullscreen && host_.isFullscreen();
+    const bool fs = (host_.isFullscreen && host_.isFullscreen()) || alpha < 0.01f;
     const std::string& tc = station_.Timecode();
     char buf[320];
     int n = 0;
@@ -518,9 +519,9 @@ void ProController::BuildStatusBar(const Status& st) {
 void ProController::BuildUI(const Status& st, float uiAlpha) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     BuildDepthOverlay(st);  // on the picture; independent of the inspector fade
-    BuildStatusBar(st);
-    station_.BuildDeckLinkDialog();
     const float alpha = inspectorPinned_ ? 1.0f : uiAlpha;
+    BuildStatusBar(st, alpha);
+    station_.BuildDeckLinkDialog();
     if (alpha < 0.01f) return;
     const ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
@@ -540,7 +541,10 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
         ImGui::SetNextWindowBgAlpha(0.82f);
     };
     placePanel(8.0f);
-    if (ImGui::Begin("Station  (Tab)", nullptr, flags)) {
+    if (ImGui::Begin("Station", nullptr, flags)) {
+        ImGui::Checkbox("Pin panels (Tab)", &inspectorPinned_);
+        ImGui::SameLine();
+        ImGui::TextDisabled("Shift+Tab: all UI");
         // --- Inputs (DeckLink / test rig / camera / stream) ----------------------
         station_.BuildInputsSection(st.sourceLabel, st.live);
 
@@ -592,7 +596,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     ImGui::End();
 
     placePanel(W - panelW - 8.0f);
-    if (ImGui::Begin("Inspector  (Tab)", nullptr, flags)) {
+    if (ImGui::Begin("Inspector", nullptr, flags)) {
         // --- View -----------------------------------------------------------
         if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
             for (int i = 0; i < (int)ViewMode::Count; ++i) {

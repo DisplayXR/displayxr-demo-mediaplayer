@@ -49,17 +49,19 @@ streams, auto-convergence, MCP tools. Plus:
 
 | Feature | How |
 |---|---|
-| Inspector panel | Right-hand ImGui panel: source, view, stereo, color. `Tab` pins / unpins it. |
+| Panels | Two ImGui panels, laid out as in the plan's mockup. **Station** (left): pin box, inputs + *DeckLink setup...*, source with timecode and delay, looks (LUT, CDL), snapshots. **Inspector** (right): view, stereo, colour (exposure, look, CDL values folded), rig check. Unpinned by default: they appear when the mouse moves and fade with the player's controls. `Tab` or *Pin panels* keeps them up; `Shift+Tab` (the player's own key) hides or shows all UI. |
+| Status bar | Along the bottom of the picture: LIVE, input, format, look, exposure, TC, near / far, convergence, A/B side. Fades with the panels; when faded, and in full screen, only a timecode chip stays (`T` hides it). |
 | QC views | `1` 3D, `2` left eye, `3` right eye, `4` eye difference (x4), `5` anaglyph. Diff and anaglyph address the two SBS halves directly, so they work with no viewer tracked. |
 | Pan / zoom | Mouse wheel zooms about the pointer, middle-drag (or left-drag while zoomed) pans, `H` fits, `Z` toggles 1:1. Identical for both eyes, so depth stays correct while zoomed. |
 | 3D LUT | `.cube` (2..256, `DOMAIN_MIN/MAX`), from the inspector, a file drop, `--lut <file>` or `MEDIAPLAYER_LUT`. |
 | ASC CDL | `.cc` / `.ccc` / `.cdl` (slope, offset, power, saturation; editable in the inspector), from the inspector, a drop, `--cdl <file>` or `MEDIAPLAYER_CDL`. |
 | Exposure | ±4 stops in linear light. Right-click the slider to reset. |
 | Grade bypass | `G` |
-| Full screen | `F` / `F11` / double-click the picture. Escape leaves full screen and never quits. |
+| Full screen | `F` / `F11` / double-click the picture. Escape leaves full screen and never quits. Full screen unpins the panels so only the picture and the timecode show; leaving restores the pin. |
 | Live inputs | `src/pro/Station`: named inputs, `J` or the inspector's **Inputs** switches. `--input="Rig=decklink:0+1,sdi"`, `--input="Resolve=decklink:2,sbs"`, `--input="Witness=camera:Integrated"`, `--input="Test=test:1920x1080@24"`, `url:<u>`; shorthands `--decklink[=<dev>]` `--decklink-right=` `--decklink-input=sdi\|hdmi` `--decklink-stereo=auto\|mono\|sbs\|dual\|pair` `--decklink-mode=Hp25`, `--test-signal[=WxH@fps]`; `--decklink-list` prints the cards. |
+| DeckLink setup dialog | *DeckLink setup...* in the Station panel: left / right device (right = "none" for one cable), connection (SDI / HDMI / as set in Desktop Video), stereo packing (auto / side by side / dual-stream 3D / mono), start format; *Open* adds or replaces the "DeckLink" input and switches to it. Says plainly when the build has no SDK or no card / driver is present. |
 | DeckLink input | `src/pro/DeckLinkSource`: one cable (mono / SBS), the card's dual-stream 3D mode (switches automatically when the card detects it), or two inputs paired by SMPTE timecode (`TimecodePairer`). Format detection follows the signal. Captures 10-bit v210 and keeps 16 bits (P016) into the grade. Publishes into the same live path as the camera (`LiveProducer` / `App::EnterLive`). |
-| Test rig | `src/pro/TestSignalSource`: synthetic stereo with known disparities and timecode; faults `MEDIAPLAYER_TEST_VSHIFT` (px), `_EYE_DELAY` (frames), `_GAIN_R`, `_DEPTH`. Exercises everything below without hardware. |
+| Test rig | `src/pro/TestSignalSource`: synthetic stereo with known disparities and timecode, or a real side-by-side photo panned slowly (`--test-signal=image=<file>`); faults `MEDIAPLAYER_TEST_VSHIFT` (px), `_EYE_DELAY` (frames), `_GAIN_R`, `_DEPTH`. Exercises everything below without hardware. |
 | Timecode + delay | Source timecode and measured capture → screen delay (the card's or camera's arrival → the panel frame it is shown in; the camera's and panel's own delays come on top). In the inspector's Source section; `T` toggles. |
 | Rig checks | `src/pro/RigCheck`: vertical error (sub-pixel 2D block matching, full-res px) + roll, eye sync (frames between the paired inputs' timecodes), colour match (CIE76 ΔE between the eyes), depth range (2nd / 98th percentile parallax, % of eye width, negative = in front) against `--depth-budget=-2,1`; `--vertical-limit=1` `--colour-limit=2`. Overruns ≥ 0.5 s become alerts with timecode, also appended to `Pictures/DisplayXR/station_alerts.jsonl`. 60-second history strip (depth band vs budget, vertical error); `R` toggles. |
 | Snapshots | `N` or the inspector: both eyes as shown (graded) via the runtime's atlas capture, plus `<name>_note.json` (note, timecode, rig numbers, budget); notes are editable in the inspector. |
@@ -74,7 +76,27 @@ Grade order is exposure → CDL → LUT, the order an on-set chain applies a CDL
 show LUT. The grade is skipped on the idle screen.
 
 Test-only env vars (headless atlas checks): `MEDIAPLAYER_PRO_VIEW=0..4`,
-`MEDIAPLAYER_PRO_ZOOM=<x>`, with the trunk's `MEDIAPLAYER_DUMP_ATLAS=<path>`.
+`MEDIAPLAYER_PRO_ZOOM=<x>`, `MEDIAPLAYER_PRO_PIN`, `_DEPTH_OVERLAY`, `_EXPOSURE=<ev>`,
+`_BYPASS`, `_COMPARE_FRAME=<n>`, `_SNAPSHOT_FRAME=<n>` + `_SNAPSHOT_NOTE`,
+`_DECKLINK_DIALOG`, with the trunk's `MEDIAPLAYER_DUMP_ATLAS=<path>` and
+`MEDIAPLAYER_DUMP_FRAME=<n>`. Do not use `MEDIAPLAYER_DUMP_HUD` on runtime v2.31: its
+blocking readback deadlocks the app (the atlas capture already contains the HUD).
+
+### Keys
+
+| Key | Does |
+|---|---|
+| `Tab` / `Shift+Tab` | pin the panels / hide or show all UI |
+| `1`..`5` | 3D, left eye, right eye, difference, anaglyph |
+| wheel, middle-drag, `H`, `Z` | zoom, pan, fit, 1:1 |
+| `G` | grade bypass |
+| `D` | depth overlay |
+| `T`, `R` | timecode, 60 s history strip |
+| `N` | snapshot (note editable in the Station panel) |
+| `J` | next input |
+| `B` | A/B compare |
+| `X`, `-` / `=`, `0` | swap eyes, convergence, reset convergence (the player's own) |
+| `F` / `F11`, `Esc` | full screen, leave full screen |
 
 ## Build, run, release
 
@@ -125,6 +147,6 @@ over SDI); RP188 at 50/60p (frame/field counting) to confirm on a card. Kept for
 6. **Review tools (Phase 4).** A Resolve panel (timecode follow, markers), ProRes / EXR /
    DPX, A/B compare, OpenColorIO.
 
-Known limits: 8-bit to the panel (the runtime's atlas path); the inspector is an ImGui
-panel in the HUD layer, so it is woven with the picture rather than drawn as a crisp 2D
+Known limits: 8-bit to the panel (the runtime's atlas path); the panels are ImGui
+panels in the HUD layer, so they are woven with the picture rather than drawn as a crisp 2D
 zone (moving it to `XR_DXR_display_zones` is planned).
