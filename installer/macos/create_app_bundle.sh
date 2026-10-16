@@ -99,6 +99,32 @@ if [ -f "$REPO_ROOT/assets/test_LR_2x1.png" ]; then
     cp "$REPO_ROOT/assets/test_LR_2x1.png" "$APP_BUNDLE/Contents/Resources/"
 fi
 
+# --- DisplayXR app manifest + icons (Contents/Resources/displayxr/) ---
+# The DisplayXR shell launcher discovers macOS apps by scanning
+# /Applications/*.app/Contents/Resources/displayxr/ for <binary>.displayxr.json,
+# exactly like the model/gauss/earthview/avatar demo bundles. The manifest basename
+# is the real binary's name (the one in Contents/Resources that the launcher execs),
+# and it carries no exe_path — the shell derives it. Content is the same manifest the
+# Windows installer ships (single source of truth: displayxr/ at the repo root), so
+# the app has one id + name on every platform. idle.png/logo.png ride along so the
+# player's idle logo resolves at <exe-dir>/displayxr/ instead of the test pattern.
+DXR_SRC="$REPO_ROOT/displayxr"
+DXR_DST="$APP_BUNDLE/Contents/Resources/displayxr"
+DXR_MANIFEST_SRC="$DXR_SRC/mediaplayer_handle_vk_win.displayxr.json"
+mkdir -p "$DXR_DST"
+for f in icon.png icon_sbs.png idle.png logo.png; do
+    if [ ! -f "$DXR_SRC/$f" ]; then
+        echo "Error: $DXR_SRC/$f missing (app manifest icon / idle logo)" >&2
+        exit 1
+    fi
+    cp "$DXR_SRC/$f" "$DXR_DST/"
+done
+if [ ! -f "$DXR_MANIFEST_SRC" ]; then
+    echo "Error: app manifest $DXR_MANIFEST_SRC missing" >&2
+    exit 1
+fi
+cp "$DXR_MANIFEST_SRC" "$DXR_DST/${BINARY_NAME}.displayxr.json"
+
 # --- MoltenVK (loaded via ICD, not linked) + ICD manifest ---
 MVK_SRC="$(find "$(brew --prefix molten-vk 2>/dev/null || echo "$BREW_PREFIX")/lib" -maxdepth 1 -name 'libMoltenVK*.dylib' 2>/dev/null | head -1)"
 if [ -z "$MVK_SRC" ]; then

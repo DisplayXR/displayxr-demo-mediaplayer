@@ -139,8 +139,11 @@ jobs:
           assert_present "$APP/Resources/lib/libopenxr_loader" "OpenXR loader"
           assert_present "$APP/Resources/lib/libavcodec" "FFmpeg avcodec"
           assert_present "$APP/Resources/lib/libavformat" "FFmpeg avformat"
+          assert_present "$APP/Resources/displayxr/mediaplayer_handle_vk_macos\.displayxr\.json" "DisplayXR app manifest"
+          assert_present "$APP/Resources/displayxr/icon\.png" "manifest 2D icon"
+          assert_present "$APP/Resources/displayxr/icon_sbs\.png" "manifest 3D icon"
           if [ "$MISSING" -ne 0 ]; then echo "Payload listing:"; cat "$EXPAND_DIR/files"; exit 1; fi
-          echo "PASS: .pkg payload contains app + MoltenVK/Vulkan/OpenXR + FFmpeg dylibs."
+          echo "PASS: .pkg payload contains app + MoltenVK/Vulkan/OpenXR + FFmpeg dylibs + DisplayXR manifest/icons."
 
       - name: Upload installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
