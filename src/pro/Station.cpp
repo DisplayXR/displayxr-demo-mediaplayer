@@ -241,6 +241,104 @@ void Station::LogNewAlerts() {
     alertsLoggedUntil_ = newest;
 }
 
+// ---------------------------------------------------------------------------- agent tools
+
+bool Station::DispatchTool(const std::string& tool, const std::string& argsJson, std::string& result,
+                           bool& success) {
+    using json = nlohmann::json;
+    json a = json::parse(argsJson.empty() ? "{}" : argsJson, nullptr, false);
+    if (a.is_discarded() || !a.is_object()) a = json::object();
+    auto err = [&](const std::string& e) {
+        success = false;
+        result = json{{"error", e}}.dump();
+        return true;
+    };
+    auto num = [&](const char* k, float& v) {
+        if (!a.contains(k) || !a[k].is_number()) return false;
+        v = a[k].get<float>();
+        return true;
+    };
+    if (tool == "get_rig_status") {
+        const rig::Result r = rig_.Last();
+        const rig::Budget b = rig_.GetBudget();
+        const std::vector<rig::Sample> h = rig_.History(1.0);
+        json out;
+        out["measured"] = r.ok && rig_.Active(LiveProducer::NowSeconds());
+        out["matches"] = r.matches;
+        out["vertical_px"] = r.verticalPx;
+        out["roll_deg"] = r.rollDeg;
+        out["near_pct"] = r.nearPct;
+        out["far_pct"] = r.farPct;
+        out["delta_e"] = r.deltaE;
+        out["eye_sync_frames"] = h.empty() ? -1 : h.back().eyeOffsetFrames;
+        out["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
+                         {"delta_e", b.maxDeltaE}};
+        json alerts = json::array();
+        for (const rig::Alert& al : rig_.Alerts())
+            alerts.push_back({{"what", al.what}, {"timecode", al.timecode}, {"time", al.wallClock}, {"open", al.end < 0}});
+        out["alerts"] = alerts;
+        out["timecode"] = timecode_;
+        out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
+        result = out.dump();
+        return true;
+    }
+    if (tool == "set_depth_budget") {
+        rig::Budget b = rig_.GetBudget();
+        num("near_pct", b.nearPct);
+        num("far_pct", b.farPct);
+        num("vertical_px", b.maxVerticalPx);
+        num("delta_e", b.maxDeltaE);
+        if (!(b.nearPct < b.farPct)) return err("near_pct must be below far_pct");
+        rig_.SetBudget(b);
+        result = json{{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
+                      {"delta_e", b.maxDeltaE}}.dump();
+        return true;
+    }
+    if (tool == "snapshot") {
+        const std::string note = a.contains("note") && a["note"].is_string() ? a["note"].get<std::string>() : "";
+        if (!TakeSnapshot(note)) return err("snapshot failed (the runtime has no atlas capture?)");
+        const Snapshot& s = snapshots_.back();
+        result = json{{"image", s.image}, {"note_file", s.notePath}, {"timecode", s.timecode}}.dump();
+        return true;
+    }
+    if (tool == "list_inputs") {
+        json arr = json::array();
+        for (size_t i = 0; i < inputs_.size(); ++i)
+            arr.push_back({{"index", i}, {"name", inputs_[i].name}, {"spec", inputs_[i].spec}});
+        result = json{{"inputs", arr}, {"active", inputIndex_}}.dump();
+        return true;
+    }
+    if (tool == "select_input") {
+        int idx = a.contains("index") && a["index"].is_number_integer() ? a["index"].get<int>() : -1;
+        if (idx < 0 && a.contains("name") && a["name"].is_string())
+            for (size_t i = 0; i < inputs_.size(); ++i)
+                if (inputs_[i].name == a["name"].get<std::string>()) idx = (int)i;
+        if (idx < 0 || idx >= (int)inputs_.size() || !SwitchInput(idx)) return err("no such input, or it failed to open");
+        result = json{{"active", inputIndex_}, {"name", inputs_[(size_t)inputIndex_].name}}.dump();
+        return true;
+    }
+    if (tool == "open_decklink") {
+        DeckLinkConfig c;
+        if (a.contains("device") && a["device"].is_string()) c.device = a["device"].get<std::string>();
+        if (a.contains("right") && a["right"].is_string()) {
+            c.rightDevice = a["right"].get<std::string>();
+            c.stereo = DeckLinkConfig::Stereo::Pair;
+        }
+        if (a.contains("input") && a["input"].is_string()) c.input = a["input"].get<std::string>();
+        if (a.contains("mode") && a["mode"].is_string()) c.mode = a["mode"].get<std::string>();
+        if (a.contains("stereo") && (!a["stereo"].is_string() ||
+                                     !DeckLinkConfig::ParseStereo(a["stereo"].get<std::string>(), c.stereo)))
+            return err("stereo must be auto|mono|sbs|dual|pair");
+        testSignal_.Stop();
+        if (!decklink_.Open(c)) return err(decklink_.LastError());
+        if (host_.enterLive) host_.enterLive(&decklink_, decklink_.DeviceName());
+        rig_.Reset();
+        result = json{{"device", decklink_.DeviceName()}, {"state", LiveStateName(decklink_.GetState())}}.dump();
+        return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------- UI
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)

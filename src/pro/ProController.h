@@ -62,6 +62,8 @@ struct Host {
     std::function<bool(float& w, float& h)> contentSizePoints;
     // Zoom at which one source pixel maps to one panel pixel in the current mode.
     std::function<float()> oneToOneZoom;
+    // The unzoomed picture as fractions (0..1) of the HUD layer ImGui draws into.
+    std::function<bool(float& x, float& y, float& w, float& h)> pictureInHud;
     std::function<bool()> isFullscreen;
     std::function<void()> toggleFullscreen;
 };
@@ -101,11 +103,16 @@ public:
     void BuildUI(const Status& st, float uiAlpha);
 
     // True while Pro wants the HUD kept alive (pinned inspector).
-    bool KeepHudAwake() const { return inspectorPinned_; }
+    bool KeepHudAwake() const { return inspectorPinned_ || depthOverlay_; }
 
     ViewMode Mode() const { return mode_; }
     // The monitoring station: inputs, timecode / delay, rig checks, snapshots (Station.h).
     Station& GetStation() { return station_; }
+    // Agent tools (ProTools.cpp): registered and dispatched from the trunk's MCP code.
+    using RegisterFn = std::function<void(const char* name, const char* description, const char* schema)>;
+    void RegisterTools(const RegisterFn& reg);
+    // True when `tool` is a Pro tool (result / success set).
+    bool DispatchTool(const std::string& tool, const std::string& argsJson, std::string& result, bool& success);
     float Zoom() const { return zoom_; }
 
     // Pro launches with eye-swap and convergence controls on the inspector, so the
@@ -114,6 +121,7 @@ public:
 
 private:
     void SetMode(ViewMode m, bool announce);
+    void BuildDepthOverlay(const Status& st);
     void ZoomAt(float factor, float u, float v);
     void SetZoom(float z);
     void ClampPan();
@@ -149,6 +157,7 @@ private:
 
     bool inspectorPinned_ = true;  // Tab toggles
     Station station_;
+    bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture
     bool stereoSource_ = false;
 };
 

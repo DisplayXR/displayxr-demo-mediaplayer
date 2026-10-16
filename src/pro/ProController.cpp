@@ -296,6 +296,10 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
                     if (host_.toast) host_.toast(t);
                     return true;
                 }
+                case SDLK_D:
+                    depthOverlay_ = !depthOverlay_;
+                    if (host_.toast) host_.toast(depthOverlay_ ? "Depth overlay on" : "Depth overlay off");
+                    return true;
                 case SDLK_G:
                     bypass_ = !bypass_;
                     if (host_.toast) host_.toast(bypass_ ? "Grade bypassed" : "Grade on");
@@ -355,8 +359,45 @@ void ProController::Tick(const Status& st) {
 // Inspector
 // ---------------------------------------------------------------------------
 
+// The depth overlay (Phase 2, "depth overlay"): every rig-check match drawn where it is
+// on the picture, coloured by screen parallax - warm in front of the screen, white on
+// it, blue behind - and ringed red when it breaks the depth budget. Follows pan / zoom.
+void ProController::BuildDepthOverlay(const Status& st) {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    if (!depthOverlay_ || !st.stereo || !st.hasPicture || !host_.pictureInHud) return;
+    float px, py, pw, ph;
+    if (!host_.pictureInHud(px, py, pw, ph)) return;
+    const rig::Result r = station_.RigLast();
+    if (!r.ok) return;
+    const rig::Budget b = station_.RigBudget();
+    const ImGuiIO& io = ImGui::GetIO();
+    const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const float rad = std::max(3.0f, H * 0.006f);
+    for (size_t i = 0; i < r.parallaxPct.size(); ++i) {
+        // match centre in eye-UV -> zoomed window -> HUD pixels
+        const float u = (r.matchX[i] - panX_) * zoom_, v = (r.matchY[i] - panY_) * zoom_;
+        if (u < 0.f || u > 1.f || v < 0.f || v > 1.f) continue;
+        const ImVec2 c((px + u * pw) * W, (py + v * ph) * H);
+        const float p = r.parallaxPct[i];
+        const float t = std::clamp(p / 2.0f, -1.0f, 1.0f);  // +-2 % spans the ramp
+        const ImVec4 col = t < 0 ? ImVec4(1.0f, 1.0f + 0.55f * t, 1.0f + 0.85f * t, 0.95f)    // white -> orange-red
+                                 : ImVec4(1.0f - 0.75f * t, 1.0f - 0.45f * t, 1.0f, 0.95f);   // white -> blue
+        dl->AddCircleFilled(c, rad, ImGui::GetColorU32(col));
+        if (p < b.nearPct || p > b.farPct) dl->AddCircle(c, rad * 1.9f, IM_COL32(255, 60, 50, 255), 0, 2.0f);
+    }
+    char legend[96];
+    std::snprintf(legend, sizeof(legend), "Depth overlay (D): near %+.1f%%  far %+.1f%%  budget %+.1f..%+.1f%%", r.nearPct,
+                  r.farPct, b.nearPct, b.farPct);
+    dl->AddText(ImVec2(px * W + 8.0f, py * H + 8.0f), IM_COL32(255, 255, 255, 230), legend);
+#else
+    (void)st;
+#endif
+}
+
 void ProController::BuildUI(const Status& st, float uiAlpha) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
+    BuildDepthOverlay(st);  // on the picture; independent of the inspector fade
     const float alpha = inspectorPinned_ ? 1.0f : uiAlpha;
     if (alpha < 0.01f) return;
     const ImGuiIO& io = ImGui::GetIO();

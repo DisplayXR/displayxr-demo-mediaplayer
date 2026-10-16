@@ -448,6 +448,7 @@ function(mp_add_player tgt is_pro)
     if(is_pro)
         target_sources(${tgt} PRIVATE
             src/pro/ProController.cpp
+            src/pro/ProTools.cpp         # agent tools: grade, view, station
             src/pro/LivePixels.cpp       # UYVY / v210 / BGRA -> NV12 / P016 for capture cards
             src/pro/LiveSourceBase.cpp   # shared ring + stats of the Pro live sources
             src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)

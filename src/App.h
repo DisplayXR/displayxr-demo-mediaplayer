@@ -366,6 +366,7 @@ private:
     // per-eye content width in tile pixels: Pro's pointer->picture mapping and 1:1 zoom.
     float proPicX_ = 0.f, proPicY_ = 0.f, proPicW_ = 0.f, proPicH_ = 0.f;
     float proTileContentW_ = 0.f;
+    float proHud_[4] = {0.f, 0.f, 1.f, 1.f};  // HUD rect in window fractions (x, y, w, h)
 #endif
 
     // Test scaffolding (env-gated).

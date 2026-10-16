@@ -862,6 +862,12 @@ void App::RenderOneFrame() {
                 hud.width = fracW;
                 hud.height = fracH;
                 hud.disparity = kHudDisparity;
+#if MEDIAPLAYER_PRO
+                proHud_[0] = hud.x;
+                proHud_[1] = hud.y;
+                proHud_[2] = hud.width;
+                proHud_[3] = hud.height;
+#endif
 
                 uint32_t pw = 0, phh = 0;
                 window_.PointSize(pw, phh);
@@ -2375,12 +2381,21 @@ void App::SetupAgentTools() {
         return DispatchAgentTool(tool, args, success);
     });
     LOG_INFO("Agent tools registered (appId=mediaplayer)");
+#if MEDIAPLAYER_PRO
+    pro_.RegisterTools([this](const char* n, const char* d, const char* s) { xr_.RegisterMcpTool(n, d, s); });
+#endif
 }
 
 std::string App::DispatchAgentTool(const std::string& tool, const std::string& argsJson,
                                    bool& success) {
     using json = nlohmann::json;
     success = true;
+#if MEDIAPLAYER_PRO
+    {
+        std::string proResult;
+        if (pro_.DispatchTool(tool, argsJson, proResult, success)) return proResult;  // Pro tools
+    }
+#endif
 
     // Parse args leniently: empty/whitespace means "no arguments".
     json args = json::object();
@@ -2804,6 +2819,17 @@ void App::InitPro() {
         const bool sbs = layout_ != StereoLayout::Mono && layout_ != StereoLayout::Dual;
         const float eyeW = (float)mediaW_ * (sbs ? 0.5f : 1.0f);
         return proTileContentW_ > 1.f ? std::max(1.0f, eyeW / proTileContentW_) : 1.0f;
+    };
+    h.pictureInHud = [this](float& x, float& y, float& w, float& hh) {
+        // The (unzoomed) picture as fractions of the HUD layer, where ImGui draws.
+        uint32_t pw = 0, ph = 0;
+        window_.PointSize(pw, ph);
+        if (pw == 0 || ph == 0 || proPicW_ < 1.f || proHud_[2] <= 0.f || proHud_[3] <= 0.f) return false;
+        x = (proPicX_ / (float)pw - proHud_[0]) / proHud_[2];
+        y = (proPicY_ / (float)ph - proHud_[1]) / proHud_[3];
+        w = (proPicW_ / (float)pw) / proHud_[2];
+        hh = (proPicH_ / (float)ph) / proHud_[3];
+        return true;
     };
     h.isFullscreen = [this] { return window_.IsFullscreen(); };
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };

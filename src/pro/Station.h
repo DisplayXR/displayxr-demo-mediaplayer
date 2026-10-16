@@ -56,6 +56,8 @@ public:
     void OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live, int eyeOffsetFrames);
 
     bool SwitchInput(int index);
+    // Agent tools for the station (called from ProController::DispatchTool).
+    bool DispatchTool(const std::string& tool, const std::string& argsJson, std::string& result, bool& success);
     bool TakeSnapshot(const std::string& note);
 
     // Inspector sections and the bottom history strip (ImGui).
@@ -66,6 +68,8 @@ public:
     void BuildHistoryStrip(float alpha, bool stereo);
 
     bool ShowHistory() const { return showHistory_; }
+    rig::Result RigLast() const { return rig_.Last(); }
+    rig::Budget RigBudget() const { return rig_.GetBudget(); }
     const std::string& Timecode() const { return timecode_; }
     double DelayMs() const { return delayMs_; }
 
