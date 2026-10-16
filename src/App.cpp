@@ -364,6 +364,7 @@ int App::Run() {
     }();
     dumpPath_ = std::getenv("MEDIAPLAYER_DUMP_ATLAS");
     dumpHudPath_ = std::getenv("MEDIAPLAYER_DUMP_HUD");
+    if (const char* f = std::getenv("MEDIAPLAYER_DUMP_FRAME")) dumpFrame_ = std::max(1, std::atoi(f));
     openAfterPath_ = std::getenv("MEDIAPLAYER_OPEN_AFTER");  // test: swap media mid-run
     if (const char* h = std::getenv("MEDIAPLAYER_HUD")) showHud_ = (*h && *h != '0');
     // Env-gated initial stereo state (test scaffolding: lets a headless atlas dump
@@ -810,7 +811,7 @@ void App::RenderOneFrame() {
         }
         ++rendered_;
 
-        if (dumpPath_ && !dumped_ && rendered_ >= 100) {
+        if (dumpPath_ && !dumped_ && rendered_ >= dumpFrame_) {
             // Prefer the runtime-owned atlas capture (compositor-owned swapchain makes the
             // app-side readback unreliable); fall back to the local readback if absent.
             if (xr_.HasAtlasCapture()) {
@@ -884,7 +885,7 @@ void App::RenderOneFrame() {
                 // Desktop Linux: the pointer shape ImGui wants (I-beam over the URL
                 // field, ...). The SDL backend does this itself elsewhere.
                 window_.SetImGuiCursor(imgui_.MouseCursor());
-                if (dumpHudPath_ && !dumpedHud_ && rendered_ >= 100) {
+                if (dumpHudPath_ && !dumpedHud_ && rendered_ >= dumpFrame_) {
                     renderer_.DumpExternalImage(xr_.HudImages()[hudIdx], xr_.HudWidth(),
                                                 xr_.HudHeight(), dumpHudPath_);
                     dumpedHud_ = true;
@@ -2220,8 +2221,13 @@ void App::ClearIdleLogo() {
     // Hand back the mode the idle screen borrowed — but only if it is still the one
     // we asked for. If the user pressed V (or the Mode button) while the logo was up,
     // that is their choice and media inherits it.
-    if (modeBeforeIdle_ >= 0 && idleModeRequested_ >= 0 &&
-        xr_.CurrentModeIndex() == (uint32_t)idleModeRequested_) {
+    if (idleModeRequested_ >= 0 && pendingModeRequest_ == idleModeRequested_) {
+        // The borrow was never sent (media replaced the logo before the first frame,
+        // e.g. a live input opened during Init): cancel it rather than go flat.
+        pendingModeRequest_ = -1;
+    } else if (modeBeforeIdle_ >= 0 && idleModeRequested_ >= 0 &&
+               (xr_.CurrentModeIndex() == (uint32_t)idleModeRequested_ ||
+                xr_.CurrentModeIndex() == (uint32_t)modeBeforeIdle_)) {  // sent, change not yet reported
         pendingModeRequest_ = modeBeforeIdle_;
     }
     modeBeforeIdle_ = -1;
