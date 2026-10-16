@@ -212,6 +212,9 @@ bool App::Initialize(const char* mediaPath) {
         // xrCreateSession). A no-op elsewhere, where Create() already made it.
         window_.RealizeOnPanel(left, top, panelW, panelH);
     };
+#if MEDIAPLAYER_PRO
+    xr_.RequestLocal2D(true);  // pinned Pro panels show flat (HudSubmit::flat)
+#endif
     if (!xr_.Initialize(window_.NativeHandle(), placeOnPanel)) {
         LOG_ERROR("OpenXR initialization failed");
         return false;
@@ -946,6 +949,19 @@ void App::RenderOneFrame() {
                 window_.PointSize(pw, phh);
                 imgui_.BeginFrame((float)pw, (float)phh, hud.x, hud.y, hud.width, hud.height);
                 BuildTransportUI();
+#if MEDIAPLAYER_PRO
+                // Pinned panels go out flat as well (Local2D layers over the same HUD image).
+                for (const pro::ProController::FlatRect& r : pro_.FlatRects()) {
+                    if (hud.flatCount >= XrSession::HudSubmit::kMaxFlat) break;
+                    XrSession::HudSubmit::Rect& o = hud.flat[hud.flatCount++];
+                    o.x = (int32_t)std::floor(r.x);
+                    o.y = (int32_t)std::floor(r.y);
+                    o.w = (int32_t)std::ceil(r.x + r.w) - o.x;
+                    o.h = (int32_t)std::ceil(r.y + r.h) - o.y;
+                }
+                hud.windowPxW = cw;
+                hud.windowPxH = ch;
+#endif
                 imgui_.RenderToHud(hudIdx, renderer_.FrameCmd());  // joins the frame's command buffer
                 // Desktop Linux: the pointer shape ImGui wants (I-beam over the URL
                 // field, ...). The SDL backend does this itself elsewhere.
@@ -3420,6 +3436,7 @@ void App::InitPro() {
     h.isFullscreen = [this] { return window_.IsFullscreen(); };
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
     pro_.Init(&renderer_, window_.SdlWindow(), std::move(h));
+    pro_.SetFlatPanelsAvailable(xr_.HasLocal2D());
 
     // Pro input rides the same SDL event hook as ImGui, after ImGui has seen the event.
     const bool imguiOk = imgui_.Ready();

@@ -18,6 +18,7 @@
 #include <openxr/XR_DXR_cursor_depth.h>            // depth-aware cursor (spec v7: measured disparity)
 #include <openxr/XR_DXR_input_providers.h>         // which input provider holds this app's roles
 #include <openxr/XR_DXR_lift.h>                    // "Convert to 3D": 2D->3D conversion (spec v4)
+#include <openxr/XR_DXR_local_3d_zone.h>           // Pro: panels as flat 2D (Local2D layers)
 #if defined(__APPLE__)
 #  include <openxr/XR_DXR_cocoa_window_binding.h>
 #elif defined(_WIN32)

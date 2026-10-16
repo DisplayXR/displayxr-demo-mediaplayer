@@ -26,6 +26,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <vector>
 
 struct SDL_Window;
 
@@ -118,6 +119,14 @@ public:
     // inspector ignores it and stays up.
     void BuildUI(const Status& st, float uiAlpha);
 
+    // Pinned panels are shown FLAT (crisp 2D, not woven with the picture): their HUD rects
+    // from the last BuildUI, in HUD pixels; App hands them to XrSession::HudSubmit::flat.
+    // Empty while the panels are unpinned (fading panels stay woven, so the picture is
+    // never cut by a half-transparent card) or MEDIAPLAYER_PRO_PANELS_3D=1.
+    struct FlatRect { float x, y, w, h; };
+    const std::vector<FlatRect>& FlatRects() const { return flatRects_; }
+    void SetFlatPanelsAvailable(bool on) { flatAvailable_ = on; }
+
     // True while Pro wants the HUD kept alive (pinned inspector).
     bool KeepHudAwake() const { return inspectorPinned_ || depthOverlay_; }
 
@@ -176,6 +185,11 @@ private:
     bool pendingDialogIsCdl_ = false;
 
     bool inspectorPinned_ = false;  // Tab / the Pin box: panels stay up; unpinned they follow the UI fade
+    std::vector<FlatRect> flatRects_;
+    bool flatAvailable_ = false;    // the runtime takes Local2D layers (XR_DXR_local_3d_zone)
+    bool flatPanels_ = true;        // MEDIAPLAYER_PRO_PANELS_3D=1 keeps pinned panels woven
+    bool FlatNow() const { return flatAvailable_ && flatPanels_ && inspectorPinned_; }
+    void AddFlatRectOfCurrentWindow();
     Station station_;
     bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture
     std::string compare_[2];       // A (what was open) and B
