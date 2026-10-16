@@ -7,6 +7,7 @@
 #include "pro/LivePixels.h"
 #include "pro/TestSignalSource.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -158,6 +159,59 @@ void UyvyWidens() {
     CHECK(d.y[0] == (10 << 8) && d.uv[0] == (101 << 8), "8-bit UYVY widened to 16 bits");
 }
 
+// The shader's Y'CbCr -> R'G'B' (shaders/sbs.frag YuvToRgb, 8-bit limited levels), per matrix.
+void DecodeLimited(int y8, int cb8, int cr8, mp::ColorMatrix m, float rgb[3]) {
+    const float y = (y8 - 16) / 219.0f, u = (cb8 - 128) / 224.0f, v = (cr8 - 128) / 224.0f;
+    if (m == mp::ColorMatrix::BT601) {
+        rgb[0] = y + 1.402f * v;
+        rgb[1] = y - 0.344136f * u - 0.714136f * v;
+        rgb[2] = y + 1.772f * u;
+    } else if (m == mp::ColorMatrix::BT2020) {
+        rgb[0] = y + 1.4746f * v;
+        rgb[1] = y - 0.164553f * u - 0.571353f * v;
+        rgb[2] = y + 1.8814f * u;
+    } else {
+        rgb[0] = y + 1.5748f * v;
+        rgb[1] = y - 0.1873f * u - 0.4681f * v;
+        rgb[2] = y + 1.8556f * u;
+    }
+}
+
+// BgraToNv12 encodes SD with BT.601 and tags it so; decoding with the tag round-trips a
+// saturated colour, decoding as BT.709 (the old hardcoded shader) visibly does not.
+void BgraMatrixTagRoundTrips() {
+    for (int h : {2, 720}) {
+        std::vector<uint8_t> src((size_t)4 * 2 * h, 0);
+        for (int i = 0; i < 2 * h; ++i) {
+            src[4 * i + 2] = 255;  // R
+            src[4 * i + 1] = 0;    // G
+            src[4 * i + 0] = 0;    // B
+            src[4 * i + 3] = 255;
+        }
+        Nv12 d;
+        d.Resize(2, h);
+        mp::livepix::BgraToNv12(src.data(), 8, 2, h, d, 0);
+        const mp::ColorMatrix want = h >= 720 ? mp::ColorMatrix::BT709 : mp::ColorMatrix::BT601;
+        CHECK(d.matrix == want, h >= 720 ? "HD BGRA tagged BT.709" : "SD BGRA tagged BT.601");
+        float rgb[3];
+        DecodeLimited(d.y[0], d.uv[0], d.uv[1], d.matrix, rgb);
+        std::printf("  BGRA red, %d lines, %s -> R %.3f G %.3f B %.3f\n", h, mp::ColorMatrixName(d.matrix), rgb[0],
+                    rgb[1], rgb[2]);
+        CHECK(std::fabs(rgb[0] - 1.0f) < 0.02f && std::fabs(rgb[1]) < 0.02f && std::fabs(rgb[2]) < 0.02f,
+              "red decodes back to red with the tagged matrix");
+        if (h < 720) {
+            float wrong[3];
+            DecodeLimited(d.y[0], d.uv[0], d.uv[1], mp::ColorMatrix::BT709, wrong);
+            CHECK(std::fabs(wrong[1]) > 0.05f, "and decoding SD as BT.709 would shift it (the old bug)");
+        }
+    }
+    mp::livepix::P016 p;
+    p.Resize(4, 2);
+    const uint8_t uyvy[2][8] = {};
+    mp::livepix::UyvyToP016(&uyvy[0][0], 8, 4, 2, p, 0);
+    CHECK(p.matrix == mp::ColorMatrix::BT601, "SD UYVY carries the SDI rule (BT.601)");
+}
+
 void TestSignalSpec() {
     mp::TestSignalConfig c;
     CHECK(c.ParseSpec("") && c.eyeW == 1920 && c.fps == 60.0, "empty spec keeps defaults");
@@ -191,6 +245,7 @@ int main() {
     UyvyWidens();
     V210Pr108Vectors();
     UyvyPr108Vector();
+    BgraMatrixTagRoundTrips();
     if (g_failures) {
         std::fprintf(stderr, "live_pixels_test: %d failure(s)\n", g_failures);
         return 1;

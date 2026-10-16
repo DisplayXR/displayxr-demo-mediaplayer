@@ -117,12 +117,14 @@ public:
     bool UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t height);
 
     // Upload a planar YUV frame (the video decoder's native output): the shader does the
-    // BT.709 convert AND the downscale via sampling, so no swscale runs on the decode
-    // thread. format: 0 = I420 (plane1=U, plane2=V), 1 = NV12 (plane1=interleaved UV,
+    // Y'CbCr convert AND the downscale via sampling, so no swscale runs on the decode
+    // thread. matrix = FrameRing ColorMatrix (0 = BT.709, the default; 1 = BT.601;
+    // 2 = BT.2020 NCL), honoured by the MP_GRADE shader both desktop players compile. format: 0 = I420 (plane1=U, plane2=V), 1 = NV12 (plane1=interleaved UV,
     // plane2 ignored), 2 = P016 (NV12 layout, 16-bit MSB-aligned samples - Pro's
     // 10-bit capture). Chroma planes are (w+1)/2 x (h+1)/2.
     bool UploadYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2,
-                   uint32_t width, uint32_t height, int format, bool fullRange);
+                   uint32_t width, uint32_t height, int format, bool fullRange, int matrix = 0);
+    int SourceMatrix() const { return sourceMatrix_; }  // last YUV upload's matrix (UI)
 
 #if defined(_WIN32)
     // Zero-copy (#28): bind a shared D3D11 NV12 texture (by its shared NT handle) as the
@@ -217,6 +219,7 @@ private:
     int sourceMode_ = 0;             // 0 RGBA, 1 I420, 2 NV12 (pushed to the shader)
     float sourceFullRange_ = 0.0f;
     bool source16_ = false;          // P016: the MP_GRADE shader uses 10-bit limited levels
+    int sourceMatrix_ = 0;           // YUV matrix pushed to the MP_GRADE shader (0 = BT.709)
 
 #if defined(_WIN32)
     // Zero-copy interop state (#28). imports_ caches one entry per shared handle. The producer

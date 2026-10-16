@@ -16,6 +16,7 @@ void Nv12::Resize(int w, int h) {
 
 void UyvyToNv12(const uint8_t* src, int srcRowBytes, int w, int h, Nv12& dst, int x0) {
     if (!src || w <= 0 || h <= 1 || x0 < 0 || x0 + w > dst.width || h > dst.height) return;
+    dst.matrix = DefaultMatrixForHeight(h);  // YUV passes through: the signal's own matrix
     const int pairs = w / 2;
     for (int row = 0; row < h; ++row) {
         const uint8_t* s = src + (size_t)row * srcRowBytes;
@@ -40,6 +41,7 @@ void BgraToNv12(const uint8_t* src, int srcRowBytes, int w, int h, Nv12& dst, in
     if (!src || w <= 0 || h <= 1 || x0 < 0 || x0 + w > dst.width || h > dst.height) return;
     // Limited range, fixed point (x256). BT.709 for HD and up, BT.601 for SD.
     const bool hd = h >= 720;
+    dst.matrix = hd ? ColorMatrix::BT709 : ColorMatrix::BT601;  // tag = the encode below
     const int kr = hd ? 54 : 77, kg = hd ? 183 : 150, kb = hd ? 19 : 29;  // luma weights /256
     auto lumaOf = [&](const uint8_t* p) {
         const int yy = (kr * p[2] + kg * p[1] + kb * p[0]) >> 8;  // full-range luma
@@ -84,6 +86,7 @@ void P016::Resize(int w, int h) {
 
 void V210ToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0) {
     if (!src || w <= 0 || h <= 1 || x0 < 0 || x0 + w > dst.width || h > dst.height) return;
+    dst.matrix = DefaultMatrixForHeight(h);
     w &= ~1;
     // one row -> Y (w) + chroma pairs (w/2 each), 10-bit values
     // per-thread scratch (two card threads may convert at once), sized once per format
@@ -132,6 +135,7 @@ void UyvyToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, in
     Nv12 tmp;
     tmp.Resize(w, h);
     UyvyToNv12(src, srcRowBytes, w, h, tmp, 0);
+    dst.matrix = tmp.matrix;
     for (int row = 0; row < h; ++row)
         for (int x = 0; x < w; ++x)
             dst.y[(size_t)row * dst.width + x0 + x] = (uint16_t)(tmp.y[(size_t)row * w + x] << 8);
@@ -145,6 +149,7 @@ void BgraToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, in
     Nv12 tmp;
     tmp.Resize(w, h);
     BgraToNv12(src, srcRowBytes, w, h, tmp, 0);
+    dst.matrix = tmp.matrix;
     for (int row = 0; row < h; ++row)
         for (int x = 0; x < w; ++x)
             dst.y[(size_t)row * dst.width + x0 + x] = (uint16_t)(tmp.y[(size_t)row * w + x] << 8);

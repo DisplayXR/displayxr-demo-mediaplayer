@@ -51,6 +51,30 @@ struct HwFormatHook {
     const char** backendName = nullptr;         // retargeted to "software …" on fallback
 };
 
+// The stream's Y'CbCr matrix / transfer (FrameRing tags). The frame's own fields win, the
+// codec context's are the fallback; an unspecified matrix follows the SD/HD rule.
+static ColorMatrix MatrixOf(const AVFrame* f, const AVCodecContext* c) {
+    AVColorSpace cs = f ? f->colorspace : AVCOL_SPC_UNSPECIFIED;
+    if (cs == AVCOL_SPC_UNSPECIFIED && c) cs = c->colorspace;
+    switch (cs) {
+    case AVCOL_SPC_BT709: return ColorMatrix::BT709;
+    case AVCOL_SPC_BT470BG:
+    case AVCOL_SPC_SMPTE170M:
+    case AVCOL_SPC_FCC: return ColorMatrix::BT601;
+    case AVCOL_SPC_BT2020_NCL:
+    case AVCOL_SPC_BT2020_CL: return ColorMatrix::BT2020;  // CL is rare; NCL is the closest we draw
+    default: return DefaultMatrixForHeight(f ? f->height : (c ? c->height : 0));
+    }
+}
+
+static ColorTransfer TransferOf(const AVFrame* f, const AVCodecContext* c) {
+    AVColorTransferCharacteristic t = f ? f->color_trc : AVCOL_TRC_UNSPECIFIED;
+    if (t == AVCOL_TRC_UNSPECIFIED && c) t = c->color_trc;
+    if (t == AVCOL_TRC_ARIB_STD_B67) return ColorTransfer::HLG;
+    if (t == AVCOL_TRC_SMPTE2084) return ColorTransfer::PQ;
+    return ColorTransfer::SDR;
+}
+
 struct VideoDecoder::Impl {
     AVFormatContext* fmt = nullptr;
     AVCodecContext* codec = nullptr;
@@ -62,12 +86,12 @@ struct VideoDecoder::Impl {
     HwFormatHook hook;                          // ctx->opaque for the get_format callback
     int videoStream = -1;
     int swsW = 0, swsH = 0, swsFmt = -1;        // cached sws source params (fallback)
-    // Pro float (EXR) path: -> GBRPF32 (when needed), then sRGB-encoded BT.709 I420.
+    // Pro float (EXR) path: -> GBRPF32 (when needed), then sRGB-encoded BT.709 P016.
     SwsContext* swsF = nullptr;
     AVFrame* f32Frame = nullptr;
     AVFrame* f32Out = nullptr;
     int swsFW = 0, swsFH = 0, swsFFmt = -1;
-    std::vector<uint8_t> oetf;                  // 16384-entry linear -> sRGB code value
+    std::vector<float> oetf;                    // linear [0,1] -> sRGB samples, lerped
 
 #if defined(_WIN32)
     // Zero-copy interop (#28): non-owning handles into the D3D11VA device FFmpeg decodes
@@ -373,7 +397,7 @@ bool VideoDecoder::TryEnableHwAccel(const void* decoder) {
     return false;
 }
 
-AVFrame* VideoDecoder::FloatToI420(AVFrame* src) {
+AVFrame* VideoDecoder::FloatToP016(AVFrame* src) {
     Impl& im = *impl_;
     const int w = src->width & ~1, h = src->height & ~1;
     if (w <= 0 || h <= 0) return nullptr;
@@ -406,47 +430,83 @@ AVFrame* VideoDecoder::FloatToI420(AVFrame* src) {
         sws_scale(im.swsF, src->data, src->linesize, 0, src->height, im.f32Frame->data, im.f32Frame->linesize);
         g = im.f32Frame;
     }
+    // linear -> sRGB OETF as a lerped table: 16385 samples keep the error under 0.1 of a
+    // 16-bit code (the toe is linear, so it is exact there).
+    constexpr int kOetfN = 16384;
     if (im.oetf.empty()) {
-        im.oetf.resize(16384);
-        for (int i = 0; i < 16384; ++i) {
-            const double l = (double)i / 16383.0;
-            const double e = l <= 0.0031308 ? 12.92 * l : 1.055 * std::pow(l, 1.0 / 2.4) - 0.055;
-            im.oetf[(size_t)i] = (uint8_t)std::lround(std::clamp(e, 0.0, 1.0) * 255.0);
+        im.oetf.resize(kOetfN + 1);
+        for (int i = 0; i <= kOetfN; ++i) {
+            const double l = (double)i / kOetfN;
+            im.oetf[(size_t)i] = (float)(l <= 0.0031308 ? 12.92 * l : 1.055 * std::pow(l, 1.0 / 2.4) - 0.055);
         }
     }
     if (!im.f32Out || im.f32Out->width != w || im.f32Out->height != h) {
         if (!im.f32Out) im.f32Out = av_frame_alloc();
         av_frame_unref(im.f32Out);
-        im.f32Out->format = AV_PIX_FMT_YUV420P;
+        im.f32Out->format = AV_PIX_FMT_P016LE;
         im.f32Out->width = w;
         im.f32Out->height = h;
         if (av_frame_get_buffer(im.f32Out, 32) < 0) return nullptr;
     }
-    auto enc = [&](float v) -> float {
-        const int idx = (int)(std::clamp(v, 0.0f, 1.0f) * 16383.0f + 0.5f);
-        return (float)im.oetf[(size_t)idx] / 255.0f;
+    const float* lut = im.oetf.data();
+    // Branch-free: clamp to [0,1] (values > 1.0 clip - an OCIO view is the tool for HDR EXR;
+    // fmin/fmax also send NaN to 0), then lerp the table.
+    auto enc = [lut](float v) -> float {
+        const float t = std::fmin(std::fmax(v, 0.0f), 1.0f) * (float)kOetfN;
+        const int i = std::min((int)t, kOetfN - 1);
+        return lut[i] + (lut[i + 1] - lut[i]) * (t - (float)i);
     };
-    for (int y = 0; y < h; y += 2) {  // gbrp: plane 0 = G, 1 = B, 2 = R
-        for (int x = 0; x < w; x += 2) {
-            float cbSum = 0, crSum = 0;
-            for (int k = 0; k < 4; ++k) {
-                const int yy = y + (k >> 1), xx = x + (k & 1);
-                const float G = enc(((const float*)(g->data[0] + (size_t)yy * g->linesize[0]))[xx]);
-                const float B = enc(((const float*)(g->data[1] + (size_t)yy * g->linesize[1]))[xx]);
-                const float Rr = enc(((const float*)(g->data[2] + (size_t)yy * g->linesize[2]))[xx]);
-                const float Y = 0.2126f * Rr + 0.7152f * G + 0.0722f * B;
-                im.f32Out->data[0][(size_t)yy * im.f32Out->linesize[0] + xx] = (uint8_t)(16.0f + Y * 219.0f + 0.5f);
-                cbSum += (B - Y) / 1.8556f;
-                crSum += (Rr - Y) / 1.5748f;
+    // 10-bit limited levels at 16-bit precision, MSB-aligned like P010 - what the shader's
+    // P016 branch reads ((v*65535/64 - 64)/876): Y 64..940, C 64..960 (x64), fraction kept.
+    auto q16 = [](float v) -> uint16_t { return (uint16_t)std::fmin(std::fmax(v + 0.5f, 0.0f), 65535.0f); };
+    AVFrame* out = im.f32Out;
+    auto band = [&, out, g, w](int pairBegin, int pairEnd) {  // gbrp: plane 0 = G, 1 = B, 2 = R
+        for (int py = pairBegin; py < pairEnd; ++py) {
+            const int ya = 2 * py, yb = ya + 1;
+            const float* G[2] = {(const float*)(g->data[0] + (size_t)ya * g->linesize[0]),
+                                 (const float*)(g->data[0] + (size_t)yb * g->linesize[0])};
+            const float* B[2] = {(const float*)(g->data[1] + (size_t)ya * g->linesize[1]),
+                                 (const float*)(g->data[1] + (size_t)yb * g->linesize[1])};
+            const float* R[2] = {(const float*)(g->data[2] + (size_t)ya * g->linesize[2]),
+                                 (const float*)(g->data[2] + (size_t)yb * g->linesize[2])};
+            uint16_t* yo[2] = {(uint16_t*)(out->data[0] + (size_t)ya * out->linesize[0]),
+                               (uint16_t*)(out->data[0] + (size_t)yb * out->linesize[0])};
+            uint16_t* uv = (uint16_t*)(out->data[1] + (size_t)py * out->linesize[1]);
+            for (int x = 0; x < w; x += 2) {
+                float cb = 0.0f, cr = 0.0f;
+                for (int k = 0; k < 4; ++k) {  // the 2x2 quad sharing one chroma sample
+                    const int r = k >> 1, xx = x + (k & 1);
+                    const float gg = enc(G[r][xx]), bb = enc(B[r][xx]), rr = enc(R[r][xx]);
+                    const float Y = 0.2126f * rr + 0.7152f * gg + 0.0722f * bb;
+                    yo[r][xx] = q16((64.0f + Y * 876.0f) * 64.0f);
+                    cb += bb - Y;
+                    cr += rr - Y;
+                }
+                uv[x] = q16((512.0f + cb * (0.25f / 1.8556f) * 896.0f) * 64.0f);
+                uv[x + 1] = q16((512.0f + cr * (0.25f / 1.5748f) * 896.0f) * 64.0f);
             }
-            im.f32Out->data[1][(size_t)(y / 2) * im.f32Out->linesize[1] + x / 2] =
-                (uint8_t)std::clamp(128.0f + cbSum * 0.25f * 224.0f + 0.5f, 16.0f, 240.0f);
-            im.f32Out->data[2][(size_t)(y / 2) * im.f32Out->linesize[2] + x / 2] =
-                (uint8_t)std::clamp(128.0f + crSum * 0.25f * 224.0f + 0.5f, 16.0f, 240.0f);
         }
+    };
+    // Row-parallel: bands of row pairs, one per hardware thread (a 4K plate is ~4M quads).
+    const int pairs = h / 2;
+    const int hw = (int)std::max(1u, std::thread::hardware_concurrency());
+    const int jobs = std::max(1, std::min({hw, 16, pairs / 32}));
+    if (jobs == 1) {
+        band(0, pairs);
+    } else {
+        std::vector<std::thread> pool;
+        pool.reserve((size_t)jobs - 1);
+        const int per = (pairs + jobs - 1) / jobs;
+        for (int j = 1; j < jobs; ++j) {
+            const int b = j * per, e = std::min(pairs, b + per);
+            if (b < e) pool.emplace_back(band, b, e);
+        }
+        band(0, std::min(pairs, per));
+        for (std::thread& t : pool) t.join();
     }
-    im.f32Out->color_range = AVCOL_RANGE_MPEG;
-    return im.f32Out;
+    out->color_range = AVCOL_RANGE_MPEG;
+    out->colorspace = AVCOL_SPC_BT709;
+    return out;
 }
 
 bool VideoDecoder::Open(const std::string& path) {
@@ -775,6 +835,8 @@ void VideoDecoder::DecodeLoop() {
             impl_->swFrame->pts = f->pts;
             impl_->swFrame->best_effort_timestamp = f->best_effort_timestamp;
             impl_->swFrame->color_range = f->color_range;
+            impl_->swFrame->colorspace = f->colorspace;  // the transfer copies pixels, not props
+            impl_->swFrame->color_trc = f->color_trc;
             src = impl_->swFrame;
         }
 
@@ -783,10 +845,11 @@ void VideoDecoder::DecodeLoop() {
         PixFormat outFmt;
         const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(sf);
         if (proFormats_ && desc && (desc->flags & AV_PIX_FMT_FLAG_FLOAT)) {
-            // Pro: scene-linear float (OpenEXR) -> the sRGB transfer, BT.709 limited 4:2:0.
-            yuv = FloatToI420(src);
+            // Pro: scene-linear float (OpenEXR) -> the sRGB transfer, BT.709 limited 4:2:0 at
+            // 16 bits (P016, the path the other Pro formats take into the grade).
+            yuv = FloatToP016(src);
             if (!yuv) return -2.0;
-            outFmt = PixFormat::I420;
+            outFmt = PixFormat::P016;
         } else if (proFormats_ && (sf == AV_PIX_FMT_P010LE || sf == AV_PIX_FMT_P016LE)) {
             outFmt = PixFormat::P016;  // Pro: 10-bit hardware decode kept at 16 bits
         } else if (proFormats_ && desc && desc->comp[0].depth > 8) {
@@ -834,6 +897,13 @@ void VideoDecoder::DecodeLoop() {
                 impl_->sws = sws_getContext(src->width, src->height, sf, src->width, src->height,
                                             AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, nullptr, nullptr,
                                             nullptr);
+                if (impl_->sws && desc && (desc->flags & AV_PIX_FMT_FLAG_RGB)) {
+                    // RGB -> YUV: say which matrix we encode with (swscale's default, BT.601
+                    // limited) so the frame can be tagged with it below; YUV -> YUV keeps the
+                    // source's matrix (swscale does not re-matrix between YUV formats).
+                    const int* bt601 = sws_getCoefficients(SWS_CS_ITU601);
+                    sws_setColorspaceDetails(impl_->sws, bt601, 1, bt601, 0, 0, 1 << 16, 1 << 16);
+                }
                 impl_->swsW = src->width;
                 impl_->swsH = src->height;
                 impl_->swsFmt = sf;
@@ -854,10 +924,20 @@ void VideoDecoder::DecodeLoop() {
         dst.width = yuv->width;
         dst.height = yuv->height;
         dst.format = outFmt;
-        // Pro's float / RGB conversions produce limited range; a YUV source keeps its own.
-        const bool convertedToLimited =
-            proFormats_ && desc && (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_FLOAT)) && outFmt != PixFormat::NV12;
+        // Our float / RGB conversions produce limited range (every RGB -> YUV swscale context
+        // here sets dstRange 0); a YUV source keeps its own.
+        const bool rgbSource = desc && (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_FLOAT));
+        const bool convertedToLimited = rgbSource && outFmt != PixFormat::NV12;
         dst.fullRange = !convertedToLimited && ((src->color_range == AVCOL_RANGE_JPEG) || sf == AV_PIX_FMT_YUVJ420P);
+        // Colour tags. A YUV source keeps its own matrix (an unspecified one follows the SD/HD
+        // rule); our RGB / float conversions name the matrix they encoded with: BT.709 for
+        // the Pro paths (sws_setColorspaceDetails above / FloatToP016), BT.601 for the
+        // rare-format fallback.
+        if (!rgbSource)
+            dst.matrix = MatrixOf(src, impl_->codec);
+        else
+            dst.matrix = outFmt == PixFormat::P016 ? ColorMatrix::BT709 : ColorMatrix::BT601;
+        dst.transfer = TransferOf(src, impl_->codec);
         const int cw = (yuv->width + 1) / 2, ch = (yuv->height + 1) / 2;
         copyPlane(dst.plane[0], yuv->data[0], yuv->linesize[0], yuv->width, yuv->height);
         if (outFmt == PixFormat::P016) {
