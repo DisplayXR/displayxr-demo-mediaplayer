@@ -45,6 +45,10 @@ public:
         // (MEDIAPLAYER_LUT / MEDIAPLAYER_CDL fill them otherwise). Ignored by the base player.
         std::string lutPath;
         std::string cdlPath;
+        // Media Player Pro station (src/pro/Station.h); ignored by the base player.
+        std::vector<std::string> proInputs;  // --input="Name=spec", --decklink..., --test-signal
+        float proBudget[4] = {-2.0f, 1.0f, 1.0f, 2.0f};  // near %, far %, vertical px, dE
+        bool proTimecode = true;             // --no-timecode
     };
     void SetLaunchOptions(const LaunchOptions& o) { launch_ = o; }  // before Initialize()
 

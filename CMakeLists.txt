@@ -446,13 +446,68 @@ function(mp_add_player tgt is_pro)
             "${CMAKE_CURRENT_SOURCE_DIR}/displayxr" "$<TARGET_FILE_DIR:${tgt}>/displayxr"
         COMMENT "Staging displayxr/ sidecar (manifest + logos) next to ${tgt}")
     if(is_pro)
-        target_sources(${tgt} PRIVATE src/pro/ProController.cpp)
+        target_sources(${tgt} PRIVATE
+            src/pro/ProController.cpp
+            src/pro/LivePixels.cpp       # UYVY / v210 / BGRA -> NV12 / P016 for capture cards
+            src/pro/LiveSourceBase.cpp   # shared ring + stats of the Pro live sources
+            src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)
+            src/pro/TimecodePairer.cpp   # two-input stereo pairing by SMPTE timecode
+            src/pro/DeckLinkSource.cpp   # Blackmagic DeckLink SDI / HDMI input
+            src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
+            src/pro/Station.cpp)         # inputs, timecode / delay, rig UI, snapshots
         target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=1)
+        if(MP_DECKLINK_INCLUDE)
+            target_sources(${tgt} PRIVATE "${MP_DECKLINK_INCLUDE}/DeckLinkAPIDispatch.cpp")
+            target_include_directories(${tgt} PRIVATE "${MP_DECKLINK_INCLUDE}")
+            target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_WITH_DECKLINK=1)
+        endif()
     else()
         target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=0)
     endif()
     message(STATUS "Configured target: ${tgt}")
 endfunction()
+
+# Blackmagic DeckLink input (Pro, docs/PRO.md Next 1). The Desktop Video SDK is a
+# registration download and is never committed: point MP_DECKLINK_SDK_DIR (or the env
+# var of the same name) at the SDK zip or its extracted folder. The COM headers are
+# generated from its IDL with midl at configure time, as Open RV does. Without it Pro
+# builds and its DeckLink input reports "no DeckLink support".
+set(MP_DECKLINK_SDK_DIR "$ENV{MP_DECKLINK_SDK_DIR}" CACHE PATH "Blackmagic DeckLink SDK zip or folder (Pro, Windows)")
+set(MP_DECKLINK_INCLUDE "")
+if(WIN32 AND MP_DECKLINK_SDK_DIR)
+    set(_dl_root "${MP_DECKLINK_SDK_DIR}")
+    if(_dl_root MATCHES "\.zip$")
+        set(_dl_extract "${CMAKE_BINARY_DIR}/decklink_sdk")
+        if(NOT EXISTS "${_dl_extract}")
+            file(ARCHIVE_EXTRACT INPUT "${_dl_root}" DESTINATION "${_dl_extract}")
+        endif()
+        set(_dl_root "${_dl_extract}")
+    endif()
+    file(GLOB_RECURSE _dl_idl "${_dl_root}/*/Win/include/DeckLinkAPI.idl" "${_dl_root}/Win/include/DeckLinkAPI.idl")
+    list(LENGTH _dl_idl _dl_n)
+    if(_dl_n EQUAL 0)
+        message(WARNING "MP_DECKLINK_SDK_DIR=${MP_DECKLINK_SDK_DIR}: no Win/include/DeckLinkAPI.idl; DeckLink off")
+    else()
+        list(GET _dl_idl 0 _dl_idl)
+        get_filename_component(_dl_inc "${_dl_idl}" DIRECTORY)
+        set(_dl_gen "${CMAKE_BINARY_DIR}/decklink_gen")
+        if(NOT EXISTS "${_dl_gen}/DeckLinkAPI.h")
+            file(MAKE_DIRECTORY "${_dl_gen}")
+            execute_process(
+                COMMAND midl /nologo /header DeckLinkAPI.h /iid DeckLinkAPIDispatch.cpp /out "${_dl_gen}" DeckLinkAPI.idl
+                WORKING_DIRECTORY "${_dl_inc}" RESULT_VARIABLE _dl_midl OUTPUT_VARIABLE _dl_out ERROR_VARIABLE _dl_out)
+            if(NOT _dl_midl EQUAL 0)
+                message(WARNING "midl failed on the DeckLink IDL (${_dl_midl}): ${_dl_out}")
+            endif()
+        endif()
+        if(EXISTS "${_dl_gen}/DeckLinkAPI.h")
+            set(MP_DECKLINK_INCLUDE "${_dl_gen}")
+            message(STATUS "DeckLink input (Pro): ON (${_dl_inc})")
+        endif()
+    endif()
+else()
+    message(STATUS "DeckLink input (Pro): OFF (set MP_DECKLINK_SDK_DIR to the Desktop Video SDK)")
+endif()
 
 mp_add_player(${MP_TARGET} OFF)
 
@@ -526,6 +581,19 @@ if(MP_BUILD_TESTS)
     add_test(NAME stream_url COMMAND stream_url_test)
 
     # Media Player Pro looks: .cube LUT + ASC CDL loaders (pure C++).
+    # Pro live sources, two-input pairing and rig checks (src/pro/, pure: no SDK, no GPU).
+    add_executable(live_pixels_test tests/live_pixels_test.cpp src/pro/LivePixels.cpp
+        src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/Log.cpp)
+    target_include_directories(live_pixels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME live_pixels COMMAND live_pixels_test)
+    add_executable(timecode_pairer_test tests/timecode_pairer_test.cpp src/pro/TimecodePairer.cpp)
+    target_include_directories(timecode_pairer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME timecode_pairer COMMAND timecode_pairer_test)
+    add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/LivePixels.cpp
+        src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/Log.cpp)
+    target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME rig_check COMMAND rig_check_test)
+
     add_executable(color_test
         tests/color_test.cpp
         src/color/CubeLut.cpp

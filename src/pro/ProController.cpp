@@ -304,7 +304,7 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
                     if (mod & SDL_KMOD_SHIFT) return false;  // Shift+Tab is the trunk's HUD master
                     inspectorPinned_ = !inspectorPinned_;
                     return true;
-                default: return false;
+                default: return station_.HandleKey((int)e.key.key);  // T R N J
             }
         }
         default: return false;
@@ -373,6 +373,9 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                                    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
                                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing;
     if (ImGui::Begin("Inspector  (Tab)", nullptr, flags)) {
+        // --- Inputs (DeckLink / test rig / camera / stream) ----------------------
+        station_.BuildInputsSection(st.sourceLabel, st.live);
+
         // --- Source ---------------------------------------------------------
         if (ImGui::CollapsingHeader("Source", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (st.sourceLabel.empty() || st.isLogo) {
@@ -386,6 +389,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                                         st.panelFps, st.frameAgeMs);
                 else
                     ImGui::TextDisabled("panel %.0f fps  mode %s", st.panelFps, st.modeName.c_str());
+                station_.BuildSignalLines(st.live);  // timecode + measured delay (T)
             }
         }
 
@@ -487,14 +491,12 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
         }
 
         // --- Rig check (Phase 2) --------------------------------------------
-        if (ImGui::CollapsingHeader("Rig check")) {
-            ImGui::TextWrapped("Use 4 (Difference) to check alignment and sync: a well-aligned, in-sync "
-                               "pair shows edges only where there is depth. Measured vertical error, eye "
-                               "sync and colour match are Phase 2 (docs/PRO.md).");
-        }
+        station_.BuildRigSection(st.stereo && st.hasPicture);  // measured (Phase 2)
+        station_.BuildSnapshotsSection();
     }
     ImGui::End();
     ImGui::PopStyleVar();
+    station_.BuildHistoryStrip(uiAlpha, st.stereo && st.hasPicture);  // 60 s of rig health (R)
 #else
     (void)st;
     (void)uiAlpha;

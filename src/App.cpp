@@ -599,6 +599,10 @@ void App::RenderOneFrame() {
                                   : (isVideo_ ? &video_.Ring() : nullptr);
     if (ring) {
         if (const FrameRing::Frame* vf = ring->AcquireLatest()) {
+#if MEDIAPLAYER_PRO
+            // Pro: timecode, measured delay and the rig checks see every uploaded frame.
+            pro_.GetStation().OnFrame(*vf, layout_, isLive_, isLive_ ? live_->GetStats().eyeOffsetFrames : -1);
+#endif
             if (isLive_) {
                 OnLiveFrame(*vf);
                 SampleAutoConv(*vf);  // ~5 Hz; downsample only, measured on the worker
@@ -619,7 +623,8 @@ void App::RenderOneFrame() {
                 const bool i420 = (vf->format == PixFormat::I420);
                 renderer_.UploadYUV(vf->plane[0].data(), vf->plane[1].data(),
                                     i420 ? vf->plane[2].data() : nullptr, (uint32_t)vf->width,
-                                    (uint32_t)vf->height, i420 ? 0 : 1, vf->fullRange);
+                                    (uint32_t)vf->height,
+                                    i420 ? 0 : vf->format == PixFormat::P016 ? 2 : 1, vf->fullRange);
             }
         }
     }
@@ -1107,6 +1112,9 @@ void App::UpdateFps() {
 
 void App::Shutdown() {
     autoConvWorker_.Stop();  // #92
+#if MEDIAPLAYER_PRO
+    pro_.GetStation().Shutdown();  // Pro live inputs (DeckLink / test rig) join their threads
+#endif
     camera_.Stop();       // join the camera worker + SDL_CloseCamera before SDL_Quit
     video_.Stop();        // join the decode thread (reads the audio clock) before audio,
     audio_.Stop();        // and before tearing down the GPU
@@ -2822,6 +2830,35 @@ void App::InitPro() {
     pro_.ApplyTestEnv();
     if (!launch_.lutPath.empty()) pro_.LoadLut(launch_.lutPath);
     if (!launch_.cdlPath.empty()) pro_.LoadCdl(launch_.cdlPath);
+
+    // The monitoring station (inputs, timecode / delay, rig checks, snapshots).
+    pro::StationHost sh;
+    sh.enterLive = [this](LiveProducer* p, const std::string& name) {
+        if (isStream_) StopStream(/*showIdleIfEmpty=*/false);
+        EnterLive(p, name);
+    };
+    sh.openCamera = [this](const std::string& sel) { return LoadLive(sel); };
+    sh.openUrl = [this](const std::string& url) { return LoadUrl(url); };
+    sh.capturePrefix = [this](const std::string& stem) {
+        return MakeCaptureAtlasPrefix(stem, xr_.ActiveTileColumns(), xr_.ActiveTileRows());
+    };
+    sh.captureAtlas = [this](const std::string& prefix) {
+        return xr_.HasAtlasCapture() && xr_.CaptureAtlas(prefix);
+    };
+    sh.toast = [this](const std::string& t) { ShowToast(t); };
+    sh.displayPeriodMs = [this] { return fps_ > 1.0f ? 1000.0 / fps_ : 1000.0 / 60.0; };
+    pro::StationOptions so;
+    so.inputs = launch_.proInputs;
+    so.budget.nearPct = launch_.proBudget[0];
+    so.budget.farPct = launch_.proBudget[1];
+    so.budget.maxVerticalPx = launch_.proBudget[2];
+    so.budget.maxDeltaE = launch_.proBudget[3];
+    so.timecode = launch_.proTimecode;
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_VSHIFT")) so.testCfg.vShiftPx = (float)std::atof(e);
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_EYE_DELAY")) so.testCfg.eyeDelay = std::atoi(e);
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_GAIN_R")) so.testCfg.gainR = (float)std::atof(e);
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_DEPTH")) so.testCfg.depthScale = (float)std::atof(e);
+    pro_.GetStation().Init(std::move(sh), so);
     LOG_INFO("Media Player Pro: ready (lut=%s cdl=%s)", launch_.lutPath.c_str(), launch_.cdlPath.c_str());
 }
 
@@ -2834,6 +2871,8 @@ pro::Status App::ProStatus() const {
     st.height = mediaH_;
     st.panelFps = fps_;
     st.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
+    st.live = isLive_;
+    st.hasPicture = hasMedia_ && !isLogo_ && (isLive_ || isStream_ || isVideo_);
     if (isLive_) {
         st.sourceKind = LiveIsCamera() ? "Camera" : live_->Kind();
         st.sourceLabel = live_->DeviceName();

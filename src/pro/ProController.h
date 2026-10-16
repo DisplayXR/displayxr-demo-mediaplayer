@@ -18,6 +18,7 @@
 
 #include "color/Cdl.h"
 #include "color/CubeLut.h"
+#include "pro/Station.h"
 #include "rhi/VulkanRenderer.h"
 
 #include <functional>
@@ -42,6 +43,8 @@ struct Status {
     float panelFps = 0.0f;
     float sourceFps = 0.0f;     // camera delivered / stream decoded fps (0 for files)
     float frameAgeMs = 0.0f;    // live: publish -> upload age
+    bool live = false;          // a live source (camera, DeckLink, test rig) is showing
+    bool hasPicture = false;    // live, video or stream: rig checks + history apply
     std::string modeName;       // display mode, e.g. "LeiaSR"
 };
 
@@ -101,6 +104,8 @@ public:
     bool KeepHudAwake() const { return inspectorPinned_; }
 
     ViewMode Mode() const { return mode_; }
+    // The monitoring station: inputs, timecode / delay, rig checks, snapshots (Station.h).
+    Station& GetStation() { return station_; }
     float Zoom() const { return zoom_; }
 
     // Pro launches with eye-swap and convergence controls on the inspector, so the
@@ -143,6 +148,7 @@ private:
     bool pendingDialogIsCdl_ = false;
 
     bool inspectorPinned_ = true;  // Tab toggles
+    Station station_;
     bool stereoSource_ = false;
 };
 
