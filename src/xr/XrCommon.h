@@ -16,6 +16,7 @@
 #include <openxr/XR_DXR_atlas_capture.h>           // 'I' key — snapshot the composed atlas
 #include <openxr/XR_DXR_mcp_tools.h>               // app-defined agent tools (per-app MCP)
 #include <openxr/XR_DXR_cursor_depth.h>            // depth-aware cursor (spec v7: measured disparity)
+#include <openxr/XR_DXR_local_3d_zone.h>           // Pro: panels as flat 2D (Local2D layers)
 #if defined(__APPLE__)
 #  include <openxr/XR_DXR_cocoa_window_binding.h>
 #elif defined(_WIN32)

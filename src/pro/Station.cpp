@@ -667,11 +667,12 @@ void Station::BuildSnapshotsSection() {
 #endif
 }
 
-void Station::BuildHistoryStrip(float alpha, bool stereo) {
+bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, float* ry, float* rw, float* rh) {
+    bool drawnFlat = false;
 #if defined(MEDIAPLAYER_WITH_IMGUI)
-    if (!showHistory_ || !stereo || alpha < 0.01f) return;
+    if (!showHistory_ || !stereo || alpha < 0.01f) return false;
     const std::vector<rig::Sample> hist = rig_.History(60.0);
-    if (hist.empty()) return;
+    if (hist.empty()) return false;
     const ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
@@ -679,7 +680,7 @@ void Station::BuildHistoryStrip(float alpha, bool stereo) {
     const float panelW = std::clamp(W * 0.24f, 280.0f, 440.0f);
     ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.86f), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
     ImGui::SetNextWindowSize(ImVec2(std::max(200.0f, W - 2.0f * panelW - 48.0f), H * 0.15f), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.72f);
+    ImGui::SetNextWindowBgAlpha(flat ? 1.0f : 0.72f);
     const ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
                                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs |
                                 ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
@@ -751,13 +752,27 @@ void Station::BuildHistoryStrip(float alpha, bool stereo) {
             const ImVec2 ts = ImGui::CalcTextSize(ticks[i]);
             dl->AddText(ImVec2(std::min(x - ts.x * 0.5f, x1 - ts.x), p0.y + 2.0f * rowH), dim, ticks[i]);
         }
+        if (flat && rx && ry && rw && rh) {
+            const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+            *rx = wp.x;
+            *ry = wp.y;
+            *rw = ws.x;
+            *rh = ws.y;
+            drawnFlat = true;
+        }
     }
     ImGui::End();
     ImGui::PopStyleVar();
 #else
     (void)alpha;
     (void)stereo;
+    (void)flat;
+    (void)rx;
+    (void)ry;
+    (void)rw;
+    (void)rh;
 #endif
+    return drawnFlat;
 }
 
 }  // namespace mp::pro

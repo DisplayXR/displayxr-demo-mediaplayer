@@ -70,6 +70,14 @@ void ProController::ApplyTestEnv() {
     if (const char* b = std::getenv("MEDIAPLAYER_PRO_BYPASS")) bypass_ = (*b && *b != '0');
     if (const char* c = std::getenv("MEDIAPLAYER_PRO_COMPARE_FRAME")) testCompareFrame_ = std::atoi(c);
     if (const char* p = std::getenv("MEDIAPLAYER_PRO_PIN")) inspectorPinned_ = (*p && *p != '0');
+    if (const char* f = std::getenv("MEDIAPLAYER_PRO_PANELS_3D")) flatPanels_ = !(*f && *f != '0');
+}
+
+void ProController::AddFlatRectOfCurrentWindow() {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    const ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
+    flatRects_.push_back({p.x, p.y, s.x, s.y});
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +528,7 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
 void ProController::BuildUI(const Status& st, float uiAlpha) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     BuildDepthOverlay(st);  // on the picture; independent of the inspector fade
+    flatRects_.clear();
     const float alpha = inspectorPinned_ ? 1.0f : uiAlpha;
     BuildStatusBar(st, alpha);
     station_.BuildDeckLinkDialog();
@@ -539,7 +548,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
         ImGui::SetNextWindowPos(ImVec2(x, top), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(panelW, 0.0f), ImGuiCond_Always);
         ImGui::SetNextWindowSizeConstraints(ImVec2(panelW, 0.0f), ImVec2(panelW, H - top - 90.0f));
-        ImGui::SetNextWindowBgAlpha(0.82f);
+        ImGui::SetNextWindowBgAlpha(FlatNow() ? 1.0f : 0.82f);  // a flat card hides the picture anyway
     };
     placePanel(8.0f);
     if (ImGui::Begin("Station", nullptr, flags)) {
@@ -594,6 +603,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
             }
         }
         station_.BuildSnapshotsSection();
+        if (FlatNow()) AddFlatRectOfCurrentWindow();
     }
     ImGui::End();
 
@@ -675,10 +685,13 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
 
         // --- Rig check (Phase 2) --------------------------------------------
         station_.BuildRigSection(st.stereo && st.hasPicture);  // measured (Phase 2)
+        if (FlatNow()) AddFlatRectOfCurrentWindow();
     }
     ImGui::End();
     ImGui::PopStyleVar();
-    station_.BuildHistoryStrip(alpha, st.stereo && st.hasPicture);  // 60 s of rig health (R); follows the pin
+    float sx = 0, sy = 0, sw = 0, sh = 0;
+    if (station_.BuildHistoryStrip(alpha, st.stereo && st.hasPicture, FlatNow(), &sx, &sy, &sw, &sh))
+        flatRects_.push_back({sx, sy, sw, sh});  // 60 s of rig health (R); follows the pin
 #else
     (void)st;
     (void)uiAlpha;

@@ -148,6 +148,9 @@ otherwise the frame pairs unfolded with the field mark, drop-frame counted the S
 6. **Review tools (Phase 4).** A Resolve panel (timecode follow, markers), ProRes / EXR /
    DPX, A/B compare, OpenColorIO.
 
-Known limits: 8-bit to the panel (the runtime's atlas path); the panels are ImGui
-panels in the HUD layer, so they are woven with the picture rather than drawn as a crisp 2D
-zone (moving it to `XR_DXR_display_zones` is planned).
+Known limits: 8-bit to the panel (the runtime's atlas path). Panels: **pinned** panels (and
+the history strip) are shown flat - each also goes out as an `XR_DXR_local_3d_zone` Local2D
+layer over the same HUD image, so inside it the runtime shows crisp 2D instead of the weave
+(the panel becomes an opaque card; the picture under it is not shown). Unpinned panels stay
+in the woven HUD layer while they fade, so a half-faded card never cuts a hole in the
+picture. `MEDIAPLAYER_PRO_PANELS_3D=1` keeps pinned panels woven too.
