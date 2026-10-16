@@ -19,6 +19,7 @@
 #include "color/Cdl.h"
 #include "color/CubeLut.h"
 #include "pro/OcioBake.h"
+#include "pro/ResolveLink.h"
 #include "pro/Station.h"
 #include "rhi/VulkanRenderer.h"
 
@@ -73,6 +74,7 @@ struct Host {
     std::function<double()> mediaPosition;
     std::function<bool()> mediaPaused;
     std::function<void(double seconds, bool paused)> seekMedia;
+    std::function<void(bool paused)> setMediaPaused;
     std::function<bool()> isFullscreen;
     std::function<void()> toggleFullscreen;
 };
@@ -141,6 +143,9 @@ private:
     void SetZoom(float z);
     void ClampPan();
     void OpenLookDialog(bool cdl);
+    // The live Resolve panel (ProResolve.cpp): status out, playhead + commands in, follow.
+    void TickResolve(const Status& st);
+    void BuildResolveLines();
     static void DialogCallback(void* userdata, const char* const* filelist, int filter);
 
     VulkanRenderer* renderer_ = nullptr;
@@ -181,6 +186,16 @@ private:
     bool wasFullscreen_ = false;   // full screen hides everything but the picture
     bool pinnedBeforeFullscreen_ = true;
     int ticks_ = 0, testCompareFrame_ = -1;  // MEDIAPLAYER_PRO_COMPARE_FRAME (screenshots)
+
+    // Live Resolve panel (ProResolve.cpp).
+    resolve::Follower follower_;
+    resolve::LinkSample link_;
+    bool followResolve_ = true;     // the inspector's "Follow Resolve" box
+    double nextStatusSec_ = 0.0, nextLinkPollSec_ = 0.0;
+    long long statusSeq_ = 0;
+    long long linkFileStamp_ = -1;  // last_write_time of resolve_link.json last read
+    long long commandsOffset_ = -1; // bytes of resolve_commands.jsonl already handled (-1 = skip history)
+    long long lastCommandId_ = 0;
 };
 
 }  // namespace mp::pro
