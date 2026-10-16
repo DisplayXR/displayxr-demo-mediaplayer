@@ -25,6 +25,7 @@
 
 #include "media/CameraSelect.h"
 #include "media/FrameRing.h"
+#include "media/LiveProducer.h"
 
 #include <atomic>
 #include <cstdio>
@@ -37,27 +38,10 @@ namespace mp {
 
 class MjpegPool;  // #90 follow-up: app-side MJPG decode for MJPG-only devices
 
-class CameraSource {
+class CameraSource : public LiveProducer {
 public:
-    enum class State {
-        Closed,
-        Opening,
-        Streaming,
-        Stalled,  // opened, but no frame for 2 s (e.g. a capture box with no signal)
-        Lost,     // unplugged / device error
-        Denied,   // OS privacy setting or a declined permission prompt
-        Failed,   // could not open (LastError() says why)
-    };
-    struct Stats {
-        float deliveredFps = 0.f;     // frames published to the ring per second (1 s window)
-        uint64_t published = 0;
-        uint64_t dropped = 0;         // SDL surfaces drained-and-discarded (we only show the newest)
-        double lastPublishSec = 0.0;  // steady_clock seconds of the last Publish (consumer computes age)
-        int w = 0, h = 0, fpsReq = 0;
-        bool fullRange = false;
-        bool mjpgPath = false;        // MJPG decode rung in use (#90 follow-up; always false today)
-        int decoders = 0;             // decoder-pool size when mjpgPath
-    };
+    using State = LiveState;  // shared with the other live sources (LiveProducer.h)
+    using Stats = LiveStats;
 
     CameraSource() = default;
     ~CameraSource();  // Stop()
@@ -80,19 +64,20 @@ public:
     // (for the Eyes: NV12 3840x2160@60). Returns false (state Failed, LastError() set)
     // when the device is refused or offers nothing this build can consume.
     bool Open(const CameraDevice& dev, int wantW, int wantH, int wantFps);
-    void Stop();  // join the worker (it closes the SDL camera); idempotent
+    void Stop() override;  // join the worker (it closes the SDL camera); idempotent
 
-    State GetState() const { return state_.load(); }
-    std::string LastError() const;
-    const std::string& DeviceName() const { return name_; }
+    State GetState() const override { return state_.load(); }
+    std::string LastError() const override;
+    const std::string& DeviceName() const override { return name_; }
     uint32_t DeviceId() const { return id_; }
     int Width() const { return w_.load(); }
     int Height() const { return h_.load(); }
     int Fps() const { return fpsReq_; }
-    Stats GetStats() const;
+    Stats GetStats() const override;
     // App forwards SDL_EVENT_CAMERA_DEVICE_REMOVED for our id -> Lost.
     void NotifyRemoved() { removed_ = true; }
-    FrameRing& Ring() { return ring_; }
+    FrameRing& Ring() override { return ring_; }
+    const char* Kind() const override { return "camera"; }
 
     static const char* StateName(State s);
 

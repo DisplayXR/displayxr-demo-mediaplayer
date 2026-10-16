@@ -16,7 +16,9 @@
 
 namespace mp {
 
-enum class PixFormat { I420, NV12, RGBA };  // 3-plane, 2-plane, or packed RGBA (zero-copy #28)
+// P016: NV12 layout with 16-bit samples, MSB-aligned (P010 is the 10-bit case). Pro's
+// 10-bit capture (DeckLink v210) publishes it; the base player never does.
+enum class PixFormat { I420, NV12, RGBA, P016 };  // 3-plane, 2-plane, packed RGBA (zero-copy #28), 16-bit 2-plane
 
 class FrameRing {
 public:
@@ -29,6 +31,10 @@ public:
         PixFormat format = PixFormat::I420;
         bool fullRange = false;       // JPEG/full vs MPEG/limited range
         int64_t serial = 0;           // monotonic; lets the consumer detect newness
+        // Live sources: when the frame was captured (steady seconds, LiveProducer::
+        // NowSeconds) and its source timecode ("HH:MM:SS:FF", empty when it has none).
+        double captureSec = 0.0;
+        char timecode[16] = {0};
 
         // Zero-copy interop (#28, Windows). When gpu==true the pixels live in a shared
         // D3D11 NV12 texture (below) instead of the CPU plane[] buffers; the decode thread

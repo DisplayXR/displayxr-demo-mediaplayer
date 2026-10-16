@@ -45,6 +45,15 @@ public:
         // (MEDIAPLAYER_LUT / MEDIAPLAYER_CDL fill them otherwise). Ignored by the base player.
         std::string lutPath;
         std::string cdlPath;
+        // Media Player Pro station (src/pro/Station.h); ignored by the base player.
+        std::vector<std::string> proInputs;  // --input="Name=spec", --decklink..., --test-signal
+        float proBudget[4] = {-2.0f, 1.0f, 1.0f, 2.0f};  // near %, far %, vertical px, dE
+        bool proTimecode = true;             // --no-timecode
+        double proSeqFps = 24.0;             // --seq-fps: EXR / DPX / TIFF sequence rate
+        std::string proCompare;              // --compare=<file>: the B clip (B swaps A/B)
+        // --ocio=<config> --ocio-src= --ocio-display= --ocio-view= --ocio-dst= --ocio-looks=
+        std::string ocioConfig, ocioSrc, ocioDisplay, ocioView, ocioDst, ocioLooks;
+        bool ocio = false;
     };
     void SetLaunchOptions(const LaunchOptions& o) { launch_ = o; }  // before Initialize()
 
@@ -137,6 +146,11 @@ private:
     // LoadLiveDevice opens one device (asynchronously — PollLive reports the outcome).
     bool LoadLive(const std::string& selector);
     bool LoadLiveDevice(const CameraDevice& dev);
+    // Make `p` (already opened) the live source: stop the camera if `p` is something
+    // else, reset the per-source state and wait for its first frame to settle the
+    // layout. The camera goes through here; so can another LiveProducer (Pro: DeckLink).
+    void EnterLive(LiveProducer* p, const std::string& name);
+    bool LiveIsCamera() const { return live_ == &camera_; }
     void StopLive(bool showIdleIfEmpty);  // tear down; idle logo if nothing replaces it
     void ToggleLive();                    // 'C': off -> LoadLive(last or auto); on -> StopLive
     void PollLive();                      // per-frame: camera state edges -> toasts / log
@@ -262,6 +276,9 @@ private:
     // Live camera (#90). isLive_ is mutually exclusive with file media: every file load
     // goes through ReloadMedia, which stops the camera first.
     CameraSource camera_;
+    LiveProducer* live_ = &camera_;     // the producer live mode reads (isLive_)
+    std::vector<uint8_t> autoConvLuma8_;
+    int dumpFrame_ = 100;               // test: MEDIAPLAYER_DUMP_FRAME (which rendered frame the dumps take)  // P016 frames: 8-bit luma for auto-convergence
     LaunchOptions launch_{};
     bool isLive_ = false;               // the live camera is the current source
     bool livePaused_ = false;           // Space = freeze (the camera keeps streaming)
@@ -356,6 +373,7 @@ private:
     // per-eye content width in tile pixels: Pro's pointer->picture mapping and 1:1 zoom.
     float proPicX_ = 0.f, proPicY_ = 0.f, proPicW_ = 0.f, proPicH_ = 0.f;
     float proTileContentW_ = 0.f;
+    float proHud_[4] = {0.f, 0.f, 1.f, 1.f};  // HUD rect in window fractions (x, y, w, h)
 #endif
 
     // Test scaffolding (env-gated).

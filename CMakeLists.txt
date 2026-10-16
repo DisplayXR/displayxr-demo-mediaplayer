@@ -285,6 +285,7 @@ function(mp_add_player tgt is_pro)
         src/media/AudioPlayer.cpp
         src/media/CameraSelect.cpp
         src/media/CameraSource.cpp   # live camera (#90): SDL3 camera -> FrameRing
+        src/media/ImageSequence.cpp  # EXR / DPX / TIFF frames as one clip (Pro formats only)
         src/media/AutoConvergence.cpp  # live auto-convergence (#92): disparity.js port
         src/media/StreamUrl.cpp      # stream-URL classifier (#93)
         src/ui/Hud.cpp
@@ -446,13 +447,103 @@ function(mp_add_player tgt is_pro)
             "${CMAKE_CURRENT_SOURCE_DIR}/displayxr" "$<TARGET_FILE_DIR:${tgt}>/displayxr"
         COMMENT "Staging displayxr/ sidecar (manifest + logos) next to ${tgt}")
     if(is_pro)
-        target_sources(${tgt} PRIVATE src/pro/ProController.cpp)
+        target_sources(${tgt} PRIVATE
+            src/pro/ProController.cpp
+            src/pro/ProTools.cpp         # agent tools: grade, view, station
+            src/pro/LivePixels.cpp       # UYVY / v210 / BGRA -> NV12 / P016 for capture cards
+            src/pro/LiveSourceBase.cpp   # shared ring + stats of the Pro live sources
+            src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)
+            src/pro/TimecodePairer.cpp   # two-input stereo pairing by SMPTE timecode
+            src/pro/DeckLinkSource.cpp   # Blackmagic DeckLink SDI / HDMI input
+            src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
+            src/pro/Station.cpp          # inputs, timecode / delay, rig UI, snapshots
+            src/pro/OcioBake.cpp)        # OpenColorIO -> the grade's LUT (MP_OCIO_ROOT)
         target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=1)
+        if(MP_HAVE_OCIO)
+            target_link_libraries(${tgt} PRIVATE OpenColorIO::OpenColorIO)
+            target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_WITH_OCIO=1)
+            foreach(_d ${MP_OCIO_DLLS})
+                add_custom_command(TARGET ${tgt} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_d}" "$<TARGET_FILE_DIR:${tgt}>")
+            endforeach()
+        endif()
+        if(MP_DECKLINK_INCLUDE)
+            target_sources(${tgt} PRIVATE "${MP_DECKLINK_INCLUDE}/DeckLinkAPIDispatch.cpp")
+            target_include_directories(${tgt} PRIVATE "${MP_DECKLINK_INCLUDE}")
+            target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_WITH_DECKLINK=1)
+        endif()
     else()
         target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=0)
     endif()
     message(STATUS "Configured target: ${tgt}")
 endfunction()
+
+# Blackmagic DeckLink input (Pro, docs/PRO.md Next 1). The Desktop Video SDK is a
+# registration download and is never committed: point MP_DECKLINK_SDK_DIR (or the env
+# var of the same name) at the SDK zip or its extracted folder. The COM headers are
+# generated from its IDL with midl at configure time, as Open RV does. Without it Pro
+# builds and its DeckLink input reports "no DeckLink support".
+set(MP_DECKLINK_SDK_DIR "$ENV{MP_DECKLINK_SDK_DIR}" CACHE PATH "Blackmagic DeckLink SDK zip or folder (Pro, Windows)")
+set(MP_DECKLINK_INCLUDE "")
+if(WIN32 AND MP_DECKLINK_SDK_DIR)
+    set(_dl_root "${MP_DECKLINK_SDK_DIR}")
+    if(_dl_root MATCHES "\.zip$")
+        set(_dl_extract "${CMAKE_BINARY_DIR}/decklink_sdk")
+        if(NOT EXISTS "${_dl_extract}")
+            file(ARCHIVE_EXTRACT INPUT "${_dl_root}" DESTINATION "${_dl_extract}")
+        endif()
+        set(_dl_root "${_dl_extract}")
+    endif()
+    file(GLOB_RECURSE _dl_idl "${_dl_root}/*/Win/include/DeckLinkAPI.idl" "${_dl_root}/Win/include/DeckLinkAPI.idl")
+    list(LENGTH _dl_idl _dl_n)
+    if(_dl_n EQUAL 0)
+        message(FATAL_ERROR "MP_DECKLINK_SDK_DIR=${MP_DECKLINK_SDK_DIR}: no Win/include/DeckLinkAPI.idl in it. Point it at the Blackmagic DeckLink SDK (folder or .zip), or leave it unset for a build without DeckLink.")
+    else()
+        list(GET _dl_idl 0 _dl_idl)
+        get_filename_component(_dl_inc "${_dl_idl}" DIRECTORY)
+        set(_dl_gen "${CMAKE_BINARY_DIR}/decklink_gen")
+        if(NOT EXISTS "${_dl_gen}/DeckLinkAPI.h")
+            file(MAKE_DIRECTORY "${_dl_gen}")
+            execute_process(
+                COMMAND midl /nologo /header DeckLinkAPI.h /iid DeckLinkAPIDispatch.cpp /out "${_dl_gen}" DeckLinkAPI.idl
+                WORKING_DIRECTORY "${_dl_inc}" RESULT_VARIABLE _dl_midl OUTPUT_VARIABLE _dl_out ERROR_VARIABLE _dl_out)
+            if(NOT _dl_midl EQUAL 0)
+                message(FATAL_ERROR "midl failed on the DeckLink IDL (${_dl_midl}): ${_dl_out}")
+            endif()
+        endif()
+        if(EXISTS "${_dl_gen}/DeckLinkAPI.h")
+            set(MP_DECKLINK_INCLUDE "${_dl_gen}")
+            message(STATUS "DeckLink input (Pro): ON (${_dl_inc})")
+        endif()
+    endif()
+else()
+    message(STATUS "DeckLink input (Pro): OFF (set MP_DECKLINK_SDK_DIR to the Desktop Video SDK)")
+endif()
+
+# OpenColorIO (Pro, optional): an OCIO 2.x install prefix (e.g. Open RV's build,
+# <OpenRV>/_build/RV_DEPS_OCIO/install) and, on Windows, the folder holding its runtime
+# DLLs (Imath, expat, zlib: <OpenRV>/_build/stage/app/bin). Off by default.
+set(MP_OCIO_ROOT "" CACHE PATH "OpenColorIO 2.x install prefix (Pro, optional)")
+set(MP_OCIO_DLL_DIR "" CACHE PATH "Folder with OpenColorIO's dependency DLLs (Windows)")
+set(MP_HAVE_OCIO FALSE)
+set(MP_OCIO_DLLS "")
+if(MP_OCIO_ROOT)
+    find_package(OpenColorIO CONFIG PATHS "${MP_OCIO_ROOT}" NO_DEFAULT_PATH)
+    if(OpenColorIO_FOUND)
+        set(MP_HAVE_OCIO TRUE)
+        if(WIN32)
+            file(GLOB MP_OCIO_DLLS "${MP_OCIO_ROOT}/bin/OpenColorIO*.dll")
+            if(MP_OCIO_DLL_DIR)
+                file(GLOB _ocio_dep "${MP_OCIO_DLL_DIR}/Imath*.dll" "${MP_OCIO_DLL_DIR}/libexpat*.dll"
+                                    "${MP_OCIO_DLL_DIR}/zlib*.dll")
+                list(APPEND MP_OCIO_DLLS ${_ocio_dep})
+            endif()
+        endif()
+        message(STATUS "OpenColorIO (Pro): ON (${OpenColorIO_VERSION})")
+    else()
+        message(WARNING "MP_OCIO_ROOT=${MP_OCIO_ROOT}: no OpenColorIO package found; OCIO off")
+    endif()
+endif()
 
 mp_add_player(${MP_TARGET} OFF)
 
@@ -526,6 +617,76 @@ if(MP_BUILD_TESTS)
     add_test(NAME stream_url COMMAND stream_url_test)
 
     # Media Player Pro looks: .cube LUT + ASC CDL loaders (pure C++).
+    # Pro live sources, two-input pairing and rig checks (src/pro/, pure: no SDK, no GPU).
+    add_executable(live_pixels_test tests/live_pixels_test.cpp src/pro/LivePixels.cpp
+        src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
+    target_include_directories(live_pixels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    add_test(NAME live_pixels COMMAND live_pixels_test)
+    add_executable(timecode_pairer_test tests/timecode_pairer_test.cpp src/pro/TimecodePairer.cpp)
+    target_include_directories(timecode_pairer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME timecode_pairer COMMAND timecode_pairer_test)
+    add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/LivePixels.cpp
+        src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
+    target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    add_test(NAME rig_check COMMAND rig_check_test)
+
+    # Pro review formats: sequences, EXR display encoding, 10-bit -> P016 (real decodes).
+    add_executable(image_sequence_test tests/image_sequence_test.cpp src/media/ImageSequence.cpp)
+    target_include_directories(image_sequence_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME image_sequence COMMAND image_sequence_test)
+    if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
+        add_executable(decode_formats_test tests/decode_formats_test.cpp src/media/VideoDecoder.cpp
+            src/media/ImageSequence.cpp src/Log.cpp)
+        target_include_directories(decode_formats_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(decode_formats_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
+        if(TARGET PkgConfig::FFMPEG)
+            target_link_libraries(decode_formats_test PRIVATE PkgConfig::FFMPEG)
+        else()
+            target_link_libraries(decode_formats_test PRIVATE mp_ffmpeg)
+        endif()
+        if(WIN32)
+            target_link_libraries(decode_formats_test PRIVATE d3d11 dxgi d3dcompiler)
+        endif()
+        add_test(NAME decode_formats COMMAND decode_formats_test)
+    endif()
+    # OpenColorIO in the grade (Pro): skips cleanly without OCIO.
+    add_executable(ocio_bake_test tests/ocio_bake_test.cpp src/pro/OcioBake.cpp)
+    target_include_directories(ocio_bake_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(MP_HAVE_OCIO)
+        target_link_libraries(ocio_bake_test PRIVATE OpenColorIO::OpenColorIO)
+        target_compile_definitions(ocio_bake_test PRIVATE MEDIAPLAYER_WITH_OCIO=1)
+        if(MP_BUILD_PRO)
+            add_dependencies(ocio_bake_test ${MP_PRO_TARGET})  # the Pro build copies the DLLs
+        endif()
+    endif()
+    add_test(NAME ocio_bake COMMAND ocio_bake_test)
+
+    # The decoder drains at EOF (short clips, last frames): writes a 5-frame ProRes clip.
+    if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
+        add_executable(short_clip_test tests/short_clip_test.cpp src/media/VideoDecoder.cpp
+            src/media/ImageSequence.cpp src/Log.cpp)
+        target_include_directories(short_clip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(short_clip_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
+        if(TARGET PkgConfig::FFMPEG)
+            target_link_libraries(short_clip_test PRIVATE PkgConfig::FFMPEG)
+        else()
+            target_link_libraries(short_clip_test PRIVATE mp_ffmpeg)
+        endif()
+        if(WIN32)
+            target_link_libraries(short_clip_test PRIVATE d3d11 dxgi d3dcompiler)
+        endif()
+        add_test(NAME short_clip COMMAND short_clip_test)
+    endif()
+
+    # The Resolve marker script (tools/resolve) against a fake timeline; needs Python 3.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME resolve_markers
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/resolve_markers_test.py)
+    endif()
+
     add_executable(color_test
         tests/color_test.cpp
         src/color/CubeLut.cpp

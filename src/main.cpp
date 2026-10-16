@@ -4,6 +4,9 @@
 // M0: open a window, bring up an OpenXR stereo session against the DisplayXR
 // runtime, and clear the two eye views to distinct colors each frame.
 #include "App.h"
+#if MEDIAPLAYER_PRO
+#include "pro/DeckLinkSource.h"
+#endif
 #include "Log.h"
 #include "media/CameraSource.h"
 
@@ -42,8 +45,13 @@ namespace {
 //   --auto-conv[=nearest|sharp|centre]  live auto-convergence on (#92; default OFF)
 // and the stream-URL flag (#93):
 //   --url <u> / --url=<u>            start on a live network stream
-bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, bool& list) {
+bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, bool& list,
+                    bool& listDeckLink) {
     std::vector<std::string> rest;
+    struct {
+        bool on = false;
+        std::string dev = "0", right, opts;
+    } decklink;  // Pro: --decklink* collected into one station input
     for (size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         if (a == "--url" && i + 1 < args.size()) {
@@ -62,6 +70,58 @@ bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, b
         } else if (a.rfind("--auto-conv=", 0) == 0) {
             o.autoConv = true;
             o.autoConvPolicy = a.substr(12);
+        } else if (a.rfind("--input=", 0) == 0) {          // Media Player Pro station input
+            o.proInputs.push_back(a.substr(8));
+        } else if (a == "--decklink" || a.rfind("--decklink=", 0) == 0) {
+            decklink.on = true;
+            if (a.size() > 10) decklink.dev = a.substr(11);
+        } else if (a.rfind("--decklink-right=", 0) == 0) {
+            decklink.on = true;
+            decklink.right = a.substr(17);
+        } else if (a.rfind("--decklink-input=", 0) == 0) {
+            decklink.opts += "," + a.substr(17);
+        } else if (a.rfind("--decklink-mode=", 0) == 0) {
+            decklink.opts += ",mode=" + a.substr(16);
+        } else if (a.rfind("--decklink-stereo=", 0) == 0) {
+            decklink.opts += "," + a.substr(18);
+        } else if (a == "--decklink-list") {
+            listDeckLink = true;
+        } else if (a == "--test-signal" || a.rfind("--test-signal=", 0) == 0) {
+            o.proInputs.push_back("Test rig=test:" + (a.size() > 13 ? a.substr(14) : std::string()));
+        } else if (a.rfind("--depth-budget=", 0) == 0) {
+            if (std::sscanf(a.c_str() + 15, "%f,%f", &o.proBudget[0], &o.proBudget[1]) != 2 ||
+                o.proBudget[0] >= o.proBudget[1]) {
+                LOG_ERROR("--depth-budget: expected near,far in %% of eye width (e.g. -2,1)");
+                return false;
+            }
+        } else if (a.rfind("--vertical-limit=", 0) == 0) {
+            o.proBudget[2] = (float)std::atof(a.c_str() + 17);
+        } else if (a.rfind("--colour-limit=", 0) == 0) {
+            o.proBudget[3] = (float)std::atof(a.c_str() + 15);
+        } else if (a == "--no-timecode") {
+            o.proTimecode = false;
+        } else if (a.rfind("--seq-fps=", 0) == 0) {
+            o.proSeqFps = std::atof(a.c_str() + 10);
+            if (!(o.proSeqFps > 0.0 && o.proSeqFps <= 240.0)) {
+                LOG_ERROR("--seq-fps: expected a rate in fps, e.g. 24 or 23.976");
+                return false;
+            }
+        } else if (a.rfind("--compare=", 0) == 0) {
+            o.proCompare = a.substr(10);
+        } else if (a.rfind("--ocio=", 0) == 0) {
+            o.ocio = true;
+            o.ocioConfig = a.substr(7);
+        } else if (a.rfind("--ocio-src=", 0) == 0) {
+            o.ocio = true;
+            o.ocioSrc = a.substr(11);
+        } else if (a.rfind("--ocio-display=", 0) == 0) {
+            o.ocioDisplay = a.substr(15);
+        } else if (a.rfind("--ocio-view=", 0) == 0) {
+            o.ocioView = a.substr(12);
+        } else if (a.rfind("--ocio-dst=", 0) == 0) {
+            o.ocioDst = a.substr(11);
+        } else if (a.rfind("--ocio-looks=", 0) == 0) {
+            o.ocioLooks = a.substr(13);
         } else if (a == "--lut" && i + 1 < args.size()) {   // Media Player Pro look
             o.lutPath = args[++i];
         } else if (a.rfind("--lut=", 0) == 0) {
@@ -77,6 +137,10 @@ bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, b
         }
     }
     args.swap(rest);
+    if (decklink.on)  // the DeckLink input goes first: the station opens input 0
+        o.proInputs.insert(o.proInputs.begin(), "DeckLink=decklink:" + decklink.dev +
+                                                    (decklink.right.empty() ? "" : "+" + decklink.right) +
+                                                    decklink.opts);
     return true;
 }
 
@@ -119,7 +183,20 @@ int main(int argc, char* argv[]) {
 #endif
     mp::App::LaunchOptions launch;
     bool listCameras = false;
-    TakeCameraArgs(args, launch, listCameras);
+    bool listDeckLink = false;
+    if (!TakeCameraArgs(args, launch, listCameras, listDeckLink)) return 2;
+#if MEDIAPLAYER_PRO
+    if (listDeckLink) {
+#if defined(_WIN32)
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            FILE* f = nullptr;
+            freopen_s(&f, "CONOUT$", "w", stdout);
+        }
+#endif
+        mp::DeckLinkSource::PrintDeviceList(stdout);
+        return 0;
+    }
+#endif
     if (listCameras) return PrintCameraList();
 
     // The media path is the first remaining argument that is not a flag.

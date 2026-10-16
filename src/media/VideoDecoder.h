@@ -30,6 +30,8 @@
 #include <string>
 #include <thread>
 
+struct AVFrame;  // FFmpeg (global scope)
+
 namespace mp {
 
 class VideoDecoder {
@@ -89,6 +91,14 @@ public:
     double PositionSeconds() const { return positionSec_.load(); }   // current frame PTS
     double DurationSeconds() const { return durationSec_; }           // 0 if unknown
     double FrameRate() const { return frameRate_; }                  // fps, 0 if unknown
+    // Media Player Pro review formats (docs/PRO.md Next 6), OFF in the base player:
+    // EXR / DPX / TIFF sequences (image2), EXR's scene-linear float encoded for display,
+    // and 10/12-bit sources kept at 16 bits (P016) instead of cut to 8-bit I420.
+    static void SetProFormats(bool on) { proFormats_ = on; }
+    static bool ProFormats() { return proFormats_; }
+    void SetSequenceFps(double fps) { seqFps_ = fps > 0.0 ? fps : 24.0; }  // before Open()
+    bool IsSequence() const { return isSequence_; }
+    ::AVFrame* FloatToI420(::AVFrame* src);  // decode thread: float EXR -> sRGB-encoded I420
 
     // Optional A/V master clock (audio position in seconds, or <0 when unavailable). When
     // set and returning >=0, the decode thread presents each frame when the clock reaches
@@ -164,6 +174,9 @@ private:
     double durationSec_ = 0.0;                  // set in Open()
     double frameRate_ = 0.0;                    // fps, for frame stepping
     bool open_ = false;
+    static inline bool proFormats_ = false;
+    double seqFps_ = 24.0;
+    bool isSequence_ = false;
     int width_ = 0;
     int height_ = 0;
 

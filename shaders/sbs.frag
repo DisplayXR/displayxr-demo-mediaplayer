@@ -39,7 +39,7 @@ layout(push_constant) uniform PushConstants {
     vec4 cdlSlope;   // .rgb = ASC slope, .a = ASC saturation
     vec4 cdlOffset;  // .rgb = ASC offset, .a = 1 when the CDL is on
     vec4 cdlPower;   // .rgb = ASC power
-    vec4 lutDomain;  // .x = domain min, .y = 1/(max-min), .z = LUT size N
+    vec4 lutDomain;  // .x = domain min, .y = 1/(max-min), .z = LUT size N, .w = 1 for P016
 #endif
 } pc;
 
@@ -75,6 +75,16 @@ vec3 SampleSource(vec2 uv) {
     // Range-expand, then BT.709. Full range uses the samples directly; limited range
     // remaps Y [16,235]->[0,1] and chroma [16,240]->[-0.5,0.5] (8-bit).
     float yb, ub, vb;
+#ifdef MP_GRADE
+    if (pc.lutDomain.w > 0.5 && pc.fullRange < 0.5) {
+        // P016 / P010 (Pro 10-bit capture): 10-bit limited range (Y 64..940, C 64..960),
+        // MSB-aligned in 16 bits.
+        yb = (y * 65535.0 / 64.0 - 64.0) / 876.0;
+        ub = (u * 65535.0 / 64.0 - 512.0) / 896.0;
+        vb = (v * 65535.0 / 64.0 - 512.0) / 896.0;
+        return clamp(vec3(yb + 1.5748 * vb, yb - 0.1873 * ub - 0.4681 * vb, yb + 1.8556 * ub), 0.0, 1.0);
+    }
+#endif
     if (pc.fullRange > 0.5) {
         yb = y;
         ub = u - 0.5;

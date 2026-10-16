@@ -67,6 +67,10 @@ public:
     // prev/next navigation, and to filter dropped files). The single source of truth for
     // the supported set.
     static bool IsSupported(const std::string& path);
+    // Media Player Pro review formats (MXF, EXR / DPX / TIFF sequences); off in the base
+    // player. Pro turns it on (with VideoDecoder::SetProFormats) before the first load.
+    static void SetProFormats(bool on) { proFormats_ = on; }
+    static inline bool proFormats_ = false;
 
     static const char* KindName(MediaKind k);
     static const char* LayoutName(StereoLayout l);   // forwards to mp::LayoutName

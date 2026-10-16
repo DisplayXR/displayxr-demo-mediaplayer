@@ -52,18 +52,7 @@ double CameraSource::NowSeconds() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-const char* CameraSource::StateName(State s) {
-    switch (s) {
-        case State::Closed: return "closed";
-        case State::Opening: return "opening";
-        case State::Streaming: return "streaming";
-        case State::Stalled: return "stalled";
-        case State::Lost: return "lost";
-        case State::Denied: return "denied";
-        case State::Failed: return "failed";
-    }
-    return "?";
-}
+const char* CameraSource::StateName(State s) { return LiveStateName(s); }
 
 CameraSource::~CameraSource() { Stop(); }
 
@@ -443,6 +432,8 @@ void CameraSource::PublishNV12(const uint8_t* pixels, int pitch, int w, int h, b
     f.gpu = false;
     f.gpuSharedTexture = nullptr;
     f.gpuSharedHandle = nullptr;
+    f.captureSec = NowSeconds();
+    f.timecode[0] = 0;
     ring_.Publish();
     NotePublished();
 }
@@ -469,6 +460,8 @@ void CameraSource::PublishI420(const uint8_t* const plane[3], const int linesize
     f.gpu = false;
     f.gpuSharedTexture = nullptr;
     f.gpuSharedHandle = nullptr;
+    f.captureSec = NowSeconds();
+    f.timecode[0] = 0;
     ring_.Publish();
     NotePublished();
 }

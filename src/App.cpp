@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "App.h"
+#include "media/ImageSequence.h"
 
 #include "Log.h"
 #include "media/ImageDecoder.h"
@@ -226,6 +227,12 @@ bool App::Initialize(const char* mediaPath) {
     // argument may be a single file OR a folder — for a folder we load the first
     // supported asset (sorted), and LoadMedia builds the prev/next list from it.
     ReadStereoEnv();   // must precede the first LoadMedia below
+#if MEDIAPLAYER_PRO
+    // Pro review formats (MXF, EXR / DPX / TIFF sequences, 10-bit kept): before any load.
+    VideoDecoder::SetProFormats(true);
+    MediaSource::SetProFormats(true);
+    video_.SetSequenceFps(launch_.proSeqFps);
+#endif
 
     // Live camera (#90). The command line (main.cpp) wins over the env vars. The picker
     // and 'C' key are desktop-only: Android's TransportCaps leave caps.camera false.
@@ -357,6 +364,7 @@ int App::Run() {
     }();
     dumpPath_ = std::getenv("MEDIAPLAYER_DUMP_ATLAS");
     dumpHudPath_ = std::getenv("MEDIAPLAYER_DUMP_HUD");
+    if (const char* f = std::getenv("MEDIAPLAYER_DUMP_FRAME")) dumpFrame_ = std::max(1, std::atoi(f));
     openAfterPath_ = std::getenv("MEDIAPLAYER_OPEN_AFTER");  // test: swap media mid-run
     if (const char* h = std::getenv("MEDIAPLAYER_HUD")) showHud_ = (*h && *h != '0');
     // Env-gated initial stereo state (test scaffolding: lets a headless atlas dump
@@ -503,7 +511,7 @@ int App::Run() {
         // Camera hot-plug events (only arrive once the camera subsystem is up).
         if (std::vector<std::pair<uint32_t, uint32_t>> camEv; window_.TakeCameraEvents(camEv)) {
             for (const auto& ev : camEv) {
-                if (ev.first == SDL_EVENT_CAMERA_DEVICE_REMOVED && isLive_ &&
+                if (ev.first == SDL_EVENT_CAMERA_DEVICE_REMOVED && isLive_ && LiveIsCamera() &&
                     ev.second == camera_.DeviceId()) {
                     camera_.NotifyRemoved();
                 } else if (ev.first == SDL_EVENT_CAMERA_DEVICE_ADDED &&
@@ -594,11 +602,15 @@ void App::RenderOneFrame() {
     // upload path. Freeze = stop acquiring: the last uploaded texture keeps drawing.
     // A stream (#93) is video_ in live mode: same ring, same freeze-by-not-acquiring.
     window_.SetKeyboardCaptured(false);  // BuildTransportUI re-asserts it while a field is focused
-    FrameRing* ring = isLive_     ? (livePaused_ ? nullptr : &camera_.Ring())
+    FrameRing* ring = isLive_     ? (livePaused_ ? nullptr : &live_->Ring())
                       : isStream_ ? (streamPaused_ ? nullptr : &video_.Ring())
                                   : (isVideo_ ? &video_.Ring() : nullptr);
     if (ring) {
         if (const FrameRing::Frame* vf = ring->AcquireLatest()) {
+#if MEDIAPLAYER_PRO
+            // Pro: timecode, measured delay and the rig checks see every uploaded frame.
+            pro_.GetStation().OnFrame(*vf, layout_, isLive_, isLive_ ? live_->GetStats().eyeOffsetFrames : -1);
+#endif
             if (isLive_) {
                 OnLiveFrame(*vf);
                 SampleAutoConv(*vf);  // ~5 Hz; downsample only, measured on the worker
@@ -619,7 +631,8 @@ void App::RenderOneFrame() {
                 const bool i420 = (vf->format == PixFormat::I420);
                 renderer_.UploadYUV(vf->plane[0].data(), vf->plane[1].data(),
                                     i420 ? vf->plane[2].data() : nullptr, (uint32_t)vf->width,
-                                    (uint32_t)vf->height, i420 ? 0 : 1, vf->fullRange);
+                                    (uint32_t)vf->height,
+                                    i420 ? 0 : vf->format == PixFormat::P016 ? 2 : 1, vf->fullRange);
             }
         }
     }
@@ -798,7 +811,7 @@ void App::RenderOneFrame() {
         }
         ++rendered_;
 
-        if (dumpPath_ && !dumped_ && rendered_ >= 100) {
+        if (dumpPath_ && !dumped_ && rendered_ >= dumpFrame_) {
             // Prefer the runtime-owned atlas capture (compositor-owned swapchain makes the
             // app-side readback unreliable); fall back to the local readback if absent.
             if (xr_.HasAtlasCapture()) {
@@ -857,6 +870,12 @@ void App::RenderOneFrame() {
                 hud.width = fracW;
                 hud.height = fracH;
                 hud.disparity = kHudDisparity;
+#if MEDIAPLAYER_PRO
+                proHud_[0] = hud.x;
+                proHud_[1] = hud.y;
+                proHud_[2] = hud.width;
+                proHud_[3] = hud.height;
+#endif
 
                 uint32_t pw = 0, phh = 0;
                 window_.PointSize(pw, phh);
@@ -866,7 +885,7 @@ void App::RenderOneFrame() {
                 // Desktop Linux: the pointer shape ImGui wants (I-beam over the URL
                 // field, ...). The SDL backend does this itself elsewhere.
                 window_.SetImGuiCursor(imgui_.MouseCursor());
-                if (dumpHudPath_ && !dumpedHud_ && rendered_ >= 100) {
+                if (dumpHudPath_ && !dumpedHud_ && rendered_ >= dumpFrame_) {
                     renderer_.DumpExternalImage(xr_.HudImages()[hudIdx], xr_.HudWidth(),
                                                 xr_.HudHeight(), dumpHudPath_);
                     dumpedHud_ = true;
@@ -886,11 +905,11 @@ void App::RenderOneFrame() {
                 const std::string layoutLabel = LayoutLabel();
                 char text[512];
                 if (isLive_) {
-                    const CameraSource::Stats cs = camera_.GetStats();
+                    const LiveStats cs = live_->GetStats();
                     std::snprintf(text, sizeof(text),
                                   "%.0f FPS   %s\nLIVE %s %dx%d  %s  cam %.0f fps  age %.0f ms\n"
                                   "win %ux%u  tile %ux%u\n%s",
-                                  fps_, xr_.ActiveModeName(), camera_.DeviceName().c_str(),
+                                  fps_, xr_.ActiveModeName(), live_->DeviceName().c_str(),
                                   mediaW_, mediaH_, layoutLabel.c_str(), cs.deliveredFps,
                                   liveAgeMs_, cw, ch, tileW, tileH, stereo);
                 } else if (isStream_) {
@@ -969,13 +988,13 @@ void App::BuildTransportUI() {
     uiState_.caps.slideshow = !isLive_ && !isStream_;
     uiState_.isLive = isLive_;
     uiState_.livePaused = livePaused_;
-    uiState_.liveDevice = isLive_ ? camera_.DeviceName() : std::string();
+    uiState_.liveDevice = isLive_ ? live_->DeviceName() : std::string();
     uiState_.liveStatus = isLive_ ? LiveStatusText() : std::string();
-    uiState_.cameraFps = isLive_ ? camera_.GetStats().deliveredFps : 0.0f;
+    uiState_.cameraFps = isLive_ ? live_->GetStats().deliveredFps : 0.0f;
     uiState_.panelFps = fps_;
     uiState_.frameAgeMs = (float)liveAgeMs_;
     uiState_.cameraCurrent = -1;
-    for (size_t i = 0; isLive_ && i < cameraDevs_.size(); ++i)
+    for (size_t i = 0; isLive_ && LiveIsCamera() && i < cameraDevs_.size(); ++i)
         if (cameraDevs_[i].id == camera_.DeviceId()) uiState_.cameraCurrent = (int)i;
     if (isLive_) uiState_.mediaFilename.clear();
     uiState_.autoConvOn = autoConvEnabled_;
@@ -1107,6 +1126,9 @@ void App::UpdateFps() {
 
 void App::Shutdown() {
     autoConvWorker_.Stop();  // #92
+#if MEDIAPLAYER_PRO
+    pro_.GetStation().Shutdown();  // Pro live inputs (DeckLink / test rig) join their threads
+#endif
     camera_.Stop();       // join the camera worker + SDL_CloseCamera before SDL_Quit
     video_.Stop();        // join the decode thread (reads the audio clock) before audio,
     audio_.Stop();        // and before tearing down the GPU
@@ -1440,7 +1462,7 @@ void App::RefreshCameraList(bool rescan) {
     // When the same device is back in the fresh list it is re-opened at once: a Rescan
     // after an unplug means "reconnect", not "show me a list" (David, first hardware run).
     bool reconnect = false;
-    if (rescan && isLive_) {
+    if (rescan && isLive_ && LiveIsCamera()) {
         const CameraSource::State st = camera_.GetState();
         if (st == CameraSource::State::Lost || st == CameraSource::State::Failed ||
             st == CameraSource::State::Denied) {
@@ -1449,7 +1471,8 @@ void App::RefreshCameraList(bool rescan) {
             camera_.Stop();
             liveStateSeen_ = CameraSource::State::Closed;
         }
-        reconnect = (camera_.GetState() == CameraSource::State::Closed) && !liveSelector_.empty();
+        reconnect = LiveIsCamera() && (camera_.GetState() == CameraSource::State::Closed) &&
+                    !liveSelector_.empty();
     }
     cameraDevs_.clear();
     uiState_.cameraNames.clear();
@@ -1490,9 +1513,19 @@ bool App::LoadLiveDevice(const CameraDevice& dev) {
     // opens on the worker): a refused device leaves the current media playing.
     if (!camera_.Open(dev, 0, 0, launch_.cameraFps)) {
         ShowToast("Camera: " + camera_.LastError());
-        if (isLive_) StopLive(/*showIdleIfEmpty=*/true);  // the old camera was closed by Open
+        if (isLive_ && LiveIsCamera()) StopLive(/*showIdleIfEmpty=*/true);  // closed by Open
         return false;
     }
+    liveSelector_ = dev.name;
+    EnterLive(&camera_, dev.name);
+    return true;
+}
+
+void App::EnterLive(LiveProducer* p, const std::string& name) {
+    // One live producer at a time: a previous one (the camera, or a Pro input) stops.
+    if (live_ != p && isLive_) live_->Stop();
+    if (p != &camera_) camera_.Stop();
+    live_ = p;
     if (isStream_) StopStream(/*showIdleIfEmpty=*/false);  // #93: the camera replaces it
     video_.Stop();   // joins the decode thread before audio (see ReloadMedia)
     audio_.Stop();
@@ -1524,15 +1557,13 @@ bool App::LoadLiveDevice(const CameraDevice& dev) {
     liveSlowSince_ = -1.0;
     liveSlowWarned_ = false;
     liveStateSeen_ = CameraSource::State::Opening;
-    liveSelector_ = dev.name;
     autoConvWorker_.RequestReset();  // #92: a new camera is a new scene
-    LOG_INFO("Live: opening '%s'", dev.name.c_str());
-    ShowToast("Live: " + dev.name);
-    return true;
+    LOG_INFO("Live: opening %s '%s'", p->Kind(), name.c_str());
+    ShowToast("Live: " + name);
 }
 
 void App::StopLive(bool showIdleIfEmpty) {
-    camera_.Stop();
+    live_->Stop();
     autoConvWorker_.RequestReset();  // #92: the next source is a new scene
     isLive_ = false;
     livePaused_ = false;
@@ -1550,9 +1581,9 @@ void App::ToggleLive() {
     if (isLive_) {
         // 'C' on a lost/blocked camera = reconnect (rescan + re-open the same device),
         // not "live off": the user is trying to get the picture back.
-        const CameraSource::State st = camera_.GetState();
-        if (st == CameraSource::State::Lost || st == CameraSource::State::Failed ||
-            st == CameraSource::State::Denied || st == CameraSource::State::Closed) {
+        const CameraSource::State st = live_->GetState();
+        if (LiveIsCamera() && (st == CameraSource::State::Lost || st == CameraSource::State::Failed ||
+                               st == CameraSource::State::Denied || st == CameraSource::State::Closed)) {
             RefreshCameraList(/*rescan=*/true);
             return;
         }
@@ -1565,11 +1596,11 @@ void App::ToggleLive() {
 
 std::string App::LiveStatusText() const {
     if (!isLive_) return std::string();
-    switch (camera_.GetState()) {
+    switch (live_->GetState()) {
         case CameraSource::State::Opening: return "OPENING";
         case CameraSource::State::Streaming: return livePaused_ ? "FROZEN" : "LIVE";
         case CameraSource::State::Stalled: return "NO SIGNAL";
-        case CameraSource::State::Lost: return "NO CAMERA";
+        case CameraSource::State::Lost: return LiveIsCamera() ? "NO CAMERA" : "NO INPUT";
         case CameraSource::State::Denied: return "BLOCKED";
         case CameraSource::State::Failed: return "ERROR";
         case CameraSource::State::Closed: break;  // released after a loss (see RefreshCameraList)
@@ -1578,7 +1609,7 @@ std::string App::LiveStatusText() const {
 }
 
 void App::OnLiveFrame(const FrameRing::Frame& f) {
-    liveAgeMs_ = (CameraSource::NowSeconds() - camera_.GetStats().lastPublishSec) * 1000.0;
+    liveAgeMs_ = (CameraSource::NowSeconds() - live_->GetStats().lastPublishSec) * 1000.0;
     SettleLiveLayout(f, "Live");
 }
 
@@ -1597,6 +1628,13 @@ void App::SettleLiveLayout(const FrameRing::Frame& f, const char* tag) {
     li.signal = StereoSignal::Aspect;
     li.confidence = 0.5f;
     li.layout = StereoDetect::ChooseFullOrHalf((float)mediaW_ / (float)mediaH_, ambiguous);
+    // A live source that knows its packing (two inputs side by side, a mono input) says
+    // so; the aspect guess is only for sources that cannot tell (the camera: -1).
+    if (isLive_ && live_->LayoutHint() >= 0) {
+        li.layout = (StereoLayout)live_->LayoutHint();
+        li.signal = StereoSignal::Metadata;
+        li.confidence = 1.0f;
+    }
     autoInfo_ = li;  // ApplyLayout skips autoInfo_ for Manual; L -> auto must land here
     if (layoutForced_) {  // MEDIAPLAYER_LAYOUT
         li.layout = layoutForcedValue_;
@@ -1763,37 +1801,38 @@ void App::PollStream() {
 
 void App::PollLive() {
     if (!isLive_) return;
-    const CameraSource::State st = camera_.GetState();
+    const CameraSource::State st = live_->GetState();
     const double now = CameraSource::NowSeconds();
+    const bool cam = LiveIsCamera();
     if (st != liveStateSeen_) {
         const CameraSource::State was = liveStateSeen_;
         liveStateSeen_ = st;
         using S = CameraSource::State;
         switch (st) {
             case S::Streaming: {
-                const CameraSource::Stats cs = camera_.GetStats();
+                const CameraSource::Stats cs = live_->GetStats();
                 LOG_INFO("Live: '%s' streaming %dx%d NV12 @%d requested (%s range)%s",
-                         camera_.DeviceName().c_str(), cs.w, cs.h, cs.fpsReq,
+                         live_->DeviceName().c_str(), cs.w, cs.h, cs.fpsReq,
                          cs.fullRange ? "full" : "limited",
                          cs.mjpgPath ? " via MJPG decoders" : "");
                 if (was == S::Stalled) ShowToast("Live");
                 break;
             }
             case S::Stalled:
-                ShowToast("No camera signal");
+                ShowToast(cam ? "No camera signal" : "No input signal");
                 break;
             case S::Lost:
-                ShowToast("Camera disconnected");
+                ShowToast(cam ? "Camera disconnected" : "Input lost");
                 break;
             case S::Denied:
             case S::Failed: {
-                const std::string err = camera_.LastError();
+                const std::string err = live_->LastError();
                 const bool denied = (st == S::Denied);
-                LOG_WARN("Live: '%s' %s: %s", camera_.DeviceName().c_str(),
+                LOG_WARN("Live: '%s' %s: %s", live_->DeviceName().c_str(),
                          denied ? "blocked" : "failed", err.c_str());
                 ShowToast(denied ? "Camera blocked by Windows privacy settings - "
                                    "Settings > Privacy & security > Camera"
-                                 : "Camera: " + err);
+                                 : std::string(cam ? "Camera: " : "Input: ") + err);
                 // Never got a frame: there is nothing to freeze on, so go back to idle
                 // rather than leave a dead source up. After frames, keep the last one.
                 if (mediaW_ == 0) StopLive(/*showIdleIfEmpty=*/true);
@@ -1805,7 +1844,7 @@ void App::PollLive() {
     }
     // Ladder rung 4: the device delivers well under what was asked (CPU-bound decode on
     // a weak box). Hint once; no automatic re-open (that re-negotiates the device).
-    if (isLive_ && st == CameraSource::State::Streaming && !liveSlowWarned_) {
+    if (isLive_ && cam && st == CameraSource::State::Streaming && !liveSlowWarned_) {
         const CameraSource::Stats cs = camera_.GetStats();
         const bool warm = cs.fpsReq > 0 && cs.published > (uint64_t)cs.fpsReq * 2;
         if (warm && cs.deliveredFps < 0.8f * (float)cs.fpsReq) {
@@ -1872,8 +1911,16 @@ void App::SampleAutoConv(const FrameRing::Frame& f) {
     // Measure on the halves the viewer's eyes actually see (X / container swap).
     const bool swap = (swapEyes_ != mediaEyeSwap_);
     const bool focus = autoConvPolicy_ == autoconv::SubjectPolicy::Focus && autoConvHasFocus_;
+    const uint8_t* luma = f.plane[0].data();
+    if (f.format == PixFormat::P016) {  // 16-bit (Pro's 10-bit path): the measurement is 8-bit
+        const size_t n = (size_t)f.width * (size_t)f.height;
+        autoConvLuma8_.resize(n);
+        const uint16_t* s16 = reinterpret_cast<const uint16_t*>(f.plane[0].data());
+        for (size_t i = 0; i < n; ++i) autoConvLuma8_[i] = (uint8_t)(s16[i] >> 8);
+        luma = autoConvLuma8_.data();
+    }
     autoConvDownsampleMs_ =
-        autoConvWorker_.Submit(f.plane[0].data(), f.width, f.width, f.height, swap,
+        autoConvWorker_.Submit(luma, f.width, f.width, f.height, swap,
                                autoConvPolicy_, focus ? autoConvFocus_ : nullptr, nowMs);
 }
 
@@ -2049,6 +2096,21 @@ void App::RebuildFolderList(std::string path) {
         if (MediaSource::IsSupported(s)) folderFiles_.push_back(s);
     }
     std::sort(folderFiles_.begin(), folderFiles_.end());
+    {
+        // An EXR / DPX / TIFF sequence (Pro) is one clip: keep its first frame only. The
+        // current file stays listed so the index below still finds it.
+        std::vector<std::string> kept;
+        std::vector<std::string> seen;  // sequence keys already listed (a folder may interleave two)
+        for (const std::string& f : folderFiles_) {
+            const std::string k = imageseq::Key(f);
+            std::error_code e3;
+            const bool dup = !k.empty() && std::find(seen.begin(), seen.end(), k) != seen.end();
+            if (dup && !fs::equivalent(fs::path(f), p, e3)) continue;
+            if (!k.empty() && !dup) seen.push_back(k);
+            kept.push_back(f);
+        }
+        folderFiles_.swap(kept);
+    }
     for (size_t i = 0; i < folderFiles_.size(); ++i) {
         std::error_code e2;
         if (fs::equivalent(fs::path(folderFiles_[i]), p, e2) && !e2) {
@@ -2159,8 +2221,13 @@ void App::ClearIdleLogo() {
     // Hand back the mode the idle screen borrowed — but only if it is still the one
     // we asked for. If the user pressed V (or the Mode button) while the logo was up,
     // that is their choice and media inherits it.
-    if (modeBeforeIdle_ >= 0 && idleModeRequested_ >= 0 &&
-        xr_.CurrentModeIndex() == (uint32_t)idleModeRequested_) {
+    if (idleModeRequested_ >= 0 && pendingModeRequest_ == idleModeRequested_) {
+        // The borrow was never sent (media replaced the logo before the first frame,
+        // e.g. a live input opened during Init): cancel it rather than go flat.
+        pendingModeRequest_ = -1;
+    } else if (modeBeforeIdle_ >= 0 && idleModeRequested_ >= 0 &&
+               (xr_.CurrentModeIndex() == (uint32_t)idleModeRequested_ ||
+                xr_.CurrentModeIndex() == (uint32_t)modeBeforeIdle_)) {  // sent, change not yet reported
         pendingModeRequest_ = modeBeforeIdle_;
     }
     modeBeforeIdle_ = -1;
@@ -2350,12 +2417,21 @@ void App::SetupAgentTools() {
         return DispatchAgentTool(tool, args, success);
     });
     LOG_INFO("Agent tools registered (appId=mediaplayer)");
+#if MEDIAPLAYER_PRO
+    pro_.RegisterTools([this](const char* n, const char* d, const char* s) { xr_.RegisterMcpTool(n, d, s); });
+#endif
 }
 
 std::string App::DispatchAgentTool(const std::string& tool, const std::string& argsJson,
                                    bool& success) {
     using json = nlohmann::json;
     success = true;
+#if MEDIAPLAYER_PRO
+    {
+        std::string proResult;
+        if (pro_.DispatchTool(tool, argsJson, proResult, success)) return proResult;  // Pro tools
+    }
+#endif
 
     // Parse args leniently: empty/whitespace means "no arguments".
     json args = json::object();
@@ -2512,10 +2588,11 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["live"] = isLive_;
         out["live_paused"] = livePaused_;
         fillAutoConv(out);
-        out["camera"] = isLive_ ? camera_.DeviceName() : std::string();
-        out["camera_state"] = isLive_ ? CameraSource::StateName(camera_.GetState()) : "closed";
+        out["camera"] = isLive_ ? live_->DeviceName() : std::string();
+        out["live_kind"] = isLive_ ? live_->Kind() : "";
+        out["camera_state"] = isLive_ ? CameraSource::StateName(live_->GetState()) : "closed";
         if (isLive_) {
-            const CameraSource::Stats cs = camera_.GetStats();
+            const CameraSource::Stats cs = live_->GetStats();
             out["camera_fps"] = cs.deliveredFps;
             out["camera_fps_requested"] = cs.fpsReq;
             out["camera_width"] = cs.w;
@@ -2525,7 +2602,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
             out["camera_dropped"] = cs.dropped;
             out["frame_age_ms"] = liveAgeMs_;
             out["panel_fps"] = fps_;
-            out["camera_error"] = camera_.LastError();
+            out["camera_error"] = live_->LastError();
         }
         // Stream URL (#93).
         out["stream"] = isStream_;
@@ -2779,6 +2856,30 @@ void App::InitPro() {
         const float eyeW = (float)mediaW_ * (sbs ? 0.5f : 1.0f);
         return proTileContentW_ > 1.f ? std::max(1.0f, eyeW / proTileContentW_) : 1.0f;
     };
+    h.pictureInHud = [this](float& x, float& y, float& w, float& hh) {
+        // The (unzoomed) picture as fractions of the HUD layer, where ImGui draws.
+        uint32_t pw = 0, ph = 0;
+        window_.PointSize(pw, ph);
+        if (pw == 0 || ph == 0 || proPicW_ < 1.f || proHud_[2] <= 0.f || proHud_[3] <= 0.f) return false;
+        x = (proPicX_ / (float)pw - proHud_[0]) / proHud_[2];
+        y = (proPicY_ / (float)ph - proHud_[1]) / proHud_[3];
+        w = (proPicW_ / (float)pw) / proHud_[2];
+        hh = (proPicH_ / (float)ph) / proHud_[3];
+        return true;
+    };
+    // A/B compare (Pro, B): reload the other clip at the same position.
+    h.currentMedia = [this] { return (isLive_ || isStream_) ? std::string() : currentMediaPath_; };
+    h.reloadMedia = [this](const std::string& path) {
+        ReloadMedia(path);
+        return currentMediaPath_ == path;
+    };
+    h.mediaPosition = [this] { return isVideo_ ? video_.PositionSeconds() : -1.0; };
+    h.mediaPaused = [this] { return isVideo_ && video_.Paused(); };
+    h.seekMedia = [this](double s, bool paused) {
+        if (!isVideo_) return;
+        video_.Seek(s);
+        if (paused && !video_.Paused()) TogglePlayback();
+    };
     h.isFullscreen = [this] { return window_.IsFullscreen(); };
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
     pro_.Init(&renderer_, window_.SdlWindow(), std::move(h));
@@ -2804,6 +2905,48 @@ void App::InitPro() {
     pro_.ApplyTestEnv();
     if (!launch_.lutPath.empty()) pro_.LoadLut(launch_.lutPath);
     if (!launch_.cdlPath.empty()) pro_.LoadCdl(launch_.cdlPath);
+    if (launch_.ocio) {
+        ocio::Request req;
+        req.config = launch_.ocioConfig;
+        req.src = launch_.ocioSrc;
+        req.display = launch_.ocioDisplay;
+        req.view = launch_.ocioView;
+        req.dst = launch_.ocioDst;
+        req.looks = launch_.ocioLooks;
+        pro_.LoadOcio(req);
+    }
+    if (!launch_.proCompare.empty()) pro_.SetCompareB(launch_.proCompare);
+
+    // The monitoring station (inputs, timecode / delay, rig checks, snapshots).
+    pro::StationHost sh;
+    sh.enterLive = [this](LiveProducer* p, const std::string& name) {
+        if (isStream_) StopStream(/*showIdleIfEmpty=*/false);
+        EnterLive(p, name);
+    };
+    sh.stopLive = [this] { if (isLive_) StopLive(/*showIdleIfEmpty=*/true); };
+    sh.openCamera = [this](const std::string& sel) { return LoadLive(sel); };
+    sh.openUrl = [this](const std::string& url) { return LoadUrl(url); };
+    sh.capturePrefix = [this](const std::string& stem) {
+        return MakeCaptureAtlasPrefix(stem, xr_.ActiveTileColumns(), xr_.ActiveTileRows());
+    };
+    sh.captureAtlas = [this](const std::string& prefix) {
+        return xr_.HasAtlasCapture() && xr_.CaptureAtlas(prefix);
+    };
+    sh.toast = [this](const std::string& t) { ShowToast(t); };
+    sh.displayPeriodMs = [this] { return fps_ > 1.0f ? 1000.0 / fps_ : 1000.0 / 60.0; };
+    pro::StationOptions so;
+    so.inputs = launch_.proInputs;
+    so.budget.nearPct = launch_.proBudget[0];
+    so.budget.farPct = launch_.proBudget[1];
+    so.budget.maxVerticalPx = launch_.proBudget[2];
+    so.budget.maxDeltaE = launch_.proBudget[3];
+    so.timecode = launch_.proTimecode;
+    so.startFirstInput = !hasMedia_ || isLogo_;  // a file / camera / URL from the command line wins
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_VSHIFT")) so.testCfg.vShiftPx = (float)std::atof(e);
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_EYE_DELAY")) so.testCfg.eyeDelay = std::atoi(e);
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_GAIN_R")) so.testCfg.gainR = (float)std::atof(e);
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_DEPTH")) so.testCfg.depthScale = (float)std::atof(e);
+    pro_.GetStation().Init(std::move(sh), so);
     LOG_INFO("Media Player Pro: ready (lut=%s cdl=%s)", launch_.lutPath.c_str(), launch_.cdlPath.c_str());
 }
 
@@ -2816,10 +2959,13 @@ pro::Status App::ProStatus() const {
     st.height = mediaH_;
     st.panelFps = fps_;
     st.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
+    st.live = isLive_;
+    st.eyesSwapped = swapEyes_ != mediaEyeSwap_;
+    st.hasPicture = hasMedia_ && !isLogo_ && (isLive_ || isStream_ || isVideo_);
     if (isLive_) {
-        st.sourceKind = "Camera";
-        st.sourceLabel = camera_.DeviceName();
-        st.sourceFps = camera_.GetStats().deliveredFps;
+        st.sourceKind = LiveIsCamera() ? "Camera" : live_->Kind();
+        st.sourceLabel = live_->DeviceName();
+        st.sourceFps = live_->GetStats().deliveredFps;
         st.frameAgeMs = (float)liveAgeMs_;
     } else if (isStream_) {
         st.sourceKind = "Stream";

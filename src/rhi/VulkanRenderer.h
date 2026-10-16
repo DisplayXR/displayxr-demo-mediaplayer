@@ -119,7 +119,8 @@ public:
     // Upload a planar YUV frame (the video decoder's native output): the shader does the
     // BT.709 convert AND the downscale via sampling, so no swscale runs on the decode
     // thread. format: 0 = I420 (plane1=U, plane2=V), 1 = NV12 (plane1=interleaved UV,
-    // plane2 ignored). Chroma planes are (w+1)/2 x (h+1)/2.
+    // plane2 ignored), 2 = P016 (NV12 layout, 16-bit MSB-aligned samples - Pro's
+    // 10-bit capture). Chroma planes are (w+1)/2 x (h+1)/2.
     bool UploadYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2,
                    uint32_t width, uint32_t height, int format, bool fullRange);
 
@@ -215,6 +216,7 @@ private:
     } planes_[3];
     int sourceMode_ = 0;             // 0 RGBA, 1 I420, 2 NV12 (pushed to the shader)
     float sourceFullRange_ = 0.0f;
+    bool source16_ = false;          // P016: the MP_GRADE shader uses 10-bit limited levels
 
 #if defined(_WIN32)
     // Zero-copy interop state (#28). imports_ caches one entry per shared handle. The producer

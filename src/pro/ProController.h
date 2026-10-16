@@ -18,6 +18,8 @@
 
 #include "color/Cdl.h"
 #include "color/CubeLut.h"
+#include "pro/OcioBake.h"
+#include "pro/Station.h"
 #include "rhi/VulkanRenderer.h"
 
 #include <functional>
@@ -42,6 +44,9 @@ struct Status {
     float panelFps = 0.0f;
     float sourceFps = 0.0f;     // camera delivered / stream decoded fps (0 for files)
     float frameAgeMs = 0.0f;    // live: publish -> upload age
+    bool live = false;          // a live source (camera, DeckLink, test rig) is showing
+    bool hasPicture = false;    // live, video or stream: rig checks + history apply
+    bool eyesSwapped = false;   // the user's swap XOR the container's (R|L packing)
     std::string modeName;       // display mode, e.g. "LeiaSR"
 };
 
@@ -59,6 +64,15 @@ struct Host {
     std::function<bool(float& w, float& h)> contentSizePoints;
     // Zoom at which one source pixel maps to one panel pixel in the current mode.
     std::function<float()> oneToOneZoom;
+    // The unzoomed picture as fractions (0..1) of the HUD layer ImGui draws into.
+    std::function<bool(float& x, float& y, float& w, float& h)> pictureInHud;
+    // A/B compare: the open file ("" when live / streaming), reload a file (true when it
+    // opened), the playback position (-1 = not a video) / pause state, and seek.
+    std::function<std::string()> currentMedia;
+    std::function<bool(const std::string&)> reloadMedia;
+    std::function<double()> mediaPosition;
+    std::function<bool()> mediaPaused;
+    std::function<void(double seconds, bool paused)> seekMedia;
     std::function<bool()> isFullscreen;
     std::function<void()> toggleFullscreen;
 };
@@ -74,6 +88,11 @@ public:
     // Launch-time looks (--lut / --cdl, or MEDIAPLAYER_LUT / MEDIAPLAYER_CDL).
     void LoadLut(const std::string& path);
     void LoadCdl(const std::string& path);
+    // An OpenColorIO transform baked into the grade's 3D LUT (needs a build with MP_OCIO_ROOT).
+    bool LoadOcio(const ocio::Request& req, std::string* err = nullptr);
+    // A/B compare: the B clip; B (key) swaps to the other at the same position.
+    void SetCompareB(const std::string& path) { compare_[1] = path; }
+    void ToggleCompare();
 
     // Raw SDL event, after ImGui has seen it. Returns true when Pro consumed it.
     bool HandleEvent(const void* sdlEvent, bool imguiWantsMouse, bool imguiWantsKeyboard);
@@ -98,9 +117,16 @@ public:
     void BuildUI(const Status& st, float uiAlpha);
 
     // True while Pro wants the HUD kept alive (pinned inspector).
-    bool KeepHudAwake() const { return inspectorPinned_; }
+    bool KeepHudAwake() const { return inspectorPinned_ || depthOverlay_; }
 
     ViewMode Mode() const { return mode_; }
+    // The monitoring station: inputs, timecode / delay, rig checks, snapshots (Station.h).
+    Station& GetStation() { return station_; }
+    // Agent tools (ProTools.cpp): registered and dispatched from the trunk's MCP code.
+    using RegisterFn = std::function<void(const char* name, const char* description, const char* schema)>;
+    void RegisterTools(const RegisterFn& reg);
+    // True when `tool` is a Pro tool (result / success set).
+    bool DispatchTool(const std::string& tool, const std::string& argsJson, std::string& result, bool& success);
     float Zoom() const { return zoom_; }
 
     // Pro launches with eye-swap and convergence controls on the inspector, so the
@@ -109,6 +135,8 @@ public:
 
 private:
     void SetMode(ViewMode m, bool announce);
+    void BuildDepthOverlay(const Status& st);
+    void BuildStatusBar(const Status& st, float alpha);
     void ZoomAt(float factor, float u, float v);
     void SetZoom(float z);
     void ClampPan();
@@ -142,8 +170,17 @@ private:
     bool dialogOpen_ = false;
     bool pendingDialogIsCdl_ = false;
 
-    bool inspectorPinned_ = true;  // Tab toggles
+    bool inspectorPinned_ = false;  // Tab / the Pin box: panels stay up; unpinned they follow the UI fade
+    Station station_;
+    bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture
+    std::string compare_[2];       // A (what was open) and B
+    int compareSide_ = 0;          // 0 = A showing
+    bool pendingCompare_ = false;  // B pressed: swap in Tick()
+    bool rightOnlyView_ = false;
     bool stereoSource_ = false;
+    bool wasFullscreen_ = false;   // full screen hides everything but the picture
+    bool pinnedBeforeFullscreen_ = true;
+    int ticks_ = 0, testCompareFrame_ = -1;  // MEDIAPLAYER_PRO_COMPARE_FRAME (screenshots)
 };
 
 }  // namespace mp::pro

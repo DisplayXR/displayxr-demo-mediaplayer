@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "media/VideoDecoder.h"
+#include "media/ImageSequence.h"
 
 #include "Log.h"
 
@@ -7,10 +8,12 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 // Include the D3D/DXGI C++ headers first (with C++ linkage): FFmpeg's
 // hwcontext_d3d11va.h pulls in <d3d11.h>, and if that first happens inside the
@@ -30,6 +33,7 @@ extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>  // <d3d11.h> already included above (guarded)
 #endif
 #include <libavutil/imgutils.h>
+#include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
 #endif
@@ -58,6 +62,12 @@ struct VideoDecoder::Impl {
     HwFormatHook hook;                          // ctx->opaque for the get_format callback
     int videoStream = -1;
     int swsW = 0, swsH = 0, swsFmt = -1;        // cached sws source params (fallback)
+    // Pro float (EXR) path: -> GBRPF32 (when needed), then sRGB-encoded BT.709 I420.
+    SwsContext* swsF = nullptr;
+    AVFrame* f32Frame = nullptr;
+    AVFrame* f32Out = nullptr;
+    int swsFW = 0, swsFH = 0, swsFFmt = -1;
+    std::vector<uint8_t> oetf;                  // 16384-entry linear -> sRGB code value
 
 #if defined(_WIN32)
     // Zero-copy interop (#28): non-owning handles into the D3D11VA device FFmpeg decodes
@@ -363,11 +373,118 @@ bool VideoDecoder::TryEnableHwAccel(const void* decoder) {
     return false;
 }
 
+AVFrame* VideoDecoder::FloatToI420(AVFrame* src) {
+    Impl& im = *impl_;
+    const int w = src->width & ~1, h = src->height & ~1;
+    if (w <= 0 || h <= 0) return nullptr;
+    AVFrame* g = src;
+    const AVPixelFormat sf = (AVPixelFormat)src->format;
+    if (sf != AV_PIX_FMT_GBRPF32LE && sf != AV_PIX_FMT_GBRAPF32LE) {
+        if (!im.f32Frame) im.f32Frame = av_frame_alloc();
+        if (!im.swsF || im.swsFW != src->width || im.swsFH != src->height || im.swsFFmt != sf) {
+            if (im.swsF) sws_freeContext(im.swsF);
+            im.swsF = sws_getContext(src->width, src->height, sf, src->width, src->height, AV_PIX_FMT_GBRPF32LE,
+                                     SWS_POINT, nullptr, nullptr, nullptr);
+            im.swsFW = src->width;
+            im.swsFH = src->height;
+            im.swsFFmt = sf;
+            av_frame_unref(im.f32Frame);
+            im.f32Frame->format = AV_PIX_FMT_GBRPF32LE;
+            im.f32Frame->width = src->width;
+            im.f32Frame->height = src->height;
+            if (av_frame_get_buffer(im.f32Frame, 32) < 0) {
+                sws_freeContext(im.swsF);  // never keep a context with no target buffer
+                im.swsF = nullptr;
+                im.swsFFmt = -1;
+                return nullptr;
+            }
+        }
+        if (!im.swsF) {
+            LOG_ERROR("VideoDecoder: cannot convert %s to float RGB", av_get_pix_fmt_name(sf));
+            return nullptr;
+        }
+        sws_scale(im.swsF, src->data, src->linesize, 0, src->height, im.f32Frame->data, im.f32Frame->linesize);
+        g = im.f32Frame;
+    }
+    if (im.oetf.empty()) {
+        im.oetf.resize(16384);
+        for (int i = 0; i < 16384; ++i) {
+            const double l = (double)i / 16383.0;
+            const double e = l <= 0.0031308 ? 12.92 * l : 1.055 * std::pow(l, 1.0 / 2.4) - 0.055;
+            im.oetf[(size_t)i] = (uint8_t)std::lround(std::clamp(e, 0.0, 1.0) * 255.0);
+        }
+    }
+    if (!im.f32Out || im.f32Out->width != w || im.f32Out->height != h) {
+        if (!im.f32Out) im.f32Out = av_frame_alloc();
+        av_frame_unref(im.f32Out);
+        im.f32Out->format = AV_PIX_FMT_YUV420P;
+        im.f32Out->width = w;
+        im.f32Out->height = h;
+        if (av_frame_get_buffer(im.f32Out, 32) < 0) return nullptr;
+    }
+    auto enc = [&](float v) -> float {
+        const int idx = (int)(std::clamp(v, 0.0f, 1.0f) * 16383.0f + 0.5f);
+        return (float)im.oetf[(size_t)idx] / 255.0f;
+    };
+    for (int y = 0; y < h; y += 2) {  // gbrp: plane 0 = G, 1 = B, 2 = R
+        for (int x = 0; x < w; x += 2) {
+            float cbSum = 0, crSum = 0;
+            for (int k = 0; k < 4; ++k) {
+                const int yy = y + (k >> 1), xx = x + (k & 1);
+                const float G = enc(((const float*)(g->data[0] + (size_t)yy * g->linesize[0]))[xx]);
+                const float B = enc(((const float*)(g->data[1] + (size_t)yy * g->linesize[1]))[xx]);
+                const float Rr = enc(((const float*)(g->data[2] + (size_t)yy * g->linesize[2]))[xx]);
+                const float Y = 0.2126f * Rr + 0.7152f * G + 0.0722f * B;
+                im.f32Out->data[0][(size_t)yy * im.f32Out->linesize[0] + xx] = (uint8_t)(16.0f + Y * 219.0f + 0.5f);
+                cbSum += (B - Y) / 1.8556f;
+                crSum += (Rr - Y) / 1.5748f;
+            }
+            im.f32Out->data[1][(size_t)(y / 2) * im.f32Out->linesize[1] + x / 2] =
+                (uint8_t)std::clamp(128.0f + cbSum * 0.25f * 224.0f + 0.5f, 16.0f, 240.0f);
+            im.f32Out->data[2][(size_t)(y / 2) * im.f32Out->linesize[2] + x / 2] =
+                (uint8_t)std::clamp(128.0f + crSum * 0.25f * 224.0f + 0.5f, 16.0f, 240.0f);
+        }
+    }
+    im.f32Out->color_range = AVCOL_RANGE_MPEG;
+    return im.f32Out;
+}
+
 bool VideoDecoder::Open(const std::string& path) {
     impl_ = std::make_unique<Impl>();
 
-    if (avformat_open_input(&impl_->fmt, path.c_str(), nullptr, nullptr) < 0) {
-        LOG_ERROR("VideoDecoder: cannot open '%s'", path.c_str());
+    // Pro: EXR / DPX / TIFF frames play as a sequence through FFmpeg's image2 demuxer -
+    // the numbered siblings of `path` become one clip at seqFps_.
+    std::string openPath = path;
+    AVDictionary* opts = nullptr;
+#if LIBAVFORMAT_VERSION_MAJOR >= 59
+    const AVInputFormat* ifmt = nullptr;
+#else
+    AVInputFormat* ifmt = nullptr;
+#endif
+    imageseq::Info seq;
+    isSequence_ = false;
+    if (proFormats_ && imageseq::IsSequenceExtension(path)) {
+        ifmt = av_find_input_format("image2");
+        char fr[32];
+        std::snprintf(fr, sizeof(fr), "%g", seqFps_);
+        av_dict_set(&opts, "framerate", fr, 0);
+        if (imageseq::Detect(path, seq) && seq.count > 1) {
+            openPath = seq.pattern;
+            av_dict_set_int(&opts, "start_number", seq.first, 0);
+            isSequence_ = true;
+            if (seq.count != seq.last - seq.first + 1)
+                LOG_WARN("VideoDecoder: sequence %s has gaps (%d frames in %d..%d): it plays to the first gap",
+                         seq.pattern.c_str(), seq.count, seq.first, seq.last);
+            LOG_INFO("VideoDecoder: sequence %s frames %d..%d at %g fps", seq.pattern.c_str(), seq.first, seq.last,
+                     seqFps_);
+        } else {
+            av_dict_set(&opts, "pattern_type", "none", 0);  // one still, no number
+        }
+    }
+    const int openRc = avformat_open_input(&impl_->fmt, openPath.c_str(), ifmt, &opts);
+    av_dict_free(&opts);
+    if (openRc < 0) {
+        LOG_ERROR("VideoDecoder: cannot open '%s'", openPath.c_str());
         impl_.reset();
         return false;
     }
@@ -402,6 +519,10 @@ bool VideoDecoder::Open(const std::string& path) {
     durationSec_ = (impl_->fmt->duration > 0)
                        ? (double)impl_->fmt->duration / (double)AV_TIME_BASE
                        : 0.0;
+    if (isSequence_) {
+        frameRate_ = seqFps_;
+        if (durationSec_ <= 0.0) durationSec_ = (double)seq.count / seqFps_;
+    }
     positionSec_.store(0.0);
     seekRequest_.store(-1.0);
     ended_.store(false);
@@ -660,7 +781,47 @@ void VideoDecoder::DecodeLoop() {
         const AVPixelFormat sf = (AVPixelFormat)src->format;
         AVFrame* yuv = src;
         PixFormat outFmt;
-        if (sf == AV_PIX_FMT_YUV420P || sf == AV_PIX_FMT_YUVJ420P) {
+        const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(sf);
+        if (proFormats_ && desc && (desc->flags & AV_PIX_FMT_FLAG_FLOAT)) {
+            // Pro: scene-linear float (OpenEXR) -> the sRGB transfer, BT.709 limited 4:2:0.
+            yuv = FloatToI420(src);
+            if (!yuv) return -2.0;
+            outFmt = PixFormat::I420;
+        } else if (proFormats_ && (sf == AV_PIX_FMT_P010LE || sf == AV_PIX_FMT_P016LE)) {
+            outFmt = PixFormat::P016;  // Pro: 10-bit hardware decode kept at 16 bits
+        } else if (proFormats_ && desc && desc->comp[0].depth > 8) {
+            // Pro: 10/12-bit YUV (ProRes, DNxHR HQX, HEVC 10) and RGB (DPX, 16-bit TIFF) ->
+            // P016, so the grade works at full precision. RGB uses BT.709 into limited range.
+            if (!impl_->convFrame) impl_->convFrame = av_frame_alloc();
+            if (!impl_->sws || impl_->swsW != src->width || impl_->swsH != src->height ||
+                impl_->swsFmt != sf + 100000) {
+                if (impl_->sws) sws_freeContext(impl_->sws);
+                impl_->sws = sws_getContext(src->width, src->height, sf, src->width, src->height,
+                                            AV_PIX_FMT_P016LE, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+                if (impl_->sws && (desc->flags & AV_PIX_FMT_FLAG_RGB)) {
+                    const int* bt709 = sws_getCoefficients(SWS_CS_ITU709);
+                    sws_setColorspaceDetails(impl_->sws, bt709, 1, bt709, 0, 0, 1 << 16, 1 << 16);
+                }
+                impl_->swsW = src->width;
+                impl_->swsH = src->height;
+                impl_->swsFmt = sf + 100000;  // distinct from the I420 fallback's cache key
+                av_frame_unref(impl_->convFrame);
+                impl_->convFrame->format = AV_PIX_FMT_P016LE;
+                impl_->convFrame->width = src->width;
+                impl_->convFrame->height = src->height;
+                if (!impl_->sws || av_frame_get_buffer(impl_->convFrame, 32) < 0) {
+                    if (impl_->sws) sws_freeContext(impl_->sws);
+                    impl_->sws = nullptr;
+                    impl_->swsFmt = -1;
+                    LOG_ERROR("VideoDecoder: cannot convert %s to 16-bit", av_get_pix_fmt_name(sf));
+                    return -2.0;
+                }
+            }
+            sws_scale(impl_->sws, src->data, src->linesize, 0, src->height, impl_->convFrame->data,
+                      impl_->convFrame->linesize);
+            yuv = impl_->convFrame;
+            outFmt = PixFormat::P016;
+        } else if (sf == AV_PIX_FMT_YUV420P || sf == AV_PIX_FMT_YUVJ420P) {
             outFmt = PixFormat::I420;
         } else if (sf == AV_PIX_FMT_NV12) {
             outFmt = PixFormat::NV12;
@@ -693,10 +854,16 @@ void VideoDecoder::DecodeLoop() {
         dst.width = yuv->width;
         dst.height = yuv->height;
         dst.format = outFmt;
-        dst.fullRange = (src->color_range == AVCOL_RANGE_JPEG) || sf == AV_PIX_FMT_YUVJ420P;
+        // Pro's float / RGB conversions produce limited range; a YUV source keeps its own.
+        const bool convertedToLimited =
+            proFormats_ && desc && (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_FLOAT)) && outFmt != PixFormat::NV12;
+        dst.fullRange = !convertedToLimited && ((src->color_range == AVCOL_RANGE_JPEG) || sf == AV_PIX_FMT_YUVJ420P);
         const int cw = (yuv->width + 1) / 2, ch = (yuv->height + 1) / 2;
         copyPlane(dst.plane[0], yuv->data[0], yuv->linesize[0], yuv->width, yuv->height);
-        if (outFmt == PixFormat::I420) {
+        if (outFmt == PixFormat::P016) {
+            copyPlane(dst.plane[0], yuv->data[0], yuv->linesize[0], yuv->width * 2, yuv->height);
+            copyPlane(dst.plane[1], yuv->data[1], yuv->linesize[1], cw * 4, ch);
+        } else if (outFmt == PixFormat::I420) {
             copyPlane(dst.plane[1], yuv->data[1], yuv->linesize[1], cw, ch);
             copyPlane(dst.plane[2], yuv->data[2], yuv->linesize[2], cw, ch);
         } else {  // NV12: a single interleaved chroma plane, cw*2 bytes per row
@@ -795,6 +962,37 @@ void VideoDecoder::DecodeLoop() {
 
         int r = av_read_frame(impl_->fmt, pkt);
         if (r < 0) {
+            // Drain the decoder first: a frame-threaded decoder holds several frames, so
+            // without this a clip shorter than its thread count showed nothing at all and
+            // every clip lost its last few frames. Wall-clock paced.
+            avcodec_send_packet(impl_->codec, nullptr);
+            while (!stop_.load() && seekRequest_.load() < 0.0 &&
+                   avcodec_receive_frame(impl_->codec, frame) == 0) {
+                const double ptsSec = fillFrame(frame);
+                if (ptsSec <= -2.0) continue;
+                if (ptsSec >= 0.0) {
+                    positionSec_.store(ptsSec);
+                    if (firstPtsSec < 0.0) { firstPtsSec = ptsSec; wallStart = clock::now(); }
+                    // Wait for the frame's time in short steps: a stop or seek cuts it short,
+                    // and a pause holds it (moving the wall clock on, as the main loop does).
+                    const auto due = std::chrono::duration_cast<clock::duration>(
+                        std::chrono::duration<double>(ptsSec - firstPtsSec));
+                    while (!stop_.load() && seekRequest_.load() < 0.0) {
+                        if (paused_.load()) {
+                            const auto pauseBegin = clock::now();
+                            while (paused_.load() && seekRequest_.load() < 0.0 && !stop_.load())
+                                std::this_thread::sleep_for(std::chrono::milliseconds(8));
+                            wallStart += clock::now() - pauseBegin;
+                            continue;
+                        }
+                        const auto left = wallStart + due - clock::now();
+                        if (left <= clock::duration::zero()) break;
+                        std::this_thread::sleep_for(std::min<clock::duration>(left, std::chrono::milliseconds(8)));
+                    }
+                }
+                ring_.Publish();
+            }
+            avcodec_flush_buffers(impl_->codec);  // reusable after the drain (loop / seek)
             if (loopEnabled_.load()) {
                 // EOF (or error) -> loop back to the start.
                 av_seek_frame(impl_->fmt, impl_->videoStream, 0, AVSEEK_FLAG_BACKWARD);
