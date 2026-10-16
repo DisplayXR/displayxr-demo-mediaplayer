@@ -594,6 +594,29 @@ if(MP_BUILD_TESTS)
     target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME rig_check COMMAND rig_check_test)
 
+    # The decoder drains at EOF (short clips, last frames): writes a 5-frame ProRes clip.
+    if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
+        add_executable(short_clip_test tests/short_clip_test.cpp src/media/VideoDecoder.cpp src/Log.cpp)
+        target_include_directories(short_clip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(short_clip_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
+        if(TARGET PkgConfig::FFMPEG)
+            target_link_libraries(short_clip_test PRIVATE PkgConfig::FFMPEG)
+        else()
+            target_link_libraries(short_clip_test PRIVATE mp_ffmpeg)
+        endif()
+        if(WIN32)
+            target_link_libraries(short_clip_test PRIVATE d3d11 dxgi d3dcompiler)
+        endif()
+        add_test(NAME short_clip COMMAND short_clip_test)
+    endif()
+
+    # The Resolve marker script (tools/resolve) against a fake timeline; needs Python 3.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME resolve_markers
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/resolve_markers_test.py)
+    endif()
+
     add_executable(color_test
         tests/color_test.cpp
         src/color/CubeLut.cpp

@@ -795,6 +795,23 @@ void VideoDecoder::DecodeLoop() {
 
         int r = av_read_frame(impl_->fmt, pkt);
         if (r < 0) {
+            // Drain the decoder first: a frame-threaded decoder holds several frames, so
+            // without this a clip shorter than its thread count showed nothing at all and
+            // every clip lost its last few frames. Wall-clock paced.
+            avcodec_send_packet(impl_->codec, nullptr);
+            while (!stop_.load() && seekRequest_.load() < 0.0 &&
+                   avcodec_receive_frame(impl_->codec, frame) == 0) {
+                const double ptsSec = fillFrame(frame);
+                if (ptsSec <= -2.0) continue;
+                if (ptsSec >= 0.0) {
+                    positionSec_.store(ptsSec);
+                    if (firstPtsSec < 0.0) { firstPtsSec = ptsSec; wallStart = clock::now(); }
+                    std::this_thread::sleep_until(wallStart + std::chrono::duration_cast<clock::duration>(
+                                                                  std::chrono::duration<double>(ptsSec - firstPtsSec)));
+                }
+                ring_.Publish();
+            }
+            avcodec_flush_buffers(impl_->codec);  // reusable after the drain (loop / seek)
             if (loopEnabled_.load()) {
                 // EOF (or error) -> loop back to the start.
                 av_seek_frame(impl_->fmt, impl_->videoStream, 0, AVSEEK_FLAG_BACKWARD);
