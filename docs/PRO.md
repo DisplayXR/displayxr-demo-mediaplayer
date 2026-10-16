@@ -10,10 +10,11 @@ panel, and to use the panel as the 3D monitor for footage reviewed in DaVinci Re
 | | Media Player | Media Player Pro |
 |---|---|---|
 | Binary | `mediaplayer_handle_vk_<plat>` | `mediaplayer_pro_handle_vk_<plat>` |
-| Build | always | `MP_BUILD_PRO` (ON by default on Windows, OFF elsewhere) |
+| Build | always | `MP_BUILD_PRO` (ON by default on Windows, OFF elsewhere; `scripts/build_macos.sh --pro`) |
 | Compile flag | `MEDIAPLAYER_PRO=0` | `MEDIAPLAYER_PRO=1` + `src/pro/` |
-| Installer | `DisplayXRMediaPlayerSetup-X.Y.Z.exe` | `DisplayXRMediaPlayerProSetup-X.Y.Z.exe` |
-| Install dir | `Program Files\DisplayXR\Demos\MediaPlayer` | `Program Files\DisplayXR\Apps\MediaPlayerPro` |
+| Installer | `DisplayXRMediaPlayerSetup-X.Y.Z.exe`, `DisplayXRMediaPlayer-X.Y.Z.pkg` | `DisplayXRMediaPlayerProSetup-X.Y.Z.exe`, `DisplayXRMediaPlayerPro-X.Y.Z.pkg` |
+| Install dir | `Program Files\DisplayXR\Demos\MediaPlayer`, `/Applications/Stereo Media Player.app` | `Program Files\DisplayXR\Apps\MediaPlayerPro`, `/Applications/Media Player Pro.app` |
+| macOS bundle / pkg id | `com.displayxr.mediaplayer` | `com.displayxr.mediaplayer.pro` (installs alongside) |
 | Release tag | `vX.Y.Z` | `pro-vX.Y.Z` |
 | In the DisplayXR bundle / `versions.json` | yes | **no** |
 
@@ -57,18 +58,19 @@ streams, auto-convergence, MCP tools. Plus:
 | ASC CDL | `.cc` / `.ccc` / `.cdl` (slope, offset, power, saturation; editable in the inspector), from the inspector, a drop, `--cdl <file>` or `MEDIAPLAYER_CDL`. |
 | Exposure | ±4 stops in linear light. Right-click the slider to reset. |
 | Grade bypass | `G` |
-| Full screen | `F` / `F11` / double-click the picture. Escape leaves full screen and never quits. Full screen unpins the panels so only the picture and the timecode show; leaving restores the pin. |
+| Full screen | `F` / `F11` / double-click the picture (macOS binds `F11` to Show Desktop, so use `F` or the double-click there). Escape leaves full screen and never quits. Full screen unpins the panels so only the picture and the timecode show; leaving restores the pin. |
 | Live inputs | `src/pro/Station`: named inputs, `J` or the inspector's **Inputs** switches. `--input="Rig=decklink:0+1,sdi"`, `--input="Resolve=decklink:2,sbs"`, `--input="Witness=camera:Integrated"`, `--input="Test=test:1920x1080@24"`, `url:<u>`; shorthands `--decklink[=<dev>]` `--decklink-right=` `--decklink-input=sdi\|hdmi` `--decklink-stereo=auto\|mono\|sbs\|dual\|pair` `--decklink-mode=Hp25`, `--test-signal[=WxH@fps]`; `--decklink-list` prints the cards. |
 | DeckLink setup dialog | *DeckLink setup...* in the Station panel: left / right device (right = "none" for one cable), connection (SDI / HDMI / as set in Desktop Video), stereo packing (auto / side by side / dual-stream 3D / mono), start format; *Open* adds or replaces the "DeckLink" input and switches to it. Says plainly when the build has no SDK or no card / driver is present. |
-| DeckLink input | `src/pro/DeckLinkSource`: one cable (mono / SBS), the card's dual-stream 3D mode (switches automatically when the card detects it), or two inputs paired by SMPTE timecode (`TimecodePairer`); without timecode, by the card's hardware reference clock (frames under half a frame apart pair exactly - from PR #108). The Station panel shows the eye skew on that clock (ms, last and max) and the unpaired-frame count. Unavailable reasons are specific: no SDK in the build, Desktop Video driver not installed, no card found. A set but wrong `MP_DECKLINK_SDK_DIR` stops CMake. Format detection follows the signal. Captures 10-bit v210 and keeps 16 bits (P016) into the grade. Publishes into the same live path as the camera (`LiveProducer` / `App::EnterLive`). |
-| Test rig | `src/pro/TestSignalSource`: synthetic stereo with known disparities and timecode, or a real side-by-side photo panned slowly (`--test-signal=image=<file>`); faults `MEDIAPLAYER_TEST_VSHIFT` (px), `_EYE_DELAY` (frames), `_GAIN_R`, `_DEPTH`. Exercises everything below without hardware. |
+| DeckLink input | `src/pro/DeckLinkSource`: one cable (mono / SBS), the card's dual-stream 3D mode (switches automatically when the card detects it), or two inputs paired by SMPTE timecode (`TimecodePairer`; above 30 fps RP188 counts frame pairs and the field mark tells them apart, `TimecodeKey()`). Without timecode, two inputs **on one card** pair by the card's hardware clock at its exact frame duration (`HwClockKey()`, genlocked inputs under half a frame apart pair exactly); two inputs on **separate cards** have two clocks and pair newest-to-newest with the offset reported, so jam-sync both. The Station panel shows the eye skew (ms, last and max), the unpaired-frame count and which pairing is in use. A dark input (no cable, or a dual-stream signal with no right eye) is reported per eye and the picture goes NO SIGNAL rather than fusing a stale eye. Unavailable reasons are specific: no SDK in the build, Desktop Video not installed, Desktop Video older than the SDK this build used (14.3+ reads frames through `IDeckLinkVideoBuffer`), no input found; the same device for both eyes is refused. A set but wrong `MP_DECKLINK_SDK_DIR` stops CMake. Format detection follows the signal (interlaced input is warned about: feed PsF or progressive). Captures 10-bit v210 and keeps 16 bits (P016) into the grade. Publishes into the same live path as the camera (`LiveProducer` / `App::EnterLive`). **Windows, macOS and Linux**: the same source file over the SDK's three COM skins (`dl` shim); macOS and Linux use the SDK's `Mac/include` / `Linux/include` headers and `DeckLinkAPIDispatch.cpp`, which loads the installed DeckLinkAPI framework / `libDeckLinkAPI.so` at run time. |
+| Test rig | `src/pro/TestSignalSource`: synthetic stereo with known disparities and timecode, or a real side-by-side photo panned slowly (`--test-signal=image=<file>`); faults `MEDIAPLAYER_TEST_VSHIFT` (px), `_EYE_DELAY` (frames), `_GAIN_R`, `_DEPTH`, `_ROLL` (degrees, right eye rotated; + = its right side lower). Exercises everything below without hardware. |
 | Timecode + delay | Source timecode and measured capture → screen delay (the card's or camera's arrival → the panel frame it is shown in; the camera's and panel's own delays come on top). In the inspector's Source section; `T` toggles. |
-| Rig checks | `src/pro/RigCheck`: vertical error (sub-pixel 2D block matching, full-res px) + roll, eye sync (frames between the paired inputs' timecodes), colour match (CIE76 ΔE between the eyes), depth range (2nd / 98th percentile parallax, % of eye width, negative = in front) against `--depth-budget=-2,1`; `--vertical-limit=1` `--colour-limit=2`. Overruns ≥ 0.5 s become alerts with timecode, also appended to `Pictures/DisplayXR/station_alerts.jsonl`. 60-second history strip (depth band vs budget, vertical error); `R` toggles. |
+| Rig checks | `src/pro/RigCheck`: vertical error (sub-pixel 2D block matching, full-res px) + roll (in displayed px, so half-SBS is not doubled), eye sync, colour match (CIE76 ΔE between the eyes), depth range (2nd / 98th percentile parallax, % of eye width, negative = in front) against `--depth-budget=-2,1`; `--vertical-limit=1` `--colour-limit=2`. Everything is measured on the eyes **as shown**: the `X` swap (and an R\|L container) is applied first, so near / far and the vertical sign stay right. Needs ≥ 20 matches after a median ± MAD outlier cut, else "Measuring...". Eye sync is **measured from the pixels** (a burst of 4 consecutive frames, each eye against the other's last 3; needs motion; says which eye is late) and shown in preference to the source's timecode figure, which stays as "timecode says N" / `(TC)`; `get_rig_status` returns both (`eye_sync_measured_frames`, `eye_sync_late_eye`, `eye_sync_frames`). Overruns ≥ 0.5 s become alerts with timecode, also appended to `Pictures/DisplayXR/station_alerts.jsonl` (with `end_timecode`); an open alert closes at the last good sample after 2 s with nothing measurable (a cut to black, a lost signal). 60-second history strip (depth band vs budget, vertical error); `R` toggles. |
 | Snapshots | `N` or the inspector: both eyes as shown (graded) via the runtime's atlas capture, plus `<name>_note.json` (note, timecode, rig numbers, budget); notes are editable in the inspector. |
 | Depth overlay | `D`: the rig check's matches drawn on the picture, coloured by parallax (warm in front, white on the screen, blue behind), ringed red outside the budget; follows pan / zoom. |
-| Review formats | MXF; EXR / DPX / TIFF **sequences** (open any frame; `--seq-fps=24`); EXR's scene-linear float encoded for display; 10/12-bit sources (ProRes, DNxHR HQX, HEVC 10, DPX, 16-bit TIFF) kept at 16 bits (P016) into the grade. Trunk code, switched on only by Pro (`VideoDecoder::SetProFormats` / `MediaSource::SetProFormats`). |
+| Review formats | MXF; EXR / DPX / TIFF **sequences** (open any frame; `--seq-fps=24`); EXR's scene-linear float encoded for display (sRGB transfer, BT.709 limited, **16-bit P016**, row-parallel; values above 1.0 clip - for HDR / wide-gamut EXR use an OpenColorIO view, below); 10/12-bit sources (ProRes, DNxHR HQX, HEVC 10, DPX, 16-bit TIFF) kept at 16 bits (P016) into the grade. Trunk code, switched on only by Pro (`VideoDecoder::SetProFormats` / `MediaSource::SetProFormats`). |
+| YUV matrix + transfer | Each frame carries a colour tag (`FrameRing::Frame::matrix` / `transfer`). Matrix: BT.709, BT.601 or BT.2020 non-constant-luminance, from the stream's `colorspace` (unspecified: BT.601 at 576 lines and below, else BT.709); live inputs tag BT.601 for SD (`livepix` sets `Nv12/P016::matrix`, a source may overwrite it from the card's colorimetry). The MP_GRADE shader picks the matrix from the push block (`yuvMatrix`, 0 = BT.709, so BT.709 content is unchanged; Android's shader is untouched). Transfer (SDR / HLG / PQ) is a **tag only**: HLG and PQ are shown without tone mapping. 8/10-bit level maths unchanged. |
 | A/B compare | `B` swaps to the other clip at the same position (`--compare=<file>` or `set_compare`). |
-| OpenColorIO | Optional (`-DMP_OCIO_ROOT=<OCIO 2.x install>`, e.g. Open RV's `_build/RV_DEPS_OCIO/install`, plus `MP_OCIO_DLL_DIR` for its DLLs): `--ocio=<config\|ocio://default> --ocio-src=<space>` and `--ocio-display= --ocio-view=` or `--ocio-dst=`, `--ocio-looks=`; baked to a 65³ LUT in the grade's LUT slot. |
+| OpenColorIO | Optional (`-DMP_OCIO_ROOT=<OCIO 2.x install>`, e.g. Open RV's `_build/RV_DEPS_OCIO/install`, plus `MP_OCIO_DLL_DIR` for its DLLs on Windows; on macOS the Homebrew keg, `$(brew --prefix opencolorio)`, which `build_macos.sh --ocio` installs and passes; the macOS CI build and `.pkg` include it): `--ocio=<config\|ocio://default> --ocio-src=<space>` and `--ocio-display= --ocio-view=` or `--ocio-dst=`, `--ocio-looks=`; baked to a 65³ LUT in the grade's LUT slot. |
 | Agent tools | `set_grade`, `get_grade`, `set_view`, `set_depth_overlay`, `get_rig_status`, `set_depth_budget`, `snapshot`, `list_inputs`, `select_input`, `open_decklink`, `set_ocio`, `describe_ocio`, `set_compare` (next to the player's own). |
 | Resolve markers | `tools/resolve/DisplayXR_Station_Markers.py` (Resolve: Workspace > Scripts): snapshot notes → blue markers, rig alerts → red markers at their timecodes on the current timeline. |
 
@@ -109,10 +111,38 @@ build\mediaplayer_pro_handle_vk_win.exe --camera="SpatialLabs Eyes" --lut show.c
 set VERSION=0.1.0 && installer\build-installer.bat pro
 ```
 
-CI (`build-windows.yml`) builds and validates both apps and both installers on every PR.
-A `pro-vX.Y.Z` tag publishes only the Pro installer, on a release named
-"Media Player Pro X.Y.Z" that is never marked latest and never dispatches the
-`versions.json` bump. Android's version stamps match `v[0-9]*` only, so `pro-v*` tags
+macOS (Apple Silicon; Homebrew `cmake ninja ffmpeg pkg-config vulkan-headers vulkan-loader
+molten-vk`; the script builds the OpenXR loader):
+
+```bash
+./scripts/build_macos.sh --pro --ocio                 # build/: both apps, Pro with OpenColorIO
+DISPLAYXR_VERSION=1.14.2 MP_PRO_VERSION=0.1.0 \
+    ./scripts/build_macos.sh --pro --ocio --installer  # + _package/DisplayXRMediaPlayer-1.14.2.pkg
+                                                      #   + _package/DisplayXRMediaPlayerPro-0.1.0.pkg
+MP_BUILD_DIR=build-pro ./scripts/build_macos.sh --pro # another build dir
+# the Pro .pkg alone, from an existing binary:
+MP_PRODUCT=pro DISPLAYXR_VERSION=0.1.0 installer/macos/build_installer.sh build/mediaplayer_pro_handle_vk_macos
+```
+
+`--ocio` runs `brew install opencolorio` when it is missing and configures
+`-DMP_OCIO_ROOT=$(brew --prefix opencolorio)`. The bundler copies OpenColorIO and its
+dylibs (Imath, yaml-cpp, pystring, minizip-ng, zlib-ng) into
+`Media Player Pro.app/Contents/Resources/lib` and relinks them to `@rpath`, like FFmpeg.
+The Pro app (`installer/macos/create_app_bundle.sh` with `MP_PRODUCT=pro`) is
+`Media Player Pro.app`, bundle id and package id `com.displayxr.mediaplayer.pro`
+(`installer/macos/pro/Distribution.xml`), so it installs next to the Stereo Media Player
+instead of over it. Its launcher opens no sample image (Pro starts on the idle screen).
+Run a dev build with
+`XR_RUNTIME_JSON=<runtime>/build/openxr_displayxr-dev.json build/mediaplayer_pro_handle_vk_macos`.
+
+CI (`build-windows.yml`, `build-macos.yml`) builds and validates both apps and both
+installers on every PR and runs the unit tests on both (Windows skips `decode_formats`,
+whose fixtures need FFmpeg encoders that the slim decode-only FFmpeg lacks). A
+`pro-vX.Y.Z` tag publishes only the Pro installers (the `.exe` from Windows, the `.pkg`
+from macOS) on one release named "Media Player Pro X.Y.Z" that is never marked latest and
+never dispatches the `versions.json` bump. Both jobs pass the same name / prerelease /
+`make_latest: false` to `softprops/action-gh-release`, so whichever finishes first creates
+the release and the other adds its asset. Android's version stamps match `v[0-9]*` only, so `pro-v*` tags
 cannot disturb them. `/dxr-release` does not know about Pro; tag it by hand
 (`git tag pro-v0.1.0 && git push origin pro-v0.1.0`) until it does.
 
@@ -151,6 +181,46 @@ over SDI); RP188 at 50/60p (frame/field counting) to confirm on a card. Kept for
 Convert to 3D (the trunk's Shift+L toggle, `XR_DXR_lift`) is inherited unchanged. The
 station, timecode and rig checks keep reading the SOURCE frames, never the converted
 pair.
+
+## DeckLink: first checks on a card
+
+None of the DeckLink code has run against a signal yet. The hardware-free half (v210 /
+UYVY unpack, the timecode and clock keys, the pairer) is unit-tested; everything below
+needs a card. Build with `-DMP_DECKLINK_SDK_DIR=<SDK>` on the box that has it, confirm the
+log line `DeckLink input (Pro): ON (SDK x.y)`, then:
+
+1. `--decklink-list` names the inputs; Desktop Video's version is at least the SDK's
+   (`UnavailableReason()` says so otherwise). A pulled cable shows NO SIGNAL within 2 s and
+   LIVE again on reconnect, without a restart.
+2. Single input: 1080p and 2160p, 8- and 10-bit, limited-range colours right, at every
+   rate 23.98 / 24 / 25 / 29.97 / 47.95 / 48 / 50 / 59.94 / 60; 2K and 4K DCI (2048 /
+   4096 wide); 3G Level A and Level B; PsF shown progressive, interlaced warned about.
+3. RP188 timecode reads right at 24p and 25p **and at 48p / 50p / 60p** (frame pairs +
+   field mark: the TC chip must advance every frame, never two frames per step); LTC vs
+   VITC1/2; drop-frame shows `;`.
+4. Two inputs on one card (8K Pro G2 in a 2- or 4-sub-device profile; Duo 2 / Quad 2),
+   genlocked: skew about 0 ms, unpaired not climbing, eye sync 0 frames. Unplug one eye:
+   NO SIGNAL, never a frozen eye next to a live one; replug: LIVE.
+5. Two inputs on two cards (two Mini Recorder 4K): with jam-synced timecode the pairing
+   is frame-accurate; without timecode the panel says so and reports the offset.
+6. Dual-stream 3D on one cable (a card that supports it; the Mini Recorder 4K does
+   **not**, and the 8K Pro's support is per mode: `bmdSupportedVideoModeDualStream3D`):
+   Auto switches to it, both eyes show, a signal that goes back to 2D leaves it.
+7. 4K60 two-input: frame rate held and no drops (conversion runs on the SDK callback
+   thread under one lock; if it drops, move the v210 unpack off that thread or onto the
+   GPU).
+8. RGB 4:4:4 and 12-bit, Rec.2020 / HLG / PQ from the VPID: shown with a warning (the
+   grade is BT.709 unless the colour tag says otherwise); audio and ancillary data are
+   ignored on purpose.
+9. Resolve Studio's stereo output modes (side by side, dual-stream) into the same card;
+   Desktop Video Setup / Media Express running at the same time (they claim the input).
+
+Card facts that shape the plan: the **Mini Recorder 4K** is one input (SDI *or* HDMI, no
+dual-stream 3D, 2160p30 max), so it covers the single-cable Resolve case only; two-cable
+stereo needs the **8K Pro G2** with its profile set to expose two or four sub-devices
+(`--decklink-list` shows one input in the 1-sub-device profile), or two cards with
+timecode. On macOS the usual box is an UltraStudio over Thunderbolt; Desktop Video's
+system extension must be approved once.
 
 Known limits: 8-bit to the panel (the runtime's atlas path); the panels are ImGui
 panels in the HUD layer, so they are woven with the picture rather than drawn as a crisp 2D
