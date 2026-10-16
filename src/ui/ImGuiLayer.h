@@ -93,7 +93,38 @@ public:
     // the runtime draws the depth cursor (XR_DXR_cursor_depth).
     void SetCursorLocked(bool locked);
 
+    // Small RGBA8 textures for ImGui::Image (Media Player Pro's input thumbnails). The
+    // pixels are display-referred bytes, like the rest of the UI. CreateTexture returns
+    // -1 on failure; UpdateTexture copies w*h*4 bytes and records the upload into the next
+    // RenderToHud (no submit of its own); TextureId is an ImTextureID, or nullptr until the
+    // first upload has been recorded. Main (render) thread only.
+    int CreateTexture(uint32_t w, uint32_t h);
+    void UpdateTexture(int id, const uint8_t* rgba);
+    void* TextureId(int id) const;
+
 private:
+    void RecordTextureUploads(VkCommandBuffer cmd);
+    void DestroyTextures();
+
+    // One user texture: the image ImGui samples + a ring of host-visible staging buffers
+    // (an upload never rewrites a buffer a frame still in flight is copying from).
+    static constexpr int kStagingRing = 4;
+    struct UserTexture {
+        uint32_t w = 0, h = 0;
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkBuffer staging[kStagingRing] = {};
+        VkDeviceMemory stagingMem[kStagingRing] = {};
+        void* mapped[kStagingRing] = {};
+        int next = 0;          // next staging buffer to fill
+        int pending = -1;      // staging buffer waiting to be recorded (-1 none)
+        bool initialized = false;  // image has been through one upload (layout defined)
+        void* descriptor = nullptr;  // VkDescriptorSet from ImGui_ImplVulkan_AddTexture
+    };
+    std::vector<UserTexture> textures_;
+    VkSampler textureSampler_ = VK_NULL_HANDLE;
+
     // Build the render pass / views / framebuffers over `hudImages`. Shared by Init()
     // and RecreateTarget(); tears down any previous target first.
     bool CreateTargetObjects(VkFormat hudFormat, uint32_t hudWidth, uint32_t hudHeight,

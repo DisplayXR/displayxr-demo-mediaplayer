@@ -459,6 +459,7 @@ function(mp_add_player tgt is_pro)
             src/pro/Station.cpp          # inputs, timecode / delay, rig UI, snapshots
             src/pro/ResolveLink.cpp      # the live Resolve panel: file protocol + follow
             src/pro/ProResolve.cpp       # the live Resolve panel: station side
+            src/pro/Thumbnail.cpp        # input-list thumbnails (left eye, CPU)
             src/pro/OcioBake.cpp)        # OpenColorIO -> the grade's LUT (MP_OCIO_ROOT)
         target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=1)
         if(MP_HAVE_OCIO)
@@ -632,6 +633,9 @@ if(MP_BUILD_TESTS)
     target_include_directories(resolve_link_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(resolve_link_test PRIVATE nlohmann_json::nlohmann_json)
     add_test(NAME resolve_link COMMAND resolve_link_test)
+    add_executable(thumbnail_test tests/thumbnail_test.cpp src/pro/Thumbnail.cpp)
+    target_include_directories(thumbnail_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME thumbnail COMMAND thumbnail_test)
     add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/LivePixels.cpp
         src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
     target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
