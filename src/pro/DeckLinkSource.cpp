@@ -372,26 +372,41 @@ bool ConvertEye(IDeckLinkVideoFrame* f, livepix::P016& dst, int x0) {
     return ok;
 }
 
-// The frame's timecode as text and as a pairing key (-1 when it has none). Above 30 fps
-// RP188 counts frame PAIRS and tells the two apart with the field mark, which the key
-// has to carry or every other pair of frames shares a key (TimecodeKey()).
+// The frame's timecode as text and as a frame count at the full frame rate (-1 when it
+// has none). A high-frame-rate timecode (HFRTC, counts every frame above 30 fps) is
+// preferred when the card has one; otherwise RP188 (VITC1 / VITC2 / LTC) or VITC, whose
+// frame pairs at 50/60p are unfolded with the field mark (TimecodeFrames).
 int ReadTimecode(IDeckLinkVideoInputFrame* f, int fpsInt, char* text, size_t n) {
     text[0] = 0;
     IDeckLinkTimecode* tc = nullptr;
-    if (FAILED(f->GetTimecode(bmdTimecodeRP188Any, &tc)) || !tc) {
+    TimecodeFields t;
+    if (SUCCEEDED(f->GetTimecode(bmdTimecodeRP188HighFrameRate, &tc)) && tc) {
+        t.highFrameRate = true;
+    } else {
         Release(tc);
-        if (FAILED(f->GetTimecode(bmdTimecodeVITC, &tc)) || !tc) {
+        tc = nullptr;
+        if (FAILED(f->GetTimecode(bmdTimecodeRP188Any, &tc)) || !tc) {
             Release(tc);
-            return -1;
+            tc = nullptr;
+            if (FAILED(f->GetTimecode(bmdTimecodeVITC, &tc)) || !tc) {
+                Release(tc);
+                return -1;
+            }
         }
     }
     unsigned char hh = 0, mm = 0, ss = 0, ff = 0;
     int key = -1;
     if (SUCCEEDED(tc->GetComponents(&hh, &mm, &ss, &ff))) {
         const BMDTimecodeFlags flags = tc->GetFlags();
-        const bool field = (flags & bmdTimecodeFieldMark) != 0;
-        std::snprintf(text, n, "%02u:%02u:%02u%c%02u", hh, mm, ss, (flags & bmdTimecodeIsDropFrame) ? ';' : ':', ff);
-        key = TimecodeKey(hh, mm, ss, ff, field, fpsInt);
+        t.hh = hh;
+        t.mm = mm;
+        t.ss = ss;
+        t.ff = ff;
+        t.fieldMark = (flags & bmdTimecodeFieldMark) != 0;
+        t.dropFrame = (flags & bmdTimecodeIsDropFrame) != 0;
+        // A source counting every frame without an HFRTC shows as ff past half the rate.
+        FormatTimecode(t, std::max(1, fpsInt), text, n);
+        key = TimecodeFrames(t, std::max(1, fpsInt));
     }
     tc->Release();
     return key;
