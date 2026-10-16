@@ -16,7 +16,9 @@
 
 namespace mp {
 
-enum class PixFormat { I420, NV12, RGBA };  // 3-plane, 2-plane, or packed RGBA (zero-copy #28)
+// P016: NV12 layout with 16-bit samples, MSB-aligned (P010 is the 10-bit case). Pro's
+// 10-bit capture (DeckLink v210) publishes it; the base player never does.
+enum class PixFormat { I420, NV12, RGBA, P016 };  // 3-plane, 2-plane, packed RGBA (zero-copy #28), 16-bit 2-plane
 
 class FrameRing {
 public:

@@ -586,7 +586,12 @@ bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, con
     int count;
     int mode;
     specs[0] = {plane0, width, height, VK_FORMAT_R8_UNORM, 1};
-    if (format == 1) {
+    if (format == 2) {  // P016 (Pro 10-bit capture): 16-bit planes, sampled as NV12
+        specs[0] = {plane0, width, height, VK_FORMAT_R16_UNORM, 2};
+        specs[1] = {plane1, cw, ch, VK_FORMAT_R16G16_UNORM, 4};
+        count = 2;
+        mode = 2;
+    } else if (format == 1) {
         specs[1] = {plane1, cw, ch, VK_FORMAT_R8G8_UNORM, 2};
         count = 2;
         mode = 2;
@@ -609,6 +614,7 @@ bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, con
 
     sourceMode_ = mode;
     sourceFullRange_ = fullRange ? 1.0f : 0.0f;
+    source16_ = (format == 2);
     // Descriptor sets are written per frame (DrawViews), so nothing to rebind here.
     if (rec[0]) LOG_INFO("VulkanRenderer: YUV source %ux%u mode=%d", width, height, mode);
     return true;
@@ -828,6 +834,7 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         pc.lutDomain[0] = lut_.domainMin;
         pc.lutDomain[1] = 1.0f / std::max(1e-6f, lut_.domainMax - lut_.domainMin);
         pc.lutDomain[2] = (float)std::max(1u, lut_.size);
+        pc.lutDomain[3] = source16_ ? 1.0f : 0.0f;  // MP_GRADE: 10-bit levels for P016
         vkCmdPushConstants(cmd, activeLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 3, 1, 0, 0);
