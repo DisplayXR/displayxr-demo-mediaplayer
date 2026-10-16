@@ -202,6 +202,9 @@ bool App::Initialize(const char* mediaPath) {
         // xrCreateSession). A no-op elsewhere, where Create() already made it.
         window_.RealizeOnPanel(left, top, panelW, panelH);
     };
+#if MEDIAPLAYER_PRO
+    xr_.RequestLocal2D(true);  // pinned Pro panels show flat (HudSubmit::flat)
+#endif
     if (!xr_.Initialize(window_.NativeHandle(), placeOnPanel)) {
         LOG_ERROR("OpenXR initialization failed");
         return false;
@@ -881,6 +884,20 @@ void App::RenderOneFrame() {
                 window_.PointSize(pw, phh);
                 imgui_.BeginFrame((float)pw, (float)phh, hud.x, hud.y, hud.width, hud.height);
                 BuildTransportUI();
+#if MEDIAPLAYER_PRO
+                // Pinned panels go out flat as well (Local2D layers over the same HUD image).
+                for (const pro::ProController::FlatRect& r : pro_.FlatRects()) {
+                    if (hud.flatCount >= XrSession::HudSubmit::kMaxFlat) break;
+                    XrSession::HudSubmit::Rect& o = hud.flat[hud.flatCount++];
+                    o.x = (int32_t)std::floor(r.x);
+                    o.y = (int32_t)std::floor(r.y);
+                    o.w = (int32_t)std::ceil(r.x + r.w) - o.x;
+                    o.h = (int32_t)std::ceil(r.y + r.h) - o.y;
+                }
+                hud.windowPxW = cw;
+                hud.windowPxH = ch;
+                pro_.ClearFlatRects();
+#endif
                 imgui_.RenderToHud(hudIdx, renderer_.FrameCmd());  // joins the frame's command buffer
                 // Desktop Linux: the pointer shape ImGui wants (I-beam over the URL
                 // field, ...). The SDL backend does this itself elsewhere.
@@ -2880,9 +2897,14 @@ void App::InitPro() {
         video_.Seek(s);
         if (paused && !video_.Paused()) TogglePlayback();
     };
+    h.mediaStart = [this] { return isVideo_ ? video_.StartSeconds() : 0.0; };
+    h.setMediaPaused = [this](bool paused) {
+        if (isVideo_ && video_.Paused() != paused) TogglePlayback();
+    };
     h.isFullscreen = [this] { return window_.IsFullscreen(); };
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
     pro_.Init(&renderer_, window_.SdlWindow(), std::move(h));
+    pro_.SetFlatPanelsAvailable(xr_.HasLocal2D());
 
     // Pro input rides the same SDL event hook as ImGui, after ImGui has seen the event.
     const bool imguiOk = imgui_.Ready();
@@ -2934,6 +2956,19 @@ void App::InitPro() {
     };
     sh.toast = [this](const std::string& t) { ShowToast(t); };
     sh.displayPeriodMs = [this] { return fps_ > 1.0f ? 1000.0 / fps_ : 1000.0 / 60.0; };
+    // Input-list thumbnails: one small ImGui texture per input slot, created on first use.
+    auto thumbIds = std::make_shared<std::vector<int>>(pro::Station::kMaxThumbs, -1);
+    sh.thumbTexture = [this, thumbIds](int slot, const uint8_t* rgba) -> void* {
+        if (slot < 0 || slot >= (int)thumbIds->size() || !imgui_.Ready()) return nullptr;
+        int& id = (*thumbIds)[slot];  // -1 not made yet, -2 creation failed (never retried)
+        if (id == -1 && rgba) {
+            id = imgui_.CreateTexture(pro::Station::kThumbW, pro::Station::kThumbH);
+            if (id < 0) id = -2;
+        }
+        if (id < 0) return nullptr;
+        if (rgba) imgui_.UpdateTexture(id, rgba);
+        return imgui_.TextureId(id);
+    };
     pro::StationOptions so;
     so.inputs = launch_.proInputs;
     so.budget.nearPct = launch_.proBudget[0];

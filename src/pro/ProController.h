@@ -19,12 +19,14 @@
 #include "color/Cdl.h"
 #include "color/CubeLut.h"
 #include "pro/OcioBake.h"
+#include "pro/ResolveLink.h"
 #include "pro/Station.h"
 #include "rhi/VulkanRenderer.h"
 
 #include <functional>
 #include <mutex>
 #include <string>
+#include <vector>
 
 struct SDL_Window;
 
@@ -73,6 +75,8 @@ struct Host {
     std::function<double()> mediaPosition;
     std::function<bool()> mediaPaused;
     std::function<void(double seconds, bool paused)> seekMedia;
+    std::function<void(bool paused)> setMediaPaused;
+    std::function<double()> mediaStart;  // the file's first timestamp (Position/Seek are in it)
     std::function<bool()> isFullscreen;
     std::function<void()> toggleFullscreen;
 };
@@ -116,6 +120,17 @@ public:
     // inspector ignores it and stays up.
     void BuildUI(const Status& st, float uiAlpha);
 
+    // Pinned panels are shown FLAT (crisp 2D, not woven with the picture): their HUD rects
+    // from the last BuildUI, in HUD pixels; App hands them to XrSession::HudSubmit::flat.
+    // Empty while the panels are unpinned (fading panels stay woven, so the picture is
+    // never cut by a half-transparent card) or MEDIAPLAYER_PRO_PANELS_3D=1.
+    struct FlatRect { float x, y, w, h; };
+    const std::vector<FlatRect>& FlatRects() const { return flatRects_; }
+    // App takes the rects once per frame: a frame that skips BuildUI (Shift+Tab hid the
+    // UI while pinned) must not resubmit last frame's cards over a HUD with no panels.
+    void ClearFlatRects() { flatRects_.clear(); }
+    void SetFlatPanelsAvailable(bool on) { flatAvailable_ = on; }
+
     // True while Pro wants the HUD kept alive (pinned inspector).
     bool KeepHudAwake() const { return inspectorPinned_ || depthOverlay_; }
 
@@ -141,6 +156,9 @@ private:
     void SetZoom(float z);
     void ClampPan();
     void OpenLookDialog(bool cdl);
+    // The live Resolve panel (ProResolve.cpp): status out, playhead + commands in, follow.
+    void TickResolve(const Status& st);
+    void BuildResolveLines();
     static void DialogCallback(void* userdata, const char* const* filelist, int filter);
 
     VulkanRenderer* renderer_ = nullptr;
@@ -171,6 +189,11 @@ private:
     bool pendingDialogIsCdl_ = false;
 
     bool inspectorPinned_ = false;  // Tab / the Pin box: panels stay up; unpinned they follow the UI fade
+    std::vector<FlatRect> flatRects_;
+    bool flatAvailable_ = false;    // the runtime takes Local2D layers (XR_DXR_local_3d_zone)
+    bool flatPanels_ = true;        // MEDIAPLAYER_PRO_PANELS_3D=1 keeps pinned panels woven
+    bool FlatNow() const { return flatAvailable_ && flatPanels_ && inspectorPinned_; }
+    void AddFlatRectOfCurrentWindow();
     Station station_;
     bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture
     std::string compare_[2];       // A (what was open) and B
@@ -181,6 +204,18 @@ private:
     bool wasFullscreen_ = false;   // full screen hides everything but the picture
     bool pinnedBeforeFullscreen_ = true;
     int ticks_ = 0, testCompareFrame_ = -1;  // MEDIAPLAYER_PRO_COMPARE_FRAME (screenshots)
+
+    // Live Resolve panel (ProResolve.cpp).
+    resolve::Follower follower_;
+    resolve::LinkSample link_;
+    bool followResolve_ = true;     // the inspector's "Follow Resolve" box
+    double nextStatusSec_ = 0.0, nextLinkPollSec_ = 0.0;
+    long long statusSeq_ = 0;
+    long long linkFileStamp_ = -1;  // last_write_time of resolve_link.json last read
+    long long commandsOffset_ = -1; // bytes of resolve_commands.jsonl already handled (-1 = skip history)
+    long long lastCommandId_ = 0;
+    std::string stationDir_;        // resolved once (the lookup walks the folder)
+    void TickResolveImpl(const Status& st);
 };
 
 }  // namespace mp::pro

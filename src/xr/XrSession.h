@@ -60,6 +60,15 @@ public:
         float disparity = 0.0f;  // 0 = zero-disparity plane (screen depth)
         int32_t srcW = 0;  // sub-rect of the HUD swapchain to show (0 => full)
         int32_t srcH = 0;
+        // Regions of the HUD image (HUD pixels) to show FLAT: each also goes out as a
+        // Local2D layer (XR_DXR_local_3d_zone) at the matching client-window rect, so the
+        // runtime shows it unwoven (crisp 2D) instead of with the picture. Needs
+        // RequestLocal2D() before Init and the window's pixel size.
+        struct Rect { int32_t x = 0, y = 0, w = 0, h = 0; };
+        static constexpr int kMaxFlat = 8;
+        Rect flat[kMaxFlat];
+        int flatCount = 0;
+        uint32_t windowPxW = 0, windowPxH = 0;
     };
 
     // Per-frame state handed between BeginFrame/EndFrame.
@@ -117,6 +126,10 @@ public:
 
     // Window-space HUD swapchain (created in Initialize if the runtime supports it).
     bool HasHud() const { return hasHud_; }
+    // Ask for XR_DXR_local_3d_zone (call before Init). Only Media Player Pro does: it
+    // shows its panels as flat 2D (HudSubmit::flat). HasLocal2D() after Init.
+    void RequestLocal2D(bool on) { wantLocal2D_ = on; }
+    bool HasLocal2D() const { return hasLocal2DExt_; }
     uint32_t HudWidth() const { return hudSwapchain_.width; }
     uint32_t HudHeight() const { return hudSwapchain_.height; }
     int64_t HudFormat() const { return hudSwapchain_.format; }
@@ -305,6 +318,7 @@ private:
 
     // Atlas capture (XR_DXR_atlas_capture). PFN null when the runtime lacks it.
     bool hasAtlasCaptureExt_ = false;
+    bool wantLocal2D_ = false, hasLocal2DExt_ = false;
     PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT_ = nullptr;
 
     // Agent tools (XR_DXR_mcp_tools). All PFNs null when the runtime lacks the extension

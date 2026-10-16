@@ -8,6 +8,7 @@
 #include "pro/TimecodePairer.h"
 
 #include <cstdio>
+#include <string>
 #include <vector>
 
 using mp::TimecodePairer;
@@ -200,9 +201,104 @@ void OneEyeMissing() {
     CHECK(s.shown.empty(), "nothing to show until both eyes have a frame");
 }
 
+// Timecode -> full-rate frames (RP188 at 50/60p: frame pairs + field mark; HFRTC;
+// drop-frame), and two inputs at 50p pairing on it.
+void FullRateTimecode() {
+    using mp::TimecodeFields;
+    using mp::TimecodeFrames;
+    auto tf = [](int hh, int mm, int ss, int ff, bool fm = false, bool df = false, bool hfr = false) {
+        TimecodeFields t;
+        t.hh = hh; t.mm = mm; t.ss = ss; t.ff = ff;
+        t.fieldMark = fm; t.dropFrame = df; t.highFrameRate = hfr;
+        return t;
+    };
+    CHECK(TimecodeFrames(tf(0, 0, 1, 0), 25) == 25, "25p: plain count");
+    CHECK(TimecodeFrames(tf(0, 0, 0, 12, false), 50) == 24, "50p pair 12, first frame -> 24");
+    CHECK(TimecodeFrames(tf(0, 0, 0, 12, true), 50) == 25, "50p pair 12, field mark -> 25");
+    CHECK(TimecodeFrames(tf(0, 0, 1, 0), 50) == 50, "50p: one second = 50 frames");
+    CHECK(TimecodeFrames(tf(0, 0, 0, 37, false, false, true), 60) == 37, "HFRTC counts every frame");
+    {
+        TimecodeFields full = tf(0, 0, 0, 37);
+        CHECK(mp::TimecodeCountsEveryFrame(full, 60), "ff past half the rate proves a full count");
+        full.fullCount = true;
+        CHECK(TimecodeFrames(full, 60) == 37, "a latched full-count source is taken as it is");
+        // A full-count source across a second, latched as an input would latch it: from
+        // the first second's ff 30 on, every frame is consecutive - including ff 0..29 of
+        // the next second, which a per-frame rule would have doubled.
+        bool latch = false, consec = true;
+        int prevK = -1, seenAfterLatch = 0;
+        for (int ss = 0; ss < 3; ++ss)
+            for (int ff = 0; ff < 60; ++ff) {
+                TimecodeFields x = tf(0, 0, ss, ff);
+                if (mp::TimecodeCountsEveryFrame(x, 60)) latch = true;
+                x.fullCount = latch;
+                const int k = TimecodeFrames(x, 60);
+                if (latch && prevK >= 0 && seenAfterLatch > 0 && k != prevK + 1) consec = false;
+                if (latch) ++seenAfterLatch;
+                prevK = k;
+            }
+        CHECK(consec, "latched full-count 60p timecode is consecutive across seconds");
+    }
+    CHECK(TimecodeFrames(tf(0, 10, 0, 0, false, true), 30) == 17982, "29.97 DF: ten minutes");
+    CHECK(TimecodeFrames(tf(0, 1, 0, 2, false, true), 30) == 1800, "29.97 DF: ;00 ;01 skipped");
+    // 59.94 DF from RP188: pairs + field mark + 4 numbers dropped a minute (2 pairs).
+    CHECK(TimecodeFrames(tf(0, 1, 0, 2, false, true), 60) == 3600, "59.94 DF: pair 2 at 00:01:00 = frame 3600");
+    // Every frame of a 60p minute boundary is consecutive.
+    int prev = -1;
+    bool consecutive = true;
+    for (int ss = 58; ss < 60; ++ss)
+        for (int ff = 0; ff < 30; ++ff)
+            for (int fm = 0; fm < 2; ++fm) {
+                const int k = TimecodeFrames(tf(0, 0, ss, ff, fm != 0, true), 60);
+                if (prev >= 0 && k != prev + 1) consecutive = false;
+                prev = k;
+            }
+    for (int ff = 2; ff < 30; ++ff)
+        for (int fm = 0; fm < 2; ++fm) {
+            const int k = TimecodeFrames(tf(0, 1, 0, ff, fm != 0, true), 60);
+            if (k != prev + 1) consecutive = false;
+            prev = k;
+        }
+    CHECK(consecutive, "59.94 DF: consecutive across the minute");
+    char buf[16];
+    mp::FormatTimecode(tf(10, 0, 0, 12, true), 50, buf, sizeof(buf));
+    CHECK(std::string(buf) == "10:00:00:25", "formatted at the full rate");
+    mp::FormatTimecode(tf(0, 1, 0, 2, false, true), 30, buf, sizeof(buf));
+    CHECK(std::string(buf) == "00:01:00;02", "drop-frame separator");
+
+    // Two 50p inputs, the right eye 1 frame behind, keyed from their RP188. Track the TRUE
+    // frame index in each slot: keyed without the field mark both frames of a pair collide
+    // (the old key) and the pairer can show frame N of one eye with N+1 of the other.
+    TimecodePairer p;
+    int slotFrame[2][TimecodePairer::kHistory] = {};
+    int shown = 0, mismatched = 0, lastShown = -1, repeats = 0;
+    auto feed = [&](int eye, int i) {
+        const int pair = 100 + i / 2;
+        const int key = TimecodeFrames(tf(0, 0, pair / 25, pair % 25, (i % 2) != 0), 50);
+        const int s = p.NextSlot(eye);
+        p.MarkBusy(eye, s);
+        slotFrame[eye][s] = i;
+        const TimecodePairer::Decision d = p.Add(eye, s, key, 0.0, 1.0 / 50.0);
+        if (!d.publish) return;
+        ++shown;
+        const int l = slotFrame[0][d.slot[0]], r = slotFrame[1][d.slot[1]];
+        if (l != r) ++mismatched;
+        if (l <= lastShown) ++repeats;
+        lastShown = l;
+    };
+    for (int i = 0; i < 40; ++i) {
+        feed(0, i);
+        if (i > 0) feed(1, i - 1);
+    }
+    CHECK(shown > 30, "50p pairs are shown");
+    CHECK(mismatched == 0, "50p: every shown pair is the same frame on both eyes");
+    CHECK(repeats == 0, "50p: each frame shown once, in order");
+}
+
 }  // namespace
 
 int main() {
+    FullRateTimecode();
     for (int lag = 0; lag < TimecodePairer::kHistory; ++lag) {
         SteadyLag(lag, true);
         SteadyLag(lag, false);

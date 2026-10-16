@@ -457,6 +457,9 @@ function(mp_add_player tgt is_pro)
             src/pro/DeckLinkSource.cpp   # Blackmagic DeckLink SDI / HDMI input
             src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
             src/pro/Station.cpp          # inputs, timecode / delay, rig UI, snapshots
+            src/pro/ResolveLink.cpp      # the live Resolve panel: file protocol + follow
+            src/pro/ProResolve.cpp       # the live Resolve panel: station side
+            src/pro/Thumbnail.cpp        # input-list thumbnails (left eye, CPU)
             src/pro/OcioBake.cpp)        # OpenColorIO -> the grade's LUT (MP_OCIO_ROOT)
         target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=1)
         if(MP_HAVE_OCIO)
@@ -626,6 +629,13 @@ if(MP_BUILD_TESTS)
     add_executable(timecode_pairer_test tests/timecode_pairer_test.cpp src/pro/TimecodePairer.cpp)
     target_include_directories(timecode_pairer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME timecode_pairer COMMAND timecode_pairer_test)
+    add_executable(resolve_link_test tests/resolve_link_test.cpp src/pro/ResolveLink.cpp)
+    target_include_directories(resolve_link_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(resolve_link_test PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME resolve_link COMMAND resolve_link_test)
+    add_executable(thumbnail_test tests/thumbnail_test.cpp src/pro/Thumbnail.cpp)
+    target_include_directories(thumbnail_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME thumbnail COMMAND thumbnail_test)
     add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/LivePixels.cpp
         src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
     target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -680,11 +690,11 @@ if(MP_BUILD_TESTS)
         add_test(NAME short_clip COMMAND short_clip_test)
     endif()
 
-    # The Resolve marker script (tools/resolve) against a fake timeline; needs Python 3.
+    # The Resolve panel (tools/resolve) against a fake Resolve; needs Python 3.
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
-        add_test(NAME resolve_markers
-                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/resolve_markers_test.py)
+        add_test(NAME resolve_panel
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/resolve_panel_test.py)
     endif()
 
     add_executable(color_test

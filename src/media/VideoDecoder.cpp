@@ -519,6 +519,9 @@ bool VideoDecoder::Open(const std::string& path) {
     durationSec_ = (impl_->fmt->duration > 0)
                        ? (double)impl_->fmt->duration / (double)AV_TIME_BASE
                        : 0.0;
+    startSec_ = (impl_->fmt->start_time != AV_NOPTS_VALUE && impl_->fmt->start_time > 0)
+                    ? (double)impl_->fmt->start_time / (double)AV_TIME_BASE
+                    : 0.0;
     if (isSequence_) {
         frameRate_ = seqFps_;
         if (durationSec_ <= 0.0) durationSec_ = (double)seq.count / seqFps_;
@@ -1183,6 +1186,7 @@ bool VideoDecoder::OpenLive(const std::string& url) {
         stats_ = StreamStats{};
     }
     durationSec_ = 0.0;
+    startSec_ = 0.0;
     frameRate_ = 0.0;
     width_ = height_ = 0;
     positionSec_.store(0.0);

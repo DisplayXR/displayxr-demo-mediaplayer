@@ -2,9 +2,40 @@
 #include "pro/TimecodePairer.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 
 namespace mp {
+
+namespace {
+
+// The frame number at the full rate: pairs (ff 0..29, field mark = second) unfolded.
+int FullRateFrame(const TimecodeFields& t, int fps) {
+    if (fps <= 30 || t.highFrameRate || t.fullCount) return t.ff;
+    return t.ff * 2 + (t.fieldMark ? 1 : 0);
+}
+
+}  // namespace
+
+int TimecodeFrames(const TimecodeFields& t, int fpsNominal) {
+    const int fps = fpsNominal > 0 ? fpsNominal : 25;
+    int frames = ((t.hh * 60 + t.mm) * 60 + t.ss) * fps + FullRateFrame(t, fps);
+    if (t.dropFrame && (fps == 30 || fps == 60)) {
+        const int drop = fps / 15;  // 2 at 29.97, 4 at 59.94
+        const int minutes = t.hh * 60 + t.mm;
+        frames -= drop * (minutes - minutes / 10);
+    }
+    return frames;
+}
+
+bool TimecodeCountsEveryFrame(const TimecodeFields& t, int fpsNominal) {
+    return fpsNominal > 30 && t.ff >= (fpsNominal + 1) / 2;
+}
+
+void FormatTimecode(const TimecodeFields& t, int fpsNominal, char* out, size_t n) {
+    const int fps = fpsNominal > 0 ? fpsNominal : 25;
+    std::snprintf(out, n, "%02d:%02d:%02d%c%02d", t.hh, t.mm, t.ss, t.dropFrame ? ';' : ':', FullRateFrame(t, fps));
+}
 
 void TimecodePairer::Reset() { *this = TimecodePairer{}; }
 

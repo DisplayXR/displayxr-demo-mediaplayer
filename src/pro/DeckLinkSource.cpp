@@ -215,22 +215,44 @@ bool ConvertEye(IDeckLinkVideoFrame* f, livepix::P016& dst, int x0) {
     return ok;
 }
 
-// The frame's timecode as text and as a frame count (-1 when it has none).
-int ReadTimecode(IDeckLinkVideoInputFrame* f, int fpsInt, char* text, size_t n) {
+// The frame's timecode as text and as a frame count at the full frame rate (-1 when it
+// has none). A high-frame-rate timecode (HFRTC, counts every frame above 30 fps) is
+// preferred when the card has one; otherwise RP188 (VITC1 / VITC2 / LTC) or VITC, whose
+// frame pairs at 50/60p are unfolded with the field mark (TimecodeFrames).
+// `fullCount` is this input's latch: set once its ff reaches half the rate (a source that
+// counts every frame without an HFRTC); the caller resets it when the format changes.
+int ReadTimecode(IDeckLinkVideoInputFrame* f, int fpsInt, char* text, size_t n, std::atomic<bool>& fullCount) {
     text[0] = 0;
     IDeckLinkTimecode* tc = nullptr;
-    if (FAILED(f->GetTimecode(bmdTimecodeRP188Any, &tc)) || !tc) {
+    TimecodeFields t;
+    if (SUCCEEDED(f->GetTimecode(bmdTimecodeRP188HighFrameRate, &tc)) && tc) {
+        t.highFrameRate = true;
+    } else {
         Release(tc);
-        if (FAILED(f->GetTimecode(bmdTimecodeVITC, &tc)) || !tc) {
+        tc = nullptr;
+        if (FAILED(f->GetTimecode(bmdTimecodeRP188Any, &tc)) || !tc) {
             Release(tc);
-            return -1;
+            tc = nullptr;
+            if (FAILED(f->GetTimecode(bmdTimecodeVITC, &tc)) || !tc) {
+                Release(tc);
+                return -1;
+            }
         }
     }
     unsigned char hh = 0, mm = 0, ss = 0, ff = 0;
     int key = -1;
     if (SUCCEEDED(tc->GetComponents(&hh, &mm, &ss, &ff))) {
-        std::snprintf(text, n, "%02u:%02u:%02u:%02u", hh, mm, ss, ff);
-        key = ((hh * 60 + mm) * 60 + ss) * std::max(1, fpsInt) + ff;
+        const BMDTimecodeFlags flags = tc->GetFlags();
+        t.hh = hh;
+        t.mm = mm;
+        t.ss = ss;
+        t.ff = ff;
+        t.fieldMark = (flags & bmdTimecodeFieldMark) != 0;
+        t.dropFrame = (flags & bmdTimecodeIsDropFrame) != 0;
+        if (TimecodeCountsEveryFrame(t, std::max(1, fpsInt))) fullCount = true;
+        t.fullCount = fullCount;
+        FormatTimecode(t, std::max(1, fpsInt), text, n);
+        key = TimecodeFrames(t, std::max(1, fpsInt));
     }
     tc->Release();
     return key;
@@ -244,6 +266,7 @@ struct DeckLinkCapture {
     bool pair = false;     // two inputs, eye 0 and eye 1
     bool dual = false;     // one input in the card's dual-stream 3D mode
     std::atomic<int> fpsInt{25};
+    std::atomic<bool> tcFullCount[2] = {false, false};  // per input: timecode counts every frame
     std::atomic<bool> noSignal[2]{};
 
     std::mutex m;  // the frames below + the ring's single-producer side
@@ -274,7 +297,7 @@ struct DeckLinkCapture {
         const int w = (int)f->GetWidth() & ~1, h = (int)f->GetHeight() & ~1;
         const double now = LiveProducer::NowSeconds();
         char tc[16];
-        int key = ReadTimecode(f, fpsInt, tc, sizeof(tc));
+        int key = ReadTimecode(f, fpsInt, tc, sizeof(tc), tcFullCount[eye]);
         BMDTimeValue hwTime = 0, hwDur = 0;
         int64_t hwUs = -1;
         if (SUCCEEDED(f->GetHardwareReferenceTimestamp(1000000, &hwTime, &hwDur))) hwUs = (int64_t)hwTime;
@@ -425,6 +448,7 @@ public:
         if (SUCCEEDED(mode->GetFrameRate(&dur, &scale)) && dur) {
             const double fps = (double)scale / (double)dur;
             cap_->fpsInt = (int)std::lround(fps);
+            cap_->tcFullCount[eye_] = false;  // a new format: learn its timecode count again
             cap_->SetFps(fps);
         }
         LOG_INFO("decklink: input %d signal is now %s, %s%s", eye_, FromBSTR(name).c_str(),

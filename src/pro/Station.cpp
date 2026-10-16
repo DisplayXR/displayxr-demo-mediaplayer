@@ -2,6 +2,7 @@
 #include "pro/Station.h"
 
 #include "Log.h"
+#include "pro/Thumbnail.h"
 
 #include <nlohmann/json.hpp>
 #include <SDL3/SDL.h>
@@ -227,6 +228,15 @@ void Station::Tick() {
 
 void Station::OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live, int eyeOffsetFrames) {
     LogNewAlerts();
+    if (live && inputIndex_ >= 0 && inputIndex_ < (int)inputs_.size() && inputIndex_ < kMaxThumbs) {
+        // The live input's thumbnail, twice a second; the others keep their last one.
+        Input& in = inputs_[inputIndex_];
+        const double now = LiveProducer::NowSeconds();
+        if (in.thumbSec < 0.0 || now - in.thumbSec >= 0.5) {
+            if (pro::MakeThumbnail(f, layout, kThumbW, kThumbH, in.thumb)) in.thumbDirty = true;
+            in.thumbSec = now;
+        }
+    }
     if (live) {
         timecode_ = f.timecode;
         if (f.captureSec > 0.0) {
@@ -256,6 +266,7 @@ bool Station::TakeSnapshot(const std::string& note) {
     s.takenSec = LiveProducer::NowSeconds();
     s.notePath = prefix + "_note.json";
     s.timecode = timecode_;
+    s.tcFps = signalFps_;
     s.clock = clock;
     s.rig = rig_.Last();
     {
@@ -276,6 +287,7 @@ void Station::SaveNote(size_t i) {
     j["image"] = s.image;
     j["note"] = std::string(s.note);
     j["timecode"] = s.timecode;
+    if (s.tcFps > 0) j["tc_fps"] = s.tcFps;
     j["time"] = s.clock;
     if (s.rig.ok) {
         j["vertical_px"] = s.rig.verticalPx;
@@ -301,12 +313,44 @@ void Station::LogNewAlerts() {
         nlohmann::json j;
         j["what"] = a.what;
         j["timecode"] = a.timecode;
+        if (signalFps_ > 0) j["tc_fps"] = signalFps_;
         j["time"] = a.wallClock;
         j["duration_s"] = a.end - a.start;
         std::ofstream((std::filesystem::path(dir) / "station_alerts.jsonl").string(), std::ios::app) << j.dump() << "\n";
         newest = std::max(newest, a.end);
     }
     alertsLoggedUntil_ = newest;
+}
+
+std::string Station::RigStatusJson() const {
+    using json = nlohmann::json;
+    const rig::Result r = rig_.Last();
+    const rig::Budget b = rig_.GetBudget();
+    const std::vector<rig::Sample> h = rig_.History(1.0);
+    json out;
+    out["measured"] = r.ok && rig_.Active(LiveProducer::NowSeconds());
+    out["matches"] = r.matches;
+    out["vertical_px"] = r.verticalPx;
+    out["roll_deg"] = r.rollDeg;
+    out["near_pct"] = r.nearPct;
+    out["far_pct"] = r.farPct;
+    out["delta_e"] = r.deltaE;
+    out["eye_sync_frames"] = h.empty() ? -1 : h.back().eyeOffsetFrames;
+    out["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
+                     {"delta_e", b.maxDeltaE}};
+    json alerts = json::array();
+    for (const rig::Alert& al : rig_.Alerts())
+        alerts.push_back({{"what", al.what}, {"timecode", al.timecode}, {"time", al.wallClock}, {"open", al.end < 0}});
+    out["alerts"] = alerts;
+    out["timecode"] = timecode_;
+    out["tc_fps"] = signalFps_;
+    out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
+    return out.dump();
+}
+
+std::string Station::Folder() const {
+    return host_.capturePrefix ? std::filesystem::path(host_.capturePrefix("x")).parent_path().string()
+                               : std::string();
 }
 
 // ---------------------------------------------------------------------------- agent tools
@@ -327,27 +371,7 @@ bool Station::DispatchTool(const std::string& tool, const std::string& argsJson,
         return true;
     };
     if (tool == "get_rig_status") {
-        const rig::Result r = rig_.Last();
-        const rig::Budget b = rig_.GetBudget();
-        const std::vector<rig::Sample> h = rig_.History(1.0);
-        json out;
-        out["measured"] = r.ok && rig_.Active(LiveProducer::NowSeconds());
-        out["matches"] = r.matches;
-        out["vertical_px"] = r.verticalPx;
-        out["roll_deg"] = r.rollDeg;
-        out["near_pct"] = r.nearPct;
-        out["far_pct"] = r.farPct;
-        out["delta_e"] = r.deltaE;
-        out["eye_sync_frames"] = h.empty() ? -1 : h.back().eyeOffsetFrames;
-        out["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
-                         {"delta_e", b.maxDeltaE}};
-        json alerts = json::array();
-        for (const rig::Alert& al : rig_.Alerts())
-            alerts.push_back({{"what", al.what}, {"timecode", al.timecode}, {"time", al.wallClock}, {"open", al.end < 0}});
-        out["alerts"] = alerts;
-        out["timecode"] = timecode_;
-        out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
-        result = out.dump();
+        result = RigStatusJson();
         return true;
     }
     if (tool == "set_depth_budget") {
@@ -435,11 +459,41 @@ void Station::BuildInputsSection(const std::string& liveName, bool live) {
         if (!DeckLinkSource::Available()) ImGui::TextDisabled("(this build has no DeckLink SDK)");
         return;
     }
+    const double now = LiveProducer::NowSeconds();
+    const float thumbH = ImGui::GetTextLineHeight() * 2.0f + ImGui::GetStyle().ItemSpacing.y;
+    const ImVec2 thumbSize(thumbH * kThumbW / (float)kThumbH, thumbH);
     for (size_t i = 0; i < inputs_.size(); ++i) {
+        Input& in = inputs_[i];
+        const bool active = (int)i == inputIndex_ && live;
         ImGui::PushID((int)i);
-        if (ImGui::Selectable(inputs_[i].name.c_str(), (int)i == inputIndex_ && live)) SwitchInput((int)i);
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.62f);
-        ImGui::TextDisabled("%s", inputs_[i].spec.substr(0, inputs_[i].spec.find(':')).c_str());
+        // A row: thumbnail (the feed when live, its last frame otherwise), name, kind, age.
+        const ImVec2 rowStart = ImGui::GetCursorPos();
+        if (ImGui::Selectable("##row", active, 0, ImVec2(0.0f, thumbH))) SwitchInput((int)i);
+        ImGui::SetCursorPos(rowStart);
+        void* tex = nullptr;
+        if (!in.thumb.empty() && host_.thumbTexture && (int)i < kMaxThumbs) {
+            tex = host_.thumbTexture((int)i, in.thumbDirty ? in.thumb.data() : nullptr);
+            if (tex) in.thumbDirty = false;
+        }
+        if (tex) {
+            ImGui::Image((ImTextureID)tex, thumbSize, ImVec2(0, 0), ImVec2(1, 1),
+                         ImVec4(1, 1, 1, active ? 1.0f : 0.55f));
+        } else {
+            ImGui::Dummy(thumbSize);
+            const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddRect(a, b, ImGui::GetColorU32(ImGuiCol_Border));
+        }
+        ImGui::SameLine();
+        ImGui::BeginGroup();
+        ImGui::TextUnformatted(in.name.c_str());
+        const std::string kind = in.spec.substr(0, in.spec.find(':'));
+        if (active)
+            ImGui::TextDisabled("%s  live", kind.c_str());
+        else if (in.thumbSec >= 0.0)
+            ImGui::TextDisabled("%s  seen %.0f s ago", kind.c_str(), now - in.thumbSec);
+        else
+            ImGui::TextDisabled("%s", kind.c_str());
+        ImGui::EndGroup();
         ImGui::PopID();
     }
 #else
@@ -617,11 +671,12 @@ void Station::BuildSnapshotsSection() {
 #endif
 }
 
-void Station::BuildHistoryStrip(float alpha, bool stereo) {
+bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, float* ry, float* rw, float* rh) {
+    bool drawnFlat = false;
 #if defined(MEDIAPLAYER_WITH_IMGUI)
-    if (!showHistory_ || !stereo || alpha < 0.01f) return;
+    if (!showHistory_ || !stereo || alpha < 0.01f) return false;
     const std::vector<rig::Sample> hist = rig_.History(60.0);
-    if (hist.empty()) return;
+    if (hist.empty()) return false;
     const ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
@@ -629,7 +684,8 @@ void Station::BuildHistoryStrip(float alpha, bool stereo) {
     const float panelW = std::clamp(W * 0.24f, 280.0f, 440.0f);
     ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.86f), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
     ImGui::SetNextWindowSize(ImVec2(std::max(200.0f, W - 2.0f * panelW - 48.0f), H * 0.15f), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.72f);
+    ImGui::SetNextWindowBgAlpha(flat ? 1.0f : 0.72f);
+    if (flat) ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     const ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
                                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs |
                                 ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
@@ -701,13 +757,28 @@ void Station::BuildHistoryStrip(float alpha, bool stereo) {
             const ImVec2 ts = ImGui::CalcTextSize(ticks[i]);
             dl->AddText(ImVec2(std::min(x - ts.x * 0.5f, x1 - ts.x), p0.y + 2.0f * rowH), dim, ticks[i]);
         }
+        if (flat && rx && ry && rw && rh) {
+            const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+            *rx = wp.x;
+            *ry = wp.y;
+            *rw = ws.x;
+            *rh = ws.y;
+            drawnFlat = true;
+        }
     }
     ImGui::End();
+    if (flat) ImGui::PopStyleVar();  // WindowRounding
     ImGui::PopStyleVar();
 #else
     (void)alpha;
     (void)stereo;
+    (void)flat;
+    (void)rx;
+    (void)ry;
+    (void)rw;
+    (void)rh;
 #endif
+    return drawnFlat;
 }
 
 }  // namespace mp::pro

@@ -36,6 +36,9 @@ struct StationHost {
     std::function<bool(const std::string& prefix)> captureAtlas;
     std::function<void(const std::string&)> toast;
     std::function<double()> displayPeriodMs;  // one panel frame, for the delay readout
+    // Input-list thumbnails (kThumbW x kThumbH RGBA): upload `rgba` for thumbnail `slot`
+    // (nullptr = no change) and return its ImTextureID, nullptr when there is none.
+    std::function<void*(int slot, const uint8_t* rgba)> thumbTexture;
 };
 
 struct StationOptions {
@@ -48,6 +51,8 @@ struct StationOptions {
 
 class Station {
 public:
+    static constexpr int kThumbW = 192, kThumbH = 108;  // thumbnail pixels (16:9)
+    static constexpr int kMaxThumbs = 8;                // inputs with a thumbnail
     ~Station();
     void Init(StationHost host, const StationOptions& opt);
     void Shutdown();
@@ -62,13 +67,19 @@ public:
     // Agent tools for the station (called from ProController::DispatchTool).
     bool DispatchTool(const std::string& tool, const std::string& argsJson, std::string& result, bool& success);
     bool TakeSnapshot(const std::string& note);
+    // The rig checks as JSON (get_rig_status; also in the Resolve panel's status file).
+    std::string RigStatusJson() const;
+    // Where snapshots, notes, alerts and the Resolve link files live (Pictures/DisplayXR).
+    std::string Folder() const;
 
     // Inspector sections and the bottom history strip (ImGui).
     void BuildInputsSection(const std::string& liveName, bool live);
     void BuildSignalLines(bool live);
     void BuildRigSection(bool stereo);
     void BuildSnapshotsSection();
-    void BuildHistoryStrip(float alpha, bool stereo);
+    // True (and the strip's HUD rect) when it was drawn as a flat card (`flat`).
+    bool BuildHistoryStrip(float alpha, bool stereo, bool flat = false, float* x = nullptr, float* y = nullptr,
+                           float* w = nullptr, float* h = nullptr);
     // DeckLink setup window: pick the left / right inputs, connection, stereo packing and
     // starting format, then Open (adds or replaces the "DeckLink" input and switches to it).
     void OpenDeckLinkDialog();
@@ -81,6 +92,10 @@ public:
     rig::Result RigLast() const { return rig_.Last(); }
     rig::Budget RigBudget() const { return rig_.GetBudget(); }
     const std::string& Timecode() const { return timecode_; }
+    // The live signal's frame rate (rounded), written with every timecode (notes, alerts,
+    // the Resolve link) so a 50p timecode can be placed on a 25p timeline. 0 = unknown.
+    void SetSignalFps(float fps) { signalFps_ = fps > 1.0f ? (int)(fps + 0.5f) : 0; }
+    int SignalFps() const { return signalFps_; }
     double DelayMs() const { return delayMs_; }
 
 private:
@@ -94,6 +109,9 @@ private:
     rig::RigMonitor rig_;
     struct Input {
         std::string name, spec;
+        std::vector<uint8_t> thumb;   // kThumbW x kThumbH RGBA, empty until first seen
+        double thumbSec = -1.0;       // when it was taken (LiveProducer::NowSeconds)
+        bool thumbDirty = false;      // not uploaded yet
     };
     std::vector<Input> inputs_;
     int inputIndex_ = -1;
@@ -112,10 +130,12 @@ private:
     std::string pendingDeckLinkSpec_;
     int testFrames_ = 0, testSnapshotFrame_ = -1;
     std::string timecode_;
+    int signalFps_ = 0;
     double delayMs_ = 0.0;
     double alertsLoggedUntil_ = 0.0;
     struct Snapshot {
         std::string image, notePath, timecode, clock;
+        int tcFps = 0;
         std::string prefix;        // capture prefix; the runtime picks the image's suffix
         double takenSec = 0.0;     // until the image is found (Tick), `image` is a guess
         bool imageFound = false;
