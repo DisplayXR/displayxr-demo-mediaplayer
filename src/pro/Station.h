@@ -80,7 +80,9 @@ public:
     void BuildSignalLines(bool live);
     void BuildRigSection(bool stereo);
     void BuildSnapshotsSection();
-    void BuildHistoryStrip(float alpha, bool stereo);
+    // True (and the strip's HUD rect) when it was drawn as a flat card (`flat`).
+    bool BuildHistoryStrip(float alpha, bool stereo, bool flat = false, float* x = nullptr, float* y = nullptr,
+                           float* w = nullptr, float* h = nullptr);
     // DeckLink setup window: pick the left / right inputs, connection, stereo packing and
     // starting format, then Open (adds or replaces the "DeckLink" input and switches to it).
     void OpenDeckLinkDialog();

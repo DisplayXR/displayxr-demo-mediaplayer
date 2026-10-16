@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "XrSession.h"
 
+#include <algorithm>
+#include <cmath>
+
 #include "ColorPolicy.h"      // swapchain encoding choice (#78)
 #include "platform/Window.h"  // Window::LinuxHandles — the Linux native-handle shape
 
@@ -103,6 +106,8 @@ bool XrSession::InitInstanceAndSystem() {
             liftSpec_ = e.extensionVersion;
             hasLiftExt_ = e.extensionVersion >= 4;
         }
+        if (wantLocal2D_ && strcmp(e.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0)
+            hasLocal2DExt_ = true;
 #if defined(__linux__) && !defined(__ANDROID__)
         if (strcmp(e.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) hasWeaveExt_ = true;
 #endif
@@ -121,6 +126,7 @@ bool XrSession::InitInstanceAndSystem() {
              inputProvidersSpec_);
     LOG_INFO("XR_DXR_lift: %s (spec %u)", hasLiftExt_ ? "yes" : liftSpec_ ? "too old" : "no",
              liftSpec_);
+    if (wantLocal2D_) LOG_INFO("XR_DXR_local_3d_zone: %s", hasLocal2DExt_ ? "yes" : "no");
 
     if (!hasVulkan) {
         LOG_ERROR("Runtime does not expose XR_KHR_vulkan_enable2");
@@ -137,6 +143,7 @@ bool XrSession::InitInstanceAndSystem() {
     if (cursorDepthSpec_) enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
     if (hasLiftExt_) enabled.push_back(XR_DXR_LIFT_EXTENSION_NAME);
     if (hasInputProvidersExt_) enabled.push_back(XR_DXR_INPUT_PROVIDERS_EXTENSION_NAME);
+    if (hasLocal2DExt_) enabled.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
 #if defined(__linux__) && !defined(__ANDROID__)
     // The window drag's phase snap (xrWeaveSnapWindowRectDXR): the X11 drag
     // lands each step on a phase-correct origin. Optional — identity without.
@@ -1271,14 +1278,49 @@ bool XrSession::EndFrame(Frame& frame, const ViewRect* rects, const HudSubmit* h
         hudLayer.disparity = hud->disparity;
     }
 
-    const XrCompositionLayerBaseHeader* layers[] = {
+    // Flat regions of the HUD (Pro's panels) as Local2D layers: the same HUD image,
+    // placed at the client-window rect its pixels land on. Inside those rects the runtime
+    // shows the 2D layer instead of the weave (the implicit mask), so the panel reads as
+    // crisp 2D and nothing is woven under it.
+    XrCompositionLayerLocal2DDXR flatLayers[HudSubmit::kMaxFlat];
+    uint32_t flatCount = 0;
+    if (submitHud && hasLocal2DExt_ && hud->flatCount > 0 && hud->windowPxW > 0 && hud->windowPxH > 0) {
+        const float srcW = (float)hudLayer.subImage.imageRect.extent.width;
+        const float srcH = (float)hudLayer.subImage.imageRect.extent.height;
+        const float sx = hud->width * (float)hud->windowPxW / srcW;  // HUD px -> window px
+        const float sy = hud->height * (float)hud->windowPxH / srcH;
+        const float ox = hud->x * (float)hud->windowPxW, oy = hud->y * (float)hud->windowPxH;
+        for (int i = 0; i < hud->flatCount && i < HudSubmit::kMaxFlat; ++i) {
+            HudSubmit::Rect r = hud->flat[i];
+            // Clamp to the HUD image; skip what is empty after clamping.
+            const int32_t x0 = std::max<int32_t>(0, r.x), y0 = std::max<int32_t>(0, r.y);
+            const int32_t x1 = std::min<int32_t>((int32_t)srcW, r.x + r.w), y1 = std::min<int32_t>((int32_t)srcH, r.y + r.h);
+            if (x1 <= x0 || y1 <= y0) continue;
+            XrCompositionLayerLocal2DDXR& l = flatLayers[flatCount++];
+            l = {};
+            l.type = XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR;
+            l.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            l.subImage = hudLayer.subImage;
+            l.subImage.imageRect.offset = {x0, y0};
+            l.subImage.imageRect.extent = {x1 - x0, y1 - y0};
+            const int32_t wx0 = (int32_t)std::floor(ox + x0 * sx), wy0 = (int32_t)std::floor(oy + y0 * sy);
+            const int32_t wx1 = (int32_t)std::ceil(ox + x1 * sx), wy1 = (int32_t)std::ceil(oy + y1 * sy);
+            l.rect.offset = {wx0, wy0};
+            l.rect.extent = {wx1 - wx0, wy1 - wy0};
+        }
+    }
+
+    const XrCompositionLayerBaseHeader* layers[2 + HudSubmit::kMaxFlat] = {
         reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer),
         reinterpret_cast<XrCompositionLayerBaseHeader*>(&hudLayer)};
+    uint32_t layerCount = submitHud ? 2u : 1u;
+    for (uint32_t i = 0; i < flatCount; ++i)
+        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&flatLayers[i]);
 
     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime = frame.frameState.predictedDisplayTime;
     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    endInfo.layerCount = frame.shouldRender ? (submitHud ? 2u : 1u) : 0u;
+    endInfo.layerCount = frame.shouldRender ? layerCount : 0u;
     endInfo.layers = frame.shouldRender ? layers : nullptr;
 
     return XR_SUCCEEDED(xrEndFrame(session_, &endInfo));

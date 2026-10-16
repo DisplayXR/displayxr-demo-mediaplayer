@@ -223,6 +223,9 @@ stereo needs the **8K Pro G2** with its profile set to expose two or four sub-de
 timecode. On macOS the usual box is an UltraStudio over Thunderbolt; Desktop Video's
 system extension must be approved once.
 
-Known limits: 8-bit to the panel (the runtime's atlas path); the panels are ImGui
-panels in the HUD layer, so they are woven with the picture rather than drawn as a crisp 2D
-zone (moving it to `XR_DXR_display_zones` is planned).
+Known limits: 8-bit to the panel (the runtime's atlas path). Panels: **pinned** panels (and
+the history strip) are shown flat - each also goes out as an `XR_DXR_local_3d_zone` Local2D
+layer over the same HUD image, so inside it the runtime shows crisp 2D instead of the weave
+(the panel becomes an opaque card; the picture under it is not shown). Unpinned panels stay
+in the woven HUD layer while they fade, so a half-faded card never cuts a hole in the
+picture. `MEDIAPLAYER_PRO_PANELS_3D=1` keeps pinned panels woven too.
