@@ -2,6 +2,7 @@
 build/
 build-deb/
 build-ninja/
+build-*/
 dist/
 out/
 _package/
