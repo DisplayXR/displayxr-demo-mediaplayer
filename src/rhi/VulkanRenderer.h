@@ -38,6 +38,23 @@ struct ClearColor {
 // Left eye of an SBS frame = {0,0, 0.5,1}; right eye = {0.5,0, 0.5,1}; mono = {0,0,1,1}.
 struct ViewUV {
     float offX, offY, scaleX, scaleY;
+    // UV offset from this view's sample to the same scene point in the OTHER eye. Only
+    // read by the Pro QC views (difference / anaglyph); 0 everywhere else.
+    float otherDX = 0.0f, otherDY = 0.0f;
+};
+
+// Media Player Pro grade, applied in the source shader to every DrawViews draw:
+// exposure (stops, linear light) -> ASC CDL -> 3D LUT. The default is the identity,
+// which is all the base player ever uses. See shaders/sbs.frag Grade().
+struct GradeParams {
+    float exposure = 0.0f;
+    bool cdlOn = false;
+    float slope[3] = {1.f, 1.f, 1.f};
+    float offset[3] = {0.f, 0.f, 0.f};
+    float power[3] = {1.f, 1.f, 1.f};
+    float saturation = 1.0f;
+    bool lutOn = false;          // ignored unless a LUT was uploaded (HasLut3D)
+    int qcMode = 0;              // 0 normal, 1 eye difference, 2 anaglyph
 };
 
 class VulkanRenderer {
@@ -136,6 +153,17 @@ public:
     // a calm backdrop with no black bars. Ignored in transparent-letterbox mode (alpha 0).
     void SetBackground(float r, float g, float b) { background_ = {r, g, b, 1.0f}; }
 
+    // Pro grade + QC mode for subsequent DrawViews calls (identity by default).
+    void SetGrade(const GradeParams& g) { grade_ = g; }
+    const GradeParams& Grade() const { return grade_; }
+
+    // Upload a 3D LUT (N^3 RGB floats, red fastest - the .cube order) as an RGBA16F 3D
+    // texture. `domainMin/Max` are the LUT's input domain (scalar: the same for R, G, B).
+    // A one-off blocking upload (user action, not per frame). Returns false on failure.
+    bool UploadLut3D(const float* rgb, uint32_t size, float domainMin, float domainMax);
+    void ClearLut3D();
+    bool HasLut3D() const { return lut_.view != VK_NULL_HANDLE; }
+
     // `rects` are the per-view content rects (the viewport — may be convergence-
     // shifted); `clipRects` are the per-view tile bounds the drawing is scissored to,
     // so a shifted content rect can never spill into the neighbouring eye's tile.
@@ -213,6 +241,18 @@ private:
     bool sharedSampledThisFrame_ = false;
     SharedImport* ImportSharedRGBA(void* handle, uint32_t w, uint32_t h);
 #endif
+    // Pro grade: the 3D LUT at binding 3, or a 1x1x1 dummy when none is loaded.
+    GradeParams grade_{};
+    struct Lut3D {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        uint32_t size = 0;
+        float domainMin = 0.f, domainMax = 1.f;
+    } lut_, lutDummy_;
+    bool CreateLutImage(Lut3D& dst, uint32_t n, const uint16_t* rgba16f);
+    void DestroyLut(Lut3D& l, bool deferred);
+
     VkImage dummyImage_ = VK_NULL_HANDLE;       // 1x1, bound to unused plane slots
     VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
     VkImageView dummyView_ = VK_NULL_HANDLE;

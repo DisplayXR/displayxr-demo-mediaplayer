@@ -11,6 +11,14 @@
 #include "media/VideoStereoProbe.h"
 #include "ui/Hud.h"
 
+// The product name in the window title. Media Player Pro is the same trunk built with
+// MEDIAPLAYER_PRO=1 (docs/PRO.md).
+#if MEDIAPLAYER_PRO
+#define MP_PRODUCT_NAME "DisplayXR Media Player Pro"
+#else
+#define MP_PRODUCT_NAME "DisplayXR Stereo Media Player"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -155,7 +163,11 @@ bool App::Initialize(const char* mediaPath) {
         if (n >= 2 && a > 0 && b > 0) { winW = a; winH = b; }
         if (n >= 4) { forceX = x; forceY = y; forcePos = true; }
     }
-    if (!window_.Create("DisplayXR Stereo Media Player", winW, winH)) return false;
+    if (!window_.Create(MP_PRODUCT_NAME, winW, winH)) return false;
+#if MEDIAPLAYER_PRO
+    // Pro is a monitoring tool: Escape leaves full screen and never quits a live session.
+    window_.SetEscapeQuits(false);
+#endif
 
     // Open the window ON the 3D panel (INV-1.3; runtime#715): on multi-monitor
     // boxes SDL centers new windows on the primary display, but the window-relative
@@ -323,6 +335,9 @@ bool App::Initialize(const char* mediaPath) {
             LOG_WARN("ImGui unavailable — using the text HUD");
         }
     }
+#if MEDIAPLAYER_PRO
+    InitPro();
+#endif
 
     // Expose the player's transport controls to agents (XR_DXR_mcp_tools). Inert when the
     // runtime lacks the extension or the MCP capability gate is off.
@@ -660,6 +675,16 @@ void App::RenderOneFrame() {
             }
         }
 
+#if MEDIAPLAYER_PRO
+        // Pro: QC view mode + pan/zoom rewrite the source rects; the grade (exposure, CDL,
+        // LUT) and the QC shader mode are pushed to the renderer here, before the draw.
+        {
+            const bool stereoSrc = layout_ != StereoLayout::Mono && layout_ != StereoLayout::Dual;
+            pro_.ApplyViewTransform(uvs, frame.viewCount, stereoSrc && hasMedia_ && !isLogo_,
+                                    swapEyes_ != mediaEyeSwap_);
+            pro_.Tick(ProStatus());
+        }
+#endif
         // Diagnostic: dump the per-view geometry once per mode change.
         const char* mode = xr_.ActiveModeName();
         if (mode != prevMode_) {
@@ -694,6 +719,19 @@ void App::RenderOneFrame() {
                 contentRects[v].h = (uint32_t)((float)viewFit.h * sy + 0.5f);
             }
 
+#if MEDIAPLAYER_PRO
+            {
+                // The picture in window points (pointer mapping) and per-eye tile pixels (1:1).
+                uint32_t pw = 0, ph = 0;
+                window_.PointSize(pw, ph);
+                const float k = canvasW ? (float)pw / (float)canvasW : 1.0f;
+                proPicX_ = (float)viewFit.x * k;
+                proPicY_ = (float)viewFit.y * (canvasH ? (float)ph / (float)canvasH : 1.0f);
+                proPicW_ = (float)viewFit.w * k;
+                proPicH_ = (float)viewFit.h * (canvasH ? (float)ph / (float)canvasH : 1.0f);
+                proTileContentW_ = (float)contentRects[0].w;
+            }
+#endif
             // Build the draw list: each eye's content quad (scissor = its tile), then
             // mirror-fill ONLY the reconvergence de-occlusion strip (offset/2 wide) by
             // reflecting this eye's own content across the exposed edge (reflect-101). Any
@@ -744,6 +782,8 @@ void App::RenderOneFrame() {
                 XrSession::ViewRect fillVp{vpx, cr.y, cr.w, cr.h};
                 ViewUV mu{uvs[v].offX + uvs[v].scaleX, uvs[v].offY,
                           -uvs[v].scaleX, uvs[v].scaleY};  // mirror across the exposed edge
+                mu.otherDX = uvs[v].otherDX;  // Pro QC views: same other-eye lookup
+                mu.otherDY = uvs[v].otherDY;
                 drawVp[n] = fillVp;
                 drawClip[n] = gap;
                 drawUv[n] = mu;
@@ -786,7 +826,11 @@ void App::RenderOneFrame() {
     const bool wantHud =
         frame.shouldRender && xr_.HasHud() &&
         (imguiReady ? (showHud_ || uiState_.fadeAlpha > 0.001f || uiState_.toastAlpha > 0.001f ||
-                       uiState_.transitionAlpha > 0.001f)
+                       uiState_.transitionAlpha > 0.001f
+#if MEDIAPLAYER_PRO
+                       || pro_.KeepHudAwake()
+#endif
+                       )
                     : showHud_);
     if (wantHud) {
         uint32_t cw = 0, ch = 0;
@@ -989,6 +1033,9 @@ void App::BuildTransportUI() {
     actions.ToggleAutoConv = [this] { SetAutoConv(!autoConvEnabled_, "ui"); };
 
     ui::BuildTransportUI(uiState_, actions);
+#if MEDIAPLAYER_PRO
+    if (showHud_) pro_.BuildUI(ProStatus(), uiState_.fadeAlpha);
+#endif
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     // A focused text field (the Stream URL popup) owns the keyboard: no hotkeys.
     window_.SetKeyboardCaptured(ImGui::GetIO().WantTextInput);
@@ -1051,7 +1098,7 @@ void App::UpdateFps() {
 
         char title[160];
         std::snprintf(title, sizeof(title),
-                      "DisplayXR Stereo Media Player  —  %.0f fps  —  %s", fps_,
+                      MP_PRODUCT_NAME "  —  %.0f fps  —  %s", fps_,
                       xr_.ActiveModeName());
         window_.SetTitle(title);
         LOG_DEBUG("fps=%.1f mode=%s", fps_, xr_.ActiveModeName());
@@ -1909,6 +1956,9 @@ void App::HandleDroppedPaths(std::vector<std::string> paths) {
                         std::make_move_iterator(inFolder.end()));
             continue;
         }
+#if MEDIAPLAYER_PRO
+        if (pro_.HandleDroppedPath(p)) continue;  // a .cube / CDL loads as a look, not media
+#endif
         if (MediaSource::IsSupported(p)) good.push_back(std::move(p));  // keep drop order
         else ++rejected;
     }
@@ -2697,5 +2747,90 @@ void App::NativeFileCallback(void* userdata, const char* const* filelist, int /*
     self->nativePath_ = picked;   // empty = cancel/error → main loop just clears pending
     self->hasNativePath_ = true;
 }
+
+#if MEDIAPLAYER_PRO
+// ---------------------------------------------------------------------------
+// Media Player Pro glue: the only place App hands trunk state to src/pro/.
+// ---------------------------------------------------------------------------
+
+void App::InitPro() {
+    pro::Host h;
+    h.getConvergence = [this] { return convergence_; };
+    h.setConvergence = [this](float c) {
+        convergence_ = std::clamp(c, -kConvergenceMax, kConvergenceMax);
+    };
+    h.getSwapEyes = [this] { return swapEyes_; };
+    h.setSwapEyes = [this](bool s) { swapEyes_ = s; };
+    h.toast = [this](const std::string& t) { ShowToast(t); };
+    h.pointToContent = [this](float x, float y, float& u, float& v) {
+        if (proPicW_ < 1.f || proPicH_ < 1.f) return false;
+        u = (x - proPicX_) / proPicW_;
+        v = (y - proPicY_) / proPicH_;
+        return u >= 0.f && u <= 1.f && v >= 0.f && v <= 1.f;
+    };
+    h.contentSizePoints = [this](float& w, float& hh) {
+        w = proPicW_;
+        hh = proPicH_;
+        return w > 1.f && hh > 1.f;
+    };
+    h.oneToOneZoom = [this] {
+        // One source pixel per tile pixel: the eye's source width over its on-tile width.
+        const bool sbs = layout_ != StereoLayout::Mono && layout_ != StereoLayout::Dual;
+        const float eyeW = (float)mediaW_ * (sbs ? 0.5f : 1.0f);
+        return proTileContentW_ > 1.f ? std::max(1.0f, eyeW / proTileContentW_) : 1.0f;
+    };
+    h.isFullscreen = [this] { return window_.IsFullscreen(); };
+    h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
+    pro_.Init(&renderer_, window_.SdlWindow(), std::move(h));
+
+    // Pro input rides the same SDL event hook as ImGui, after ImGui has seen the event.
+    const bool imguiOk = imgui_.Ready();
+    window_.SetEventHook([this, imguiOk](void* ev) {
+        bool wantMouse = false, wantKeys = false;
+        if (imguiOk) {
+            imgui_.ProcessEvent(ev);
+            wantMouse = imgui_.WantCaptureMouse();
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+            wantKeys = ImGui::GetIO().WantTextInput;
+#endif
+        }
+        pro_.HandleEvent(ev, wantMouse, wantKeys);
+    });
+
+    if (launch_.lutPath.empty())
+        if (const char* e = std::getenv("MEDIAPLAYER_LUT")) launch_.lutPath = e;
+    if (launch_.cdlPath.empty())
+        if (const char* e = std::getenv("MEDIAPLAYER_CDL")) launch_.cdlPath = e;
+    pro_.ApplyTestEnv();
+    if (!launch_.lutPath.empty()) pro_.LoadLut(launch_.lutPath);
+    if (!launch_.cdlPath.empty()) pro_.LoadCdl(launch_.cdlPath);
+    LOG_INFO("Media Player Pro: ready (lut=%s cdl=%s)", launch_.lutPath.c_str(), launch_.cdlPath.c_str());
+}
+
+pro::Status App::ProStatus() const {
+    pro::Status st;
+    st.isLogo = isLogo_ || !hasMedia_;
+    st.stereo = hasMedia_ && !isLogo_ && layout_ != StereoLayout::Mono && layout_ != StereoLayout::Dual;
+    st.layoutName = MediaSource::LayoutName(layout_);
+    st.width = mediaW_;
+    st.height = mediaH_;
+    st.panelFps = fps_;
+    st.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
+    if (isLive_) {
+        st.sourceKind = "Camera";
+        st.sourceLabel = camera_.DeviceName();
+        st.sourceFps = camera_.GetStats().deliveredFps;
+        st.frameAgeMs = (float)liveAgeMs_;
+    } else if (isStream_) {
+        st.sourceKind = "Stream";
+        st.sourceLabel = stream::UrlHost(streamUrl_);
+        st.sourceFps = video_.GetStreamStats().fpsIn;
+    } else if (!currentMediaPath_.empty()) {
+        st.sourceKind = isVideo_ ? "Video" : "Image";
+        st.sourceLabel = std::filesystem::path(currentMediaPath_).filename().string();
+    }
+    return st;
+}
+#endif  // MEDIAPLAYER_PRO
 
 } // namespace mp

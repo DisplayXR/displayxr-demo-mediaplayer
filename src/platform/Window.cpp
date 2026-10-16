@@ -188,7 +188,10 @@ bool Window::PumpEvents() {
             else if (e.key.key == SDLK_RIGHTBRACKET) ++frameStepRequest_;  // ']' next frame
             else if (e.key.key == SDLK_LEFTBRACKET) --frameStepRequest_;   // '[' prev frame
             else if (!e.key.repeat) {
-                if (e.key.key == SDLK_ESCAPE) return false;
+                if (e.key.key == SDLK_ESCAPE) {
+                    if (escapeQuits_) return false;
+                    if (fullscreen_) ToggleFullscreen();
+                }
                 if (e.key.key == SDLK_V) cycleModeRequested_ = true;
                 if (e.key.key == SDLK_TAB && (e.key.mod & SDL_KMOD_SHIFT)) toggleHudRequested_ = true;
                 if (e.key.key == SDLK_0) resetConvergenceRequested_ = true;

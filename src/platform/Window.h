@@ -101,6 +101,10 @@ public:
     void SetEventHook(std::function<void(void*)> hook);
 
     void ToggleFullscreen();      // `F` key, and the ImGui button
+    bool IsFullscreen() const { return fullscreen_; }
+    // Escape quits (default, the base player) or only leaves full screen (Media Player Pro,
+    // where a stray Escape must never end a live monitoring session).
+    void SetEscapeQuits(bool q) { escapeQuits_ = q; }
 
     // Pump SDL events; returns false when the user asked to quit (close / Esc).
     bool PumpEvents();
@@ -214,6 +218,7 @@ private:
     bool mouseLeft_ = false;
     bool mouseInWindow_ = true;
     bool fullscreen_ = false;
+    bool escapeQuits_ = true;
     std::function<void()> liveResizeCb_;
     std::function<void(void*)> eventHook_;
     bool eventWatchAdded_ = false;

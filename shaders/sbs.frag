@@ -7,6 +7,11 @@
 //
 // uvOffset/uvScale select the SBS half: left eye = offset(0,0) scale(0.5,1), right eye =
 // offset(0.5,0) scale(0.5,1); a 2D source uses offset(0,0) scale(1,1).
+//
+// MP_GRADE (defined for the DESKTOP build by scripts/gen_shaders.sh) adds the Media
+// Player Pro grade (exposure, ASC CDL, 3D LUT at binding 3) and the QC views, and
+// grows the push block to 112 bytes. The Android leg compiles this same file WITHOUT
+// it, so its 3-binding layout and 28-byte push block (sbs_renderer.cpp) are unchanged.
 #version 450
 
 layout(location = 0) in vec2 vUV;
@@ -15,6 +20,9 @@ layout(location = 0) out vec4 outColor;
 layout(binding = 0) uniform sampler2D plane0;  // RGBA (mode 0) or Y (modes 1/2)
 layout(binding = 1) uniform sampler2D plane1;  // U (I420) or interleaved UV (NV12)
 layout(binding = 2) uniform sampler2D plane2;  // V (I420 only)
+#ifdef MP_GRADE
+layout(binding = 3) uniform sampler3D lut3d;   // grade LUT (Media Player Pro); 1x1x1 dummy otherwise
+#endif
 
 layout(push_constant) uniform PushConstants {
     vec2 uvOffset;
@@ -22,6 +30,17 @@ layout(push_constant) uniform PushConstants {
     int mode;        // 0 = RGBA, 1 = I420, 2 = NV12
     float fullRange; // 1 = full/JPEG range, 0 = limited/MPEG range
     float srgbTarget;// 1 = the colour attachment is an _SRGB view (encodes on store)
+#ifdef MP_GRADE
+    // --- Grade + QC (Media Player Pro; all identity / 0 in the base player) ---------
+    int qcMode;      // 0 = normal, 1 = difference |this eye - other eye|, 2 = anaglyph (red/cyan)
+    vec2 otherDelta; // uv offset from this eye's sample to the same point in the other eye
+    float exposure;  // stops, applied in linear light
+    float lutOn;     // 1 = sample lut3d
+    vec4 cdlSlope;   // .rgb = ASC slope, .a = ASC saturation
+    vec4 cdlOffset;  // .rgb = ASC offset, .a = 1 when the CDL is on
+    vec4 cdlPower;   // .rgb = ASC power
+    vec4 lutDomain;  // .x = domain min, .y = 1/(max-min), .z = LUT size N
+#endif
 } pc;
 
 // sRGB EOTF: display-referred (encoded) -> scene-linear. Every value this shader
@@ -38,13 +57,9 @@ vec4 EncodeForTarget(vec4 c) {
     return c;
 }
 
-void main() {
-    vec2 uv = pc.uvOffset + vUV * pc.uvScale;
-
-    if (pc.mode == 0) {
-        outColor = EncodeForTarget(texture(plane0, uv));
-        return;
-    }
+// Fetch the display-referred RGB at `uv` (RGBA texture or planar YUV).
+vec3 SampleSource(vec2 uv) {
+    if (pc.mode == 0) return texture(plane0, uv).rgb;
 
     float y = texture(plane0, uv).r;
     float u, v;
@@ -72,5 +87,55 @@ void main() {
     vec3 rgb = vec3(yb + 1.5748 * vb,
                     yb - 0.1873 * ub - 0.4681 * vb,
                     yb + 1.8556 * ub);
-    outColor = EncodeForTarget(vec4(clamp(rgb, 0.0, 1.0), 1.0));
+    return clamp(rgb, 0.0, 1.0);
+}
+
+#ifdef MP_GRADE
+vec3 SceneLinearToDisplayReferred(vec3 c) {
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+
+// Media Player Pro grade, in the order an on-set chain applies it:
+// exposure (linear light) -> ASC CDL (on the encoded signal) -> 3D LUT.
+// Every stage is skipped at its identity, so the base player pays three branches.
+vec3 Grade(vec3 c) {
+    if (pc.exposure != 0.0) {
+        vec3 lin = DisplayReferredToSceneLinear(clamp(c, 0.0, 1.0)) * exp2(pc.exposure);
+        c = SceneLinearToDisplayReferred(clamp(lin, 0.0, 1.0));
+    }
+    if (pc.cdlOffset.a > 0.5) {
+        c = pow(clamp(c * pc.cdlSlope.rgb + pc.cdlOffset.rgb, 0.0, 1.0), pc.cdlPower.rgb);
+        float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        c = clamp(luma + pc.cdlSlope.a * (c - luma), 0.0, 1.0);
+    }
+    if (pc.lutOn > 0.5) {
+        // Map the LUT domain onto texel centres: N samples span [0.5/N, 1 - 0.5/N].
+        vec3 t = clamp((c - pc.lutDomain.x) * pc.lutDomain.y, 0.0, 1.0);
+        float n = pc.lutDomain.z;
+        c = texture(lut3d, t * ((n - 1.0) / n) + 0.5 / n).rgb;
+    }
+    return c;
+}
+#else
+vec3 Grade(vec3 c) { return c; }
+#endif
+
+void main() {
+    vec2 uv = pc.uvOffset + vUV * pc.uvScale;
+    vec3 c = Grade(SampleSource(uv));
+
+#ifdef MP_GRADE
+    if (pc.qcMode == 1) {          // eye difference: alignment / sync check
+        vec3 o = Grade(SampleSource(uv + pc.otherDelta));
+        c = clamp(abs(c - o) * 4.0, 0.0, 1.0);
+    } else if (pc.qcMode == 2) {   // anaglyph: red = this (left) eye, cyan = the other
+        vec3 o = Grade(SampleSource(uv + pc.otherDelta));
+        float l = dot(c, vec3(0.299, 0.587, 0.114));
+        float r = dot(o, vec3(0.299, 0.587, 0.114));
+        c = vec3(l, r, r);
+    }
+#endif
+
+    float a = pc.mode == 0 ? texture(plane0, uv).a : 1.0;
+    outColor = EncodeForTarget(vec4(c, a));
 }

@@ -3,6 +3,18 @@
 
 #include <winver.h>
 
+// Media Player Pro is the same trunk built with MEDIAPLAYER_PRO=1 (docs/PRO.md); CMake
+// passes the target's compile definitions to the resource compiler too.
+#if MEDIAPLAYER_PRO
+#define MP_RC_DESCRIPTION  "DisplayXR Media Player Pro"
+#define MP_RC_INTERNAL     "mediaplayer_pro_handle_vk_win"
+#define MP_RC_ORIGINAL     "mediaplayer_pro_handle_vk_win.exe"
+#else
+#define MP_RC_DESCRIPTION  "DisplayXR Media Player"
+#define MP_RC_INTERNAL     "mediaplayer_handle_vk_win"
+#define MP_RC_ORIGINAL     "mediaplayer_handle_vk_win.exe"
+#endif
+
 // Explorer/file icon — multi-size .ico generated from the 2D workspace
 // logo (displayxr/icon.png); the SBS 3D logo stays shell-only.
 1 ICON "../displayxr/icon.ico"
@@ -21,12 +33,12 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName",      "The DisplayXR Project"
-            VALUE "FileDescription",  "DisplayXR Media Player"
+            VALUE "FileDescription",  MP_RC_DESCRIPTION
             VALUE "FileVersion",      "1.0.0.0"
-            VALUE "InternalName",     "mediaplayer_handle_vk_win"
+            VALUE "InternalName",     MP_RC_INTERNAL
             VALUE "LegalCopyright",   "Copyright 2026 The DisplayXR Project and its contributors"
-            VALUE "OriginalFilename", "mediaplayer_handle_vk_win.exe"
-            VALUE "ProductName",      "DisplayXR Media Player"
+            VALUE "OriginalFilename", MP_RC_ORIGINAL
+            VALUE "ProductName",      MP_RC_DESCRIPTION
             VALUE "ProductVersion",   "1.0.0.0"
         END
     END

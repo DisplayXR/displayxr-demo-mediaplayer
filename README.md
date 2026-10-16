@@ -236,6 +236,14 @@ Kill the sender to watch it reconnect, then start it again and the picture comes
 | `MEDIAPLAYER_URL=<u>` | opens at launch when the command line names nothing else, and prefills the Stream URL field |
 | **Ctrl+U** | the Stream URL field |
 
+## Media Player Pro (Windows)
+
+The same source tree also builds **Media Player Pro** (`mediaplayer_pro_handle_vk_win`), a
+3D monitoring and review player: everything above plus an inspector panel, QC views (left,
+right, eye difference, anaglyph), pan/zoom, and a grade (exposure, ASC CDL, `.cube` 3D
+LUT). It has its own installer (`DisplayXRMediaPlayerProSetup-*.exe`, released on
+`pro-v*` tags) and is not part of the DisplayXR bundle. See [`docs/PRO.md`](docs/PRO.md).
+
 ## Requirements
 
 - A working DisplayXR runtime install (or dev build) — this app cannot run without it.

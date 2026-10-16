@@ -7,7 +7,9 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_DIR}"
 
 glslangValidator -V shaders/fullscreen.vert --vn g_fullscreenVertSpv -o /tmp/_v.h
-glslangValidator -V shaders/sbs.frag        --vn g_sbsFragSpv        -o /tmp/_f.h
+# -DMP_GRADE: the desktop build carries the Pro grade + QC views (see shaders/sbs.frag).
+# The Android leg compiles shaders/sbs.frag itself, without it.
+glslangValidator -V -DMP_GRADE shaders/sbs.frag --vn g_sbsFragSpv  -o /tmp/_f.h
 
 {
   cat <<'HDR'

@@ -1,0 +1,338 @@
+; DisplayXR Media Player Pro — Windows Installer
+;
+; Media Player Pro is the Media Player trunk built with MEDIAPLAYER_PRO=1 (docs/PRO.md).
+; It ships its OWN installer and release tags (pro-v*) and is deliberately NOT part of
+; the DisplayXR meta-bundle or versions.json. It installs side by side with the demo
+; Media Player (different folder, registry keys, manifest and shortcut).
+; Copyright 2026, DisplayXR
+; SPDX-License-Identifier: Apache-2.0
+;
+; Build: makensis /DVERSION=0.1.0 /DBIN_DIR=<build-dir> /DSOURCE_DIR=<repo-root> /DOUTPUT_DIR=<output-dir> DisplayXRMediaPlayerProInstaller.nsi
+;
+; Hard-prereqs the DisplayXR runtime (HKLM\Software\DisplayXR\Runtime\InstallPath).
+; Installs the Pro exe + its runtime DLLs (SDL3 + FFmpeg) + a bundled sample
+; stereo image to Program Files\DisplayXR\Apps\MediaPlayerPro\. Drops a
+; registered-mode app manifest under %ProgramData%\DisplayXR\apps\ so the
+; DisplayXR Shell launcher discovers the tile (system-wide; installer is elevated).
+;
+; The OpenXR loader is statically linked into the exe (the CMake build fetches +
+; builds the Khronos loader from source), so — unlike the model/gauss demos —
+; there is no openxr_loader.dll to ship next to the exe.
+
+!ifndef VERSION
+    !define VERSION "0.0.0"
+!endif
+!ifndef VERSION_MAJOR
+    !define VERSION_MAJOR "0"
+!endif
+!ifndef VERSION_MINOR
+    !define VERSION_MINOR "0"
+!endif
+!ifndef VERSION_PATCH
+    !define VERSION_PATCH "0"
+!endif
+
+!ifndef BIN_DIR
+    !define BIN_DIR "${__FILEDIR__}\..\build\Release"
+!endif
+!ifndef SOURCE_DIR
+    !define SOURCE_DIR "${__FILEDIR__}\.."
+!endif
+!ifndef OUTPUT_DIR
+    !define OUTPUT_DIR "${__FILEDIR__}"
+!endif
+
+;--------------------------------
+; Code signing (SIGN_CMD passed from build-installer.bat; empty/absent =
+; unsigned build). SIGN_CMD carries no secret — on a signing-capable build
+; machine it points at the configured signer; elsewhere it is absent and the
+; build is unsigned.
+;
+; The installer .exe is signed via !finalize. The UNINSTALLER is signed via a
+; two-pass build instead of !uninstfinalize (which is unreliable — the
+; uninstaller NSIS writes at install time inherits the signed installer's
+; cert-table pointer, which can dangle past the smaller uninstaller file =>
+; effectively unsigned): compile an INNER installer whose only job is to
+; WriteUninstaller to %TEMP% and Quit; run it; sign that %TEMP%\Uninstall.exe;
+; then File-include the pre-signed uninstaller in the real pass. INNER is
+; RequestExecutionLevel user so it never triggers UAC from makensis.
+!ifndef INNER
+    !ifdef SIGN_CMD
+        !if "${SIGN_CMD}" != ""
+            !finalize '${SIGN_CMD} "%1"'
+            !makensis '-DINNER "-DVERSION=${VERSION}" "-DVERSION_MAJOR=${VERSION_MAJOR}" "-DVERSION_MINOR=${VERSION_MINOR}" "-DVERSION_PATCH=${VERSION_PATCH}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DBIN_DIR=${BIN_DIR}" "-DOUTPUT_DIR=${OUTPUT_DIR}" "${__FILE__}"' = 0
+            !system '"$%TEMP%\DisplayXRMediaPlayerProSetup_inner.exe"' = 2
+            !system '${SIGN_CMD} "$%TEMP%\Uninstall.exe"' = 0
+            !define USE_PRESIGNED_UNINST
+        !endif
+    !endif
+!endif
+
+;--------------------------------
+; General
+
+Name "DisplayXR Media Player Pro ${VERSION}"
+!ifdef INNER
+    ; Throwaway inner installer: only emits the uninstaller to %TEMP%.
+    OutFile "$%TEMP%\DisplayXRMediaPlayerProSetup_inner.exe"
+    RequestExecutionLevel user
+!else
+    OutFile "${OUTPUT_DIR}\DisplayXRMediaPlayerProSetup-${VERSION}.exe"
+    RequestExecutionLevel admin
+!endif
+InstallDir "$PROGRAMFILES64\DisplayXR\Apps\MediaPlayerPro"
+InstallDirRegKey HKLM "Software\DisplayXR\Apps\MediaPlayerPro" "InstallPath"
+ShowInstDetails show
+ShowUninstDetails show
+
+!include "MUI2.nsh"
+!include "FileFunc.nsh"
+!include "x64.nsh"
+!include "LogicLib.nsh"
+!include "WordFunc.nsh"
+
+;--------------------------------
+; Abort a pre-flight check without ever showing a modal in silent mode.
+;
+; NSIS does NOT suppress MessageBox under /S — it shows and blocks forever.
+; The DisplayXR meta-bundle runs every child installer as
+; `ExecWait '<child> /S'` and aborts the chain on a non-zero exit, so a modal
+; here would hang the ENTIRE bundle against a window nobody can see. In silent
+; mode set a distinct exit code instead; the bundle already surfaces that as
+; "<component> installer exited with code $0. Aborting bundle."
+;
+; Codes: 3 = not 64-bit, 4 = runtime absent, 5 = runtime below the floor.
+; (2 is reserved — the INNER uninstaller-emitting pass exits 2 by design.)
+!macro AbortWithReason CODE MSG
+    ${If} ${Silent}
+        SetErrorLevel ${CODE}
+    ${Else}
+        MessageBox MB_ICONSTOP "${MSG}"
+    ${EndIf}
+    Abort
+!macroend
+
+;--------------------------------
+; UI
+
+!define MUI_ABORTWARNING
+
+; Installer / wizard / uninstaller icon — the demo's own (rounded) app logo.
+!define MUI_ICON   "${SOURCE_DIR}\displayxr\icon.ico"
+!define MUI_UNICON "${SOURCE_DIR}\displayxr\icon.ico"
+!define MUI_WELCOMEPAGE_TITLE "DisplayXR Media Player Pro Setup"
+!define MUI_WELCOMEPAGE_TEXT "This will install Media Player Pro, the 3D monitoring and review player for the DisplayXR runtime.$\r$\n$\r$\nThe DisplayXR runtime must be installed first."
+
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+
+!insertmacro MUI_LANGUAGE "English"
+
+;--------------------------------
+; Pre-flight: hard-prereq the runtime
+
+Function .onInit
+!ifdef INNER
+    ; Inner pass only: emit the uninstaller to %TEMP% (the binary that gets
+    ; signed and File-included by the real pass) then bail — no UI, no install.
+    ; This whole path is absent from the real installer.
+    SetSilent silent
+    WriteUninstaller "$%TEMP%\Uninstall.exe"
+    Quit
+!endif
+    ${IfNot} ${RunningX64}
+        !insertmacro AbortWithReason 3 "DisplayXR requires 64-bit Windows."
+    ${EndIf}
+
+    ; HKLM\Software\DisplayXR\Runtime\InstallPath is set by the runtime
+    ; installer. NSIS is a 32-bit executable so HKLM access is silently
+    ; redirected through WOW6432Node by default; the runtime writes to the
+    ; 64-bit view, so switch views to match.
+    SetRegView 64
+    ReadRegStr $0 HKLM "Software\DisplayXR\Runtime" "InstallPath"
+    SetRegView 32
+    ${If} $0 == ""
+        !insertmacro AbortWithReason 4 "DisplayXR runtime is not installed.$\r$\n$\r$\nInstall the DisplayXR runtime first, then re-run this installer.$\r$\n$\r$\nGet it from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
+    ${EndIf}
+    ; Presence is the only hard gate. A minimum-version covenant can be added
+    ; here (VersionCompare against HKLM ...\Runtime "Version") once a verified
+    ; floor is established — see README "Runtime compatibility".
+FunctionEnd
+
+;--------------------------------
+; Install
+
+Section "Media Player Pro" SecPro
+    SectionIn RO
+
+    SetRegView 64
+    SetShellVarContext all
+
+    ; Kill any running instance so we can overwrite the exe + DLLs.
+    nsExec::ExecToLog 'taskkill /f /im mediaplayer_pro_handle_vk_win.exe'
+    Pop $0
+
+    SetOutPath "$INSTDIR"
+    File "${BIN_DIR}\mediaplayer_pro_handle_vk_win.exe"
+    ; Runtime DLLs the CMake build stages next to the exe: SDL3 + the FFmpeg
+    ; shared libs (libav*/libsw*). Wildcards keep us version-agnostic as the
+    ; FFmpeg soname bumps (e.g. avcodec-62.dll).
+    File "${BIN_DIR}\SDL3.dll"
+    File "${BIN_DIR}\avcodec-*.dll"
+    File "${BIN_DIR}\avformat-*.dll"
+    File "${BIN_DIR}\avutil-*.dll"
+    File "${BIN_DIR}\swscale-*.dll"
+    File "${BIN_DIR}\swresample-*.dll"
+
+    ; Bundled sample stereo image (auto-loaded by the Start Menu shortcut).
+    File "${SOURCE_DIR}\assets\test_LR_2x1.png"
+
+    ; Sidecar workspace manifest + real logos next to the exe (manifest spec:
+    ; <exe-dir>\displayxr\; generated by /make-app-logos from a live capture).
+    SetOutPath "$INSTDIR\displayxr"
+    File "${SOURCE_DIR}\displayxr\icon.png"
+    File "${SOURCE_DIR}\displayxr\icon_sbs.png"
+    ; idle.png + logo.png back the no-media idle screen (LoadIdleLogo resolves them at
+    ; <exe-dir>\displayxr\); without them the app falls back to the RED|BLUE test pattern.
+    File "${SOURCE_DIR}\displayxr\idle.png"
+    File "${SOURCE_DIR}\displayxr\logo.png"
+    File "${SOURCE_DIR}\displayxr\mediaplayer_pro_handle_vk_win.displayxr.json"
+    SetOutPath "$INSTDIR"
+
+    ; Registered-mode app manifest under %ProgramData%\DisplayXR\apps\ so the
+    ; shell launcher discovers the tile on workspace activate (manifest spec §2.2).
+    ; Registered mode uses app-specific icon names in the shared dir.
+    CreateDirectory "$APPDATA\DisplayXR\apps"
+    SetOutPath "$APPDATA\DisplayXR\apps"
+    File /oname=mediaplayer-pro.png "${SOURCE_DIR}\displayxr\icon.png"
+    File /oname=mediaplayer-pro_sbs.png "${SOURCE_DIR}\displayxr\icon_sbs.png"
+    SetOutPath "$INSTDIR"
+    FileOpen $0 "$APPDATA\DisplayXR\apps\mediaplayer-pro.displayxr.json" w
+    FileWrite $0 '{$\r$\n'
+    FileWrite $0 '  "schema_version": 1,$\r$\n'
+    FileWrite $0 '  "name": "Media Player Pro",$\r$\n'
+    FileWrite $0 '  "type": "3d",$\r$\n'
+    FileWrite $0 '  "category": "app",$\r$\n'
+    FileWrite $0 '  "display_mode": "auto",$\r$\n'
+    FileWrite $0 '  "description": "3D monitoring and review: live stereo cameras and streams, stereo files, LUT and CDL looks, convergence and QC views.",$\r$\n'
+    FileWrite $0 '  "icon": "mediaplayer-pro.png",$\r$\n'
+    FileWrite $0 '  "icon_3d": "mediaplayer-pro_sbs.png",$\r$\n'
+    FileWrite $0 '  "icon_3d_layout": "sbs-lr",$\r$\n'
+    ; Forward slashes so the JSON parses with any strict library.
+    ${WordReplace} "$INSTDIR" "\" "/" "+" $1
+    FileWrite $0 '  "exe_path": "$1/mediaplayer_pro_handle_vk_win.exe"$\r$\n'
+    FileWrite $0 '}$\r$\n'
+    FileClose $0
+
+    ; Registry breadcrumbs.
+    SetRegView 64
+    WriteRegStr HKLM "Software\DisplayXR\Apps\MediaPlayerPro" "InstallPath" "$INSTDIR"
+    WriteRegStr HKLM "Software\DisplayXR\Apps\MediaPlayerPro" "Version" "${VERSION}"
+
+    ; Add/Remove Programs entry.
+    ; In a signed build, install the pre-signed uninstaller produced by the
+    ; inner pass (two-pass signing — see the code-signing block in the header);
+    ; otherwise (unsigned build / CI) write it normally. $OUTDIR is already
+    ; $INSTDIR here, but set it explicitly so File /oname can't be misdirected.
+!ifdef USE_PRESIGNED_UNINST
+    SetOutPath "$INSTDIR"
+    File "/oname=Uninstall.exe" "$%TEMP%\Uninstall.exe"
+!else
+    WriteUninstaller "$INSTDIR\Uninstall.exe"
+!endif
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "DisplayName" "DisplayXR Media Player Pro"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "QuietUninstallString" "$\"$INSTDIR\Uninstall.exe$\" /S"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "InstallLocation" "$INSTDIR"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "DisplayIcon" "$INSTDIR\mediaplayer_pro_handle_vk_win.exe"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "Publisher" "DisplayXR"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "DisplayVersion" "${VERSION}"
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "VersionMajor" ${VERSION_MAJOR}
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "VersionMinor" ${VERSION_MINOR}
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "NoModify" 1
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "NoRepair" 1
+    ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+    IntFmt $0 "0x%08X" $0
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro" \
+        "EstimatedSize" "$0"
+SectionEnd
+
+Section "Start Menu Shortcut" SecShortcut
+    SetShellVarContext all
+    CreateDirectory "$SMPROGRAMS\DisplayXR"
+    ; Launch with no argument so the app opens on the DisplayXR idle screen (mark +
+    ; "Media Player"); the user opens media via the in-app picker (Open / Ctrl+O).
+    CreateShortCut "$SMPROGRAMS\DisplayXR\Media Player Pro.lnk" \
+        "$INSTDIR\mediaplayer_pro_handle_vk_win.exe" "" \
+        "$INSTDIR\mediaplayer_pro_handle_vk_win.exe" 0
+SectionEnd
+
+;--------------------------------
+; Uninstall
+
+Section "Uninstall"
+    SetRegView 64
+    SetShellVarContext all
+
+    nsExec::ExecToLog 'taskkill /f /im mediaplayer_pro_handle_vk_win.exe'
+    Pop $0
+
+    ; The DisplayXR Shell scans %ProgramData%\DisplayXR\apps\ and may hold an
+    ; open handle to the manifest; kill it so the Delete below can't silently
+    ; fail (mirrors the model/gauss demos). /REBOOTOK as belt-and-suspenders.
+    nsExec::ExecToLog 'taskkill /f /im displayxr-shell.exe'
+    Pop $0
+    Sleep 500
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\mediaplayer-pro.displayxr.json"
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\mediaplayer-pro.png"
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\mediaplayer-pro_sbs.png"
+    RMDir "$APPDATA\DisplayXR\apps"
+
+    ; Remove install dir contents.
+    Delete "$INSTDIR\mediaplayer_pro_handle_vk_win.exe"
+    Delete "$INSTDIR\*.dll"
+    Delete "$INSTDIR\test_LR_2x1.png"
+    Delete "$INSTDIR\displayxr\icon.png"
+    Delete "$INSTDIR\displayxr\icon_sbs.png"
+    Delete "$INSTDIR\displayxr\idle.png"
+    Delete "$INSTDIR\displayxr\logo.png"
+    Delete "$INSTDIR\displayxr\mediaplayer_pro_handle_vk_win.displayxr.json"
+    RMDir "$INSTDIR\displayxr"
+    Delete "$INSTDIR\Uninstall.exe"
+    RMDir "$INSTDIR"
+    RMDir "$PROGRAMFILES64\DisplayXR\Apps"
+
+    Delete "$SMPROGRAMS\DisplayXR\Media Player Pro.lnk"
+    ; Don't RMDir $SMPROGRAMS\DisplayXR — the runtime's own shortcuts may live there.
+
+    DeleteRegKey HKLM "Software\DisplayXR\Apps\MediaPlayerPro"
+    DeleteRegKey /ifempty HKLM "Software\DisplayXR\Apps"
+    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRMediaPlayerPro"
+SectionEnd
+
+;--------------------------------
+; Version metadata
+
+VIProductVersion "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}.0"
+VIAddVersionKey "ProductName" "DisplayXR Media Player Pro"
+VIAddVersionKey "CompanyName" "DisplayXR"
+VIAddVersionKey "LegalCopyright" "Copyright (c) 2026 DisplayXR"
+VIAddVersionKey "FileDescription" "DisplayXR Media Player Pro Installer"
+VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "ProductVersion" "${VERSION}"

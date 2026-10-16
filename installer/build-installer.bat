@@ -1,9 +1,20 @@
 @echo off
 :: SPDX-License-Identifier: Apache-2.0
-:: Build the Windows NSIS installer for the Stereo Media Player demo.
+:: Build the Windows NSIS installer for the Stereo Media Player demo, or - with the
+:: argument `pro` - for Media Player Pro (same trunk, own installer; docs/PRO.md).
 :: Requires the app to be built first (cmake --build), so its exe + staged
 :: runtime DLLs (SDL3 + FFmpeg) sit in the build dir.
+::   build-installer.bat        -> DisplayXRMediaPlayerSetup-%VERSION%.exe
+::   build-installer.bat pro    -> DisplayXRMediaPlayerProSetup-%VERSION%.exe
 setlocal
+set "MP_EXE=mediaplayer_handle_vk_win.exe"
+set "MP_NSI=DisplayXRMediaPlayerInstaller.nsi"
+set "MP_SETUP=DisplayXRMediaPlayerSetup"
+if /i "%~1"=="pro" (
+    set "MP_EXE=mediaplayer_pro_handle_vk_win.exe"
+    set "MP_NSI=DisplayXRMediaPlayerProInstaller.nsi"
+    set "MP_SETUP=DisplayXRMediaPlayerProSetup"
+)
 set "REPO=%~dp0.."
 set "OUT_DIR=%~dp0"
 if "%OUT_DIR:~-1%"=="\" set "OUT_DIR=%OUT_DIR:~0,-1%"
@@ -11,7 +22,7 @@ if "%OUT_DIR:~-1%"=="\" set "OUT_DIR=%OUT_DIR:~0,-1%"
 :: Locate the built binary. VS multi-config drops it in build\Release; the Ninja
 :: single-config build (CI) drops it in build\. Honor a caller-set BIN_DIR first.
 if "%BIN_DIR%"=="" (
-    if exist "%REPO%\build\Release\mediaplayer_handle_vk_win.exe" (
+    if exist "%REPO%\build\Release\%MP_EXE%" (
         set "BIN_DIR=%REPO%\build\Release"
     ) else (
         set "BIN_DIR=%REPO%\build"
@@ -30,8 +41,8 @@ if "%VERSION_MAJOR%"=="" set "VERSION_MAJOR=0"
 if "%VERSION_MINOR%"=="" set "VERSION_MINOR=0"
 if "%VERSION_PATCH%"=="" set "VERSION_PATCH=0"
 
-if not exist "%BIN_DIR%\mediaplayer_handle_vk_win.exe" (
-    echo ERROR: demo binary not found at %BIN_DIR%\mediaplayer_handle_vk_win.exe
+if not exist "%BIN_DIR%\%MP_EXE%" (
+    echo ERROR: binary not found at %BIN_DIR%\%MP_EXE%
     echo Build it first: cmake --build build --config Release
     exit /b 1
 )
@@ -62,7 +73,7 @@ if defined SIGN_CMD (
     echo === Signing skipped [SIGN_CMD not set] - installer will be UNSIGNED ===
 )
 
-"%MAKENSIS%" /DVERSION=%VERSION% /DVERSION_MAJOR=%VERSION_MAJOR% /DVERSION_MINOR=%VERSION_MINOR% /DVERSION_PATCH=%VERSION_PATCH% "/DBIN_DIR=%BIN_DIR%" "/DSOURCE_DIR=%REPO%" "/DOUTPUT_DIR=%OUT_DIR%" %SIGN_ARG% "%~dp0DisplayXRMediaPlayerInstaller.nsi" || exit /b 1
+"%MAKENSIS%" /DVERSION=%VERSION% /DVERSION_MAJOR=%VERSION_MAJOR% /DVERSION_MINOR=%VERSION_MINOR% /DVERSION_PATCH=%VERSION_PATCH% "/DBIN_DIR=%BIN_DIR%" "/DSOURCE_DIR=%REPO%" "/DOUTPUT_DIR=%OUT_DIR%" %SIGN_ARG% "%~dp0%MP_NSI%" || exit /b 1
 
 echo === DONE ===
-echo Installer: %OUT_DIR%\DisplayXRMediaPlayerSetup-%VERSION%.exe
+echo Installer: %OUT_DIR%\%MP_SETUP%-%VERSION%.exe
