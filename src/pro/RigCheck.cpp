@@ -95,7 +95,7 @@ float DeltaE76(const float a[3], const float b[3]) {
                      (la[2] - lb[2]) * (la[2] - lb[2]));
 }
 
-bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, EyePair& out) {
+bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, EyePair& out, bool swapEyes) {
     if (layout != StereoLayout::SbsFull && layout != StereoLayout::SbsHalf) return false;
     if (f.width < 64 || f.height < 32 || f.plane[0].empty()) return false;
     if (f.format != PixFormat::NV12 && f.format != PixFormat::I420 && f.format != PixFormat::P016) return false;
@@ -113,12 +113,14 @@ bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, E
     out.h = ah;
     out.fullEyeW = (float)fullEye;
     out.fullH = (float)f.height;
+    out.xStretch = layout == StereoLayout::SbsHalf ? 2.f : 1.f;  // half-SBS eyes are squeezed
     out.left.resize((size_t)aw * ah);
     out.right.resize((size_t)aw * ah);
     const int W = f.width;
     for (int eye = 0; eye < 2; ++eye) {
         std::vector<float>& dst = eye == 0 ? out.left : out.right;
-        const int x0 = eye * fullEye;
+        // the eye as SHOWN: with the eyes swapped the right half feeds the left eye
+        const int x0 = (eye ^ (swapEyes ? 1 : 0)) * fullEye;
         for (int y = 0; y < ah; ++y) {
             const int sy0 = std::min(f.height - 2, (int)(y * sy));
             const size_t r0 = (size_t)sy0 * W, r1 = r0 + W;
@@ -227,8 +229,42 @@ Result Measure(const EyePair& e, const Options& o) {
             r.matchY.push_back(((float)by + bs * 0.5f) / (float)H);
         }
     }
+    // Outlier cut (median +- k x MAD) before any statistic: a block that locked onto the
+    // wrong repeat of a texture gives one wild dx / dy, and with few matches the 2nd / 98th
+    // percentiles ARE the extremes. dx keeps a wide floor (the scene's real depth spread,
+    // e.g. a -2 % foreground over a 0 % background, must survive); dy should be one value
+    // plus roll, so its floor is tight.
+    auto median = [](std::vector<float> v) {
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        return v[v.size() / 2];
+    };
+    if ((int)dxs.size() >= o.minMatches) {
+        const float mdx = median(dxs), mdy = median(dys);
+        std::vector<float> ax(dxs.size()), ay(dys.size());
+        for (size_t i = 0; i < dxs.size(); ++i) {
+            ax[i] = std::fabs(dxs[i] - mdx);
+            ay[i] = std::fabs(dys[i] - mdy);
+        }
+        const float tx = std::max(5.f * 1.4826f * median(ax), 0.03f * (float)W);
+        const float ty = std::max(4.f * 1.4826f * median(ay), 1.0f);
+        size_t k = 0;
+        for (size_t i = 0; i < dxs.size(); ++i) {
+            if (ax[i] > tx || ay[i] > ty) continue;
+            dxs[k] = dxs[i];
+            dys[k] = dys[i];
+            xs[k] = xs[i];
+            r.matchX[k] = r.matchX[i];
+            r.matchY[k] = r.matchY[i];
+            ++k;
+        }
+        dxs.resize(k);
+        dys.resize(k);
+        xs.resize(k);
+        r.matchX.resize(k);
+        r.matchY.resize(k);
+    }
     r.matches = (int)dxs.size();
-    if (r.matches < 4) return r;
+    if (r.matches < std::max(4, o.minMatches)) return r;
     r.ok = true;
     // parallax (% of eye width): x_right - x_left = dx
     r.parallaxPct.resize(dxs.size());
@@ -238,10 +274,8 @@ Result Measure(const EyePair& e, const Options& o) {
     auto pct = [&](float q) { return sorted[(size_t)std::lround(q * (float)(sorted.size() - 1))]; };
     r.nearPct = pct(0.02f);
     r.farPct = pct(0.98f);
-    std::vector<float> dy = dys;
-    std::nth_element(dy.begin(), dy.begin() + dy.size() / 2, dy.end());
     const float scaleY = e.fullH / (float)H;
-    r.verticalPx = dy[dy.size() / 2] * scaleY;
+    r.verticalPx = median(dys) * scaleY;
     // roll: least-squares slope of dy over x (both in analysis px)
     double mx = 0, my = 0;
     for (size_t i = 0; i < xs.size(); ++i) {
@@ -255,11 +289,75 @@ Result Measure(const EyePair& e, const Options& o) {
         sxy += (xs[i] - mx) * (dys[i] - my);
         sxx += (xs[i] - mx) * (xs[i] - mx);
     }
-    // dy is in rows of H, x in columns of W; convert both to full-res px before the angle
-    const double slope = sxx > 0 ? (sxy / sxx) * (scaleY / (e.fullEyeW / (float)W)) : 0.0;
+    // dy is in rows of H, x in columns of W; convert both to full-res DISPLAYED px before
+    // the angle (a half-SBS eye is shown twice as wide as it is stored)
+    const double slope = sxx > 0 ? (sxy / sxx) * (scaleY / (e.fullEyeW * e.xStretch / (float)W)) : 0.0;
     r.rollDeg = (float)(std::atan(slope) * 180.0 / 3.14159265358979);
     r.deltaE = DeltaE76(e.meanRgb[0], e.meanRgb[1]);
     return r;
+}
+
+namespace {
+
+// Mean absolute difference of two analysis-size luma images, b sampled at (x + sx, y + sy),
+// over the overlap minus a margin; each image's mean over that region is removed first so a
+// gain / offset mismatch between the eyes does not count. Every 2nd pixel: plenty, cheap.
+float Mad(const std::vector<float>& a, const std::vector<float>& b, int W, int H, int sx, int sy) {
+    const int m = 4;
+    const int x0 = std::max(m, m - sx), x1 = std::min(W - m, W - m - sx);
+    const int y0 = std::max(m, m - sy), y1 = std::min(H - m, H - m - sy);
+    if (x1 - x0 < 16 || y1 - y0 < 16) return -1.f;
+    double ma = 0, mb = 0;
+    int n = 0;
+    for (int y = y0; y < y1; y += 2)
+        for (int x = x0; x < x1; x += 2) {
+            ma += a[(size_t)y * W + x];
+            mb += b[(size_t)(y + sy) * W + x + sx];
+            ++n;
+        }
+    ma /= n;
+    mb /= n;
+    double d = 0;
+    for (int y = y0; y < y1; y += 2)
+        for (int x = x0; x < x1; x += 2)
+            d += std::fabs((a[(size_t)y * W + x] - ma) - (b[(size_t)(y + sy) * W + x + sx] - mb));
+    return (float)(d / n);
+}
+
+}  // namespace
+
+int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, int* lateEye) {
+    if (lateEye) *lateEye = 0;
+    const int n = (int)seq.size();
+    if (n < 2) return -1;
+    const EyePair& cur = seq.back();
+    const int W = cur.eyeW, H = cur.h;
+    for (const EyePair& e : seq)
+        if (e.eyeW != W || e.h != H || e.left.size() != (size_t)W * H || e.right.size() != (size_t)W * H) return -1;
+    // Motion: without it every candidate looks alike and there is nothing to measure.
+    const float motion = Mad(cur.left, seq[n - 2].left, W, H, 0, 0);
+    if (motion < 0.4f) return -1;
+    const int sx = (int)std::lround(shiftX), sy = (int)std::lround(shiftY);
+    // Candidates: right(now) vs left(now - k) -> the right eye is k late; left(now) vs
+    // right(now - k) -> the left eye is k late. Right sampled at +shift in both.
+    struct Cand {
+        float score;
+        int frames, late;
+    };
+    std::vector<Cand> c;
+    for (int k = 0; k < n; ++k) {
+        const float a = Mad(seq[n - 1 - k].left, cur.right, W, H, sx, sy);
+        if (a >= 0) c.push_back({a, k, k == 0 ? 0 : +1});
+        if (k == 0) continue;
+        const float b = Mad(cur.left, seq[n - 1 - k].right, W, H, sx, sy);
+        if (b >= 0) c.push_back({b, k, -1});
+    }
+    if (c.size() < 2) return -1;
+    std::sort(c.begin(), c.end(), [](const Cand& x, const Cand& y) { return x.score < y.score; });
+    // A clear winner only: the runner-up must be clearly worse.
+    if (c[1].score - c[0].score < 0.15f * c[1].score) return -1;
+    if (lateEye) *lateEye = c[0].late;
+    return c[0].frames;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -276,16 +374,32 @@ RigMonitor::~RigMonitor() {
 }
 
 void RigMonitor::Submit(const FrameRing::Frame& f, StereoLayout layout, int eyeOffsetFrames,
-                        const std::string& timecode) {
+                        const std::string& timecode, bool swapEyes) {
     const double now = LiveProducer::NowSeconds();
-    {
+    if (burst_.empty()) {
         std::lock_guard<std::mutex> lk(m_);
         if (pending_ || now - lastSubmit_ < 0.25) return;  // ~4 measurements a second
+    } else if (f.serial != burstLastSerial_ + 1 || layout != burstLayout_ || swapEyes != burstSwap_) {
+        burst_.clear();  // a dropped frame or a change: the burst is no longer consecutive
     }
     EyePair e;
-    if (!Downsample(f, layout, 640, e)) return;
+    if (!Downsample(f, layout, 640, e, swapEyes)) {
+        burst_.clear();
+        return;
+    }
+    if (burst_.empty()) burstStart_ = now;
+    burst_.push_back(std::move(e));
+    burstLastSerial_ = f.serial;
+    burstLayout_ = layout;
+    burstSwap_ = swapEyes;
+    // Hand over once the burst is complete - or, when frames keep dropping, after 0.5 s
+    // with the latest frame alone (spatial checks only, eye sync not measured).
+    const bool complete = (int)burst_.size() >= kSyncFrames;
+    if (!complete && now - burstStart_ < 0.5) return;
+    if (!complete) burst_.erase(burst_.begin(), burst_.end() - 1);
     std::lock_guard<std::mutex> lk(m_);
-    work_ = std::move(e);
+    work_ = std::move(burst_);
+    burst_.clear();
     pendingEyeOffset_ = eyeOffsetFrames;
     pendingTimecode_ = timecode;
     pending_ = true;
@@ -298,13 +412,23 @@ void RigMonitor::Worker() {
     while (true) {
         cv_.wait(lk, [this] { return stop_ || pending_; });
         if (stop_) return;
-        EyePair e = std::move(work_);
+        std::vector<EyePair> seq = std::move(work_);
+        work_.clear();
         const uint64_t gen = generation_;
         const int eyeOffset = pendingEyeOffset_;
         const std::string tc = pendingTimecode_;
         lk.unlock();
         const auto t0 = std::chrono::steady_clock::now();
-        Result r = Measure(e);
+        Result r = seq.empty() ? Result{} : Measure(seq.back());
+        if (r.ok && seq.size() >= 2) {
+            // remove the rig's mean offset first: median parallax and the vertical error
+            std::vector<float> p = r.parallaxPct;
+            std::nth_element(p.begin(), p.begin() + p.size() / 2, p.end());
+            const EyePair& e = seq.back();
+            const float shiftX = p[p.size() / 2] / 100.f * (float)e.eyeW;
+            const float shiftY = e.fullH > 0 ? r.verticalPx * (float)e.h / e.fullH : 0.f;
+            r.eyeSyncMeasuredFrames = MeasureEyeSync(seq, shiftX, shiftY, &r.eyeSyncLateEye);
+        }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         lk.lock();
         pending_ = false;
@@ -319,62 +443,93 @@ void RigMonitor::Worker() {
         s.verticalPx = r.verticalPx;
         s.deltaE = r.deltaE;
         s.eyeOffsetFrames = eyeOffset;
-        history_.push_back(s);
-        while (!history_.empty() && s.t - history_.front().t > 120.0) history_.pop_front();
-        UpdateAlerts(s, tc);
+        s.eyeSyncMeasured = r.eyeSyncMeasuredFrames;
+        s.eyeSyncLateEye = r.eyeSyncLateEye;
+        AddSampleLocked(s, tc);
     }
 }
 
-// Under m_. A budget overrun becomes an alert once it is over and lasted >= 0.5 s.
+void RigMonitor::AddSample(const Sample& s, const std::string& tc) {
+    std::lock_guard<std::mutex> lk(m_);
+    AddSampleLocked(s, tc);
+}
+
+void RigMonitor::AddSampleLocked(const Sample& s, const std::string& tc) {
+    history_.push_back(s);
+    while (!history_.empty() && s.t - history_.front().t > 120.0) history_.pop_front();
+    UpdateAlerts(s, tc);
+}
+
+namespace {
+// The alert texts, per run: near, far, vertical, colour.
+const char* const kClosedFmt[4] = {
+    "Foreground at %+.1f%% for %.0f s (near limit %+.1f%%)",
+    "Background at %+.1f%% for %.0f s (far limit %+.1f%%)",
+    "Vertical error %.1f px for %.0f s (limit %.1f px)",
+    "Colour mismatch dE %.1f for %.0f s (limit %.1f)",
+};
+const char* const kOpenFmt[4] = {
+    "Foreground at %+.1f%% for %.0f s (now)",
+    "Background at %+.1f%% for %.0f s (now)",
+    "Vertical error %.1f px for %.0f s (now)",
+    "Colour mismatch dE %.1f for %.0f s (now)",
+};
+// An open run is closed when the picture has not measured for this long (a cut to black,
+// a lost signal): it would otherwise stay "now" until the next good sample.
+constexpr double kAlertExpireSec = 2.0;
+}  // namespace
+
+// Under m_. Ends run i at `end`: kept as an alert when it lasted >= 0.5 s.
+void RigMonitor::CloseRun(int i, double end, const std::string& endTc) {
+    Run& r = runs_[i];
+    if (r.since < 0) return;
+    const double dur = end - r.since;
+    if (dur >= 0.5) {
+        const float limits[] = {budget_.nearPct, budget_.farPct, budget_.maxVerticalPx, budget_.maxDeltaE};
+        Alert a;
+        a.start = r.since;
+        a.end = end;
+        char b[160];
+        std::snprintf(b, sizeof(b), kClosedFmt[i], r.worst, std::max(1.0, std::round(dur)), limits[i]);
+        a.what = b;
+        a.timecode = r.tc;
+        a.endTimecode = endTc;
+        a.wallClock = r.clock;
+        alerts_.push_back(a);
+        if (alerts_.size() > 20) alerts_.erase(alerts_.begin());
+    }
+    r.since = -1;
+}
+
+// Under m_. A budget overrun becomes an alert once it is over and lasted >= 0.5 s. Samples
+// that did not measure leave the runs alone, unless they go on for kAlertExpireSec: then
+// every open run closes at the last good sample, with its timecode.
 void RigMonitor::UpdateAlerts(const Sample& s, const std::string& tc) {
-    if (!s.ok) return;
-    struct Run {
-        bool over;
-        float value;
-        double& since;
-        float& worst;
-        std::string& tcStart;
-        std::string& clock;
-        bool lowerIsWorse;
-        const char* fmt;
-    };
-    Run runs[] = {
-        {s.nearPct < budget_.nearPct, s.nearPct, nearSince_, nearWorst_, nearTc_, nearClock_, true,
-         "Foreground at %+.1f%% for %.0f s (near limit %+.1f%%)"},
-        {s.farPct > budget_.farPct, s.farPct, farSince_, farWorst_, farTc_, farClock_, false,
-         "Background at %+.1f%% for %.0f s (far limit %+.1f%%)"},
-        {std::fabs(s.verticalPx) > budget_.maxVerticalPx, std::fabs(s.verticalPx), vertSince_, vertWorst_, vertTc_,
-         vertClock_, false, "Vertical error %.1f px for %.0f s (limit %.1f px)"},
-        {s.deltaE > budget_.maxDeltaE, s.deltaE, colSince_, colWorst_, colTc_, colClock_, false,
-         "Colour mismatch dE %.1f for %.0f s (limit %.1f)"},
-    };
-    const float limits[] = {budget_.nearPct, budget_.farPct, budget_.maxVerticalPx, budget_.maxDeltaE};
+    if (!s.ok) {
+        if (notOkSince_ < 0) notOkSince_ = s.t;
+        if (s.t - notOkSince_ >= kAlertExpireSec && lastGoodT_ >= 0)
+            for (int i = 0; i < 4; ++i) CloseRun(i, lastGoodT_, lastGoodTc_);
+        return;
+    }
+    notOkSince_ = -1;
+    lastGoodT_ = s.t;
+    lastGoodTc_ = tc;
+    const bool over[4] = {s.nearPct < budget_.nearPct, s.farPct > budget_.farPct,
+                          std::fabs(s.verticalPx) > budget_.maxVerticalPx, s.deltaE > budget_.maxDeltaE};
+    const float value[4] = {s.nearPct, s.farPct, std::fabs(s.verticalPx), s.deltaE};
     for (int i = 0; i < 4; ++i) {
-        Run& r = runs[i];
-        if (r.over) {
+        Run& r = runs_[i];
+        if (over[i]) {
             if (r.since < 0) {
                 r.since = s.t;
-                r.worst = r.value;
-                r.tcStart = tc;
+                r.worst = value[i];
+                r.tc = tc;
                 r.clock = WallClock(s.t);
             } else {
-                r.worst = r.lowerIsWorse ? std::min(r.worst, r.value) : std::max(r.worst, r.value);
+                r.worst = i == 0 ? std::min(r.worst, value[i]) : std::max(r.worst, value[i]);  // near: lower is worse
             }
-        } else if (r.since >= 0) {
-            const double dur = s.t - r.since;
-            if (dur >= 0.5) {
-                Alert a;
-                a.start = r.since;
-                a.end = s.t;
-                char b[160];
-                std::snprintf(b, sizeof(b), r.fmt, r.worst, std::max(1.0, std::round(dur)), limits[i]);
-                a.what = b;
-                a.timecode = r.tcStart;
-                a.wallClock = r.clock;
-                alerts_.push_back(a);
-                if (alerts_.size() > 20) alerts_.erase(alerts_.begin());
-            }
-            r.since = -1;
+        } else {
+            CloseRun(i, s.t, tc);
         }
     }
 }
@@ -395,7 +550,9 @@ void RigMonitor::Reset() {
     history_.clear();
     alerts_.clear();
     last_ = Result{};
-    nearSince_ = farSince_ = vertSince_ = colSince_ = -1;
+    for (Run& r : runs_) r.since = -1;
+    lastGoodT_ = notOkSince_ = -1.0;
+    lastGoodTc_.clear();
 }
 
 Result RigMonitor::Last() const {
@@ -418,22 +575,19 @@ std::vector<Alert> RigMonitor::Alerts() const {
     std::vector<Alert> a = alerts_;
     // an overrun still in progress shows as an open alert
     const double now = history_.empty() ? 0.0 : history_.back().t;
-    auto open = [&](double since, const char* what, float worst, const std::string& tc, const std::string& clock) {
-        if (since < 0 || now - since < 0.5) return;
+    for (int i = 0; i < 4; ++i) {
+        const Run& r = runs_[i];
+        if (r.since < 0 || now - r.since < 0.5) continue;
         Alert x;
-        x.start = since;
+        x.start = r.since;
         x.end = -1.0;
         char b[160];
-        std::snprintf(b, sizeof(b), what, worst, now - since);
+        std::snprintf(b, sizeof(b), kOpenFmt[i], r.worst, now - r.since);
         x.what = b;
-        x.timecode = tc;
-        x.wallClock = clock;
+        x.timecode = r.tc;
+        x.wallClock = r.clock;
         a.push_back(x);
-    };
-    open(nearSince_, "Foreground at %+.1f%% for %.0f s (now)", nearWorst_, nearTc_, nearClock_);
-    open(farSince_, "Background at %+.1f%% for %.0f s (now)", farWorst_, farTc_, farClock_);
-    open(vertSince_, "Vertical error %.1f px for %.0f s (now)", vertWorst_, vertTc_, vertClock_);
-    open(colSince_, "Colour mismatch dE %.1f for %.0f s (now)", colWorst_, colTc_, colClock_);
+    }
     return a;
 }
 

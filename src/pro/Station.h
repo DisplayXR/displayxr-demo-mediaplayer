@@ -56,7 +56,10 @@ public:
     bool HandleKey(int sdlKey);
     void Tick();  // per frame, from ProController::Tick (outside the SDL event hook)
     // Every frame the trunk uploads (live or file): timecode, delay, rig checks.
-    void OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live, int eyeOffsetFrames);
+    // eyesSwapped = the player's effective eye swap (X toggle XOR a R|L container): the rig
+    // checks measure the eyes as shown.
+    void OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live, int eyeOffsetFrames,
+                 bool eyesSwapped = false);
 
     bool SwitchInput(int index);
     // Agent tools for the station (called from ProController::DispatchTool).
@@ -85,6 +88,8 @@ public:
 
 private:
     void LogNewAlerts();
+    // The newest pixel-measured eye sync of the last 2 s (-1 none); lateEye +1 right, -1 left.
+    int MeasuredEyeSync(int* lateEye) const;
     void SaveNote(size_t i);
 
     StationHost host_;
@@ -109,7 +114,8 @@ private:
     int dlgConn_ = 0;                 // 0 as set in Desktop Video, 1 SDI, 2 HDMI
     int dlgStereo_ = 0;               // one cable: 0 auto, 1 side by side, 2 dual-stream 3D, 3 mono
     char dlgMode_[8] = "";            // starting format FourCC; empty = 1080p25 (auto-detect follows)
-    std::string pendingDeckLinkSpec_;
+    std::string pendingDeckLinkSpec_;  // "0+1,sdi": the "DeckLink" input's spec, opened in Tick()
+    bool OpenDeckLinkSpec(const std::string& spec);
     int testFrames_ = 0, testSnapshotFrame_ = -1;
     std::string timecode_;
     double delayMs_ = 0.0;

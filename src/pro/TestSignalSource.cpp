@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "stb_image.h"  // implementation compiled in src/media/ImageDecoder.cpp
@@ -65,15 +66,25 @@ std::shared_ptr<const TestSignalConfig::Plate> TestSignalConfig::BuildPlate(cons
     // Right-eye faults: red gain, vertical shift (down), extra crossed parallax (the right
     // eye moves left, so everything comes forward by (depthScale - 1) x 2 % of the width).
     const float dx = (cfg.depthScale - 1.0f) * 0.02f * ew;
+    // roll: the right eye's plate pixel (x, y) samples the un-rolled plate at the inverse
+    // rotation about the plate centre
+    const float rr = cfg.rollDeg * 3.14159265f / 180.0f, rc = std::cos(rr), rs = std::sin(rr);
+    const float pcx = pw * 0.5f, pcy = ph * 0.5f;
     std::vector<uint8_t> bgra((size_t)pw * ph * 4);
     for (int eye = 0; eye < 2; ++eye) {
         const bool right = eye == 1;
         for (int y = 0; y < ph; ++y) {
-            const float sy = std::clamp(oy + (y - (right ? cfg.vShiftPx : 0.0f) + 0.5f) / scale - 0.5f, 0.0f, ih - 1.001f);
-            const int y0 = (int)sy;
-            const float fy = sy - y0;
             for (int x = 0; x < pw; ++x) {
-                const float sx = std::clamp(ox + (x + (right ? dx : 0.0f) + 0.5f) / scale - 0.5f, 0.0f, sw - 1.001f);
+                float ux = (float)x, uy = (float)y;
+                if (right && cfg.rollDeg != 0.0f) {
+                    const float qx = x - pcx, qy = y - pcy;
+                    ux = pcx + qx * rc + qy * rs;
+                    uy = pcy - qx * rs + qy * rc;
+                }
+                const float sy = std::clamp(oy + (uy - (right ? cfg.vShiftPx : 0.0f) + 0.5f) / scale - 0.5f, 0.0f, ih - 1.001f);
+                const int y0 = (int)sy;
+                const float fy = sy - y0;
+                const float sx = std::clamp(ox + (ux + (right ? dx : 0.0f) + 0.5f) / scale - 0.5f, 0.0f, sw - 1.001f);
                 const int x0 = (int)sx;
                 const float fx = sx - x0;
                 float c[3];
@@ -103,6 +114,7 @@ TestSignalSource::~TestSignalSource() { Stop(); }
 bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
     Stop();
     TestSignalConfig cfg = cfgIn;
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_ROLL")) cfg.rollDeg = (float)std::atof(e);
     if (!cfg.image.empty() && !cfg.plate) {
         std::string err;
         cfg.plate = TestSignalConfig::BuildPlate(cfg, &err);
@@ -125,8 +137,8 @@ bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
     SetState(LiveState::Opening);
     stop_ = false;
     worker_ = std::thread([this] { Worker(); });
-    LOG_INFO("test signal: %s, vshift %.1f px, eye delay %d, right gain %.2f", name_.c_str(),
-             cfg.vShiftPx, cfg.eyeDelay, cfg.gainR);
+    LOG_INFO("test signal: %s, vshift %.1f px, eye delay %d, right gain %.2f, roll %.2f deg", name_.c_str(),
+             cfg.vShiftPx, cfg.eyeDelay, cfg.gainR, cfg.rollDeg);
     return true;
 }
 
@@ -145,6 +157,22 @@ struct Disc {
     float cx, cy, r;  // in eye pixels
     uint8_t y, u, v;
 };
+
+// Smooth value noise (+-14 levels, 12 px cells, smoothstep between hashed corners) at a
+// disc-local position: band-limited, so it measures sub-pixel shifts without aliasing.
+float Blotch(float x, float y, int seed) {
+    auto h = [seed](int i, int j) {
+        uint32_t v = (uint32_t)(i * 73856093) ^ (uint32_t)(j * 19349663) ^ (uint32_t)(seed * 83492791);
+        v = (v ^ (v >> 13)) * 0x5bd1e995u;
+        return (float)((v >> 24) % 29) - 14.0f;
+    };
+    const float fx = x / 12.0f, fy = y / 12.0f;
+    const int i = (int)std::floor(fx), j = (int)std::floor(fy);
+    float u = fx - i, v = fy - j;
+    u = u * u * (3 - 2 * u);
+    v = v * v * (3 - 2 * v);
+    return (h(i, j) * (1 - u) + h(i + 1, j) * u) * (1 - v) + (h(i, j + 1) * (1 - u) + h(i + 1, j + 1) * u) * v;
+}
 
 // One eye of the scene at time t (seconds) into dst at column x0.
 void DrawEye(livepix::Nv12& dst, int x0, int w, int h, double t, float disparityScale,
@@ -195,9 +223,10 @@ void DrawEye(livepix::Nv12& dst, int x0, int w, int h, double t, float disparity
                 const float dx = x - cx;
                 const float q = (dx * dx + dy * dy) / (r * r);
                 if (q > 1.0f) continue;
-                // shaded: brighter towards the top-left, so the disc has inner texture
+                // shaded: brighter towards the top-left, plus a smooth blotchy texture that
+                // moves with the disc, so its depth has something to match on
                 const float shade = 1.0f - 0.35f * q - 0.15f * (dx + dy) / r;
-                yo[x] = (uint8_t)std::clamp((int)(yv * shade), 16, 235);
+                yo[x] = (uint8_t)std::clamp((int)(yv * shade + Blotch(dx, dy, d)), 16, 235);
             }
             if ((row & 1) == 0) {
                 uint8_t* uv = dst.uv.data() + (size_t)(row / 2) * dst.width + x0;
@@ -249,7 +278,39 @@ void TestSignalSource::Render(const TestSignalConfig& cfg, int64_t n, livepix::N
         return;
     }
     DrawEye(frame, 0, w, h, t, cfg.depthScale, 0.0f, 1.0f, false);
-    DrawEye(frame, w, w, h, tR, cfg.depthScale, cfg.vShiftPx, cfg.gainR, true);
+    if (cfg.rollDeg == 0.0f) {
+        DrawEye(frame, w, w, h, tR, cfg.depthScale, cfg.vShiftPx, cfg.gainR, true);
+        return;
+    }
+    // Roll: draw the right eye un-rolled, then resample it rotated about its centre
+    // (bilinear luma, nearest chroma) into the right half.
+    thread_local livepix::Nv12 eye;
+    if (eye.width != w || eye.height != h) eye.Resize(w, h);
+    DrawEye(eye, 0, w, h, tR, cfg.depthScale, cfg.vShiftPx, cfg.gainR, true);
+    const float a = cfg.rollDeg * 3.14159265f / 180.0f, c = std::cos(a), s = std::sin(a);
+    const float cx = w * 0.5f, cy = h * 0.5f;
+    for (int y = 0; y < h; ++y) {
+        uint8_t* yo = frame.y.data() + (size_t)y * frame.width + w;
+        for (int x = 0; x < w; ++x) {
+            const float qx = x - cx, qy = y - cy;
+            const float sx = std::clamp(cx + qx * c + qy * s, 0.0f, w - 1.001f);
+            const float sy = std::clamp(cy - qx * s + qy * c, 0.0f, h - 1.001f);
+            const int x0 = (int)sx, y0 = (int)sy;
+            const float fx = sx - x0, fy = sy - y0;
+            const uint8_t* p = eye.y.data() + (size_t)y0 * w + x0;
+            yo[x] = (uint8_t)((p[0] * (1 - fx) + p[1] * fx) * (1 - fy) + (p[w] * (1 - fx) + p[w + 1] * fx) * fy + 0.5f);
+        }
+    }
+    for (int y = 0; y < h / 2; ++y) {
+        uint8_t* uv = frame.uv.data() + (size_t)y * frame.width + w;
+        for (int x = 0; x < w / 2; ++x) {
+            const float qx = 2 * x + 1 - cx, qy = 2 * y + 1 - cy;
+            const int sx = std::clamp((int)((cx + qx * c + qy * s) * 0.5f), 0, w / 2 - 1);
+            const int sy = std::clamp((int)((cy - qx * s + qy * c) * 0.5f), 0, h / 2 - 1);
+            uv[2 * x] = eye.uv[(size_t)sy * w + 2 * sx];
+            uv[2 * x + 1] = eye.uv[(size_t)sy * w + 2 * sx + 1];
+        }
+    }
 }
 
 void TestSignalSource::Worker() {

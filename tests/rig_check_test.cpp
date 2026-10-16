@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 using namespace mp;
 
@@ -25,9 +26,7 @@ int g_failures = 0;
         }                                                                           \
     } while (0)
 
-rig::Result MeasureTest(const TestSignalConfig& cfg, int64_t frame = 30) {
-    livepix::Nv12 px;
-    TestSignalSource::Render(cfg, frame, px);
+FrameRing::Frame ToFrame(const livepix::Nv12& px) {
     FrameRing::Frame f;
     f.plane[0] = px.y;
     f.plane[1] = px.uv;
@@ -35,8 +34,39 @@ rig::Result MeasureTest(const TestSignalConfig& cfg, int64_t frame = 30) {
     f.height = px.height;
     f.format = PixFormat::NV12;
     f.fullRange = false;
+    return f;
+}
+
+// Swap the two halves of an SBS frame (an R|L master).
+livepix::Nv12 SwapHalves(const livepix::Nv12& px) {
+    livepix::Nv12 o = px;
+    const int h = px.width / 2;
+    for (int y = 0; y < px.height; ++y)
+        for (int x = 0; x < h; ++x) std::swap(o.y[(size_t)y * px.width + x], o.y[(size_t)y * px.width + x + h]);
+    for (int y = 0; y < px.height / 2; ++y)
+        for (int x = 0; x < h; ++x) std::swap(o.uv[(size_t)y * px.width + x], o.uv[(size_t)y * px.width + x + h]);
+    return o;
+}
+
+// Squeeze an SBS-full frame into half-SBS (every eye at half its width).
+livepix::Nv12 Squeeze(const livepix::Nv12& px) {
+    livepix::Nv12 o;
+    o.Resize(px.width / 2, px.height);
+    for (int y = 0; y < px.height; ++y)
+        for (int x = 0; x < o.width; ++x) o.y[(size_t)y * o.width + x] = px.y[(size_t)y * px.width + 2 * x];
+    for (int y = 0; y < px.height / 2; ++y)
+        for (int x = 0; x < o.width / 2; ++x) {
+            o.uv[(size_t)y * o.width + 2 * x] = px.uv[(size_t)y * px.width + 4 * x];
+            o.uv[(size_t)y * o.width + 2 * x + 1] = px.uv[(size_t)y * px.width + 4 * x + 1];
+        }
+    return o;
+}
+
+rig::Result MeasureTest(const TestSignalConfig& cfg, int64_t frame = 30) {
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, frame, px);
     rig::EyePair e;
-    if (!rig::Downsample(f, StereoLayout::SbsFull, 640, e)) return {};
+    if (!rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, e)) return {};
     return rig::Measure(e);
 }
 
@@ -100,6 +130,135 @@ void DeltaE() {
     CHECK(d > 0.5f && d < 3.0f, "a small red shift is a small delta-E");
 }
 
+void EyeSwap() {
+    TestSignalConfig cfg;
+    cfg.vShiftPx = 4.0f;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    const livepix::Nv12 sw = SwapHalves(px);  // an R|L master of the same rig
+    rig::EyePair e;
+    rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, e);
+    const rig::Result plain = rig::Measure(e);
+    rig::Downsample(ToFrame(sw), StereoLayout::SbsFull, 640, e, /*swapEyes=*/true);
+    const rig::Result fixed = rig::Measure(e);
+    rig::Downsample(ToFrame(sw), StereoLayout::SbsFull, 640, e, /*swapEyes=*/false);
+    const rig::Result wrong = rig::Measure(e);
+    std::printf("  eye swap: plain near=%.2f far=%.2f v=%.2f | swapped+flag near=%.2f far=%.2f v=%.2f | no flag near=%.2f far=%.2f v=%.2f\n",
+                plain.nearPct, plain.farPct, plain.verticalPx, fixed.nearPct, fixed.farPct, fixed.verticalPx,
+                wrong.nearPct, wrong.farPct, wrong.verticalPx);
+    CHECK(plain.ok && fixed.ok && wrong.ok, "all three measure");
+    CHECK(std::fabs(fixed.nearPct - plain.nearPct) < 0.1f && std::fabs(fixed.farPct - plain.farPct) < 0.1f,
+          "swapped input + swap flag = same depth range");
+    CHECK(std::fabs(fixed.verticalPx - plain.verticalPx) < 0.3f, "swapped input + swap flag = same vertical sign");
+    CHECK(std::fabs(wrong.nearPct + plain.farPct) < 0.35f && std::fabs(wrong.farPct + plain.nearPct) < 0.35f,
+          "swapped input without the flag = depth inverted");
+    CHECK(wrong.verticalPx < -3.0f, "swapped input without the flag = vertical sign flipped");
+}
+
+void RollFault() {
+    TestSignalConfig cfg;
+    cfg.rollDeg = 0.6f;
+    const rig::Result r = MeasureTest(cfg);
+    std::printf("  roll 0.6 deg: roll=%.2f deg vertical=%.2f px matches=%d\n", r.rollDeg, r.verticalPx, r.matches);
+    CHECK(r.ok && std::fabs(r.rollDeg - 0.6f) < 0.15f, "0.6 deg right-eye roll measured");
+    // the same rig delivered half-SBS: the eyes are squeezed, the roll on screen is the same
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    rig::EyePair e;
+    CHECK(rig::Downsample(ToFrame(Squeeze(px)), StereoLayout::SbsHalf, 640, e), "half-SBS downsamples");
+    const rig::Result h = rig::Measure(e);
+    std::printf("  roll 0.6 deg half-SBS: roll=%.2f deg (stretch %.0f)\n", h.rollDeg, e.xStretch);
+    CHECK(h.ok && std::fabs(h.rollDeg - 0.6f) < 0.15f, "half-SBS roll is the displayed roll, not 2x");
+}
+
+void TooFewMatches() {
+    // flat grey except one small textured patch per eye (9 px cells, shifted 9 px): a
+    // handful of matches, not enough to call the rig measured
+    livepix::Nv12 px;
+    px.Resize(3840, 1080);
+    std::fill(px.y.begin(), px.y.end(), (uint8_t)90);
+    std::fill(px.uv.begin(), px.uv.end(), (uint8_t)128);
+    uint32_t seed = 1234;
+    for (int y = 400; y < 560; ++y)
+        for (int x = 800; x < 960; ++x) {
+            uint32_t hsh = (uint32_t)((x / 9) * 73856093) ^ (uint32_t)((y / 9) * 19349663) ^ seed;
+            hsh = (hsh ^ (hsh >> 13)) * 0x5bd1e995u;
+            const uint8_t v = (uint8_t)(40 + ((hsh >> 24) % 160));
+            px.y[(size_t)y * px.width + x] = v;
+            px.y[(size_t)y * px.width + 1920 + x + 9] = v;
+        }
+    rig::EyePair e;
+    rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, e);
+    const rig::Result r = rig::Measure(e);
+    std::printf("  small patch: ok=%d matches=%d\n", r.ok, r.matches);
+    CHECK(r.matches > 0, "the patch does match");
+    CHECK(!r.ok, "a handful of matches is not a measurement");
+}
+
+void AlertClosesOnBlack() {
+    rig::RigMonitor m;
+    rig::Budget b;
+    b.maxVerticalPx = 1.0f;
+    m.SetBudget(b);
+    auto sample = [](double t, bool ok, float v) {
+        rig::Sample s;
+        s.t = t;
+        s.ok = ok;
+        s.verticalPx = v;
+        s.deltaE = 0.5f;
+        s.nearPct = -0.5f;
+        s.farPct = 0.5f;
+        return s;
+    };
+    // 1 s of a 3 px vertical error, then the picture cuts to black (nothing to measure)
+    for (int i = 0; i <= 4; ++i) {
+        char tc[16];
+        std::snprintf(tc, sizeof(tc), "01:00:00:%02d", i * 6);
+        m.AddSample(sample(1000.0 + i * 0.25, true, 3.0f), tc);
+    }
+    std::vector<rig::Alert> a = m.Alerts();
+    CHECK(a.size() == 1 && a[0].end < 0, "an open alert while the error lasts");
+    for (int i = 1; i <= 12; ++i) m.AddSample(sample(1001.0 + i * 0.25, false, 0.f), "");
+    a = m.Alerts();
+    std::printf("  cut to black: %zu alert(s)%s%s\n", a.size(), a.empty() ? "" : ", ",
+                a.empty() ? "" : (a[0].what + " end TC " + a[0].endTimecode).c_str());
+    CHECK(a.size() == 1 && a[0].end >= 0, "the alert closed after the cut");
+    CHECK(!a.empty() && std::fabs(a[0].end - 1001.0) < 1e-6, "closed at the last good sample");
+    CHECK(!a.empty() && a[0].timecode == "01:00:00:00" && a[0].endTimecode == "01:00:00:24",
+          "start and last-good timecodes");
+}
+
+std::vector<rig::EyePair> Burst(const TestSignalConfig& cfg, int64_t last, bool swap) {
+    std::vector<rig::EyePair> seq;
+    for (int64_t n = last - rig::RigMonitor::kSyncFrames + 1; n <= last; ++n) {
+        livepix::Nv12 px;
+        TestSignalSource::Render(cfg, n, px);
+        rig::EyePair e;
+        rig::Downsample(ToFrame(swap ? SwapHalves(px) : px), StereoLayout::SbsFull, 640, e, false);
+        seq.push_back(std::move(e));
+    }
+    return seq;
+}
+
+void EyeSyncMeasured() {
+    TestSignalConfig cfg;
+    int late = 0;
+    const int d0 = rig::MeasureEyeSync(Burst(cfg, 30, false), 0, 0, &late);
+    std::printf("  eye delay 0: measured %d (late %d)\n", d0, late);
+    CHECK(d0 == 0, "in step measures 0");
+    cfg.eyeDelay = 2;
+    const int d2 = rig::MeasureEyeSync(Burst(cfg, 30, false), 0, 0, &late);
+    std::printf("  eye delay 2: measured %d (late %d)\n", d2, late);
+    CHECK(d2 == 2 && late == +1, "right eye 2 frames late measured from the pixels");
+    // the same rig seen with the halves swapped: now the LEFT eye is the late one
+    const int dl = rig::MeasureEyeSync(Burst(cfg, 30, true), 0, 0, &late);
+    std::printf("  eye delay 2, halves swapped: measured %d (late %d)\n", dl, late);
+    CHECK(dl == 2 && late == -1, "left eye late measured");
+    // a still picture has no motion: not measured
+    std::vector<rig::EyePair> still(rig::RigMonitor::kSyncFrames, Burst(cfg, 30, false).back());
+    CHECK(rig::MeasureEyeSync(still, 0, 0, &late) == -1, "no motion = not measured");
+}
+
 }  // namespace
 
 int main() {
@@ -109,6 +268,11 @@ int main() {
     DepthScale();
     MonoRefused();
     DeltaE();
+    EyeSwap();
+    RollFault();
+    TooFewMatches();
+    AlertClosesOnBlack();
+    EyeSyncMeasured();
     if (g_failures) {
         std::fprintf(stderr, "rig_check_test: %d failure(s)\n", g_failures);
         return 1;

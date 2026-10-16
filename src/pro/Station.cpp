@@ -208,16 +208,7 @@ void Station::Tick() {
     if (!pendingDeckLinkSpec_.empty()) {
         const std::string spec = pendingDeckLinkSpec_;
         pendingDeckLinkSpec_.clear();
-        int idx = -1;
-        for (size_t i = 0; i < inputs_.size(); ++i)
-            if (inputs_[i].name == "DeckLink") idx = (int)i;
-        if (idx < 0) {
-            inputs_.push_back({"DeckLink", spec});
-            idx = (int)inputs_.size() - 1;
-        } else {
-            inputs_[idx].spec = spec;
-        }
-        SwitchInput(idx);
+        OpenDeckLinkSpec(spec);
     }
     if (pendingSwitch_) {
         pendingSwitch_ = false;
@@ -225,7 +216,24 @@ void Station::Tick() {
     }
 }
 
-void Station::OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live, int eyeOffsetFrames) {
+// The dialog's and the open_decklink tool's path: the "DeckLink" input gets this spec
+// (added or replaced) and becomes the live input through SwitchInput, so a failure leaves
+// live mode and the input list the same way a failed J does.
+bool Station::OpenDeckLinkSpec(const std::string& spec) {
+    int idx = -1;
+    for (size_t i = 0; i < inputs_.size(); ++i)
+        if (inputs_[i].name == "DeckLink") idx = (int)i;
+    if (idx < 0) {
+        inputs_.push_back({"DeckLink", "decklink:" + spec});
+        idx = (int)inputs_.size() - 1;
+    } else {
+        inputs_[idx].spec = "decklink:" + spec;
+    }
+    return SwitchInput(idx);
+}
+
+void Station::OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live, int eyeOffsetFrames,
+                      bool eyesSwapped) {
     LogNewAlerts();
     if (live) {
         timecode_ = f.timecode;
@@ -238,7 +246,18 @@ void Station::OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live,
         delayMs_ = 0.0;
     }
     if (layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf)
-        rig_.Submit(f, layout, live ? eyeOffsetFrames : -1, f.timecode);
+        rig_.Submit(f, layout, live ? eyeOffsetFrames : -1, f.timecode, eyesSwapped);
+}
+
+int Station::MeasuredEyeSync(int* lateEye) const {
+    if (lateEye) *lateEye = 0;
+    const std::vector<rig::Sample> h = rig_.History(2.0);
+    for (auto it = h.rbegin(); it != h.rend(); ++it)
+        if (it->eyeSyncMeasured >= 0) {
+            if (lateEye) *lateEye = it->eyeSyncLateEye;
+            return it->eyeSyncMeasured;
+        }
+    return -1;
 }
 
 bool Station::TakeSnapshot(const std::string& note) {
@@ -285,6 +304,7 @@ void Station::SaveNote(size_t i) {
         j["delta_e"] = s.rig.deltaE;
     }
     if (s.eyeSync >= 0) j["eye_sync_frames"] = s.eyeSync;
+    if (s.rig.eyeSyncMeasuredFrames >= 0) j["eye_sync_measured_frames"] = s.rig.eyeSyncMeasuredFrames;
     const rig::Budget b = rig_.GetBudget();
     j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}};
     std::ofstream(s.notePath) << j.dump(2) << "\n";
@@ -301,6 +321,7 @@ void Station::LogNewAlerts() {
         nlohmann::json j;
         j["what"] = a.what;
         j["timecode"] = a.timecode;
+        if (!a.endTimecode.empty()) j["end_timecode"] = a.endTimecode;
         j["time"] = a.wallClock;
         j["duration_s"] = a.end - a.start;
         std::ofstream((std::filesystem::path(dir) / "station_alerts.jsonl").string(), std::ios::app) << j.dump() << "\n";
@@ -339,6 +360,9 @@ bool Station::DispatchTool(const std::string& tool, const std::string& argsJson,
         out["far_pct"] = r.farPct;
         out["delta_e"] = r.deltaE;
         out["eye_sync_frames"] = h.empty() ? -1 : h.back().eyeOffsetFrames;
+        int late = 0;
+        out["eye_sync_measured_frames"] = MeasuredEyeSync(&late);  // from the pixels, -1 = not measured
+        out["eye_sync_late_eye"] = late > 0 ? "right" : late < 0 ? "left" : "none";
         out["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
                          {"delta_e", b.maxDeltaE}};
         json alerts = json::array();
@@ -386,22 +410,20 @@ bool Station::DispatchTool(const std::string& tool, const std::string& argsJson,
         return true;
     }
     if (tool == "open_decklink") {
-        DeckLinkConfig c;
-        if (a.contains("device") && a["device"].is_string()) c.device = a["device"].get<std::string>();
-        if (a.contains("right") && a["right"].is_string()) {
-            c.rightDevice = a["right"].get<std::string>();
-            c.stereo = DeckLinkConfig::Stereo::Pair;
+        // Same path as the dialog: a "DeckLink" input with this spec, switched to.
+        std::string spec = a.contains("device") && a["device"].is_string() ? a["device"].get<std::string>() : "0";
+        if (a.contains("right") && a["right"].is_string()) spec += "+" + a["right"].get<std::string>();
+        if (a.contains("input") && a["input"].is_string()) spec += "," + a["input"].get<std::string>();
+        if (a.contains("stereo")) {
+            DeckLinkConfig::Stereo st;
+            if (!a["stereo"].is_string() || !DeckLinkConfig::ParseStereo(a["stereo"].get<std::string>(), st))
+                return err("stereo must be auto|mono|sbs|dual|pair");
+            if (!a["right"].is_string()) spec += "," + a["stereo"].get<std::string>();
         }
-        if (a.contains("input") && a["input"].is_string()) c.input = a["input"].get<std::string>();
-        if (a.contains("mode") && a["mode"].is_string()) c.mode = a["mode"].get<std::string>();
-        if (a.contains("stereo") && (!a["stereo"].is_string() ||
-                                     !DeckLinkConfig::ParseStereo(a["stereo"].get<std::string>(), c.stereo)))
-            return err("stereo must be auto|mono|sbs|dual|pair");
-        testSignal_.Stop();
-        if (!decklink_.Open(c)) return err(decklink_.LastError());
-        if (host_.enterLive) host_.enterLive(&decklink_, decklink_.DeviceName());
-        rig_.Reset();
-        result = json{{"device", decklink_.DeviceName()}, {"state", LiveStateName(decklink_.GetState())}}.dump();
+        if (a.contains("mode") && a["mode"].is_string()) spec += ",mode=" + a["mode"].get<std::string>();
+        if (!OpenDeckLinkSpec(spec)) return err(decklink_.LastError().empty() ? "bad DeckLink spec: " + spec : decklink_.LastError());
+        result = json{{"device", decklink_.DeviceName()}, {"state", LiveStateName(decklink_.GetState())},
+                      {"spec", "decklink:" + spec}}.dump();
         return true;
     }
     return false;
@@ -502,7 +524,9 @@ void Station::BuildDeckLinkDialog() {
     deviceCombo("Left eye / input", dlgLeft_, false);
     deviceCombo("Right eye", dlgRight_, true);
     const bool pair = dlgRight_ > 0;
-    ImGui::TextDisabled(pair ? "Two cables: frames paired by SDI timecode (RP188)." : "One cable: both eyes in one signal.");
+    const bool sameDevice = pair && dlgRight_ - 1 == dlgLeft_;
+    if (sameDevice) ImGui::TextColored(kBad, "Left and right must be two different inputs.");
+    else ImGui::TextDisabled(pair ? "Two cables: frames paired by SDI timecode (RP188); same card: by its clock." : "One cable: both eyes in one signal.");
     const char* conns[] = {"as set in Desktop Video", "SDI", "HDMI"};
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
     ImGui::Combo("Connection", &dlgConn_, conns, 3);
@@ -514,8 +538,9 @@ void Station::BuildDeckLinkDialog() {
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
     ImGui::InputTextWithHint("Start format", "Hp25 (auto-detect follows)", dlgMode_, sizeof(dlgMode_));
     ImGui::Separator();
+    ImGui::BeginDisabled(sameDevice);
     if (ImGui::Button("Open")) {
-        std::string spec = "decklink:" + std::to_string(dlgLeft_);
+        std::string spec = std::to_string(dlgLeft_);
         if (pair) spec += "+" + std::to_string(dlgRight_ - 1);
         if (dlgConn_ == 1) spec += ",sdi";
         if (dlgConn_ == 2) spec += ",hdmi";
@@ -527,6 +552,7 @@ void Station::BuildDeckLinkDialog() {
         pendingDeckLinkSpec_ = spec;  // opened in Tick()
         dlgOpen_ = false;
     }
+    ImGui::EndDisabled();
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Cancel")) dlgOpen_ = false;
@@ -540,11 +566,19 @@ void Station::BuildSignalLines(bool live) {
     ImGui::Text("TC %s", timecode_.empty() ? "--:--:--:--" : timecode_.c_str());
     const double period = host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7;
     ImGui::Text("Delay %.0f ms", delayMs_ + period);
+    if (decklink_.GetState() != LiveState::Closed) {
+        const int dark = decklink_.GetStats().noSignalEyes;
+        if (dark & 1) ImGui::TextColored(kBad, decklink_.IsPair() ? "Left eye: NO SIGNAL" : "NO SIGNAL");
+        if (dark & 2) ImGui::TextColored(kBad, "Right eye: NO SIGNAL");
+    }
     if (decklink_.IsPair()) {
         const DeckLinkSource::PairStats ps = decklink_.GetPairStats();
         ImGui::Text("Eye skew %+.2f ms (max %.2f)  unpaired %llu", ps.lastSkewMs, ps.maxAbsSkewMs,
                     (unsigned long long)ps.unpaired);
-        if (ps.hwClockPairing) ImGui::TextDisabled("no timecode: paired by the card's clock");
+        if (ps.timecode) ImGui::TextDisabled("paired by SMPTE timecode");
+        else if (ps.hwClockPairing) ImGui::TextDisabled("no timecode: paired by the card's clock");
+        else if (ps.separateCards) ImGui::TextColored(kWarn, "no timecode, two cards: newest frames paired - jam-sync both inputs");
+        else if (ps.pairs) ImGui::TextDisabled("no timecode: newest frames paired");
     }
     ImGui::TextDisabled("capture to screen; camera + panel not included");
 #else
@@ -572,13 +606,20 @@ void Station::BuildRigSection(bool stereo) {
     Graded("Roll", v, std::fabs(r.rollDeg), 0.5f);
     const std::vector<rig::Sample> h = rig_.History(1.0);
     const int sync = h.empty() ? -1 : h.back().eyeOffsetFrames;
-    if (sync >= 0) {
-        std::snprintf(v, sizeof(v), "%d frame%s", sync, sync == 1 ? "" : "s");
+    int late = 0;
+    const int measured = MeasuredEyeSync(&late);
+    if (measured >= 0) {  // measured from the pixels wins; the timecode figure is the source's word
+        std::snprintf(v, sizeof(v), "%d frame%s%s", measured, measured == 1 ? "" : "s",
+                      measured == 0 ? "" : late > 0 ? " (R late)" : " (L late)");
+        Graded("Eye sync", v, (float)measured, 0.5f);
+        if (sync >= 0 && sync != measured) ImGui::TextDisabled("timecode says %d", sync);
+    } else if (sync >= 0) {
+        std::snprintf(v, sizeof(v), "%d frame%s (TC)", sync, sync == 1 ? "" : "s");
         Graded("Eye sync", v, (float)sync, 0.5f);
     } else {
         ImGui::TextUnformatted("Eye sync");
         ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.56f);
-        ImGui::TextDisabled("no timecode");
+        ImGui::TextDisabled("no timecode / motion");
     }
     std::snprintf(v, sizeof(v), "dE %.1f", r.deltaE);
     Graded("Color match", v, r.deltaE, b.maxDeltaE);

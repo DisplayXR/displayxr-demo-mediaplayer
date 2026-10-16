@@ -431,9 +431,9 @@ void ProController::Tick(const Status& st) {
 // it, blue behind - and ringed red when it breaks the depth budget. Follows pan / zoom.
 void ProController::BuildDepthOverlay(const Status& st) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
-    // The matches are left-eye positions: shown in 3D / left / difference / anaglyph, not
-    // in the right-eye view, and not while the eyes are swapped (they would sit off).
-    if (!depthOverlay_ || !st.stereo || !st.hasPicture || !host_.pictureInHud || rightOnlyView_ || st.eyesSwapped) return;
+    // The matches are positions in the SHOWN left eye (the rig check follows the eye
+    // swap): drawn in 3D / left / difference / anaglyph, not in the right-eye view.
+    if (!depthOverlay_ || !st.stereo || !st.hasPicture || !host_.pictureInHud || rightOnlyView_) return;
     float px, py, pw, ph;
     if (!host_.pictureInHud(px, py, pw, ph)) return;
     const rig::Result r = station_.RigLast();
