@@ -104,6 +104,7 @@ private:
     // DeckLink setup window
     bool dlgOpen_ = false;
     std::vector<std::string> dlgDevices_;
+    std::string dlgReason_;
     int dlgLeft_ = 0, dlgRight_ = 0;  // device list index; right 0 = "none (one cable)"
     int dlgConn_ = 0;                 // 0 as set in Desktop Video, 1 SDI, 2 HDMI
     int dlgStereo_ = 0;               // one cable: 0 auto, 1 side by side, 2 dual-stream 3D, 3 mono

@@ -450,6 +450,7 @@ void Station::BuildInputsSection(const std::string& liveName, bool live) {
 
 void Station::OpenDeckLinkDialog() {
     dlgDevices_ = DeckLinkSource::Available() ? DeckLinkSource::Enumerate() : std::vector<std::string>{};
+    dlgReason_ = dlgDevices_.empty() ? DeckLinkSource::UnavailableReason() : std::string();
     dlgLeft_ = std::clamp(dlgLeft_, 0, std::max(0, (int)dlgDevices_.size() - 1));
     dlgRight_ = std::clamp(dlgRight_, 0, (int)dlgDevices_.size());
     dlgOpen_ = true;
@@ -473,7 +474,9 @@ void Station::BuildDeckLinkDialog() {
         ImGui::TextColored(kBad, "This build has no DeckLink SDK.");
         ImGui::TextDisabled("Rebuild with -DMP_DECKLINK_SDK_DIR=<Blackmagic DeckLink SDK>.");
     } else if (!any) {
-        ImGui::TextColored(kWarn, "No DeckLink devices found.");
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
+        ImGui::TextWrapped("No DeckLink devices found: %s.", dlgReason_.c_str());
+        ImGui::PopStyleColor();
         ImGui::TextWrapped("Fit a Blackmagic DeckLink card (e.g. DeckLink Duo 2, 8K Pro G2, Mini Recorder 4K) and "
                            "install Blackmagic Desktop Video, then press Refresh.");
     } else {
@@ -488,7 +491,7 @@ void Station::BuildDeckLinkDialog() {
         const std::string cur = allowNone && sel == 0 ? std::string("none - one cable")
                                 : n ? dlgDevices_[std::clamp(sel - (allowNone ? 1 : 0), 0, n - 1)]
                                     : std::string("-");
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
         if (ImGui::BeginCombo(label, cur.c_str())) {
             if (allowNone && ImGui::Selectable("none - one cable", sel == 0)) sel = 0;
             for (int i = 0; i < n; ++i)
@@ -501,14 +504,14 @@ void Station::BuildDeckLinkDialog() {
     const bool pair = dlgRight_ > 0;
     ImGui::TextDisabled(pair ? "Two cables: frames paired by SDI timecode (RP188)." : "One cable: both eyes in one signal.");
     const char* conns[] = {"as set in Desktop Video", "SDI", "HDMI"};
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
     ImGui::Combo("Connection", &dlgConn_, conns, 3);
     ImGui::BeginDisabled(pair);
     const char* packs[] = {"auto (3D flag / aspect)", "side by side", "dual-stream 3D (SDI 3G-B)", "mono"};
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
     ImGui::Combo("Stereo", &dlgStereo_, packs, 4);
     ImGui::EndDisabled();
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
     ImGui::InputTextWithHint("Start format", "Hp25 (auto-detect follows)", dlgMode_, sizeof(dlgMode_));
     ImGui::Separator();
     if (ImGui::Button("Open")) {
@@ -537,6 +540,12 @@ void Station::BuildSignalLines(bool live) {
     ImGui::Text("TC %s", timecode_.empty() ? "--:--:--:--" : timecode_.c_str());
     const double period = host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7;
     ImGui::Text("Delay %.0f ms", delayMs_ + period);
+    if (decklink_.IsPair()) {
+        const DeckLinkSource::PairStats ps = decklink_.GetPairStats();
+        ImGui::Text("Eye skew %+.2f ms (max %.2f)  unpaired %llu", ps.lastSkewMs, ps.maxAbsSkewMs,
+                    (unsigned long long)ps.unpaired);
+        if (ps.hwClockPairing) ImGui::TextDisabled("no timecode: paired by the card's clock");
+    }
     ImGui::TextDisabled("capture to screen; camera + panel not included");
 #else
     (void)live;

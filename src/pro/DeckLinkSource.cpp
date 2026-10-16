@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -153,13 +155,13 @@ template <class T> void Release(T*& p) {
 }
 
 // All DeckLink devices, in the driver's order, with their display names.
-std::vector<IDeckLink*> AllDevices(std::vector<std::string>& names) {
+std::vector<IDeckLink*> AllDevices(std::vector<std::string>& names, bool* driver = nullptr) {
     std::vector<IDeckLink*> out;
     IDeckLinkIterator* it = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_CDeckLinkIterator, nullptr, CLSCTX_ALL, IID_IDeckLinkIterator,
-                                (void**)&it)) ||
-        !it)
-        return out;
+    const bool ok = SUCCEEDED(CoCreateInstance(CLSID_CDeckLinkIterator, nullptr, CLSCTX_ALL, IID_IDeckLinkIterator,
+                                               (void**)&it)) && it;
+    if (driver) *driver = ok;  // the iterator is registered by Blackmagic Desktop Video
+    if (!ok) return out;
     IDeckLink* dl = nullptr;
     while (it->Next(&dl) == S_OK) {
         BSTR b = nullptr;
@@ -253,8 +255,14 @@ struct DeckLinkCapture {
     struct EyeFrame {
         livepix::P016 px;
         double arrived = 0.0;
+        int64_t hwUs = -1;  // the card's hardware reference clock, microseconds (-1 unknown)
         char tc[16] = {0};
     };
+    // No timecode: the hardware reference clock stands in for it (#108's pairing). Frame
+    // index = round((t - t0) / period) with t0 from the first frame, so two genlocked
+    // inputs less than half a frame apart get the same index and pair exactly.
+    std::atomic<int64_t> hwT0{INT64_MIN};
+    uint64_t framesIn[2] = {0, 0};
     EyeFrame hist[2][TimecodePairer::kHistory];
     bool warnedUnsynced = false;
     bool warnedSize = false;
@@ -266,7 +274,10 @@ struct DeckLinkCapture {
         const int w = (int)f->GetWidth() & ~1, h = (int)f->GetHeight() & ~1;
         const double now = LiveProducer::NowSeconds();
         char tc[16];
-        const int key = ReadTimecode(f, fpsInt, tc, sizeof(tc));
+        int key = ReadTimecode(f, fpsInt, tc, sizeof(tc));
+        BMDTimeValue hwTime = 0, hwDur = 0;
+        int64_t hwUs = -1;
+        if (SUCCEEDED(f->GetHardwareReferenceTimestamp(1000000, &hwTime, &hwDur))) hwUs = (int64_t)hwTime;
         if (!pair) {
             // one input: only this card thread touches `out`; the lock keeps Stop() simple
             std::lock_guard<std::mutex> lk(m);
@@ -298,10 +309,37 @@ struct DeckLinkCapture {
         ef.px.Resize(w, h);
         if (!ConvertEye(f, ef.px, 0)) return;
         ef.arrived = now;
+        ef.hwUs = hwUs;
+        bool hwKey = false;
+        if (key < 0 && hwUs >= 0) {
+            int64_t t0 = hwT0.load();
+            if (t0 == INT64_MIN) {
+                hwT0.compare_exchange_strong(t0, hwUs);
+                t0 = hwT0.load();
+            }
+            const double periodUs = 1e6 / std::max(1, fpsInt.load());
+            key = (int)std::llround((double)(hwUs - t0) / periodUs);
+            hwKey = true;
+        }
         std::memcpy(ef.tc, tc, sizeof(tc));
         std::lock_guard<std::mutex> lk(m);
+        ++framesIn[eye];
         const TimecodePairer::Decision d = pairer.Add(eye, slot, key, now, 1.0 / std::max(1, fpsInt.load()));
         if (!d.publish || !alive) return;
+        {
+            const EyeFrame& lf = hist[0][d.slot[0]];
+            const EyeFrame& rf = hist[1][d.slot[1]];
+            std::lock_guard<std::mutex> ps(src->pairMutex_);
+            DeckLinkSource::PairStats& st = src->pairStats_;
+            ++st.pairs;
+            const uint64_t in = framesIn[0] + framesIn[1];
+            st.unpaired = in > 2 * st.pairs ? in - 2 * st.pairs : 0;
+            st.hwClockPairing = hwKey;
+            if (lf.hwUs >= 0 && rf.hwUs >= 0) {
+                st.lastSkewMs = (double)(rf.hwUs - lf.hwUs) / 1000.0;
+                st.maxAbsSkewMs = std::max(st.maxAbsSkewMs, std::fabs(st.lastSkewMs));
+            }
+        }
         if (d.unsynced && !warnedUnsynced) {
             LOG_WARN("decklink: the two inputs' timecodes are %d frames apart - not jam-synced; "
                      "pairing the newest frames instead", d.offsetFrames);
@@ -450,6 +488,22 @@ private:
 
 }  // namespace
 
+std::string DeckLinkSource::UnavailableReason() {
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    std::vector<std::string> names;
+    bool driver = false;
+    for (IDeckLink* d : AllDevices(names, &driver)) d->Release();
+    if (SUCCEEDED(co)) CoUninitialize();
+    if (!driver) return "Blackmagic Desktop Video driver not installed";
+    if (names.empty()) return "no DeckLink card found (Desktop Video is installed)";
+    return "";
+}
+
+DeckLinkSource::PairStats DeckLinkSource::GetPairStats() const {
+    std::lock_guard<std::mutex> lk(pairMutex_);
+    return pairStats_;
+}
+
 std::vector<std::string> DeckLinkSource::Enumerate() {
     const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     std::vector<std::string> names;
@@ -463,8 +517,13 @@ std::vector<std::string> DeckLinkSource::Enumerate() {
 void DeckLinkSource::Worker() {
     const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     std::vector<std::string> names;
-    std::vector<IDeckLink*> devices = AllDevices(names);
+    bool driver = false;
+    std::vector<IDeckLink*> devices = AllDevices(names, &driver);
     const bool pair = cfg_.stereo == DeckLinkConfig::Stereo::Pair;
+    {
+        std::lock_guard<std::mutex> lk(pairMutex_);
+        pairStats_ = PairStats{};
+    }
     const int nInputs = pair ? 2 : 1;
 
     auto capPtr = std::make_shared<DeckLinkCapture>();
@@ -478,8 +537,10 @@ void DeckLinkSource::Worker() {
     int started = 0;
     std::string err;
 
-    if (devices.empty()) {
-        err = "no Blackmagic device found (is Blackmagic Desktop Video installed and the card connected?)";
+    if (!driver) {
+        err = "Blackmagic Desktop Video driver not installed";
+    } else if (devices.empty()) {
+        err = "no DeckLink card found (Desktop Video is installed; is the card seated?)";
     } else {
         const std::string sel[2] = {cfg_.device, cfg_.rightDevice};
         for (int e = 0; e < nInputs && err.empty(); ++e) {
@@ -593,6 +654,8 @@ void DeckLinkSource::Worker() {
 
 bool DeckLinkSource::Available() { return false; }
 std::vector<std::string> DeckLinkSource::Enumerate() { return {}; }
+std::string DeckLinkSource::UnavailableReason() { return "this build has no DeckLink SDK"; }
+DeckLinkSource::PairStats DeckLinkSource::GetPairStats() const { return {}; }
 void DeckLinkSource::Worker() {}
 
 #endif

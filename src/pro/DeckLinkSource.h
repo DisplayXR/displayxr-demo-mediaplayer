@@ -24,6 +24,8 @@
 #include "pro/LiveSourceBase.h"
 
 #include <atomic>
+#include <cstdint>
+#include <mutex>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -51,6 +53,20 @@ public:
     static bool Available();
     // "0: DeckLink Duo (1)" lines; empty when there are none (or no driver).
     static std::vector<std::string> Enumerate();
+    // Why there is nothing to open: "" when a device is present, else no SDK in this
+    // build / Blackmagic Desktop Video driver not installed / no card found.
+    static std::string UnavailableReason();
+
+    // Two-input stereo: how far apart the paired frames were on the card's hardware
+    // reference clock, and how many frames never made it into a pair.
+    struct PairStats {
+        uint64_t pairs = 0;
+        uint64_t unpaired = 0;
+        double lastSkewMs = 0.0, maxAbsSkewMs = 0.0;
+        bool hwClockPairing = false;  // no timecode: paired by the hardware clock
+    };
+    PairStats GetPairStats() const;
+    bool IsPair() const { return cfg_.stereo == DeckLinkConfig::Stereo::Pair && GetState() != LiveState::Closed; }
     static void PrintDeviceList(FILE* out);
 
     // Non-blocking: spawns the worker, which finds the device(s) and starts capture.
@@ -65,6 +81,8 @@ public:
 private:
     friend struct DeckLinkCapture;  // the SDK side (DeckLinkSource.cpp) publishes through us
     void Worker();
+    mutable std::mutex pairMutex_;
+    PairStats pairStats_;
     DeckLinkConfig cfg_;
     std::thread worker_;
     std::atomic<bool> stop_{false};

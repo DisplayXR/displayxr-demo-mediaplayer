@@ -117,6 +117,39 @@ void V210Basics() {
     CHECK(d.y[0] == 0, "left eye untouched");
 }
 
+// PR #108's vectors (its own v210 packer), as a cross-check of V210ToP016: six 10-bit
+// lumas incl. both legal ends, chroma identical on both rows (no averaging), into x0=0.
+void V210Pr108Vectors() {
+    const int y[6] = {64, 128, 256, 512, 768, 1020}, cb[3] = {400, 500, 600}, cr[3] = {700, 800, 900};
+    uint8_t row[2][128] = {};
+    for (int r = 0; r < 2; ++r) {
+        uint8_t* out = row[r];
+        auto put = [&](int word, uint32_t v) { std::memcpy(out + word * 4, &v, 4); };
+        put(0, (uint32_t)cb[0] | ((uint32_t)y[0] << 10) | ((uint32_t)cr[0] << 20));
+        put(1, (uint32_t)y[1] | ((uint32_t)cb[1] << 10) | ((uint32_t)y[2] << 20));
+        put(2, (uint32_t)cr[1] | ((uint32_t)y[3] << 10) | ((uint32_t)cb[2] << 20));
+        put(3, (uint32_t)y[4] | ((uint32_t)cr[2] << 10) | ((uint32_t)y[5] << 20));
+    }
+    mp::livepix::P016 d;
+    d.Resize(6, 2);
+    mp::livepix::V210ToP016(&row[0][0], 128, 6, 2, d, 0);
+    bool ok = true;
+    for (int i = 0; i < 6; ++i) ok = ok && d.y[i] == (uint16_t)(y[i] << 6) && d.y[6 + i] == (uint16_t)(y[i] << 6);
+    for (int i = 0; i < 3; ++i) ok = ok && d.uv[2 * i] == (uint16_t)(cb[i] << 6) && d.uv[2 * i + 1] == (uint16_t)(cr[i] << 6);
+    CHECK(ok, "#108 v210 vectors: every luma and chroma sample kept at 10 bits");
+}
+
+// PR #108's UYVY-into-the-right-half vector (8-bit NV12 path).
+void UyvyPr108Vector() {
+    const uint8_t src[2][8] = {{10, 100, 20, 101, 30, 102, 40, 103}, {12, 110, 22, 111, 32, 112, 42, 113}};
+    mp::livepix::Nv12 d;
+    d.Resize(8, 2);
+    mp::livepix::UyvyToNv12(&src[0][0], 8, 4, 2, d, 4);
+    CHECK(d.y[0] == 0 && d.y[3] == 0, "#108: left half untouched");
+    CHECK(d.y[4] == 100 && d.y[5] == 101 && d.y[7] == 103 && d.y[8 + 4] == 110 && d.y[8 + 7] == 113, "#108: luma");
+    CHECK(d.uv[4] == 11 && d.uv[5] == 21 && d.uv[6] == 31 && d.uv[7] == 41, "#108: chroma averaged over the row pair");
+}
+
 void UyvyWidens() {
     const uint8_t src[2][8] = {{100, 10, 200, 11, 110, 12, 210, 13}, {102, 20, 202, 21, 112, 22, 212, 23}};
     mp::livepix::P016 d;
@@ -137,6 +170,12 @@ void TestSignalSpec() {
     CHECK(!f.ParseSpec("big"), "garbage refused");
     CHECK(!f.ParseSpec("10x10"), "too small refused");
     CHECK(!f.ParseSpec("1920x1080@0"), "zero rate refused");
+    mp::TestSignalConfig g;
+    CHECK(g.ParseSpec("1280x720@30,image=C:/shots/cup, 2x1.jpg") && g.eyeW == 1280 && g.fps == 30.0 &&
+              g.image == "C:/shots/cup, 2x1.jpg", "photo rig: size, rate and a path with a comma");
+    mp::TestSignalConfig h;
+    CHECK(h.ParseSpec("image=a.png") && h.image == "a.png" && h.eyeW == 1920, "photo rig: path only");
+    CHECK(!h.ParseSpec("image="), "photo rig: empty path refused");
 }
 
 }  // namespace
@@ -150,6 +189,8 @@ int main() {
     TestSignalSpec();
     V210Basics();
     UyvyWidens();
+    V210Pr108Vectors();
+    UyvyPr108Vector();
     if (g_failures) {
         std::fprintf(stderr, "live_pixels_test: %d failure(s)\n", g_failures);
         return 1;
