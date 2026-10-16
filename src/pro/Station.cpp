@@ -309,6 +309,36 @@ void Station::LogNewAlerts() {
     alertsLoggedUntil_ = newest;
 }
 
+std::string Station::RigStatusJson() const {
+    using json = nlohmann::json;
+    const rig::Result r = rig_.Last();
+    const rig::Budget b = rig_.GetBudget();
+    const std::vector<rig::Sample> h = rig_.History(1.0);
+    json out;
+    out["measured"] = r.ok && rig_.Active(LiveProducer::NowSeconds());
+    out["matches"] = r.matches;
+    out["vertical_px"] = r.verticalPx;
+    out["roll_deg"] = r.rollDeg;
+    out["near_pct"] = r.nearPct;
+    out["far_pct"] = r.farPct;
+    out["delta_e"] = r.deltaE;
+    out["eye_sync_frames"] = h.empty() ? -1 : h.back().eyeOffsetFrames;
+    out["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
+                     {"delta_e", b.maxDeltaE}};
+    json alerts = json::array();
+    for (const rig::Alert& al : rig_.Alerts())
+        alerts.push_back({{"what", al.what}, {"timecode", al.timecode}, {"time", al.wallClock}, {"open", al.end < 0}});
+    out["alerts"] = alerts;
+    out["timecode"] = timecode_;
+    out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
+    return out.dump();
+}
+
+std::string Station::Folder() const {
+    return host_.capturePrefix ? std::filesystem::path(host_.capturePrefix("x")).parent_path().string()
+                               : std::string();
+}
+
 // ---------------------------------------------------------------------------- agent tools
 
 bool Station::DispatchTool(const std::string& tool, const std::string& argsJson, std::string& result,
@@ -327,27 +357,7 @@ bool Station::DispatchTool(const std::string& tool, const std::string& argsJson,
         return true;
     };
     if (tool == "get_rig_status") {
-        const rig::Result r = rig_.Last();
-        const rig::Budget b = rig_.GetBudget();
-        const std::vector<rig::Sample> h = rig_.History(1.0);
-        json out;
-        out["measured"] = r.ok && rig_.Active(LiveProducer::NowSeconds());
-        out["matches"] = r.matches;
-        out["vertical_px"] = r.verticalPx;
-        out["roll_deg"] = r.rollDeg;
-        out["near_pct"] = r.nearPct;
-        out["far_pct"] = r.farPct;
-        out["delta_e"] = r.deltaE;
-        out["eye_sync_frames"] = h.empty() ? -1 : h.back().eyeOffsetFrames;
-        out["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
-                         {"delta_e", b.maxDeltaE}};
-        json alerts = json::array();
-        for (const rig::Alert& al : rig_.Alerts())
-            alerts.push_back({{"what", al.what}, {"timecode", al.timecode}, {"time", al.wallClock}, {"open", al.end < 0}});
-        out["alerts"] = alerts;
-        out["timecode"] = timecode_;
-        out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
-        result = out.dump();
+        result = RigStatusJson();
         return true;
     }
     if (tool == "set_depth_budget") {

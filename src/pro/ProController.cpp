@@ -369,6 +369,7 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
 void ProController::Tick(const Status& st) {
     stereoSource_ = st.stereo;
     station_.Tick();
+    TickResolve(st);
     if (++ticks_ == testCompareFrame_) pendingCompare_ = true;
     // Full screen shows the picture alone (the plan's "full screen hides everything except
     // the picture"): the inspector unpins and fades with the trunk's UI; leaving full
@@ -562,6 +563,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                 else
                     ImGui::TextDisabled("panel %.0f fps  mode %s", st.panelFps, st.modeName.c_str());
                 station_.BuildSignalLines(st.live);  // timecode + measured delay (T)
+                BuildResolveLines();                  // the live Resolve panel, when running
             }
         }
 

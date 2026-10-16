@@ -69,8 +69,8 @@ streams, auto-convergence, MCP tools. Plus:
 | Review formats | MXF; EXR / DPX / TIFF **sequences** (open any frame; `--seq-fps=24`); EXR's scene-linear float encoded for display; 10/12-bit sources (ProRes, DNxHR HQX, HEVC 10, DPX, 16-bit TIFF) kept at 16 bits (P016) into the grade. Trunk code, switched on only by Pro (`VideoDecoder::SetProFormats` / `MediaSource::SetProFormats`). |
 | A/B compare | `B` swaps to the other clip at the same position (`--compare=<file>` or `set_compare`). |
 | OpenColorIO | Optional (`-DMP_OCIO_ROOT=<OCIO 2.x install>`, e.g. Open RV's `_build/RV_DEPS_OCIO/install`, plus `MP_OCIO_DLL_DIR` for its DLLs): `--ocio=<config\|ocio://default> --ocio-src=<space>` and `--ocio-display= --ocio-view=` or `--ocio-dst=`, `--ocio-looks=`; baked to a 65³ LUT in the grade's LUT slot. |
-| Agent tools | `set_grade`, `get_grade`, `set_view`, `set_depth_overlay`, `get_rig_status`, `set_depth_budget`, `snapshot`, `list_inputs`, `select_input`, `open_decklink`, `set_ocio`, `describe_ocio`, `set_compare` (next to the player's own). |
-| Resolve markers | `tools/resolve/DisplayXR_Station_Markers.py` (Resolve: Workspace > Scripts): snapshot notes → blue markers, rig alerts → red markers at their timecodes on the current timeline. |
+| Agent tools | `set_grade`, `get_grade`, `set_view`, `set_depth_overlay`, `get_rig_status`, `set_depth_budget`, `snapshot`, `list_inputs`, `select_input`, `open_decklink`, `set_ocio`, `describe_ocio`, `set_compare`, `get_resolve_link`, `set_resolve_follow` (next to the player's own). |
+| Resolve panel | `tools/resolve/DisplayXR_Station_Panel.py`, a window inside Resolve (Workspace > Workflow Integrations in Resolve Studio - the Pro installer puts it there when Resolve is installed; or Workspace > Scripts). **Markers live**: snapshot notes become blue markers and rig alerts red markers on the current timeline as they happen, at their timecodes (SMPTE drop-frame counted properly), never twice. **Timecode follow**: Resolve's playhead and the clip under it reach the station; when the station can open the same media file it follows - plays while Resolve plays (correcting drift past 0.5 s), lands on the exact frame when Resolve parks (Resolve's API has no play state, so it is inferred from the playhead). The inspector shows "Resolve <timeline> TC" and a *Follow Resolve* box. **Station in Resolve**: input, timecode, rig numbers and the open alert; *Go to station TC* moves Resolve's playhead there; *Snapshot* takes a station snapshot with a note typed in Resolve; double-click a listed note / alert to jump to it. The two talk through files in the station folder (`station_status.json`, `resolve_link.json`, `resolve_commands.jsonl`; `src/pro/ResolveLink.h`), so no port and either side can start first. `--once` (or no UI) adds the markers once and exits. |
 
 Grade order is exposure → CDL → LUT, the order an on-set chain applies a CDL under a
 show LUT. The grade is skipped on the idle screen.
@@ -124,9 +124,9 @@ Ordered by what the customer needs first.
 
 Items 1-6 below are built (see the table above) and unit-tested; **none of the DeckLink,
 rig or Resolve parts has run with a card, a stereo rig or Resolve yet** - that needs the
-hardware. Still open: a Resolve *panel* inside Resolve (timecode follow + markers live;
-today the marker script runs after the fact, and the station follows Resolve's timecode
-over SDI); RP188 at 50/60p (frame/field counting) to confirm on a card. Kept for the record:
+hardware, and the Resolve panel has run against a fake Resolve (`tests/resolve_panel_test.py`)
+but not yet inside Resolve. Still open: RP188 at 50/60p (frame/field counting) to confirm on
+a card. Kept for the record:
 
 1. **Blackmagic DeckLink input (Phase 1).** A `src/pro/DeckLinkSource.{h,cpp}` that
    publishes into the same `FrameRing` the camera uses, so the render path is untouched.

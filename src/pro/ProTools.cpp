@@ -7,6 +7,7 @@
 #include "pro/ProController.h"
 
 #include "Log.h"
+#include "media/LiveProducer.h"
 
 #include <nlohmann/json.hpp>
 
@@ -62,6 +63,13 @@ void ProController::RegisterTools(const RegisterFn& reg) {
         "\"looks\":{\"type\":\"string\"}},\"required\":[\"src\"]}");
     reg("describe_ocio", "List an OpenColorIO config's colour spaces, displays and the default display's views.",
         "{\"type\":\"object\",\"properties\":{\"config\":{\"type\":\"string\"}}}");
+    reg("get_resolve_link",
+        "Read the live Resolve panel link: whether the panel is running, Resolve's timeline, playhead "
+        "timecode and the clip under it, whether the station follows it, and whether Resolve is "
+        "playing (inferred from the playhead).",
+        "{\"type\":\"object\"}");
+    reg("set_resolve_follow", "Make the station follow (or stop following) Resolve's playhead.",
+        "{\"type\":\"object\",\"properties\":{\"on\":{\"type\":\"boolean\"}},\"required\":[\"on\"]}");
     reg("set_compare",
         "A/B compare: set the B clip (a file path); toggle=true (or no path) swaps to the other clip "
         "at the current position.",
@@ -178,6 +186,24 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             if (!a.contains("on") || !a["on"].is_boolean()) return err("on (boolean) is required");
             depthOverlay_ = a["on"].get<bool>();
             result = json{{"depth_overlay", depthOverlay_}}.dump();
+            return true;
+        }
+        if (tool == "get_resolve_link") {
+            const double now = LiveProducer::NowSeconds();
+            result = json{{"panel_running", follower_.Active(now)},
+                          {"timeline", link_.timeline},
+                          {"playhead_tc", link_.playheadTc},
+                          {"clip", link_.clipPath},
+                          {"clip_seconds", link_.clipSeconds},
+                          {"follow", followResolve_},
+                          {"panel_follow", link_.follow},
+                          {"resolve_playing", follower_.ResolvePlaying()}}.dump();
+            return true;
+        }
+        if (tool == "set_resolve_follow") {
+            if (!a.contains("on") || !a["on"].is_boolean()) return err("on (boolean) is required");
+            followResolve_ = a["on"].get<bool>();
+            result = json{{"follow", followResolve_}}.dump();
             return true;
         }
         return station_.DispatchTool(tool, a.dump(), result, success);

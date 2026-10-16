@@ -273,6 +273,21 @@ Section "Media Player Pro" SecPro
         "EstimatedSize" "$0"
 SectionEnd
 
+; The live DaVinci Resolve panel (docs/PRO.md, "Resolve panel"). A copy always goes in the
+; install dir; when Resolve is installed it also goes where Resolve Studio looks for
+; Workflow Integration plugins, so it shows in Workspace > Workflow Integrations.
+Section "DaVinci Resolve panel" SecResolve
+    SetShellVarContext all
+    SetOutPath "$INSTDIR\tools\resolve"
+    File "${SOURCE_DIR}\tools\resolve\DisplayXR_Station_Panel.py"
+    ${If} ${FileExists} "$APPDATA\Blackmagic Design\DaVinci Resolve\Support\*.*"
+        CreateDirectory "$APPDATA\Blackmagic Design\DaVinci Resolve\Support\Workflow Integration Plugins"
+        SetOutPath "$APPDATA\Blackmagic Design\DaVinci Resolve\Support\Workflow Integration Plugins"
+        File "${SOURCE_DIR}\tools\resolve\DisplayXR_Station_Panel.py"
+    ${EndIf}
+    SetOutPath "$INSTDIR"
+SectionEnd
+
 Section "Start Menu Shortcut" SecShortcut
     SetShellVarContext all
     CreateDirectory "$SMPROGRAMS\DisplayXR"
@@ -314,6 +329,10 @@ Section "Uninstall"
     Delete "$INSTDIR\displayxr\logo.png"
     Delete "$INSTDIR\displayxr\mediaplayer_pro_handle_vk_win.displayxr.json"
     RMDir "$INSTDIR\displayxr"
+    Delete "$INSTDIR\tools\resolve\DisplayXR_Station_Panel.py"
+    RMDir "$INSTDIR\tools\resolve"
+    RMDir "$INSTDIR\tools"
+    Delete "$APPDATA\Blackmagic Design\DaVinci Resolve\Support\Workflow Integration Plugins\DisplayXR_Station_Panel.py"
     Delete "$INSTDIR\Uninstall.exe"
     RMDir "$INSTDIR"
     RMDir "$PROGRAMFILES64\DisplayXR\Apps"
