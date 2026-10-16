@@ -69,6 +69,13 @@ public:
     void BuildRigSection(bool stereo);
     void BuildSnapshotsSection();
     void BuildHistoryStrip(float alpha, bool stereo);
+    // DeckLink setup window: pick the left / right inputs, connection, stereo packing and
+    // starting format, then Open (adds or replaces the "DeckLink" input and switches to it).
+    void OpenDeckLinkDialog();
+    void BuildDeckLinkDialog();
+    bool ShowTimecode() const { return showTimecode_; }
+    std::string InputName() const { return inputIndex_ >= 0 && inputIndex_ < (int)inputs_.size() ? inputs_[inputIndex_].name : std::string(); }
+    size_t SnapshotCount() const { return snapshots_.size(); }
 
     bool ShowHistory() const { return showHistory_; }
     rig::Result RigLast() const { return rig_.Last(); }
@@ -93,11 +100,25 @@ private:
     bool showTimecode_ = true;
     bool showHistory_ = true;
     bool pendingSnapshot_ = false, pendingSwitch_ = false;
+    std::string pendingSnapshotNote_;
+    // DeckLink setup window
+    bool dlgOpen_ = false;
+    std::vector<std::string> dlgDevices_;
+    int dlgLeft_ = 0, dlgRight_ = 0;  // device list index; right 0 = "none (one cable)"
+    int dlgConn_ = 0;                 // 0 as set in Desktop Video, 1 SDI, 2 HDMI
+    int dlgStereo_ = 0;               // one cable: 0 auto, 1 side by side, 2 dual-stream 3D, 3 mono
+    char dlgMode_[8] = "";            // starting format FourCC; empty = 1080p25 (auto-detect follows)
+    std::string pendingDeckLinkSpec_;
+    int testFrames_ = 0, testSnapshotFrame_ = -1;
     std::string timecode_;
     double delayMs_ = 0.0;
     double alertsLoggedUntil_ = 0.0;
     struct Snapshot {
         std::string image, notePath, timecode, clock;
+        std::string prefix;        // capture prefix; the runtime picks the image's suffix
+        double takenSec = 0.0;     // until the image is found (Tick), `image` is a guess
+        bool imageFound = false;
+        int eyeSync = -1;          // frames between the paired inputs (-1 unknown)
         char note[160] = {0};
         rig::Result rig;
     };

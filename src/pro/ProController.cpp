@@ -65,6 +65,10 @@ void ProController::ApplyTestEnv() {
         if (m >= 0 && m < (int)ViewMode::Count) mode_ = (ViewMode)m;  // stereo check happens per frame
     }
     if (const char* z = std::getenv("MEDIAPLAYER_PRO_ZOOM")) SetZoom((float)std::atof(z));
+    if (const char* d = std::getenv("MEDIAPLAYER_PRO_DEPTH_OVERLAY")) depthOverlay_ = (*d && *d != '0');
+    if (const char* e = std::getenv("MEDIAPLAYER_PRO_EXPOSURE")) grade_.exposure = std::clamp((float)std::atof(e), -4.0f, 4.0f);
+    if (const char* b = std::getenv("MEDIAPLAYER_PRO_BYPASS")) bypass_ = (*b && *b != '0');
+    if (const char* c = std::getenv("MEDIAPLAYER_PRO_COMPARE_FRAME")) testCompareFrame_ = std::atoi(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +368,20 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
 void ProController::Tick(const Status& st) {
     stereoSource_ = st.stereo;
     station_.Tick();
+    if (++ticks_ == testCompareFrame_) pendingCompare_ = true;
+    // Full screen shows the picture alone (the plan's "full screen hides everything except
+    // the picture"): the inspector unpins and fades with the trunk's UI; leaving full
+    // screen restores the pin.
+    const bool fs = host_.isFullscreen && host_.isFullscreen();
+    if (fs != wasFullscreen_) {
+        if (fs) {
+            pinnedBeforeFullscreen_ = inspectorPinned_;
+            inspectorPinned_ = false;
+        } else {
+            inspectorPinned_ = pinnedBeforeFullscreen_;
+        }
+        wasFullscreen_ = fs;
+    }
     if (pendingCompare_) {
         pendingCompare_ = false;
         ToggleCompare();
@@ -445,9 +463,63 @@ void ProController::BuildDepthOverlay(const Status& st) {
 #endif
 }
 
+// The status bar along the bottom of the picture (the plan's mockup: LIVE, input, format,
+// look, timecode, depth range, convergence shift). In full screen only the timecode stays
+// (the "SDI timecode overlay"); T hides it.
+void ProController::BuildStatusBar(const Status& st) {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    if (st.isLogo || !host_.pictureInHud) return;
+    float px, py, pw, ph;
+    if (!host_.pictureInHud(px, py, pw, ph)) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    const bool fs = host_.isFullscreen && host_.isFullscreen();
+    const std::string& tc = station_.Timecode();
+    char buf[320];
+    int n = 0;
+    auto add = [&](const char* fmt, auto... a) {
+        if (n < (int)sizeof(buf)) n += std::snprintf(buf + n, sizeof(buf) - n, fmt, a...);
+    };
+    if (fs) {
+        if (!station_.ShowTimecode() || tc.empty()) return;
+        add("TC %s", tc.c_str());
+    } else {
+        if (st.live) add("LIVE  ");
+        const std::string in = st.live ? station_.InputName() : std::string();
+        add("%s", !in.empty() ? in.c_str() : st.sourceLabel.c_str());
+        if (!compare_[1].empty() && !st.live) add("  [%s]", compareSide_ ? "B" : "A");
+        add("  |  %dx%d %s", st.width, st.height, st.layoutName.c_str());
+        if (st.sourceFps > 0.0f) add(" %.0f fps", st.sourceFps);
+        add("  |  %s", bypass_ ? "grade bypassed"
+                       : grade_.lutOn && !lutName_.empty() ? lutName_.c_str()
+                       : grade_.cdlOn ? "CDL" : "no look");
+        if (!bypass_ && std::fabs(grade_.exposure) > 0.005f) add(" %+.1f EV", grade_.exposure);
+        if (station_.ShowTimecode() && !tc.empty()) add("  |  TC %s", tc.c_str());
+        const rig::Result r = station_.RigLast();
+        if (st.stereo && st.hasPicture && r.ok) add("  |  near %+.1f%%  far %+.1f%%", r.nearPct, r.farPct);
+        if (st.stereo) add("  |  conv %+.2f%%", host_.getConvergence ? host_.getConvergence() * 100.0f : 0.0f);
+    }
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const ImVec2 ts = ImGui::CalcTextSize(buf);
+    const float pad = 6.0f;
+    const float x = px * W + 8.0f, y = (py + ph) * H - ts.y - 2.0f * pad - 8.0f;
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + ts.x + 2.0f * pad, y + ts.y + 2.0f * pad), IM_COL32(10, 12, 16, 190), 4.0f);
+    float tx = x + pad;
+    if (st.live && !fs) {
+        dl->AddCircleFilled(ImVec2(tx + 4.0f, y + pad + ts.y * 0.5f), 4.0f, IM_COL32(235, 60, 50, 255));
+        tx += 0.0f;
+    }
+    dl->AddText(ImVec2(tx + (st.live && !fs ? 12.0f : 0.0f), y + pad), IM_COL32(235, 238, 242, 255), buf);
+#else
+    (void)st;
+#endif
+}
+
 void ProController::BuildUI(const Status& st, float uiAlpha) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     BuildDepthOverlay(st);  // on the picture; independent of the inspector fade
+    BuildStatusBar(st);
+    station_.BuildDeckLinkDialog();
     const float alpha = inspectorPinned_ ? 1.0f : uiAlpha;
     if (alpha < 0.01f) return;
     const ImGuiIO& io = ImGui::GetIO();
@@ -455,15 +527,20 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     const float panelW = std::clamp(W * 0.24f, 280.0f, 440.0f);
     const float top = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f + 8.0f;
 
+    // Two panels, as in the plan's mockup: the station on the left (inputs, source,
+    // looks, snapshots), the picture controls on the right (view, stereo, color, rig check).
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
-    ImGui::SetNextWindowPos(ImVec2(W - panelW - 8.0f, top), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(panelW, 0.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(panelW, 0.0f), ImVec2(panelW, H - top - 90.0f));
-    ImGui::SetNextWindowBgAlpha(0.82f);
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
                                    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
                                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing;
-    if (ImGui::Begin("Inspector  (Tab)", nullptr, flags)) {
+    auto placePanel = [&](float x) {
+        ImGui::SetNextWindowPos(ImVec2(x, top), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(panelW, 0.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(panelW, 0.0f), ImVec2(panelW, H - top - 90.0f));
+        ImGui::SetNextWindowBgAlpha(0.82f);
+    };
+    placePanel(8.0f);
+    if (ImGui::Begin("Station  (Tab)", nullptr, flags)) {
         // --- Inputs (DeckLink / test rig / camera / stream) ----------------------
         station_.BuildInputsSection(st.sourceLabel, st.live);
 
@@ -484,6 +561,38 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
             }
         }
 
+        // --- Looks ----------------------------------------------------------
+        if (ImGui::CollapsingHeader("Looks", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::Button("Load .cube...")) OpenLookDialog(false);
+            if (!lutName_.empty()) {
+                ImGui::SameLine();
+                ImGui::Checkbox("On##lut", &grade_.lutOn);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear##lut")) {
+                    lutName_.clear();
+                    lutPath_.clear();
+                    grade_.lutOn = false;
+                    if (renderer_) renderer_->ClearLut3D();
+                }
+                ImGui::TextDisabled("%s  (%d^3)", lutName_.c_str(), lut_.size);
+            } else {
+                ImGui::SameLine();
+                ImGui::TextDisabled("or drop one on the window");
+            }
+            if (ImGui::Button("Load .cdl / .cc...")) OpenLookDialog(true);
+            ImGui::SameLine();
+            ImGui::Checkbox("On##cdl", &grade_.cdlOn);
+            if (!cdlName_.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", cdlName_.c_str());
+            }
+        }
+        station_.BuildSnapshotsSection();
+    }
+    ImGui::End();
+
+    placePanel(W - panelW - 8.0f);
+    if (ImGui::Begin("Inspector  (Tab)", nullptr, flags)) {
         // --- View -----------------------------------------------------------
         if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
             for (int i = 0; i < (int)ViewMode::Count; ++i) {
@@ -531,36 +640,11 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
             ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
             ImGui::SliderFloat("Exposure", &grade_.exposure, -4.0f, 4.0f, "%+.2f EV");
             if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) grade_.exposure = 0.0f;
-
-            // LUT
-            ImGui::SeparatorText("LUT");
-            if (ImGui::Button("Load .cube...")) OpenLookDialog(false);
-            if (!lutName_.empty()) {
-                ImGui::SameLine();
-                ImGui::Checkbox("On##lut", &grade_.lutOn);
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Clear##lut")) {
-                    lutName_.clear();
-                    lutPath_.clear();
-                    grade_.lutOn = false;
-                    if (renderer_) renderer_->ClearLut3D();
-                }
-                ImGui::TextDisabled("%s  (%d^3)", lutName_.c_str(), lut_.size);
-            } else {
-                ImGui::SameLine();
-                ImGui::TextDisabled("or drop one on the window");
-            }
-
-            // CDL
-            ImGui::SeparatorText("ASC CDL");
-            if (ImGui::Button("Load .cdl / .cc...")) OpenLookDialog(true);
-            ImGui::SameLine();
-            ImGui::Checkbox("On##cdl", &grade_.cdlOn);
-            if (!cdlName_.empty()) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", cdlName_.c_str());
-            }
+            ImGui::TextDisabled("Look: %s%s%s", grade_.lutOn && !lutName_.empty() ? lutName_.c_str() : "no LUT",
+                                grade_.cdlOn ? " + CDL " : "", grade_.cdlOn ? cdlName_.c_str() : "");
             ImGui::BeginDisabled(!grade_.cdlOn);
+            const bool cdlOpen = ImGui::TreeNode("ASC CDL values");
+            if (cdlOpen) {
             ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
             ImGui::DragFloat3("Slope", grade_.slope, 0.005f, 0.0f, 4.0f, "%.3f");
             ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
@@ -577,17 +661,18 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                 }
                 grade_.saturation = cdl_.saturation;
             }
+            ImGui::TreePop();
+            }
             ImGui::EndDisabled();
             ImGui::EndDisabled();
         }
 
         // --- Rig check (Phase 2) --------------------------------------------
         station_.BuildRigSection(st.stereo && st.hasPicture);  // measured (Phase 2)
-        station_.BuildSnapshotsSection();
     }
     ImGui::End();
     ImGui::PopStyleVar();
-    station_.BuildHistoryStrip(uiAlpha, st.stereo && st.hasPicture);  // 60 s of rig health (R)
+    station_.BuildHistoryStrip(alpha, st.stereo && st.hasPicture);  // 60 s of rig health (R); follows the pin
 #else
     (void)st;
     (void)uiAlpha;

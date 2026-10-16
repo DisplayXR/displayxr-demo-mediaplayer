@@ -136,6 +136,7 @@ public:
 private:
     void SetMode(ViewMode m, bool announce);
     void BuildDepthOverlay(const Status& st);
+    void BuildStatusBar(const Status& st);
     void ZoomAt(float factor, float u, float v);
     void SetZoom(float z);
     void ClampPan();
@@ -177,6 +178,9 @@ private:
     bool pendingCompare_ = false;  // B pressed: swap in Tick()
     bool rightOnlyView_ = false;
     bool stereoSource_ = false;
+    bool wasFullscreen_ = false;   // full screen hides everything but the picture
+    bool pinnedBeforeFullscreen_ = true;
+    int ticks_ = 0, testCompareFrame_ = -1;  // MEDIAPLAYER_PRO_COMPARE_FRAME (screenshots)
 };
 
 }  // namespace mp::pro

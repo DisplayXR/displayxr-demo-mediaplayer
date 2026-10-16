@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -85,6 +86,8 @@ void Station::Init(StationHost host, const StationOptions& opt) {
         inputs_.push_back(d);
     }
     if (!inputs_.empty() && opt.startFirstInput) SwitchInput(0);
+    if (const char* f = std::getenv("MEDIAPLAYER_PRO_SNAPSHOT_FRAME")) testSnapshotFrame_ = std::atoi(f);
+    if (const char* d = std::getenv("MEDIAPLAYER_PRO_DECKLINK_DIALOG"); d && *d && *d != '0') OpenDeckLinkDialog();
 }
 
 void Station::Shutdown() {
@@ -156,6 +159,7 @@ bool Station::HandleKey(int key) {
             return true;
         case SDLK_N:
             pendingSnapshot_ = true;  // done in Tick(), outside the SDL event hook
+            pendingSnapshotNote_.clear();
             return true;
         case SDLK_J:
             pendingSwitch_ = true;
@@ -166,9 +170,54 @@ bool Station::HandleKey(int key) {
 }
 
 void Station::Tick() {
+    // Test scaffolding (screenshots): MEDIAPLAYER_PRO_SNAPSHOT_FRAME=N takes one snapshot
+    // after N ticks, with MEDIAPLAYER_PRO_SNAPSHOT_NOTE as its note.
+    ++testFrames_;
+    if (testSnapshotFrame_ > 0 && testFrames_ == testSnapshotFrame_) {
+        pendingSnapshot_ = true;
+        const char* n = std::getenv("MEDIAPLAYER_PRO_SNAPSHOT_NOTE");
+        pendingSnapshotNote_ = n ? n : "";
+    }
     if (pendingSnapshot_) {
         pendingSnapshot_ = false;
-        TakeSnapshot("");
+        TakeSnapshot(pendingSnapshotNote_);
+        pendingSnapshotNote_.clear();
+    }
+    // The runtime names the capture <prefix>_atlas<...>.png; point each new note at it.
+    for (size_t i = 0; i < snapshots_.size(); ++i) {
+        Snapshot& s = snapshots_[i];
+        if (s.imageFound || s.prefix.empty()) continue;
+        if (LiveProducer::NowSeconds() - s.takenSec > 5.0) {
+            s.imageFound = true;  // give up; the note keeps the guess
+            continue;
+        }
+        if (testFrames_ % 15 != 0) continue;
+        const std::filesystem::path pre(s.prefix);
+        const std::string stem = pre.filename().string() + "_atlas";
+        std::error_code ec;
+        for (const auto& de : std::filesystem::directory_iterator(pre.parent_path(), ec)) {
+            const std::string f = de.path().filename().string();
+            if (f.rfind(stem, 0) == 0 && de.path().extension() == ".png") {
+                s.image = de.path().string();
+                s.imageFound = true;
+                SaveNote(i);
+                break;
+            }
+        }
+    }
+    if (!pendingDeckLinkSpec_.empty()) {
+        const std::string spec = pendingDeckLinkSpec_;
+        pendingDeckLinkSpec_.clear();
+        int idx = -1;
+        for (size_t i = 0; i < inputs_.size(); ++i)
+            if (inputs_[i].name == "DeckLink") idx = (int)i;
+        if (idx < 0) {
+            inputs_.push_back({"DeckLink", spec});
+            idx = (int)inputs_.size() - 1;
+        } else {
+            inputs_[idx].spec = spec;
+        }
+        SwitchInput(idx);
     }
     if (pendingSwitch_) {
         pendingSwitch_ = false;
@@ -202,11 +251,17 @@ bool Station::TakeSnapshot(const std::string& note) {
         return false;
     }
     Snapshot s;
-    s.image = prefix + "_atlas.png";
+    s.image = prefix + "_atlas.png";  // corrected in Tick once the runtime has written it
+    s.prefix = prefix;
+    s.takenSec = LiveProducer::NowSeconds();
     s.notePath = prefix + "_note.json";
     s.timecode = timecode_;
     s.clock = clock;
     s.rig = rig_.Last();
+    {
+        const std::vector<rig::Sample> h = rig_.History(1.0);
+        s.eyeSync = h.empty() ? -1 : h.back().eyeOffsetFrames;
+    }
     std::snprintf(s.note, sizeof(s.note), "%s", note.c_str());
     snapshots_.push_back(s);
     if (snapshots_.size() > 50) snapshots_.erase(snapshots_.begin());
@@ -229,6 +284,7 @@ void Station::SaveNote(size_t i) {
         j["far_pct"] = s.rig.farPct;
         j["delta_e"] = s.rig.deltaE;
     }
+    if (s.eyeSync >= 0) j["eye_sync_frames"] = s.eyeSync;
     const rig::Budget b = rig_.GetBudget();
     j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}};
     std::ofstream(s.notePath) << j.dump(2) << "\n";
@@ -362,7 +418,7 @@ const ImVec4 kAccent(0.20f, 0.65f, 1.00f, 1.0f);
 
 void Graded(const char* label, const char* value, float magnitude, float limit) {
     ImGui::TextUnformatted(label);
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.48f);
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.56f);
     const ImVec4 c = magnitude <= limit * 0.75f ? kOk : magnitude <= limit ? kWarn : kBad;
     ImGui::TextColored(c, "%s", value);
 }
@@ -372,6 +428,7 @@ void Graded(const char* label, const char* value, float magnitude, float limit) 
 void Station::BuildInputsSection(const std::string& liveName, bool live) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     if (!ImGui::CollapsingHeader("Inputs  (J)", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    if (ImGui::SmallButton("DeckLink setup...")) OpenDeckLinkDialog();
     if (inputs_.empty()) {
         ImGui::TextDisabled("%s", live ? liveName.c_str() : "No inputs configured.");
         ImGui::TextDisabled("--input=\"Rig=decklink:0+1,sdi\"  --test-signal");
@@ -388,6 +445,89 @@ void Station::BuildInputsSection(const std::string& liveName, bool live) {
 #else
     (void)liveName;
     (void)live;
+#endif
+}
+
+void Station::OpenDeckLinkDialog() {
+    dlgDevices_ = DeckLinkSource::Available() ? DeckLinkSource::Enumerate() : std::vector<std::string>{};
+    dlgLeft_ = std::clamp(dlgLeft_, 0, std::max(0, (int)dlgDevices_.size() - 1));
+    dlgRight_ = std::clamp(dlgRight_, 0, (int)dlgDevices_.size());
+    dlgOpen_ = true;
+}
+
+void Station::BuildDeckLinkDialog() {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    if (!dlgOpen_) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.42f), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(std::clamp(io.DisplaySize.x * 0.30f, 380.0f, 520.0f), 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.95f);
+    if (!ImGui::Begin("DeckLink input setup", &dlgOpen_, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+    const bool sdk = DeckLinkSource::Available();
+    const bool any = !dlgDevices_.empty();
+    if (!sdk) {
+        ImGui::TextColored(kBad, "This build has no DeckLink SDK.");
+        ImGui::TextDisabled("Rebuild with -DMP_DECKLINK_SDK_DIR=<Blackmagic DeckLink SDK>.");
+    } else if (!any) {
+        ImGui::TextColored(kWarn, "No DeckLink devices found.");
+        ImGui::TextWrapped("Fit a Blackmagic DeckLink card (e.g. DeckLink Duo 2, 8K Pro G2, Mini Recorder 4K) and "
+                           "install Blackmagic Desktop Video, then press Refresh.");
+    } else {
+        ImGui::TextColored(kOk, "%zu DeckLink input%s found.", dlgDevices_.size(), dlgDevices_.size() == 1 ? "" : "s");
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Refresh")) OpenDeckLinkDialog();
+    ImGui::Separator();
+    ImGui::BeginDisabled(!any);
+    auto deviceCombo = [&](const char* label, int& sel, bool allowNone) {
+        const int n = (int)dlgDevices_.size();
+        const std::string cur = allowNone && sel == 0 ? std::string("none - one cable")
+                                : n ? dlgDevices_[std::clamp(sel - (allowNone ? 1 : 0), 0, n - 1)]
+                                    : std::string("-");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+        if (ImGui::BeginCombo(label, cur.c_str())) {
+            if (allowNone && ImGui::Selectable("none - one cable", sel == 0)) sel = 0;
+            for (int i = 0; i < n; ++i)
+                if (ImGui::Selectable(dlgDevices_[i].c_str(), sel == i + (allowNone ? 1 : 0))) sel = i + (allowNone ? 1 : 0);
+            ImGui::EndCombo();
+        }
+    };
+    deviceCombo("Left eye / input", dlgLeft_, false);
+    deviceCombo("Right eye", dlgRight_, true);
+    const bool pair = dlgRight_ > 0;
+    ImGui::TextDisabled(pair ? "Two cables: frames paired by SDI timecode (RP188)." : "One cable: both eyes in one signal.");
+    const char* conns[] = {"as set in Desktop Video", "SDI", "HDMI"};
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+    ImGui::Combo("Connection", &dlgConn_, conns, 3);
+    ImGui::BeginDisabled(pair);
+    const char* packs[] = {"auto (3D flag / aspect)", "side by side", "dual-stream 3D (SDI 3G-B)", "mono"};
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+    ImGui::Combo("Stereo", &dlgStereo_, packs, 4);
+    ImGui::EndDisabled();
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+    ImGui::InputTextWithHint("Start format", "Hp25 (auto-detect follows)", dlgMode_, sizeof(dlgMode_));
+    ImGui::Separator();
+    if (ImGui::Button("Open")) {
+        std::string spec = "decklink:" + std::to_string(dlgLeft_);
+        if (pair) spec += "+" + std::to_string(dlgRight_ - 1);
+        if (dlgConn_ == 1) spec += ",sdi";
+        if (dlgConn_ == 2) spec += ",hdmi";
+        if (!pair) {
+            const char* st[] = {"", "sbs", "dual", "mono"};
+            if (*st[dlgStereo_]) spec += std::string(",") + st[dlgStereo_];
+        }
+        if (dlgMode_[0]) spec += std::string(",mode=") + dlgMode_;
+        pendingDeckLinkSpec_ = spec;  // opened in Tick()
+        dlgOpen_ = false;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) dlgOpen_ = false;
+    ImGui::End();
 #endif
 }
 
@@ -428,7 +568,7 @@ void Station::BuildRigSection(bool stereo) {
         Graded("Eye sync", v, (float)sync, 0.5f);
     } else {
         ImGui::TextUnformatted("Eye sync");
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.48f);
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.56f);
         ImGui::TextDisabled("no timecode");
     }
     std::snprintf(v, sizeof(v), "dE %.1f", r.deltaE);
@@ -454,7 +594,7 @@ void Station::BuildSnapshotsSection() {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     char head[48];
     std::snprintf(head, sizeof(head), "Snapshots - %zu  (N)###snaps", snapshots_.size());
-    if (!ImGui::CollapsingHeader(head)) return;
+    if (!ImGui::CollapsingHeader(head, ImGuiTreeNodeFlags_DefaultOpen)) return;
     if (ImGui::Button("Snapshot")) TakeSnapshot("");
     for (size_t k = snapshots_.size(); k-- > 0;) {
         Snapshot& s = snapshots_[k];
@@ -476,8 +616,10 @@ void Station::BuildHistoryStrip(float alpha, bool stereo) {
     const ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
-    ImGui::SetNextWindowPos(ImVec2(W * 0.38f, H * 0.86f), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
-    ImGui::SetNextWindowSize(ImVec2(W * 0.56f, H * 0.15f), ImGuiCond_Always);
+    // Between the two panels (ProController's panel width), along the bottom.
+    const float panelW = std::clamp(W * 0.24f, 280.0f, 440.0f);
+    ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.86f), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+    ImGui::SetNextWindowSize(ImVec2(std::max(200.0f, W - 2.0f * panelW - 48.0f), H * 0.15f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.72f);
     const ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
                                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs |
@@ -528,7 +670,11 @@ void Station::BuildHistoryStrip(float alpha, bool stereo) {
             const float y0 = p0.y + rowH, y1 = p0.y + 2.0f * rowH - 4.0f;
             dl->AddText(ImVec2(p0.x, y0 + rowH * 0.3f), dim, "Vertical");
             dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), grid);
-            const float range = std::max(b.maxVerticalPx * 2.0f, 2.0f);
+            // Scale to the larger of twice the limit and the worst sample, so an error past
+            // the limit shows as a line above the dashed limit, not one pinned to the frame.
+            float range = std::max(b.maxVerticalPx * 2.0f, 2.0f);
+            for (const rig::Sample& s : hist)
+                if (s.ok) range = std::max(range, std::fabs(s.verticalPx) * 1.25f);
             auto Y = [&](float px) { return (y0 + y1) * 0.5f - std::clamp(px / range, -1.0f, 1.0f) * (y1 - y0) * 0.5f; };
             for (float lim : {b.maxVerticalPx, -b.maxVerticalPx})
                 for (float x = x0; x < x1; x += 10.0f) dl->AddLine(ImVec2(x, Y(lim)), ImVec2(std::min(x + 5.0f, x1), Y(lim)), limit, 1.0f);
