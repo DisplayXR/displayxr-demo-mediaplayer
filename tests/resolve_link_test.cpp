@@ -174,9 +174,67 @@ void TestEdges() {
     CHECK(still.seeks == 0 && still.opens == 0, "a still is not seeked");
 }
 
+// Review fixes: a clip that will not open is asked for once; a parked Resolve whose
+// source time falls between the file's frames is sought once, not every sample; movement
+// is timed on the panel's clock (station arrival jitter does not flip play / park).
+void TestReviewFixes() {
+    {
+        Follower f;
+        Player p{"D:/a.mov", 1.0, true};
+        int opens = 0;
+        for (int i = 1; i <= 10; ++i) {
+            const Action a = f.Update(Sample(i, "D:/clip.braw", 2.0), i * 0.2, p.path, p.pos, p.paused, true);
+            if (a.kind == Action::Open) {
+                ++opens;
+                f.OpenFailed(a.path);  // the station could not decode it
+            }
+        }
+        CHECK(opens == 1, "a clip that fails to open is asked for once");
+        const Action back = f.Update(Sample(11, "D:/b.mov", 0.0), 2.4, p.path, p.pos, p.paused, true);
+        CHECK(back.kind == Action::Open && back.path == "D:/b.mov", "another clip opens normally");
+        f.Update(Sample(12, "D:/b.mov", 0.0), 2.6, "D:/b.mov", 0.0, true, true);
+        const Action again = f.Update(Sample(13, "D:/clip.braw", 2.0), 2.8, "D:/b.mov", 0.0, true, true);
+        CHECK(again.kind == Action::Open, "returning to the failed clip later asks again");
+    }
+    {
+        // Resolve parked at 5.010 s; the decoder lands on the next frame (5.0417 at 24 fps).
+        Follower f;
+        double pos = 5.0417;
+        int seeks = 0;
+        for (int i = 1; i <= 10; ++i) {
+            const Action a = f.Update(Sample(i, "D:/a.mov", 5.010), i * 0.2, "D:/a.mov", pos, true, true);
+            if (a.kind == Action::Seek) ++seeks;
+        }
+        CHECK(seeks == 0, "within a frame of Resolve: no seek");
+        pos = 5.2;  // 4 frames off, and the decoder never gets closer than that
+        for (int i = 11; i <= 20; ++i) {
+            const Action a = f.Update(Sample(i, "D:/a.mov", 5.010), i * 0.2, "D:/a.mov", pos, true, true);
+            if (a.kind == Action::Seek) ++seeks;
+        }
+        CHECK(seeks == 1, "an unchanged target is sought once, not every sample");
+    }
+    {
+        // Resolve plays in real time, samples written every 0.2 s on the panel's clock but
+        // arriving at the station 0.42 / 0.02 s apart (a late UI tick, then the catch-up).
+        Follower f;
+        double arrive = 0.0, flips = 0;
+        bool last = false;
+        for (int i = 0; i < 30; ++i) {
+            LinkSample s = Sample(i + 1, "D:/a.mov", 10.0 + i * 0.2);
+            s.written = 1000.0 + i * 0.2;
+            arrive += (i % 2) ? 0.02 : 0.42;  // a late Resolve timer tick, then a quick one
+            f.Update(s, arrive, "D:/a.mov", 10.0 + i * 0.2, false, true);
+            if (i > 1 && f.ResolvePlaying() != last) ++flips;
+            last = f.ResolvePlaying();
+        }
+        CHECK(last && flips == 0, "jittered arrival does not flip playing / parked");
+    }
+}
+
 }  // namespace
 
 int main() {
+    TestReviewFixes();
     TestParse();
     TestSamePath();
     TestPlayFollows();

@@ -11,7 +11,7 @@ namespace {
 
 // The frame number at the full rate: pairs (ff 0..29, field mark = second) unfolded.
 int FullRateFrame(const TimecodeFields& t, int fps) {
-    if (fps <= 30 || t.highFrameRate || t.ff >= (fps + 1) / 2) return t.ff;
+    if (fps <= 30 || t.highFrameRate || t.fullCount) return t.ff;
     return t.ff * 2 + (t.fieldMark ? 1 : 0);
 }
 
@@ -26,6 +26,10 @@ int TimecodeFrames(const TimecodeFields& t, int fpsNominal) {
         frames -= drop * (minutes - minutes / 10);
     }
     return frames;
+}
+
+bool TimecodeCountsEveryFrame(const TimecodeFields& t, int fpsNominal) {
+    return fpsNominal > 30 && t.ff >= (fpsNominal + 1) / 2;
 }
 
 void FormatTimecode(const TimecodeFields& t, int fpsNominal, char* out, size_t n) {

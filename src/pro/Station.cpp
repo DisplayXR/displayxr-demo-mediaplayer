@@ -266,6 +266,7 @@ bool Station::TakeSnapshot(const std::string& note) {
     s.takenSec = LiveProducer::NowSeconds();
     s.notePath = prefix + "_note.json";
     s.timecode = timecode_;
+    s.tcFps = signalFps_;
     s.clock = clock;
     s.rig = rig_.Last();
     {
@@ -286,6 +287,7 @@ void Station::SaveNote(size_t i) {
     j["image"] = s.image;
     j["note"] = std::string(s.note);
     j["timecode"] = s.timecode;
+    if (s.tcFps > 0) j["tc_fps"] = s.tcFps;
     j["time"] = s.clock;
     if (s.rig.ok) {
         j["vertical_px"] = s.rig.verticalPx;
@@ -311,6 +313,7 @@ void Station::LogNewAlerts() {
         nlohmann::json j;
         j["what"] = a.what;
         j["timecode"] = a.timecode;
+        if (signalFps_ > 0) j["tc_fps"] = signalFps_;
         j["time"] = a.wallClock;
         j["duration_s"] = a.end - a.start;
         std::ofstream((std::filesystem::path(dir) / "station_alerts.jsonl").string(), std::ios::app) << j.dump() << "\n";
@@ -340,6 +343,7 @@ std::string Station::RigStatusJson() const {
         alerts.push_back({{"what", al.what}, {"timecode", al.timecode}, {"time", al.wallClock}, {"open", al.end < 0}});
     out["alerts"] = alerts;
     out["timecode"] = timecode_;
+    out["tc_fps"] = signalFps_;
     out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
     return out.dump();
 }
@@ -681,6 +685,7 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
     ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.86f), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
     ImGui::SetNextWindowSize(ImVec2(std::max(200.0f, W - 2.0f * panelW - 48.0f), H * 0.15f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(flat ? 1.0f : 0.72f);
+    if (flat) ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     const ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
                                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs |
                                 ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
@@ -762,6 +767,7 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
         }
     }
     ImGui::End();
+    if (flat) ImGui::PopStyleVar();  // WindowRounding
     ImGui::PopStyleVar();
 #else
     (void)alpha;

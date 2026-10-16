@@ -125,7 +125,9 @@ Ordered by what the customer needs first.
 Items 1-6 below are built (see the table above) and unit-tested; **none of the DeckLink,
 rig or Resolve parts has run with a card, a stereo rig or Resolve yet** - that needs the
 hardware, and the Resolve panel has run against a fake Resolve (`tests/resolve_panel_test.py`)
-but not yet inside Resolve. RP188 at 50/60p is handled (an HFRTC when the card has one,
+but not yet inside Resolve (to confirm there: that `GetSourceStartTime` counts from the
+file's start, not from the media's start timecode - if it does the latter, follow is off by
+that start). RP188 at 50/60p is handled (an HFRTC when the card has one,
 otherwise the frame pairs unfolded with the field mark, drop-frame counted the SMPTE way;
 `TimecodeFrames`, tested) but not yet seen on a card. Kept for the record:
 

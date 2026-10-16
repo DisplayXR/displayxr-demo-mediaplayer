@@ -191,5 +191,36 @@ with tempfile.TemporaryDirectory() as d:
     check(m.status_lines(None)[0] == "Station: not running", "no station")
     check(link.goto_station(m.read_status(d)) and tl.tc == "01:00:12:05", "Go to station TC moves the playhead")
 
+# --- review fixes
+check(m.parse_fps("29.97 DF") == 29.97 and m.parse_fps("23.976") == 23.976, "drop-frame rate strings parse")
+check(m.parse_fps(None, 25.0) == 25.0 and m.parse_fps("", 25.0) == 25.0, "missing rate falls back")
+check(m.tc_on_timeline("10:00:00:26", 50, 25) == 36000 * 25 + 13, "50p station TC on a 25p timeline")
+check(m.tc_on_timeline("10:00:00:12", 0, 25) == 36000 * 25 + 12, "no tc_fps: same rate")
+with tempfile.TemporaryDirectory() as d2:
+    tl2 = FakeTimeline("01:00:00:00", "29.97 DF", 30 * 600)
+    tl2.GetSetting = lambda k: "29.97 DF" if k == "timelineFrameRate" else ""
+    check(m.timeline_fps(tl2) == 29.97, "a DF timeline is not read as 24 fps")
+    # Two notes on the SAME frame: Resolve keeps one; the other is refused once, not forever.
+    for name in ("pro_a_note.json", "pro_b_note.json"):
+        with open(os.path.join(d2, name), "w", encoding="utf-8") as f:
+            json.dump({"note": name, "timecode": "01:00:01:00"}, f)
+    calls = {"n": 0}
+    orig = tl2.AddMarker
+
+    def counting(*a):
+        calls["n"] += 1
+        return orig(*a)
+    tl2.AddMarker = counting
+    lk = m.Link(FakeResolve(tl2), d2)
+    for k in range(5):
+        lk.tick(now=200.0 + k * 1.1)
+    check(len(tl2.markers) == 1 and calls["n"] == 2, "a clashing marker is tried once: %d calls" % calls["n"])
+    check(lk.last_counts["skipped"] == 2, "settled keys are skipped without asking Resolve")
+    # Go to a 50p station TC on the 29.97 DF timeline.
+    ok = lk.goto_station({"timecode": "01:00:10:00", "tc_fps": 50})
+    want = int(round(3610.0 * 29.97))  # 3610 s of 29.97 fps frames
+    check(ok and ";" in tl2.tc and m.tc_to_frames(tl2.tc, 29.97) == want,
+          "station TC converted to the timeline's rate: %s" % tl2.tc)
+
 print("resolve_panel_test:", "all passed" if not failures else "%d failure(s)" % failures)
 sys.exit(1 if failures else 0)

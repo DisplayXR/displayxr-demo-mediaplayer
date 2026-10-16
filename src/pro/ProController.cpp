@@ -376,6 +376,7 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
 
 void ProController::Tick(const Status& st) {
     stereoSource_ = st.stereo;
+    station_.SetSignalFps(st.live ? st.sourceFps : 0.0f);
     station_.Tick();
     TickResolve(st);
     if (++ticks_ == testCompareFrame_) pendingCompare_ = true;
@@ -550,6 +551,10 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
         ImGui::SetNextWindowSizeConstraints(ImVec2(panelW, 0.0f), ImVec2(panelW, H - top - 90.0f));
         ImGui::SetNextWindowBgAlpha(FlatNow() ? 1.0f : 0.82f);  // a flat card hides the picture anyway
     };
+    // A flat card is a rectangle of 2D (the Local2D rect): square corners, or the corners
+    // would show black / the desktop instead of the picture.
+    const bool flat = FlatNow();
+    if (flat) ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     placePanel(8.0f);
     if (ImGui::Begin("Station", nullptr, flags)) {
         ImGui::Checkbox("Pin panels (Tab)", &inspectorPinned_);
@@ -688,6 +693,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
         if (FlatNow()) AddFlatRectOfCurrentWindow();
     }
     ImGui::End();
+    if (flat) ImGui::PopStyleVar();  // WindowRounding
     ImGui::PopStyleVar();
     float sx = 0, sy = 0, sw = 0, sh = 0;
     if (station_.BuildHistoryStrip(alpha, st.stereo && st.hasPicture, FlatNow(), &sx, &sy, &sw, &sh))

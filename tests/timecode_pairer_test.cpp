@@ -217,7 +217,28 @@ void FullRateTimecode() {
     CHECK(TimecodeFrames(tf(0, 0, 0, 12, true), 50) == 25, "50p pair 12, field mark -> 25");
     CHECK(TimecodeFrames(tf(0, 0, 1, 0), 50) == 50, "50p: one second = 50 frames");
     CHECK(TimecodeFrames(tf(0, 0, 0, 37, false, false, true), 60) == 37, "HFRTC counts every frame");
-    CHECK(TimecodeFrames(tf(0, 0, 0, 37), 60) == 37, "ff past half the rate is already full-rate");
+    {
+        TimecodeFields full = tf(0, 0, 0, 37);
+        CHECK(mp::TimecodeCountsEveryFrame(full, 60), "ff past half the rate proves a full count");
+        full.fullCount = true;
+        CHECK(TimecodeFrames(full, 60) == 37, "a latched full-count source is taken as it is");
+        // A full-count source across a second, latched as an input would latch it: from
+        // the first second's ff 30 on, every frame is consecutive - including ff 0..29 of
+        // the next second, which a per-frame rule would have doubled.
+        bool latch = false, consec = true;
+        int prevK = -1, seenAfterLatch = 0;
+        for (int ss = 0; ss < 3; ++ss)
+            for (int ff = 0; ff < 60; ++ff) {
+                TimecodeFields x = tf(0, 0, ss, ff);
+                if (mp::TimecodeCountsEveryFrame(x, 60)) latch = true;
+                x.fullCount = latch;
+                const int k = TimecodeFrames(x, 60);
+                if (latch && prevK >= 0 && seenAfterLatch > 0 && k != prevK + 1) consec = false;
+                if (latch) ++seenAfterLatch;
+                prevK = k;
+            }
+        CHECK(consec, "latched full-count 60p timecode is consecutive across seconds");
+    }
     CHECK(TimecodeFrames(tf(0, 10, 0, 0, false, true), 30) == 17982, "29.97 DF: ten minutes");
     CHECK(TimecodeFrames(tf(0, 1, 0, 2, false, true), 30) == 1800, "29.97 DF: ;00 ;01 skipped");
     // 59.94 DF from RP188: pairs + field mark + 4 numbers dropped a minute (2 pairs).
