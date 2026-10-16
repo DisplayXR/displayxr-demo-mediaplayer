@@ -18,6 +18,7 @@
 
 #include "color/Cdl.h"
 #include "color/CubeLut.h"
+#include "pro/DeckLinkSource.h"
 #include "rhi/VulkanRenderer.h"
 
 #include <functional>
@@ -61,6 +62,10 @@ struct Host {
     std::function<float()> oneToOneZoom;
     std::function<bool()> isFullscreen;
     std::function<void()> toggleFullscreen;
+    // DeckLink input became / stopped being the current source. App swaps its frame
+    // source (and leaves / returns to the idle screen) accordingly.
+    std::function<void()> deckLinkStarted;
+    std::function<void()> deckLinkStopped;
 };
 
 class ProController {
@@ -70,6 +75,15 @@ public:
     // Test scaffolding: MEDIAPLAYER_PRO_VIEW=0..4 (view mode) and MEDIAPLAYER_PRO_ZOOM=<x>
     // set the initial view, so a headless atlas dump can prove them without keystrokes.
     void ApplyTestEnv();
+
+    // DeckLink SDI / HDMI input. `spec` is the --decklink value: "0" = SBS on input 0,
+    // "0,1" = left camera on input 0 + right camera on input 1.
+    bool StartDeckLink(DeckLinkSource::Mode mode, int left, int right);
+    bool StartDeckLinkSpec(const std::string& spec);
+    void StopDeckLink();
+    bool DeckLinkActive() const { return deckLinkActive_; }
+    DeckLinkSource& DeckLink() { return deckLink_; }
+    const DeckLinkSource& DeckLink() const { return deckLink_; }
 
     // Launch-time looks (--lut / --cdl, or MEDIAPLAYER_LUT / MEDIAPLAYER_CDL).
     void LoadLut(const std::string& path);
@@ -141,6 +155,18 @@ private:
     bool dialogReady_ = false;
     bool dialogOpen_ = false;
     bool pendingDialogIsCdl_ = false;
+
+    // DeckLink input.
+    void BuildDeckLinkUI();
+    void PollDeckLink();
+    DeckLinkSource deckLink_;
+    bool deckLinkActive_ = false;
+    DeckLinkSource::State deckLinkSeen_ = DeckLinkSource::State::Closed;
+    std::vector<DeckLinkSource::Device> dlDevices_;
+    std::string dlUnavailable_;
+    bool dlScanned_ = false;
+    int dlMode_ = 0;            // 0 = one input (SBS), 1 = two inputs (L + R)
+    int dlLeft_ = 0, dlRight_ = 1;
 
     bool inspectorPinned_ = true;  // Tab toggles
     bool stereoSource_ = false;

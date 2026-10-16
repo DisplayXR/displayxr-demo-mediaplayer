@@ -597,8 +597,17 @@ void App::RenderOneFrame() {
     FrameRing* ring = isLive_     ? (livePaused_ ? nullptr : &camera_.Ring())
                       : isStream_ ? (streamPaused_ ? nullptr : &video_.Ring())
                                   : (isVideo_ ? &video_.Ring() : nullptr);
+#if MEDIAPLAYER_PRO
+    if (proLive_) ring = &pro_.DeckLink().Ring();  // DeckLink SDI/HDMI input
+#endif
     if (ring) {
         if (const FrameRing::Frame* vf = ring->AcquireLatest()) {
+#if MEDIAPLAYER_PRO
+            if (proLive_) {
+                SettleLiveLayout(*vf, "DeckLink");
+                SampleAutoConv(*vf);
+            }
+#endif
             if (isLive_) {
                 OnLiveFrame(*vf);
                 SampleAutoConv(*vf);  // ~5 Hz; downsample only, measured on the worker
@@ -1405,6 +1414,9 @@ void App::ReloadMedia(const std::string& path) {
     // Every file path (Open, drop, open_file, navigation) lands here, so this is the one
     // place a file replaces the live camera.
     const bool wasLive = isLive_ || isStream_;
+#if MEDIAPLAYER_PRO
+    if (proLive_) StopProLive(/*showIdleIfEmpty=*/false);  // a file replaces the DeckLink input
+#endif
     if (isLive_) StopLive(/*showIdleIfEmpty=*/false);
     if (isStream_) StopStream(/*showIdleIfEmpty=*/false);  // #93: a file replaces the stream
     video_.Stop();   // joins the decode thread (which reads the audio clock) FIRST,
@@ -1494,6 +1506,9 @@ bool App::LoadLiveDevice(const CameraDevice& dev) {
         return false;
     }
     if (isStream_) StopStream(/*showIdleIfEmpty=*/false);  // #93: the camera replaces it
+#if MEDIAPLAYER_PRO
+    if (proLive_) StopProLive(/*showIdleIfEmpty=*/false);  // ...and the DeckLink input
+#endif
     video_.Stop();   // joins the decode thread before audio (see ReloadMedia)
     audio_.Stop();
 #if defined(_WIN32)
@@ -2781,6 +2796,8 @@ void App::InitPro() {
     };
     h.isFullscreen = [this] { return window_.IsFullscreen(); };
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
+    h.deckLinkStarted = [this] { StartProLive(); };
+    h.deckLinkStopped = [this] { StopProLive(/*showIdleIfEmpty=*/true); };
     pro_.Init(&renderer_, window_.SdlWindow(), std::move(h));
 
     // Pro input rides the same SDL event hook as ImGui, after ImGui has seen the event.
@@ -2804,7 +2821,46 @@ void App::InitPro() {
     pro_.ApplyTestEnv();
     if (!launch_.lutPath.empty()) pro_.LoadLut(launch_.lutPath);
     if (!launch_.cdlPath.empty()) pro_.LoadCdl(launch_.cdlPath);
+    if (launch_.deckLink.empty())
+        if (const char* e = std::getenv("MEDIAPLAYER_DECKLINK")) launch_.deckLink = e;
+    if (!launch_.deckLink.empty()) pro_.StartDeckLinkSpec(launch_.deckLink);
     LOG_INFO("Media Player Pro: ready (lut=%s cdl=%s)", launch_.lutPath.c_str(), launch_.cdlPath.c_str());
+}
+
+void App::StartProLive() {
+    // Mirrors LoadLiveDevice: the DeckLink input replaces whatever was showing.
+    if (isLive_) StopLive(/*showIdleIfEmpty=*/false);
+    if (isStream_) StopStream(/*showIdleIfEmpty=*/false);
+    video_.Stop();
+    audio_.Stop();
+#if defined(_WIN32)
+    renderer_.ClearSharedImports();
+#endif
+    proLive_ = true;
+    isVideo_ = false;
+    hasMedia_ = true;
+    currentMediaPath_.clear();
+    folderFiles_.clear();
+    folderIndex_ = 0;
+    playlistFromDrop_ = false;
+    if (uiState_.slideshowActive) SetSlideshow(false);
+    mediaConvergence_ = 0.0f;
+    mediaAutoConvAvailable_ = false;
+    mediaEyeSwap_ = false;
+    mediaW_ = mediaH_ = 0;  // SettleLiveLayout leaves the idle screen on the first frame
+    autoConvWorker_.RequestReset();
+}
+
+void App::StopProLive(bool showIdleIfEmpty) {
+    if (!proLive_) return;
+    proLive_ = false;
+    pro_.StopDeckLink();  // idempotent; no callback loop (it only fires when it was active)
+    autoConvWorker_.RequestReset();
+    if (showIdleIfEmpty) {
+        hasMedia_ = false;
+        mediaW_ = mediaH_ = 0;
+        LoadIdleLogo();
+    }
 }
 
 pro::Status App::ProStatus() const {
@@ -2816,7 +2872,16 @@ pro::Status App::ProStatus() const {
     st.height = mediaH_;
     st.panelFps = fps_;
     st.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
-    if (isLive_) {
+    if (proLive_) {
+        const pro::DeckLinkSource& dlk = pro_.DeckLink();
+        const pro::DeckLinkSource::Stats ds = dlk.GetStats();
+        st.sourceKind = "DeckLink";
+        st.sourceLabel = dlk.Description();
+        st.sourceFps = ds.fps;
+        st.frameAgeMs = ds.lastPublishSec > 0.0
+                            ? (float)((CameraSource::NowSeconds() - ds.lastPublishSec) * 1000.0)
+                            : 0.0f;
+    } else if (isLive_) {
         st.sourceKind = "Camera";
         st.sourceLabel = camera_.DeviceName();
         st.sourceFps = camera_.GetStats().deliveredFps;

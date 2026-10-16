@@ -317,6 +317,7 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
 
 void ProController::Tick(const Status& st) {
     stereoSource_ = st.stereo;
+    PollDeckLink();
     std::string path;
     bool isCdl = false;
     {
@@ -388,6 +389,8 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                     ImGui::TextDisabled("panel %.0f fps  mode %s", st.panelFps, st.modeName.c_str());
             }
         }
+
+        BuildDeckLinkUI();
 
         // --- View -----------------------------------------------------------
         if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -498,6 +501,107 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
 #else
     (void)st;
     (void)uiAlpha;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DeckLink input
+// ---------------------------------------------------------------------------
+
+bool ProController::StartDeckLink(DeckLinkSource::Mode mode, int left, int right) {
+    if (!deckLink_.Open(mode, left, right)) {
+        if (host_.toast) host_.toast("DeckLink: " + deckLink_.LastError());
+        return false;
+    }
+    deckLinkActive_ = true;
+    deckLinkSeen_ = DeckLinkSource::State::Opening;
+    if (host_.deckLinkStarted) host_.deckLinkStarted();
+    if (host_.toast) host_.toast("DeckLink: " + deckLink_.Description());
+    return true;
+}
+
+bool ProController::StartDeckLinkSpec(const std::string& spec) {
+    int a = 0, b = -1;
+    const int n = std::sscanf(spec.c_str(), "%d,%d", &a, &b);
+    if (n < 1) {
+        if (host_.toast) host_.toast("DeckLink: bad --decklink value '" + spec + "'");
+        return false;
+    }
+    return n == 2 ? StartDeckLink(DeckLinkSource::Mode::Dual, a, b)
+                  : StartDeckLink(DeckLinkSource::Mode::Single, a, a);
+}
+
+void ProController::StopDeckLink() {
+    const bool was = deckLinkActive_;
+    deckLink_.Stop();
+    deckLinkActive_ = false;
+    deckLinkSeen_ = DeckLinkSource::State::Closed;
+    if (was && host_.deckLinkStopped) host_.deckLinkStopped();
+}
+
+void ProController::PollDeckLink() {
+    if (!deckLinkActive_) return;
+    const DeckLinkSource::State s = deckLink_.GetState();
+    if (s == deckLinkSeen_) return;
+    deckLinkSeen_ = s;
+    if (!host_.toast) return;
+    switch (s) {
+        case DeckLinkSource::State::NoSignal: host_.toast("DeckLink: no signal"); break;
+        case DeckLinkSource::State::Failed: host_.toast("DeckLink: " + deckLink_.LastError()); break;
+        case DeckLinkSource::State::Streaming: host_.toast("DeckLink: live"); break;
+        default: break;
+    }
+}
+
+void ProController::BuildDeckLinkUI() {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    if (!ImGui::CollapsingHeader("SDI / HDMI input (DeckLink)")) return;
+    if (!dlScanned_ || ImGui::SmallButton("Rescan")) {
+        dlDevices_ = DeckLinkSource::Enumerate();
+        dlUnavailable_ = dlDevices_.empty() ? DeckLinkSource::Unavailable() : std::string();
+        dlScanned_ = true;
+    }
+    if (dlDevices_.empty()) {
+        ImGui::TextWrapped("%s", dlUnavailable_.c_str());
+        return;
+    }
+    auto deviceCombo = [&](const char* label, int& sel) {
+        const char* cur = "?";
+        for (const auto& d : dlDevices_)
+            if (d.index == sel) cur = d.name.c_str();
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
+        if (ImGui::BeginCombo(label, cur)) {
+            for (const auto& d : dlDevices_) {
+                char row[160];
+                std::snprintf(row, sizeof(row), "%s%s##dl%d", d.name.c_str(),
+                              d.formatDetection ? "" : "  (no auto-detect)", d.index);
+                if (ImGui::Selectable(row, sel == d.index)) sel = d.index;
+            }
+            ImGui::EndCombo();
+        }
+    };
+    ImGui::BeginDisabled(deckLinkActive_);
+    ImGui::RadioButton("One input, side by side", &dlMode_, 0);
+    ImGui::RadioButton("Two inputs, left + right camera", &dlMode_, 1);
+    deviceCombo(dlMode_ == 1 ? "Left" : "Input", dlLeft_);
+    if (dlMode_ == 1) deviceCombo("Right", dlRight_);
+    ImGui::EndDisabled();
+    if (!deckLinkActive_) {
+        if (ImGui::Button("Start"))
+            StartDeckLink(dlMode_ == 1 ? DeckLinkSource::Mode::Dual : DeckLinkSource::Mode::Single, dlLeft_,
+                          dlRight_);
+    } else {
+        if (ImGui::Button("Stop")) StopDeckLink();
+        const DeckLinkSource::Stats s = deckLink_.GetStats();
+        ImGui::SameLine();
+        ImGui::Text("%s", DeckLinkSource::StateName(deckLink_.GetState()));
+        ImGui::TextDisabled("%s  %dx%d  %s  %.1f fps", s.modeName.c_str(), s.width, s.height,
+                            s.tenBit ? "10-bit" : "8-bit", s.fps);
+        if (!s.timecode.empty()) ImGui::TextDisabled("TC %s", s.timecode.c_str());
+        if (dlMode_ == 1)
+            ImGui::TextDisabled("eye skew %.2f ms (max %.2f)  unpaired %llu", s.lastSkewMs, s.maxSkewMs,
+                                (unsigned long long)s.unpaired);
+    }
 #endif
 }
 

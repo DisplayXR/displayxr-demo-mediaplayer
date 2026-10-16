@@ -70,6 +70,10 @@ bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, b
             o.cdlPath = args[++i];
         } else if (a.rfind("--cdl=", 0) == 0) {
             o.cdlPath = a.substr(6);
+        } else if (a == "--decklink" && i + 1 < args.size()) {  // Media Player Pro SDI input
+            o.deckLink = args[++i];
+        } else if (a.rfind("--decklink=", 0) == 0) {
+            o.deckLink = a.substr(11);
         } else if (a == "--camera-list") {
             list = true;
         } else {

@@ -446,8 +446,40 @@ function(mp_add_player tgt is_pro)
             "${CMAKE_CURRENT_SOURCE_DIR}/displayxr" "$<TARGET_FILE_DIR:${tgt}>/displayxr"
         COMMENT "Staging displayxr/ sidecar (manifest + logos) next to ${tgt}")
     if(is_pro)
-        target_sources(${tgt} PRIVATE src/pro/ProController.cpp)
+        target_sources(${tgt} PRIVATE
+            src/pro/ProController.cpp
+            src/pro/DeckLinkFrames.cpp
+            src/pro/DeckLinkSource.cpp)
         target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=1)
+        # Blackmagic DeckLink input (docs/PRO.md). The SDK is a registration download
+        # and is never committed: point MP_DECKLINK_SDK_DIR at the directory holding
+        # DeckLinkAPI.idl (the SDK's Win/include) and MIDL generates the C++ headers
+        # into the build tree. Without it DeckLinkSource builds as a stub.
+        if(WIN32 AND MP_DECKLINK_SDK_DIR)
+            if(NOT EXISTS "${MP_DECKLINK_SDK_DIR}/DeckLinkAPI.idl")
+                message(FATAL_ERROR "MP_DECKLINK_SDK_DIR has no DeckLinkAPI.idl: ${MP_DECKLINK_SDK_DIR}")
+            endif()
+            find_program(MP_MIDL midl REQUIRED)
+            set(_dl_out "${CMAKE_CURRENT_BINARY_DIR}/decklink")
+            file(MAKE_DIRECTORY "${_dl_out}")
+            file(GLOB _dl_idls "${MP_DECKLINK_SDK_DIR}/*.idl")
+            add_custom_command(
+                OUTPUT "${_dl_out}/DeckLinkAPI_h.h" "${_dl_out}/DeckLinkAPI_i.c"
+                COMMAND "${MP_MIDL}" /nologo /env x64 /I "${MP_DECKLINK_SDK_DIR}"
+                        /h DeckLinkAPI_h.h /iid DeckLinkAPI_i.c /tlb DeckLinkAPI.tlb
+                        /out "${_dl_out}" "${MP_DECKLINK_SDK_DIR}/DeckLinkAPI.idl"
+                DEPENDS ${_dl_idls}
+                COMMENT "MIDL: DeckLink SDK headers"
+                VERBATIM)
+            target_sources(${tgt} PRIVATE "${_dl_out}/DeckLinkAPI_i.c")
+            target_include_directories(${tgt} PRIVATE "${_dl_out}" "${MP_DECKLINK_SDK_DIR}")
+            target_compile_definitions(${tgt} PRIVATE MP_HAVE_DECKLINK=1)
+            target_link_libraries(${tgt} PRIVATE ole32 oleaut32)
+            message(STATUS "Media Player Pro: DeckLink input ON (SDK ${MP_DECKLINK_SDK_DIR})")
+        else()
+            target_compile_definitions(${tgt} PRIVATE MP_HAVE_DECKLINK=0)
+            message(STATUS "Media Player Pro: DeckLink input stubbed (set MP_DECKLINK_SDK_DIR)")
+        endif()
     else()
         target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=0)
     endif()
@@ -464,6 +496,7 @@ else()
     set(_mp_pro_default OFF)
 endif()
 option(MP_BUILD_PRO "Also build Media Player Pro (mediaplayer_pro_handle_vk_<plat>)" ${_mp_pro_default})
+set(MP_DECKLINK_SDK_DIR "" CACHE PATH "Pro: Blackmagic DeckLink SDK include dir (DeckLinkAPI.idl); empty = stub")
 set(MP_PRO_TARGET "mediaplayer_pro_handle_vk_${MP_PLATFORM}")
 if(MP_BUILD_PRO)
     mp_add_player(${MP_PRO_TARGET} ON)
@@ -532,6 +565,14 @@ if(MP_BUILD_TESTS)
         src/color/Cdl.cpp)
     target_include_directories(color_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME color COMMAND color_test)
+
+    # Media Player Pro DeckLink input, hardware-free half: UYVY/v210 -> NV12 + the
+    # two-input stereo pairer.
+    add_executable(decklink_frames_test
+        tests/decklink_frames_test.cpp
+        src/pro/DeckLinkFrames.cpp)
+    target_include_directories(decklink_frames_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME decklink_frames COMMAND decklink_frames_test)
 
     add_executable(mpo_parse_test
         tests/mpo_parse_test.cpp

@@ -60,3 +60,4 @@ _android_build.log
 # A binary that is already published elsewhere must not be vendored here: it would
 # drift from dxrClientRuntimeTag silently, which is the whole failure this replaces.
 android/libs/
+build-dl/

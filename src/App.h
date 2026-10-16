@@ -45,6 +45,9 @@ public:
         // (MEDIAPLAYER_LUT / MEDIAPLAYER_CDL fill them otherwise). Ignored by the base player.
         std::string lutPath;
         std::string cdlPath;
+        // Media Player Pro DeckLink input: --decklink=<in> (SBS) or <left>,<right>
+        // (two cameras); MEDIAPLAYER_DECKLINK fills it otherwise.
+        std::string deckLink;
     };
     void SetLaunchOptions(const LaunchOptions& o) { launch_ = o; }  // before Initialize()
 
@@ -356,6 +359,10 @@ private:
     // per-eye content width in tile pixels: Pro's pointer->picture mapping and 1:1 zoom.
     float proPicX_ = 0.f, proPicY_ = 0.f, proPicW_ = 0.f, proPicH_ = 0.f;
     float proTileContentW_ = 0.f;
+    // The DeckLink input is the current source (its FrameRing feeds the render path).
+    bool proLive_ = false;
+    void StartProLive();
+    void StopProLive(bool showIdleIfEmpty);
 #endif
 
     // Test scaffolding (env-gated).
