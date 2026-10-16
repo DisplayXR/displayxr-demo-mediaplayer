@@ -9,6 +9,7 @@
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include <cfloat>
+#include <cstring>
 #include <chrono>
 
 #include "imgui.h"
@@ -628,6 +629,7 @@ void ImGuiLayer::RenderToHud(uint32_t imageIndex, VkCommandBuffer cmd) {
     rp.renderArea.extent = {hudWidth_, hudHeight_};
     rp.clearValueCount = 1;
     rp.pClearValues = &clear;
+    RecordTextureUploads(cmd);  // thumbnails: before the pass that samples them
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
     ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
     vkCmdEndRenderPass(cmd);
@@ -691,6 +693,7 @@ void ImGuiLayer::Shutdown() {
         g_subclassedHwnd = nullptr;
     }
 #endif
+    DestroyTextures();
     if (ready_) {
         ImGui_ImplVulkan_Shutdown();
 #if defined(MEDIAPLAYER_IMGUI_SDL)
@@ -702,6 +705,139 @@ void ImGuiLayer::Shutdown() {
     DestroyTargetObjects();
     if (descPool_) { vkDestroyDescriptorPool(device_, descPool_, nullptr); descPool_ = VK_NULL_HANDLE; }
     device_ = VK_NULL_HANDLE;
+}
+
+// ----------------------------------------------------------------------------- user textures
+
+int ImGuiLayer::CreateTexture(uint32_t w, uint32_t h) {
+    if (!ready_ || w == 0 || h == 0) return -1;
+    if (!textureSampler_) {
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.maxLod = 0.0f;
+        if (vkCreateSampler(device_, &si, nullptr, &textureSampler_) != VK_SUCCESS) return -1;
+    }
+    UserTexture t;
+    t.w = w;
+    t.h = h;
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = VK_FORMAT_R8G8B8A8_UNORM;  // encoded bytes, sampled as-is (the UI is display-referred)
+    ii.extent = {w, h, 1};
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool ok = vkCreateImage(device_, &ii, nullptr, &t.image) == VK_SUCCESS;
+    if (ok) {
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(device_, t.image, &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = FindMemoryType(physicalDevice_, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        ok = mai.memoryTypeIndex != UINT32_MAX && vkAllocateMemory(device_, &mai, nullptr, &t.memory) == VK_SUCCESS &&
+             vkBindImageMemory(device_, t.image, t.memory, 0) == VK_SUCCESS;
+    }
+    if (ok) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = t.image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = ii.format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        ok = vkCreateImageView(device_, &vi, nullptr, &t.view) == VK_SUCCESS;
+    }
+    for (int i = 0; ok && i < kStagingRing; ++i) {
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = (VkDeviceSize)w * h * 4;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        ok = vkCreateBuffer(device_, &bi, nullptr, &t.staging[i]) == VK_SUCCESS;
+        if (!ok) break;
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(device_, t.staging[i], &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = FindMemoryType(physicalDevice_, req.memoryTypeBits,
+                                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        ok = mai.memoryTypeIndex != UINT32_MAX &&
+             vkAllocateMemory(device_, &mai, nullptr, &t.stagingMem[i]) == VK_SUCCESS &&
+             vkBindBufferMemory(device_, t.staging[i], t.stagingMem[i], 0) == VK_SUCCESS &&
+             vkMapMemory(device_, t.stagingMem[i], 0, VK_WHOLE_SIZE, 0, &t.mapped[i]) == VK_SUCCESS;
+    }
+    if (ok) {
+        t.descriptor = (void*)ImGui_ImplVulkan_AddTexture(textureSampler_, t.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        ok = t.descriptor != nullptr;
+    }
+    textures_.push_back(t);
+    if (!ok) {
+        LOG_WARN("ImGuiLayer: could not create a %ux%u texture", w, h);
+        textures_.back().descriptor = nullptr;
+        return -1;  // its pieces are freed with the rest in DestroyTextures()
+    }
+    return (int)textures_.size() - 1;
+}
+
+void ImGuiLayer::UpdateTexture(int id, const uint8_t* rgba) {
+    if (id < 0 || id >= (int)textures_.size() || !rgba) return;
+    UserTexture& t = textures_[id];
+    if (!t.mapped[t.next]) return;
+    std::memcpy(t.mapped[t.next], rgba, (size_t)t.w * t.h * 4);
+    t.pending = t.next;
+    t.next = (t.next + 1) % kStagingRing;
+}
+
+void* ImGuiLayer::TextureId(int id) const {
+    if (id < 0 || id >= (int)textures_.size()) return nullptr;
+    const UserTexture& t = textures_[id];
+    return t.initialized || t.pending >= 0 ? t.descriptor : nullptr;
+}
+
+void ImGuiLayer::RecordTextureUploads(VkCommandBuffer cmd) {
+    for (UserTexture& t : textures_) {
+        if (t.pending < 0 || !t.descriptor) continue;
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = t.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.oldLayout = t.initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcAccessMask = t.initialized ? VK_ACCESS_SHADER_READ_BIT : 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &b);
+        VkBufferImageCopy c{};
+        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.imageExtent = {t.w, t.h, 1};
+        vkCmdCopyBufferToImage(cmd, t.staging[t.pending], t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &b);
+        t.initialized = true;
+        t.pending = -1;
+    }
+}
+
+void ImGuiLayer::DestroyTextures() {
+    if (textures_.empty() && !textureSampler_) return;
+    if (device_) vkDeviceWaitIdle(device_);  // shutdown only: frames in flight may still sample them
+    for (UserTexture& t : textures_) {
+        if (t.descriptor && ready_) ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)t.descriptor);
+        for (int i = 0; i < kStagingRing; ++i) {
+            if (t.staging[i]) vkDestroyBuffer(device_, t.staging[i], nullptr);
+            if (t.stagingMem[i]) vkFreeMemory(device_, t.stagingMem[i], nullptr);
+        }
+        if (t.view) vkDestroyImageView(device_, t.view, nullptr);
+        if (t.image) vkDestroyImage(device_, t.image, nullptr);
+        if (t.memory) vkFreeMemory(device_, t.memory, nullptr);
+    }
+    textures_.clear();
+    if (textureSampler_) vkDestroySampler(device_, textureSampler_, nullptr);
+    textureSampler_ = VK_NULL_HANDLE;
 }
 
 #else  // !MEDIAPLAYER_WITH_IMGUI
@@ -726,6 +862,11 @@ bool ImGuiLayer::WantCaptureMouse() const { return false; }
 void ImGuiLayer::SetCursorLocked(bool) {}
 int ImGuiLayer::MouseCursor() const { return 0; }
 void ImGuiLayer::Shutdown() {}
+int ImGuiLayer::CreateTexture(uint32_t, uint32_t) { return -1; }
+void ImGuiLayer::UpdateTexture(int, const uint8_t*) {}
+void* ImGuiLayer::TextureId(int) const { return nullptr; }
+void ImGuiLayer::RecordTextureUploads(VkCommandBuffer) {}
+void ImGuiLayer::DestroyTextures() {}
 
 #endif
 
