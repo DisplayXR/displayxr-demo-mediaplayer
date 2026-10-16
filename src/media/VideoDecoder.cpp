@@ -451,9 +451,10 @@ AVFrame* VideoDecoder::FloatToP016(AVFrame* src) {
     const float* lut = im.oetf.data();
     // Branch-free: clamp to [0,1] (values > 1.0 clip - an OCIO view is the tool for HDR EXR;
     // fmin/fmax also send NaN to 0), then lerp the table.
-    auto enc = [lut](float v) -> float {
-        const float t = std::fmin(std::fmax(v, 0.0f), 1.0f) * (float)kOetfN;
-        const int i = std::min((int)t, kOetfN - 1);
+    const int oetfN = kOetfN;  // a copy: MSVC will not capture a constexpr implicitly
+    auto enc = [lut, oetfN](float v) -> float {
+        const float t = std::fmin(std::fmax(v, 0.0f), 1.0f) * (float)oetfN;
+        const int i = (std::min)((int)t, oetfN - 1);  // parenthesised: windows.h min()
         return lut[i] + (lut[i + 1] - lut[i]) * (t - (float)i);
     };
     // 10-bit limited levels at 16-bit precision, MSB-aligned like P010 - what the shader's
@@ -489,8 +490,8 @@ AVFrame* VideoDecoder::FloatToP016(AVFrame* src) {
     };
     // Row-parallel: bands of row pairs, one per hardware thread (a 4K plate is ~4M quads).
     const int pairs = h / 2;
-    const int hw = (int)std::max(1u, std::thread::hardware_concurrency());
-    const int jobs = std::max(1, std::min({hw, 16, pairs / 32}));
+    const int hw = (int)(std::max)(1u, std::thread::hardware_concurrency());
+    const int jobs = (std::max)(1, (std::min)({hw, 16, pairs / 32}));
     if (jobs == 1) {
         band(0, pairs);
     } else {
@@ -498,10 +499,10 @@ AVFrame* VideoDecoder::FloatToP016(AVFrame* src) {
         pool.reserve((size_t)jobs - 1);
         const int per = (pairs + jobs - 1) / jobs;
         for (int j = 1; j < jobs; ++j) {
-            const int b = j * per, e = std::min(pairs, b + per);
+            const int b = j * per, e = (std::min)(pairs, b + per);
             if (b < e) pool.emplace_back(band, b, e);
         }
-        band(0, std::min(pairs, per));
+        band(0, (std::min)(pairs, per));
         for (std::thread& t : pool) t.join();
     }
     out->color_range = AVCOL_RANGE_MPEG;
