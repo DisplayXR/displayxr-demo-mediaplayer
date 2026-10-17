@@ -94,6 +94,10 @@ bool XrSession::InitInstanceAndSystem() {
             hasMcpToolsExt_ = true;
         if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0)
             cursorDepthSpec_ = e.extensionVersion;
+        if (strcmp(e.extensionName, XR_DXR_INPUT_PROVIDERS_EXTENSION_NAME) == 0) {
+            inputProvidersSpec_ = e.extensionVersion;
+            hasInputProvidersExt_ = e.extensionVersion >= 1;  // spec 1: enumerate + set + event
+        }
         // "Convert to 3D" needs the spec-4 task API (VIEWS_MONO streams, CPU images).
         if (strcmp(e.extensionName, XR_DXR_LIFT_EXTENSION_NAME) == 0) {
             liftSpec_ = e.extensionVersion;
@@ -113,6 +117,8 @@ bool XrSession::InitInstanceAndSystem() {
     LOG_INFO("XR_DXR_atlas_capture: %s", hasAtlasCaptureExt_ ? "yes" : "no");
     LOG_INFO("XR_DXR_mcp_tools: %s", hasMcpToolsExt_ ? "yes" : "no");
     LOG_INFO("XR_DXR_cursor_depth: %s (spec %u)", cursorDepthSpec_ ? "yes" : "no", cursorDepthSpec_);
+    LOG_INFO("XR_DXR_input_providers: %s (spec %u)", hasInputProvidersExt_ ? "yes" : "no",
+             inputProvidersSpec_);
     LOG_INFO("XR_DXR_lift: %s (spec %u)", hasLiftExt_ ? "yes" : liftSpec_ ? "too old" : "no",
              liftSpec_);
 
@@ -130,6 +136,7 @@ bool XrSession::InitInstanceAndSystem() {
     if (hasMcpToolsExt_) enabled.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
     if (cursorDepthSpec_) enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
     if (hasLiftExt_) enabled.push_back(XR_DXR_LIFT_EXTENSION_NAME);
+    if (hasInputProvidersExt_) enabled.push_back(XR_DXR_INPUT_PROVIDERS_EXTENSION_NAME);
 #if defined(__linux__) && !defined(__ANDROID__)
     // The window drag's phase snap (xrWeaveSnapWindowRectDXR): the X11 drag
     // lands each step on a phase-correct origin. Optional — identity without.
@@ -174,6 +181,14 @@ bool XrSession::InitInstanceAndSystem() {
                               (PFN_xrVoidFunction*)&pfnSubmitMcpToolResult_);
         LOG_INFO("XR_DXR_mcp_tools entry points: %s",
                  HasMcpTools() ? "resolved" : "NULL");
+    }
+    if (hasInputProvidersExt_) {
+        xrGetInstanceProcAddr(instance_, "xrEnumerateInputProvidersDXR",
+                              (PFN_xrVoidFunction*)&inputApi_.enumerate);
+        xrGetInstanceProcAddr(instance_, "xrSetInputProviderPreferenceDXR",
+                              (PFN_xrVoidFunction*)&inputApi_.setPreference);
+        LOG_INFO("XR_DXR_input_providers entry points: %s",
+                 HasInputProviders() ? "resolved" : "NULL");
     }
     // 2D->3D conversion entry points (session-scoped calls, instance-resolved PFNs). An
     // unresolved one leaves HasLift() false and the Convert-to-3D toggle hidden.
@@ -997,6 +1012,10 @@ void XrSession::PollEvents() {
                          ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());
                 break;
             }
+            case (XrStructureType)XR_TYPE_EVENT_DATA_INPUT_PROVIDERS_CHANGED_DXR:
+                if (inputEventHandler_)
+                    inputEventHandler_(reinterpret_cast<const XrEventDataBaseHeader*>(&event));
+                break;
             case (XrStructureType)XR_TYPE_EVENT_DATA_LIFT_TASK_STATE_CHANGED_DXR:
             case (XrStructureType)XR_TYPE_EVENT_DATA_LIFT_PROVIDERS_CHANGED_DXR:
                 // "Convert to 3D": the app's LiftClient follows the task's readiness.

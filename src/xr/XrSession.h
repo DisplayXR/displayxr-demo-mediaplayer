@@ -19,6 +19,7 @@
 
 #include <cursor_depth.h>  // displayxr-common: dxr::CursorDepth (XR_DXR_cursor_depth helper)
 
+#include "media/InputProviderClient.h"  // input::Api (XR_DXR_input_providers entry points)
 #include "media/LiftClient.h"  // lift::Api (XR_DXR_lift entry-point table)
 
 #include <cstdint>
@@ -197,6 +198,15 @@ public:
     using LiftEventHandler = std::function<void(const XrEventDataBaseHeader* event)>;
     void SetLiftEventHandler(LiftEventHandler handler) { liftEventHandler_ = std::move(handler); }
 
+    // --- Input providers (XR_DXR_input_providers spec >= 1) ---
+    // Enabled whenever advertised; HasInputProviders() once its entry points resolved.
+    // The providers-changed event is forwarded from PollEvents to the handler set here.
+    bool HasInputProviders() const { return hasInputProvidersExt_ && inputApi_.Complete(); }
+    const input::Api& InputApi() const { return inputApi_; }
+    XrInstance Instance() const { return instance_; }
+    XrSystemId SystemId() const { return systemId_; }
+    void SetInputEventHandler(LiftEventHandler handler) { inputEventHandler_ = std::move(handler); }
+
     // Vulkan handles the runtime selected for us — handed to the renderer.
     VkInstance VkInstanceHandle() const { return vkInstance_; }
     VkPhysicalDevice PhysicalDevice() const { return physicalDevice_; }
@@ -342,6 +352,12 @@ private:
     uint32_t liftSpec_ = 0;
     lift::Api liftApi_{};
     LiftEventHandler liftEventHandler_;
+
+    // Input providers (XR_DXR_input_providers). Entry points null when absent.
+    bool hasInputProvidersExt_ = false;
+    uint32_t inputProvidersSpec_ = 0;
+    input::Api inputApi_{};
+    LiftEventHandler inputEventHandler_;
 
     // Capabilities discovered at instance creation.
     bool hasWindowBindingExt_ = false;
