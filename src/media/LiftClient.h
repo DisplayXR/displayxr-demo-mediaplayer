@@ -81,6 +81,8 @@ public:
     // submit (a declined conversion produces nothing; the mailbox is latest-wins, so a
     // resubmit simply replaces it). Also the re-enumeration period while waiting.
     static constexpr double kStaleSeconds = 1.0;
+    // Re-enumeration period while the toggle is off and the task is not settled READY.
+    static constexpr double kIdlePollSeconds = 2.0;
 
     LiftClient() = default;
     ~LiftClient() { Detach(); }
@@ -89,7 +91,8 @@ public:
 
     // Bind to a session. `api` incomplete => the client stays Hidden. Enumerates the
     // tasks once, which also opts the session into the task / provider events.
-    void Attach(const Api& api, XrSession session);
+    // `::XrSession`: mp::XrSession (the app's session class) shadows the handle type.
+    void Attach(const Api& api, ::XrSession session);
     // Destroy the stream (if any) and forget the session. Call before xrDestroySession.
     void Detach();
     bool Attached() const { return session_ != XR_NULL_HANDLE && api_.Complete(); }
@@ -98,8 +101,11 @@ public:
     void Refresh();
     // Feed every XrEventDataBuffer from xrPollEvent. Returns true if it was a lift event.
     bool OnEvent(const XrEventDataBaseHeader* ev);
-    // Periodic work, call once per frame: while the toggle is on and the task is
-    // waiting, re-enumerate at most once per kStaleSeconds (the spec's <= 2 Hz poll).
+    // Periodic work, call once per frame. While the task is not settled READY, re-read it
+    // (the spec's consumer contract: poll at <= 2 Hz or follow events): every
+    // kStaleSeconds while the toggle is on (and retry the stream), every kIdlePollSeconds
+    // while it is off. An in-process session may enumerate NOTHING until its lift link has
+    // connected, so the first answer is not final. A latched FEATURE_UNSUPPORTED is.
     void Tick(double nowSec);
 
     Availability GetAvailability() const;
@@ -146,7 +152,7 @@ private:
     static bool Terminal(XrLiftTaskStateDXR s);
 
     Api api_{};
-    XrSession session_ = XR_NULL_HANDLE;
+    ::XrSession session_ = XR_NULL_HANDLE;
 
     // The VIEWS_MONO task as last enumerated (taskPresent_ false => ABSENT).
     XrLiftTaskPropertiesDXR task_{};

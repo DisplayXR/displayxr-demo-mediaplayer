@@ -118,6 +118,16 @@ constexpr double kTransitionSeconds = 0.40; // slideshow: dip-to-black half-dura
 // of exact frames — a fast sweep; below it, fine adjustment gets exact frames.
 constexpr float kFastScrubSeconds = 1.0f;
 
+// "Convert to 3D": the layout label while a converted result is on screen. ASCII arrow:
+// the default ImGui font (and the CPU text HUD) have no U+2192.
+constexpr const char* kConvertedLayoutName = "Mono -> 3D (converted)";
+
+// Monotonic seconds for the converter's cadence (stale in-flight frames, re-polls).
+double SteadySeconds() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 // Per-eye display aspect (width/height): full SBS packs two eyes across the width
 // (each eye half-width); half-SBS and mono use the full frame width.
 float PerEyeAspect(StereoLayout layout, int frameW, int frameH) {
@@ -206,6 +216,10 @@ bool App::Initialize(const char* mediaPath) {
         LOG_ERROR("OpenXR initialization failed");
         return false;
     }
+    // "Convert to 3D": follow the runtime's 2D->3D conversion task. Without XR_DXR_lift the
+    // client stays unattached and the toggle is never drawn.
+    xr_.SetLiftEventHandler([this](const XrEventDataBaseHeader* e) { lift_.OnEvent(e); });
+    if (xr_.HasLift()) lift_.Attach(xr_.LiftApi(), xr_.Handle());
 
     if (!renderer_.Initialize(xr_.PhysicalDevice(), xr_.Device(), xr_.GraphicsQueue(),
                               xr_.GraphicsQueueFamily(), (VkFormat)xr_.SwapchainFormat(),
@@ -407,7 +421,7 @@ int App::Run() {
         keepRunning = window_.PumpEvents();
         const auto nowT = std::chrono::steady_clock::now();
         bool activity = window_.TakeMouseActivity();   // any input revives the UI
-        if (window_.TakeCycleModeRequest()) { xr_.RequestNextMode(); activity = true; }  // 'V'
+        if (window_.TakeCycleModeRequest()) { xr_.RequestNextMode(); userModeChoice_ = true; activity = true; }  // 'V'
         if (window_.TakeToggleHudRequest()) {                        // SHIFT+TAB (master)
             showHud_ = !showHud_;
             LOG_INFO("HUD %s", showHud_ ? "on" : "off");
@@ -506,6 +520,7 @@ int App::Run() {
         if (window_.TakeToggleSlideshowRequest()) { ToggleSlideshow(); activity = true; } // 'S'
         if (window_.TakeToggleMuteRequest()) { ToggleMute(); activity = true; }            // 'M'
         if (window_.TakeCycleLayoutRequest()) { CycleLayoutOverride(); activity = true; }  // 'L'
+        if (window_.TakeConvertRequest()) { SetConvert(!lift_.On(), "key"); activity = true; }  // Shift+L
         if (window_.TakeToggleCameraRequest()) { ToggleLive(); activity = true; }          // 'C'
         if (window_.TakeOpenUrlRequest()) { OpenUrlPrompt(); activity = true; }            // Ctrl+U
         // Camera hot-plug events (only arrive once the camera subsystem is up).
@@ -618,12 +633,16 @@ void App::RenderOneFrame() {
                 SettleLiveLayout(*vf, "Stream");
                 SampleAutoConv(*vf);  // streams converge like the camera (#93 follow-up)
             }
-            bool bound = false;
+            // "Convert to 3D": hand the frame to the converter (latest-wins, one in flight).
+            // While a converted picture is bound it REPLACES the source, so the source frame
+            // is not uploaded; a stalled converter freezes on its last good picture.
+            if (lift_.On()) SubmitConvertFrame(*vf, SteadySeconds());
+            bool bound = convertBound_;
 #if defined(_WIN32)
             // Zero-copy (#28): a GPU frame carries a shared RGBA texture handle (the producer
             // converted NV12->RGBA on the D3D side) — bind it directly. Falls back to the CPU
             // upload if the import fails.
-            if (vf->gpu && vf->gpuSharedHandle)
+            if (!bound && vf->gpu && vf->gpuSharedHandle)
                 bound = renderer_.BindSharedRGBA(vf->gpuSharedHandle, (uint32_t)vf->width,
                                                  (uint32_t)vf->height);
 #endif
@@ -637,6 +656,7 @@ void App::RenderOneFrame() {
         }
     }
 
+    PumpConvert(SteadySeconds());  // "Convert to 3D": poll + upload a landed result (no-op off)
     TickAutoConv();  // smoothed auto-convergence shift (#92); exactly 0 while never enabled
     UpdateDepthCursor();
 
@@ -680,7 +700,10 @@ void App::RenderOneFrame() {
             // `abl` left view). Slicing a Dual frame in half would show half a
             // left-eye picture to each eye. The Android leg is where Dual actually
             // renders stereo (two decoders); here it degrades to flat-left.
-            if (layout_ == StereoLayout::Mono || layout_ == StereoLayout::Dual) {
+            // A bound "Convert to 3D" result is two full-width eyes side by side: sample it
+            // as SBS-full while layout_ stays Mono (contentAspect_ is the mono frame's).
+            if ((layout_ == StereoLayout::Mono || layout_ == StereoLayout::Dual) &&
+                !convertBound_) {
                 uvs[v] = {0.0f, 0.0f, 1.0f, 1.0f};
             } else {
                 uvs[v] = isLeft ? ViewUV{0.0f, 0.0f, 0.5f, 1.0f}
@@ -692,7 +715,8 @@ void App::RenderOneFrame() {
         // Pro: QC view mode + pan/zoom rewrite the source rects; the grade (exposure, CDL,
         // LUT) and the QC shader mode are pushed to the renderer here, before the draw.
         {
-            const bool stereoSrc = layout_ != StereoLayout::Mono && layout_ != StereoLayout::Dual;
+            const bool stereoSrc =
+                (layout_ != StereoLayout::Mono && layout_ != StereoLayout::Dual) || convertBound_;
             pro_.ApplyViewTransform(uvs, frame.viewCount, stereoSrc && hasMedia_ && !isLogo_,
                                     swapEyes_ != mediaEyeSwap_);
             pro_.Tick(ProStatus());
@@ -972,7 +996,7 @@ void App::BuildTransportUI() {
         currentMediaPath_.empty() ? std::string()
                                   : std::filesystem::path(currentMediaPath_).filename().string();
     uiState_.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
-    uiState_.layoutName = MediaSource::LayoutName(layout_);
+    uiState_.layoutName = convertBound_ ? kConvertedLayoutName : MediaSource::LayoutName(layout_);
     uiState_.layoutTooltip = LayoutLabel();
     uiState_.layoutPinned = layoutPinned_;
     uiState_.positionSeconds = video_.PositionSeconds();
@@ -1007,6 +1031,22 @@ void App::BuildTransportUI() {
             std::snprintf(t, sizeof(t), "Auto-conv: off");
         uiState_.autoConvLabel = t;
     }
+    // "Convert to 3D" (XR_DXR_lift): drawn only for mono content on a runtime that offers
+    // the extension; greyed with the reason while the conversion task cannot serve.
+    {
+        const lift::Availability av = lift_.GetAvailability();
+        const lift::State st = lift_.GetState();
+        uiState_.caps.convert = av != lift::Availability::Hidden && ConvertEligible();
+        uiState_.convertOn = lift_.On();
+        uiState_.convertEnabled = av == lift::Availability::Enabled || lift_.On();
+        uiState_.convertWarming = st == lift::State::Warming;
+        uiState_.convertUnavailable = st == lift::State::Unavailable;
+        const std::string why = lift_.Reason();
+        uiState_.convertTooltip =
+            !why.empty() ? why
+            : lift_.On() ? std::string("Shift+L: show the original 2D picture")
+                         : std::string("Shift+L: convert this 2D picture to 3D");
+    }
     // Stream URL (#93).
     uiState_.isStream = isStream_;
     uiState_.streamStatus = isStream_ ? StreamStatusText() : std::string();
@@ -1020,7 +1060,7 @@ void App::BuildTransportUI() {
 
     ui::TransportActions actions;
     actions.Open = [this] { RequestOpenFile(); };
-    actions.NextMode = [this] { xr_.RequestNextMode(); };
+    actions.NextMode = [this] { xr_.RequestNextMode(); userModeChoice_ = true; };
     actions.CycleLayout = [this] { CycleLayoutOverride(); };
     actions.ToggleSlideshow = [this] { ToggleSlideshow(); };
     actions.TogglePlayback = [this] { TogglePlayback(); };
@@ -1029,10 +1069,14 @@ void App::BuildTransportUI() {
         video_.ToggleLoop();
         audio_.SetLoop(video_.Loop());
     };
-    actions.Seek = [this](float sec, bool preview) { video_.Seek(sec, preview); };
+    actions.Seek = [this](float sec, bool preview) {
+        video_.Seek(sec, preview);
+        if (!preview) ResetConvertStream();  // a jump: no pre-seek result may land after it
+    };
     actions.ScrubHeld = [this] { audio_.SetPaused(true); };
     actions.ScrubReleased = [this](float sec) {
         video_.Seek(sec, /*preview=*/false);
+        ResetConvertStream();
         audio_.Seek(sec);
         if (!video_.Paused()) audio_.SetPaused(false);
     };
@@ -1050,6 +1094,7 @@ void App::BuildTransportUI() {
     };
     actions.OpenUrl = [this](const std::string& url) { LoadUrl(url); };
     actions.ToggleAutoConv = [this] { SetAutoConv(!autoConvEnabled_, "ui"); };
+    actions.ToggleConvert = [this] { SetConvert(!lift_.On(), "ui"); };
 
     ui::BuildTransportUI(uiState_, actions);
 #if MEDIAPLAYER_PRO
@@ -1066,8 +1111,9 @@ void App::UpdateDepthCursor() {
     // Measured disparity is spec v7. Only stereo media qualifies: mono content (and the
     // idle logo) is on the glass by construction, so asking would be pure cost. There
     // is no depth map or lifted-content path in this player to prefer over it.
+    // A "Convert to 3D" picture is stereo too.
     const bool want = depthCursorAllowed_ && xr_.CursorDepthSpec() >= 7 && hasMedia_ && !isLogo_ &&
-                      layout_ != StereoLayout::Mono;
+                      (layout_ != StereoLayout::Mono || convertBound_);
     if (want != depthCursorOn_) {
         depthCursorOn_ = want;
         // enable(0) makes the helper inert: nothing is chained on xrLocateViews, so the
@@ -1134,6 +1180,7 @@ void App::Shutdown() {
     audio_.Stop();        // and before tearing down the GPU
     imgui_.Shutdown();    // before xr_ destroys the Vulkan device ImGui borrows
     renderer_.Shutdown();
+    lift_.Detach();       // destroy the conversion stream before its session
     xr_.Shutdown();
     window_.Destroy();
 }
@@ -1146,8 +1193,12 @@ void App::ReadStereoEnv() {
     // silently had no effect on the file the app was launched with, only on files opened
     // later.
     //
-    // MEDIAPLAYER_STEREO_DETECT: default `meta`; `full` opts into the pixel detector;
-    // `off` skips the probe entirely (container metadata included).
+    // MEDIAPLAYER_STEREO_DETECT: default `full` (App.h detectMode_) — filename, metadata,
+    // the pixel detector, then the aspect assumption; `meta` skips the pixel detector;
+    // `off` skips the probe entirely (container metadata included). An unrecognised value
+    // reads as `meta`. Only the pixel detector can conclude a file is MONO, so under `meta`
+    // / `off` (or when it cannot decide) mono content shows as stereo until the user pins
+    // Mono with L — which is also what brings up the "Convert to 3D" toggle for it.
     if (const char* d = std::getenv("MEDIAPLAYER_STEREO_DETECT")) {
         if (std::strcmp(d, "off") == 0) detectMode_ = DetectMode::Off;
         else if (std::strcmp(d, "full") == 0) detectMode_ = DetectMode::Full;
@@ -1222,6 +1273,7 @@ bool App::LoadMedia(const std::string& path) {
         ApplyLayout(vinfo);
         mediaConvergence_ = 0.0f;  // no baked convergence for video
         mediaAutoConvAvailable_ = false;
+        KeepStillForConvert(nullptr, 0, 0);  // a video converts from its decoded frames
         mediaW_ = video_.Width();
         mediaH_ = video_.Height();
         contentAspect_ = PerEyeAspect(layout_, video_.Width(), video_.Height());
@@ -1275,6 +1327,7 @@ bool App::LoadMedia(const std::string& path) {
         mediaConvergence_ = lif.convergence;  // baked reconvergence from the LIF
         mediaAutoConvAvailable_ = lif.stereo && !lif.hasConvergence;  // estimate available
         mediaAutoConvergence_ = lif.autoConvergence;
+        KeepStillForConvert(lif.image.pixels.data(), lif.image.width, lif.image.height);
         mediaW_ = lif.image.width;
         mediaH_ = lif.image.height;
         contentAspect_ = PerEyeAspect(layout_, lif.image.width, lif.image.height);
@@ -1317,6 +1370,7 @@ bool App::LoadMedia(const std::string& path) {
             mediaConvergence_ = 0.0f;   // MPO carries no baked convergence...
             mediaAutoConvAvailable_ = true;   // ...so the estimate is always on offer
             mediaAutoConvergence_ = mpo.autoConvergence;
+            KeepStillForConvert(mpo.image.pixels.data(), mpo.image.width, mpo.image.height);
             mediaW_ = mpo.image.width;
             mediaH_ = mpo.image.height;
             contentAspect_ = PerEyeAspect(layout_, mpo.image.width, mpo.image.height);
@@ -1351,6 +1405,7 @@ bool App::LoadMedia(const std::string& path) {
     ApplyLayout(imgInfo);
     mediaConvergence_ = 0.0f;  // plain SBS image carries no baked convergence
     mediaAutoConvAvailable_ = false;
+    KeepStillForConvert(img.pixels.data(), img.width, img.height);
     mediaW_ = img.width;
     mediaH_ = img.height;
     contentAspect_ = PerEyeAspect(layout_, img.width, img.height);
@@ -1378,6 +1433,7 @@ void App::ApplyLayout(const MediaInfo& info) {
 }
 
 std::string App::LayoutLabel() const {
+    if (convertBound_) return kConvertedLayoutName;  // "Convert to 3D" result on screen
     std::string s = MediaSource::LayoutName(layout_);
     if (mediaEyeSwap_) s += " (R|L)";
     s += " — ";
@@ -1427,6 +1483,9 @@ void App::ReloadMedia(const std::string& path) {
     // Every file path (Open, drop, open_file, navigation) lands here, so this is the one
     // place a file replaces the live camera.
     const bool wasLive = isLive_ || isStream_;
+    // "Convert to 3D" is off on every load. Put the source picture back first, so a load
+    // that fails keeps showing the previous media as it was.
+    StopConvert(/*restorePicture=*/true);
     if (isLive_) StopLive(/*showIdleIfEmpty=*/false);
     if (isStream_) StopStream(/*showIdleIfEmpty=*/false);  // #93: a file replaces the stream
     video_.Stop();   // joins the decode thread (which reads the audio clock) FIRST,
@@ -1522,6 +1581,8 @@ bool App::LoadLiveDevice(const CameraDevice& dev) {
 }
 
 void App::EnterLive(LiveProducer* p, const std::string& name) {
+    StopConvert(/*restorePicture=*/true);  // off on every source change
+    KeepStillForConvert(nullptr, 0, 0);
     // One live producer at a time: a previous one (the camera, or a Pro input) stops.
     if (live_ != p && isLive_) live_->Stop();
     if (p != &camera_) camera_.Stop();
@@ -1619,7 +1680,11 @@ void App::SettleLiveLayout(const FrameRing::Frame& f, const char* tag) {
     // the layout from the frame aspect. No content detector and no metadata for a live
     // feed — 3840x2160 (the Eyes) is 16:9, which ChooseFullOrHalf reads as SBS-half.
     const bool firstFrame = (mediaW_ == 0);
-    if (firstFrame) ClearIdleLogo();
+    if (firstFrame) {
+        ClearIdleLogo();
+    } else {
+        ResetConvertStream();  // a size change is a discontinuity for the converter
+    }
     mediaW_ = f.width;
     mediaH_ = f.height;
     bool ambiguous = false;
@@ -1676,6 +1741,8 @@ bool App::LoadUrl(const std::string& url) {
         return false;
     }
     uiState_.urlSeed = url;  // remembered for the popup, even if the connect fails
+    StopConvert(/*restorePicture=*/true);  // off on every source change
+    KeepStillForConvert(nullptr, 0, 0);
     if (isLive_) StopLive(/*showIdleIfEmpty=*/false);
     video_.Stop();   // joins the decode thread (reads the audio clock) before audio
     audio_.Stop();
@@ -2160,6 +2227,8 @@ void App::LoadIdleLogo() {
     // returned string is owned by SDL (do not free). Prefer the composed idle lockup
     // (DisplayXR mark + bold "Media Player" label, pre-padded as a square) and fall back
     // to the bare brand mark, then to the RED|BLUE test pattern if neither is present.
+    StopConvert(/*restorePicture=*/false);  // nothing to convert on the idle screen
+    KeepStillForConvert(nullptr, 0, 0);
     namespace fs = std::filesystem;
     std::string base;
     if (const char* b = SDL_GetBasePath()) base = b;
@@ -2264,6 +2333,7 @@ void App::TogglePlayback() {
     if (!isVideo_) return;
     if (video_.Ended()) {
         video_.Seek(0.0);          // restart a clip that already ran to the end
+        ResetConvertStream();
         video_.SetPaused(false);
         audio_.Seek(0.0);
         audio_.SetPaused(false);
@@ -2291,8 +2361,162 @@ void App::StepFrame(int n) {
     double t = video_.PositionSeconds() + ((double)n - 0.5) * fd;
     if (t < 0.0) t = 0.0;
     video_.Seek(t);             // exact
+    ResetConvertStream();
     audio_.Seek(t);             // keep audio aligned for the eventual resume
     uiState_.scrubTarget = (float)t;    // hold the scrubber knob until the frame lands
+}
+
+// --- Convert to 3D (XR_DXR_lift) ---------------------------------------------------------
+
+bool App::ConvertEligible() const {
+    // Mono content only (a plain still, a mono LIF, a mono video, a live source settled
+    // mono — or anything the user pinned Mono with L). The idle screen never converts.
+    return hasMedia_ && !isLogo_ && layout_ == StereoLayout::Mono && mediaW_ > 0 && mediaH_ > 0;
+}
+
+void App::KeepStillForConvert(const uint8_t* rgba, int w, int h) {
+    // Only when the runtime offers the extension: a runtime without it costs no copy.
+    convertStill_.clear();
+    convertStill_.shrink_to_fit();
+    convertStillW_ = convertStillH_ = 0;
+    if (!rgba || w <= 0 || h <= 0 || lift_.GetAvailability() == lift::Availability::Hidden)
+        return;
+    convertStill_.assign(rgba, rgba + (size_t)w * h * 4);
+    convertStillW_ = w;
+    convertStillH_ = h;
+}
+
+bool App::SetConvert(bool on, const char* why) {
+    if (!on) {
+        if (!lift_.On() && !convertBound_) return true;
+        // A paused clip decodes nothing new: re-decode the frame on screen so the full-
+        // resolution source replaces the converted picture (StopConvert's interim is the
+        // downscaled frame last handed to the converter).
+        const bool pausedVideo = isVideo_ && convertBound_ && (video_.Paused() || video_.Ended());
+        StopConvert(/*restorePicture=*/true);
+        if (pausedVideo) {
+            const double fr = video_.FrameRate();
+            const double fd = (fr > 1.0) ? 1.0 / fr : 1.0 / 30.0;
+            video_.Seek(std::max(0.0, video_.PositionSeconds() - 0.5 * fd));
+        }
+        LOG_INFO("Convert to 3D off (%s)", why);
+        ShowToast("Convert to 3D: off");
+        return true;
+    }
+    if (lift_.GetAvailability() == lift::Availability::Hidden) {
+        ShowToast("2D->3D conversion is not available");
+        return false;
+    }
+    if (!ConvertEligible()) {
+        ShowToast("Convert to 3D needs 2D (mono) content");
+        return false;
+    }
+    const bool video = isVideo_ || LiveSource();
+    if (!video && convertStill_.empty()) {
+        ShowToast("Convert to 3D: reopen the picture");
+        return false;
+    }
+    if (!lift_.Start(video)) {
+        const std::string reason = lift_.Reason();
+        lift_.Stop();  // the toggle stays off; the reason is the answer
+        LOG_INFO("Convert to 3D refused (%s): %s", why, reason.c_str());
+        ShowToast(reason.empty() ? std::string("Convert to 3D is unavailable") : reason);
+        return false;
+    }
+    // A converted picture wants the panel in 3D: on a flat panel ask for the stereo mode,
+    // exactly as V would (and count it as the user's mode choice). Turning the toggle off
+    // leaves the mode alone; otherwise the player keeps the mode as it finds it.
+    if (xr_.CurrentModeIsFlat()) {
+        const int32_t m = xr_.FindStereoMode();
+        if (m >= 0) {
+            pendingModeRequest_ = m;
+            LOG_INFO("Convert to 3D: flat panel - requesting 3D mode [%d]", m);
+        }
+    }
+    userModeChoice_ = true;
+    if (!video) {
+        // A still converts once: downscale its kept pixels now, PumpConvert submits them
+        // (and again only if no result came back within the stale period).
+        lift::FitExtent((uint32_t)convertStillW_, (uint32_t)convertStillH_,
+                        lift::LiftClient::kMaxInputLongEdge, convertInW_, convertInH_);
+        lift::ScaleRgba(convertStill_.data(), (uint32_t)convertStillW_, (uint32_t)convertStillH_,
+                        (uint32_t)convertStillW_ * 4, convertInW_, convertInH_, convertIn_);
+        convertStillPending_ = true;
+    }
+    LOG_INFO("Convert to 3D on (%s): %s, task %s", why, video ? "video" : "still",
+             lift::TaskStateName(lift_.TaskState()));
+    ShowToast(lift_.GetState() == lift::State::Warming ? "Convert to 3D (warming)"
+                                                       : "Convert to 3D");
+    return true;
+}
+
+void App::StopConvert(bool restorePicture) {
+    if (!lift_.On() && !convertBound_) return;
+    const bool wasBound = convertBound_;
+    lift_.Stop();
+    convertBound_ = false;
+    convertStillPending_ = false;
+    if (restorePicture && wasBound && hasMedia_ && !isLogo_) {
+        if (!isVideo_ && !LiveSource() && !convertStill_.empty()) {
+            renderer_.UploadTexture(convertStill_.data(), (uint32_t)convertStillW_,
+                                    (uint32_t)convertStillH_);
+        } else if (!convertIn_.empty()) {
+            // Video / live: the last frame handed to the converter, until the next decode
+            // (the render loop uploads every new frame again now that nothing is bound).
+            renderer_.UploadTexture(convertIn_.data(), convertInW_, convertInH_);
+        }
+    }
+    convertIn_.clear();
+    convertInW_ = convertInH_ = 0;
+}
+
+void App::ResetConvertStream() {
+    if (!lift_.On()) return;
+    lift_.Reset();
+    if (!isVideo_ && !LiveSource()) convertStillPending_ = true;
+}
+
+void App::SubmitConvertFrame(const FrameRing::Frame& f, double nowSec) {
+    // Latest-wins: only when nothing is in flight, never every decoded frame. A zero-copy
+    // GPU frame (#28, Windows opt-in) carries no CPU planes, so it cannot be submitted here.
+    if (!lift_.WantsFrame(nowSec) || f.gpu || f.width <= 0 || f.height <= 0) return;
+    const int fmt = f.format == PixFormat::I420   ? 0
+                    : f.format == PixFormat::NV12 ? 1
+                    : f.format == PixFormat::P016 ? 2
+                                                  : 3;
+    lift::FitExtent((uint32_t)f.width, (uint32_t)f.height, lift::LiftClient::kMaxInputLongEdge,
+                    convertInW_, convertInH_);
+    if (!lift::ConvertYuvToRgba(f.plane[0].data(), f.plane[1].data(),
+                                fmt == 0 ? f.plane[2].data() : nullptr, (uint32_t)f.width,
+                                (uint32_t)f.height, fmt, f.fullRange, convertInW_, convertInH_,
+                                convertIn_))
+        return;
+    lift_.Submit(convertIn_.data(), convertInW_, convertInH_, convertInW_ * 4, f.serial, nowSec);
+}
+
+void App::PumpConvert(double nowSec) {
+    if (!lift_.Attached()) return;
+    lift_.Tick(nowSec);
+    if (!lift_.On()) return;
+    if (!ConvertEligible()) {  // the layout left Mono (L / set_layout / a live re-settle)
+        StopConvert(/*restorePicture=*/true);
+        return;
+    }
+    if (convertStillPending_ && !isVideo_ && !LiveSource() && !convertIn_.empty() &&
+        lift_.WantsFrame(nowSec)) {
+        lift_.Submit(convertIn_.data(), convertInW_, convertInH_, convertInW_ * 4, 0, nowSec);
+    }
+    lift::Result r;
+    if (!lift_.Poll(r)) return;
+    // Non-blocking: the result is a CPU image owned by the runtime until the next acquire;
+    // UploadTexture stages a copy into the open frame's command buffer.
+    if (renderer_.UploadTexture(r.rgba, r.width, r.height)) {
+        if (!convertBound_ || r.sizeChanged)
+            LOG_INFO("Convert to 3D: showing %ux%u converted (%u views, frame %llu)", r.width,
+                     r.height, r.viewCount, (unsigned long long)r.frameId);
+        convertBound_ = true;
+        if (!isVideo_ && !LiveSource()) convertStillPending_ = false;
+    }
 }
 
 void App::SetupAgentTools() {
@@ -2347,8 +2571,9 @@ void App::SetupAgentTools() {
         "get_status",
         "Read the player's live state: whether a video is playing, the current and total "
         "position in seconds, the open file path, the media kind, mute state, the folder "
-        "index/count used by navigate, and the resolved stereo layout with the signal that "
-        "decided it. Requires no arguments.",
+        "index/count used by navigate, the resolved stereo layout with the signal that "
+        "decided it, and the Convert-to-3D state (convert3d_available / _state / _active). "
+        "Requires no arguments.",
         "{\"type\":\"object\"}");
 
     xr_.RegisterMcpTool(
@@ -2405,6 +2630,21 @@ void App::SetupAgentTools() {
         "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\","
         "\"description\":\"Stream URL, e.g. rtsp://192.168.1.10:554/stream1 or "
         "udp://127.0.0.1:5004.\"}},\"required\":[\"url\"]}");
+
+    xr_.RegisterMcpTool(
+        "set_convert_3d",
+        "Convert to 3D: have the runtime's 2D->3D conversion turn the current MONO picture "
+        "(a 2D still, a mono video or live source, or anything pinned mono with set_layout) "
+        "into a stereo pair that replaces it on screen. Mirrors Shift+L and the top-bar "
+        "toggle. Off on every load; turning it on asks for the panel's 3D mode if it is flat. "
+        "Errors when the runtime offers no conversion, the content is not mono, or the "
+        "conversion task cannot serve this session (the error says why). 'provider' is "
+        "reserved and currently ignored. Returns the convert3d_* fields of get_status.",
+        "{\"type\":\"object\",\"properties\":{"
+        "\"on\":{\"type\":\"boolean\",\"description\":\"true = convert, false = show the "
+        "original 2D picture.\"},"
+        "\"provider\":{\"type\":\"string\",\"description\":\"Reserved; ignored.\"}},"
+        "\"required\":[\"on\"]}");
 
     xr_.RegisterMcpTool(
         "close_camera",
@@ -2483,6 +2723,34 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
             o["auto_conv_focus_y"] = autoConvFocus_[1];
         }
     };
+    auto fillConvert = [this](json& o) {
+        const lift::Availability av = lift_.GetAvailability();
+        o["convert3d_available"] = av == lift::Availability::Enabled && ConvertEligible();
+        o["convert3d_offered"] = lift::AvailabilityName(av);  // hidden | disabled | enabled
+        o["convert3d_state"] = lift::StateName(lift_.GetState());
+        o["convert3d_active"] = convertBound_;
+        o["convert3d_reason"] = lift_.Reason();
+        if (av != lift::Availability::Hidden) {
+            o["convert3d_task_state"] = lift::TaskStateName(lift_.TaskState());
+            o["convert3d_frames_submitted"] = lift_.FramesSubmitted();
+            o["convert3d_frames_converted"] = lift_.FramesConverted();
+        }
+    };
+    if (tool == "set_convert_3d") {
+        if (!args.contains("on") || !args["on"].is_boolean()) {
+            success = false;
+            return "{\"error\":\"missing required boolean arg 'on'\"}";
+        }
+        // args["provider"] is reserved (runtime #2178) and deliberately ignored for now.
+        const bool want = args["on"].get<bool>();
+        if (!SetConvert(want, "mcp") && want) {
+            success = false;
+            out["error"] = uiState_.toastText.empty() ? std::string("convert to 3D unavailable")
+                                                      : uiState_.toastText;
+        }
+        fillConvert(out);
+        return out.dump();
+    }
     if (tool == "set_auto_convergence") {
         const bool hasFx = args.contains("focus_x") && args["focus_x"].is_number();
         const bool hasFy = args.contains("focus_y") && args["focus_y"].is_number();
@@ -2549,6 +2817,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         if (t < 0.0) t = 0.0;
         if (durationS > 0.0 && t > durationS) t = durationS;
         video_.Seek(t);             // exact
+        ResetConvertStream();
         audio_.Seek(t);             // keep audio aligned
         uiState_.scrubTarget = (float)t;    // hold the scrubber knob until the decode lands
         out["position_s"] = t;
@@ -2588,6 +2857,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["live"] = isLive_;
         out["live_paused"] = livePaused_;
         fillAutoConv(out);
+        fillConvert(out);
         out["camera"] = isLive_ ? live_->DeviceName() : std::string();
         out["live_kind"] = isLive_ ? live_->Kind() : "";
         out["camera_state"] = isLive_ ? CameraSource::StateName(live_->GetState()) : "closed";

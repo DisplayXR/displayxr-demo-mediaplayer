@@ -80,7 +80,7 @@ bool LiftClient::Terminal(XrLiftTaskStateDXR s) {
 
 // ---- session binding ---------------------------------------------------------------
 
-void LiftClient::Attach(const Api& api, XrSession session) {
+void LiftClient::Attach(const Api& api, ::XrSession session) {
     Detach();
     api_ = api;
     session_ = session;
@@ -175,13 +175,15 @@ bool LiftClient::OnEvent(const XrEventDataBaseHeader* ev) {
 }
 
 void LiftClient::Tick(double nowSec) {
-    if (!Attached() || !want_) return;
-    const bool waiting = stream_ == XR_NULL_HANDLE || TaskWaiting();
-    if (waiting && nowSec - lastEnumSec_ >= kStaleSeconds) {
-        lastEnumSec_ = nowSec;
-        Refresh();
-        if (stream_ == XR_NULL_HANDLE && GetAvailability() == Availability::Enabled) CreateStream();
-    }
+    if (!Attached() || enumerateUnsupported_ || createUnsupported_) return;
+    const bool settled = GetAvailability() == Availability::Enabled && !TaskWaiting() &&
+                         (!want_ || stream_ != XR_NULL_HANDLE);
+    if (settled) return;
+    if (nowSec - lastEnumSec_ < (want_ ? kStaleSeconds : kIdlePollSeconds)) return;
+    lastEnumSec_ = nowSec;
+    Refresh();
+    if (want_ && stream_ == XR_NULL_HANDLE && GetAvailability() == Availability::Enabled)
+        CreateStream();
 }
 
 // ---- availability --------------------------------------------------------------------
@@ -214,27 +216,27 @@ std::string LiftClient::Reason() const {
     if (want_ && !unavailableWhy_.empty()) return unavailableWhy_;
     if (!Attached()) return std::string();
     if (enumerateUnsupported_ || createUnsupported_)
-        return "2D→3D conversion is not available for this session";
-    if (!taskPresent_) return "No 2D→3D converter is installed";
+        return "2D->3D conversion is not available for this session";
+    if (!taskPresent_) return "No 2D->3D converter is installed";
     switch (task_.state) {
         case XR_LIFT_TASK_STATE_INCOMPATIBLE_DXR:
-            return "The 2D→3D converter cannot run on this system";
-        case XR_LIFT_TASK_STATE_UNLICENSED_DXR: return "The 2D→3D converter is not licensed";
-        case XR_LIFT_TASK_STATE_DISABLED_DXR: return "2D→3D conversion is switched off";
+            return "The 2D->3D converter cannot run on this system";
+        case XR_LIFT_TASK_STATE_UNLICENSED_DXR: return "The 2D->3D converter is not licensed";
+        case XR_LIFT_TASK_STATE_DISABLED_DXR: return "2D->3D conversion is switched off";
         case XR_LIFT_TASK_STATE_FAILED_DXR: {
             const char* why = FailureText(task_.failureReason);
-            return why ? std::string("The 2D→3D converter failed: ") + why
-                       : std::string("The 2D→3D converter failed");
+            return why ? std::string("The 2D->3D converter failed: ") + why
+                       : std::string("The 2D->3D converter failed");
         }
         default: break;
     }
     if ((task_.inputKinds & Bit(XR_LIFT_INPUT_KIND_MONO_DXR)) == 0)
-        return "The 2D→3D converter takes no single-picture input here";
+        return "The 2D->3D converter takes no single-picture input here";
     if ((task_.imageKinds & Bit(XR_LIFT_IMAGE_KIND_CPU_DXR)) == 0 ||
         (task_.exportKinds & Bit(XR_LIFT_IMAGE_KIND_CPU_DXR)) == 0)
-        return "The 2D→3D converter cannot exchange pictures with this player yet";
+        return "The 2D->3D converter cannot exchange pictures with this player yet";
     if ((task_.lanes & XR_LIFT_LANE_STREAM_BIT_DXR) == 0)
-        return "The 2D→3D converter does not convert continuously";
+        return "The 2D->3D converter does not convert continuously";
     return std::string();
 }
 
@@ -309,15 +311,15 @@ bool LiftClient::CreateStream() {
     switch (r) {
         case XR_ERROR_FEATURE_UNSUPPORTED:
             createUnsupported_ = true;  // latched until the provider set changes
-            SetUnavailable("2D→3D conversion is not available for this session");
+            SetUnavailable("2D->3D conversion is not available for this session");
             break;
         case XR_ERROR_LIMIT_REACHED:
-            SetUnavailable("The 2D→3D converter is busy with other apps");
+            SetUnavailable("The 2D->3D converter is busy with other apps");
             break;
         case XR_ERROR_VALIDATION_FAILURE:
-            SetUnavailable("The 2D→3D converter refused this player's request");
+            SetUnavailable("The 2D->3D converter refused this player's request");
             break;
-        default: SetUnavailable("2D→3D conversion could not start"); break;
+        default: SetUnavailable("2D->3D conversion could not start"); break;
     }
     LOG_WARN("2D→3D conversion: xrCreateLiftStreamDXR failed: XrResult=%d (%s)", (int)r,
              unavailableWhy_.c_str());

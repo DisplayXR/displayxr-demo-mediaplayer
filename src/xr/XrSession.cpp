@@ -94,6 +94,11 @@ bool XrSession::InitInstanceAndSystem() {
             hasMcpToolsExt_ = true;
         if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0)
             cursorDepthSpec_ = e.extensionVersion;
+        // "Convert to 3D" needs the spec-4 task API (VIEWS_MONO streams, CPU images).
+        if (strcmp(e.extensionName, XR_DXR_LIFT_EXTENSION_NAME) == 0) {
+            liftSpec_ = e.extensionVersion;
+            hasLiftExt_ = e.extensionVersion >= 4;
+        }
 #if defined(__linux__) && !defined(__ANDROID__)
         if (strcmp(e.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) hasWeaveExt_ = true;
 #endif
@@ -108,6 +113,8 @@ bool XrSession::InitInstanceAndSystem() {
     LOG_INFO("XR_DXR_atlas_capture: %s", hasAtlasCaptureExt_ ? "yes" : "no");
     LOG_INFO("XR_DXR_mcp_tools: %s", hasMcpToolsExt_ ? "yes" : "no");
     LOG_INFO("XR_DXR_cursor_depth: %s (spec %u)", cursorDepthSpec_ ? "yes" : "no", cursorDepthSpec_);
+    LOG_INFO("XR_DXR_lift: %s (spec %u)", hasLiftExt_ ? "yes" : liftSpec_ ? "too old" : "no",
+             liftSpec_);
 
     if (!hasVulkan) {
         LOG_ERROR("Runtime does not expose XR_KHR_vulkan_enable2");
@@ -122,6 +129,7 @@ bool XrSession::InitInstanceAndSystem() {
     if (hasAtlasCaptureExt_) enabled.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
     if (hasMcpToolsExt_) enabled.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
     if (cursorDepthSpec_) enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+    if (hasLiftExt_) enabled.push_back(XR_DXR_LIFT_EXTENSION_NAME);
 #if defined(__linux__) && !defined(__ANDROID__)
     // The window drag's phase snap (xrWeaveSnapWindowRectDXR): the X11 drag
     // lands each step on a phase-correct origin. Optional — identity without.
@@ -166,6 +174,20 @@ bool XrSession::InitInstanceAndSystem() {
                               (PFN_xrVoidFunction*)&pfnSubmitMcpToolResult_);
         LOG_INFO("XR_DXR_mcp_tools entry points: %s",
                  HasMcpTools() ? "resolved" : "NULL");
+    }
+    // 2D->3D conversion entry points (session-scoped calls, instance-resolved PFNs). An
+    // unresolved one leaves HasLift() false and the Convert-to-3D toggle hidden.
+    if (hasLiftExt_) {
+        auto get = [this](const char* name, auto& pfn) {
+            xrGetInstanceProcAddr(instance_, name, (PFN_xrVoidFunction*)&pfn);
+        };
+        get("xrEnumerateLiftTasksDXR", liftApi_.enumerateTasks);
+        get("xrRequestLiftTaskWarmDXR", liftApi_.requestWarm);
+        get("xrCreateLiftStreamDXR", liftApi_.createStream);
+        get("xrDestroyLiftStreamDXR", liftApi_.destroyStream);
+        get("xrSubmitLiftFrameDXR", liftApi_.submitFrame);
+        get("xrAcquireLiftResultDXR", liftApi_.acquireResult);
+        LOG_INFO("XR_DXR_lift entry points: %s", HasLift() ? "resolved" : "NULL");
     }
 
     XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
@@ -721,6 +743,19 @@ int32_t XrSession::FindFlatMode() const {
     return fallback ? (int32_t)fallback->modeIndex : -1;
 }
 
+int32_t XrSession::FindStereoMode() const {
+    // The first requestable mode that drives the hardware to 3D with two or more views
+    // (the runtime lists them in its own preference order).
+    for (const auto& m : modes_)
+        if (m.requestable && m.hardware3D && m.viewCount >= 2) return (int32_t)m.modeIndex;
+    return -1;
+}
+
+bool XrSession::CurrentModeIsFlat() const {
+    const RenderingMode* m = CurrentMode();
+    return m && m->viewCount == 1 && !m->hardware3D;
+}
+
 void XrSession::RequestMode(uint32_t modeIndex) {
     if (!pfnRequestMode_) return;
     for (const auto& m : modes_) {
@@ -958,6 +993,12 @@ void XrSession::PollEvents() {
                          ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());
                 break;
             }
+            case (XrStructureType)XR_TYPE_EVENT_DATA_LIFT_TASK_STATE_CHANGED_DXR:
+            case (XrStructureType)XR_TYPE_EVENT_DATA_LIFT_PROVIDERS_CHANGED_DXR:
+                // "Convert to 3D": the app's LiftClient follows the task's readiness.
+                if (liftEventHandler_)
+                    liftEventHandler_(reinterpret_cast<const XrEventDataBaseHeader*>(&event));
+                break;
             case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
                 // An agent invoked one of our registered tools. We're on the main loop, so
                 // dispatch + answer here where player state is consistent (no locking).

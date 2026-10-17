@@ -140,6 +140,7 @@ public:
     bool TakeToggleSlideshowRequest(); // `S` — toggle slideshow ("diaporama")
     bool TakeToggleMuteRequest();      // `M` — toggle audio mute
     bool TakeCycleLayoutRequest();     // `L` — cycle the stereo-layout override (#45)
+    bool TakeConvertRequest();         // Shift+L — "Convert to 3D" on/off (XR_DXR_lift)
     bool TakeToggleCameraRequest();    // `C` — live camera on/off (#90)
     bool TakeToggleAutoConvRequest();  // `A` — auto-convergence on/off (#92)
     bool TakeCycleAutoConvPolicyRequest();  // Shift+A — next subject policy (#92)
@@ -205,6 +206,7 @@ private:
     bool toggleSlideshowRequested_ = false;
     bool toggleMuteRequested_ = false;
     bool cycleLayoutRequested_ = false;
+    bool convertRequested_ = false;
     bool toggleCameraRequested_ = false;
     bool toggleAutoConvRequested_ = false;
     bool cycleAutoConvPolicyRequested_ = false;

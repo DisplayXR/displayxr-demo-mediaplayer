@@ -242,7 +242,10 @@ void Window::HandleLinuxKey(uint32_t ks, uint32_t mods, bool repeat, bool* quit)
         case XK_Right: nextMediaRequested_ = true; break;
         case XK_s: toggleSlideshowRequested_ = true; break;
         case XK_m: toggleMuteRequested_ = true; break;
-        case XK_l: cycleLayoutRequested_ = true; break;          // stereo layout override
+        case XK_l:                                                // stereo layout override
+            if (shift) convertRequested_ = true;                  // Shift+L: Convert to 3D
+            else cycleLayoutRequested_ = true;
+            break;
         case XK_c: if (!ctrl) toggleCameraRequested_ = true; break;  // live camera (#90)
         case XK_i: captureRequested_ = true; break;               // snapshot the atlas
         case XK_a:                                                // auto-convergence (#92)

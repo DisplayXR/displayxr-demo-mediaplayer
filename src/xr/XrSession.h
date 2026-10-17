@@ -19,6 +19,8 @@
 
 #include <cursor_depth.h>  // displayxr-common: dxr::CursorDepth (XR_DXR_cursor_depth helper)
 
+#include "media/LiftClient.h"  // lift::Api (XR_DXR_lift entry-point table)
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -183,6 +185,18 @@ public:
     // Install the handler invoked when an agent calls a registered tool.
     void SetMcpToolHandler(McpToolHandler handler) { mcpToolHandler_ = std::move(handler); }
 
+    // --- 2D->3D conversion (XR_DXR_lift spec v4, "Convert to 3D") ---
+    // The extension is enabled whenever the runtime advertises it. HasLift() is true once
+    // it is enabled AND its entry points resolved; LiftApi() is then the table the app's
+    // lift::LiftClient runs on (all null otherwise, which keeps the toggle hidden). The two
+    // lift events (task state changed, providers changed) are forwarded from PollEvents to
+    // the handler installed here.
+    bool HasLift() const { return hasLiftExt_ && liftApi_.Complete(); }
+    const lift::Api& LiftApi() const { return liftApi_; }
+    ::XrSession Handle() const { return session_; }
+    using LiftEventHandler = std::function<void(const XrEventDataBaseHeader* event)>;
+    void SetLiftEventHandler(LiftEventHandler handler) { liftEventHandler_ = std::move(handler); }
+
     // Vulkan handles the runtime selected for us — handed to the renderer.
     VkInstance VkInstanceHandle() const { return vkInstance_; }
     VkPhysicalDevice PhysicalDevice() const { return physicalDevice_; }
@@ -233,6 +247,10 @@ public:
     // offers no such mode (no rendering-mode extension, 3D-only display, or the
     // mode is workspace-locked), which callers treat as "leave the mode alone".
     int32_t FindFlatMode() const;
+    // The first requestable hardware-3D mode with >= 2 views, or -1 (Pro: a monitoring
+    // station asks for it when stereo content arrives on a flat panel).
+    int32_t FindStereoMode() const;
+    bool CurrentModeIsFlat() const;
     // VkImage handles backing the swapchain (length == imageCount).
     const std::vector<VkImage>& SwapchainImages() const { return swapchainVkImages_; }
 
@@ -318,6 +336,12 @@ private:
     PFN_xrGetMCPToolCallArgsDXR pfnGetMcpToolCallArgs_ = nullptr;
     PFN_xrSubmitMCPToolResultDXR pfnSubmitMcpToolResult_ = nullptr;
     McpToolHandler mcpToolHandler_;
+
+    // 2D->3D conversion (XR_DXR_lift). Entry points null when the runtime lacks it.
+    bool hasLiftExt_ = false;
+    uint32_t liftSpec_ = 0;
+    lift::Api liftApi_{};
+    LiftEventHandler liftEventHandler_;
 
     // Capabilities discovered at instance creation.
     bool hasWindowBindingExt_ = false;

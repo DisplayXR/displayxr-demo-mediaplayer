@@ -264,7 +264,7 @@ void TestDisabledReasons() {
     ResetFake({});
     LiftClient c;
     c.Attach(FakeApi(), kSession);
-    CHECK(c.Reason() == "No 2D→3D converter is installed", "absent reason text");
+    CHECK(c.Reason() == "No 2D->3D converter is installed", "absent reason text");
 }
 
 void TestEnumerateUnsupported() {
@@ -475,6 +475,27 @@ void TestTerminalWhileOnAndRecovery() {
     CHECK(!d.OnEvent(Hdr(&unrelated)), "non-lift event not consumed");
 }
 
+void TestIdlePoll() {
+    // An in-process session can enumerate nothing until its lift link connects: the first
+    // answer is not final, so Tick re-reads it (2 s while off) and the toggle enables.
+    ResetFake({});
+    LiftClient c;
+    c.Attach(FakeApi(), kSession);
+    CHECK(c.GetAvailability() == Availability::Disabled, "nothing known yet -> disabled");
+    const int calls = g.enumCalls;
+    c.Tick(0.0);
+    CHECK(g.enumCalls > calls, "unsettled -> re-enumerates");
+    g.tasks = {MakeTask(XR_LIFT_TASK_STATE_READY_DXR)};
+    const int calls2 = g.enumCalls;
+    c.Tick(1.0);
+    CHECK(g.enumCalls == calls2, "idle poll period respected");
+    c.Tick(2.5);
+    CHECK(c.GetAvailability() == Availability::Enabled, "task appeared on the poll");
+    const int calls3 = g.enumCalls;
+    c.Tick(10.0);
+    CHECK(g.enumCalls == calls3, "settled READY -> no more polling");
+}
+
 void TestReset() {
     ResetFake({MakeTask(XR_LIFT_TASK_STATE_READY_DXR)});
     LiftClient c;
@@ -567,6 +588,7 @@ int main() {
     TestCreateUnsupported();
     TestLimitReachedNotLatched();
     TestTerminalWhileOnAndRecovery();
+    TestIdlePoll();
     TestReset();
     TestFrameHelpers();
     if (g_failures) {

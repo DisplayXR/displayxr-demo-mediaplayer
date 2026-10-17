@@ -38,6 +38,10 @@ struct TransportCaps {
     // Stream URL source (#93): the "Stream URL..." row in the Live combo, its popup and
     // the STREAM pill. DEFAULT FALSE for the same reason as `camera`.
     bool url = false;
+    // "Convert to 3D" (XR_DXR_lift): the toggle after Layout. DEFAULT FALSE like `camera`;
+    // the desktop owner sets it per frame (true only for mono content on a runtime that
+    // offers the conversion), so it is unsupported = not drawn, exactly like the rest.
+    bool convert = false;
 };
 
 // Everything the widgets read, and the little bit of state they own.
@@ -83,6 +87,14 @@ struct TransportState {
     float streamKbps = 0.0f;   // demuxed bitrate
     std::string urlSeed;       // last URL (or MEDIAPLAYER_URL): prefills the popup
     bool urlPopupRequest = false;  // owner (Ctrl+U) or the combo row asks to open it
+    // "Convert to 3D" - only read when caps.convert. A temporary state (the conversion task
+    // cannot serve right now) draws it greyed via convertEnabled = false, with the reason
+    // in convertTooltip. convertWarming / convertUnavailable pick the label.
+    bool convertOn = false;
+    bool convertEnabled = false;
+    bool convertWarming = false;
+    bool convertUnavailable = false;
+    std::string convertTooltip;
 
     // ---- UI owns (do not clobber) ------------------------------------------
     // Scrubber. The displayed knob tracks playback EXCEPT while dragging, or
@@ -140,6 +152,9 @@ struct TransportActions {
 
     // Stream URL (#93), used only when caps.url: Connect in the URL popup.
     std::function<void(const std::string& url)> OpenUrl;
+
+    // "Convert to 3D", used only when caps.convert: the toggle.
+    std::function<void()> ToggleConvert;
 };
 
 // The player's "dark glass" look. `metricScale` is the ONE sanctioned divergence
