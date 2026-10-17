@@ -136,8 +136,11 @@ bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, E
         double sy_ = 0, su = 0, sv = 0;
         int n = 0;
         const int cw = W / 2, chh = f.height / 2;
-        for (int y = f.height / 10; y < f.height * 9 / 10; y += 16) {
-            for (int x = fullEye / 10; x < fullEye * 9 / 10; x += 16) {
+        // Whole rows, every 7th: a sparse grid aliases with periodic content (a 16 px
+        // grid on a drifting 160 px grating read one eye 15 % brighter for a burst now
+        // and then, and the colour alert latched that peak - tmp-mp-pro 2026-10-18).
+        for (int y = f.height / 10; y < f.height * 9 / 10; y += 7) {
+            for (int x = fullEye / 10; x < fullEye * 9 / 10; ++x) {
                 const int gx = x0 + x;
                 sy_ += lumaAt((size_t)y * W + gx);
                 if (p16) {

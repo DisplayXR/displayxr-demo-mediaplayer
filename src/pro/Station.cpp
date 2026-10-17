@@ -92,6 +92,7 @@ void Station::Init(StationHost host, const StationOptions& opt) {
 }
 
 void Station::Shutdown() {
+    FlushOpenAlerts();
     decklink_.Stop();
     testSignal_.Stop();
 }
@@ -375,6 +376,28 @@ std::string Station::RigStatusJson() const {
 std::string Station::Folder() const {
     return host_.capturePrefix ? std::filesystem::path(host_.capturePrefix("x")).parent_path().string()
                                : std::string();
+}
+
+// An episode still open when the station closes would otherwise never reach the log (it
+// is written when it closes): write it as open, with the time it has run so far. A kill
+// or a crash still loses it.
+void Station::FlushOpenAlerts() {
+    LogNewAlerts();
+    std::string dir;
+    const double now = LiveProducer::NowSeconds();
+    for (const rig::Alert& a : rig_.Alerts()) {
+        if (a.end >= 0) continue;
+        if (dir.empty() && host_.capturePrefix)
+            dir = std::filesystem::path(host_.capturePrefix("x")).parent_path().string();
+        if (dir.empty()) return;
+        nlohmann::json j;
+        j["what"] = a.what;
+        j["timecode"] = a.timecode;
+        j["time"] = a.wallClock;
+        j["duration_s"] = now - a.start;
+        j["open"] = true;
+        std::ofstream((std::filesystem::path(dir) / "station_alerts.jsonl").string(), std::ios::app) << j.dump() << "\n";
+    }
 }
 
 // ---------------------------------------------------------------------------- agent tools
