@@ -416,6 +416,7 @@ private:
     bool startModeRequested_ = false;
     const char* dumpPath_ = nullptr;
     bool dumped_ = false;
+    bool convertAtStart_ = false;          // MEDIAPLAYER_CONVERT: toggle Convert to 3D on
     const char* openAfterPath_ = nullptr;  // ReloadMedia() this path after a few frames
     bool openedAfter_ = false;
     const char* dumpHudPath_ = nullptr;   // dump the rendered ImGui HUD image once

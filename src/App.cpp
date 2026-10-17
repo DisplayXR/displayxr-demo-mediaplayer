@@ -380,6 +380,10 @@ int App::Run() {
     dumpHudPath_ = std::getenv("MEDIAPLAYER_DUMP_HUD");
     if (const char* f = std::getenv("MEDIAPLAYER_DUMP_FRAME")) dumpFrame_ = std::max(1, std::atoi(f));
     openAfterPath_ = std::getenv("MEDIAPLAYER_OPEN_AFTER");  // test: swap media mid-run
+    // Test: switch "Convert to 3D" on without a keystroke (headless runs). Retried until it
+    // takes, because an in-process session may only learn the conversion task a moment
+    // after start. Never set by the player itself.
+    if (const char* c = std::getenv("MEDIAPLAYER_CONVERT")) convertAtStart_ = (*c && *c != '0');
     if (const char* h = std::getenv("MEDIAPLAYER_HUD")) showHud_ = (*h && *h != '0');
     // Env-gated initial stereo state (test scaffolding: lets a headless atlas dump
     // prove convergence/swap without keystrokes). Interactive keys still apply on top.
@@ -656,6 +660,9 @@ void App::RenderOneFrame() {
         }
     }
 
+    if (convertAtStart_ && rendered_ >= 30 && rendered_ % 60 == 30) {  // MEDIAPLAYER_CONVERT
+        if (SetConvert(true, "env") || rendered_ > 1200) convertAtStart_ = false;
+    }
     PumpConvert(SteadySeconds());  // "Convert to 3D": poll + upload a landed result (no-op off)
     TickAutoConv();  // smoothed auto-convergence shift (#92); exactly 0 while never enabled
     UpdateDepthCursor();
