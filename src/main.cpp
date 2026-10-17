@@ -188,7 +188,10 @@ int main(int argc, char* argv[]) {
 #if MEDIAPLAYER_PRO
     if (listDeckLink) {
 #if defined(_WIN32)
-        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        // Same rule as --camera-list: borrow the parent's console only when stdout has
+        // none, so `> file` keeps working (an unconditional CONOUT$ swallowed it).
+        const HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if ((h == nullptr || h == INVALID_HANDLE_VALUE) && AttachConsole(ATTACH_PARENT_PROCESS)) {
             FILE* f = nullptr;
             freopen_s(&f, "CONOUT$", "w", stdout);
         }

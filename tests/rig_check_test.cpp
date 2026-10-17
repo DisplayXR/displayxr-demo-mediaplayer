@@ -259,6 +259,48 @@ void EyeSyncMeasured() {
     CHECK(rig::MeasureEyeSync(still, 0, 0, &late) == -1, "no motion = not measured");
 }
 
+
+// The app's path (RigMonitor::Worker): the rig's measured parallax and vertical offset
+// are removed before the eyes are compared, at the station's live config: 48p, a 4 px
+// vertical shift, a brighter right eye, a 2-frame-late right eye. Reported from the
+// Windows box as "measured 0, timecode says 2" (tmp-mp-pro, 2026-10-18).
+void EyeSyncLikeTheApp() {
+    TestSignalConfig cfg;
+    cfg.fps = 48.0;
+    cfg.vShiftPx = 4.0f;
+    cfg.gainR = 1.15f;
+    cfg.eyeDelay = 2;
+    int wrong = 0, measured = 0;
+    for (int64_t last : {30, 60, 90, 150, 200, 260}) {
+        std::vector<rig::EyePair> seq = Burst(cfg, last, false);
+        rig::Result r = rig::Measure(seq.back());
+        CHECK(r.ok, "the spatial measurement works at the app's config");
+        std::vector<float> p = r.parallaxPct;
+        std::nth_element(p.begin(), p.begin() + p.size() / 2, p.end());
+        const rig::EyePair& e = seq.back();
+        const float shiftX = p[p.size() / 2] / 100.f * (float)e.eyeW;
+        const float shiftY = e.fullH > 0 ? r.verticalPx * (float)e.h / e.fullH : 0.f;
+        int late = 0;
+        const int d = rig::MeasureEyeSync(seq, shiftX, shiftY, &late);
+        std::printf("  app path, frame %lld: shift %.2f,%.2f vertical %.2f px -> measured %d (late %d)\n",
+                    (long long)last, shiftX, shiftY, r.verticalPx, d, late);
+        if (d >= 0) ++measured;
+        if (d >= 0 && !(d == 2 && late == +1)) ++wrong;
+        // the Worker's follow-up: the rig's geometry on the time-aligned pair (the right
+        // eye now against the left eye d frames back) reads the injected 4 px, not the
+        // moving discs seen through the delay
+        if (d == 2 && late == +1) {
+            rig::EyePair aligned = seq.back();
+            aligned.left = seq[seq.size() - 1 - 2].left;
+            const rig::Result a = rig::Measure(aligned);
+            std::printf("    aligned pair: vertical %.2f px\n", a.verticalPx);
+            CHECK(a.ok && std::fabs(a.verticalPx - 4.0f) < 0.5f, "vertical error on the aligned pair = 4 px");
+        }
+    }
+    CHECK(wrong == 0, "never a confident wrong eye-sync reading on the app's path");
+    CHECK(measured >= 4, "the 2-frame delay is measured from the pixels most of the time");
+}
+
 }  // namespace
 
 int main() {
@@ -273,6 +315,7 @@ int main() {
     TooFewMatches();
     AlertClosesOnBlack();
     EyeSyncMeasured();
+    EyeSyncLikeTheApp();
     if (g_failures) {
         std::fprintf(stderr, "rig_check_test: %d failure(s)\n", g_failures);
         return 1;
