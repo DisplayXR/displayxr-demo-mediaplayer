@@ -10,7 +10,7 @@
     "XR_DXR_cursor_depth.h": "1d7fd8b2a9795d804dfaa3326faa68dbb942f399",
     "XR_DXR_display_info.h": "c1e4fe00da0f189122eca14e61e9faaa88e4b38e",
     "XR_DXR_display_zones.h": "a71979a4d1385841a224eccd64ae973385300b1f",
-    "XR_DXR_lift.h": "0d12e5f997c9a592ccd898a4e82435c443d21daa",
+    "XR_DXR_lift.h": "b663a97e98fbe1ceeb0600a8b30079d4d5b484b5",
     "XR_DXR_local_3d_zone.h": "a71979a4d1385841a224eccd64ae973385300b1f",
     "XR_DXR_macos_gl_binding.h": "a71979a4d1385841a224eccd64ae973385300b1f",
     "XR_DXR_mcp_tools.h": "a71979a4d1385841a224eccd64ae973385300b1f",
