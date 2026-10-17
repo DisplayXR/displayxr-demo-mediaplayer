@@ -461,6 +461,37 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
                     !s.convertTooltip.empty())
                     ImGui::SetTooltip("%s", s.convertTooltip.c_str());
+                // Provider selector: the runtime's candidates, names verbatim. A pick is a
+                // per-session hint (nothing is persisted; the default lives in DisplayXR).
+                if (!s.convertProviders.empty()) {
+                    const int cur = s.convertProviderCurrent;
+                    const bool valid = cur >= 0 && cur < (int)s.convertProviders.size();
+                    const char* preview =
+                        valid ? s.convertProviders[cur].preview.c_str() : "Default";
+                    ImGui::SameLine();
+                    const ImGuiStyle& st = ImGui::GetStyle();
+                    ImGui::SetNextItemWidth(std::min(ImGui::CalcTextSize(preview).x +
+                                                         ImGui::GetFrameHeight() +
+                                                         st.FramePadding.x * 2.0f,
+                                                     280.0f));
+                    if (ImGui::BeginCombo("##convert3d_provider", preview)) {
+                        for (int i = 0; i < (int)s.convertProviders.size(); ++i) {
+                            const ConvertProviderRow& row = s.convertProviders[i];
+                            ImGui::PushID(i);
+                            ImGui::BeginDisabled(!row.enabled);
+                            if (ImGui::Selectable(row.label.c_str(), i == cur) && i != cur &&
+                                a.SelectConvertProvider)
+                                a.SelectConvertProvider(i);
+                            ImGui::EndDisabled();
+                            ImGui::PopID();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "2D->3D provider for this session\n"
+                            "(the default is set in DisplayXR's settings)");
+                }
             }
             // Auto-convergence (#92): live only. Highlighted while on.
             if (((s.caps.camera && s.isLive) || (s.caps.url && s.isStream)) && !s.autoConvLabel.empty()) {

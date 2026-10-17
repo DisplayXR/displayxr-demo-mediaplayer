@@ -72,6 +72,12 @@ const char* TaskStateName(XrLiftTaskStateDXR s) {
     }
 }
 
+bool Candidate::Terminal() const {
+    return state == XR_LIFT_TASK_STATE_ABSENT_DXR || state == XR_LIFT_TASK_STATE_INCOMPATIBLE_DXR ||
+           state == XR_LIFT_TASK_STATE_UNLICENSED_DXR || state == XR_LIFT_TASK_STATE_FAILED_DXR ||
+           state == XR_LIFT_TASK_STATE_DISABLED_DXR;
+}
+
 bool LiftClient::Terminal(XrLiftTaskStateDXR s) {
     return s == XR_LIFT_TASK_STATE_ABSENT_DXR || s == XR_LIFT_TASK_STATE_INCOMPATIBLE_DXR ||
            s == XR_LIFT_TASK_STATE_UNLICENSED_DXR || s == XR_LIFT_TASK_STATE_FAILED_DXR ||
@@ -99,6 +105,8 @@ void LiftClient::Detach() {
     session_ = XR_NULL_HANDLE;
     taskPresent_ = false;
     enumerateUnsupported_ = createUnsupported_ = false;
+    candidates_.clear();
+    preferred_.clear();
 }
 
 void LiftClient::Refresh() {
@@ -137,8 +145,108 @@ void LiftClient::Refresh() {
                 taskPresent_ = true;
             }
         }
+        RefreshCandidates();
         return;
     }
+}
+
+void LiftClient::RefreshCandidates() {
+    if (!api_.enumerateCandidates || session_ == XR_NULL_HANDLE) {
+        candidates_.clear();
+        return;
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        uint32_t n = 0;
+        XrResult r =
+            api_.enumerateCandidates(session_, XR_LIFT_TASK_VIEWS_MONO_DXR, 0, &n, nullptr);
+        if (XR_FAILED(r)) {
+            candidates_.clear();  // not offered here: no selector
+            return;
+        }
+        std::vector<XrLiftTaskCandidateDXR> raw(n);
+        for (auto& c : raw) {
+            c = XrLiftTaskCandidateDXR{};
+            c.type = XR_TYPE_LIFT_TASK_CANDIDATE_DXR;
+        }
+        if (n > 0) {
+            r = api_.enumerateCandidates(session_, XR_LIFT_TASK_VIEWS_MONO_DXR, n, &n, raw.data());
+            if (r == XR_ERROR_SIZE_INSUFFICIENT) continue;
+            if (XR_FAILED(r)) {
+                candidates_.clear();
+                return;
+            }
+        }
+        std::vector<Candidate> before;
+        before.swap(candidates_);
+        for (uint32_t i = 0; i < n && i < raw.size(); ++i) {
+            Candidate c;
+            c.id.assign(raw[i].providerId, strnlen(raw[i].providerId, sizeof(raw[i].providerId)));
+            c.name.assign(raw[i].displayName,
+                          strnlen(raw[i].displayName, sizeof(raw[i].displayName)));
+            if (c.name.empty()) c.name = c.id;
+            c.state = raw[i].state;
+            c.failureReason = raw[i].failureReason;
+            c.hosting = raw[i].hosting;
+            c.isUserDefault = raw[i].isUserDefault == XR_TRUE;
+            c.isSelected = raw[i].isSelected == XR_TRUE;
+            if (!c.id.empty()) candidates_.push_back(std::move(c));
+        }
+        // Log the list when it changes (lifecycle, not per frame). The strings are the
+        // runtime's, verbatim.
+        bool changed = before.size() != candidates_.size();
+        for (size_t i = 0; !changed && i < before.size(); ++i)
+            changed = before[i].id != candidates_[i].id || before[i].state != candidates_[i].state ||
+                      before[i].isUserDefault != candidates_[i].isUserDefault ||
+                      before[i].isSelected != candidates_[i].isSelected;
+        if (changed) {
+            LOG_INFO("2D→3D conversion: %zu provider candidate(s)", candidates_.size());
+            for (const Candidate& c : candidates_)
+                LOG_INFO("  candidate '%s' (id %s): %s%s%s%s", c.name.c_str(), c.id.c_str(),
+                         TaskStateName(c.state),
+                         c.hosting == XR_LIFT_PROVIDER_HOSTING_REMOTE_DXR ? ", remote" : "",
+                         c.isUserDefault ? ", user default" : "",
+                         c.isSelected ? ", selected" : "");
+        }
+        // A pick that is no longer a candidate would be a silent no-op hint: drop it.
+        if (!preferred_.empty()) {
+            bool found = false;
+            for (const Candidate& c : candidates_) found = found || c.id == preferred_;
+            if (!found) {
+                LOG_INFO(
+                    "2D→3D conversion: picked provider is no longer a candidate; default again");
+                preferred_.clear();
+            }
+        }
+        return;
+    }
+}
+
+int LiftClient::EffectiveCandidate() const {
+    int def = -1, sel = -1;
+    for (size_t i = 0; i < candidates_.size(); ++i) {
+        if (!preferred_.empty() && candidates_[i].id == preferred_) return (int)i;
+        if (def < 0 && candidates_[i].isUserDefault) def = (int)i;
+        if (sel < 0 && candidates_[i].isSelected) sel = (int)i;
+    }
+    return def >= 0 ? def : sel;
+}
+
+std::string LiftClient::SetPreferred(const std::string& id) {
+    if (!api_.enumerateCandidates) return "this runtime offers no provider choice";
+    std::string want = id;
+    if (!want.empty()) {
+        const Candidate* hit = nullptr;
+        for (const Candidate& c : candidates_)
+            if (c.id == want) hit = &c;
+        if (!hit) return "no such 2D->3D provider: " + id;
+        if (hit->Terminal()) return hit->name + " is " + TaskStateName(hit->state);
+        if (hit->isUserDefault) want.clear();  // the default needs no hint
+    }
+    if (want == preferred_) return std::string();
+    preferred_ = want;
+    LOG_INFO("2D→3D conversion: provider %s", preferred_.empty() ? "default" : "picked");
+    if (want_) Reset();  // a live stream does not move on its own: re-create it with the hint
+    return std::string();
 }
 
 bool LiftClient::OnEvent(const XrEventDataBaseHeader* ev) {
@@ -296,6 +404,14 @@ bool LiftClient::CreateStream() {
     ci.mode = XR_LIFT_MODE_SBS_DXR;  // the legacy mode matching VIEWS_MONO with 2 views
     ci.contentHint = video_ ? XR_LIFT_CONTENT_HINT_VIDEO_DXR : XR_LIFT_CONTENT_HINT_PHOTO_DXR;
     ci.inputScale = 0.0f;  // = 1.0 (native)
+
+    // Spec 5: the player's pick rides on THIS create only (a spec-4 runtime ignores it).
+    XrLiftProviderPreferenceDXR pref{};
+    if (!preferred_.empty()) {
+        pref.type = XR_TYPE_LIFT_PROVIDER_PREFERENCE_DXR;
+        pref.providerId = preferred_.c_str();
+        task.next = &pref;
+    }
 
     XrLiftStreamDXR s = XR_NULL_HANDLE;
     const XrResult r = api_.createStream(session_, &ci, &s);

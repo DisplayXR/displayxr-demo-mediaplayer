@@ -44,6 +44,15 @@ struct TransportCaps {
     bool convert = false;
 };
 
+// One row of the "Convert to 3D" provider selector: the runtime's verbatim provider name
+// plus its state, already formatted by the owner. Disabled rows (terminal states) draw
+// greyed and cannot be picked.
+struct ConvertProviderRow {
+    std::string label;    // e.g. "<name>  (ready)" / "<name>  (warming, remote)"
+    std::string preview;  // the closed combo's text: the name (+ " (remote)")
+    bool enabled = true;
+};
+
 // Everything the widgets read, and the little bit of state they own.
 //
 // The "owner writes" block is refreshed by the caller every frame from the real
@@ -95,6 +104,10 @@ struct TransportState {
     bool convertWarming = false;
     bool convertUnavailable = false;
     std::string convertTooltip;
+    // The provider selector beside the toggle: drawn only when non-empty (a spec-5 runtime
+    // reporting >= 1 candidate). convertProviderCurrent = the row shown as current.
+    std::vector<ConvertProviderRow> convertProviders;
+    int convertProviderCurrent = -1;
 
     // ---- UI owns (do not clobber) ------------------------------------------
     // Scrubber. The displayed knob tracks playback EXCEPT while dragging, or
@@ -155,6 +168,7 @@ struct TransportActions {
 
     // "Convert to 3D", used only when caps.convert: the toggle.
     std::function<void()> ToggleConvert;
+    std::function<void(int row)> SelectConvertProvider;  // a pick in the provider selector
 };
 
 // The player's "dark glass" look. `metricScale` is the ONE sanctioned divergence

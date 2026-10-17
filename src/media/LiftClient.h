@@ -46,6 +46,9 @@ struct Api {
     PFN_xrDestroyLiftStreamDXR destroyStream = nullptr;
     PFN_xrSubmitLiftFrameDXR submitFrame = nullptr;
     PFN_xrAcquireLiftResultDXR acquireResult = nullptr;
+    // Spec 5 (#2178), OPTIONAL: absent on a spec-4 runtime (xrGetInstanceProcAddr fails),
+    // which simply means no candidate list and no provider selector.
+    PFN_xrEnumerateLiftTaskCandidatesDXR enumerateCandidates = nullptr;
 
     bool Complete() const {
         return enumerateTasks && createStream && destroyStream && submitFrame && acquireResult;
@@ -58,6 +61,20 @@ enum class Availability { Hidden, Disabled, Enabled };
 const char* StateName(State s);  // "off" | "requested" | "warming" | "active" | "unavailable"
 const char* AvailabilityName(Availability a);  // "hidden" | "disabled" | "enabled"
 const char* TaskStateName(XrLiftTaskStateDXR s);
+
+// One provider that could serve VIEWS_MONO (spec 5), as the runtime reported it. `name` is
+// the provider's own display name, shown VERBATIM and never matched on; `id` is the only
+// thing the player sends back (as the per-create hint).
+struct Candidate {
+    std::string id;
+    std::string name;
+    XrLiftTaskStateDXR state = XR_LIFT_TASK_STATE_UNKNOWN_DXR;
+    XrLiftFailureReasonDXR failureReason = XR_LIFT_FAILURE_REASON_NONE_DXR;
+    XrLiftProviderHostingDXR hosting = XR_LIFT_PROVIDER_HOSTING_LOCAL_IN_SERVICE_DXR;
+    bool isUserDefault = false;
+    bool isSelected = false;  // a create WITHOUT a hint would bind it now
+    bool Terminal() const;
+};
 
 // One converted picture. `rgba` is tightly packed RGBA8 (width * 4 bytes per row),
 // owned by the runtime (or the client's swizzle buffer) and valid until the next
@@ -141,12 +158,29 @@ public:
     // Non-blocking: the newest finished result newer than the last one, or false.
     bool Poll(Result& out);
 
+    // ---- provider candidates (spec 5) ---------------------------------------------------
+    // The VIEWS_MONO candidates in the runtime's selection order, refreshed with every
+    // Refresh() (attach, events, polls). Empty on a spec-4 runtime: no selector.
+    const std::vector<Candidate>& Candidates() const { return candidates_; }
+    bool HasCandidates() const { return !candidates_.empty(); }
+    // The player's per-session pick: "" = no hint (the runtime's / user's default). Never
+    // persisted and never written to the runtime's default; it only rides on creates.
+    const std::string& Preferred() const { return preferred_; }
+    // The candidate the selector shows as current: the pick, else the user's default, else
+    // the one a hint-less create would bind. -1 when there are none.
+    int EffectiveCandidate() const;
+    // Pick a provider by id ("" = back to the default). A change re-creates a live stream
+    // with the hint. Returns "" on success, else why not (unknown id / terminal / no
+    // candidates on this runtime). Picking the user's default clears the hint.
+    std::string SetPreferred(const std::string& id);
+
     uint64_t FramesSubmitted() const { return submitted_; }
     uint64_t FramesConverted() const { return converted_; }
     bool HaveResult() const { return haveResult_; }
 
 private:
     bool CreateStream();
+    void RefreshCandidates();
     void DestroyStream();
     void SetUnavailable(const std::string& why) { unavailableWhy_ = why; }
     static bool Terminal(XrLiftTaskStateDXR s);
@@ -174,6 +208,8 @@ private:
     std::vector<uint8_t> swizzle_;  // BGRA -> RGBA when the export is BGRA
     uint64_t submitted_ = 0, converted_ = 0;
     bool acquireErrLogged_ = false;
+    std::vector<Candidate> candidates_;
+    std::string preferred_;
 };
 
 // ---- frame preparation (pure, unit-tested) --------------------------------------

@@ -203,6 +203,9 @@ private:
     void PumpConvert(double nowSec);
     void SubmitConvertFrame(const FrameRing::Frame& f, double nowSec);
     void KeepStillForConvert(const uint8_t* rgba, int w, int h);
+    // Provider selector (XR_DXR_lift spec 5): pick a candidate by id ("" = the default) as
+    // the hint for this session's creates. "" on success, else why not. Never persisted.
+    std::string SetConvertProvider(const std::string& id, const char* why);
 
     // Agent tools (XR_DXR_mcp_tools). SetupAgentTools registers the player's controls as
     // MCP tools on the runtime's per-process server (no-op when the MCP gate is off);
@@ -417,6 +420,7 @@ private:
     const char* dumpPath_ = nullptr;
     bool dumped_ = false;
     bool convertAtStart_ = false;          // MEDIAPLAYER_CONVERT: toggle Convert to 3D on
+    std::string convertProviderAtStart_;   // MEDIAPLAYER_CONVERT_PROVIDER: pick this id first
     const char* openAfterPath_ = nullptr;  // ReloadMedia() this path after a few frames
     bool openedAfter_ = false;
     const char* dumpHudPath_ = nullptr;   // dump the rendered ImGui HUD image once

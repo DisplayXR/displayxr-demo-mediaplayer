@@ -384,6 +384,8 @@ int App::Run() {
     // takes, because an in-process session may only learn the conversion task a moment
     // after start. Never set by the player itself.
     if (const char* c = std::getenv("MEDIAPLAYER_CONVERT")) convertAtStart_ = (*c && *c != '0');
+    // Test: with MEDIAPLAYER_CONVERT, first pick this provider id (spec 5 hint).
+    if (const char* p = std::getenv("MEDIAPLAYER_CONVERT_PROVIDER")) convertProviderAtStart_ = p;
     if (const char* h = std::getenv("MEDIAPLAYER_HUD")) showHud_ = (*h && *h != '0');
     // Env-gated initial stereo state (test scaffolding: lets a headless atlas dump
     // prove convergence/swap without keystrokes). Interactive keys still apply on top.
@@ -662,6 +664,9 @@ void App::RenderOneFrame() {
 
     if (convertAtStart_ && rendered_ >= 30 && rendered_ % 60 == 30) {  // MEDIAPLAYER_CONVERT
         // No XR_DXR_lift at all: nothing will ever come, and no toast either.
+        if (!convertProviderAtStart_.empty() && lift_.HasCandidates() &&
+            SetConvertProvider(convertProviderAtStart_, "env").empty())
+            convertProviderAtStart_.clear();
         if (lift_.GetAvailability() == lift::Availability::Hidden || SetConvert(true, "env") ||
             rendered_ > 1200)
             convertAtStart_ = false;
@@ -1056,6 +1061,18 @@ void App::BuildTransportUI() {
             !why.empty() ? why
             : lift_.On() ? std::string("Shift+L: show the original 2D picture")
                          : std::string("Shift+L: convert this 2D picture to 3D");
+        // Provider selector (spec 5): the runtime's candidates, names verbatim.
+        uiState_.convertProviders.clear();
+        for (const lift::Candidate& c : lift_.Candidates()) {
+            const bool remote = c.hosting == XR_LIFT_PROVIDER_HOSTING_REMOTE_DXR;
+            ui::ConvertProviderRow row;
+            row.label = c.name + "  (" + lift::TaskStateName(c.state) +
+                        (remote ? ", remote" : "") + ")";
+            row.preview = remote ? c.name + " (remote)" : c.name;
+            row.enabled = !c.Terminal();
+            uiState_.convertProviders.push_back(std::move(row));
+        }
+        uiState_.convertProviderCurrent = lift_.EffectiveCandidate();
     }
     // Stream URL (#93).
     uiState_.isStream = isStream_;
@@ -1105,6 +1122,10 @@ void App::BuildTransportUI() {
     actions.OpenUrl = [this](const std::string& url) { LoadUrl(url); };
     actions.ToggleAutoConv = [this] { SetAutoConv(!autoConvEnabled_, "ui"); };
     actions.ToggleConvert = [this] { SetConvert(!lift_.On(), "ui"); };
+    actions.SelectConvertProvider = [this](int row) {
+        const auto& cands = lift_.Candidates();
+        if (row >= 0 && row < (int)cands.size()) SetConvertProvider(cands[row].id, "ui");
+    };
 
     ui::BuildTransportUI(uiState_, actions);
 #if MEDIAPLAYER_PRO
@@ -2460,6 +2481,23 @@ bool App::SetConvert(bool on, const char* why) {
     return true;
 }
 
+std::string App::SetConvertProvider(const std::string& id, const char* why) {
+    const std::string err = lift_.SetPreferred(id);
+    if (!err.empty()) {
+        LOG_INFO("Convert to 3D: provider pick refused (%s): %s", why, err.c_str());
+        ShowToast(err);
+        return err;
+    }
+    // A live stream was re-created with the hint; a still has to be handed over again.
+    if (lift_.On() && !isVideo_ && !LiveSource()) convertStillPending_ = true;
+    const int i = lift_.EffectiveCandidate();
+    const std::string name = i >= 0 ? lift_.Candidates()[i].name : std::string("default");
+    LOG_INFO("Convert to 3D: provider %s (%s)", lift_.Preferred().empty() ? "default" : "picked",
+             why);
+    ShowToast("2D->3D: " + name);
+    return std::string();
+}
+
 void App::StopConvert(bool restorePicture) {
     if (!lift_.On() && !convertBound_) return;
     const bool wasBound = convertBound_;
@@ -2648,12 +2686,15 @@ void App::SetupAgentTools() {
         "into a stereo pair that replaces it on screen. Mirrors Shift+L and the top-bar "
         "toggle. Off on every load; turning it on asks for the panel's 3D mode if it is flat. "
         "Errors when the runtime offers no conversion, the content is not mono, or the "
-        "conversion task cannot serve this session (the error says why). 'provider' is "
-        "reserved and currently ignored. Returns the convert3d_* fields of get_status.",
+        "conversion task cannot serve this session (the error says why). 'provider' (runtimes "
+        "with provider choice) picks one of get_status's convert3d_candidates by id for this "
+        "session only, or \"\" for the default; it never changes the user's default. "
+        "Returns the convert3d_* fields of get_status.",
         "{\"type\":\"object\",\"properties\":{"
         "\"on\":{\"type\":\"boolean\",\"description\":\"true = convert, false = show the "
         "original 2D picture.\"},"
-        "\"provider\":{\"type\":\"string\",\"description\":\"Reserved; ignored.\"}},"
+        "\"provider\":{\"type\":\"string\",\"description\":\"A convert3d_candidates id, or "
+        "empty for the default.\"}},"
         "\"required\":[\"on\"]}");
 
     xr_.RegisterMcpTool(
@@ -2740,6 +2781,23 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         o["convert3d_state"] = lift::StateName(lift_.GetState());
         o["convert3d_active"] = convertBound_;
         o["convert3d_reason"] = lift_.Reason();
+        // Spec 5: the runtime's candidates (names verbatim). "selected" = what the player's
+        // next create uses (its pick, else the user's default); "runtime_selected" = what a
+        // hint-less create would bind.
+        json cands = json::array();
+        const int eff = lift_.EffectiveCandidate();
+        for (size_t i = 0; i < lift_.Candidates().size(); ++i) {
+            const lift::Candidate& c = lift_.Candidates()[i];
+            cands.push_back({{"id", c.id},
+                             {"name", c.name},
+                             {"state", lift::TaskStateName(c.state)},
+                             {"default", c.isUserDefault},
+                             {"selected", (int)i == eff},
+                             {"runtime_selected", c.isSelected},
+                             {"remote", c.hosting == XR_LIFT_PROVIDER_HOSTING_REMOTE_DXR}});
+        }
+        o["convert3d_candidates"] = cands;
+        o["convert3d_provider"] = lift_.Preferred();  // "" = no hint (the default)
         if (av != lift::Availability::Hidden) {
             o["convert3d_task_state"] = lift::TaskStateName(lift_.TaskState());
             o["convert3d_frames_submitted"] = lift_.FramesSubmitted();
@@ -2751,7 +2809,21 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
             success = false;
             return "{\"error\":\"missing required boolean arg 'on'\"}";
         }
-        // args["provider"] is reserved (runtime #2178) and deliberately ignored for now.
+        // provider (spec 5, runtime #2178): a candidate id from convert3d_candidates, or ""
+        // for the default. A per-session hint; it never changes the user's default.
+        if (args.contains("provider") && !args["provider"].is_null()) {
+            if (!args["provider"].is_string()) {
+                success = false;
+                return "{\"error\":\"provider must be a string (a convert3d_candidates id)\"}";
+            }
+            const std::string err = SetConvertProvider(args["provider"].get<std::string>(), "mcp");
+            if (!err.empty()) {
+                success = false;
+                out["error"] = err;
+                fillConvert(out);
+                return out.dump();
+            }
+        }
         const bool want = args["on"].get<bool>();
         if (!SetConvert(want, "mcp") && want) {
             success = false;

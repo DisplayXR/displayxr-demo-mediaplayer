@@ -187,7 +187,11 @@ bool XrSession::InitInstanceAndSystem() {
         get("xrDestroyLiftStreamDXR", liftApi_.destroyStream);
         get("xrSubmitLiftFrameDXR", liftApi_.submitFrame);
         get("xrAcquireLiftResultDXR", liftApi_.acquireResult);
-        LOG_INFO("XR_DXR_lift entry points: %s", HasLift() ? "resolved" : "NULL");
+        // Spec 5 (#2178), optional: the provider candidates behind the selector. Only asked
+        // for on a spec-5 runtime; absent => no selector.
+        if (liftSpec_ >= 5) get("xrEnumerateLiftTaskCandidatesDXR", liftApi_.enumerateCandidates);
+        LOG_INFO("XR_DXR_lift entry points: %s (provider candidates: %s)",
+                 HasLift() ? "resolved" : "NULL", liftApi_.enumerateCandidates ? "yes" : "no");
     }
 
     XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
