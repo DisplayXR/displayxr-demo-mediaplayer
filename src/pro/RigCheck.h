@@ -54,6 +54,7 @@ struct Result {
     int matches = 0;              // confident block matches used
     float verticalPx = 0.f;       // right minus left, full-res px (+ = right eye lower)
     float rollDeg = 0.f;          // vertical error slope across the width, degrees
+    float dySlope = 0.f;          // the same slope in analysis rows per analysis column
     float nearPct = 0.f;          // 2nd percentile parallax, % of eye width (negative = in front)
     float farPct = 0.f;           // 98th percentile parallax
     float deltaE = 0.f;           // CIE76 between the eyes' mean colours
@@ -84,7 +85,29 @@ Result Measure(const EyePair& e, const Options& o = {});
 // rig's mean parallax / vertical offset (shiftX / shiftY, analysis px, right minus left).
 // Returns the frame offset (0 = in step), or -1 when there is too little motion or no
 // clear winner; lateEye as in Result.
-int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, int* lateEye);
+// shiftSlope = the rig's vertical offset slope over x (Result::dySlope): a rolled eye's
+// dy runs across the picture, and the moving blocks are judged against that line.
+int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, float shiftSlope, int* lateEye);
+
+// A measured eye sync is shown only once two bursts in a row agree on it: one burst can
+// still pick a neighbour of the truth when a frame of motion is at the noise floor (48p,
+// analysis size), and a single wrong direction on the panel is worse than "not
+// measured" for a quarter second. Feed every burst's reading (-1 = not measured, which
+// keeps the pending one); the return is the confirmed reading or -1.
+struct SyncConfirm {
+    int frames = -2, late = 0;
+    int Feed(int measuredFrames, int lateEye, int* confirmedLate) {
+        if (measuredFrames < 0) {
+            if (confirmedLate) *confirmedLate = 0;
+            return -1;
+        }
+        const bool same = measuredFrames == frames && lateEye == late;
+        frames = measuredFrames;
+        late = lateEye;
+        if (confirmedLate) *confirmedLate = same ? lateEye : 0;
+        return same ? measuredFrames : -1;
+    }
+};
 
 // CIE76 delta-E of two display-referred sRGB colours (0..1).
 float DeltaE76(const float a[3], const float b[3]);
@@ -165,6 +188,7 @@ private:
     std::vector<Alert> alerts_;
     Budget budget_;
     double measureMs_ = 0.0;
+    SyncConfirm syncConfirm_;
     uint64_t generation_ = 0;  // bumped by Reset: a measurement started before it is dropped
     // open alert runs: near, far, vertical, colour
     struct Run {
