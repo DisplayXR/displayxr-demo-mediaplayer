@@ -28,6 +28,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <system_error>
