@@ -661,7 +661,10 @@ void App::RenderOneFrame() {
     }
 
     if (convertAtStart_ && rendered_ >= 30 && rendered_ % 60 == 30) {  // MEDIAPLAYER_CONVERT
-        if (SetConvert(true, "env") || rendered_ > 1200) convertAtStart_ = false;
+        // No XR_DXR_lift at all: nothing will ever come, and no toast either.
+        if (lift_.GetAvailability() == lift::Availability::Hidden || SetConvert(true, "env") ||
+            rendered_ > 1200)
+            convertAtStart_ = false;
     }
     PumpConvert(SteadySeconds());  // "Convert to 3D": poll + upload a landed result (no-op off)
     TickAutoConv();  // smoothed auto-convergence shift (#92); exactly 0 while never enabled
