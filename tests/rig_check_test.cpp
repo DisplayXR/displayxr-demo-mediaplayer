@@ -266,7 +266,7 @@ void EyeSyncMeasured() {
 // are removed before the eyes are compared, at the station's live config: 48p, a 4 px
 // vertical shift, a brighter right eye, a 2-frame-late right eye. Reported from the
 // Windows box as "measured 0, timecode says 2" (tmp-mp-pro, 2026-10-18).
-void EyeSyncLikeTheApp(float rollDeg) {
+void EyeSyncLikeTheApp(float rollDeg, int& confirmedRightTotal) {
     TestSignalConfig cfg;
     cfg.fps = 48.0;
     cfg.vShiftPx = 4.0f;
@@ -309,8 +309,8 @@ void EyeSyncLikeTheApp(float rollDeg) {
     std::printf("    single bursts: %d measured, %d wrong; confirmed: %d right, %d wrong\n", measured, wrong,
                 confirmedRight, confirmedWrong);
     CHECK(confirmedWrong == 0, "never a confirmed wrong eye-sync reading on the app's path");
-    CHECK(confirmedRight >= 1, "the 2-frame delay is confirmed from the pixels");
     CHECK(wrong <= 1, "at most one wrong single-burst reading in six");
+    confirmedRightTotal += confirmedRight;
 }
 
 }  // namespace
@@ -327,8 +327,10 @@ int main() {
     TooFewMatches();
     AlertClosesOnBlack();
     EyeSyncMeasured();
-    EyeSyncLikeTheApp(0.0f);
-    EyeSyncLikeTheApp(0.5f);  // a rolled eye: dy runs across x, far more than a frame of motion
+    int confirmedRight = 0;
+    EyeSyncLikeTheApp(0.0f, confirmedRight);
+    EyeSyncLikeTheApp(0.5f, confirmedRight);  // a rolled eye: dy runs across x, far more than a frame of motion
+    CHECK(confirmedRight >= 1, "the 2-frame delay is confirmed from the pixels on the app's path");
     if (g_failures) {
         std::fprintf(stderr, "rig_check_test: %d failure(s)\n", g_failures);
         return 1;

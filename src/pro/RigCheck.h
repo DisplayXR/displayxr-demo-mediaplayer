@@ -89,23 +89,26 @@ Result Measure(const EyePair& e, const Options& o = {});
 // dy runs across the picture, and the moving blocks are judged against that line.
 int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, float shiftSlope, int* lateEye);
 
-// A measured eye sync is shown only once two bursts in a row agree on it: one burst can
-// still pick a neighbour of the truth when a frame of motion is at the noise floor (48p,
-// analysis size), and a single wrong direction on the panel is worse than "not
-// measured" for a quarter second. Feed every burst's reading (-1 = not measured, which
-// keeps the pending one); the return is the confirmed reading or -1.
+// A measured eye sync is shown only once kAgree bursts in a row agree on it: one burst
+// can still pick a neighbour of the truth when a frame of motion is at the noise floor
+// (48p, analysis size), and a wrong figure on the panel is worse than "not measured"
+// for half a second. Feed every burst's reading (-1 = not measured, which keeps the
+// pending one); the return is the confirmed reading or -1.
 struct SyncConfirm {
-    int frames = -2, late = 0;
+    static constexpr int kAgree = 3;
+    int frames = -2, late = 0, run = 0;
     int Feed(int measuredFrames, int lateEye, int* confirmedLate) {
         if (measuredFrames < 0) {
             if (confirmedLate) *confirmedLate = 0;
             return -1;
         }
         const bool same = measuredFrames == frames && lateEye == late;
+        run = same ? run + 1 : 1;
         frames = measuredFrames;
         late = lateEye;
-        if (confirmedLate) *confirmedLate = same ? lateEye : 0;
-        return same ? measuredFrames : -1;
+        const bool ok = run >= kAgree;
+        if (confirmedLate) *confirmedLate = ok ? lateEye : 0;
+        return ok ? measuredFrames : -1;
     }
 };
 
