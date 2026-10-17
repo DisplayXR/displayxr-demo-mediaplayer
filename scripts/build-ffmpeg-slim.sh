@@ -39,6 +39,25 @@ echo "link=$(command -v link)"
 echo "nasm=$(command -v nasm || echo MISSING)"
 echo "make=$(command -v make || echo MISSING)"
 
+# zlib, static, built here for MSVC: FFmpeg's exr and png decoders depend on it and
+# configure DROPS them silently when it is missing (under --disable-autodetect zlib is
+# off unless enabled, and an enabled zlib with no library soft-disables). Linked into
+# avcodec: no new DLL in the installer. Pinned; the cache key hashes this script.
+ZLIB_TAG=v1.3.1
+ZLIB_SRC="$(cd "$SRC/.." && pwd)/zlib-src"
+ZLIB_PREFIX="$(cd "$SRC/.." && pwd)/zlib-msvc"
+if [ ! -f "$ZLIB_PREFIX/lib/z.lib" ]; then
+    rm -rf "$ZLIB_SRC" "$ZLIB_PREFIX"
+    git clone --depth 1 --branch "$ZLIB_TAG" https://github.com/madler/zlib.git "$ZLIB_SRC"
+    ( cd "$ZLIB_SRC" && nmake -f win32/Makefile.msc zlib.lib )   # -MD, like FFmpeg's msvc build
+    mkdir -p "$ZLIB_PREFIX/include" "$ZLIB_PREFIX/lib"
+    cp "$ZLIB_SRC/zlib.h" "$ZLIB_SRC/zconf.h" "$ZLIB_PREFIX/include/"
+    cp "$ZLIB_SRC/zlib.lib" "$ZLIB_PREFIX/lib/z.lib"   # configure probes -lz -> z.lib under msvc
+fi
+ZLIB_INC_W="$(cygpath -w "$ZLIB_PREFIX/include" 2>/dev/null || echo "$ZLIB_PREFIX/include")"
+ZLIB_LIB_W="$(cygpath -w "$ZLIB_PREFIX/lib" 2>/dev/null || echo "$ZLIB_PREFIX/lib")"
+echo "zlib=$ZLIB_PREFIX ($ZLIB_TAG)"
+
 cd "$SRC"
 
 # configure (at the pinned commit and on master, 2026-09-30) hands compile-only
@@ -61,8 +80,9 @@ fi
   --disable-avdevice --disable-avfilter \
   --enable-network --disable-autodetect --disable-debug \
   --enable-swscale --enable-swresample \
+  --enable-zlib --extra-cflags="-I$ZLIB_INC_W" --extra-ldflags="-LIBPATH:$ZLIB_LIB_W" \
   --enable-protocol=file,pipe,tcp,udp,rtp,http,https,tls,rtmp,rtmps,hls,crypto,data \
-  --enable-demuxer=mov,matroska,mpegts,avi,flv,live_flv,rtsp,rtp,sdp,hls,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v,mxf,dpx_pipe,exr_pipe \
+  --enable-demuxer=mov,matroska,mpegts,avi,flv,live_flv,rtsp,rtp,sdp,hls,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v,mxf,image_dpx_pipe,image_exr_pipe \
   --enable-decoder=h264,hevc,av1,vp9,vp8,mpeg4,mpeg2video,mpeg1video,mjpeg,png,bmp,tiff,webp,gif,prores,dnxhd,exr,dpx,aac,aac_latm,mp3,ac3,eac3,flac,opus,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8 \
   --enable-parser=h264,hevc,av1,vp9,vp8,mpeg4video,mpegvideo,aac,aac_latm,ac3,flac,opus,vorbis,mjpeg,png \
   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,av1_frame_split,vp9_superframe,vp9_superframe_split,aac_adtstoasc,extract_extradata,mpeg4_unpack_bframes,null \
@@ -72,9 +92,14 @@ fi
 
 # configure silently drops a feature whose dependency is missing (schannel is an
 # explicit enable under --disable-autodetect and soft-disables when its headers or
-# libs are absent): fail instead of shipping a player whose https:// is dead.
+# libs are absent; exr and png need zlib; a misspelt --enable-demuxer name matches
+# nothing and says nothing): fail instead of shipping a player whose https:// is dead
+# or whose EXR / DPX review formats (Media Player Pro) do not open.
 for want in CONFIG_NETWORK CONFIG_SCHANNEL CONFIG_TLS_PROTOCOL CONFIG_HTTPS_PROTOCOL \
-            CONFIG_RTSP_DEMUXER CONFIG_HLS_DEMUXER CONFIG_UDP_PROTOCOL CONFIG_RTMP_PROTOCOL; do
+            CONFIG_RTSP_DEMUXER CONFIG_HLS_DEMUXER CONFIG_UDP_PROTOCOL CONFIG_RTMP_PROTOCOL \
+            CONFIG_ZLIB CONFIG_EXR_DECODER CONFIG_PNG_DECODER CONFIG_DPX_DECODER \
+            CONFIG_PRORES_DECODER CONFIG_DNXHD_DECODER CONFIG_MXF_DEMUXER \
+            CONFIG_IMAGE_EXR_PIPE_DEMUXER CONFIG_IMAGE_DPX_PIPE_DEMUXER; do
     # (component switches live in config_components.h on FFmpeg >= 6)
     cat config.h config_components.h 2>/dev/null | grep -q "^#define $want 1" || { echo "ERROR: FFmpeg configure disabled $want" >&2; exit 1; }
 done

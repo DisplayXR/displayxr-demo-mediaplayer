@@ -208,10 +208,13 @@ void DrawEye(livepix::Nv12& dst, int x0, int w, int h, double t, float disparity
     for (int d = 0; d < TestSignalSource::kDiscs; ++d) {
         const Disc& b = base[d];
         const float sway = 0.04f * (float)std::sin(t * (0.6 + 0.25 * d) + d);
+        // ... and a smaller bob: sideways motion alone cannot show a late eye (it looks
+        // like depth), vertical motion can, so the eye-sync check has something to see.
+        const float bob = 0.05f * (float)std::sin(t * (0.9 + 0.3 * d) + 2 * d);
         const float disp = TestSignalSource::kDisparity[d] * disparityScale * (float)w;
         // Disparity = right x - left x: each eye takes half of it.
         const float cx = (b.cx + sway) * w + (rightEye ? 0.5f : -0.5f) * disp;
-        const float cy = b.cy * h + (rightEye ? vShift : 0.0f);
+        const float cy = (b.cy + bob) * h + (rightEye ? vShift : 0.0f);
         const float r = b.r * h;
         const int x1 = std::max(0, (int)(cx - r)), x2 = std::min(w - 1, (int)(cx + r));
         const int y1 = std::max(0, (int)(cy - r)), y2 = std::min(h - 1, (int)(cy + r));
