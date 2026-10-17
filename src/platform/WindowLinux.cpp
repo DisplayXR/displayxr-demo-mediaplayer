@@ -229,6 +229,12 @@ void Window::HandleLinuxKey(uint32_t ks, uint32_t mods, bool repeat, bool* quit)
     if (ks == XK_minus) { --convergenceSteps_; return; }
     if (ks == XK_bracketright) { ++frameStepRequest_; return; }
     if (ks == XK_bracketleft) { --frameStepRequest_; return; }
+    if (ks == XK_Right || ks == XK_Left) {   // editor arrows: a frame (Shift: a jump)
+        const int dir = (ks == XK_Right) ? 1 : -1;
+        frameStepRequest_ += dir * (shift ? kFrameJump : 1);
+        if (!repeat) arrowPress_ = dir;      // on a still: previous / next asset
+        return;
+    }
     if (repeat) return;
     switch (ks) {
         case XK_Escape: *quit = true; break;
@@ -238,8 +244,8 @@ void Window::HandleLinuxKey(uint32_t ks, uint32_t mods, bool repeat, bool* quit)
         case XK_BackSpace: autoConvergeRequested_ = true; break;
         case XK_x: swapEyesRequested_ = true; break;
         case XK_space: togglePauseRequested_ = true; break;
-        case XK_Left: prevMediaRequested_ = true; break;
-        case XK_Right: nextMediaRequested_ = true; break;
+        case XK_Up: prevMediaRequested_ = true; break;
+        case XK_Down: nextMediaRequested_ = true; break;
         case XK_s: toggleSlideshowRequested_ = true; break;
         case XK_m: toggleMuteRequested_ = true; break;
         case XK_l:                                                // stereo layout override

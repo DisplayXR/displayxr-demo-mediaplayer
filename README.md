@@ -75,15 +75,19 @@ scripts/run_mediaplayer_handle_vk_macos.sh assets/test_LR_2x1.png
 ```
 
 Keys: **V** cycles display modes, **SHIFT+TAB** toggles the HUD, **L** cycles the stereo
-layout override (auto / mono / SBS-full / SBS-half), **Esc** quits. With no file argument it
-falls back to a RED|BLUE left/right test pattern. See `PRD.md` §11 for the milestone map.
+layout override (auto / mono / SBS-full / SBS-half), **Esc** quits. Transport follows the
+editor convention (Resolve, Premiere, Avid, RV): **Space** play/pause, **Left** / **Right**
+one frame back/forward (**Shift** for a 5-frame jump; `[` / `]` do the same), **Up** /
+**Down** previous/next asset in the folder. On a still, where there is no frame to step,
+Left / Right walk the folder too. With no file argument it falls back to a RED|BLUE
+left/right test pattern. See `PRD.md` §11 for the milestone map.
 
 On Linux (X11 or native Wayland) the window is the same one the other DisplayXR demos use.
 Move it by its title bar, or **right-drag anywhere in the picture**. Either drag keeps the
 3D interlace in phase. **F** / **F11** toggle fullscreen on the 3D panel.
 
 You can also **drag files or a folder onto the window**. Dropping several files at once
-loads the first and makes the dropped set the list the arrow keys and the slideshow walk.
+loads the first and makes the dropped set the list Up / Down and the slideshow walk.
 Dropping a **folder** opens its first asset and starts the slideshow, with the folder as
 that list — the same thing as passing the folder on the command line, plus playback.
 

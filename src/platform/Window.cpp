@@ -187,6 +187,13 @@ bool Window::PumpEvents() {
             else if (e.key.key == SDLK_MINUS) --convergenceSteps_;
             else if (e.key.key == SDLK_RIGHTBRACKET) ++frameStepRequest_;  // ']' next frame
             else if (e.key.key == SDLK_LEFTBRACKET) --frameStepRequest_;   // '[' prev frame
+            else if (e.key.key == SDLK_RIGHT || e.key.key == SDLK_LEFT) {
+                // Editor arrows: a frame (Shift: a jump) on video; on a still the one-shot
+                // press walks the folder instead (the app decides, it knows the content).
+                const int dir = (e.key.key == SDLK_RIGHT) ? 1 : -1;
+                frameStepRequest_ += dir * ((e.key.mod & SDL_KMOD_SHIFT) ? kFrameJump : 1);
+                if (!e.key.repeat) arrowPress_ = dir;
+            }
             else if (!e.key.repeat) {
                 if (e.key.key == SDLK_ESCAPE) {
                     if (escapeQuits_) return false;
@@ -198,8 +205,8 @@ bool Window::PumpEvents() {
                 if (e.key.key == SDLK_BACKSPACE) autoConvergeRequested_ = true;
                 if (e.key.key == SDLK_X) swapEyesRequested_ = true;
                 if (e.key.key == SDLK_SPACE) togglePauseRequested_ = true;
-                if (e.key.key == SDLK_LEFT) prevMediaRequested_ = true;
-                if (e.key.key == SDLK_RIGHT) nextMediaRequested_ = true;
+                if (e.key.key == SDLK_UP) prevMediaRequested_ = true;
+                if (e.key.key == SDLK_DOWN) nextMediaRequested_ = true;
                 if (e.key.key == SDLK_S) toggleSlideshowRequested_ = true;
                 if (e.key.key == SDLK_M) toggleMuteRequested_ = true;
                 if (e.key.key == SDLK_L) {
@@ -262,6 +269,12 @@ bool Window::TakeAutoConvergeRequest() {
 int Window::TakeFrameStep() {
     int v = frameStepRequest_;
     frameStepRequest_ = 0;
+    return v;
+}
+
+int Window::TakeArrowPress() {
+    int v = arrowPress_;
+    arrowPress_ = 0;
     return v;
 }
 
