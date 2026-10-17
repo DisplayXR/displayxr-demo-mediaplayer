@@ -88,6 +88,7 @@ public:
 
 private:
     void LogNewAlerts();
+    void FlushOpenAlerts();  // at shutdown: episodes still open go to the log as open
     // The newest pixel-measured eye sync of the last 2 s (-1 none); lateEye +1 right, -1 left.
     int MeasuredEyeSync(int* lateEye) const;
     void SaveNote(size_t i);
