@@ -218,6 +218,10 @@ void MatchBlocks(const std::vector<float>& left, const std::vector<float>& right
                     }
                 }
             if (best < o.minNcc) continue;
+            // a peak on the edge of the search window is not a peak: the real match may
+            // be outside, and such blocks read as the search limit itself (a +8 % "far"
+            // alert from a 1.5 % scene, tmp-mp-pro 2026-10-18)
+            if (bdx <= dxLo || bdx >= dxHi || bdy <= dyLo || bdy >= dyHi) continue;
             // uniqueness: no rival as good >= 4 px away along the row (periodic texture)
             float rival = -2.f;
             for (int dx = dxLo; dx <= dxHi; dx += 2)
@@ -315,6 +319,7 @@ Result Measure(const EyePair& e, const Options& o) {
     const double slopeA = sxx > 0 ? sxy / sxx : 0.0;  // analysis rows per analysis column
     const double slope = slopeA * (scaleY / (e.fullEyeW * e.xStretch / (float)W));
     r.rollDeg = (float)(std::atan(slope) * 180.0 / 3.14159265358979);
+    r.dySlope = (float)slopeA;
     // vertical error: the offset at the picture centre with the roll taken out. A plain
     // median of dy reads the offset where the matches happen to sit, so a rolled eye
     // with its features off-centre inflated it (0.5 deg read as 5-6 px instead of 4).
@@ -359,6 +364,25 @@ float Mad(const std::vector<float>& a, const std::vector<float>& b, int W, int H
     return (float)(d / n);
 }
 
+// img resampled so that out(x, y) = img(x, y + a + b * (x - W/2)) (bilinear, clamped):
+// takes the rig's vertical offset line out of an eye, so a true match sits at dy = 0,
+// an integer, where the sub-pixel peak is unbiased. (At a fractional offset the parabola
+// peak locks toward the nearer integer by up to ~0.3 px, block by block, which is the
+// size of a frame of motion at 48p and analysis size.)
+std::vector<float> WarpY(const std::vector<float>& img, int W, int H, double a, double b) {
+    std::vector<float> out((size_t)W * H);
+    for (int x = 0; x < W; ++x) {
+        const double off = a + b * (x - 0.5 * W);
+        for (int y = 0; y < H; ++y) {
+            const double sy = std::clamp((double)y + off, 0.0, (double)H - 1.0001);
+            const int y0 = (int)sy;
+            const float f = (float)(sy - y0);
+            out[(size_t)y * W + x] = img[(size_t)y0 * W + x] * (1.f - f) + img[(size_t)(y0 + 1) * W + x] * f;
+        }
+    }
+    return out;
+}
+
 // Where the left eye moved between two consecutive frames, grown by `grow` px so the
 // same content in the right eye (at its parallax, a frame or two late) is inside too.
 std::vector<uint8_t> MotionMask(const std::vector<float>& now, const std::vector<float>& before, int W, int H,
@@ -377,7 +401,7 @@ std::vector<uint8_t> MotionMask(const std::vector<float>& now, const std::vector
 
 }  // namespace
 
-int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, int* lateEye) {
+int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, float shiftSlope, int* lateEye) {
     (void)shiftX;
     if (lateEye) *lateEye = 0;
     const int n = (int)seq.size();
@@ -406,31 +430,114 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
     Options o;
     o.block = 24;  // the sub-pixel vertical peak is what is scored: bigger blocks pin it better
     o.step = 12;
+    const bool dbg = std::getenv("MEDIAPLAYER_RIG_DEBUG") != nullptr;
     auto median = [](std::vector<float> v) {
         std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
         return v[v.size() / 2];
     };
-    float rigDy = shiftY;
+    // The rig's vertical offset as a LINE over x (a rolled eye's dy runs across the
+    // picture: 0.5 deg is +-8 px full width, far more than a frame of motion), from the
+    // spatial pass over the whole pair - not re-fitted on the static blocks here, which
+    // can be few and untextured (a plain background) and then tilt the line at random.
+    // Fitted here on the static blocks after an outlier cut (a flat or periodic
+    // background matches at random dy; median +- k x MAD drops those), falling back to
+    // the spatial pass's line (shiftY, shiftSlope) when too few static blocks survive.
+    // The spatial pass alone is not good enough: its line includes the moving blocks,
+    // whose dy is seen through the very delay being measured, and the bias that leaves
+    // (up to a frame of motion, and a spurious 0.2 deg of slope) is the size of the
+    // signal the candidates are told apart by.
+    double rigA = shiftY, rigB = shiftSlope;  // dy(x) = rigA + rigB * (x - W/2)
     {
         std::vector<float> dxs, dys, xs;
         MatchBlocks(cur.left, cur.right, W, H, o, &mask, false, dxs, dys, xs, nullptr);
-        if (dys.size() >= 6) rigDy = median(dys);
+        if (dys.size() >= 8) {
+            // de-roll with the spatial pass's slope for the cut only (a rolled eye's dy
+            // spread is real), then fit on the survivors in raw dy
+            std::vector<float> d(dys.size()), ad(dys.size());
+            for (size_t i = 0; i < dys.size(); ++i) d[i] = dys[i] - (float)(shiftSlope * (xs[i] - 0.5 * W));
+            const float md = median(d);
+            for (size_t i = 0; i < d.size(); ++i) ad[i] = std::fabs(d[i] - md);
+            const float cut = std::max(4.f * 1.4826f * median(ad), 1.0f);
+            double mx = 0, my = 0;
+            int m = 0;
+            for (size_t i = 0; i < d.size(); ++i) {
+                if (ad[i] > cut) continue;
+                mx += xs[i];
+                my += dys[i];
+                ++m;
+            }
+            if (m >= 8) {
+                mx /= m;
+                my /= m;
+                double sxy = 0, sxx = 0;
+                for (size_t i = 0; i < d.size(); ++i) {
+                    if (ad[i] > cut) continue;
+                    sxy += (xs[i] - mx) * (dys[i] - my);
+                    sxx += (xs[i] - mx) * (xs[i] - mx);
+                }
+                rigB = sxx > 0 ? sxy / sxx : 0.0;
+                rigA = my + rigB * (0.5 * W - mx);
+            }
+            if (dbg) std::fprintf(stderr, "    eyesync rig line from %d/%zu static blocks\n", m, dys.size());
+        }
     }
+    // The rig's line is taken OUT of the search eyes by a vertical warp, so a true match
+    // sits at dy = 0 for every block and family alike; the line itself is then refined
+    // once on the warped static blocks (near 0, unbiased) before the candidates run.
+    // right(x, y) ~ left(x, y - rig(x)): the left eye warped by -rig lines up with the
+    // right eye, the right eye warped by +rig with the left.
+    auto refine = [&]() {
+        std::vector<float> dxs, dys, xs;
+        const std::vector<float> rw = WarpY(cur.right, W, H, rigA, rigB);
+        MatchBlocks(cur.left, rw, W, H, o, &mask, false, dxs, dys, xs, nullptr);
+        if (dys.size() < 8) return;
+        std::vector<float> ad(dys.size());
+        const float md = median(dys);
+        for (size_t i = 0; i < dys.size(); ++i) ad[i] = std::fabs(dys[i] - md);
+        const float cut = std::max(4.f * 1.4826f * median(ad), 0.5f);
+        double mx = 0, my = 0;
+        int m = 0;
+        for (size_t i = 0; i < dys.size(); ++i) {
+            if (ad[i] > cut) continue;
+            mx += xs[i];
+            my += dys[i];
+            ++m;
+        }
+        if (m < 8) return;
+        mx /= m;
+        my /= m;
+        double sxy = 0, sxx = 0;
+        for (size_t i = 0; i < dys.size(); ++i) {
+            if (ad[i] > cut) continue;
+            sxy += (xs[i] - mx) * (dys[i] - my);
+            sxx += (xs[i] - mx) * (xs[i] - mx);
+        }
+        const double db = sxx > 0 ? sxy / sxx : 0.0;
+        const double da = my + db * (0.5 * W - mx);
+        rigA += da;
+        rigB += db;
+    };
+    refine();
+    if (dbg) std::fprintf(stderr, "    eyesync rig line: dy = %.3f %+.5f/px * (x - W/2)\n", rigA, rigB);
     struct Cand {
         float score;
         int frames, late;
     };
     std::vector<Cand> c;
-    const bool dbg = std::getenv("MEDIAPLAYER_RIG_DEBUG") != nullptr;
     // One family: template eye `tpl` (of the current frame), searched in the other eye of
-    // the frame k back, k = 0..n-1. sign = +1 when the search eye is the right eye (dy as
-    // matched is right minus left), -1 when it is the left eye.
-    auto family = [&](const std::vector<float>& tpl, auto searchEye, int late, float sign) {
-        std::vector<std::vector<float>> dy(n);
+    // the frame k back (warped onto the template eye's geometry), k = 0..n-1.
+    // Each family's moving blocks come from ITS template eye's own motion: a late eye's
+    // moving region sits a few px from the other eye's, and a block that is static in
+    // the template matches every candidate alike and drags the in-step score down.
+    auto family = [&](const std::vector<float>& tpl, const std::vector<float>& tplBefore, auto searchEye, int late,
+                      double wa, double wb) {
+        const std::vector<uint8_t> tmask = MotionMask(tpl, tplBefore, W, H, 6.f, 3);
+        std::vector<std::vector<float>> dy(n), x(n);
         std::vector<std::vector<int>> id(n);
         for (int k = 0; k < n; ++k) {
-            std::vector<float> dxs, xs;
-            MatchBlocks(tpl, searchEye(seq[n - 1 - k]), W, H, o, &mask, true, dxs, dy[k], xs, nullptr, &id[k]);
+            std::vector<float> dxs;
+            const std::vector<float> warped = WarpY(searchEye(seq[n - 1 - k]), W, H, wa, wb);
+            MatchBlocks(tpl, warped, W, H, o, &tmask, true, dxs, dy[k], x[k], nullptr, &id[k]);
         }
         // the blocks every candidate matched
         std::vector<int> common = id[0];
@@ -446,13 +553,16 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
         for (int k = 0; k < n; ++k) {
             std::vector<float> v;
             for (size_t i = 0; i < id[k].size(); ++i)
-                if (std::binary_search(common.begin(), common.end(), id[k][i])) v.push_back(std::fabs(sign * dy[k][i] - rigDy));
+                if (std::binary_search(common.begin(), common.end(), id[k][i])) v.push_back(std::fabs(dy[k][i]));
             c.push_back({median(v), k, k == 0 ? 0 : late});
-            if (dbg) std::fprintf(stderr, "      k=%d: score %.3f (rig dy %.2f)\n", k, c.back().score, rigDy);
+            if (dbg) std::fprintf(stderr, "      k=%d: score %.3f\n", k, c.back().score);
         }
     };
-    family(cur.right, [](const EyePair& e) -> const std::vector<float>& { return e.left; }, +1, -1.f);
-    family(cur.left, [](const EyePair& e) -> const std::vector<float>& { return e.right; }, -1, +1.f);
+    // the right eye late: its content is k frames old, so it lines up with the LEFT eye
+    // k frames back (warped by -rig onto the right eye's geometry)
+    family(cur.right, seq[n - 2].right, [](const EyePair& e) -> const std::vector<float>& { return e.left; }, +1, -rigA, -rigB);
+    // the left eye late: lines up with the RIGHT eye k frames back (warped by +rig)
+    family(cur.left, seq[n - 2].left, [](const EyePair& e) -> const std::vector<float>& { return e.right; }, -1, rigA, rigB);
     if (c.size() < 2) return -1;
     std::sort(c.begin(), c.end(), [](const Cand& x, const Cand& y) { return x.score < y.score; });
     // A clear winner only: the runner-up must be clearly worse, by more than the
@@ -533,7 +643,8 @@ void RigMonitor::Worker() {
             const EyePair& e = seq.back();
             const float shiftX = p[p.size() / 2] / 100.f * (float)e.eyeW;
             const float shiftY = e.fullH > 0 ? r.verticalPx * (float)e.h / e.fullH : 0.f;
-            r.eyeSyncMeasuredFrames = MeasureEyeSync(seq, shiftX, shiftY, &r.eyeSyncLateEye);
+            const int m = MeasureEyeSync(seq, shiftX, shiftY, r.dySlope, &r.eyeSyncLateEye);
+            r.eyeSyncMeasuredFrames = syncConfirm_.Feed(m, r.eyeSyncLateEye, &r.eyeSyncLateEye);
             // A late eye measured: the rig's geometry is what the eyes show at the SAME
             // instant, so re-measure on the time-aligned pair (the late eye now, the other
             // eye that many frames back). Otherwise moving content read through the delay
@@ -545,7 +656,9 @@ void RigMonitor::Worker() {
                 if (r.eyeSyncLateEye > 0) aligned.left = back.left;
                 else aligned.right = back.right;
                 Result a = Measure(aligned);
-                if (a.ok) {
+                // a true alignment matches at least as well as the raw pair; a worse one
+                // means the delay reading was wrong, and its geometry would be garbage
+                if (a.ok && a.matches >= (r.matches * 7) / 10) {
                     a.eyeSyncMeasuredFrames = r.eyeSyncMeasuredFrames;
                     a.eyeSyncLateEye = r.eyeSyncLateEye;
                     r = std::move(a);
@@ -668,6 +781,7 @@ Budget RigMonitor::GetBudget() const {
 }
 
 void RigMonitor::Reset() {
+    syncConfirm_ = SyncConfirm{};
     std::lock_guard<std::mutex> lk(m_);
     ++generation_;
     history_.clear();

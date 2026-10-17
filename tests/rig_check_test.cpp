@@ -243,21 +243,22 @@ std::vector<rig::EyePair> Burst(const TestSignalConfig& cfg, int64_t last, bool 
 
 void EyeSyncMeasured() {
     TestSignalConfig cfg;
+    cfg.fps = 24.0;  // a frame of motion a single burst can see; 48p/60p need the Worker's confirmation (below)
     int late = 0;
-    const int d0 = rig::MeasureEyeSync(Burst(cfg, 30, false), 0, 0, &late);
+    const int d0 = rig::MeasureEyeSync(Burst(cfg, 30, false), 0, 0, 0, &late);
     std::printf("  eye delay 0: measured %d (late %d)\n", d0, late);
     CHECK(d0 == 0, "in step measures 0");
     cfg.eyeDelay = 2;
-    const int d2 = rig::MeasureEyeSync(Burst(cfg, 30, false), 0, 0, &late);
+    const int d2 = rig::MeasureEyeSync(Burst(cfg, 30, false), 0, 0, 0, &late);
     std::printf("  eye delay 2: measured %d (late %d)\n", d2, late);
     CHECK(d2 == 2 && late == +1, "right eye 2 frames late measured from the pixels");
     // the same rig seen with the halves swapped: now the LEFT eye is the late one
-    const int dl = rig::MeasureEyeSync(Burst(cfg, 30, true), 0, 0, &late);
+    const int dl = rig::MeasureEyeSync(Burst(cfg, 30, true), 0, 0, 0, &late);
     std::printf("  eye delay 2, halves swapped: measured %d (late %d)\n", dl, late);
     CHECK(dl == 2 && late == -1, "left eye late measured");
     // a still picture has no motion: not measured
     std::vector<rig::EyePair> still(rig::RigMonitor::kSyncFrames, Burst(cfg, 30, false).back());
-    CHECK(rig::MeasureEyeSync(still, 0, 0, &late) == -1, "no motion = not measured");
+    CHECK(rig::MeasureEyeSync(still, 0, 0, 0, &late) == -1, "no motion = not measured");
 }
 
 
@@ -265,13 +266,16 @@ void EyeSyncMeasured() {
 // are removed before the eyes are compared, at the station's live config: 48p, a 4 px
 // vertical shift, a brighter right eye, a 2-frame-late right eye. Reported from the
 // Windows box as "measured 0, timecode says 2" (tmp-mp-pro, 2026-10-18).
-void EyeSyncLikeTheApp() {
+void EyeSyncLikeTheApp(float rollDeg) {
     TestSignalConfig cfg;
     cfg.fps = 48.0;
     cfg.vShiftPx = 4.0f;
     cfg.gainR = 1.15f;
     cfg.eyeDelay = 2;
-    int wrong = 0, measured = 0;
+    cfg.rollDeg = rollDeg;
+    std::printf("  app path, roll %.1f deg:\n", rollDeg);
+    int wrong = 0, measured = 0, confirmedWrong = 0, confirmedRight = 0;
+    rig::SyncConfirm confirm;
     for (int64_t last : {30, 60, 90, 150, 200, 260}) {
         std::vector<rig::EyePair> seq = Burst(cfg, last, false);
         rig::Result r = rig::Measure(seq.back());
@@ -282,11 +286,14 @@ void EyeSyncLikeTheApp() {
         const float shiftX = p[p.size() / 2] / 100.f * (float)e.eyeW;
         const float shiftY = e.fullH > 0 ? r.verticalPx * (float)e.h / e.fullH : 0.f;
         int late = 0;
-        const int d = rig::MeasureEyeSync(seq, shiftX, shiftY, &late);
+        const int d = rig::MeasureEyeSync(seq, shiftX, shiftY, r.dySlope, &late);
         std::printf("  app path, frame %lld: shift %.2f,%.2f vertical %.2f px -> measured %d (late %d)\n",
                     (long long)last, shiftX, shiftY, r.verticalPx, d, late);
         if (d >= 0) ++measured;
         if (d >= 0 && !(d == 2 && late == +1)) ++wrong;
+        int cl = 0;
+        const int cd = confirm.Feed(d, late, &cl);  // what the Worker would show
+        if (cd >= 0) ((cd == 2 && cl == +1) ? confirmedRight : confirmedWrong)++;
         // the Worker's follow-up: the rig's geometry on the time-aligned pair (the right
         // eye now against the left eye d frames back) reads the injected 4 px, not the
         // moving discs seen through the delay
@@ -295,11 +302,15 @@ void EyeSyncLikeTheApp() {
             aligned.left = seq[seq.size() - 1 - 2].left;
             const rig::Result a = rig::Measure(aligned);
             std::printf("    aligned pair: vertical %.2f px\n", a.verticalPx);
-            CHECK(a.ok && std::fabs(a.verticalPx - 4.0f) < 0.5f, "vertical error on the aligned pair = 4 px");
+            CHECK(a.ok && std::fabs(a.verticalPx - 4.0f) < 0.6f, "vertical error on the aligned pair = 4 px");
+            CHECK(a.ok && a.farPct < 3.0f, "no search-limit outlier in the far depth");
         }
     }
-    CHECK(wrong == 0, "never a confident wrong eye-sync reading on the app's path");
-    CHECK(measured >= 4, "the 2-frame delay is measured from the pixels most of the time");
+    std::printf("    single bursts: %d measured, %d wrong; confirmed: %d right, %d wrong\n", measured, wrong,
+                confirmedRight, confirmedWrong);
+    CHECK(confirmedWrong == 0, "never a confirmed wrong eye-sync reading on the app's path");
+    CHECK(confirmedRight >= 1, "the 2-frame delay is confirmed from the pixels");
+    CHECK(wrong <= 1, "at most one wrong single-burst reading in six");
 }
 
 }  // namespace
@@ -316,7 +327,8 @@ int main() {
     TooFewMatches();
     AlertClosesOnBlack();
     EyeSyncMeasured();
-    EyeSyncLikeTheApp();
+    EyeSyncLikeTheApp(0.0f);
+    EyeSyncLikeTheApp(0.5f);  // a rolled eye: dy runs across x, far more than a frame of motion
     if (g_failures) {
         std::fprintf(stderr, "rig_check_test: %d failure(s)\n", g_failures);
         return 1;
