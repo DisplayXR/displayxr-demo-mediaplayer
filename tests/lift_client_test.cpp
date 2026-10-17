@@ -52,6 +52,10 @@ struct Fake {
     uint32_t readyW = 0, readyH = 0;
     std::vector<uint8_t> bytes;
     XrLiftPixelFormatDXR fmt = XR_LIFT_PIXEL_FORMAT_RGBA8_SRGB_DXR;
+    // Spec 5.
+    std::vector<XrLiftTaskCandidateDXR> candidates;
+    int candidateCalls = 0;
+    std::string lastPreference;  // providerId of the hint chained on the last create ("" = none)
     XrLiftImageKindDXR kind = XR_LIFT_IMAGE_KIND_CPU_DXR;
 
     void Finish(uint64_t id, uint32_t w, uint32_t h, uint8_t fill = 0x40) {
@@ -105,10 +109,17 @@ XRAPI_ATTR XrResult XRAPI_CALL FakeCreate(XrSession s, const XrLiftStreamCreateI
     if (s != kSession) return XR_ERROR_HANDLE_INVALID;
     g.lastCreate = *ci;
     g.lastTaskChained = false;
+    g.lastPreference.clear();
     for (auto* n = static_cast<const XrBaseInStructure*>(ci->next); n; n = n->next) {
         if (n->type == XR_TYPE_LIFT_TASK_STREAM_CREATE_INFO_DXR) {
             g.lastTask = *reinterpret_cast<const XrLiftTaskStreamCreateInfoDXR*>(n);
             g.lastTaskChained = true;
+            // The hint chains on the TASK create info (spec 5), not on the base struct.
+            for (auto* m = static_cast<const XrBaseInStructure*>(g.lastTask.next); m; m = m->next)
+                if (m->type == XR_TYPE_LIFT_PROVIDER_PREFERENCE_DXR) {
+                    const auto* p = reinterpret_cast<const XrLiftProviderPreferenceDXR*>(m);
+                    g.lastPreference = p->providerId ? p->providerId : "";
+                }
         }
     }
     if (XR_FAILED(g.createResult)) return g.createResult;
@@ -161,6 +172,34 @@ XRAPI_ATTR XrResult XRAPI_CALL FakeAcquire(XrLiftStreamDXR, XrLiftResultDXR* r) 
     }
     g.readyId = 0;
     return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL FakeCandidates(XrSession s, XrLiftTaskDXR task, uint32_t cap,
+                                              uint32_t* count, XrLiftTaskCandidateDXR* out) {
+    ++g.candidateCalls;
+    if (s != kSession || task != XR_LIFT_TASK_VIEWS_MONO_DXR) return XR_ERROR_VALIDATION_FAILURE;
+    *count = (uint32_t)g.candidates.size();
+    if (cap == 0) return XR_SUCCESS;
+    if (cap < g.candidates.size()) return XR_ERROR_SIZE_INSUFFICIENT;
+    for (size_t i = 0; i < g.candidates.size(); ++i) {
+        if (out[i].type != XR_TYPE_LIFT_TASK_CANDIDATE_DXR) return XR_ERROR_VALIDATION_FAILURE;
+        out[i] = g.candidates[i];
+    }
+    return XR_SUCCESS;
+}
+
+XrLiftTaskCandidateDXR MakeCandidate(
+    const char* id, const char* name, XrLiftTaskStateDXR state, bool isDefault, bool isSelected,
+    XrLiftProviderHostingDXR hosting = XR_LIFT_PROVIDER_HOSTING_LOCAL_IN_SERVICE_DXR) {
+    XrLiftTaskCandidateDXR c{};
+    c.type = XR_TYPE_LIFT_TASK_CANDIDATE_DXR;
+    std::snprintf(c.providerId, sizeof(c.providerId), "%s", id);
+    std::snprintf(c.displayName, sizeof(c.displayName), "%s", name);
+    c.state = state;
+    c.hosting = hosting;
+    c.isUserDefault = isDefault ? XR_TRUE : XR_FALSE;
+    c.isSelected = isSelected ? XR_TRUE : XR_FALSE;
+    return c;
 }
 
 Api FakeApi() {
@@ -496,6 +535,76 @@ void TestIdlePoll() {
     CHECK(g.enumCalls == calls3, "settled READY -> no more polling");
 }
 
+void TestCandidates() {
+    // Spec-4 runtime: the entry point is absent -> no candidates, no selector, no hint.
+    ResetFake({MakeTask(XR_LIFT_TASK_STATE_READY_DXR)});
+    {
+        LiftClient c;
+        c.Attach(FakeApi(), kSession);
+        CHECK(!c.HasCandidates() && c.EffectiveCandidate() == -1, "spec 4: no candidates");
+        CHECK(!c.SetPreferred("anything").empty(), "spec 4: a pick is refused");
+        c.Start(true);
+        CHECK(g.lastPreference.empty(), "spec 4: no hint chained");
+    }
+    // Spec 5: listed in order, the user's default pre-selected.
+    ResetFake({MakeTask(XR_LIFT_TASK_STATE_READY_DXR)});
+    g.candidates = {
+        MakeCandidate("prov.a", "Provider A", XR_LIFT_TASK_STATE_READY_DXR, false, false),
+        MakeCandidate("prov.b", "Provider B", XR_LIFT_TASK_STATE_WARMING_DXR, true, true),
+        MakeCandidate("prov.c", "Provider C", XR_LIFT_TASK_STATE_FAILED_DXR, false, false,
+                      XR_LIFT_PROVIDER_HOSTING_REMOTE_DXR)};
+    Api api = FakeApi();
+    api.enumerateCandidates = FakeCandidates;
+    LiftClient c;
+    c.Attach(api, kSession);
+    CHECK(c.Candidates().size() == 3, "three candidates listed");
+    CHECK(c.Candidates()[0].id == "prov.a" && c.Candidates()[1].name == "Provider B",
+          "order + verbatim strings");
+    CHECK(c.Candidates()[2].hosting == XR_LIFT_PROVIDER_HOSTING_REMOTE_DXR &&
+              c.Candidates()[2].Terminal(),
+          "hosting + terminal state carried");
+    CHECK(c.EffectiveCandidate() == 1, "the user's default is pre-selected");
+    CHECK(c.Preferred().empty(), "no pick -> no hint");
+    CHECK(c.Start(true) && g.lastPreference.empty() && g.creates == 1,
+          "default create carries no hint");
+
+    // Picking another candidate re-creates the live stream with the hint.
+    CHECK(c.SetPreferred("prov.a").empty(), "pick a ready candidate");
+    CHECK(g.destroys == 1 && g.creates == 2, "a change re-creates the stream");
+    CHECK(g.lastPreference == "prov.a", "the hint rides on the create");
+    CHECK(c.EffectiveCandidate() == 0, "the pick is shown as current");
+    CHECK(c.SetPreferred("prov.a").empty() && g.creates == 2, "same pick: no re-create");
+    // Refused picks change nothing.
+    CHECK(!c.SetPreferred("prov.c").empty() && c.Preferred() == "prov.a",
+          "terminal candidate refused");
+    CHECK(!c.SetPreferred("nope").empty() && c.Preferred() == "prov.a", "unknown id refused");
+    // Back to the default (by picking it, or by "") clears the hint.
+    CHECK(c.SetPreferred("prov.b").empty() && c.Preferred().empty() && g.lastPreference.empty(),
+          "picking the user's default clears the hint");
+    // A pick while off is remembered for the next Start.
+    c.Stop();
+    c.SetPreferred("prov.a");
+    CHECK(g.creates == 3, "a pick while off creates nothing");
+    c.Start(false);
+    CHECK(g.lastPreference == "prov.a", "the next create carries the pick");
+
+    // The providers-changed event (spec 5: also on a candidate state change) re-enumerates.
+    g.candidates[2].state = XR_LIFT_TASK_STATE_READY_DXR;
+    const int calls = g.candidateCalls;
+    XrEventDataLiftProvidersChangedDXR pe{};
+    pe.type = XR_TYPE_EVENT_DATA_LIFT_PROVIDERS_CHANGED_DXR;
+    pe.session = kSession;
+    c.OnEvent(Hdr(&pe));
+    CHECK(g.candidateCalls > calls && !c.Candidates()[2].Terminal(),
+          "event refreshes the candidates");
+    // A picked provider that disappears drops the pick (no silent no-op hint).
+    g.candidates.erase(g.candidates.begin());
+    c.OnEvent(Hdr(&pe));
+    CHECK(c.Preferred().empty() && c.EffectiveCandidate() == 0, "vanished pick -> default again");
+    c.Detach();
+    CHECK(!c.HasCandidates(), "detach forgets the candidates");
+}
+
 void TestReset() {
     ResetFake({MakeTask(XR_LIFT_TASK_STATE_READY_DXR)});
     LiftClient c;
@@ -589,6 +698,7 @@ int main() {
     TestLimitReachedNotLatched();
     TestTerminalWhileOnAndRecovery();
     TestIdlePoll();
+    TestCandidates();
     TestReset();
     TestFrameHelpers();
     if (g_failures) {

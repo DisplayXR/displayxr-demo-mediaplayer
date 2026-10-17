@@ -305,7 +305,10 @@ v2.45–v2.47 that means a Windows IPC session (the player under the shell, or
 `XRT_FORCE_MODE=ipc`); an in-process Vulkan session — the player's default — sees the
 task with no transport and shows the toggle disabled until the runtime adds it. Older
 runtimes simply hide the toggle. Test hook: `MEDIAPLAYER_CONVERT=1` switches it on
-headlessly.
+headlessly. On a runtime with `XR_DXR_lift` **spec 5** (provider candidates, runtime #2178) a
+small selector beside the toggle lists the runtime's converters by their own names and
+state; a pick applies to this session only and is never saved (the default stays in
+DisplayXR's settings / `displayxr-cli conv use`).
 
 ## License
 
