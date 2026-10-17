@@ -57,8 +57,11 @@ if [ ! -f "$ZLIB_PREFIX/lib/z.lib" ]; then
     cp "$ZLIB_SRC/zlib.lib" "$ZLIB_PREFIX/lib/zlib.lib"
     cp "$ZLIB_SRC/zlib.lib" "$ZLIB_PREFIX/lib/z.lib"
 fi
-ZLIB_INC_W="$(cygpath -w "$ZLIB_PREFIX/include" 2>/dev/null || echo "$ZLIB_PREFIX/include")"
-ZLIB_LIB_W="$(cygpath -w "$ZLIB_PREFIX/lib" 2>/dev/null || echo "$ZLIB_PREFIX/lib")"
+# Mixed form (D:/a/...): a backslash path survives configure's probes but not
+# config.mak -> make -> sh, where "\a\_temp" is an escape sequence (CI: http.c could
+# not find zlib.h after configure had found it). cl and link take forward slashes.
+ZLIB_INC_W="$(cygpath -m "$ZLIB_PREFIX/include" 2>/dev/null || echo "$ZLIB_PREFIX/include")"
+ZLIB_LIB_W="$(cygpath -m "$ZLIB_PREFIX/lib" 2>/dev/null || echo "$ZLIB_PREFIX/lib")"
 echo "zlib=$ZLIB_PREFIX ($ZLIB_TAG)"
 
 cd "$SRC"
