@@ -40,6 +40,7 @@ struct EyePair {
     float xStretch = 1.f;         // displayed / stored eye width (2 for half-SBS)
     std::vector<float> left, right;  // eyeW * h luma (0..255)
     float meanRgb[2][3] = {};     // per eye, display-referred 0..1
+    int64_t serial = 0;           // the source frame's ring serial (diagnostics)
 };
 
 // Build an EyePair from an NV12/I420 side-by-side frame (SbsFull or SbsHalf; both eyes
@@ -54,6 +55,8 @@ struct Result {
     int matches = 0;              // confident block matches used
     float verticalPx = 0.f;       // right minus left, full-res px (+ = right eye lower)
     float rollDeg = 0.f;          // vertical error slope across the width, degrees
+    float dySlope = 0.f;          // the same slope in analysis rows per analysis column
+    float dyMad = 0.f;            // spread (MAD) of the vertical residuals about that line, full-res px
     float nearPct = 0.f;          // 2nd percentile parallax, % of eye width (negative = in front)
     float farPct = 0.f;           // 98th percentile parallax
     float deltaE = 0.f;           // CIE76 between the eyes' mean colours
@@ -84,7 +87,32 @@ Result Measure(const EyePair& e, const Options& o = {});
 // rig's mean parallax / vertical offset (shiftX / shiftY, analysis px, right minus left).
 // Returns the frame offset (0 = in step), or -1 when there is too little motion or no
 // clear winner; lateEye as in Result.
-int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, int* lateEye);
+// shiftSlope = the rig's vertical offset slope over x (Result::dySlope): a rolled eye's
+// dy runs across the picture, and the moving blocks are judged against that line.
+int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, float shiftSlope, int* lateEye);
+
+// A measured eye sync is shown only once kAgree bursts in a row agree on it: one burst
+// can still pick a neighbour of the truth when a frame of motion is at the noise floor
+// (48p, analysis size), and a wrong figure on the panel is worse than "not measured"
+// for half a second. Feed every burst's reading (-1 = not measured, which keeps the
+// pending one); the return is the confirmed reading or -1.
+struct SyncConfirm {
+    static constexpr int kAgree = 3;
+    int frames = -2, late = 0, run = 0;
+    int Feed(int measuredFrames, int lateEye, int* confirmedLate) {
+        if (measuredFrames < 0) {
+            if (confirmedLate) *confirmedLate = 0;
+            return -1;
+        }
+        const bool same = measuredFrames == frames && lateEye == late;
+        run = same ? run + 1 : 1;
+        frames = measuredFrames;
+        late = lateEye;
+        const bool ok = run >= kAgree;
+        if (confirmedLate) *confirmedLate = ok ? lateEye : 0;
+        return ok ? measuredFrames : -1;
+    }
+};
 
 // CIE76 delta-E of two display-referred sRGB colours (0..1).
 float DeltaE76(const float a[3], const float b[3]);
@@ -165,6 +193,9 @@ private:
     std::vector<Alert> alerts_;
     Budget budget_;
     double measureMs_ = 0.0;
+    SyncConfirm syncConfirm_;
+    StereoLayout pendingLayout_ = StereoLayout::SbsFull;
+    bool pendingSwap_ = false;
     uint64_t generation_ = 0;  // bumped by Reset: a measurement started before it is dropped
     // open alert runs: near, far, vertical, colour
     struct Run {

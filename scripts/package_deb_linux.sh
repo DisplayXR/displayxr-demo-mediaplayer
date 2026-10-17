@@ -139,7 +139,10 @@ done
 for so in libopenxr_loader.so.1 libavcodec.so libavformat.so libavutil.so libswscale.so libswresample.so; do
   ls "$APPDIR/$so"* >/dev/null 2>&1 || { echo "error: bundled $so* missing from $BUILD_DIR." >&2; exit 1; }
 done
-objdump -p "$APPDIR/$BINARY" | grep -q 'RUNPATH *\$ORIGIN$' \
+# (whitespace-tolerant: the same binary, same binutils 2.38, passed and then failed
+# this exact-anchor grep across two CI runs on 2026-10-17 while the error path
+# printed "RUNPATH $ORIGIN" both times)
+objdump -p "$APPDIR/$BINARY" | grep -Eq 'RUNPATH[[:space:]]+\$ORIGIN[[:space:]]*$' \
   || { echo "error: $BINARY lacks RUNPATH \$ORIGIN (build-tree paths would ship)." >&2; objdump -p "$APPDIR/$BINARY" | grep -E 'R(UN)?PATH' >&2; exit 1; }
 
 # Bundle assets (sample stereo media etc.).
