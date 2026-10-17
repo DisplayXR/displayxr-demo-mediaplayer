@@ -52,7 +52,10 @@ if [ ! -f "$ZLIB_PREFIX/lib/z.lib" ]; then
     ( cd "$ZLIB_SRC" && nmake -f win32/Makefile.msc zlib.lib )   # -MD, like FFmpeg's msvc build
     mkdir -p "$ZLIB_PREFIX/include" "$ZLIB_PREFIX/lib"
     cp "$ZLIB_SRC/zlib.h" "$ZLIB_SRC/zconf.h" "$ZLIB_PREFIX/include/"
-    cp "$ZLIB_SRC/zlib.lib" "$ZLIB_PREFIX/lib/z.lib"   # configure probes -lz -> z.lib under msvc
+    # configure's msvc toolchain maps -lz to zlib.lib (its one special case; every other
+    # -lfoo becomes foo.lib), so ship both names.
+    cp "$ZLIB_SRC/zlib.lib" "$ZLIB_PREFIX/lib/zlib.lib"
+    cp "$ZLIB_SRC/zlib.lib" "$ZLIB_PREFIX/lib/z.lib"
 fi
 ZLIB_INC_W="$(cygpath -w "$ZLIB_PREFIX/include" 2>/dev/null || echo "$ZLIB_PREFIX/include")"
 ZLIB_LIB_W="$(cygpath -w "$ZLIB_PREFIX/lib" 2>/dev/null || echo "$ZLIB_PREFIX/lib")"
