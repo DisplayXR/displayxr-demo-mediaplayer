@@ -288,6 +288,7 @@ function(mp_add_player tgt is_pro)
         src/media/ImageSequence.cpp  # EXR / DPX / TIFF frames as one clip (Pro formats only)
         src/media/AutoConvergence.cpp  # live auto-convergence (#92): disparity.js port
         src/media/StreamUrl.cpp      # stream-URL classifier (#93)
+        src/media/LiftClient.cpp     # "Convert to 3D": XR_DXR_lift VIEWS_MONO stream (CPU in / out)
         src/ui/Hud.cpp
         src/ui/ImGuiLayer.cpp
         # The player's ImGui chrome, shared VERBATIM with the Android leg. If you add or
@@ -616,6 +617,17 @@ if(MP_BUILD_TESTS)
     target_include_directories(stream_url_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME stream_url COMMAND stream_url_test)
 
+    # "Convert to 3D" (XR_DXR_lift spec v4): the LiftClient state machine over a fake
+    # entry-point table, plus the CPU frame preparation. No runtime, no loader, no GPU.
+    add_executable(lift_client_test
+        tests/lift_client_test.cpp
+        src/media/LiftClient.cpp
+        src/Log.cpp)
+    target_include_directories(lift_client_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/displayxr-openxr)
+    add_test(NAME lift_client COMMAND lift_client_test)
+
     # Media Player Pro looks: .cube LUT + ASC CDL loaders (pure C++).
     # Pro live sources, two-input pairing and rig checks (src/pro/, pure: no SDK, no GPU).
     add_executable(live_pixels_test tests/live_pixels_test.cpp src/pro/LivePixels.cpp
@@ -734,5 +746,5 @@ if(MP_BUILD_TESTS)
              ${CMAKE_CURRENT_SOURCE_DIR}/assets/media/detect)
 
     message(STATUS
-        "Tests enabled: lif_roundtrip_test stereo_detect_test mpo_parse_test camera_select_test auto_convergence_test stream_url_test stereo_sweep")
+        "Tests enabled: lif_roundtrip_test stereo_detect_test mpo_parse_test camera_select_test auto_convergence_test stream_url_test lift_client_test stereo_sweep")
 endif()

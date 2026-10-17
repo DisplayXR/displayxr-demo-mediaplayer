@@ -147,6 +147,10 @@ over SDI); RP188 at 50/60p (frame/field counting) to confirm on a card. Kept for
 6. **Review tools (Phase 4).** A Resolve panel (timecode follow, markers), ProRes / EXR /
    DPX, A/B compare, OpenColorIO.
 
+Convert to 3D (the trunk's Shift+L toggle, `XR_DXR_lift`) is inherited unchanged. The
+station, timecode and rig checks keep reading the SOURCE frames, never the converted
+pair.
+
 Known limits: 8-bit to the panel (the runtime's atlas path); the panels are ImGui
 panels in the HUD layer, so they are woven with the picture rather than drawn as a crisp 2D
 zone (moving it to `XR_DXR_display_zones` is planned).

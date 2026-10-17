@@ -443,6 +443,25 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                                       s.layoutTooltip.c_str());
                 }
             }
+            // Convert to 3D: mono content only (caps). Highlighted while on; greyed with
+            // the reason while the conversion cannot serve (a temporary state). The "###"
+            // keeps one widget id across the label changes.
+            if (s.caps.convert && s.hasMedia) {
+                ImGui::SameLine();
+                const char* label = "Convert to 3D###convert3d";
+                if (s.convertWarming) label = "Convert to 3D (warming)###convert3d";
+                if (s.convertUnavailable) label = "Convert to 3D (unavailable)###convert3d";
+                ImGui::BeginDisabled(!s.convertEnabled);
+                if (s.convertOn)
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                                          ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                if (ImGui::Button(label)) Fire(a.ToggleConvert);
+                if (s.convertOn) ImGui::PopStyleColor();
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
+                    !s.convertTooltip.empty())
+                    ImGui::SetTooltip("%s", s.convertTooltip.c_str());
+            }
             // Auto-convergence (#92): live only. Highlighted while on.
             if (((s.caps.camera && s.isLive) || (s.caps.url && s.isStream)) && !s.autoConvLabel.empty()) {
                 ImGui::SameLine();

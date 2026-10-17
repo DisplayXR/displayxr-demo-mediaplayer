@@ -8,6 +8,7 @@
 #include "media/AudioPlayer.h"
 #include "media/AutoConvergence.h"
 #include "media/CameraSource.h"
+#include "media/LiftClient.h"
 #include "media/MediaSource.h"
 #include "media/VideoDecoder.h"
 #include "platform/Window.h"
@@ -183,6 +184,25 @@ private:
     void SampleAutoConv(const FrameRing::Frame& f);
     void TickAutoConv();
     std::string AutoConvHudText() const;
+
+    // "Convert to 3D" (XR_DXR_lift spec v4): the runtime's 2D->3D conversion turns MONO
+    // content into a side-by-side pair that replaces the picture. Off on every load; the
+    // player never converts on its own. The toggle is hidden when the runtime does not
+    // offer the extension or the content is not mono (ConvertEligible), and disabled
+    // (with the reason) when the conversion task cannot serve this session.
+    //   SetConvert     — the toggle (Shift+L, the top-bar button, MCP set_convert_3d).
+    //   StopConvert    — off; `restorePicture` re-uploads the source picture over a bound
+    //                    converted one (a still from its kept pixels, video / live from
+    //                    the last frame handed to the converter until the next decode).
+    //   ResetConvertStream — discontinuity (seek, live size change): recreate the stream.
+    //   PumpConvert    — per frame: still submits, Poll, upload a landed result.
+    bool ConvertEligible() const;
+    bool SetConvert(bool on, const char* why);
+    void StopConvert(bool restorePicture);
+    void ResetConvertStream();
+    void PumpConvert(double nowSec);
+    void SubmitConvertFrame(const FrameRing::Frame& f, double nowSec);
+    void KeepStillForConvert(const uint8_t* rgba, int w, int h);
 
     // Agent tools (XR_DXR_mcp_tools). SetupAgentTools registers the player's controls as
     // MCP tools on the runtime's per-process server (no-op when the MCP gate is off);
@@ -360,8 +380,23 @@ private:
     // modeBeforeIdle_ is what to hand back; idleModeRequested_ is what we asked for,
     // kept so a mode the USER picked while idle is not undone on the way out.
     int32_t pendingModeRequest_ = -1;
+    bool userModeChoice_ = false;  // V / the Mode button was used: Pro's auto-3D stays out
     int32_t modeBeforeIdle_ = -1;
     int32_t idleModeRequested_ = -1;
+
+    // "Convert to 3D" (XR_DXR_lift). convertBound_: the renderer's texture is a converted
+    // side-by-side result, so the per-view UVs treat the content as SBS-full while layout_
+    // stays Mono (contentAspect_ = the mono frame's aspect: the result is two full eyes).
+    lift::LiftClient lift_;
+    bool convertBound_ = false;
+    bool convertStillPending_ = false;  // still: submit until its result lands
+    // Full-resolution pixels of the loaded still, kept ONLY when the runtime offers the
+    // extension (so the base player on a runtime without it holds no extra copy): the
+    // source to convert, and what toggling off puts back.
+    std::vector<uint8_t> convertStill_;
+    int convertStillW_ = 0, convertStillH_ = 0;
+    std::vector<uint8_t> convertIn_;  // the last frame handed to the converter (RGBA8)
+    uint32_t convertInW_ = 0, convertInH_ = 0;
 
 #if MEDIAPLAYER_PRO
     // Media Player Pro (src/pro/, docs/PRO.md). Everything Pro adds hangs off pro_;
@@ -381,6 +416,7 @@ private:
     bool startModeRequested_ = false;
     const char* dumpPath_ = nullptr;
     bool dumped_ = false;
+    bool convertAtStart_ = false;          // MEDIAPLAYER_CONVERT: toggle Convert to 3D on
     const char* openAfterPath_ = nullptr;  // ReloadMedia() this path after a few frames
     bool openedAfter_ = false;
     const char* dumpHudPath_ = nullptr;   // dump the rendered ImGui HUD image once

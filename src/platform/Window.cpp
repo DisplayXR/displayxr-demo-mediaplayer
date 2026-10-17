@@ -202,7 +202,10 @@ bool Window::PumpEvents() {
                 if (e.key.key == SDLK_RIGHT) nextMediaRequested_ = true;
                 if (e.key.key == SDLK_S) toggleSlideshowRequested_ = true;
                 if (e.key.key == SDLK_M) toggleMuteRequested_ = true;
-                if (e.key.key == SDLK_L) cycleLayoutRequested_ = true;  // stereo layout override
+                if (e.key.key == SDLK_L) {
+                    if (e.key.mod & SDL_KMOD_SHIFT) convertRequested_ = true;  // Convert to 3D
+                    else cycleLayoutRequested_ = true;  // stereo layout override
+                }
                 if (e.key.key == SDLK_C && !(e.key.mod & SDL_KMOD_CTRL))
                     toggleCameraRequested_ = true;  // live camera on/off (#90)
                 if (e.key.key == SDLK_I) captureRequested_ = true;  // snapshot the atlas
@@ -289,6 +292,12 @@ bool Window::TakeOpenFileRequest() {
 bool Window::TakeCycleLayoutRequest() {
     bool v = cycleLayoutRequested_;
     cycleLayoutRequested_ = false;
+    return v;
+}
+
+bool Window::TakeConvertRequest() {
+    bool v = convertRequested_;
+    convertRequested_ = false;
     return v;
 }
 
