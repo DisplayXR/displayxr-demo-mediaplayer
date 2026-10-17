@@ -120,8 +120,14 @@ public:
     int TakeConvergenceSteps();
     bool TakeResetConvergence();   // `0` — convergence back to 0
     bool TakeAutoConvergeRequest(); // Backspace — apply auto-convergence (LIF w/o convergence)
-    // Net single-frame steps since last read: `]` = +1, `[` = -1 (key-repeat counts).
+    // Net frame steps since last read (key-repeat counts): Right / `]` = +1, Left / `[`
+    // = -1, Shift+Right / Shift+Left = +/- kFrameJump. The editor convention (Resolve,
+    // Premiere, Avid, RV): the arrows walk frames, Up/Down walk the folder.
     int TakeFrameStep();
+    // One-shot Left (-1) / Right (+1) press since last read, repeats excluded: what the
+    // arrows mean on a still, where there is no frame to step (previous / next asset).
+    int TakeArrowPress();
+    static constexpr int kFrameJump = 5;  // frames per Shift+arrow, Resolve's jump
     bool TakeSwapEyesRequest();    // `X` — toggle L/R eye assignment
     bool TakeCaptureRequest();     // `I` — snapshot the composed atlas to a PNG
     bool TakeTogglePauseRequest(); // Space — play/pause
@@ -135,8 +141,8 @@ public:
     bool TakeDroppedPaths(std::vector<std::string>& out);
 
     // --- Folder navigation / slideshow ---
-    bool TakePrevMediaRequest();      // Left arrow — previous asset in the folder
-    bool TakeNextMediaRequest();      // Right arrow — next asset in the folder
+    bool TakePrevMediaRequest();      // Up arrow — previous asset in the folder
+    bool TakeNextMediaRequest();      // Down arrow — next asset in the folder
     bool TakeToggleSlideshowRequest(); // `S` — toggle slideshow ("diaporama")
     bool TakeToggleMuteRequest();      // `M` — toggle audio mute
     bool TakeCycleLayoutRequest();     // `L` — cycle the stereo-layout override (#45)
@@ -195,6 +201,7 @@ private:
     bool toggleHudRequested_ = false;
     int convergenceSteps_ = 0;
     int frameStepRequest_ = 0;
+    int arrowPress_ = 0;
     bool resetConvergenceRequested_ = false;
     bool autoConvergeRequested_ = false;
     bool swapEyesRequested_ = false;

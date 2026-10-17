@@ -470,9 +470,18 @@ int App::Run() {
             }
             activity = true;
         }
-        if (const int fs = window_.TakeFrameStep(); fs != 0) {        // '[' / ']'
-            StepFrame(fs);
-            activity = true;
+        // Left / Right (and '[' / ']') step frames on video. On a still there is no frame
+        // to step, so the one-shot arrow press walks the folder like Up / Down do - the
+        // photo-viewer habit kept without a mode.
+        {
+            const int fs = window_.TakeFrameStep();
+            const int press = window_.TakeArrowPress();
+            if (isVideo_) {
+                if (fs != 0) { StepFrame(fs); activity = true; }
+            } else if (press != 0) {
+                RequestNavTransition(press);
+                activity = true;
+            }
         }
         if (window_.TakeSwapEyesRequest()) {                          // 'X'
             swapEyes_ = !swapEyes_;
@@ -529,8 +538,8 @@ int App::Run() {
             activity = true;
         }
         if (window_.TakeTogglePauseRequest()) { TogglePlayback(); activity = true; }  // Space
-        if (window_.TakePrevMediaRequest()) { RequestNavTransition(-1); activity = true; }  // Left
-        if (window_.TakeNextMediaRequest()) { RequestNavTransition(+1); activity = true; }  // Right
+        if (window_.TakePrevMediaRequest()) { RequestNavTransition(-1); activity = true; }  // Up
+        if (window_.TakeNextMediaRequest()) { RequestNavTransition(+1); activity = true; }  // Down
         if (window_.TakeToggleSlideshowRequest()) { ToggleSlideshow(); activity = true; } // 'S'
         if (window_.TakeToggleMuteRequest()) { ToggleMute(); activity = true; }            // 'M'
         if (window_.TakeCycleLayoutRequest()) { CycleLayoutOverride(); activity = true; }  // 'L'
@@ -1677,7 +1686,7 @@ void App::EnterLive(LiveProducer* p, const std::string& name) {
     livePaused_ = false;
     isVideo_ = false;
     hasMedia_ = true;
-    // No folder behind a camera: ←/→ and the slideshow have nothing to step through.
+    // No folder behind a camera: ↑/↓ and the slideshow have nothing to step through.
     currentMediaPath_.clear();
     folderFiles_.clear();
     folderIndex_ = 0;
@@ -2167,7 +2176,7 @@ void App::HandleDroppedPaths(std::vector<std::string> paths) {
 
     if (droppedOneFolder) {
         // Exactly the argv-folder gesture: open the first asset and let the normal
-        // directory scan govern ←/→, so the folder itself becomes the nav list.
+        // directory scan govern ↑/↓, so the folder itself becomes the nav list.
         playlistFromDrop_ = false;
         LOG_INFO("Drop: folder '%s', %zu asset(s), opening first", paths[0].c_str(), good.size());
         ReloadMedia(good.front());
@@ -2184,7 +2193,7 @@ void App::HandleDroppedPaths(std::vector<std::string> paths) {
 
     if (good.size() == 1) {
         // A single drop is the same gesture as Ctrl+O: load it and let the normal
-        // directory scan govern ←/→, so the user can walk the containing folder.
+        // directory scan govern ↑/↓, so the user can walk the containing folder.
         playlistFromDrop_ = false;
         LOG_INFO("Drop: loading '%s'", good[0].c_str());
         if (rejected > 0) {
@@ -3259,7 +3268,7 @@ void App::TickUi() {
     const double idle = duration<double>(now - lastActivity_).count();
     ui::TickTransportUI(uiState_, dt, /*uiAwake=*/showHud_ && idle < kIdleHideSeconds);
 
-    // Dip-to-black transition machine, shared by the slideshow and manual ←/→ nav.
+    // Dip-to-black transition machine, shared by the slideshow and manual ↑/↓ nav.
     // Slideshow auto-starts a transition when a still has shown long enough / a video
     // ended; manual nav starts one via RequestNavTransition(). The swap happens at full
     // black. pendingNavDelta_ carries the step (+1 next, -1 prev).
