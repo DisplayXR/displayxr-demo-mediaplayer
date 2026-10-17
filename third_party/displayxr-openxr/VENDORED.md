@@ -41,7 +41,7 @@ Pins in force:
 | Runtime commit | Headers |
 |---|---|
 | `1d7fd8b2a9795d804dfaa3326faa68dbb942f399`<br>1d7fd8b2a (2026-10-12) — carries the `XR_DXR_cursor_depth` **spec v7** train (runtime #1976, ADR-046 Amendment 3: `XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR`) | `XR_DXR_cursor_depth.h` |
-| `bc20bff104d74a02889a8b9b711ee6ac18c1a048`<br>bc20bff10 (2026-10-16) — runtime `main`; the header last changed in aec2f6742 (#2054). `XR_DXR_lift` **spec v4** (ADR-053: conversion tasks, CPU images / exports) | `XR_DXR_lift.h` |
+| `0d12e5f997c9a592ccd898a4e82435c443d21daa`<br>0d12e5f99 (2026-10-17) — **DRAFT-PR header**: runtime PR #2193, branch `feat/2178-lift-spec5-candidates` (#2178), not yet on `main`. `XR_DXR_lift` **spec v5**: read-only provider candidates + the per-create preference hint. Re-pin to the merged `main` commit once #2193 lands (the checker needs the commit reachable in the runtime repo) | `XR_DXR_lift.h` |
 | `98d46018d16f226e021fb4e6b9ac6e8ee9cd3647`<br>98d46018d (2026-09-22) fix(d3d11_service): run the combine pass's draws under immediate_ctx_mutex (#1589/#1610) | `XR_DXR_wayland_surface_binding.h` |
 | `a71979a4d1385841a224eccd64ae973385300b1f`<br>a71979a4d (2026-07-12) feat(#734): fold planned XR_EXT_android_surface_binding → XR_DXR_ (docs/comments); post-rename-safe map regen | `XR_DXR_atlas_capture.h`, `XR_DXR_cocoa_window_binding.h`, `XR_DXR_display_zones.h`, `XR_DXR_local_3d_zone.h`, `XR_DXR_macos_gl_binding.h`, `XR_DXR_mcp_tools.h`, `XR_DXR_spatial_workspace.h`, `XR_DXR_view_rig.h`, `XR_DXR_weave.h`, `XR_DXR_win32_window_binding.h`, `XR_DXR_workspace_file_dialog.h` |
 | `c1e4fe00da0f189122eca14e61e9faaa88e4b38e`<br>c1e4fe00d (2026-09-17) — the `XR_DXR_display_info` **spec v19** train (runtime #1486/#1500), which adds `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` | `XR_DXR_display_info.h` |
@@ -86,7 +86,7 @@ informational — only a pin *mismatch* fails CI).
 | `openxr/XR_DXR_workspace_file_dialog.h` | Tier-1 spatial file picker (`xrRequestFilePickerDXR`) for Open; native dialog fallback when unsupported |
 | `openxr/XR_DXR_display_zones.h`, `XR_DXR_local_3d_zone.h` | Mixed 2D/3D region paradigm (ADR-027). Vendored for completeness; not used by this app yet |
 | `openxr/XR_DXR_cursor_depth.h` | Depth-aware cursor (spec v7). The player asks the runtime to MEASURE the disparity under the pointer in stereo media (`MEASURED_DISPARITY`) and the runtime draws the cursor; consumed through displayxr-common's `dxr::CursorDepth` |
-| `openxr/XR_DXR_lift.h` | 2D→3D conversion (spec v4). "Convert to 3D" creates a `VIEWS_MONO` task stream with CPU input and CPU export (`src/media/LiftClient`); the toggle is hidden when the runtime does not offer the extension |
+| `openxr/XR_DXR_lift.h` | 2D→3D conversion (spec v5, draft PR #2193; spec 4 is enough for the toggle). "Convert to 3D" creates a `VIEWS_MONO` task stream with CPU input and CPU export (`src/media/LiftClient`); the toggle is hidden when the runtime does not offer the extension |
 | `openxr/XR_DXR_atlas_capture.h` | `xrCaptureAtlasDXR` composed-atlas capture (agent-side debugging) |
 | `openxr/XR_DXR_weave.h` | Browser/inline-3D weave surface. Vendored for completeness; not used by this app |
 | `openxr/XR_DXR_macos_gl_binding.h`, `XR_DXR_mcp_tools.h`, `XR_DXR_spatial_workspace.h` | Rest of the extension surface, vendored so the snapshot is a whole directory rather than a hand-picked subset. Not used by this app |
@@ -111,5 +111,5 @@ Refreshed in the PRIMARY_MULTIVIEW_DXR opt-in pass: `XR_DXR_display_info.h`
 Added for the native-Wayland leg on Linux: `XR_DXR_wayland_surface_binding.h`,
 spec **v2** (surface-geometry struct + `xrSetWaylandSurfaceGeometryDXR`).
 
-Added for "Convert to 3D": `XR_DXR_lift.h`, spec **v4**. It needs only core types already in the
+Added for "Convert to 3D": `XR_DXR_lift.h`, spec **v4**; re-pinned to the spec-**v5** draft (#2193) for the provider selector. It needs only core types already in the
 pinned `openxr.h` (1.1.51), so the core headers and the `FetchContent` OpenXR `GIT_TAG` stay put.
