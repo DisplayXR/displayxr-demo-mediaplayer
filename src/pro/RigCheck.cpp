@@ -221,7 +221,7 @@ void MatchBlocks(const std::vector<float>& left, const std::vector<float>& right
             // a peak on the edge of the search window is not a peak: the real match may
             // be outside, and such blocks read as the search limit itself (a +8 % "far"
             // alert from a 1.5 % scene, tmp-mp-pro 2026-10-18)
-            if (bdx <= dxLo || bdx >= dxHi || bdy <= dyLo || bdy >= dyHi) continue;
+            if (bdx <= dxLo + 2 || bdx >= dxHi - 2 || bdy <= dyLo || bdy >= dyHi) continue;
             // uniqueness: no rival as good >= 4 px away along the row (periodic texture)
             float rival = -2.f;
             for (int dx = dxLo; dx <= dxHi; dx += 2)
@@ -326,6 +326,12 @@ Result Measure(const EyePair& e, const Options& o) {
     std::vector<float> dyc(dys.size());
     for (size_t i = 0; i < dys.size(); ++i) dyc[i] = dys[i] - (float)(slopeA * (xs[i] - 0.5 * W));
     r.verticalPx = median(dyc) * scaleY;
+    {
+        const float mc = median(dyc);
+        std::vector<float> ad(dyc.size());
+        for (size_t i = 0; i < dyc.size(); ++i) ad[i] = std::fabs(dyc[i] - mc);
+        r.dyMad = median(ad) * scaleY;
+    }
     r.deltaE = DeltaE76(e.meanRgb[0], e.meanRgb[1]);
     return r;
 }
@@ -610,6 +616,7 @@ void RigMonitor::Submit(const FrameRing::Frame& f, StereoLayout layout, int eyeO
         burst_.clear();  // a dropped frame or a change: the burst is no longer consecutive
     }
     EyePair e;
+    e.serial = f.serial;
     if (!Downsample(f, layout, 640, e, swapEyes)) {
         burst_.clear();
         return;
@@ -628,6 +635,8 @@ void RigMonitor::Submit(const FrameRing::Frame& f, StereoLayout layout, int eyeO
     work_ = std::move(burst_);
     burst_.clear();
     pendingEyeOffset_ = eyeOffsetFrames;
+    pendingLayout_ = layout;
+    pendingSwap_ = swapEyes;
     pendingTimecode_ = timecode;
     pending_ = true;
     lastSubmit_ = now;
@@ -644,6 +653,8 @@ void RigMonitor::Worker() {
         const uint64_t gen = generation_;
         const int eyeOffset = pendingEyeOffset_;
         const std::string tc = pendingTimecode_;
+        const StereoLayout layout = pendingLayout_;
+        const bool swap = pendingSwap_;
         lk.unlock();
         const auto t0 = std::chrono::steady_clock::now();
         Result r = seq.empty() ? Result{} : Measure(seq.back());
@@ -670,6 +681,10 @@ void RigMonitor::Worker() {
             }
             if (d > 0 && d < (int)seq.size()) {
                 const EyePair& back = seq[seq.size() - 1 - (size_t)d];
+                // the true alignment is the one whose vertical residuals are tightest: the
+                // other eye's moving content then sits on the rig's line, while a wrong
+                // alignment (or none) scatters it (a 1-7 px vertical and a far value pinned
+                // near the search limit came from match counts picking the wrong side)
                 Result best;
                 for (int side = -1; side <= 1; side += 2) {
                     if (lateEye != 0 && side != lateEye) continue;
@@ -677,17 +692,23 @@ void RigMonitor::Worker() {
                     if (side > 0) aligned.left = back.left;   // right eye late: left eye d back
                     else aligned.right = back.right;          // left eye late: right eye d back
                     Result a = Measure(aligned);
-                    if (a.ok && a.matches >= (r.matches * 7) / 10 && a.matches > best.matches) best = std::move(a);
+                    if (!a.ok || a.matches < (r.matches * 7) / 10) continue;
+                    if (!best.ok || a.dyMad < best.dyMad) best = std::move(a);
                 }
-                if (best.ok) {
+                if (best.ok && best.dyMad <= r.dyMad + 0.05f) {
                     best.eyeSyncMeasuredFrames = r.eyeSyncMeasuredFrames;
                     best.eyeSyncLateEye = r.eyeSyncLateEye;
                     r = std::move(best);
                 }
             }
-            if (std::getenv("MEDIAPLAYER_RIG_DEBUG"))
-                std::fprintf(stderr, "    rig: vertical %.2f px roll %.2f deg dE %.1f near %.2f far %.2f matches %d (aligned d=%d)\n",
-                             r.verticalPx, r.rollDeg, r.deltaE, r.nearPct, r.farPct, r.matches, d);
+            if (std::getenv("MEDIAPLAYER_RIG_DEBUG")) {
+                const EyePair& c = seq.back();
+                std::fprintf(stderr,
+                             "    rig: vertical %.2f px (mad %.2f) roll %.2f deg dE %.1f near %.2f far %.2f matches %d "
+                             "(aligned d=%d) serial %lld layout %d swap %d meanG %.3f/%.3f\n",
+                             r.verticalPx, r.dyMad, r.rollDeg, r.deltaE, r.nearPct, r.farPct, r.matches, d,
+                             (long long)c.serial, (int)layout, (int)swap, c.meanRgb[0][1], c.meanRgb[1][1]);
+            }
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         lk.lock();

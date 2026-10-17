@@ -40,6 +40,7 @@ struct EyePair {
     float xStretch = 1.f;         // displayed / stored eye width (2 for half-SBS)
     std::vector<float> left, right;  // eyeW * h luma (0..255)
     float meanRgb[2][3] = {};     // per eye, display-referred 0..1
+    int64_t serial = 0;           // the source frame's ring serial (diagnostics)
 };
 
 // Build an EyePair from an NV12/I420 side-by-side frame (SbsFull or SbsHalf; both eyes
@@ -55,6 +56,7 @@ struct Result {
     float verticalPx = 0.f;       // right minus left, full-res px (+ = right eye lower)
     float rollDeg = 0.f;          // vertical error slope across the width, degrees
     float dySlope = 0.f;          // the same slope in analysis rows per analysis column
+    float dyMad = 0.f;            // spread (MAD) of the vertical residuals about that line, full-res px
     float nearPct = 0.f;          // 2nd percentile parallax, % of eye width (negative = in front)
     float farPct = 0.f;           // 98th percentile parallax
     float deltaE = 0.f;           // CIE76 between the eyes' mean colours
@@ -192,6 +194,8 @@ private:
     Budget budget_;
     double measureMs_ = 0.0;
     SyncConfirm syncConfirm_;
+    StereoLayout pendingLayout_ = StereoLayout::SbsFull;
+    bool pendingSwap_ = false;
     uint64_t generation_ = 0;  // bumped by Reset: a measurement started before it is dropped
     // open alert runs: near, far, vertical, colour
     struct Run {
