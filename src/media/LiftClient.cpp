@@ -176,7 +176,8 @@ void LiftClient::RefreshCandidates() {
                 return;
             }
         }
-        candidates_.clear();
+        std::vector<Candidate> before;
+        before.swap(candidates_);
         for (uint32_t i = 0; i < n && i < raw.size(); ++i) {
             Candidate c;
             c.id.assign(raw[i].providerId, strnlen(raw[i].providerId, sizeof(raw[i].providerId)));
@@ -189,6 +190,22 @@ void LiftClient::RefreshCandidates() {
             c.isUserDefault = raw[i].isUserDefault == XR_TRUE;
             c.isSelected = raw[i].isSelected == XR_TRUE;
             if (!c.id.empty()) candidates_.push_back(std::move(c));
+        }
+        // Log the list when it changes (lifecycle, not per frame). The strings are the
+        // runtime's, verbatim.
+        bool changed = before.size() != candidates_.size();
+        for (size_t i = 0; !changed && i < before.size(); ++i)
+            changed = before[i].id != candidates_[i].id || before[i].state != candidates_[i].state ||
+                      before[i].isUserDefault != candidates_[i].isUserDefault ||
+                      before[i].isSelected != candidates_[i].isSelected;
+        if (changed) {
+            LOG_INFO("2D→3D conversion: %zu provider candidate(s)", candidates_.size());
+            for (const Candidate& c : candidates_)
+                LOG_INFO("  candidate '%s' (id %s): %s%s%s%s", c.name.c_str(), c.id.c_str(),
+                         TaskStateName(c.state),
+                         c.hosting == XR_LIFT_PROVIDER_HOSTING_REMOTE_DXR ? ", remote" : "",
+                         c.isUserDefault ? ", user default" : "",
+                         c.isSelected ? ", selected" : "");
         }
         // A pick that is no longer a candidate would be a silent no-op hint: drop it.
         if (!preferred_.empty()) {

@@ -384,6 +384,8 @@ int App::Run() {
     // takes, because an in-process session may only learn the conversion task a moment
     // after start. Never set by the player itself.
     if (const char* c = std::getenv("MEDIAPLAYER_CONVERT")) convertAtStart_ = (*c && *c != '0');
+    // Test: with MEDIAPLAYER_CONVERT, first pick this provider id (spec 5 hint).
+    if (const char* p = std::getenv("MEDIAPLAYER_CONVERT_PROVIDER")) convertProviderAtStart_ = p;
     if (const char* h = std::getenv("MEDIAPLAYER_HUD")) showHud_ = (*h && *h != '0');
     // Env-gated initial stereo state (test scaffolding: lets a headless atlas dump
     // prove convergence/swap without keystrokes). Interactive keys still apply on top.
@@ -662,6 +664,9 @@ void App::RenderOneFrame() {
 
     if (convertAtStart_ && rendered_ >= 30 && rendered_ % 60 == 30) {  // MEDIAPLAYER_CONVERT
         // No XR_DXR_lift at all: nothing will ever come, and no toast either.
+        if (!convertProviderAtStart_.empty() && lift_.HasCandidates() &&
+            SetConvertProvider(convertProviderAtStart_, "env").empty())
+            convertProviderAtStart_.clear();
         if (lift_.GetAvailability() == lift::Availability::Hidden || SetConvert(true, "env") ||
             rendered_ > 1200)
             convertAtStart_ = false;
