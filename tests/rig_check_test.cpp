@@ -8,6 +8,7 @@
 #include "pro/RigCheck.h"
 #include "pro/TestSignalSource.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
