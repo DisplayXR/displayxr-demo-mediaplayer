@@ -391,6 +391,9 @@ int App::Run() {
     if (const char* c = std::getenv("MEDIAPLAYER_CONVERT")) convertAtStart_ = (*c && *c != '0');
     // Test: with MEDIAPLAYER_CONVERT, first pick this provider id (spec 5 hint).
     if (const char* p = std::getenv("MEDIAPLAYER_CONVERT_PROVIDER")) convertProviderAtStart_ = p;
+    // Test: one non-persisted input-provider request, "<family>=<id>" (id from the runtime's
+    // list; "" after '=' = back to the default), sent once the session runs.
+    if (const char* r = std::getenv("MEDIAPLAYER_INPUT_REQUEST")) inputRequestAtStart_ = r;
     if (const char* h = std::getenv("MEDIAPLAYER_HUD")) showHud_ = (*h && *h != '0');
     // Env-gated initial stereo state (test scaffolding: lets a headless atlas dump
     // prove convergence/swap without keystrokes). Interactive keys still apply on top.
@@ -667,6 +670,13 @@ void App::RenderOneFrame() {
         }
     }
 
+    if (!inputRequestAtStart_.empty() && rendered_ == 60) {  // MEDIAPLAYER_INPUT_REQUEST
+        const size_t eq = inputRequestAtStart_.find('=');
+        XrInputRoleFamilyDXR fam;
+        if (eq != std::string::npos && input::ParseFamily(inputRequestAtStart_.substr(0, eq), fam))
+            SetInputProvider(fam, inputRequestAtStart_.substr(eq + 1), /*persist=*/false, "env");
+        inputRequestAtStart_.clear();
+    }
     if (convertAtStart_ && rendered_ >= 30 && rendered_ % 60 == 30) {  // MEDIAPLAYER_CONVERT
         // No XR_DXR_lift at all: nothing will ever come, and no toast either.
         if (!convertProviderAtStart_.empty() && lift_.HasCandidates() &&
