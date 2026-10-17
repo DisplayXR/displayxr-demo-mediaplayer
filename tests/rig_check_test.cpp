@@ -276,7 +276,10 @@ void EyeSyncLikeTheApp(float rollDeg, int& confirmedRightTotal) {
     std::printf("  app path, roll %.1f deg:\n", rollDeg);
     int wrong = 0, measured = 0, confirmedWrong = 0, confirmedRight = 0;
     rig::SyncConfirm confirm;
-    for (int64_t last : {30, 60, 90, 150, 200, 260}) {
+    // bursts every 20 frames over 6 s: dense enough for the Worker's three-in-a-row rule
+    std::vector<int64_t> lasts;
+    for (int64_t f = 30; f <= 290; f += 20) lasts.push_back(f);
+    for (int64_t last : lasts) {
         std::vector<rig::EyePair> seq = Burst(cfg, last, false);
         rig::Result r = rig::Measure(seq.back());
         CHECK(r.ok, "the spatial measurement works at the app's config");
@@ -309,7 +312,8 @@ void EyeSyncLikeTheApp(float rollDeg, int& confirmedRightTotal) {
     std::printf("    single bursts: %d measured, %d wrong; confirmed: %d right, %d wrong\n", measured, wrong,
                 confirmedRight, confirmedWrong);
     CHECK(confirmedWrong == 0, "never a confirmed wrong eye-sync reading on the app's path");
-    CHECK(wrong <= 1, "at most one wrong single-burst reading in six");
+    CHECK(wrong <= 2, "at most two wrong single-burst readings in fourteen");
+    CHECK(measured >= 3, "the delay is read from the pixels in a fair share of bursts");
     confirmedRightTotal += confirmedRight;
 }
 

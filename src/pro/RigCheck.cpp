@@ -529,6 +529,12 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
     // Each family's moving blocks come from ITS template eye's own motion: a late eye's
     // moving region sits a few px from the other eye's, and a block that is static in
     // the template matches every candidate alike and drags the in-step score down.
+    // The warp (a bilinear resample) is used only when the roll matters - a slope worth
+    // over half a pixel at the picture's edges. Resampling softens the searched eye and
+    // that costs sub-pixel precision; without roll the offset is scored directly
+    // (the no-roll case lost a third of its correct readings to the warp, tmp-mp-pro).
+    const bool rolled = std::fabs(rigB) * 0.5 * W > 0.5;
+    if (dbg) std::fprintf(stderr, "    eyesync %s\n", rolled ? "warping the roll out" : "no roll: direct offset");
     auto family = [&](const std::vector<float>& tpl, const std::vector<float>& tplBefore, auto searchEye, int late,
                       double wa, double wb) {
         const std::vector<uint8_t> tmask = MotionMask(tpl, tplBefore, W, H, 6.f, 3);
@@ -536,9 +542,14 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
         std::vector<std::vector<int>> id(n);
         for (int k = 0; k < n; ++k) {
             std::vector<float> dxs;
-            const std::vector<float> warped = WarpY(searchEye(seq[n - 1 - k]), W, H, wa, wb);
-            MatchBlocks(tpl, warped, W, H, o, &tmask, true, dxs, dy[k], x[k], nullptr, &id[k]);
+            if (rolled) {
+                const std::vector<float> warped = WarpY(searchEye(seq[n - 1 - k]), W, H, wa, wb);
+                MatchBlocks(tpl, warped, W, H, o, &tmask, true, dxs, dy[k], x[k], nullptr, &id[k]);
+            } else {
+                MatchBlocks(tpl, searchEye(seq[n - 1 - k]), W, H, o, &tmask, true, dxs, dy[k], x[k], nullptr, &id[k]);
+            }
         }
+        const float expect = rolled ? 0.f : (float)wa;  // the warp moves the search by wa, so unwarped the match sits at wa
         // the blocks every candidate matched
         std::vector<int> common = id[0];
         std::sort(common.begin(), common.end());
@@ -553,7 +564,7 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
         for (int k = 0; k < n; ++k) {
             std::vector<float> v;
             for (size_t i = 0; i < id[k].size(); ++i)
-                if (std::binary_search(common.begin(), common.end(), id[k][i])) v.push_back(std::fabs(dy[k][i]));
+                if (std::binary_search(common.begin(), common.end(), id[k][i])) v.push_back(std::fabs(dy[k][i] - expect));
             c.push_back({median(v), k, k == 0 ? 0 : late});
             if (dbg) std::fprintf(stderr, "      k=%d: score %.3f\n", k, c.back().score);
         }
@@ -645,25 +656,38 @@ void RigMonitor::Worker() {
             const float shiftY = e.fullH > 0 ? r.verticalPx * (float)e.h / e.fullH : 0.f;
             const int m = MeasureEyeSync(seq, shiftX, shiftY, r.dySlope, &r.eyeSyncLateEye);
             r.eyeSyncMeasuredFrames = syncConfirm_.Feed(m, r.eyeSyncLateEye, &r.eyeSyncLateEye);
-            // A late eye measured: the rig's geometry is what the eyes show at the SAME
-            // instant, so re-measure on the time-aligned pair (the late eye now, the other
-            // eye that many frames back). Otherwise moving content read through the delay
-            // shifts the vertical error and the depth range with every frame.
-            const int d = r.eyeSyncMeasuredFrames;
+            // A late eye: the rig's geometry is what the eyes show at the SAME instant, so
+            // re-measure on the time-aligned pair (the late eye now, the other eye that many
+            // frames back). Otherwise moving content read through the delay shifts the
+            // vertical error and the depth range with every frame. The picture reading says
+            // which eye; the timecode figure (used when the picture has none) does not, so
+            // both alignments are tried and the one that matches better is the true one -
+            // a true alignment matches at least as well as the raw pair, a wrong one worse.
+            int d = r.eyeSyncMeasuredFrames, lateEye = r.eyeSyncLateEye;
+            if (d <= 0 && eyeOffset > 0) {
+                d = eyeOffset;
+                lateEye = 0;
+            }
             if (d > 0 && d < (int)seq.size()) {
-                EyePair aligned = seq.back();
                 const EyePair& back = seq[seq.size() - 1 - (size_t)d];
-                if (r.eyeSyncLateEye > 0) aligned.left = back.left;
-                else aligned.right = back.right;
-                Result a = Measure(aligned);
-                // a true alignment matches at least as well as the raw pair; a worse one
-                // means the delay reading was wrong, and its geometry would be garbage
-                if (a.ok && a.matches >= (r.matches * 7) / 10) {
-                    a.eyeSyncMeasuredFrames = r.eyeSyncMeasuredFrames;
-                    a.eyeSyncLateEye = r.eyeSyncLateEye;
-                    r = std::move(a);
+                Result best;
+                for (int side = -1; side <= 1; side += 2) {
+                    if (lateEye != 0 && side != lateEye) continue;
+                    EyePair aligned = seq.back();
+                    if (side > 0) aligned.left = back.left;   // right eye late: left eye d back
+                    else aligned.right = back.right;          // left eye late: right eye d back
+                    Result a = Measure(aligned);
+                    if (a.ok && a.matches >= (r.matches * 7) / 10 && a.matches > best.matches) best = std::move(a);
+                }
+                if (best.ok) {
+                    best.eyeSyncMeasuredFrames = r.eyeSyncMeasuredFrames;
+                    best.eyeSyncLateEye = r.eyeSyncLateEye;
+                    r = std::move(best);
                 }
             }
+            if (std::getenv("MEDIAPLAYER_RIG_DEBUG"))
+                std::fprintf(stderr, "    rig: vertical %.2f px roll %.2f deg dE %.1f near %.2f far %.2f matches %d (aligned d=%d)\n",
+                             r.verticalPx, r.rollDeg, r.deltaE, r.nearPct, r.farPct, r.matches, d);
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         lk.lock();
