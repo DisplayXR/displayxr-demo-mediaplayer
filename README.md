@@ -311,7 +311,7 @@ state; a pick applies to this session only and is never saved (the default stays
 DisplayXR's settings / `displayxr-cli conv use`).
 
 **Input** (top bar, runtimes with `XR_DXR_input_providers`): pick which of the runtime's
-input providers drives this app's controllers / hands, by the providers' own names; the
+input providers drives this app's controllers / hands / gamepad, by the providers' own names; the
 pick is a request for this run only unless you tick *Remember for this app*, which saves
 the same per-app setting DisplayXR's settings edit. Hidden on runtimes without it.
 

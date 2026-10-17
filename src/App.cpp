@@ -2548,8 +2548,9 @@ std::string App::SetConvertProvider(const std::string& id, const char* why) {
 
 std::vector<XrInputRoleFamilyDXR> App::InputFamiliesShown() const {
     std::vector<XrInputRoleFamilyDXR> out;
-    for (XrInputRoleFamilyDXR f :
-         {XR_INPUT_ROLE_FAMILY_CONTROLLERS_DXR, XR_INPUT_ROLE_FAMILY_HAND_TRACKING_DXR})
+    for (XrInputRoleFamilyDXR f : {XR_INPUT_ROLE_FAMILY_CONTROLLERS_DXR,
+                                   XR_INPUT_ROLE_FAMILY_HAND_TRACKING_DXR,
+                                   XR_INPUT_ROLE_FAMILY_GAMEPAD_DXR})
         if (input_.FamilyOffered(f)) out.push_back(f);
     return out;
 }
@@ -2910,6 +2911,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         };
         o["input_controllers"] = holder(XR_INPUT_ROLE_FAMILY_CONTROLLERS_DXR);
         o["input_hand_tracking"] = holder(XR_INPUT_ROLE_FAMILY_HAND_TRACKING_DXR);
+        o["input_gamepad"] = holder(XR_INPUT_ROLE_FAMILY_GAMEPAD_DXR);
         json list = json::array();
         for (const input::Provider& p : input_.Providers()) {
             json fams = json::array(), cur = json::array(), req = json::array();

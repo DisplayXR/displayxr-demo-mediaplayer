@@ -56,11 +56,11 @@ struct ConvertProviderRow {
     bool enabled = true;
 };
 
-// One role family in the Input popup (controllers, hands): row 0 is "Default" (clear this
+// One role family in the Input popup (controllers, hands, gamepad): row 0 is "Default" (clear this
 // app's request), rows 1.. are the runtime's providers that supply the family, labels
 // already formatted by the owner from the runtime's verbatim display names.
 struct InputFamilyRow {
-    std::string label;              // "Controllers" / "Hands"
+    std::string label;              // "Controllers" / "Hands" / "Gamepad"
     std::vector<std::string> rows;  // [0] = "Default", then providers
     int current = 0;                // row shown as current
 };
