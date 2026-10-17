@@ -21,8 +21,10 @@ OpenCV + TensorRT/CUDA + direct SR-SDK weaving). We delete that entire stack by
 leaning on the runtime for weaving and on FFmpeg for portable hardware decode.
 
 ### Non-goals (v1)
-- **No 2D→3D conversion.** No depth model, no TensorRT, no CUDA *requirement*.
-  (Deferred to a possible v2 as an optional ONNX module.)
+- **No 2D→3D conversion in the player.** No depth model, no TensorRT, no CUDA
+  *requirement*. **v2: runtime-provided, optional** — a "Convert to 3D" toggle for mono
+  content asks the runtime's `XR_DXR_lift` conversion service (the runtime picks the
+  converter); the player bundles none and never converts on its own.
 - **No vendor SR SDK.** Weaving is the runtime's job (ADR-007).
 - **macOS is in v1** on the same Vulkan codebase (MoltenVK/CAMetalLayer; no Metal
   backend needed — §3). Android is a v1.x stretch.
@@ -172,7 +174,8 @@ reference. Specifics:
 
 **Images:** SBS JPG/PNG (`Name_2x1.ext`, `Name_half_2x1.ext`) via stb_image. HEIF
 behind `MEDIAPLAYER_WITH_HEIF` CMake option, **OFF by default** (libheif is LGPL +
-heavier — opt-in for LIF content). 2D images shown centered as flat (no conversion).
+heavier — opt-in for LIF content). 2D images shown centered as flat; v2 adds the
+optional, runtime-provided "Convert to 3D" (`XR_DXR_lift`, off by default).
 **Stereo LIF** (`.lif`): the container is parsed directly (no vendor SDK) — the two
 embedded views are decoded and composed to a full-SBS frame (`src/media/LifLoader.*`,
 nlohmann/json for the metadata). Mono+depth LIFs fall back to flat 2D for now; their

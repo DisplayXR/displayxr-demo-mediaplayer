@@ -7,7 +7,9 @@ H.264/H.265/AV1) on a 3D display, with a subtle 3D UI.
 
 It's an OpenXR **client app**: the DisplayXR runtime + display processor do the
 weaving. The player just decodes a stereo pair and submits left/right views — no
-vendor SR SDK, no weaving, no CUDA dependency.
+vendor SR SDK, no weaving, no CUDA dependency. For 2D (mono) content an optional
+**Convert to 3D** toggle (Shift+L) asks the runtime's own 2D→3D conversion
+(`XR_DXR_lift`) for a stereo pair; the player ships no depth model of its own.
 
 > The minimal, un-bloated counterpart to Leia's `LeiaPlayerWin` — built on
 > OpenXR + FFmpeg + SDL3 + Dear ImGui + stb. One Vulkan codebase for Windows,
@@ -280,6 +282,7 @@ Set `MEDIAPLAYER_LOG_DEBUG=1` for verbose logs.
 |---|---|---|
 | Images | SBS JPG/PNG, LIF, MPO | layout from filename / container / content, else assumed stereo; HEIF behind `MEDIAPLAYER_WITH_HEIF` (off by default) |
 | Video | SBS H.264 / H.265 / AV1 (MP4/MKV/MOV) | hardware decode via FFmpeg, CPU fallback; `AVStereo3D` side data honoured incl. eye order |
+| 2D (mono) stills, video, live | anything above that is mono, or pinned Mono with `L` | optional **Convert to 3D** (Shift+L / top-bar toggle / MCP `set_convert_3d`): the runtime's `XR_DXR_lift` `VIEWS_MONO` task returns a side-by-side pair that replaces the picture. Off on every load. Hidden when the runtime has no `XR_DXR_lift`; greyed with the reason when the task cannot serve this session |
 
 ## Runtime compatibility
 
@@ -295,6 +298,14 @@ the demo needs the runtime's window-binding + stereo-session extensions
 (`XR_DXR_win32_window_binding` / `XR_DXR_cocoa_window_binding`, `XR_DXR_display_info`),
 so any runtime exposing that protocol should work, but v1.10.2 is the combination this
 release was validated against.
+
+**Convert to 3D** needs `XR_DXR_lift` **spec 4** with CPU image transport: runtime
+**v2.45.0** or later, and only for sessions the runtime opens that transport to. On
+v2.45–v2.47 that means a Windows IPC session (the player under the shell, or
+`XRT_FORCE_MODE=ipc`); an in-process Vulkan session — the player's default — sees the
+task with no transport and shows the toggle disabled until the runtime adds it. Older
+runtimes simply hide the toggle. Test hook: `MEDIAPLAYER_CONVERT=1` switches it on
+headlessly.
 
 ## License
 
