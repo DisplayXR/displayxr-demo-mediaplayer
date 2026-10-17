@@ -493,6 +493,52 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                             "(the default is set in DisplayXR's settings)");
                 }
             }
+            // Input providers: one button, a small popup with a combo per role family and the
+            // "Remember for this app" checkbox. Names are the runtime's, verbatim.
+            if (s.caps.input) {
+                ImGui::SameLine();
+                if (ImGui::Button("Input")) ImGui::OpenPopup("##input_providers");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Which input device drives this app (controllers, hands)");
+                if (ImGui::BeginPopup("##input_providers")) {
+                    for (int f = 0; f < (int)s.inputFamilies.size(); ++f) {
+                        const InputFamilyRow& fam = s.inputFamilies[f];
+                        ImGui::PushID(f);
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted(fam.label.c_str());
+                        ImGui::SameLine(110.0f);
+                        const bool valid =
+                            fam.enabled && fam.current >= 0 && fam.current < (int)fam.rows.size();
+                        ImGui::BeginDisabled(!fam.enabled);
+                        ImGui::SetNextItemWidth(260.0f);
+                        if (ImGui::BeginCombo("##family", valid ? fam.rows[fam.current].c_str()
+                                                                : "no provider")) {
+                            for (int r = 0; r < (int)fam.rows.size(); ++r) {
+                                ImGui::PushID(r);
+                                if (ImGui::Selectable(fam.rows[r].c_str(), r == fam.current) &&
+                                    r != fam.current && a.SelectInputProvider)
+                                    a.SelectInputProvider(f, r);
+                                ImGui::PopID();
+                            }
+                            ImGui::EndCombo();
+                        }
+                        ImGui::EndDisabled();
+                        if (!fam.enabled &&
+                            ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                            ImGui::SetTooltip("No installed input provider supplies %s",
+                                              fam.label.c_str());
+                        ImGui::PopID();
+                    }
+                    bool remember = s.inputRemember;
+                    if (ImGui::Checkbox("Remember for this app", &remember) && a.SetInputRemember)
+                        a.SetInputRemember(remember);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "Saves your pick as this app's input setting\n"
+                            "(the same one DisplayXR's settings edit)");
+                    ImGui::EndPopup();
+                }
+            }
             // Auto-convergence (#92): live only. Highlighted while on.
             if (((s.caps.camera && s.isLive) || (s.caps.url && s.isStream)) && !s.autoConvLabel.empty()) {
                 ImGui::SameLine();

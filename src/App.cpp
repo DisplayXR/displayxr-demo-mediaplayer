@@ -220,6 +220,11 @@ bool App::Initialize(const char* mediaPath) {
     // client stays unattached and the toggle is never drawn.
     xr_.SetLiftEventHandler([this](const XrEventDataBaseHeader* e) { lift_.OnEvent(e); });
     if (xr_.HasLift()) lift_.Attach(xr_.LiftApi(), xr_.Handle());
+    // Input providers: the Input popup appears only when the runtime offers the extension
+    // and lists at least one provider.
+    xr_.SetInputEventHandler([this](const XrEventDataBaseHeader* e) { input_.OnEvent(e); });
+    if (xr_.HasInputProviders())
+        input_.Attach(xr_.InputApi(), xr_.Instance(), xr_.SystemId(), xr_.Handle());
 
     if (!renderer_.Initialize(xr_.PhysicalDevice(), xr_.Device(), xr_.GraphicsQueue(),
                               xr_.GraphicsQueueFamily(), (VkFormat)xr_.SwapchainFormat(),
@@ -386,6 +391,9 @@ int App::Run() {
     if (const char* c = std::getenv("MEDIAPLAYER_CONVERT")) convertAtStart_ = (*c && *c != '0');
     // Test: with MEDIAPLAYER_CONVERT, first pick this provider id (spec 5 hint).
     if (const char* p = std::getenv("MEDIAPLAYER_CONVERT_PROVIDER")) convertProviderAtStart_ = p;
+    // Test: one non-persisted input-provider request, "<family>=<id>" (id from the runtime's
+    // list; "" after '=' = back to the default), sent once the session runs.
+    if (const char* r = std::getenv("MEDIAPLAYER_INPUT_REQUEST")) inputRequestAtStart_ = r;
     if (const char* h = std::getenv("MEDIAPLAYER_HUD")) showHud_ = (*h && *h != '0');
     // Env-gated initial stereo state (test scaffolding: lets a headless atlas dump
     // prove convergence/swap without keystrokes). Interactive keys still apply on top.
@@ -662,6 +670,13 @@ void App::RenderOneFrame() {
         }
     }
 
+    if (!inputRequestAtStart_.empty() && rendered_ == 60) {  // MEDIAPLAYER_INPUT_REQUEST
+        const size_t eq = inputRequestAtStart_.find('=');
+        XrInputRoleFamilyDXR fam;
+        if (eq != std::string::npos && input::ParseFamily(inputRequestAtStart_.substr(0, eq), fam))
+            SetInputProvider(fam, inputRequestAtStart_.substr(eq + 1), /*persist=*/false, "env");
+        inputRequestAtStart_.clear();
+    }
     if (convertAtStart_ && rendered_ >= 30 && rendered_ % 60 == 30) {  // MEDIAPLAYER_CONVERT
         // No XR_DXR_lift at all: nothing will ever come, and no toast either.
         if (!convertProviderAtStart_.empty() && lift_.HasCandidates() &&
@@ -1074,6 +1089,30 @@ void App::BuildTransportUI() {
         }
         uiState_.convertProviderCurrent = lift_.EffectiveCandidate();
     }
+    // Input popup (XR_DXR_input_providers): one combo per family the runtime can supply.
+    uiState_.caps.input = input_.Attached();  // hidden only without the extension
+    uiState_.inputRemember = inputRemember_;
+    uiState_.inputFamilies.clear();
+    for (XrInputRoleFamilyDXR fam : InputFamiliesShown()) {
+        ui::InputFamilyRow row;
+        row.label = input::FamilyLabel(fam);
+        row.rows.push_back("Default");
+        row.enabled = input_.FamilyOffered(fam);
+        const std::vector<int> map = InputRowProviders(fam);
+        // Pre-select the current holder; this app's own request (if it names another
+        // provider) wins the display, so a pick is visible before the holder moves.
+        const int shown = input_.Requested(fam) >= 0 ? input_.Requested(fam) : input_.Current(fam);
+        for (size_t r = 1; r < map.size(); ++r) {
+            const input::Provider& pv = input_.Providers()[map[r]];
+            std::string label = pv.name;
+            if (pv.current & input::FamilyBit(fam)) label += "  (in use)";
+            if (!pv.present) label += "  (not connected)";
+            if (pv.appPinned) label += "  (remembered)";
+            row.rows.push_back(label);
+            if (map[r] == shown) row.current = (int)r;
+        }
+        uiState_.inputFamilies.push_back(std::move(row));
+    }
     // Stream URL (#93).
     uiState_.isStream = isStream_;
     uiState_.streamStatus = isStream_ ? StreamStatusText() : std::string();
@@ -1122,6 +1161,15 @@ void App::BuildTransportUI() {
     actions.OpenUrl = [this](const std::string& url) { LoadUrl(url); };
     actions.ToggleAutoConv = [this] { SetAutoConv(!autoConvEnabled_, "ui"); };
     actions.ToggleConvert = [this] { SetConvert(!lift_.On(), "ui"); };
+    actions.SelectInputProvider = [this](int family, int row) {
+        const std::vector<XrInputRoleFamilyDXR> fams = InputFamiliesShown();
+        if (family < 0 || family >= (int)fams.size()) return;
+        const std::vector<int> map = InputRowProviders(fams[family]);
+        if (row < 0 || row >= (int)map.size()) return;
+        const std::string id = map[row] < 0 ? std::string() : input_.Providers()[map[row]].id;
+        SetInputProvider(fams[family], id, inputRemember_, "ui");
+    };
+    actions.SetInputRemember = [this](bool remember) { inputRemember_ = remember; };
     actions.SelectConvertProvider = [this](int row) {
         const auto& cands = lift_.Candidates();
         if (row >= 0 && row < (int)cands.size()) SetConvertProvider(cands[row].id, "ui");
@@ -1212,6 +1260,7 @@ void App::Shutdown() {
     imgui_.Shutdown();    // before xr_ destroys the Vulkan device ImGui borrows
     renderer_.Shutdown();
     lift_.Detach();       // destroy the conversion stream before its session
+    input_.Detach();
     xr_.Shutdown();
     window_.Destroy();
 }
@@ -2498,6 +2547,40 @@ std::string App::SetConvertProvider(const std::string& id, const char* why) {
     return std::string();
 }
 
+std::vector<XrInputRoleFamilyDXR> App::InputFamiliesShown() const {
+    std::vector<XrInputRoleFamilyDXR> out;
+    for (XrInputRoleFamilyDXR f : {XR_INPUT_ROLE_FAMILY_CONTROLLERS_DXR,
+                                   XR_INPUT_ROLE_FAMILY_HAND_TRACKING_DXR,
+                                   XR_INPUT_ROLE_FAMILY_GAMEPAD_DXR})
+        out.push_back(f);  // every family; one nobody supplies draws greyed
+    return out;
+}
+
+std::vector<int> App::InputRowProviders(XrInputRoleFamilyDXR family) const {
+    std::vector<int> map{-1};  // row 0 = Default
+    const XrInputRoleFamilyFlagsDXR bit = input::FamilyBit(family);
+    for (size_t i = 0; i < input_.Providers().size(); ++i)
+        if (input_.Providers()[i].supported & bit) map.push_back((int)i);
+    return map;
+}
+
+std::string App::SetInputProvider(XrInputRoleFamilyDXR family, const std::string& id, bool persist,
+                                  const char* why) {
+    const std::string err = input_.SetPreference(family, id, persist);
+    if (!err.empty()) {
+        ShowToast(err);
+        return err;
+    }
+    std::string name = "default";
+    for (const input::Provider& p : input_.Providers())
+        if (!id.empty() && p.id == id) name = p.name;
+    LOG_INFO("Input: %s -> %s (%s%s)", input::FamilyKey(family), id.empty() ? "default" : "picked",
+             why, persist ? ", remembered for this app" : "");
+    ShowToast(std::string(input::FamilyLabel(family)) + ": " + name +
+              (persist ? " (remembered)" : ""));
+    return std::string();
+}
+
 void App::StopConvert(bool restorePicture) {
     if (!lift_.On() && !convertBound_) return;
     const bool wasBound = convertBound_;
@@ -2698,6 +2781,21 @@ void App::SetupAgentTools() {
         "\"required\":[\"on\"]}");
 
     xr_.RegisterMcpTool(
+        "set_input_provider",
+        "Ask the runtime for a specific input provider for this app's controllers, hand "
+        "tracking or gamepad (XR_DXR_input_providers). 'provider' is an id from get_status's "
+        "input_providers list, or \"\" to go back to the default. 'persist' (default false) "
+        "also saves it as the user's per-app input setting - the same record DisplayXR's "
+        "settings edit; only set it when the user asked to remember the choice. Roles move on "
+        "the app's next input sync. Errors when the runtime offers no input-provider choice.",
+        "{\"type\":\"object\",\"properties\":{"
+        "\"family\":{\"type\":\"string\",\"enum\":[\"controllers\",\"hand_tracking\",\"gamepad\"]},"
+        "\"provider\":{\"type\":\"string\",\"description\":\"An input_providers id, or empty for "
+        "the default.\"},"
+        "\"persist\":{\"type\":\"boolean\"}},"
+        "\"required\":[\"family\",\"provider\"]}");
+
+    xr_.RegisterMcpTool(
         "close_camera",
         "Stop the live camera (or live stream) and return to the idle screen. Errors if "
         "neither is live.",
@@ -2804,6 +2902,64 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
             o["convert3d_frames_converted"] = lift_.FramesConverted();
         }
     };
+    auto fillInput = [this](json& o) {
+        // Current holder per family for this app (null when none / no extension), plus the
+        // runtime's list (names verbatim).
+        auto holder = [this](XrInputRoleFamilyDXR f) -> json {
+            const int i = input_.Current(f);
+            if (i < 0) return nullptr;
+            return {{"id", input_.Providers()[i].id}, {"name", input_.Providers()[i].name}};
+        };
+        o["input_controllers"] = holder(XR_INPUT_ROLE_FAMILY_CONTROLLERS_DXR);
+        o["input_hand_tracking"] = holder(XR_INPUT_ROLE_FAMILY_HAND_TRACKING_DXR);
+        o["input_gamepad"] = holder(XR_INPUT_ROLE_FAMILY_GAMEPAD_DXR);
+        json list = json::array();
+        for (const input::Provider& p : input_.Providers()) {
+            json fams = json::array(), cur = json::array(), req = json::array();
+            for (XrInputRoleFamilyDXR f :
+                 {XR_INPUT_ROLE_FAMILY_CONTROLLERS_DXR, XR_INPUT_ROLE_FAMILY_HAND_TRACKING_DXR,
+                  XR_INPUT_ROLE_FAMILY_GAMEPAD_DXR}) {
+                if (p.supported & input::FamilyBit(f)) fams.push_back(input::FamilyKey(f));
+                if (p.current & input::FamilyBit(f)) cur.push_back(input::FamilyKey(f));
+                if (p.requested & input::FamilyBit(f)) req.push_back(input::FamilyKey(f));
+            }
+            list.push_back({{"id", p.id},
+                            {"name", p.name},
+                            {"families", fams},
+                            {"current", cur},
+                            {"requested", req},
+                            {"present", p.present},
+                            {"user_default", p.userDefault},
+                            {"app_pinned", p.appPinned}});
+        }
+        o["input_providers"] = list;
+    };
+    if (tool == "set_input_provider") {
+        XrInputRoleFamilyDXR fam;
+        if (!args.contains("family") || !args["family"].is_string() ||
+            !input::ParseFamily(args["family"].get<std::string>(), fam)) {
+            success = false;
+            return "{\"error\":\"family must be controllers|hand_tracking|gamepad\"}";
+        }
+        if (!args.contains("provider") || !args["provider"].is_string()) {
+            success = false;
+            return "{\"error\":\"missing required string arg 'provider' (\\\"\\\" = default)\"}";
+        }
+        if (!input_.Attached()) {
+            success = false;
+            return "{\"error\":\"this runtime offers no input-provider choice\"}";
+        }
+        const bool persist =
+            args.contains("persist") && args["persist"].is_boolean() && args["persist"].get<bool>();
+        const std::string err =
+            SetInputProvider(fam, args["provider"].get<std::string>(), persist, "mcp");
+        if (!err.empty()) {
+            success = false;
+            out["error"] = err;
+        }
+        fillInput(out);
+        return out.dump();
+    }
     if (tool == "set_convert_3d") {
         if (!args.contains("on") || !args["on"].is_boolean()) {
             success = false;
@@ -2940,6 +3096,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["live_paused"] = livePaused_;
         fillAutoConv(out);
         fillConvert(out);
+        fillInput(out);
         out["camera"] = isLive_ ? live_->DeviceName() : std::string();
         out["live_kind"] = isLive_ ? live_->Kind() : "";
         out["camera_state"] = isLive_ ? CameraSource::StateName(live_->GetState()) : "closed";

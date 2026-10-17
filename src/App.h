@@ -8,6 +8,7 @@
 #include "media/AudioPlayer.h"
 #include "media/AutoConvergence.h"
 #include "media/CameraSource.h"
+#include "media/InputProviderClient.h"
 #include "media/LiftClient.h"
 #include "media/MediaSource.h"
 #include "media/VideoDecoder.h"
@@ -206,6 +207,12 @@ private:
     // Provider selector (XR_DXR_lift spec 5): pick a candidate by id ("" = the default) as
     // the hint for this session's creates. "" on success, else why not. Never persisted.
     std::string SetConvertProvider(const std::string& id, const char* why);
+    // Input providers (XR_DXR_input_providers): the families the Input popup shows, the
+    // provider index behind each of a family's rows (row 0 = Default = -1), and a pick.
+    std::vector<XrInputRoleFamilyDXR> InputFamiliesShown() const;
+    std::vector<int> InputRowProviders(XrInputRoleFamilyDXR family) const;
+    std::string SetInputProvider(XrInputRoleFamilyDXR family, const std::string& id, bool persist,
+                                 const char* why);
 
     // Agent tools (XR_DXR_mcp_tools). SetupAgentTools registers the player's controls as
     // MCP tools on the runtime's per-process server (no-op when the MCP gate is off);
@@ -391,6 +398,10 @@ private:
     // side-by-side result, so the per-view UVs treat the content as SBS-full while layout_
     // stays Mono (contentAspect_ = the mono frame's aspect: the result is two full eyes).
     lift::LiftClient lift_;
+    // Input providers. inputRemember_ is the popup's "Remember for this app" checkbox: off
+    // at every launch (never saved by the player); when on, a pick persists the per-app pin.
+    input::InputProviderClient input_;
+    bool inputRemember_ = false;
     bool convertBound_ = false;
     bool convertStillPending_ = false;  // still: submit until its result lands
     // Full-resolution pixels of the loaded still, kept ONLY when the runtime offers the
@@ -421,6 +432,7 @@ private:
     bool dumped_ = false;
     bool convertAtStart_ = false;          // MEDIAPLAYER_CONVERT: toggle Convert to 3D on
     std::string convertProviderAtStart_;   // MEDIAPLAYER_CONVERT_PROVIDER: pick this id first
+    std::string inputRequestAtStart_;      // MEDIAPLAYER_INPUT_REQUEST: "<family>=<id>"
     const char* openAfterPath_ = nullptr;  // ReloadMedia() this path after a few frames
     bool openedAfter_ = false;
     const char* dumpHudPath_ = nullptr;   // dump the rendered ImGui HUD image once

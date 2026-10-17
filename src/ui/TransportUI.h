@@ -42,6 +42,10 @@ struct TransportCaps {
     // the desktop owner sets it per frame (true only for mono content on a runtime that
     // offers the conversion), so it is unsupported = not drawn, exactly like the rest.
     bool convert = false;
+    // Input providers (XR_DXR_input_providers): the "Input" popup. DEFAULT FALSE; the
+    // desktop owner sets it whenever the runtime offers the extension (a family nobody can
+    // supply then draws greyed, "no provider"; the row hides only without the extension).
+    bool input = false;
 };
 
 // One row of the "Convert to 3D" provider selector: the runtime's verbatim provider name
@@ -51,6 +55,16 @@ struct ConvertProviderRow {
     std::string label;    // e.g. "<name>  (ready)" / "<name>  (warming, remote)"
     std::string preview;  // the closed combo's text: the name (+ " (remote)")
     bool enabled = true;
+};
+
+// One role family in the Input popup (controllers, hands, gamepad): row 0 is "Default" (clear this
+// app's request), rows 1.. are the runtime's providers that supply the family, labels
+// already formatted by the owner from the runtime's verbatim display names.
+struct InputFamilyRow {
+    std::string label;              // "Controllers" / "Hands" / "Gamepad"
+    std::vector<std::string> rows;  // [0] = "Default", then providers
+    int current = 0;                // row shown as current
+    bool enabled = true;            // false: no provider supplies the family (greyed)
 };
 
 // Everything the widgets read, and the little bit of state they own.
@@ -108,6 +122,9 @@ struct TransportState {
     // reporting >= 1 candidate). convertProviderCurrent = the row shown as current.
     std::vector<ConvertProviderRow> convertProviders;
     int convertProviderCurrent = -1;
+    // Input popup - only read when caps.input.
+    std::vector<InputFamilyRow> inputFamilies;
+    bool inputRemember = false;  // "Remember for this app": the next pick persists (per-app pin)
 
     // ---- UI owns (do not clobber) ------------------------------------------
     // Scrubber. The displayed knob tracks playback EXCEPT while dragging, or
@@ -169,6 +186,10 @@ struct TransportActions {
     // "Convert to 3D", used only when caps.convert: the toggle.
     std::function<void()> ToggleConvert;
     std::function<void(int row)> SelectConvertProvider;  // a pick in the provider selector
+    // Input popup, used only when caps.input: a pick (family index into inputFamilies, row
+    // into its rows; row 0 = Default) and the "Remember for this app" checkbox.
+    std::function<void(int family, int row)> SelectInputProvider;
+    std::function<void(bool remember)> SetInputRemember;
 };
 
 // The player's "dark glass" look. `metricScale` is the ONE sanctioned divergence
