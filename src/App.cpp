@@ -1090,13 +1090,14 @@ void App::BuildTransportUI() {
         uiState_.convertProviderCurrent = lift_.EffectiveCandidate();
     }
     // Input popup (XR_DXR_input_providers): one combo per family the runtime can supply.
-    uiState_.caps.input = input_.Visible();
+    uiState_.caps.input = input_.Attached();  // hidden only without the extension
     uiState_.inputRemember = inputRemember_;
     uiState_.inputFamilies.clear();
     for (XrInputRoleFamilyDXR fam : InputFamiliesShown()) {
         ui::InputFamilyRow row;
         row.label = input::FamilyLabel(fam);
         row.rows.push_back("Default");
+        row.enabled = input_.FamilyOffered(fam);
         const std::vector<int> map = InputRowProviders(fam);
         // Pre-select the current holder; this app's own request (if it names another
         // provider) wins the display, so a pick is visible before the holder moves.
@@ -2551,7 +2552,7 @@ std::vector<XrInputRoleFamilyDXR> App::InputFamiliesShown() const {
     for (XrInputRoleFamilyDXR f : {XR_INPUT_ROLE_FAMILY_CONTROLLERS_DXR,
                                    XR_INPUT_ROLE_FAMILY_HAND_TRACKING_DXR,
                                    XR_INPUT_ROLE_FAMILY_GAMEPAD_DXR})
-        if (input_.FamilyOffered(f)) out.push_back(f);
+        out.push_back(f);  // every family; one nobody supplies draws greyed
     return out;
 }
 

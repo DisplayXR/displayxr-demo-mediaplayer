@@ -495,7 +495,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             }
             // Input providers: one button, a small popup with a combo per role family and the
             // "Remember for this app" checkbox. Names are the runtime's, verbatim.
-            if (s.caps.input && !s.inputFamilies.empty()) {
+            if (s.caps.input) {
                 ImGui::SameLine();
                 if (ImGui::Button("Input")) ImGui::OpenPopup("##input_providers");
                 if (ImGui::IsItemHovered())
@@ -507,10 +507,12 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                         ImGui::AlignTextToFramePadding();
                         ImGui::TextUnformatted(fam.label.c_str());
                         ImGui::SameLine(110.0f);
-                        const bool valid = fam.current >= 0 && fam.current < (int)fam.rows.size();
+                        const bool valid =
+                            fam.enabled && fam.current >= 0 && fam.current < (int)fam.rows.size();
+                        ImGui::BeginDisabled(!fam.enabled);
                         ImGui::SetNextItemWidth(260.0f);
-                        if (ImGui::BeginCombo("##family",
-                                              valid ? fam.rows[fam.current].c_str() : "")) {
+                        if (ImGui::BeginCombo("##family", valid ? fam.rows[fam.current].c_str()
+                                                                : "no provider")) {
                             for (int r = 0; r < (int)fam.rows.size(); ++r) {
                                 ImGui::PushID(r);
                                 if (ImGui::Selectable(fam.rows[r].c_str(), r == fam.current) &&
@@ -520,6 +522,11 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                             }
                             ImGui::EndCombo();
                         }
+                        ImGui::EndDisabled();
+                        if (!fam.enabled &&
+                            ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                            ImGui::SetTooltip("No installed input provider supplies %s",
+                                              fam.label.c_str());
                         ImGui::PopID();
                     }
                     bool remember = s.inputRemember;

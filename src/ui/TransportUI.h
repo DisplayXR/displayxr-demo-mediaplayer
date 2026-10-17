@@ -43,7 +43,8 @@ struct TransportCaps {
     // offers the conversion), so it is unsupported = not drawn, exactly like the rest.
     bool convert = false;
     // Input providers (XR_DXR_input_providers): the "Input" popup. DEFAULT FALSE; the
-    // desktop owner sets it only when the runtime offers the extension AND lists providers.
+    // desktop owner sets it whenever the runtime offers the extension (a family nobody can
+    // supply then draws greyed, "no provider"; the row hides only without the extension).
     bool input = false;
 };
 
@@ -63,6 +64,7 @@ struct InputFamilyRow {
     std::string label;              // "Controllers" / "Hands" / "Gamepad"
     std::vector<std::string> rows;  // [0] = "Default", then providers
     int current = 0;                // row shown as current
+    bool enabled = true;            // false: no provider supplies the family (greyed)
 };
 
 // Everything the widgets read, and the little bit of state they own.

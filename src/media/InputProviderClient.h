@@ -67,7 +67,8 @@ public:
     bool OnEvent(const XrEventDataBaseHeader* ev);
 
     const std::vector<Provider>& Providers() const { return providers_; }
-    // The row is drawn only when the runtime lists at least one provider.
+    // The runtime lists at least one provider. (The player draws its Input row whenever the
+    // client is Attached(); a family nobody supplies shows greyed.)
     bool Visible() const { return Attached() && !providers_.empty(); }
     // Some listed provider can supply `family`.
     bool FamilyOffered(XrInputRoleFamilyDXR family) const;
