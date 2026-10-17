@@ -52,6 +52,11 @@ if [ ! -f "$ZLIB_PREFIX/lib/z.lib" ]; then
     ( cd "$ZLIB_SRC" && nmake -f win32/Makefile.msc zlib.lib )   # -MD, like FFmpeg's msvc build
     mkdir -p "$ZLIB_PREFIX/include" "$ZLIB_PREFIX/lib"
     cp "$ZLIB_SRC/zlib.h" "$ZLIB_SRC/zconf.h" "$ZLIB_PREFIX/include/"
+    # FFmpeg's config.h defines HAVE_UNISTD_H to 0 on MSVC, and zconf.h tests it with
+    # #ifdef, so every FFmpeg file that includes zlib.h would pull in unistd.h (CI:
+    # "zconf.h(484): cannot open include file 'unistd.h'"). Make the test a value test.
+    sed -i 's|^#ifdef HAVE_UNISTD_H |#if defined(HAVE_UNISTD_H) \&\& HAVE_UNISTD_H |' "$ZLIB_PREFIX/include/zconf.h"
+    grep -q "defined(HAVE_UNISTD_H) && HAVE_UNISTD_H" "$ZLIB_PREFIX/include/zconf.h" || { echo "ERROR: zconf.h HAVE_UNISTD_H patch did not apply" >&2; exit 1; }
     # configure's msvc toolchain maps -lz to zlib.lib (its one special case; every other
     # -lfoo becomes foo.lib), so ship both names.
     cp "$ZLIB_SRC/zlib.lib" "$ZLIB_PREFIX/lib/zlib.lib"
