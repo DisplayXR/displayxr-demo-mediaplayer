@@ -92,6 +92,8 @@ void Station::Init(StationHost host, const StationOptions& opt) {
 }
 
 void Station::Shutdown() {
+    if (shutDown_) return;
+    shutDown_ = true;
     FlushOpenAlerts();
     decklink_.Stop();
     testSignal_.Stop();
