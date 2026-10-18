@@ -276,7 +276,7 @@ void EyeSyncLikeTheApp(float rollDeg, int& confirmedRightTotal) {
     std::printf("  app path, roll %.1f deg:\n", rollDeg);
     int wrong = 0, measured = 0, confirmedWrong = 0, confirmedRight = 0;
     rig::SyncConfirm confirm;
-    // bursts every 20 frames over 6 s: dense enough for the Worker's three-in-a-row rule
+    // bursts every 20 frames over 6 s (the Worker manages 2-4 a second)
     std::vector<int64_t> lasts;
     for (int64_t f = 30; f <= 290; f += 20) lasts.push_back(f);
     for (int64_t last : lasts) {
@@ -295,7 +295,7 @@ void EyeSyncLikeTheApp(float rollDeg, int& confirmedRightTotal) {
         if (d >= 0) ++measured;
         if (d >= 0 && !(d == 2 && late == +1)) ++wrong;
         int cl = 0;
-        const int cd = confirm.Feed(d, late, &cl);  // what the Worker would show
+        const int cd = confirm.Feed(d, late, (double)last / cfg.fps, &cl);  // what the Worker would show
         if (cd >= 0) ((cd == 2 && cl == +1) ? confirmedRight : confirmedWrong)++;
         // the Worker's follow-up: the rig's geometry on the time-aligned pair (the right
         // eye now against the left eye d frames back) reads the injected 4 px, not the
@@ -313,8 +313,26 @@ void EyeSyncLikeTheApp(float rollDeg, int& confirmedRightTotal) {
                 confirmedRight, confirmedWrong);
     CHECK(confirmedWrong == 0, "never a confirmed wrong eye-sync reading on the app's path");
     CHECK(wrong <= 2, "at most two wrong single-burst readings in fourteen");
-    CHECK(measured >= 3, "the delay is read from the pixels in a fair share of bursts");
+    // was >= 3 on the aliased analysis image (2x2 of every 3x3 source pixels)
+    CHECK(measured >= 5, "the delay is read from the pixels in a fair share of bursts");
+    CHECK(confirmedRight >= 1, "the 2-frame delay is shown from the pixels at this roll");
     confirmedRightTotal += confirmedRight;
+}
+
+// The vote that turns single-burst readings into the figure shown (RigMonitor::Worker).
+void SyncConfirmVotes() {
+    rig::SyncConfirm c;
+    int late = 0;
+    double t = 0;
+    auto feed = [&](int d, int l) { return c.Feed(d, l, t += 0.4, &late); };
+    CHECK(feed(2, +1) == -1 && feed(-1, 0) == -1 && feed(2, +1) == -1, "two votes are not enough");
+    CHECK(feed(2, +1) == 2 && late == +1, "three votes show the reading");
+    CHECK(feed(-1, 0) == 2 && feed(-1, 0) == 2 && late == +1, "held between readings (bursts that read nothing)");
+    CHECK(feed(1, +1) == 2 && feed(1, +1) == -1, "a neighbour that gains half the votes blanks it");
+    rig::SyncConfirm d;
+    t = 0;
+    for (int i = 0; i < 3; ++i) d.Feed(2, +1, t += 0.4, &late);
+    CHECK(d.Feed(-1, 0, t + rig::SyncConfirm::kWindowSec + 1.0, &late) == -1, "readings expire after the window");
 }
 
 }  // namespace
@@ -330,6 +348,7 @@ int main() {
     RollFault();
     TooFewMatches();
     AlertClosesOnBlack();
+    SyncConfirmVotes();
     EyeSyncMeasured();
     int confirmedRight = 0;
     EyeSyncLikeTheApp(0.0f, confirmedRight);

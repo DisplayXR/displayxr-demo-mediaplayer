@@ -91,26 +91,49 @@ Result Measure(const EyePair& e, const Options& o = {});
 // dy runs across the picture, and the moving blocks are judged against that line.
 int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, float shiftSlope, int* lateEye);
 
-// A measured eye sync is shown only once kAgree bursts in a row agree on it: one burst
-// can still pick a neighbour of the truth when a frame of motion is at the noise floor
-// (48p, analysis size), and a wrong figure on the panel is worse than "not measured"
-// for half a second. Feed every burst's reading (-1 = not measured, which keeps the
-// pending one); the return is the confirmed reading or -1.
+// A measured eye sync is shown only once the recent bursts agree on it: one burst can
+// still pick a neighbour of the truth when a frame of motion is near the noise floor
+// (48p, analysis size), and a wrong figure on the panel is worse than "not measured".
+// The reading shown is the majority of the last kMax readings within kWindowSec, when
+// it has at least kVotes votes and twice as many as any other reading - and it is HELD
+// between readings: most bursts read nothing (too little vertical motion that instant),
+// and a "three in a row, then -1 again" rule (this used to be one) published the
+// confirmed figure on one sample in ten, so the panel, the snapshot note and
+// get_rig_status almost never saw it. Feed every burst's reading (-1 = not measured)
+// with its time in seconds; the return is the shown reading or -1.
 struct SyncConfirm {
-    static constexpr int kAgree = 3;
-    int frames = -2, late = 0, run = 0;
-    int Feed(int measuredFrames, int lateEye, int* confirmedLate) {
-        if (measuredFrames < 0) {
-            if (confirmedLate) *confirmedLate = 0;
-            return -1;
+    static constexpr int kVotes = 3;
+    static constexpr int kMax = 7;
+    static constexpr double kWindowSec = 5.0;
+    struct Reading {
+        int frames, late;
+        double t;
+    };
+    std::deque<Reading> recent;
+    int Feed(int measuredFrames, int lateEye, double now, int* confirmedLate) {
+        if (measuredFrames >= 0) recent.push_back({measuredFrames, lateEye, now});
+        while (!recent.empty() && (now - recent.front().t > kWindowSec || (int)recent.size() > kMax))
+            recent.pop_front();
+        if (confirmedLate) *confirmedLate = 0;
+        // count each distinct reading; the winner needs kVotes and twice the runner-up
+        const Reading* best = nullptr;
+        int bestN = 0, secondN = 0;
+        for (const Reading& a : recent) {
+            int n = 0;
+            for (const Reading& b : recent) n += a.frames == b.frames && a.late == b.late;
+            const bool same = best && best->frames == a.frames && best->late == a.late;
+            if (same) continue;
+            if (n > bestN) {
+                secondN = bestN;
+                bestN = n;
+                best = &a;
+            } else if (n > secondN) {
+                secondN = n;
+            }
         }
-        const bool same = measuredFrames == frames && lateEye == late;
-        run = same ? run + 1 : 1;
-        frames = measuredFrames;
-        late = lateEye;
-        const bool ok = run >= kAgree;
-        if (confirmedLate) *confirmedLate = ok ? lateEye : 0;
-        return ok ? measuredFrames : -1;
+        if (!best || bestN < kVotes || bestN < 2 * secondN) return -1;
+        if (confirmedLate) *confirmedLate = best->late;
+        return best->frames;
     }
 };
 
@@ -193,7 +216,8 @@ private:
     std::vector<Alert> alerts_;
     Budget budget_;
     double measureMs_ = 0.0;
-    SyncConfirm syncConfirm_;
+    SyncConfirm syncConfirm_;  // worker thread only; restarted when generation_ moves
+    uint64_t syncGen_ = 0;
     StereoLayout pendingLayout_ = StereoLayout::SbsFull;
     bool pendingSwap_ = false;
     uint64_t generation_ = 0;  // bumped by Reset: a measurement started before it is dropped
