@@ -25,6 +25,31 @@ constexpr double kScopeInterval = 0.125;  // re-sample frames at 8 Hz at most
 
 double NowSec() { return (double)SDL_GetTicksNS() * 1e-9; }
 
+// Cost of the scopes, logged every 5 s while they run: the render thread's gather and the
+// worker's measurement.
+struct CostStat {
+    double sum = 0.0, max = 0.0;
+    int n = 0;
+    void Add(double ms) {
+        sum += ms;
+        max = std::max(max, ms);
+        ++n;
+    }
+};
+CostStat g_down, g_measure;
+double g_nextCostLog = 0.0;
+void LogCost() {
+    const double now = NowSec();
+    if (now < g_nextCostLog) return;
+    if (g_nextCostLog > 0.0 && (g_down.n || g_measure.n))
+        LOG_INFO("Pro scopes: render-thread gather %d x avg %.2f max %.2f ms; worker %d x avg %.2f max %.2f ms",
+                 g_down.n, g_down.n ? g_down.sum / g_down.n : 0.0, g_down.max, g_measure.n,
+                 g_measure.n ? g_measure.sum / g_measure.n : 0.0, g_measure.max);
+    g_down = CostStat{};
+    g_measure = CostStat{};
+    g_nextCostLog = now + 5.0;
+}
+
 const char* MatrixName(ColorMatrix m) {
     switch (m) {
         case ColorMatrix::BT601: return "BT.601";
@@ -55,27 +80,34 @@ void ProController::OnFrame(const FrameRing::Frame& f, StereoLayout layout) {
         std::snprintf(tag, sizeof(tag), "%s %s %s %s", MatrixName(f.matrix), TransferName(f.transfer),
                       f.format == PixFormat::P016 ? "10/16-bit" : "8-bit", f.fullRange ? "full" : "legal");
     colourTag_ = tag;
-    if (scopeSrcIsStill_ || (!scopesOn_ && !probeOn_)) return;
+    if (scopeIsStill_ || (!scopesOn_ && !probeOn_)) return;
     const double now = NowSec();
     if (now < nextScopeSec_) return;
     nextScopeSec_ = now + kScopeInterval;
-    if (scopes::Downsample(f, layout, kScopeW, scopeSrc_, scopeSrcW_, scopeSrcH_)) ++scopeSrcSeq_;
+    // Render thread: a point-sampled copy of the eye only; the rest runs on the worker.
+    scopes::ScopeWorker::Job job;
+    if (!scopes::Gather(f, layout, kScopeW, job.mini, job.w, job.h)) return;
+    job.hasFrame = true;
+    g_down.Add((NowSec() - now) * 1000.0);
+    LogCost();
+    SubmitScopeJob(std::move(job));
 }
 
 void ProController::OnStill(const uint8_t* rgba, int w, int h, StereoLayout layout) {
     if (!rgba) {
-        scopeSrcIsStill_ = false;
+        scopeIsStill_ = false;
         return;
     }
-    // A still never repeats, so it is sampled whether or not the scopes are up.
-    if (scopes::DownsampleRgba(rgba, w, h, layout, kScopeW, scopeSrc_, scopeSrcW_, scopeSrcH_)) {
-        scopeSrcIsStill_ = true;
-        ++scopeSrcSeq_;
-        colourTag_ = "sRGB 8-bit (still)";
-    }
+    // A still never repeats, so it is sampled whether or not the scopes are up (once, at load).
+    scopes::ScopeWorker::Job job;
+    if (!scopes::DownsampleRgba(rgba, w, h, layout, kScopeW, job.image, job.w, job.h)) return;
+    job.hasImage = true;
+    scopeIsStill_ = true;
+    colourTag_ = "sRGB 8-bit (still)";
+    SubmitScopeJob(std::move(job));
 }
 
-scopes::Grade ProController::ScopeGrade() const {
+scopes::Grade ProController::ScopeGrade() {
     scopes::Grade g;
     if (bypass_) return g;
     g.exposure = grade_.exposure;
@@ -86,27 +118,48 @@ scopes::Grade ProController::ScopeGrade() const {
         g.power[i] = grade_.power[i];
     }
     g.saturation = grade_.saturation;
-    if (grade_.lutOn && lut_.Valid()) g.lut = &lut_;
+    if (grade_.lutOn && lut_.Valid()) {
+        // The worker reads its own copy, taken when the LUT changes (a new load moves new
+        // data into lut_), so loading a LUT never races a measurement.
+        if (lut_.rgb.data() != lutSnapData_ || !lutSnap_) {
+            lutSnap_ = std::make_shared<const color::CubeLut>(lut_);
+            lutSnapData_ = lut_.rgb.data();
+        }
+        g.lut = lutSnap_.get();
+    }
     return g;
 }
 
-// Re-measure when a new analysis image arrived or the grade changed (a paused clip or a
-// still follows the exposure / CDL sliders).
-void ProController::UpdateScopes() {
-    if ((!scopesOn_ && !probeOn_) || scopeSrc_.empty()) return;
+std::string ProController::ScopeKey() {
     const scopes::Grade g = ScopeGrade();
     char key[256];
-    std::snprintf(key, sizeof(key), "%d|%.4f|%d|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f|%p|%s", (int)bypass_,
-                  g.exposure, (int)g.cdlOn, g.slope[0], g.slope[1], g.slope[2], g.offset[0], g.offset[1], g.offset[2],
-                  g.power[0], g.power[1], g.power[2], g.saturation, (const void*)g.lut, lutPath_.c_str());
-    if (scopeSrcSeq_ == scopeMeasuredSeq_ && gradeKey_ == key) return;
-    scopes::Measure(scopeSrc_, scopeSrcW_, scopeSrcH_, g, scope_);
-    scopeMeasuredSeq_ = scopeSrcSeq_;
-    gradeKey_ = key;
-    if (scopesOn_) {
-        scopes::RenderWaveform(scope_, parade_, kScopeW, waveRgba_);
-        scopes::RenderVectorscope(scope_, vecRgba_);
-        scopeTexDirty_ = true;
+    std::snprintf(key, sizeof(key), "%d|%.4f|%d|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f|%p|%d%d",
+                  (int)bypass_, g.exposure, (int)g.cdlOn, g.slope[0], g.slope[1], g.slope[2], g.offset[0], g.offset[1],
+                  g.offset[2], g.power[0], g.power[1], g.power[2], g.saturation, (const void*)g.lut, (int)parade_,
+                  (int)scopesOn_);
+    return key;
+}
+
+void ProController::SubmitScopeJob(scopes::ScopeWorker::Job&& job) {
+    job.grade = ScopeGrade();
+    job.lut = job.grade.lut ? lutSnap_ : nullptr;  // keeps the LUT alive for the worker
+    job.parade = parade_;
+    job.pictures = scopesOn_;
+    job.pictureW = kScopeW;
+    gradeKey_ = ScopeKey();
+    if (job.hasFrame || job.hasImage) haveScopeSource_ = true;
+    scopeWorker_.Submit(std::move(job));
+}
+
+// Per frame: a grade change re-measures the worker's last image (a paused clip or a
+// still follows the exposure / CDL sliders), and a finished measurement is swapped in.
+void ProController::UpdateScopes() {
+    if (!scopesOn_ && !probeOn_) return;
+    if (haveScopeSource_ && ScopeKey() != gradeKey_) SubmitScopeJob(scopes::ScopeWorker::Job{});
+    if (scopeWorker_.Take(scope_, waveRgba_, vecRgba_)) {
+        scopeTexDirty_ = scopesOn_ && !waveRgba_.empty();
+        g_measure.Add(scopeWorker_.LastMs());
+        LogCost();
     }
 }
 
@@ -256,8 +309,8 @@ void ProController::BuildMonitoringSection(const Status& st) {
         }
     }
     if (scope_.ok && (scopesOn_ || probeOn_) && !st.isLogo)
-        ImGui::TextDisabled("Luma %.0f..%.0f%%  mean %.0f%%  (%.1f ms)", scope_.minY * 100.0f, scope_.maxY * 100.0f,
-                            scope_.meanY * 100.0f, scope_.ms);
+        ImGui::TextDisabled("Luma %.0f..%.0f%%  mean %.0f%%  (worker %.1f ms)", scope_.minY * 100.0f, scope_.maxY * 100.0f,
+                            scope_.meanY * 100.0f, scopeWorker_.LastMs());
 #else
     (void)st;
 #endif

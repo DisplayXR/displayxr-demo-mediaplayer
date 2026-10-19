@@ -6,9 +6,11 @@
 
 #include "pro/Scopes.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 
 using namespace mp;
 using namespace mp::pro;
@@ -168,6 +170,68 @@ void FramesNeedPixels() {
     CHECK(!scopes::Downsample(f, StereoLayout::Mono, 32, small, w, h), "a GPU-only frame has nothing to measure");
 }
 
+// The render-thread gather: left eye only, the eye's display aspect, colours intact (NV12),
+// and the worker turns it into the same scopes the direct path gives.
+void GatherAndWorker() {
+    const int W = 1920, H = 540;  // half-SBS: each eye 960 wide, shown 1920 wide
+    FrameRing::Frame f;
+    f.width = W;
+    f.height = H;
+    f.format = PixFormat::NV12;
+    f.plane[0].assign((size_t)W * H, 0);
+    f.plane[1].assign((size_t)(W / 2) * (H / 2) * 2, 128);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) f.plane[0][(size_t)y * W + x] = x < W / 2 ? 63 : 32;  // left red, right blue
+    for (int y = 0; y < H / 2; ++y)
+        for (int x = 0; x < W / 2; ++x) {
+            uint8_t* uv = &f.plane[1][((size_t)y * (W / 2) + x) * 2];
+            if (x < W / 4) { uv[0] = 102; uv[1] = 240; } else { uv[0] = 240; uv[1] = 118; }
+        }
+    FrameRing::Frame mini;
+    int w = 0, h = 0;
+    CHECK(scopes::Gather(f, StereoLayout::SbsHalf, 160, mini, w, h), "gather");
+    CHECK(w == 160 && h == 44, "half-SBS eye shown at 1920x540 -> 160x45, even -> 44");
+    CHECK(mini.width == w * scopes::kGatherScale && mini.height == h * scopes::kGatherScale &&
+              mini.format == PixFormat::NV12,
+          "mini frame: kGatherScale x the analysis size, same format");
+    std::vector<uint8_t> rgba;
+    CHECK(scopes::DownsampleMini(mini, w, h, rgba), "downsample the mini frame");
+    bool allRed = true;
+    for (size_t i = 0; i < rgba.size(); i += 4) allRed = allRed && rgba[i] > 200 && rgba[i + 2] < 60;
+    CHECK(allRed, "the gathered eye is the left (red) one, colours intact");
+
+    scopes::ScopeWorker worker;
+    scopes::ScopeWorker::Job job;
+    job.mini = mini;
+    job.w = w;
+    job.h = h;
+    job.hasFrame = true;
+    worker.Submit(std::move(job));
+    scopes::Result r;
+    std::vector<uint8_t> wave, vec;
+    bool got = false;
+    for (int i = 0; i < 400 && !got; ++i) {
+        got = worker.Take(r, wave, vec);
+        if (!got) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(got && r.ok && r.w == w && r.h == h, "the worker measures the gathered frame");
+    CHECK(wave.size() == (size_t)480 * scopes::kLevels * 4 && vec.size() == (size_t)scopes::kVecSize * scopes::kVecSize * 4,
+          "the worker renders the pictures");
+    CHECK(r.histR[scopes::kLevels - 1] > (uint32_t)(w * h / 2), "red measured at full level");
+
+    // A grade-only job re-measures the worker's last image without a new frame.
+    scopes::ScopeWorker::Job g;
+    g.grade.exposure = -2.0f;
+    worker.Submit(std::move(g));
+    scopes::Result r2;
+    got = false;
+    for (int i = 0; i < 400 && !got; ++i) {
+        got = worker.Take(r2, wave, vec);
+        if (!got) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(got && r2.ok && r2.meanY < r.meanY - 0.05f, "a grade-only job re-measures the held image");
+}
+
 }  // namespace
 
 int main() {
@@ -175,6 +239,7 @@ int main() {
     ScopesReadTheLeftEye();
     VectorscopeHue();
     FramesNeedPixels();
+    GatherAndWorker();
     if (g_failures) {
         std::fprintf(stderr, "scopes_test: %d failure(s)\n", g_failures);
         return 1;

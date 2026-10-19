@@ -170,7 +170,7 @@ private:
     void BuildScopesPanel(float alpha, float W, float H, float panelW);
     void BuildPixelProbe(const Status& st);
     void UpdateScopes();
-    scopes::Grade ScopeGrade() const;
+    scopes::Grade ScopeGrade();
     bool OverlaysOn() const {
         return overlays_.safeAreas || overlays_.frameLine > 0 || overlays_.centreCross || overlays_.burnFrame ||
                overlays_.burnClip || overlays_.burnColour;
@@ -229,13 +229,16 @@ private:
     float zebraLevel_ = 0.95f;
     float testProbeU_ = -1.0f, testProbeV_ = -1.0f;  // MEDIAPLAYER_PRO_PROBE: a fixed probe point
     static constexpr int kScopeW = 480;          // analysis width (left eye)
-    std::vector<uint8_t> scopeSrc_;              // ungraded analysis image (RGBA)
-    int scopeSrcW_ = 0, scopeSrcH_ = 0;
-    bool scopeSrcIsStill_ = false;               // a still holds the analysis until frames return
-    uint64_t scopeSrcSeq_ = 0, scopeMeasuredSeq_ = ~0ull;
+    scopes::ScopeWorker scopeWorker_;            // box filter, grade, bins, pictures: off the render thread
+    bool scopeIsStill_ = false;                  // a still holds the analysis until frames return
+    bool haveScopeSource_ = false;               // the worker holds an analysis image
     double nextScopeSec_ = 0.0;
-    std::string gradeKey_;                       // the grade the scopes were measured with
-    scopes::Result scope_;
+    std::string gradeKey_;                       // the grade + picture settings last submitted
+    std::shared_ptr<const color::CubeLut> lutSnap_;  // the LUT as the worker sees it
+    const float* lutSnapData_ = nullptr;         // lut_'s data when lutSnap_ was taken
+    void SubmitScopeJob(scopes::ScopeWorker::Job&& job);
+    std::string ScopeKey();
+    scopes::Result scope_;                       // the last finished measurement
     std::vector<uint8_t> waveRgba_, vecRgba_;
     bool scopeTexDirty_ = false;
     std::string colourTag_;                      // "BT.709 SDR, 10-bit" (the colour burn-in)

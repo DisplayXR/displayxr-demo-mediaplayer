@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 
 namespace mp::pro::scopes {
 
@@ -45,6 +46,13 @@ double EyeAspect(StereoLayout layout, int w, int h) {
     const bool sbs = layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf;
     const int eyeW = sbs ? w / 2 : w;
     return (layout == StereoLayout::SbsHalf ? (double)w : (double)eyeW) / std::max(1, h);
+}
+
+// The analysis size: `analysisW` wide, the eye's display aspect, even height (the gathered
+// frame's chroma is half-size, so the gather and the box filter agree exactly).
+void AnalysisSize(double aspect, int analysisW, int& w, int& h) {
+    w = std::max(16, analysisW) & ~1;
+    h = std::max(10, (int)std::lround(w / std::max(0.1, aspect))) & ~1;
 }
 
 void Analyze(const std::vector<uint8_t>& rgba, int w, int h, const Grade& g, Result& out) {
@@ -121,8 +129,7 @@ void ApplyGrade(const Grade& g, float c[3]) {
 bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, std::vector<uint8_t>& rgba,
                 int& w, int& h) {
     const double aspect = EyeAspect(layout, f.width, f.height);
-    w = std::max(16, analysisW);
-    h = std::max(9, (int)std::lround(w / std::max(0.1, aspect)));
+    AnalysisSize(aspect, analysisW, w, h);
     return MakeThumbnail(f, layout, w, h, rgba);
 }
 
@@ -132,8 +139,7 @@ bool DownsampleRgba(const uint8_t* src, int sw, int sh, StereoLayout layout, int
     const bool sbs = layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf;
     const int eyeW = sbs ? sw / 2 : sw;
     const double aspect = EyeAspect(layout, sw, sh);
-    w = std::max(16, analysisW);
-    h = std::max(9, (int)std::lround(w / std::max(0.1, aspect)));
+    AnalysisSize(aspect, analysisW, w, h);
     rgba.assign((size_t)w * h * 4, 255);
     // Box filter, 3x3 taps per output pixel (as MakeThumbnail).
     const double stepX = (double)eyeW / w, stepY = (double)sh / h;
@@ -162,6 +168,144 @@ void Measure(const std::vector<uint8_t>& rgba, int w, int h, const Grade& g, Res
     }
     Analyze(rgba, w, h, g, out);
     out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+bool Gather(const FrameRing::Frame& f, StereoLayout layout, int analysisW, FrameRing::Frame& mini, int& w, int& h) {
+    if (f.gpu || f.width < 2 || f.height < 2 || f.plane[0].empty()) return false;
+    const double aspect = EyeAspect(layout, f.width, f.height);
+    AnalysisSize(aspect, analysisW, w, h);
+    const bool sbs = layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf;
+    const int eyeW = sbs ? f.width / 2 : f.width, H = f.height;
+    const int mw = w * kGatherScale, mh = h * kGatherScale;  // even: w and h are
+    const bool rgba = f.format == PixFormat::RGBA, p16 = f.format == PixFormat::P016;
+    const size_t bY = rgba ? 4 : p16 ? 2 : 1;
+    if (f.plane[0].size() < (size_t)f.width * H * bY) return false;
+    const size_t cw = (size_t)(f.width / 2), ch = (size_t)(H / 2);
+    if (f.format == PixFormat::NV12 && f.plane[1].size() < cw * ch * 2) return false;
+    if (p16 && f.plane[1].size() < cw * ch * 4) return false;
+    if (f.format == PixFormat::I420 && (f.plane[1].size() < cw * ch || f.plane[2].size() < cw * ch)) return false;
+
+    mini.width = mw;
+    mini.height = mh;
+    mini.format = f.format;
+    mini.fullRange = f.fullRange;
+    mini.matrix = f.matrix;
+    mini.transfer = f.transfer;
+    mini.gpu = false;
+    mini.serial = f.serial;
+    // Source column / row of each mini sample (pixel centres).
+    std::vector<int> sx(mw), sy(mh);
+    for (int x = 0; x < mw; ++x) sx[x] = std::min(eyeW - 1, (int)((x + 0.5) * eyeW / mw));
+    for (int y = 0; y < mh; ++y) sy[y] = std::min(H - 1, (int)((y + 0.5) * H / mh));
+    mini.plane[0].resize((size_t)mw * mh * bY);
+    for (int y = 0; y < mh; ++y) {
+        const uint8_t* row = f.plane[0].data() + (size_t)sy[y] * f.width * bY;
+        uint8_t* o = mini.plane[0].data() + (size_t)y * mw * bY;
+        for (int x = 0; x < mw; ++x) std::memcpy(o + (size_t)x * bY, row + (size_t)sx[x] * bY, bY);
+    }
+    if (rgba) {
+        mini.plane[1].clear();
+        mini.plane[2].clear();
+        return true;
+    }
+    // Chroma: one sample per 2x2 mini pixels, from the source chroma under it.
+    const int mcw = mw / 2, mch = mh / 2;
+    const size_t bC = f.format == PixFormat::NV12 ? 2 : p16 ? 4 : 1;
+    mini.plane[1].resize((size_t)mcw * mch * bC);
+    if (f.format == PixFormat::I420) mini.plane[2].resize((size_t)mcw * mch);
+    else mini.plane[2].clear();
+    for (int y = 0; y < mch; ++y) {
+        const size_t srow = (size_t)(sy[y * 2] / 2) * cw;
+        for (int x = 0; x < mcw; ++x) {
+            const size_t si = srow + (size_t)(sx[x * 2] / 2);
+            std::memcpy(mini.plane[1].data() + ((size_t)y * mcw + x) * bC, f.plane[1].data() + si * bC, bC);
+            if (f.format == PixFormat::I420) mini.plane[2][(size_t)y * mcw + x] = f.plane[2][si];
+        }
+    }
+    return true;
+}
+
+bool DownsampleMini(const FrameRing::Frame& mini, int w, int h, std::vector<uint8_t>& rgba) {
+    return MakeThumbnail(mini, StereoLayout::Mono, w, h, rgba);  // mini has the eye's display aspect
+}
+
+// --- ScopeWorker ---------------------------------------------------------------
+
+ScopeWorker::ScopeWorker() : thread_([this] { Run(); }) {}
+
+ScopeWorker::~ScopeWorker() {
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        stop_ = true;
+    }
+    cv_.notify_one();
+    if (thread_.joinable()) thread_.join();
+}
+
+void ScopeWorker::Submit(Job&& job) {
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        job_ = std::move(job);
+        pending_ = true;
+    }
+    cv_.notify_one();
+}
+
+bool ScopeWorker::Take(Result& r, std::vector<uint8_t>& wave, std::vector<uint8_t>& vec) {
+    std::lock_guard<std::mutex> lk(m_);
+    if (!ready_) return false;
+    std::swap(r, result_);
+    std::swap(wave, wave_);
+    std::swap(vec, vec_);
+    ready_ = false;
+    return true;
+}
+
+double ScopeWorker::LastMs() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return lastMs_;
+}
+
+void ScopeWorker::Run() {
+    std::unique_lock<std::mutex> lk(m_);
+    while (true) {
+        cv_.wait(lk, [this] { return stop_ || pending_; });
+        if (stop_) return;
+        Job job = std::move(job_);
+        pending_ = false;
+        lk.unlock();
+        const auto t0 = std::chrono::steady_clock::now();
+        if (job.hasImage) {
+            image_ = std::move(job.image);
+            imageW_ = job.w;
+            imageH_ = job.h;
+        } else if (job.hasFrame) {
+            if (DownsampleMini(job.mini, job.w, job.h, image_)) {
+                imageW_ = job.w;
+                imageH_ = job.h;
+            }
+        }
+        Result r;
+        std::vector<uint8_t> wave, vec;
+        bool ok = false;
+        if (!image_.empty() && imageW_ > 0) {
+            Measure(image_, imageW_, imageH_, job.grade, r);
+            if (r.ok && job.pictures) {
+                RenderWaveform(r, job.parade, job.pictureW, wave);
+                RenderVectorscope(r, vec);
+            }
+            ok = r.ok;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        lk.lock();
+        if (ok) {
+            result_ = std::move(r);
+            wave_ = std::move(wave);
+            vec_ = std::move(vec);
+            ready_ = true;
+            lastMs_ = ms;
+        }
+    }
 }
 
 void RenderWaveform(const Result& r, bool parade, int outW, std::vector<uint8_t>& rgba) {
