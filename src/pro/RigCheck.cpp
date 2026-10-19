@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <future>
 #include <iterator>
 
 namespace mp::rig {
@@ -119,17 +120,38 @@ bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, E
     out.left.resize((size_t)aw * ah);
     out.right.resize((size_t)aw * ah);
     const int W = f.width;
+    std::vector<float> colSum((size_t)fullEye);
     for (int eye = 0; eye < 2; ++eye) {
         std::vector<float>& dst = eye == 0 ? out.left : out.right;
         // the eye as SHOWN: with the eyes swapped the right half feeds the left eye
         const int x0 = (eye ^ (swapEyes ? 1 : 0)) * fullEye;
+        // A box over each analysis pixel's whole footprint (sx x sy source pixels). Sampling
+        // a 2x2 corner of a 3x3 footprint, as this did, skips five source pixels in nine:
+        // an edge moving through the skipped rows does not move in the analysis image,
+        // so sub-pixel motion is quantised and a frame of motion at 48p (~0.3 px here)
+        // vanished - the eye-sync reading split between the true delay and its neighbour
+        // or read "in step" (tmp-mp-pro, 2026-10-18).
         for (int y = 0; y < ah; ++y) {
-            const int sy0 = std::min(f.height - 2, (int)(y * sy));
-            const size_t r0 = (size_t)sy0 * W, r1 = r0 + W;
+            const int ya = std::min(f.height - 1, (int)(y * sy));
+            const int yb = std::max(ya + 1, std::min(f.height, (int)((y + 1) * sy)));
+            std::fill(colSum.begin(), colSum.end(), 0.f);
+            for (int yy = ya; yy < yb; ++yy) {
+                const size_t r = (size_t)yy * W + x0;
+                if (p16) {
+                    const uint16_t* src = reinterpret_cast<const uint16_t*>(f.plane[0].data()) + r;
+                    for (int x = 0; x < fullEye; ++x) colSum[x] += (float)src[x] * (1.0f / 256.0f);
+                } else {
+                    const uint8_t* src = f.plane[0].data() + r;
+                    for (int x = 0; x < fullEye; ++x) colSum[x] += (float)src[x];
+                }
+            }
             float* d = dst.data() + (size_t)y * aw;
             for (int x = 0; x < aw; ++x) {
-                const size_t sx0 = (size_t)x0 + std::min(fullEye - 2, (int)(x * sx));
-                d[x] = 0.25f * (lumaAt(r0 + sx0) + lumaAt(r0 + sx0 + 1) + lumaAt(r1 + sx0) + lumaAt(r1 + sx0 + 1));
+                const int xa = std::min(fullEye - 1, (int)(x * sx));
+                const int xb = std::max(xa + 1, std::min(fullEye, (int)((x + 1) * sx)));
+                float acc = 0.f;
+                for (int xx = xa; xx < xb; ++xx) acc += colSum[xx];
+                d[x] = acc / (float)((xb - xa) * (yb - ya));
             }
         }
         // mean colour over the central 80 %, on a coarse grid of chroma samples
@@ -549,7 +571,10 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
         const std::vector<uint8_t> tmask = MotionMask(tpl, tplBefore, W, H, 6.f, 3);
         std::vector<std::vector<float>> dy(n), x(n);
         std::vector<std::vector<int>> id(n);
-        for (int k = 0; k < n; ++k) {
+        // The candidates are independent block-match passes over const images: one task
+        // each. In series they were ~2/3 of a ~0.5 s measurement on a laptop CPU (Intel
+        // PTL, Linux), which held the worker to ~2 bursts a second instead of ~4.
+        auto candidate = [&](int k) {
             std::vector<float> dxs;
             if (rolled) {
                 const std::vector<float> warped = WarpY(searchEye(seq[n - 1 - k]), W, H, wa, wb);
@@ -557,7 +582,11 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
             } else {
                 MatchBlocks(tpl, searchEye(seq[n - 1 - k]), W, H, o, &tmask, true, dxs, dy[k], x[k], nullptr, &id[k]);
             }
-        }
+        };
+        std::vector<std::future<void>> tasks;
+        for (int k = 1; k < n; ++k) tasks.push_back(std::async(std::launch::async, candidate, k));
+        candidate(0);
+        for (auto& t : tasks) t.get();
         const float expect = rolled ? 0.f : (float)wa;  // the warp moves the search by wa, so unwarped the match sits at wa
         // the blocks every candidate matched
         std::vector<int> common = id[0];
@@ -591,7 +620,11 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
     size_t ru = 1;
     while (ru < c.size() && c[ru].frames == c[0].frames && c[ru].late == c[0].late) ++ru;
     if (ru >= c.size()) return -1;
-    if (c[ru].score - c[0].score < std::max(0.12f, 0.25f * c[ru].score)) return -1;
+    // (0.12 / 25 % before the analysis image was box-filtered: the aliased image's
+    // sub-pixel noise needed it; on the filtered image it threw away most correct
+    // readings at 48p, and the vote across bursts in SyncConfirm guards against a
+    // stray one.)
+    if (c[ru].score - c[0].score < std::max(0.06f, 0.2f * c[ru].score)) return -1;
     if (lateEye) *lateEye = c[0].late;
     return c[0].frames;
 }
@@ -669,7 +702,11 @@ void RigMonitor::Worker() {
             const float shiftX = p[p.size() / 2] / 100.f * (float)e.eyeW;
             const float shiftY = e.fullH > 0 ? r.verticalPx * (float)e.h / e.fullH : 0.f;
             const int m = MeasureEyeSync(seq, shiftX, shiftY, r.dySlope, &r.eyeSyncLateEye);
-            r.eyeSyncMeasuredFrames = syncConfirm_.Feed(m, r.eyeSyncLateEye, &r.eyeSyncLateEye);
+            if (gen != syncGen_) {  // Reset() ran since the last burst: start the vote afresh
+                syncConfirm_ = SyncConfirm{};
+                syncGen_ = gen;
+            }
+            r.eyeSyncMeasuredFrames = syncConfirm_.Feed(m, r.eyeSyncLateEye, LiveProducer::NowSeconds(), &r.eyeSyncLateEye);
             // A late eye: the rig's geometry is what the eyes show at the SAME instant, so
             // re-measure on the time-aligned pair (the late eye now, the other eye that many
             // frames back). Otherwise moving content read through the delay shifts the
@@ -829,7 +866,6 @@ Budget RigMonitor::GetBudget() const {
 }
 
 void RigMonitor::Reset() {
-    syncConfirm_ = SyncConfirm{};
     std::lock_guard<std::mutex> lk(m_);
     ++generation_;
     history_.clear();
