@@ -92,6 +92,7 @@ void Station::Init(StationHost host, const StationOptions& opt) {
 }
 
 void Station::Shutdown() {
+    FlushOpenAlerts();
     decklink_.Stop();
     testSignal_.Stop();
 }
@@ -375,6 +376,28 @@ std::string Station::RigStatusJson() const {
 std::string Station::Folder() const {
     return host_.capturePrefix ? std::filesystem::path(host_.capturePrefix("x")).parent_path().string()
                                : std::string();
+}
+
+// An episode still open when the station closes would otherwise never reach the log (it
+// is written when it closes): write it as open, with the time it has run so far. A kill
+// or a crash still loses it.
+void Station::FlushOpenAlerts() {
+    LogNewAlerts();
+    std::string dir;
+    const double now = LiveProducer::NowSeconds();
+    for (const rig::Alert& a : rig_.Alerts()) {
+        if (a.end >= 0) continue;
+        if (dir.empty() && host_.capturePrefix)
+            dir = std::filesystem::path(host_.capturePrefix("x")).parent_path().string();
+        if (dir.empty()) return;
+        nlohmann::json j;
+        j["what"] = a.what;
+        j["timecode"] = a.timecode;
+        j["time"] = a.wallClock;
+        j["duration_s"] = now - a.start;
+        j["open"] = true;
+        std::ofstream((std::filesystem::path(dir) / "station_alerts.jsonl").string(), std::ios::app) << j.dump() << "\n";
+    }
 }
 
 // ---------------------------------------------------------------------------- agent tools
@@ -662,14 +685,18 @@ void Station::BuildRigSection(bool stereo) {
     const int sync = h.empty() ? -1 : h.back().eyeOffsetFrames;
     int late = 0;
     const int measured = MeasuredEyeSync(&late);
-    if (measured >= 0) {  // measured from the pixels wins; the timecode figure is the source's word
-        std::snprintf(v, sizeof(v), "%d frame%s%s", measured, measured == 1 ? "" : "s",
-                      measured == 0 ? "" : late > 0 ? " (R late)" : " (L late)");
-        Graded("Eye sync", v, (float)measured, 0.5f);
-        if (sync >= 0 && sync != measured) ImGui::TextDisabled("timecode says %d", sync);
-    } else if (sync >= 0) {
+    // The source's timecode figure is the word on eye sync when there is one (RP188 is
+    // per frame and exact). The picture reading is a cross-check: at 48p a frame of
+    // motion is near its resolution, so it can sit a frame off; it leads only when the
+    // source has no timecode.
+    const char* lateTxt = measured == 0 ? "" : late > 0 ? " (R late)" : " (L late)";
+    if (sync >= 0) {
         std::snprintf(v, sizeof(v), "%d frame%s (TC)", sync, sync == 1 ? "" : "s");
         Graded("Eye sync", v, (float)sync, 0.5f);
+        if (measured >= 0 && measured != sync) ImGui::TextDisabled("picture reads %d%s", measured, lateTxt);
+    } else if (measured >= 0) {
+        std::snprintf(v, sizeof(v), "%d frame%s%s (picture)", measured, measured == 1 ? "" : "s", lateTxt);
+        Graded("Eye sync", v, (float)measured, 0.5f);
     } else {
         ImGui::TextUnformatted("Eye sync");
         ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.56f);

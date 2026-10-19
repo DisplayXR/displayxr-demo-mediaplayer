@@ -85,7 +85,7 @@ rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
   --enable-swscale --enable-swresample \
   --enable-zlib \
   --enable-protocol=file,pipe,tcp,udp,rtp,http,rtmp,hls,crypto,data \
-  --enable-demuxer=mov,matroska,mpegts,avi,flv,live_flv,rtsp,rtp,sdp,hls,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v,mxf,dpx_pipe,exr_pipe \
+  --enable-demuxer=mov,matroska,mpegts,avi,flv,live_flv,rtsp,rtp,sdp,hls,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v,mxf,image_dpx_pipe,image_exr_pipe \
   --enable-decoder=h264,hevc,av1,vp9,vp8,mpeg4,mpeg2video,mpeg1video,mjpeg,png,bmp,tiff,webp,gif,prores,dnxhd,exr,dpx,aac,aac_latm,mp3,ac3,eac3,flac,opus,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8 \
   --enable-parser=h264,hevc,av1,vp9,vp8,mpeg4video,mpegvideo,aac,aac_latm,ac3,flac,opus,vorbis,mjpeg,png \
   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,av1_frame_split,vp9_superframe,vp9_superframe_split,aac_adtstoasc,extract_extradata,mpeg4_unpack_bframes,null \
@@ -96,7 +96,9 @@ rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
 # configure silently drops a feature whose dependency is missing: fail instead
 # of shipping a player without hardware decode.
 for want in CONFIG_VAAPI CONFIG_NVDEC CONFIG_H264_VAAPI_HWACCEL CONFIG_HEVC_NVDEC_HWACCEL CONFIG_ZLIB \
-            CONFIG_NETWORK CONFIG_RTSP_DEMUXER CONFIG_HLS_DEMUXER CONFIG_UDP_PROTOCOL CONFIG_HTTP_PROTOCOL; do
+            CONFIG_NETWORK CONFIG_RTSP_DEMUXER CONFIG_HLS_DEMUXER CONFIG_UDP_PROTOCOL CONFIG_HTTP_PROTOCOL \
+            CONFIG_EXR_DECODER CONFIG_PNG_DECODER CONFIG_DPX_DECODER CONFIG_PRORES_DECODER CONFIG_DNXHD_DECODER \
+            CONFIG_MXF_DEMUXER CONFIG_IMAGE_EXR_PIPE_DEMUXER CONFIG_IMAGE_DPX_PIPE_DEMUXER; do
     # (component switches live in config_components.h on FFmpeg >= 6)
     cat config.h config_components.h 2>/dev/null | grep -q "^#define $want 1" || { echo "error: FFmpeg configure disabled $want" >&2; exit 1; }
 done
