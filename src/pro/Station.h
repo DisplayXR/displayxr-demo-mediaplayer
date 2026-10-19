@@ -140,6 +140,7 @@ private:
     int signalFps_ = 0;
     double delayMs_ = 0.0;
     double alertsLoggedUntil_ = 0.0;
+    bool shutDown_ = false;  // App::Shutdown() and ~Station() both call Shutdown(): flush once
     struct Snapshot {
         std::string image, notePath, timecode, clock;
         int tcFps = 0;
