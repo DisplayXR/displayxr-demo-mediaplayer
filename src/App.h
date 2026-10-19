@@ -238,6 +238,10 @@ private:
     bool isVideo_ = false;
     StereoLayout layout_ = StereoLayout::Mono;
     float contentAspect_ = 1.0f;  // per-eye display aspect (width/height), for letterboxing
+    // The aspect the picture is fitted with: contentAspect_, stretched by Pro's anamorphic
+    // desqueeze (1 in the base player).
+    float proDesqueeze_ = 1.0f;
+    float FitAspect() const { return contentAspect_ * proDesqueeze_; }
 
     // Layered stereo-layout detection (#45). layoutSignal_ records WHICH layer decided
     // layout_, so the HUD can name it. autoInfo_ caches the automatic verdict, which is

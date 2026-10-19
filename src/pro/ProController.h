@@ -10,7 +10,8 @@
 // scattered #ifs in the trunk — the trunk must stay readable as the base player.
 //
 // What lives here today (Phase 1 of docs/PRO.md):
-//   - QC view modes: 3D, left eye only, right eye only, eye difference, anaglyph
+//   - QC view modes: 3D, left eye only, right eye only, eye difference, anaglyph, false colour
+//   - framing overlays + burn-ins (Overlays.h), scopes + pixel probe + zebras (Scopes.h)
 //   - pan / zoom (identical for both eyes, so depth is preserved while zoomed)
 //   - the grade: exposure, ASC CDL (.cc/.ccc/.cdl), 3D LUT (.cube), with bypass
 //   - the inspector panel (ImGui) and the Pro key map
@@ -19,7 +20,9 @@
 #include "color/Cdl.h"
 #include "color/CubeLut.h"
 #include "pro/OcioBake.h"
+#include "pro/Overlays.h"
 #include "pro/ResolveLink.h"
+#include "pro/Scopes.h"
 #include "pro/Station.h"
 #include "rhi/VulkanRenderer.h"
 
@@ -32,7 +35,7 @@ struct SDL_Window;
 
 namespace mp::pro {
 
-enum class ViewMode { Stereo3D = 0, LeftOnly, RightOnly, Difference, Anaglyph, Count };
+enum class ViewMode { Stereo3D = 0, LeftOnly, RightOnly, Difference, Anaglyph, FalseColour, Count };
 const char* ViewModeName(ViewMode m);
 
 // Live player state the inspector shows, refreshed by App every frame.
@@ -79,6 +82,11 @@ struct Host {
     std::function<double()> mediaStart;  // the file's first timestamp (Position/Seek are in it)
     std::function<bool()> isFullscreen;
     std::function<void()> toggleFullscreen;
+    std::function<void(float)> setDesqueeze;  // anamorphic: stretch the picture's width
+    std::function<double()> mediaFps;         // the open video's frame rate, 0 when not a video
+    // An RGBA texture for ImGui::Image (scope pictures), per slot: upload `rgba` (nullptr =
+    // no change) and return its ImTextureID, nullptr when there is none.
+    std::function<void*(int slot, int w, int h, const uint8_t* rgba)> userTexture;
 };
 
 class ProController {
@@ -97,6 +105,11 @@ public:
     // A/B compare: the B clip; B (key) swaps to the other at the same position.
     void SetCompareB(const std::string& path) { compare_[1] = path; }
     void ToggleCompare();
+
+    // Every uploaded frame (video, stream, live) and every still: the scopes' and the pixel
+    // probe's source, and the colour-space burn-in. OnStill(nullptr) = frames again.
+    void OnFrame(const FrameRing::Frame& f, StereoLayout layout);
+    void OnStill(const uint8_t* rgba, int w, int h, StereoLayout layout);
 
     // Raw SDL event, after ImGui has seen it. Returns true when Pro consumed it.
     bool HandleEvent(const void* sdlEvent, bool imguiWantsMouse, bool imguiWantsKeyboard);
@@ -132,7 +145,7 @@ public:
     void SetFlatPanelsAvailable(bool on) { flatAvailable_ = on; }
 
     // True while Pro wants the HUD kept alive (pinned inspector).
-    bool KeepHudAwake() const { return inspectorPinned_ || depthOverlay_; }
+    bool KeepHudAwake() const { return inspectorPinned_ || depthOverlay_ || OverlaysOn() || scopesOn_; }
 
     ViewMode Mode() const { return mode_; }
     // The monitoring station: inputs, timecode / delay, rig checks, snapshots (Station.h).
@@ -151,6 +164,17 @@ public:
 private:
     void SetMode(ViewMode m, bool announce);
     void BuildDepthOverlay(const Status& st);
+    void BuildOverlays(const Status& st, float uiAlpha);
+    void BuildOverlaySection();
+    void BuildMonitoringSection(const Status& st);
+    void BuildScopesPanel(float alpha, float W, float H, float panelW);
+    void BuildPixelProbe(const Status& st);
+    void UpdateScopes();
+    scopes::Grade ScopeGrade() const;
+    bool OverlaysOn() const {
+        return overlays_.safeAreas || overlays_.frameLine > 0 || overlays_.centreCross || overlays_.burnFrame ||
+               overlays_.burnClip || overlays_.burnColour;
+    }
     void BuildStatusBar(const Status& st, float alpha);
     void ZoomAt(float factor, float u, float v);
     void SetZoom(float z);
@@ -196,6 +220,25 @@ private:
     void AddFlatRectOfCurrentWindow();
     Station station_;
     bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture
+
+    // Framing overlays (Q cycles the frame line) and the picture's anamorphic desqueeze.
+    OverlaySettings overlays_;
+    int appliedDesqueeze_ = 0;
+    // Monitoring: scopes (W), pixel probe (P), zebras (7; level 0..1), false colour (6 = a view).
+    bool scopesOn_ = false, parade_ = false, probeOn_ = false, zebraOn_ = false;
+    float zebraLevel_ = 0.95f;
+    float testProbeU_ = -1.0f, testProbeV_ = -1.0f;  // MEDIAPLAYER_PRO_PROBE: a fixed probe point
+    static constexpr int kScopeW = 480;          // analysis width (left eye)
+    std::vector<uint8_t> scopeSrc_;              // ungraded analysis image (RGBA)
+    int scopeSrcW_ = 0, scopeSrcH_ = 0;
+    bool scopeSrcIsStill_ = false;               // a still holds the analysis until frames return
+    uint64_t scopeSrcSeq_ = 0, scopeMeasuredSeq_ = ~0ull;
+    double nextScopeSec_ = 0.0;
+    std::string gradeKey_;                       // the grade the scopes were measured with
+    scopes::Result scope_;
+    std::vector<uint8_t> waveRgba_, vecRgba_;
+    bool scopeTexDirty_ = false;
+    std::string colourTag_;                      // "BT.709 SDR, 10-bit" (the colour burn-in)
     std::string compare_[2];       // A (what was open) and B
     int compareSide_ = 0;          // 0 = A showing
     bool pendingCompare_ = false;  // B pressed: swap in Tick()

@@ -49,6 +49,7 @@ const char* ViewModeName(ViewMode m) {
         case ViewMode::RightOnly: return "Right eye";
         case ViewMode::Difference: return "Difference";
         case ViewMode::Anaglyph: return "Anaglyph";
+        case ViewMode::FalseColour: return "False colour";
         default: return "?";
     }
 }
@@ -71,6 +72,41 @@ void ProController::ApplyTestEnv() {
     if (const char* c = std::getenv("MEDIAPLAYER_PRO_COMPARE_FRAME")) testCompareFrame_ = std::atoi(c);
     if (const char* p = std::getenv("MEDIAPLAYER_PRO_PIN")) inspectorPinned_ = (*p && *p != '0');
     if (const char* f = std::getenv("MEDIAPLAYER_PRO_PANELS_3D")) flatPanels_ = !(*f && *f != '0');
+    // Overlays / monitoring (screenshots): MEDIAPLAYER_PRO_OVERLAYS = a comma list of
+    // safe, cross, tc, frame, clip, colour, line=<index>, matte=<0..1>, desqueeze=<index>;
+    // MEDIAPLAYER_PRO_SCOPES=1 (parade with =2), MEDIAPLAYER_PRO_ZEBRA=<level 0..1>,
+    // MEDIAPLAYER_PRO_PROBE=<u>,<v> (a fixed probe point, picture fractions).
+    if (const char* o = std::getenv("MEDIAPLAYER_PRO_OVERLAYS")) {
+        const std::string s = o;
+        size_t i = 0;
+        while (i <= s.size()) {
+            const size_t j = std::min(s.find(',', i), s.size());
+            const std::string t = s.substr(i, j - i);
+            if (t == "safe") overlays_.safeAreas = true;
+            else if (t == "cross") overlays_.centreCross = true;
+            else if (t == "tc") overlays_.burnTimecode = true;
+            else if (t == "frame") overlays_.burnFrame = true;
+            else if (t == "clip") overlays_.burnClip = true;
+            else if (t == "colour") overlays_.burnColour = true;
+            else if (t.rfind("line=", 0) == 0)
+                overlays_.frameLine = std::clamp(std::atoi(t.c_str() + 5), 0, FrameLineCount() - 1);
+            else if (t.rfind("matte=", 0) == 0)
+                overlays_.matte = std::clamp((float)std::atof(t.c_str() + 6), 0.0f, 1.0f);
+            else if (t.rfind("desqueeze=", 0) == 0)
+                overlays_.desqueeze = std::clamp(std::atoi(t.c_str() + 10), 0, DesqueezeCount() - 1);
+            i = j + 1;
+        }
+    }
+    if (const char* s = std::getenv("MEDIAPLAYER_PRO_SCOPES")) {
+        scopesOn_ = (*s && *s != '0');
+        parade_ = (*s == '2');
+    }
+    if (const char* z = std::getenv("MEDIAPLAYER_PRO_ZEBRA")) {
+        zebraOn_ = true;
+        zebraLevel_ = std::clamp((float)std::atof(z), 0.05f, 1.0f);
+    }
+    if (const char* p = std::getenv("MEDIAPLAYER_PRO_PROBE"))
+        probeOn_ = std::sscanf(p, "%f,%f", &testProbeU_, &testProbeV_) == 2;
 }
 
 void ProController::AddFlatRectOfCurrentWindow() {
@@ -335,6 +371,29 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
                 case SDLK_3: SetMode(ViewMode::RightOnly, true); return true;
                 case SDLK_4: SetMode(ViewMode::Difference, true); return true;
                 case SDLK_5: SetMode(ViewMode::Anaglyph, true); return true;
+                case SDLK_6:
+                    SetMode(mode_ == ViewMode::FalseColour ? ViewMode::Stereo3D : ViewMode::FalseColour, true);
+                    return true;
+                case SDLK_7: {
+                    zebraOn_ = !zebraOn_;
+                    char t[48];
+                    std::snprintf(t, sizeof(t), zebraOn_ ? "Zebras at %.0f%%" : "Zebras off", zebraLevel_ * 100.0f);
+                    if (host_.toast) host_.toast(t);
+                    return true;
+                }
+                case SDLK_W:
+                    scopesOn_ = !scopesOn_;
+                    if (host_.toast) host_.toast(scopesOn_ ? "Scopes on" : "Scopes off");
+                    return true;
+                case SDLK_P:
+                    probeOn_ = !probeOn_;
+                    testProbeU_ = testProbeV_ = -1.0f;
+                    if (host_.toast) host_.toast(probeOn_ ? "Pixel probe on (hover the picture)" : "Pixel probe off");
+                    return true;
+                case SDLK_Q:  // cycle the frame line
+                    overlays_.frameLine = (overlays_.frameLine + 1) % FrameLineCount();
+                    if (host_.toast) host_.toast(std::string("Frame line: ") + FrameLineName(overlays_.frameLine));
+                    return true;
                 case SDLK_H:  // home: fit
                     SetZoom(1.0f);
                     if (host_.toast) host_.toast("Zoom: fit");
@@ -428,8 +487,18 @@ void ProController::Tick(const Status& st) {
     if (bypass_ || st.isLogo) {
         g = GradeParams{};
     }
-    g.qcMode = st.isLogo ? 0 : mode_ == ViewMode::Difference ? 1 : mode_ == ViewMode::Anaglyph ? 2 : 0;
+    g.qcMode = st.isLogo                          ? 0
+               : mode_ == ViewMode::Difference  ? 1
+               : mode_ == ViewMode::Anaglyph    ? 2
+               : mode_ == ViewMode::FalseColour ? 3
+                                                : 0;
+    g.zebraLevel = (zebraOn_ && !st.isLogo) ? zebraLevel_ : 0.0f;
     renderer_->SetGrade(g);
+    if (overlays_.desqueeze != appliedDesqueeze_ && host_.setDesqueeze) {
+        host_.setDesqueeze(DesqueezeFactor(overlays_.desqueeze));
+        appliedDesqueeze_ = overlays_.desqueeze;
+    }
+    UpdateScopes();
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +597,9 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
 
 void ProController::BuildUI(const Status& st, float uiAlpha) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
+    BuildOverlays(st, inspectorPinned_ ? 1.0f : uiAlpha);  // framing + burn-ins: not faded
     BuildDepthOverlay(st);  // on the picture; independent of the inspector fade
+    BuildPixelProbe(st);
     flatRects_.clear();
     const float alpha = inspectorPinned_ ? 1.0f : uiAlpha;
     BuildStatusBar(st, alpha);
@@ -619,14 +690,15 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
             for (int i = 0; i < (int)ViewMode::Count; ++i) {
                 const ViewMode m = (ViewMode)i;
                 const bool needsStereo = m == ViewMode::Difference || m == ViewMode::Anaglyph;
-                if (i > 0) ImGui::SameLine();
+                if (i % 3 != 0) ImGui::SameLine();  // two rows of three: fits a narrow panel
                 ImGui::BeginDisabled(needsStereo && !st.stereo);
                 char label[32];
                 std::snprintf(label, sizeof(label), "%d %s", i + 1,
                               m == ViewMode::Stereo3D ? "3D"
                               : m == ViewMode::LeftOnly ? "L"
                               : m == ViewMode::RightOnly ? "R"
-                              : m == ViewMode::Difference ? "Diff" : "Ana");
+                              : m == ViewMode::Difference ? "Diff"
+                              : m == ViewMode::Anaglyph ? "Ana" : "FC");
                 if (ImGui::RadioButton(label, mode_ == m)) SetMode(m, false);
                 ImGui::EndDisabled();
             }
@@ -641,6 +713,8 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                 host_.toggleFullscreen();
             ImGui::TextDisabled("Wheel zooms, middle-drag pans");
         }
+        BuildOverlaySection();
+        BuildMonitoringSection(st);
 
         // --- Stereo ---------------------------------------------------------
         if (ImGui::CollapsingHeader("Stereo", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -695,6 +769,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     ImGui::End();
     if (flat) ImGui::PopStyleVar();  // WindowRounding
     ImGui::PopStyleVar();
+    BuildScopesPanel(alpha, W, H, panelW);
     float sx = 0, sy = 0, sw = 0, sh = 0;
     if (station_.BuildHistoryStrip(alpha, st.stereo && st.hasPicture, FlatNow(), &sx, &sy, &sw, &sh))
         flatRects_.push_back({sx, sy, sw, sh});  // 60 s of rig health (R); follows the pin
