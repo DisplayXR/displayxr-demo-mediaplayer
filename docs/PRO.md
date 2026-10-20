@@ -52,7 +52,11 @@ streams, auto-convergence, MCP tools. Plus:
 |---|---|
 | Panels | Two ImGui panels, laid out as in the plan's mockup. **Station** (left): pin box, inputs + *DeckLink setup...*, source with timecode and delay, looks (LUT, CDL), snapshots. **Inspector** (right): view, stereo, colour (exposure, look, CDL values folded), rig check. Unpinned by default: they appear when the mouse moves and fade with the player's controls. `Tab` or *Pin panels* keeps them up; `Shift+Tab` (the player's own key) hides or shows all UI. |
 | Status bar | Along the bottom of the picture: LIVE, input, format, look, exposure, TC, near / far, convergence, A/B side. Fades with the panels; when faded, and in full screen, only a timecode chip stays (`T` hides it). |
-| QC views | `1` 3D, `2` left eye, `3` right eye, `4` eye difference (x4), `5` anaglyph. Diff and anaglyph address the two SBS halves directly, so they work with no viewer tracked. |
+| QC views | `1` 3D, `2` left eye, `3` right eye, `4` eye difference (x4), `5` anaglyph, `6` false colour. Diff and anaglyph address the two SBS halves directly, so they work with no viewer tracked. |
+| Framing overlays | `src/pro/Overlays`, Inspector *Overlays*: frame lines 2.39 / 1.85 / 16:9 / 9:16 / 4:3 / 1:1 (`Q` cycles) with a matte (0..1), action / title safe 93 / 90 % (EBU R 95), centre cross, anamorphic desqueeze 1.3 / 1.5 / 1.8 / 2.0x (the picture is fitted wider), burn-ins: timecode, frame number (files), clip name, colour space (matrix, transfer, bit depth, range). Drawn in the HUD at the screen plane; frame lines and safe areas follow pan / zoom, burn-ins stay in the picture's top corners (inside the panels while they are up). They stay up when the panels fade. |
+| Scopes | `W`, `src/pro/Scopes`: waveform (luma) or RGB parade, vectorscope (BT.709 Cb/Cr, 75 % bar targets, skin-tone line), histogram (R, G, B, luma). Measured on the CPU from the left eye box-filtered to 480 px wide, **after the grade** (the shader's exposure -> CDL -> LUT, re-run on the CPU), at up to 8 Hz; a paused clip or a still re-measures when the grade changes. A panel at the bottom between the Station and Inspector, flat when pinned. |
+| False colour / zebras | `6` false colour on the graded Rec.709 luma: < 2.5 % purple, < 10 % blue, 38-42 % (18 % grey) green, 52-56 % (skin) pink, 97-99 % yellow, > 99 % red, the rest grey. `7` zebras at or above a level (Inspector slider, 50-100 %), striped in source pixels so they sit at the object's depth in 3D. Both in the grade shader (`qcMode` 3, `zebraLevel`). |
+| Pixel probe | `P`: the graded R G B (8-bit) and luma % under the pointer, read from the scopes' 480 px analysis image (a small-area average, not a single source pixel). |
 | Pan / zoom | Mouse wheel zooms about the pointer, middle-drag (or left-drag while zoomed) pans, `H` fits, `Z` toggles 1:1. Identical for both eyes, so depth stays correct while zoomed. |
 | 3D LUT | `.cube` (2..256, `DOMAIN_MIN/MAX`), from the inspector, a file drop, `--lut <file>` or `MEDIAPLAYER_LUT`. |
 | ASC CDL | `.cc` / `.ccc` / `.cdl` (slope, offset, power, saturation; editable in the inspector), from the inspector, a drop, `--cdl <file>` or `MEDIAPLAYER_CDL`. |
@@ -89,7 +93,8 @@ blocking readback deadlocks the app (the atlas capture already contains the HUD)
 | Key | Does |
 |---|---|
 | `Tab` / `Shift+Tab` | pin the panels / hide or show all UI |
-| `1`..`5` | 3D, left eye, right eye, difference, anaglyph |
+| `1`..`6` | 3D, left eye, right eye, difference, anaglyph, false colour |
+| `7`, `W`, `P`, `Q` | zebras, scopes, pixel probe, cycle the frame line |
 | wheel, middle-drag, `H`, `Z` | zoom, pan, fit, 1:1 |
 | `G` | grade bypass |
 | `D` | depth overlay |

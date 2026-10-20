@@ -32,7 +32,8 @@ layout(push_constant) uniform PushConstants {
     float srgbTarget;// 1 = the colour attachment is an _SRGB view (encodes on store)
 #ifdef MP_GRADE
     // --- Grade + QC (Media Player Pro; all identity / 0 in the base player) ---------
-    int qcMode;      // 0 = normal, 1 = difference |this eye - other eye|, 2 = anaglyph (red/cyan)
+    int qcMode;      // 0 = normal, 1 = difference |this eye - other eye|, 2 = anaglyph (red/cyan),
+                     // 3 = false colour (exposure bands on the graded luma)
     vec2 otherDelta; // uv offset from this eye's sample to the same point in the other eye
     float exposure;  // stops, applied in linear light
     float lutOn;     // 1 = sample lut3d
@@ -41,6 +42,7 @@ layout(push_constant) uniform PushConstants {
     vec4 cdlPower;   // .rgb = ASC power
     vec4 lutDomain;  // .x = domain min, .y = 1/(max-min), .z = LUT size N, .w = 1 for P016
     int yuvMatrix;   // 0 = BT.709 (default: base content unchanged), 1 = BT.601, 2 = BT.2020 NCL
+    float zebraLevel;// > 0: diagonal stripes where the graded luma is at or above it (0..1)
 #endif
 } pc;
 
@@ -138,13 +140,28 @@ vec3 Grade(vec3 c) {
     }
     return c;
 }
+
+// False colour: exposure bands on the graded Rec.709 luma (% of full scale), the rest in
+// grey, the way on-set monitors show it. Bands: crushed < 2.5 purple, 2.5-10 blue,
+// 38-42 (18 % grey) green, 52-56 (skin) pink, 97-99 yellow, > 99 clipped red.
+vec3 FalseColour(vec3 c) {
+    float y = dot(c, vec3(0.2126, 0.7152, 0.0722)) * 100.0;
+    if (y < 2.5) return vec3(0.50, 0.00, 0.60);
+    if (y < 10.0) return vec3(0.10, 0.25, 0.95);
+    if (y >= 38.0 && y <= 42.0) return vec3(0.15, 0.80, 0.20);
+    if (y >= 52.0 && y <= 56.0) return vec3(1.00, 0.55, 0.70);
+    if (y > 99.0) return vec3(1.00, 0.10, 0.05);
+    if (y >= 97.0) return vec3(1.00, 0.90, 0.10);
+    return vec3(y / 100.0 * 0.85);
+}
 #else
 vec3 Grade(vec3 c) { return c; }
 #endif
 
 void main() {
     vec2 uv = pc.uvOffset + vUV * pc.uvScale;
-    vec3 c = Grade(SampleSource(uv));
+    vec3 graded = Grade(SampleSource(uv));
+    vec3 c = graded;
 
 #ifdef MP_GRADE
     if (pc.qcMode == 1) {          // eye difference: alignment / sync check
@@ -155,6 +172,16 @@ void main() {
         float l = dot(c, vec3(0.299, 0.587, 0.114));
         float r = dot(o, vec3(0.299, 0.587, 0.114));
         c = vec3(l, r, r);
+    } else if (pc.qcMode == 3) {   // false colour
+        c = FalseColour(c);
+    }
+    if (pc.zebraLevel > 0.0 && pc.qcMode != 1 &&
+        dot(graded, vec3(0.2126, 0.7152, 0.0722)) >= pc.zebraLevel) {
+        // Stripes in SOURCE pixels, 45 degrees, 16 px period: both eyes stripe the same
+        // content point, so the zebras sit at the object's depth, not on the screen plane
+        // (a half-SBS frame's eye offset is a multiple of 16 px for the usual widths).
+        vec2 sp = uv * vec2(textureSize(plane0, 0));
+        if (mod(sp.x + sp.y, 16.0) < 8.0) c = vec3(0.0);
     }
 #endif
 

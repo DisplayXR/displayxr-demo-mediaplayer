@@ -21,11 +21,13 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 
 #include <nlohmann/json.hpp>  // parse agent-tool args / build results (XR_DXR_mcp_tools)
 #include <SDL3/SDL.h>   // SDL_ShowOpenFileDialog (Tier-0 native file dialog)
@@ -510,7 +512,7 @@ int App::Run() {
             window_.PointSize(pw, ph);
             window_.PixelSize(cw, ch);
             if (LiveSource() && hasMedia_ && pw && ph && cw && ch) {
-                const XrSession::ViewRect fit = MatchMinRect({0, 0, cw, ch}, contentAspect_);
+                const XrSession::ViewRect fit = MatchMinRect({0, 0, cw, ch}, FitAspect());
                 const float px = cx * (float)cw / (float)pw, py = cy * (float)ch / (float)ph;
                 const float u = (px - (float)fit.x) / (float)std::max(1u, fit.w);
                 const float v = (py - (float)fit.y) / (float)std::max(1u, fit.h);
@@ -652,6 +654,7 @@ void App::RenderOneFrame() {
             // Pro: timecode, measured delay and the rig checks see every uploaded frame.
             pro_.GetStation().OnFrame(*vf, layout_, isLive_, isLive_ ? live_->GetStats().eyeOffsetFrames : -1,
                                       swapEyes_ != mediaEyeSwap_);  // rig checks measure the eyes as shown
+            pro_.OnFrame(*vf, layout_);  // scopes, pixel probe, colour-space burn-in
 #endif
             if (isLive_) {
                 OnLiveFrame(*vf);
@@ -779,7 +782,7 @@ void App::RenderOneFrame() {
             // longer axis), then scale into each tile (handles non-uniform modes).
             const float sx = xr_.ActiveViewScaleX();
             const float sy = xr_.ActiveViewScaleY();
-            const XrSession::ViewRect viewFit = MatchMinRect({0, 0, canvasW, canvasH}, contentAspect_);
+            const XrSession::ViewRect viewFit = MatchMinRect({0, 0, canvasW, canvasH}, FitAspect());
             const int32_t lbx = (int32_t)((float)viewFit.x * sx);  // horizontal inset of the content
             // Convergence = horizontal image translation: shift the two eyes' content
             // oppositely within their tiles, moving the zero-disparity plane. A LIF's
@@ -1382,6 +1385,9 @@ bool App::LoadMedia(const std::string& path) {
         mediaConvergence_ = 0.0f;  // no baked convergence for video
         mediaAutoConvAvailable_ = false;
         KeepStillForConvert(nullptr, 0, 0);  // a video converts from its decoded frames
+#if MEDIAPLAYER_PRO
+        pro_.OnStill(nullptr, 0, 0, layout_);  // scopes follow the frames again
+#endif
         mediaW_ = video_.Width();
         mediaH_ = video_.Height();
         contentAspect_ = PerEyeAspect(layout_, video_.Width(), video_.Height());
@@ -1436,6 +1442,9 @@ bool App::LoadMedia(const std::string& path) {
         mediaAutoConvAvailable_ = lif.stereo && !lif.hasConvergence;  // estimate available
         mediaAutoConvergence_ = lif.autoConvergence;
         KeepStillForConvert(lif.image.pixels.data(), lif.image.width, lif.image.height);
+#if MEDIAPLAYER_PRO
+        pro_.OnStill(lif.image.pixels.data(), lif.image.width, lif.image.height, layout_);
+#endif
         mediaW_ = lif.image.width;
         mediaH_ = lif.image.height;
         contentAspect_ = PerEyeAspect(layout_, lif.image.width, lif.image.height);
@@ -1479,6 +1488,9 @@ bool App::LoadMedia(const std::string& path) {
             mediaAutoConvAvailable_ = true;   // ...so the estimate is always on offer
             mediaAutoConvergence_ = mpo.autoConvergence;
             KeepStillForConvert(mpo.image.pixels.data(), mpo.image.width, mpo.image.height);
+#if MEDIAPLAYER_PRO
+            pro_.OnStill(mpo.image.pixels.data(), mpo.image.width, mpo.image.height, layout_);
+#endif
             mediaW_ = mpo.image.width;
             mediaH_ = mpo.image.height;
             contentAspect_ = PerEyeAspect(layout_, mpo.image.width, mpo.image.height);
@@ -1514,6 +1526,9 @@ bool App::LoadMedia(const std::string& path) {
     mediaConvergence_ = 0.0f;  // plain SBS image carries no baked convergence
     mediaAutoConvAvailable_ = false;
     KeepStillForConvert(img.pixels.data(), img.width, img.height);
+#if MEDIAPLAYER_PRO
+    pro_.OnStill(img.pixels.data(), img.width, img.height, layout_);
+#endif
     mediaW_ = img.width;
     mediaH_ = img.height;
     contentAspect_ = PerEyeAspect(layout_, img.width, img.height);
@@ -1705,6 +1720,9 @@ bool App::LoadLiveDevice(const CameraDevice& dev) {
 void App::EnterLive(LiveProducer* p, const std::string& name) {
     StopConvert(/*restorePicture=*/true);  // off on every source change
     KeepStillForConvert(nullptr, 0, 0);
+#if MEDIAPLAYER_PRO
+    pro_.OnStill(nullptr, 0, 0, layout_);  // scopes follow the frames again
+#endif
     // One live producer at a time: a previous one (the camera, or a Pro input) stops.
     if (live_ != p && isLive_) live_->Stop();
     if (p != &camera_) camera_.Stop();
@@ -1865,6 +1883,9 @@ bool App::LoadUrl(const std::string& url) {
     uiState_.urlSeed = url;  // remembered for the popup, even if the connect fails
     StopConvert(/*restorePicture=*/true);  // off on every source change
     KeepStillForConvert(nullptr, 0, 0);
+#if MEDIAPLAYER_PRO
+    pro_.OnStill(nullptr, 0, 0, layout_);  // scopes follow the frames again
+#endif
     if (isLive_) StopLive(/*showIdleIfEmpty=*/false);
     video_.Stop();   // joins the decode thread (reads the audio clock) before audio
     audio_.Stop();
@@ -2351,6 +2372,9 @@ void App::LoadIdleLogo() {
     // to the bare brand mark, then to the RED|BLUE test pattern if neither is present.
     StopConvert(/*restorePicture=*/false);  // nothing to convert on the idle screen
     KeepStillForConvert(nullptr, 0, 0);
+#if MEDIAPLAYER_PRO
+    pro_.OnStill(nullptr, 0, 0, layout_);  // scopes follow the frames again
+#endif
     namespace fs = std::filesystem;
     std::string base;
     if (const char* b = SDL_GetBasePath()) base = b;
@@ -3437,6 +3461,24 @@ void App::InitPro() {
     };
     h.isFullscreen = [this] { return window_.IsFullscreen(); };
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
+    h.setDesqueeze = [this](float f) { proDesqueeze_ = f > 0.1f ? f : 1.0f; };
+    h.mediaFps = [this] { return isVideo_ ? video_.FrameRate() : 0.0; };
+    // Scope pictures: one ImGui texture per slot, (re)made when the size changes.
+    auto scopeIds = std::make_shared<std::vector<std::array<int, 3>>>(4, std::array<int, 3>{-1, 0, 0});
+    h.userTexture = [this, scopeIds](int slot, int w, int hh, const uint8_t* rgba) -> void* {
+        if (slot < 0 || slot >= (int)scopeIds->size() || !imgui_.Ready() || w < 1 || hh < 1) return nullptr;
+        auto& e = (*scopeIds)[slot];  // {id, w, h}; id -1 not made, -2 failed (never retried)
+        if (e[0] >= 0 && (e[1] != w || e[2] != hh)) e[0] = -1;  // size changed: a new texture
+        if (e[0] == -1 && rgba) {
+            e[0] = imgui_.CreateTexture((uint32_t)w, (uint32_t)hh);
+            if (e[0] < 0) e[0] = -2;
+            e[1] = w;
+            e[2] = hh;
+        }
+        if (e[0] < 0) return nullptr;
+        if (rgba) imgui_.UpdateTexture(e[0], rgba);
+        return imgui_.TextureId(e[0]);
+    };
     pro_.Init(&renderer_, window_.SdlWindow(), std::move(h));
     pro_.SetFlatPanelsAvailable(xr_.HasLocal2D());
 

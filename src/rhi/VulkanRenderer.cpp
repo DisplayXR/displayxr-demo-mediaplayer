@@ -59,8 +59,9 @@ struct DrawPush {
     float cdlPower[4];   // 80
     float lutDomain[4];  // 96  x = min, y = 1/(max-min), z = N
     int32_t yuvMatrix;   // 112 0 = BT.709 (default), 1 = BT.601, 2 = BT.2020 NCL
+    float zebraLevel;    // 116 > 0: zebra stripes at or above this graded luma
 };
-static_assert(sizeof(DrawPush) == 116, "DrawPush must match the shader's PushConstants");
+static_assert(sizeof(DrawPush) == 120, "DrawPush must match the shader's PushConstants");
 static_assert(sizeof(DrawPush) <= 128, "push block over the guaranteed 128-byte minimum");
 
 // IEEE 754 binary32 -> binary16 (round half up on the dropped bits), for the RGBA16F LUT.
@@ -840,6 +841,7 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         pc.lutDomain[2] = (float)std::max(1u, lut_.size);
         pc.lutDomain[3] = source16_ ? 1.0f : 0.0f;  // MP_GRADE: 10-bit levels for P016
         pc.yuvMatrix = sourceMode_ == 0 ? 0 : sourceMatrix_;  // RGBA sources ignore it
+        pc.zebraLevel = grade_.zebraLevel;
         vkCmdPushConstants(cmd, activeLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 3, 1, 0, 0);

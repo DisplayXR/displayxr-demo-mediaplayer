@@ -54,7 +54,8 @@ struct GradeParams {
     float power[3] = {1.f, 1.f, 1.f};
     float saturation = 1.0f;
     bool lutOn = false;          // ignored unless a LUT was uploaded (HasLut3D)
-    int qcMode = 0;              // 0 normal, 1 eye difference, 2 anaglyph
+    int qcMode = 0;              // 0 normal, 1 eye difference, 2 anaglyph, 3 false colour
+    float zebraLevel = 0.0f;     // > 0: zebras at or above this graded luma (0..1)
 };
 
 class VulkanRenderer {
