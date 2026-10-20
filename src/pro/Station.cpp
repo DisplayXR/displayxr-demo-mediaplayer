@@ -317,11 +317,13 @@ void Station::SaveNote(size_t i) {
         j["near_pct"] = s.rig.nearPct;
         j["far_pct"] = s.rig.farPct;
         j["delta_e"] = s.rig.deltaE;
+        for (int i = 0; i < 2; ++i)
+            if (s.rig.edge[i].measured) j[i == 0 ? "edge_left_pct" : "edge_right_pct"] = s.rig.edge[i].parallaxPct;
     }
     if (s.eyeSync >= 0) j["eye_sync_frames"] = s.eyeSync;
     if (s.rig.eyeSyncMeasuredFrames >= 0) j["eye_sync_measured_frames"] = s.rig.eyeSyncMeasuredFrames;
     const rig::Budget b = rig_.GetBudget();
-    j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}};
+    j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"edge_pct", b.edgePct}};
     std::ofstream(s.notePath) << j.dump(2) << "\n";
 }
 
@@ -359,12 +361,17 @@ std::string Station::RigStatusJson() const {
     out["near_pct"] = r.nearPct;
     out["far_pct"] = r.farPct;
     out["delta_e"] = r.deltaE;
+    // edge violations: the 2nd most in-front parallax along each frame edge, null = not measured
+    for (int i = 0; i < 2; ++i) {
+        const char* k = i == 0 ? "edge_left_pct" : "edge_right_pct";
+        out[k] = r.edge[i].measured ? json(r.edge[i].parallaxPct) : json(nullptr);
+    }
     out["eye_sync_frames"] = h.empty() ? -1 : h.back().eyeOffsetFrames;
     int late = 0;
     out["eye_sync_measured_frames"] = MeasuredEyeSync(&late);  // from the pixels, -1 = not measured
     out["eye_sync_late_eye"] = late > 0 ? "right" : late < 0 ? "left" : "none";
     out["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
-                     {"delta_e", b.maxDeltaE}};
+                     {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}};
     json alerts = json::array();
     for (const rig::Alert& al : rig_.Alerts())
         alerts.push_back({{"what", al.what}, {"timecode", al.timecode}, {"time", al.wallClock}, {"open", al.end < 0}});
@@ -429,10 +436,11 @@ bool Station::DispatchTool(const std::string& tool, const std::string& argsJson,
         num("far_pct", b.farPct);
         num("vertical_px", b.maxVerticalPx);
         num("delta_e", b.maxDeltaE);
+        num("edge_pct", b.edgePct);
         if (!(b.nearPct < b.farPct)) return err("near_pct must be below far_pct");
         rig_.SetBudget(b);
         result = json{{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
-                      {"delta_e", b.maxDeltaE}}.dump();
+                      {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}}.dump();
         return true;
     }
     if (tool == "snapshot") {
@@ -709,7 +717,28 @@ void Station::BuildRigSection(bool stereo) {
     std::snprintf(v, sizeof(v), "%+.1f%% .. %+.1f%%", r.nearPct, r.farPct);
     const float over = std::max(b.nearPct - r.nearPct, r.farPct - b.farPct);
     Graded("Depth range", v, std::max(0.0f, over) + 0.01f, 0.05f);
-    ImGui::TextDisabled("budget %+.1f%% .. %+.1f%%  (R: 60 s history)", b.nearPct, b.farPct);
+    // Edge violations: something in front of the screen cut off by the left / right frame
+    // edge. Shown as the worse of the two edges; "-" when neither band has enough texture.
+    {
+        const rig::EdgeSide& L = r.edge[0];
+        const rig::EdgeSide& R = r.edge[1];
+        const bool lBad = L.measured && L.parallaxPct < b.edgePct, rBad = R.measured && R.parallaxPct < b.edgePct;
+        if (!L.measured && !R.measured) {
+            ImGui::TextUnformatted("Frame edges");
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.56f);
+            ImGui::TextDisabled("-");
+        } else {
+            if (lBad && rBad)
+                std::snprintf(v, sizeof(v), "L %+.1f%%  R %+.1f%%", L.parallaxPct, R.parallaxPct);
+            else if (lBad || rBad)
+                std::snprintf(v, sizeof(v), "%s %+.1f%%", lBad ? "left" : "right", lBad ? L.parallaxPct : R.parallaxPct);
+            else
+                std::snprintf(v, sizeof(v), "OK");
+            const float worst = std::min(L.measured ? L.parallaxPct : 0.0f, R.measured ? R.parallaxPct : 0.0f);
+            Graded("Frame edges", v, std::max(0.0f, b.edgePct - worst) + 0.01f, 0.05f);
+        }
+    }
+    ImGui::TextDisabled("budget %+.1f%% .. %+.1f%%, edges %+.1f%%  (R: 60 s history)", b.nearPct, b.farPct, b.edgePct);
     const std::vector<rig::Alert> alerts = rig_.Alerts();
     if (!alerts.empty()) {
         const rig::Alert& al = alerts.back();

@@ -245,11 +245,77 @@ bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, E
 
 namespace {
 
-// Block-match `right` against templates cut from `left` (NCC, coarse then fine, sub-pixel
-// peak, uniqueness against periodic texture). One entry per accepted block: its parallax
-// dx, vertical offset dy (analysis px, right minus left) and template x; the normalised
-// centre goes to r when given. With `mask`, only blocks whose centre is marked (want =
-// true) or not marked (want = false) are matched.
+// One block: the template at (bx, by) of `a`, searched for in `b` over dx in [-R, R] and
+// dy in [-D, D], clipped to the frame (NCC, coarse then fine, sub-pixel peak, uniqueness
+// against periodic texture). On success dx / dy are where it sits in `b` minus where it
+// sits in `a`, analysis px. tpl is scratch (bs * bs).
+bool MatchAt(const std::vector<float>& a, const std::vector<float>& b, int W, int H, const Options& o, int bx, int by,
+             int R, int D, std::vector<float>& tpl, float& outDx, float& outDy) {
+    const int bs = o.block;
+    float mean = 0;
+    for (int j = 0; j < bs; ++j)
+        for (int i = 0; i < bs; ++i) mean += a[(size_t)(by + j) * W + bx + i];
+    mean /= (float)(bs * bs);
+    float norm = 0;
+    for (int j = 0; j < bs; ++j)
+        for (int i = 0; i < bs; ++i) {
+            const float v = a[(size_t)(by + j) * W + bx + i] - mean;
+            tpl[(size_t)j * bs + i] = v;
+            norm += v * v;
+        }
+    const float sd = std::sqrt(norm / (float)(bs * bs));
+    if (sd < o.minTexture) return false;
+    norm = std::sqrt(norm);
+    const int dxLo = std::max(-R, -bx), dxHi = std::min(R, W - bs - bx);
+    const int dyLo = std::max(-D, -by), dyHi = std::min(D, H - bs - by);
+    // coarse (step 2), then refine (+-2, step 1)
+    float best = -2.f;
+    int bdx = 0, bdy = 0;
+    for (int dy = dyLo; dy <= dyHi; dy += 2)
+        for (int dx = dxLo; dx <= dxHi; dx += 2) {
+            const float c = Ncc(b, W, tpl.data(), norm, bs, bx + dx, by + dy);
+            if (c > best) {
+                best = c;
+                bdx = dx;
+                bdy = dy;
+            }
+        }
+    const int cx = bdx, cy = bdy;
+    for (int dy = std::max(dyLo, cy - 2); dy <= std::min(dyHi, cy + 2); ++dy)
+        for (int dx = std::max(dxLo, cx - 2); dx <= std::min(dxHi, cx + 2); ++dx) {
+            const float c = Ncc(b, W, tpl.data(), norm, bs, bx + dx, by + dy);
+            if (c > best) {
+                best = c;
+                bdx = dx;
+                bdy = dy;
+            }
+        }
+    if (best < o.minNcc) return false;
+    // a peak on the edge of the search window is not a peak: the real match may
+    // be outside, and such blocks read as the search limit itself (a +8 % "far"
+    // alert from a 1.5 % scene, tmp-mp-pro 2026-10-18)
+    if (bdx <= dxLo + 2 || bdx >= dxHi - 2 || bdy <= dyLo || bdy >= dyHi) return false;
+    // uniqueness: no rival as good >= 4 px away along the row (periodic texture)
+    float rival = -2.f;
+    for (int dx = dxLo; dx <= dxHi; dx += 2)
+        if (std::abs(dx - bdx) >= 4) rival = std::max(rival, Ncc(b, W, tpl.data(), norm, bs, bx + dx, by + bdy));
+    if (rival > best - 0.05f) return false;
+    float fx = 0, fy = 0;
+    if (bdx > dxLo && bdx < dxHi)
+        fx = SubPixel(Ncc(b, W, tpl.data(), norm, bs, bx + bdx - 1, by + bdy), best,
+                      Ncc(b, W, tpl.data(), norm, bs, bx + bdx + 1, by + bdy));
+    if (bdy > dyLo && bdy < dyHi)
+        fy = SubPixel(Ncc(b, W, tpl.data(), norm, bs, bx + bdx, by + bdy - 1), best,
+                      Ncc(b, W, tpl.data(), norm, bs, bx + bdx, by + bdy + 1));
+    outDx = (float)bdx + fx;
+    outDy = (float)bdy + fy;
+    return true;
+}
+
+// Block-match `right` against templates cut from `left` (MatchAt). One entry per accepted
+// block: its parallax dx, vertical offset dy (analysis px, right minus left) and template
+// x; the normalised centre goes to r when given. With `mask`, only blocks whose centre is
+// marked (want = true) or not marked (want = false) are matched.
 void MatchBlocks(const std::vector<float>& left, const std::vector<float>& right, int W, int H, const Options& o,
                  const std::vector<uint8_t>* mask, bool want, std::vector<float>& dxs, std::vector<float>& dys,
                  std::vector<float>& xs, Result* r, std::vector<int>* ids = nullptr) {
@@ -260,65 +326,10 @@ void MatchBlocks(const std::vector<float>& left, const std::vector<float>& right
     for (int by = D + 2; by + bs + D + 2 <= H; by += o.step) {
         for (int bx = 2; bx + bs + 2 <= W; bx += o.step) {
             if (mask && ((*mask)[(size_t)(by + bs / 2) * W + bx + bs / 2] != 0) != want) continue;
-            // template: centred left block
-            float mean = 0;
-            for (int j = 0; j < bs; ++j)
-                for (int i = 0; i < bs; ++i) mean += left[(size_t)(by + j) * W + bx + i];
-            mean /= (float)(bs * bs);
-            float norm = 0;
-            for (int j = 0; j < bs; ++j)
-                for (int i = 0; i < bs; ++i) {
-                    const float v = left[(size_t)(by + j) * W + bx + i] - mean;
-                    tpl[(size_t)j * bs + i] = v;
-                    norm += v * v;
-                }
-            const float sd = std::sqrt(norm / (float)(bs * bs));
-            if (sd < o.minTexture) continue;
-            norm = std::sqrt(norm);
-            const int dxLo = std::max(-R, -bx), dxHi = std::min(R, W - bs - bx);
-            const int dyLo = std::max(-D, -by), dyHi = std::min(D, H - bs - by);
-            // coarse (step 2), then refine (+-2, step 1)
-            float best = -2.f;
-            int bdx = 0, bdy = 0;
-            for (int dy = dyLo; dy <= dyHi; dy += 2)
-                for (int dx = dxLo; dx <= dxHi; dx += 2) {
-                    const float c = Ncc(right, W, tpl.data(), norm, bs, bx + dx, by + dy);
-                    if (c > best) {
-                        best = c;
-                        bdx = dx;
-                        bdy = dy;
-                    }
-                }
-            const int cx = bdx, cy = bdy;
-            for (int dy = std::max(dyLo, cy - 2); dy <= std::min(dyHi, cy + 2); ++dy)
-                for (int dx = std::max(dxLo, cx - 2); dx <= std::min(dxHi, cx + 2); ++dx) {
-                    const float c = Ncc(right, W, tpl.data(), norm, bs, bx + dx, by + dy);
-                    if (c > best) {
-                        best = c;
-                        bdx = dx;
-                        bdy = dy;
-                    }
-                }
-            if (best < o.minNcc) continue;
-            // a peak on the edge of the search window is not a peak: the real match may
-            // be outside, and such blocks read as the search limit itself (a +8 % "far"
-            // alert from a 1.5 % scene, tmp-mp-pro 2026-10-18)
-            if (bdx <= dxLo + 2 || bdx >= dxHi - 2 || bdy <= dyLo || bdy >= dyHi) continue;
-            // uniqueness: no rival as good >= 4 px away along the row (periodic texture)
-            float rival = -2.f;
-            for (int dx = dxLo; dx <= dxHi; dx += 2)
-                if (std::abs(dx - bdx) >= 4)
-                    rival = std::max(rival, Ncc(right, W, tpl.data(), norm, bs, bx + dx, by + bdy));
-            if (rival > best - 0.05f) continue;
-            float fx = 0, fy = 0;
-            if (bdx > dxLo && bdx < dxHi)
-                fx = SubPixel(Ncc(right, W, tpl.data(), norm, bs, bx + bdx - 1, by + bdy), best,
-                              Ncc(right, W, tpl.data(), norm, bs, bx + bdx + 1, by + bdy));
-            if (bdy > dyLo && bdy < dyHi)
-                fy = SubPixel(Ncc(right, W, tpl.data(), norm, bs, bx + bdx, by + bdy - 1), best,
-                              Ncc(right, W, tpl.data(), norm, bs, bx + bdx, by + bdy + 1));
-            dxs.push_back((float)bdx + fx);
-            dys.push_back((float)bdy + fy);
+            float dx, dy;
+            if (!MatchAt(left, right, W, H, o, bx, by, R, D, tpl, dx, dy)) continue;
+            dxs.push_back(dx);
+            dys.push_back(dy);
             xs.push_back((float)bx + bs * 0.5f);
             if (ids) ids->push_back(by * W + bx);
             if (r) {
@@ -329,12 +340,50 @@ void MatchBlocks(const std::vector<float>& left, const std::vector<float>& right
     }
 }
 
+// Edge (window) violations: blocks in a band along each frame edge, matched from the eye
+// whose image of a foreground object is nearer that edge (EdgeSide), on a denser column
+// step than the main grid so a narrow band still has several columns.
+void MeasureEdges(const EyePair& e, const Options& o, Result& r) {
+    const int bs = o.block, W = e.eyeW, H = e.h;
+    const int R = std::max(2, (int)std::lround(o.maxParallaxPct / 100.f * W));
+    const int D = o.maxDy;
+    const int band = std::max(bs + 4, (int)std::lround(o.edgeBandPct / 100.f * W));
+    const int xStep = std::max(2, bs / 2);
+    std::vector<float> tpl((size_t)bs * bs);
+    for (int side = 0; side < 2; ++side) {
+        EdgeSide& es = r.edge[side];
+        // left edge: right-eye blocks found in the left eye (parallax = right - left = -dx);
+        // right edge: left-eye blocks found in the right eye (parallax = dx)
+        const std::vector<float>& a = side == 0 ? e.right : e.left;
+        const std::vector<float>& b = side == 0 ? e.left : e.right;
+        for (int by = D + 2; by + bs + D + 2 <= H; by += o.step) {
+            for (int k = 0;; ++k) {
+                const int bx = side == 0 ? 2 + k * xStep : W - bs - 2 - k * xStep;
+                const int inner = side == 0 ? bx + bs : W - bx;  // how far in the block reaches
+                if (inner > band || bx < 2 || bx + bs + 2 > W) break;
+                float dx, dy;
+                if (!MatchAt(a, b, W, H, o, bx, by, R, D, tpl, dx, dy)) continue;
+                es.matchY.push_back(((float)by + bs * 0.5f) / (float)H);
+                es.parallax.push_back((side == 0 ? -dx : dx) / (float)W * 100.f);
+            }
+        }
+        es.measured = (int)es.parallax.size() >= std::max(1, o.edgeMinMatches);
+        if (es.measured) {
+            // the 2nd most in front: one stray block does not make a violation
+            std::vector<float> v = es.parallax;
+            std::sort(v.begin(), v.end());
+            es.parallaxPct = v[std::min<size_t>(1, v.size() - 1)];
+        }
+    }
+}
+
 }  // namespace
 
 Result Measure(const EyePair& e, const Options& o) {
     Result r;
     const int bs = o.block, W = e.eyeW, H = e.h;
     if (W < 4 * bs || H < 4 * bs) return r;
+    MeasureEdges(e, o, r);
     std::vector<float> dxs, dys, xs;
     MatchBlocks(e.left, e.right, W, H, o, nullptr, true, dxs, dys, xs, &r);
     // Outlier cut (median +- k x MAD) before any statistic: a block that locked onto the
@@ -842,6 +891,10 @@ void RigMonitor::Worker() {
         s.eyeOffsetFrames = eyeOffset;
         s.eyeSyncMeasured = r.eyeSyncMeasuredFrames;
         s.eyeSyncLateEye = r.eyeSyncLateEye;
+        for (int i = 0; i < 2; ++i) {
+            s.edgeMeasured[i] = r.edge[i].measured;
+            s.edgePct[i] = r.edge[i].parallaxPct;
+        }
         AddSampleLocked(s, tc);
     }
 }
@@ -859,17 +912,21 @@ void RigMonitor::AddSampleLocked(const Sample& s, const std::string& tc) {
 
 namespace {
 // The alert texts, per run: near, far, vertical, colour.
-const char* const kClosedFmt[4] = {
+const char* const kClosedFmt[6] = {
     "Foreground at %+.1f%% for %.0f s (near limit %+.1f%%)",
     "Background at %+.1f%% for %.0f s (far limit %+.1f%%)",
     "Vertical error %.1f px for %.0f s (limit %.1f px)",
     "Colour mismatch dE %.1f for %.0f s (limit %.1f)",
+    "Left edge violation at %+.1f%% for %.0f s (edge limit %+.1f%%)",
+    "Right edge violation at %+.1f%% for %.0f s (edge limit %+.1f%%)",
 };
-const char* const kOpenFmt[4] = {
+const char* const kOpenFmt[6] = {
     "Foreground at %+.1f%% for %.0f s (now)",
     "Background at %+.1f%% for %.0f s (now)",
     "Vertical error %.1f px for %.0f s (now)",
     "Colour mismatch dE %.1f for %.0f s (now)",
+    "Left edge violation at %+.1f%% for %.0f s (now)",
+    "Right edge violation at %+.1f%% for %.0f s (now)",
 };
 // An open run is closed when the picture has not measured for this long (a cut to black,
 // a lost signal): it would otherwise stay "now" until the next good sample.
@@ -882,7 +939,8 @@ void RigMonitor::CloseRun(int i, double end, const std::string& endTc) {
     if (r.since < 0) return;
     const double dur = end - r.since;
     if (dur >= 0.5) {
-        const float limits[] = {budget_.nearPct, budget_.farPct, budget_.maxVerticalPx, budget_.maxDeltaE};
+        const float limits[kRuns] = {budget_.nearPct, budget_.farPct, budget_.maxVerticalPx,
+                                     budget_.maxDeltaE, budget_.edgePct, budget_.edgePct};
         Alert a;
         a.start = r.since;
         a.end = end;
@@ -905,16 +963,20 @@ void RigMonitor::UpdateAlerts(const Sample& s, const std::string& tc) {
     if (!s.ok) {
         if (notOkSince_ < 0) notOkSince_ = s.t;
         if (s.t - notOkSince_ >= kAlertExpireSec && lastGoodT_ >= 0)
-            for (int i = 0; i < 4; ++i) CloseRun(i, lastGoodT_, lastGoodTc_);
+            for (int i = 0; i < kRuns; ++i) CloseRun(i, lastGoodT_, lastGoodTc_);
         return;
     }
     notOkSince_ = -1;
     lastGoodT_ = s.t;
     lastGoodTc_ = tc;
-    const bool over[4] = {s.nearPct < budget_.nearPct, s.farPct > budget_.farPct,
-                          std::fabs(s.verticalPx) > budget_.maxVerticalPx, s.deltaE > budget_.maxDeltaE};
-    const float value[4] = {s.nearPct, s.farPct, std::fabs(s.verticalPx), s.deltaE};
-    for (int i = 0; i < 4; ++i) {
+    const bool over[kRuns] = {s.nearPct < budget_.nearPct,
+                              s.farPct > budget_.farPct,
+                              std::fabs(s.verticalPx) > budget_.maxVerticalPx,
+                              s.deltaE > budget_.maxDeltaE,
+                              s.edgeMeasured[0] && s.edgePct[0] < budget_.edgePct,
+                              s.edgeMeasured[1] && s.edgePct[1] < budget_.edgePct};
+    const float value[kRuns] = {s.nearPct, s.farPct, std::fabs(s.verticalPx), s.deltaE, s.edgePct[0], s.edgePct[1]};
+    for (int i = 0; i < kRuns; ++i) {
         Run& r = runs_[i];
         if (over[i]) {
             if (r.since < 0) {
@@ -923,7 +985,8 @@ void RigMonitor::UpdateAlerts(const Sample& s, const std::string& tc) {
                 r.tc = tc;
                 r.clock = WallClock(s.t);
             } else {
-                r.worst = i == 0 ? std::min(r.worst, value[i]) : std::max(r.worst, value[i]);  // near: lower is worse
+                const bool lowerIsWorse = i == 0 || i >= 4;  // near and the edges: further in front is worse
+                r.worst = lowerIsWorse ? std::min(r.worst, value[i]) : std::max(r.worst, value[i]);
             }
         } else {
             CloseRun(i, s.t, tc);
@@ -972,7 +1035,7 @@ std::vector<Alert> RigMonitor::Alerts() const {
     std::vector<Alert> a = alerts_;
     // an overrun still in progress shows as an open alert
     const double now = history_.empty() ? 0.0 : history_.back().t;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kRuns; ++i) {
         const Run& r = runs_[i];
         if (r.since < 0 || now - r.since < 0.5) continue;
         Alert x;

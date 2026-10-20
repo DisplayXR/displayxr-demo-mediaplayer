@@ -49,7 +49,7 @@ public:
         std::string cdlPath;
         // Media Player Pro station (src/pro/Station.h); ignored by the base player.
         std::vector<std::string> proInputs;  // --input="Name=spec", --decklink..., --test-signal
-        float proBudget[4] = {-2.0f, 1.0f, 1.0f, 2.0f};  // near %, far %, vertical px, dE
+        float proBudget[5] = {-2.0f, 1.0f, 1.0f, 2.0f, -0.3f};  // near %, far %, vertical px, dE, edge %
         bool proTimecode = true;             // --no-timecode
         double proSeqFps = 24.0;             // --seq-fps: EXR / DPX / TIFF sequence rate
         std::string proCompare;              // --compare=<file>: the B clip (B swaps A/B)

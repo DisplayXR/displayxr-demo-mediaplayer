@@ -610,6 +610,33 @@ void ProController::BuildDepthOverlay(const Status& st) {
         dl->AddCircleFilled(c, rad, ImGui::GetColorU32(col));
         if (p < b.nearPct || p > b.farPct) dl->AddCircle(c, rad * 1.9f, IM_COL32(255, 60, 50, 255), 0, 2.0f);
     }
+    // Edge violations: a red bar along the frame edge over the rows where something in
+    // front of the screen is cut off by it (the band's matches past the edge limit).
+    for (int side = 0; side < 2; ++side) {
+        const rig::EdgeSide& es = r.edge[side];
+        if (!es.measured || es.parallaxPct >= b.edgePct) continue;
+        float y0 = 2.f, y1 = -1.f;
+        for (size_t i = 0; i < es.parallax.size(); ++i)
+            if (es.parallax[i] < b.edgePct) {
+                y0 = std::min(y0, es.matchY[i]);
+                y1 = std::max(y1, es.matchY[i]);
+            }
+        if (y1 < y0) continue;
+        const float half = 0.04f;  // a match stands for the rows around it
+        const float u = ((side == 0 ? 0.f : 1.f) - panX_) * zoom_;
+        if (u < 0.f || u > 1.f) continue;  // that edge is panned out of view
+        const float v0 = std::clamp((y0 - half - panY_) * zoom_, 0.f, 1.f);
+        const float v1 = std::clamp((y1 + half - panY_) * zoom_, 0.f, 1.f);
+        if (v1 <= v0) continue;
+        const float x = (px + u * pw) * W, bw = std::max(4.0f, W * 0.004f);
+        const float xa = side == 0 ? x : x - bw, xb = side == 0 ? x + bw : x;
+        dl->AddRectFilled(ImVec2(xa, (py + v0 * ph) * H), ImVec2(xb, (py + v1 * ph) * H), IM_COL32(255, 60, 50, 235));
+        char t[48];
+        std::snprintf(t, sizeof(t), "EDGE %+.1f%%", es.parallaxPct);
+        const ImVec2 ts = ImGui::CalcTextSize(t);
+        const float tx = side == 0 ? xb + 6.0f : xa - 6.0f - ts.x;
+        dl->AddText(ImVec2(tx, (py + v0 * ph) * H + 2.0f), IM_COL32(255, 90, 80, 255), t);
+    }
     char legend[96];
     std::snprintf(legend, sizeof(legend), "Depth overlay (D): near %+.1f%%  far %+.1f%%  budget %+.1f..%+.1f%%", r.nearPct,
                   r.farPct, b.nearPct, b.farPct);

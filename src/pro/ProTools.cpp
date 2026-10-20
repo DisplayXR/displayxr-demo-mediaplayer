@@ -41,15 +41,18 @@ void ProController::RegisterTools(const RegisterFn& reg) {
     reg("get_rig_status",
         "Read the live rig checks for a side-by-side stereo source: vertical error (full-res px, + = "
         "right eye lower), roll (degrees), near / far screen parallax (% of eye width, negative = in "
-        "front of the screen), colour match between the eyes (CIE76 dE), eye sync (frames between "
+        "front of the screen), edge violations (edge_left_pct / edge_right_pct: the most in-front "
+        "parallax along each frame edge, null = not measured), colour match between the eyes (CIE76 dE), eye sync (frames between "
         "the paired inputs, -1 = unknown), the depth budget, recent alerts with timecode, and the "
         "source timecode and capture-to-screen delay.",
         "{\"type\":\"object\"}");
     reg("set_depth_budget",
         "Set the limits the rig checks alert on: near / far parallax in % of eye width (near "
-        "negative = in front), vertical error in px, colour match in dE.",
+        "negative = in front), vertical error in px, colour match in dE, and edge_pct: the nearest "
+        "parallax allowed at the left / right frame edge (an edge violation below it).",
         "{\"type\":\"object\",\"properties\":{\"near_pct\":{\"type\":\"number\"},\"far_pct\":{\"type\":\"number\"},"
-        "\"vertical_px\":{\"type\":\"number\"},\"delta_e\":{\"type\":\"number\"}}}");
+        "\"vertical_px\":{\"type\":\"number\"},\"delta_e\":{\"type\":\"number\"},"
+        "\"edge_pct\":{\"type\":\"number\"}}}");
     reg("set_depth_overlay", "Show or hide the depth overlay (the rig check's matches on the picture).",
         "{\"type\":\"object\",\"properties\":{\"on\":{\"type\":\"boolean\"}},\"required\":[\"on\"]}");
     reg("snapshot",
