@@ -98,6 +98,8 @@ bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, b
             o.proBudget[2] = (float)std::atof(a.c_str() + 17);
         } else if (a.rfind("--colour-limit=", 0) == 0) {
             o.proBudget[3] = (float)std::atof(a.c_str() + 15);
+        } else if (a.rfind("--edge-limit=", 0) == 0) {
+            o.proBudget[4] = (float)std::atof(a.c_str() + 13);
         } else if (a == "--no-timecode") {
             o.proTimecode = false;
         } else if (a.rfind("--seq-fps=", 0) == 0) {

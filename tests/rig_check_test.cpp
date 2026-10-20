@@ -197,6 +197,83 @@ void TooFewMatches() {
     CHECK(!r.ok, "a handful of matches is not a measurement");
 }
 
+// Edge (window) violations. A synthetic pair: a textured background at the screen plane
+// (identical in both eyes) and a textured box of its own, at x0..x0+w of the left eye and
+// shifted by parallaxPx in the right (right minus left; negative = in front of the screen).
+float Cell(int x, int y, uint32_t seed) {
+    uint32_t h = (uint32_t)((x >> 2) * 73856093) ^ (uint32_t)((y >> 2) * 19349663) ^ seed;
+    h = (h ^ (h >> 13)) * 0x5bd1e995u;
+    return (float)(40 + ((h >> 24) % 170));
+}
+
+rig::EyePair EdgeScene(int x0, int w, int parallaxPx) {
+    rig::EyePair e;
+    e.eyeW = 640;
+    e.h = 360;
+    e.fullEyeW = 640;
+    e.fullH = 360;
+    e.left.resize((size_t)e.eyeW * e.h);
+    e.right.resize(e.left.size());
+    const int y0 = 110, y1 = 250;
+    for (int y = 0; y < e.h; ++y)
+        for (int x = 0; x < e.eyeW; ++x) {
+            const bool inY = y >= y0 && y < y1;
+            const int lx = x - x0, rx = x - x0 - parallaxPx;  // box-local x in each eye
+            e.left[(size_t)y * e.eyeW + x] = inY && lx >= 0 && lx < w ? Cell(lx, y, 777u) : Cell(x, y, 31u);
+            e.right[(size_t)y * e.eyeW + x] = inY && rx >= 0 && rx < w ? Cell(rx, y, 777u) : Cell(x, y, 31u);
+        }
+    for (int i = 0; i < 2; ++i)
+        for (int c = 0; c < 3; ++c) e.meanRgb[i][c] = 0.5f;
+    return e;
+}
+
+void EdgeViolations() {
+    const rig::Budget b;
+    const float px2pct = 100.f / 640.f;
+    // a box in front (-13 px = -2.0 %) cut by the left edge
+    rig::Result r = rig::Measure(EdgeScene(-20, 140, -13));
+    std::printf("  left edge, in front: L measured=%d %.2f%% (%zu)  R measured=%d %.2f%%\n", r.edge[0].measured,
+                r.edge[0].parallaxPct, r.edge[0].parallax.size(), r.edge[1].measured, r.edge[1].parallaxPct);
+    CHECK(r.edge[0].measured && std::fabs(r.edge[0].parallaxPct + 13 * px2pct) < 0.3f, "left edge reads the box's -2%");
+    CHECK(r.edge[0].measured && r.edge[0].parallaxPct < b.edgePct, "left edge violation flagged");
+    CHECK(r.edge[1].measured && r.edge[1].parallaxPct >= b.edgePct, "right edge clean");
+    // the same at the right edge
+    r = rig::Measure(EdgeScene(640 - 120, 140, -13));
+    std::printf("  right edge, in front: L %.2f%%  R measured=%d %.2f%%\n", r.edge[0].parallaxPct, r.edge[1].measured,
+                r.edge[1].parallaxPct);
+    CHECK(r.edge[1].measured && std::fabs(r.edge[1].parallaxPct + 13 * px2pct) < 0.3f, "right edge reads the box's -2%");
+    CHECK(r.edge[0].measured && r.edge[0].parallaxPct >= b.edgePct, "left edge clean");
+    // behind the screen at the edge is fine (the window is in front of it)
+    r = rig::Measure(EdgeScene(-20, 140, 7));
+    std::printf("  left edge, behind: L measured=%d %.2f%%\n", r.edge[0].measured, r.edge[0].parallaxPct);
+    CHECK(!(r.edge[0].measured && r.edge[0].parallaxPct < b.edgePct), "behind the screen at the edge is not a violation");
+    // in front but in the middle of the frame: depth, not an edge violation
+    r = rig::Measure(EdgeScene(250, 140, -13));
+    std::printf("  centre, in front: near %.2f%%  L %.2f%%  R %.2f%%\n", r.nearPct, r.edge[0].parallaxPct,
+                r.edge[1].parallaxPct);
+    CHECK(r.ok && r.nearPct < -1.5f, "the centre box is seen as near");
+    CHECK(r.edge[0].measured && r.edge[1].measured, "both edges measured on a textured background");
+    CHECK(r.edge[0].parallaxPct >= b.edgePct && r.edge[1].parallaxPct >= b.edgePct, "no edge violation");
+}
+
+void EdgeAlert() {
+    rig::RigMonitor m;
+    for (int i = 0; i <= 10; ++i) {
+        rig::Sample s;
+        s.t = 2000.0 + i * 0.25;
+        s.ok = true;
+        s.farPct = 0.5f;
+        s.edgeMeasured[0] = s.edgeMeasured[1] = true;
+        s.edgePct[0] = i < 8 ? -1.5f : 0.0f;  // 2 s cut off by the left edge, then clear
+        s.edgePct[1] = 0.0f;
+        m.AddSample(s, "01:00:00:00");
+    }
+    const std::vector<rig::Alert> a = m.Alerts();
+    std::printf("  edge alert: %s\n", a.empty() ? "(none)" : a.back().what.c_str());
+    CHECK(a.size() == 1 && a[0].end >= 0, "one closed edge alert");
+    CHECK(!a.empty() && a[0].what.find("Left edge violation at -1.5%") == 0, "named by side, with the worst parallax");
+}
+
 void AlertClosesOnBlack() {
     rig::RigMonitor m;
     rig::Budget b;
@@ -446,6 +523,8 @@ int main() {
     EyeSwap();
     RollFault();
     TooFewMatches();
+    EdgeViolations();
+    EdgeAlert();
     AlertClosesOnBlack();
     SyncConfirmVotes();
     EyeSyncMeasured();

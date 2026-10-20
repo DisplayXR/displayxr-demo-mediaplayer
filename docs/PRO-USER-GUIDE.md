@@ -147,12 +147,17 @@ For a live stereo rig (a capture card, a camera, or the built-in test signal):
 - The **Source** section shows the input, its timecode (**`T`** shows / hides it) and the
   measured delay from capture to screen.
 - The **Rig check** section (Inspector) measures the rig continuously: vertical error, roll,
-  eye sync, colour match between the eyes and the depth range against your depth budget.
+  eye sync, colour match between the eyes, the depth range against your depth budget, and
+  **frame edges**: something in front of the screen that the left or right edge of the frame
+  cuts off (an *edge violation* - one eye sees more of it than the other, and it reads as
+  poking through a window). The line says *OK*, or which edge and how far in front.
   Problems that last become **alerts**, logged with their timecode to
   `Pictures\DisplayXR\station_alerts.jsonl`.
 - **`R`** shows a 60-second history strip of depth and vertical error.
 - **`D`** draws the rig check's depth on the picture: warm colours in front of the screen,
-  white on it, blue behind, ringed in red where it breaks the budget.
+  white on it, blue behind, ringed in red where it breaks the budget. An edge violation
+  shows as a red bar along that edge of the picture, over the rows where it happens, with
+  its parallax (`EDGE -2.5%`).
 
 ## Snapshots
 

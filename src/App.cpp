@@ -3551,6 +3551,7 @@ void App::InitPro() {
     so.budget.farPct = launch_.proBudget[1];
     so.budget.maxVerticalPx = launch_.proBudget[2];
     so.budget.maxDeltaE = launch_.proBudget[3];
+    so.budget.edgePct = launch_.proBudget[4];
     so.timecode = launch_.proTimecode;
     so.startFirstInput = !hasMedia_ || isLogo_;  // a file / camera / URL from the command line wins
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_VSHIFT")) so.testCfg.vShiftPx = (float)std::atof(e);

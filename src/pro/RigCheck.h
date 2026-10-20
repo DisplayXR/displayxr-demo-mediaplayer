@@ -9,6 +9,9 @@
 //                   front of the screen (crossed), positive = behind
 //   colour match    CIE76 delta-E between the two eyes' mean colours (the same scene
 //                   through two cameras should match; > ~2 is visible)
+//   frame edges     edge (window) violations: something in front of the screen that the
+//                   left or right frame edge cuts off - one eye sees more of it than the
+//                   other, and the eyes read the frame as a window it pokes through
 //   eye sync        from the source (two inputs paired by timecode) when it has one, and
 //                   MEASURED from the pixels: a short burst of consecutive frames, each
 //                   eye compared against the other eye's last K frames (MeasureEyeSync)
@@ -50,6 +53,18 @@ struct EyePair {
 bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, EyePair& out,
                 bool swapEyes = false);
 
+// One frame edge: the matches in a band along it. Something in front of the screen sits
+// further left in the right eye than in the left, so at the LEFT edge its blocks are taken
+// from the right eye and found further in, in the left eye; at the right edge, from the
+// left eye into the right. (The main grid matches left into right only, and at the left
+// edge that search would have to go past the frame - which is the violation itself.)
+struct EdgeSide {
+    bool measured = false;      // enough matches in the band to say
+    float parallaxPct = 0.f;    // the 2nd most in-front parallax in the band (% of eye width)
+    std::vector<float> matchY;  // matches in the band, 0..1 of the eye height
+    std::vector<float> parallax;  // and their parallax, %
+};
+
 struct Result {
     bool ok = false;
     int matches = 0;              // confident block matches used
@@ -67,6 +82,7 @@ struct Result {
     // eye is late, -1 the left, 0 in step / unknown.
     int eyeSyncMeasuredFrames = -1;
     int eyeSyncLateEye = 0;
+    EdgeSide edge[2];             // 0 = left frame edge, 1 = right
 };
 
 struct Options {
@@ -77,6 +93,8 @@ struct Options {
     float minNcc = 0.80f;
     float minTexture = 6.f;       // block luma std below this is too flat to match
     int minMatches = 20;          // fewer inliers than this = not measured
+    float edgeBandPct = 6.f;      // width of the band along each frame edge, % of eye width
+    int edgeMinMatches = 2;       // fewer matches in a band than this = that edge not measured
 };
 
 Result Measure(const EyePair& e, const Options& o = {});
@@ -147,6 +165,7 @@ struct Budget {
     float farPct = 1.0f;    // farthest allowed (behind)
     float maxVerticalPx = 1.0f;
     float maxDeltaE = 2.0f;
+    float edgePct = -0.3f;  // nearest parallax allowed at the left / right frame edge
 };
 
 struct Sample {
@@ -156,6 +175,8 @@ struct Sample {
     int eyeOffsetFrames = -1;       // from the source's timecodes (-1 unknown)
     int eyeSyncMeasured = -1;       // measured from the pixels (-1 not measured)
     int eyeSyncLateEye = 0;         // +1 right late, -1 left late
+    bool edgeMeasured[2] = {};      // left, right frame edge
+    float edgePct[2] = {};
 };
 
 struct Alert {
@@ -221,13 +242,14 @@ private:
     StereoLayout pendingLayout_ = StereoLayout::SbsFull;
     bool pendingSwap_ = false;
     uint64_t generation_ = 0;  // bumped by Reset: a measurement started before it is dropped
-    // open alert runs: near, far, vertical, colour
+    // open alert runs: near, far, vertical, colour, left edge, right edge
+    static constexpr int kRuns = 6;
     struct Run {
         double since = -1;
         float worst = 0;
         std::string tc, clock;
     };
-    Run runs_[4];
+    Run runs_[kRuns];
     void CloseRun(int i, double end, const std::string& endTc);
     // the last measured sample, for closing runs when the picture stops measuring
     double lastGoodT_ = -1.0, notOkSince_ = -1.0;
