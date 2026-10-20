@@ -309,6 +309,10 @@ function(mp_add_player tgt is_pro)
         set_target_properties(${tgt} PROPERTIES WIN32_EXECUTABLE TRUE)
         # Embedded Explorer icon + version info (icon from the 2D workspace logo).
         target_sources(${tgt} PRIVATE windows/resource.rc)
+        # rc.exe does not report the .ico it embeds as a dependency, so a changed logo would
+        # not rebuild the exe without this.
+        set_source_files_properties(windows/resource.rc PROPERTIES OBJECT_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/displayxr/icon.ico;${CMAKE_CURRENT_SOURCE_DIR}/displayxr/icon_pro.ico")
     endif()
 
     target_include_directories(${tgt} PRIVATE

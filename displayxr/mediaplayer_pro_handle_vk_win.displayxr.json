@@ -6,7 +6,7 @@
   "category": "app",
   "display_mode": "auto",
   "description": "3D monitoring and review: live stereo inputs, LUT and CDL looks, convergence, QC views",
-  "icon": "icon.png",
-  "icon_3d": "icon_sbs.png",
+  "icon": "icon_pro.png",
+  "icon_3d": "icon_pro_sbs.png",
   "icon_3d_layout": "sbs-lr"
 }
