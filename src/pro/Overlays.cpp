@@ -53,7 +53,10 @@ void DrawOverlays(const OverlaySettings& s, const BurnIn& b, float px, float py,
     auto toHud = [&](float u, float v) { return ImVec2(px + (u - panX) * zoom * pw, py + (v - panY) * zoom * ph); };
     const ImVec2 p0(px, py), p1(px + pw, py + ph);
     dl->PushClipRect(p0, p1, true);
-    const float thin = std::max(1.0f, ph / 540.0f);
+    // Line weight. On a lenticular panel a thin vertical line crosses the slanted lens in
+    // visible steps (panel check 2026-10-19: "the vertical yellow lines are a bit jaggy"),
+    // so lines are at least ~3 px at a 1080-line picture and scale up from there.
+    const float thin = std::max(2.0f, ph / 360.0f);
 
     if (s.frameLine > 0) {
         float fx, fy, fw, fh;
@@ -66,7 +69,7 @@ void DrawOverlays(const OverlaySettings& s, const BurnIn& b, float px, float py,
             dl->AddRectFilled(ImVec2(p0.x, a.y), ImVec2(a.x, c.y), shade);
             dl->AddRectFilled(ImVec2(c.x, a.y), ImVec2(p1.x, c.y), shade);
         }
-        dl->AddRect(a, c, IM_COL32(255, 210, 60, 230), 0.0f, 0, thin * 1.5f);
+        dl->AddRect(a, c, IM_COL32(255, 210, 60, 230), 0.0f, 0, thin * 2.0f);
         dl->AddText(ImVec2(a.x + 6.0f, a.y + 4.0f), IM_COL32(255, 210, 60, 230), FrameLineName(s.frameLine));
     }
     if (s.safeAreas) {
