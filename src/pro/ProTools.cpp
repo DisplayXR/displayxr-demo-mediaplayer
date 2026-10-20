@@ -31,12 +31,13 @@ void ProController::RegisterTools(const RegisterFn& reg) {
         "Set the QC view: 3d, left, right, difference (|left - right| x4), anaglyph or false_colour; "
         "optional zoom (1 = fit) applied to both eyes; channel isolation (rgb, red, green, blue, "
         "alpha, luma); display gamma (0.25..4, 1 = none); a wipe (off, grade = source | graded, "
-        "eyes = left eye | right eye) at wipe_pos (0..1 across the picture).",
+        "eyes = left eye | right eye, clips = this clip | the set_compare B clip) at wipe_pos (0..1 across "
+        "the picture).",
         "{\"type\":\"object\",\"properties\":{\"view\":{\"type\":\"string\",\"enum\":[\"3d\",\"left\",\"right\","
         "\"difference\",\"anaglyph\",\"false_colour\"]},\"zoom\":{\"type\":\"number\",\"minimum\":1},"
         "\"channel\":{\"type\":\"string\",\"enum\":[\"rgb\",\"red\",\"green\",\"blue\",\"alpha\",\"luma\"]},"
         "\"gamma\":{\"type\":\"number\",\"minimum\":0.25,\"maximum\":4},"
-        "\"wipe\":{\"type\":\"string\",\"enum\":[\"off\",\"grade\",\"eyes\"]},"
+        "\"wipe\":{\"type\":\"string\",\"enum\":[\"off\",\"grade\",\"eyes\",\"clips\"]},"
         "\"wipe_pos\":{\"type\":\"number\",\"minimum\":0,\"maximum\":1}}}");
     reg("get_rig_status",
         "Read the live rig checks for a side-by-side stereo source: vertical error (full-res px, + = "
@@ -167,8 +168,12 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             if (Num(a, "gamma", g)) gamma_ = std::clamp(g, 0.25f, 4.0f);
             std::string w;
             if (Str(a, "wipe", w)) {
-                const Wipe m = w == "off" ? Wipe::Off : w == "grade" ? Wipe::Grade : w == "eyes" ? Wipe::Eyes : Wipe::Count;
-                if (m == Wipe::Count) return err("wipe must be off|grade|eyes");
+                const Wipe m = w == "off"     ? Wipe::Off
+                               : w == "grade" ? Wipe::Grade
+                               : w == "eyes"  ? Wipe::Eyes
+                               : w == "clips" ? Wipe::Clips
+                                              : Wipe::Count;
+                if (m == Wipe::Count) return err("wipe must be off|grade|eyes|clips");
                 SetWipe(m, true);
             }
             float wp;

@@ -134,6 +134,16 @@ public:
                    uint32_t width, uint32_t height, int format, bool fullRange, int matrix = 0);
     int SourceMatrix() const { return sourceMatrix_; }  // last YUV upload's matrix (UI)
 
+    // Media Player Pro's clip-vs-clip wipe: a second source (B) at bindings 4..6, sampled by
+    // the MP_GRADE shader right of the wipe line (GradeParams::wipeMode 3). Same formats and
+    // upload path as UploadTexture / UploadYUV; ClearCompare drops it. The base player
+    // never calls these.
+    bool UploadCompareTexture(const uint8_t* rgba, uint32_t width, uint32_t height);
+    bool UploadCompareYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2, uint32_t width,
+                          uint32_t height, int format, bool fullRange, int matrix = 0);
+    void ClearCompare();
+    bool HasCompare() const { return compareMode_ >= 0; }
+
 #if defined(_WIN32)
     // Zero-copy (#28): bind a shared D3D11 NV12 texture (by its shared NT handle) as the
     // video source instead of uploading CPU planes. The texture is imported into Vulkan
@@ -223,8 +233,11 @@ private:
         uint32_t w = 0, h = 0;
         VkFormat fmt = VK_FORMAT_UNDEFINED;
         bool initialized = false;  // false right after (re)create -> barrier from UNDEFINED
-    } planes_[3];
+    } planes_[6];                    // 0..2 the source; 3..5 the Pro compare source (B)
     int sourceMode_ = 0;             // 0 RGBA, 1 I420, 2 NV12 (pushed to the shader)
+    int compareMode_ = -1;           // B: -1 none, else as sourceMode_
+    bool compareFullRange_ = false, compare16_ = false;
+    int compareMatrix_ = 0;
     float sourceFullRange_ = 0.0f;
     bool source16_ = false;          // P016: the MP_GRADE shader uses 10-bit limited levels
     int sourceMatrix_ = 0;           // YUV matrix pushed to the MP_GRADE shader (0 = BT.709)

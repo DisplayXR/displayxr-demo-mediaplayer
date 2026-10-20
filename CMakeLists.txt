@@ -465,6 +465,7 @@ function(mp_add_player tgt is_pro)
             src/pro/Overlays.cpp         # frame lines, safe areas, centre cross, burn-ins
             src/pro/Scopes.cpp           # waveform / parade, vectorscope, histogram (graded)
             src/pro/ProMonitor.cpp       # overlays + monitoring UI, pixel probe
+            src/pro/CompareClip.cpp      # the clip wipe's B: a second clip following A
             src/pro/OcioBake.cpp)        # OpenColorIO -> the grade's LUT (MP_OCIO_ROOT)
         target_compile_definitions(${tgt} PRIVATE MEDIAPLAYER_PRO=1)
         if(MP_HAVE_OCIO)
@@ -703,6 +704,9 @@ if(MP_BUILD_TESTS)
     add_executable(scopes_test tests/scopes_test.cpp src/pro/Scopes.cpp src/pro/Thumbnail.cpp)
     target_include_directories(scopes_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME scopes COMMAND scopes_test)
+    add_executable(compare_clip_test tests/compare_clip_test.cpp)
+    target_include_directories(compare_clip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME compare_clip COMMAND compare_clip_test)
     add_executable(overlays_test tests/overlays_test.cpp src/pro/Overlays.cpp)
     target_include_directories(overlays_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME overlays COMMAND overlays_test)

@@ -19,6 +19,7 @@
 
 #include "color/Cdl.h"
 #include "color/CubeLut.h"
+#include "pro/CompareClip.h"
 #include "pro/OcioBake.h"
 #include "pro/Overlays.h"
 #include "pro/ResolveLink.h"
@@ -41,7 +42,8 @@ const char* ViewModeName(ViewMode m);
 // Channel isolation (9 cycles) and the wipe (8 cycles), both in the grade shader.
 enum class Channel { RGB = 0, Red, Green, Blue, Alpha, Luma, Count };
 const char* ChannelName(Channel c);
-enum class Wipe { Off = 0, Grade, Eyes, Count };  // before | after the grade; left eye | right eye
+// before | after the grade; left eye | right eye; this clip | the compare clip B
+enum class Wipe { Off = 0, Grade, Eyes, Clips, Count };
 const char* WipeName(Wipe w);
 
 // Live player state the inspector shows, refreshed by App every frame.
@@ -216,9 +218,12 @@ private:
     std::mutex dialogMutex_;
     std::string dialogPath_;
     bool dialogIsCdl_ = false;
+    bool dialogIsCompare_ = false;  // the "Load B..." dialog (the clip wipe's compare clip)
     bool dialogReady_ = false;
     bool dialogOpen_ = false;
     bool pendingDialogIsCdl_ = false;
+    bool pendingDialogIsCompare_ = false;
+    void OpenCompareDialog();
 
     bool inspectorPinned_ = false;  // Tab / the Pin box: panels stay up; unpinned they follow the UI fade
     std::vector<FlatRect> flatRects_;
@@ -236,6 +241,9 @@ private:
     Wipe wipe_ = Wipe::Off;
     float wipePos_ = 0.5f;
     bool wipeDragging_ = false;
+    CompareClip compareClip_;                    // B for Wipe::Clips, following the open clip
+    void TickCompareClip();
+    std::string CompareOther() const { return compare_[1 - compareSide_]; }  // the clip not showing
     bool NearWipeLine(float x, float y) const;  // window points
 
     // Framing overlays (Q cycles the frame line) and the picture's anamorphic desqueeze.
