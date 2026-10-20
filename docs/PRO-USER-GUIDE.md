@@ -140,24 +140,49 @@ Inspector > Monitoring.
   green = 18 % grey (correct exposure for mid-tones), pink = skin tones, yellow = near
   white, red = clipped. Everything else is grey.
 
-## Live inputs and the rig check
+## The rig check
 
-For a live stereo rig (a capture card, a camera, or the built-in test signal):
+The rig check measures a stereo picture continuously and warns you about what makes 3D
+uncomfortable or wrong. It runs on **side-by-side video and live inputs** (a capture card, a
+camera, the built-in test signal); it does not run on still images.
 
-- The **Source** section shows the input, its timecode (**`T`** shows / hides it) and the
-  measured delay from capture to screen.
-- The **Rig check** section (Inspector) measures the rig continuously: vertical error, roll,
-  eye sync, colour match between the eyes, the depth range against your depth budget, and
-  **frame edges**: something in front of the screen that the left or right edge of the frame
-  cuts off (an *edge violation* - one eye sees more of it than the other, and it reads as
-  poking through a window). The line says *OK*, or which edge and how far in front.
-  Problems that last become **alerts**, logged with their timecode to
-  `Pictures\DisplayXR\station_alerts.jsonl`.
+For a live input, the **Source** section also shows the input, its timecode (**`T`** shows /
+hides it) and the measured delay from capture to screen.
+
+The **Rig check** section (Inspector) shows, each in green, amber or red:
+
+- **Vertical error** and **roll**: one eye higher than, or tilted against, the other.
+- **Eye sync**: the two eyes from different moments (frames apart).
+- **Colour match**: the eyes differ in colour or brightness.
+- **Depth range**: how far in front of and behind the screen the scene goes, against your
+  depth budget.
+- **Frame edges**: something in front of the screen that the left or right edge of the
+  frame cuts off - an *edge violation*. One eye sees more of it than the other, and it
+  reads as poking through a window: hard on the eyes. The line says **OK**, or which edge
+  and how far in front (`left -2.5%`). To fix it in the shot, push that object back behind
+  the screen (convergence) or keep it clear of the frame edge.
+
+Problems that last half a second or more become **alerts**, shown under the numbers and
+logged with their timecode to `Pictures\DisplayXR\station_alerts.jsonl`.
+
 - **`R`** shows a 60-second history strip of depth and vertical error.
-- **`D`** draws the rig check's depth on the picture: warm colours in front of the screen,
-  white on it, blue behind, ringed in red where it breaks the budget. An edge violation
-  shows as a red bar along that edge of the picture, over the rows where it happens, with
-  its parallax (`EDGE -2.5%`).
+- **`D`** draws the rig check on the picture. Each **dot** is a point matched between the
+  two eyes, coloured by depth: orange / red in front of the screen, white on it, blue
+  behind; a **red ring** marks a dot outside the depth budget. An edge violation shows as
+  a **red bar** along that edge, over the rows where it happens, with its depth
+  (`EDGE -2.5%`). Press **`D`** again to turn the dots and bars off.
+
+### Limits
+
+Depth is in % of the picture width: negative is in front of the screen, positive behind.
+The defaults, and how to change them when starting the player:
+
+| Check | Default | Option |
+|---|---|---|
+| Depth budget (nearest, farthest) | -2 % to +1 % | `--depth-budget=-2,1` |
+| Vertical error | 1 px | `--vertical-limit=1` |
+| Colour match | dE 2 | `--colour-limit=2` |
+| Frame edges (nearest allowed at the edge) | -0.3 % | `--edge-limit=-0.3` |
 
 ## Snapshots
 
