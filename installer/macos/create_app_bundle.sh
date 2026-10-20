@@ -228,15 +228,53 @@ bundle_deps "$LIBDIR/libMoltenVK.dylib"
 # Walk the binary's dependency closure.
 bundle_deps "$BIN"
 
-# Give the binary an rpath rooted at the bundled libs.
-install_name_tool -add_rpath "@loader_path/lib" "$BIN" 2>/dev/null || true
+# --- rpaths: bundle-relative ONLY, @loader_path/lib first ---
+# The linker leaves the build tree's search dirs in the binary as LC_RPATHs
+# (/opt/homebrew/lib, /tmp/openxr-install/lib — needed for dev runs from build/).
+# Shipped, they are searched BEFORE @loader_path/lib, so on a Mac with Homebrew
+# SDL3 / FFmpeg / vulkan-loader the app loaded THOSE instead of the bundled copies
+# (v1.14.2). Strip them from every Mach-O in the bundle; -delete_rpath removes one
+# occurrence per call, so loop until none is left.
+list_rpaths() {
+    otool -l "$1" | awk '/cmd LC_RPATH/{r=1} r && $1=="path"{print $2; r=0}'
+}
+strip_rpaths() {   # $1 = Mach-O, $2 = "all" | "absolute"
+    local target="$1" mode="$2" rp found
+    while :; do
+        found=""
+        while IFS= read -r rp; do
+            [ -z "$rp" ] && continue
+            case "$rp" in
+                @loader_path|@loader_path/*|@executable_path|@executable_path/*)
+                    [ "$mode" = "all" ] || continue ;;
+            esac
+            found="$rp"; break
+        done < <(list_rpaths "$target")
+        [ -z "$found" ] && break
+        install_name_tool -delete_rpath "$found" "$target"
+    done
+}
+# The binary: drop every rpath, then add the one it needs — the bundled libs.
+strip_rpaths "$BIN" all
+install_name_tool -add_rpath "@loader_path/lib" "$BIN"
+# Bundled dylibs: keep their own bundle-relative rpaths (e.g. x265's
+# @loader_path/../lib), drop absolute ones.
+for d in "$LIBDIR"/*.dylib; do
+    [ -e "$d" ] || continue
+    strip_rpaths "$d" absolute
+done
 
 # Re-sign everything install_name_tool touched — Apple Silicon SIGKILLs Mach-O
-# whose code signature was invalidated by relinking.
+# whose code signature was invalidated by relinking. Must stay AFTER the last
+# install_name_tool edit.
 for d in "$LIBDIR"/*.dylib; do
     [ -e "$d" ] || continue
     codesign --force --sign - "$d"
 done
 codesign --force --sign - "$BIN"
+
+# Guard: no Mach-O in the .app may reach outside it (rpath, dependency, install id)
+# or carry a broken signature. Fails the build instead of shipping v1.14.2 again.
+bash "$REPO_ROOT/installer/macos/check_bundle_paths.sh" "$APP_BUNDLE"
 
 echo ".app bundle created: $APP_BUNDLE ($(ls "$LIBDIR" | wc -l | tr -d ' ') bundled dylibs)"
