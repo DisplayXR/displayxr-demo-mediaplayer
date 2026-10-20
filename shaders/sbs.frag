@@ -43,6 +43,10 @@ layout(push_constant) uniform PushConstants {
     vec4 lutDomain;  // .x = domain min, .y = 1/(max-min), .z = LUT size N, .w = 1 for P016
     int yuvMatrix;   // 0 = BT.709 (default: base content unchanged), 1 = BT.601, 2 = BT.2020 NCL
     float zebraLevel;// > 0: diagonal stripes where the graded luma is at or above it (0..1)
+    int viewFlags;   // bits 0-2 channel (0 RGB, 1 R, 2 G, 3 B, 4 alpha, 5 luma); bits 4-5 wipe
+                     // (0 off, 1 before | after the grade, 2 left eye | right eye)
+    uint wipeGamma;  // low 16 bits: wipe position across the picture (unorm16); high 16 bits:
+                     // display gamma x 4096 (0 = 1.0)
 #endif
 } pc;
 
@@ -162,6 +166,18 @@ void main() {
     vec2 uv = pc.uvOffset + vUV * pc.uvScale;
     vec3 graded = Grade(SampleSource(uv));
     vec3 c = graded;
+#ifdef MP_GRADE
+    const int channel = pc.viewFlags & 7;
+    const int wipe = (pc.viewFlags >> 4) & 3;
+    const float wipePos = float(pc.wipeGamma & 0xFFFFu) / 65535.0;
+    // The wipe is a vertical line across the picture as shown (vUV, before pan / zoom), the
+    // same in both eyes. 1: left of it the source as it arrives, right of it the grade.
+    // 2: left of it the left eye, right of it the right eye (otherDelta reaches it).
+    const bool pastWipe = wipe != 0 && vUV.x >= wipePos;
+    if (wipe == 1 && !pastWipe) c = SampleSource(uv);
+    if (wipe == 2 && pastWipe) c = Grade(SampleSource(uv + pc.otherDelta));
+    graded = c;  // zebras judge the picture as shown on each side of the wipe
+#endif
 
 #ifdef MP_GRADE
     if (pc.qcMode == 1) {          // eye difference: alignment / sync check
@@ -175,6 +191,14 @@ void main() {
     } else if (pc.qcMode == 3) {   // false colour
         c = FalseColour(c);
     }
+    // Display gamma trim, then channel isolation (a channel or luma shown as grey).
+    const float gammaTrim = float(pc.wipeGamma >> 16) / 4096.0;
+    if (gammaTrim > 0.0 && abs(gammaTrim - 1.0) > 0.001) c = pow(clamp(c, 0.0, 1.0), vec3(1.0 / gammaTrim));
+    if (channel == 1) c = vec3(c.r);
+    else if (channel == 2) c = vec3(c.g);
+    else if (channel == 3) c = vec3(c.b);
+    else if (channel == 4) c = vec3(pc.mode == 0 ? texture(plane0, uv).a : 1.0);
+    else if (channel == 5) c = vec3(dot(c, vec3(0.2126, 0.7152, 0.0722)));
     if (pc.zebraLevel > 0.0 && pc.qcMode != 1 &&
         dot(graded, vec3(0.2126, 0.7152, 0.0722)) >= pc.zebraLevel) {
         // Stripes in SOURCE pixels, 45 degrees, 16 px period: both eyes stripe the same

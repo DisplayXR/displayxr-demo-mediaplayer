@@ -251,7 +251,8 @@ LUT, OpenColorIO). It has its own installers (`DisplayXRMediaPlayerProSetup-*.ex
 `DisplayXRMediaPlayerPro-*.pkg`, released together on `pro-v*` tags), installs alongside
 the Media Player (its own app, bundle id and package id), and is not part of the DisplayXR
 bundle. macOS: `./scripts/build_macos.sh --pro --ocio --installer`. See
-[`docs/PRO.md`](docs/PRO.md).
+[`docs/PRO.md`](docs/PRO.md) (developer reference) and
+[`docs/PRO-USER-GUIDE.md`](docs/PRO-USER-GUIDE.md) (user guide).
 
 ## Requirements
 

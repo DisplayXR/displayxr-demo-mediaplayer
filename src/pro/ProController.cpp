@@ -54,6 +54,25 @@ const char* ViewModeName(ViewMode m) {
     }
 }
 
+const char* ChannelName(Channel c) {
+    switch (c) {
+        case Channel::Red: return "Red";
+        case Channel::Green: return "Green";
+        case Channel::Blue: return "Blue";
+        case Channel::Alpha: return "Alpha";
+        case Channel::Luma: return "Luma";
+        default: return "RGB";
+    }
+}
+
+const char* WipeName(Wipe w) {
+    switch (w) {
+        case Wipe::Grade: return "Before | after grade";
+        case Wipe::Eyes: return "Left eye | right eye";
+        default: return "Off";
+    }
+}
+
 void ProController::Init(VulkanRenderer* renderer, SDL_Window* window, Host host) {
     renderer_ = renderer;
     window_ = window;
@@ -97,6 +116,18 @@ void ProController::ApplyTestEnv() {
             i = j + 1;
         }
     }
+    // MEDIAPLAYER_PRO_WIPE=<mode 0..2>[,<pos 0..1>], _CHANNEL=<0..5>, _GAMMA=<0.25..4>.
+    if (const char* w = std::getenv("MEDIAPLAYER_PRO_WIPE")) {
+        int m = 0;
+        float pos = 0.5f;
+        if (std::sscanf(w, "%d,%f", &m, &pos) >= 1) {
+            wipe_ = (Wipe)std::clamp(m, 0, (int)Wipe::Count - 1);
+            wipePos_ = std::clamp(pos, 0.0f, 1.0f);
+        }
+    }
+    if (const char* c = std::getenv("MEDIAPLAYER_PRO_CHANNEL"))
+        channel_ = (Channel)std::clamp(std::atoi(c), 0, (int)Channel::Count - 1);
+    if (const char* g = std::getenv("MEDIAPLAYER_PRO_GAMMA")) gamma_ = std::clamp((float)std::atof(g), 0.25f, 4.0f);
     if (const char* s = std::getenv("MEDIAPLAYER_PRO_SCOPES")) {
         scopesOn_ = (*s && *s != '0');
         parade_ = (*s == '2');
@@ -243,6 +274,15 @@ void ProController::SetMode(ViewMode m, bool announce) {
     if (announce && host_.toast) host_.toast(std::string("View: ") + ViewModeName(m));
 }
 
+void ProController::SetWipe(Wipe w, bool announce) {
+    if (w == Wipe::Eyes && !stereoSource_) {
+        if (host_.toast) host_.toast("The eye wipe needs a stereo source");
+        return;
+    }
+    wipe_ = w;
+    if (announce && host_.toast) host_.toast(std::string("Wipe: ") + WipeName(w));
+}
+
 void ProController::SetZoom(float z) {
     // Keep the centre of the visible window fixed.
     const float cx = panX_ + 0.5f / zoom_, cy = panY_ + 0.5f / zoom_;
@@ -270,6 +310,7 @@ void ProController::ClampPan() {
 
 void ProController::ApplyViewTransform(ViewUV* uvs, uint32_t n, bool stereo, bool eyesSwapped) {
     stereoSource_ = stereo;
+    if (!stereo && wipe_ == Wipe::Eyes) wipe_ = Wipe::Off;
     if (!stereo && mode_ != ViewMode::Stereo3D) {
         // Eye-specific views mean nothing for a mono picture.
         if (mode_ == ViewMode::Difference || mode_ == ViewMode::Anaglyph) mode_ = ViewMode::Stereo3D;
@@ -293,7 +334,15 @@ void ProController::ApplyViewTransform(ViewUV* uvs, uint32_t n, bool stereo, boo
                 u.otherDX = rightUv.offX - leftUv.offX;
                 u.otherDY = rightUv.offY - leftUv.offY;
                 break;
-            default: break;
+            default:
+                // The eye wipe is the same: left eye one side of the line, right eye the
+                // other, the same picture in every view.
+                if (wipe_ == Wipe::Eyes && stereo) {
+                    u = leftUv;
+                    u.otherDX = rightUv.offX - leftUv.offX;
+                    u.otherDY = rightUv.offY - leftUv.offY;
+                }
+                break;
         }
         // Pan / zoom inside the eye's sub-rect; identical for both eyes, so the
         // disparity scales with the picture and depth reads correctly while zoomed.
@@ -326,6 +375,10 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
         }
         case SDL_EVENT_MOUSE_BUTTON_DOWN: {
             if (imguiWantsMouse) return false;
+            if (e.button.button == SDL_BUTTON_LEFT && wipe_ != Wipe::Off && NearWipeLine(e.button.x, e.button.y)) {
+                wipeDragging_ = true;
+                return true;
+            }
             const bool middle = e.button.button == SDL_BUTTON_MIDDLE;
             const bool leftPlain = e.button.button == SDL_BUTTON_LEFT &&
                                    !(SDL_GetModState() & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT)) && zoom_ > 1.0001f;
@@ -342,12 +395,23 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
             return false;
         }
         case SDL_EVENT_MOUSE_BUTTON_UP:
+            if (wipeDragging_ && e.button.button == SDL_BUTTON_LEFT) {
+                wipeDragging_ = false;
+                return true;
+            }
             if (panning_ && (e.button.button == SDL_BUTTON_MIDDLE || e.button.button == SDL_BUTTON_LEFT)) {
                 panning_ = false;
                 return true;
             }
             return false;
         case SDL_EVENT_MOUSE_MOTION: {
+            if (wipeDragging_) {
+                // Off the picture the line stays where it was (pointToContent refuses the point).
+                float u = 0.0f, v = 0.0f;
+                if (host_.pointToContent && host_.pointToContent(e.motion.x, e.motion.y, u, v))
+                    wipePos_ = std::clamp(u, 0.0f, 1.0f);
+                return true;
+            }
             if (!panning_) return false;
             float w = 0.0f, h = 0.0f;
             if (host_.contentSizePoints && host_.contentSizePoints(w, h) && w > 1.0f && h > 1.0f) {
@@ -374,6 +438,12 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
                 case SDLK_6:
                     SetMode(mode_ == ViewMode::FalseColour ? ViewMode::Stereo3D : ViewMode::FalseColour, true);
                     return true;
+                case SDLK_8: SetWipe((Wipe)(((int)wipe_ + 1) % (int)Wipe::Count), true); return true;
+                case SDLK_9: {
+                    channel_ = (Channel)(((int)channel_ + 1) % (int)Channel::Count);
+                    if (host_.toast) host_.toast(std::string("Channel: ") + ChannelName(channel_));
+                    return true;
+                }
                 case SDLK_7: {
                     zebraOn_ = !zebraOn_;
                     char t[48];
@@ -493,6 +563,12 @@ void ProController::Tick(const Status& st) {
                : mode_ == ViewMode::FalseColour ? 3
                                                 : 0;
     g.zebraLevel = (zebraOn_ && !st.isLogo) ? zebraLevel_ : 0.0f;
+    if (!st.isLogo) {
+        g.channel = (int)channel_;
+        g.wipeMode = (int)wipe_;
+        g.wipePos = wipePos_;
+        g.gamma = gamma_;
+    }
     renderer_->SetGrade(g);
     if (overlays_.desqueeze != appliedDesqueeze_ && host_.setDesqueeze) {
         host_.setDesqueeze(DesqueezeFactor(overlays_.desqueeze));
@@ -541,6 +617,41 @@ void ProController::BuildDepthOverlay(const Status& st) {
 #else
     (void)st;
 #endif
+}
+
+// The wipe line, drawn where the shader splits the picture (picture fractions as shown, not
+// panned / zoomed), with what each side holds.
+void ProController::BuildWipeLine(const Status& st) {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    if (wipe_ == Wipe::Off || st.isLogo || !host_.pictureInHud) return;
+    float px, py, pw, ph;
+    if (!host_.pictureInHud(px, py, pw, ph)) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    const float x = (px + wipePos_ * pw) * W, y0 = py * H, y1 = (py + ph) * H;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const float wgt = std::max(2.0f, ph * H / 360.0f);  // heavy enough not to stair-step through the lens
+    dl->AddLine(ImVec2(x, y0), ImVec2(x, y1), IM_COL32(0, 0, 0, 140), wgt + 2.0f);
+    dl->AddLine(ImVec2(x, y0), ImVec2(x, y1), IM_COL32(255, 255, 255, 230), wgt);
+    const float my = (y0 + y1) * 0.5f;  // a grab handle
+    dl->AddCircleFilled(ImVec2(x, my), wgt * 3.0f, IM_COL32(255, 255, 255, 230));
+    dl->AddCircle(ImVec2(x, my), wgt * 3.0f, IM_COL32(0, 0, 0, 160), 0, 1.5f);
+    const char* l = wipe_ == Wipe::Grade ? "source" : "left eye";
+    const char* r = wipe_ == Wipe::Grade ? "graded" : "right eye";
+    const ImVec2 ls = ImGui::CalcTextSize(l);
+    const float ty = y1 - ls.y - 70.0f;
+    dl->AddText(ImVec2(x - ls.x - 10.0f, ty), IM_COL32(255, 255, 255, 220), l);
+    dl->AddText(ImVec2(x + 10.0f, ty), IM_COL32(255, 255, 255, 220), r);
+#else
+    (void)st;
+#endif
+}
+
+bool ProController::NearWipeLine(float x, float y) const {
+    float u = 0.0f, v = 0.0f, w = 0.0f, h = 0.0f;
+    if (!host_.pointToContent || !host_.pointToContent(x, y, u, v)) return false;
+    if (!host_.contentSizePoints || !host_.contentSizePoints(w, h) || w < 1.0f) return false;
+    return std::fabs(u - wipePos_) * w <= 12.0f;  // within 12 points of the line
 }
 
 // The status bar along the bottom of the picture (the plan's mockup: LIVE, input, format,
@@ -599,6 +710,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     BuildOverlays(st, inspectorPinned_ ? 1.0f : uiAlpha);  // framing + burn-ins: not faded
     BuildDepthOverlay(st);  // on the picture; independent of the inspector fade
+    BuildWipeLine(st);
     BuildPixelProbe(st);
     flatRects_.clear();
     const float alpha = inspectorPinned_ ? 1.0f : uiAlpha;
@@ -712,6 +824,30 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
             if (ImGui::SmallButton(fs ? "Windowed (F11)" : "Full screen (F11)") && host_.toggleFullscreen)
                 host_.toggleFullscreen();
             ImGui::TextDisabled("Wheel zooms, middle-drag pans");
+            const float itemW = ImGui::GetContentRegionAvail().x * 0.42f;
+            ImGui::SetNextItemWidth(itemW);
+            if (ImGui::BeginCombo("Channel (9)", ChannelName(channel_))) {
+                for (int i = 0; i < (int)Channel::Count; ++i)
+                    if (ImGui::Selectable(ChannelName((Channel)i), channel_ == (Channel)i)) channel_ = (Channel)i;
+                ImGui::EndCombo();
+            }
+            ImGui::SetNextItemWidth(itemW);
+            ImGui::SliderFloat("Gamma", &gamma_, 0.5f, 2.5f, "%.2f");
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) gamma_ = 1.0f;
+            ImGui::SetNextItemWidth(itemW);
+            if (ImGui::BeginCombo("Wipe (8)", WipeName(wipe_))) {
+                for (int i = 0; i < (int)Wipe::Count; ++i) {
+                    ImGui::BeginDisabled((Wipe)i == Wipe::Eyes && !st.stereo);
+                    if (ImGui::Selectable(WipeName((Wipe)i), wipe_ == (Wipe)i)) SetWipe((Wipe)i, false);
+                    ImGui::EndDisabled();
+                }
+                ImGui::EndCombo();
+            }
+            if (wipe_ != Wipe::Off) {
+                ImGui::SetNextItemWidth(itemW);
+                ImGui::SliderFloat("Wipe at", &wipePos_, 0.0f, 1.0f, "%.2f");
+                ImGui::TextDisabled("Drag the line on the picture");
+            }
         }
         BuildOverlaySection();
         BuildMonitoringSection(st);

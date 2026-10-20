@@ -38,6 +38,12 @@ namespace mp::pro {
 enum class ViewMode { Stereo3D = 0, LeftOnly, RightOnly, Difference, Anaglyph, FalseColour, Count };
 const char* ViewModeName(ViewMode m);
 
+// Channel isolation (9 cycles) and the wipe (8 cycles), both in the grade shader.
+enum class Channel { RGB = 0, Red, Green, Blue, Alpha, Luma, Count };
+const char* ChannelName(Channel c);
+enum class Wipe { Off = 0, Grade, Eyes, Count };  // before | after the grade; left eye | right eye
+const char* WipeName(Wipe w);
+
 // Live player state the inspector shows, refreshed by App every frame.
 struct Status {
     std::string sourceLabel;    // file name, camera name or stream host
@@ -164,6 +170,8 @@ public:
 private:
     void SetMode(ViewMode m, bool announce);
     void BuildDepthOverlay(const Status& st);
+    void BuildWipeLine(const Status& st);
+    void SetWipe(Wipe w, bool announce);
     void BuildOverlays(const Status& st, float uiAlpha);
     void BuildOverlaySection();
     void BuildMonitoringSection(const Status& st);
@@ -220,6 +228,15 @@ private:
     void AddFlatRectOfCurrentWindow();
     Station station_;
     bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture
+
+    // Channel isolation, display gamma trim and the wipe (position across the picture as
+    // shown, dragged with the left button near the line).
+    Channel channel_ = Channel::RGB;
+    float gamma_ = 1.0f;
+    Wipe wipe_ = Wipe::Off;
+    float wipePos_ = 0.5f;
+    bool wipeDragging_ = false;
+    bool NearWipeLine(float x, float y) const;  // window points
 
     // Framing overlays (Q cycles the frame line) and the picture's anamorphic desqueeze.
     OverlaySettings overlays_;
