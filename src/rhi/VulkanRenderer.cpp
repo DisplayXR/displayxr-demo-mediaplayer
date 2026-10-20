@@ -42,6 +42,8 @@ VkShaderModule MakeShaderModule(VkDevice device, const uint32_t* spv, size_t byt
 namespace mp {
 
 namespace {
+constexpr uint32_t kBindings = 7;  // 3 source planes, the grade LUT, 3 compare planes
+
 // Fragment push constants - must match `PushConstants` in shaders/sbs.frag (std430
 // push-constant offsets: vec2 at 8, vec4 at 16).
 struct DrawPush {
@@ -217,9 +219,10 @@ uint32_t VulkanRenderer::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags
 
 bool VulkanRenderer::CreatePipeline() {
     // Descriptor set layout: bindings 0..2 = combined image samplers (RGBA in plane 0,
-    // or Y + chroma planes for YUV video); binding 3 = the Pro grade's 3D LUT.
-    VkDescriptorSetLayoutBinding bindings[4] = {};
-    for (uint32_t i = 0; i < 4; ++i) {
+    // or Y + chroma planes for YUV video); binding 3 = the Pro grade's 3D LUT; 4..6 = the
+    // Pro compare source (B) for the clip wipe (dummies otherwise).
+    VkDescriptorSetLayoutBinding bindings[kBindings] = {};
+    for (uint32_t i = 0; i < kBindings; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[i].descriptorCount = 1;
@@ -227,7 +230,7 @@ bool VulkanRenderer::CreatePipeline() {
     }
     VkDescriptorSetLayoutCreateInfo dslci = {};
     dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslci.bindingCount = 4;
+    dslci.bindingCount = kBindings;
     dslci.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device_, &dslci, nullptr, &descSetLayout_) != VK_SUCCESS) {
         LOG_ERROR("vkCreateDescriptorSetLayout failed");
@@ -350,7 +353,7 @@ bool VulkanRenderer::CreatePipeline() {
     const uint32_t nSlots = ring_.framesInFlight();
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = 4 * nSlots;
+    poolSize.descriptorCount = kBindings * nSlots;
     VkDescriptorPoolCreateInfo dpci = {};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.maxSets = nSlots;
@@ -627,6 +630,79 @@ bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, con
     return true;
 }
 
+bool VulkanRenderer::UploadCompareTexture(const uint8_t* rgba, uint32_t width, uint32_t height) {
+    if (!rgba || width == 0 || height == 0) return false;
+    if (!EnsureDummy()) return false;
+    VkCommandBuffer cmd = FrameCmd();
+    if (cmd == VK_NULL_HANDLE) return false;
+    bool rec = false;
+    if (!RecordPlaneUpload(cmd, 3, rgba, width, height, VK_FORMAT_R8G8B8A8_UNORM, 4, rec)) return false;
+    compareMode_ = 0;
+    compareFullRange_ = false;
+    compare16_ = false;
+    compareMatrix_ = 0;
+    if (rec) LOG_INFO("VulkanRenderer: compare (B) RGBA %ux%u", width, height);
+    return true;
+}
+
+bool VulkanRenderer::UploadCompareYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2,
+                                      uint32_t width, uint32_t height, int format, bool fullRange, int matrix) {
+    if (!plane0 || !plane1 || width == 0 || height == 0) return false;
+    if (format == 0 && !plane2) return false;
+    if (!EnsureDummy()) return false;
+    const uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
+    PlaneSpec specs[3];
+    int count, mode;
+    specs[0] = {plane0, width, height, VK_FORMAT_R8_UNORM, 1};
+    if (format == 2) {
+        specs[0] = {plane0, width, height, VK_FORMAT_R16_UNORM, 2};
+        specs[1] = {plane1, cw, ch, VK_FORMAT_R16G16_UNORM, 4};
+        count = 2;
+        mode = 2;
+    } else if (format == 1) {
+        specs[1] = {plane1, cw, ch, VK_FORMAT_R8G8_UNORM, 2};
+        count = 2;
+        mode = 2;
+    } else {
+        specs[1] = {plane1, cw, ch, VK_FORMAT_R8_UNORM, 1};
+        specs[2] = {plane2, cw, ch, VK_FORMAT_R8_UNORM, 1};
+        count = 3;
+        mode = 1;
+    }
+    VkCommandBuffer cmd = FrameCmd();
+    if (cmd == VK_NULL_HANDLE) return false;
+    bool rec[3] = {false, false, false};
+    for (int i = 0; i < count; ++i)
+        if (!RecordPlaneUpload(cmd, 3 + i, specs[i].data, specs[i].w, specs[i].h, specs[i].fmt, specs[i].bpt,
+                               rec[i]))
+            return false;
+    compareMode_ = mode;
+    compareFullRange_ = fullRange;
+    compare16_ = format == 2;
+    compareMatrix_ = (matrix == 1 || matrix == 2) ? matrix : 0;
+    if (rec[0]) LOG_INFO("VulkanRenderer: compare (B) YUV %ux%u mode=%d", width, height, mode);
+    return true;
+}
+
+void VulkanRenderer::ClearCompare() {
+    VkDevice dev = device_;
+    for (int i = 3; i < 6; ++i) {
+        Plane& p = planes_[i];
+        if (p.view || p.image || p.memory) {
+            const VkImageView v = p.view;
+            const VkImage im = p.image;
+            const VkDeviceMemory m = p.memory;
+            ring_.deferDestroy([dev, v, im, m]() {
+                if (v) vkDestroyImageView(dev, v, nullptr);
+                if (im) vkDestroyImage(dev, im, nullptr);
+                if (m) vkFreeMemory(dev, m, nullptr);
+            });
+        }
+        p = Plane{};
+    }
+    compareMode_ = -1;
+}
+
 bool VulkanRenderer::EnsureDummy() {
     if (dummyView_ != VK_NULL_HANDLE) return true;
     VkImageCreateInfo ici = {};
@@ -696,12 +772,22 @@ void VulkanRenderer::BindDescriptors(VkDescriptorSet set) {
     } else if (sourceMode_ == 2) {     // NV12: Y, interleaved UV
         views[1] = planes_[1].view;
     }
-    VkDescriptorImageInfo dii[4] = {};
-    VkWriteDescriptorSet writes[4] = {};
-    for (uint32_t i = 0; i < 4; ++i) {
+    // The compare source (B) at 4..6, by its own mode.
+    VkImageView bViews[3] = {dummyView_, dummyView_, dummyView_};
+    if (compareMode_ >= 0) {
+        bViews[0] = planes_[3].view;
+        if (compareMode_ >= 1) bViews[1] = planes_[4].view;
+        if (compareMode_ == 1) bViews[2] = planes_[5].view;
+    }
+    VkDescriptorImageInfo dii[kBindings] = {};
+    VkWriteDescriptorSet writes[kBindings] = {};
+    for (uint32_t i = 0; i < kBindings; ++i) {
         dii[i].sampler = sampler_;
         if (i == 3) {   // the Pro grade LUT, or its 1x1x1 dummy
             dii[i].imageView = lut_.view ? lut_.view : lutDummy_.view;
+            dii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        } else if (i >= 4) {
+            dii[i].imageView = bViews[i - 4] ? bViews[i - 4] : dummyView_;
             dii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         } else {
             dii[i].imageView = views[i] ? views[i] : dummyView_;
@@ -714,7 +800,7 @@ void VulkanRenderer::BindDescriptors(VkDescriptorSet set) {
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[i].pImageInfo = &dii[i];
     }
-    vkUpdateDescriptorSets(device_, 4, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device_, kBindings, writes, 0, nullptr);
 }
 
 bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* rects,
@@ -845,6 +931,9 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         pc.yuvMatrix = sourceMode_ == 0 ? 0 : sourceMatrix_;  // RGBA sources ignore it
         pc.zebraLevel = grade_.zebraLevel;
         pc.viewFlags = (grade_.channel & 7) | ((grade_.wipeMode & 3) << 4);
+        if (compareMode_ >= 0)  // B's sampling: mode bits 8-9, full range 10, matrix 11-12, P016 13, bound 14
+            pc.viewFlags |= (compareMode_ << 8) | ((compareFullRange_ ? 1 : 0) << 10) | (compareMatrix_ << 11) |
+                            ((compare16_ ? 1 : 0) << 13) | (1 << 14);
         pc.wipeGamma = PackWipeGamma(grade_.wipePos, grade_.gamma);
         vkCmdPushConstants(cmd, activeLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
@@ -1011,7 +1100,8 @@ void VulkanRenderer::DestroyTexture() {
     // Queued frames may still sample these: release them once the GPU is past every frame
     // submitted so far (immediately when the ring is not up).
     VkDevice dev = device_;
-    for (Plane& p : planes_) {
+    for (int idx = 0; idx < 3; ++idx) {  // the source's planes; B (3..5) is ClearCompare's
+        Plane& p = planes_[idx];
         if (p.view || p.image || p.memory) {
             const VkImageView v = p.view;
             const VkImage i = p.image;
@@ -1300,6 +1390,7 @@ void VulkanRenderer::Shutdown() {
     ClearSharedImports();  // zero-copy (#28) imported textures
 #endif
     DestroyTexture();
+    ClearCompare();
     DestroyLut(lut_, false);
     DestroyLut(lutDummy_, false);
     ring_.destroy();  // waits its fences, runs the deferred releases, frees cmds/fences

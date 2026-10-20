@@ -69,6 +69,7 @@ const char* WipeName(Wipe w) {
     switch (w) {
         case Wipe::Grade: return "Before | after grade";
         case Wipe::Eyes: return "Left eye | right eye";
+        case Wipe::Clips: return "Clip A | B";
         default: return "Off";
     }
 }
@@ -242,6 +243,7 @@ void ProController::DialogCallback(void* userdata, const char* const* filelist, 
     if (filelist && filelist[0]) {
         self->dialogPath_ = filelist[0];
         self->dialogIsCdl_ = self->pendingDialogIsCdl_;
+        self->dialogIsCompare_ = self->pendingDialogIsCompare_;
         self->dialogReady_ = true;
     }
 }
@@ -252,6 +254,7 @@ void ProController::OpenLookDialog(bool cdl) {
         if (dialogOpen_) return;
         dialogOpen_ = true;
         pendingDialogIsCdl_ = cdl;
+        pendingDialogIsCompare_ = false;
     }
     static const SDL_DialogFileFilter kLutFilter[] = {{"3D LUT (.cube)", "cube"}};
     static const SDL_DialogFileFilter kCdlFilter[] = {{"ASC CDL (.cc, .ccc, .cdl)", "cc;ccc;cdl"}};
@@ -259,6 +262,46 @@ void ProController::OpenLookDialog(bool cdl) {
     std::string dir = last.empty() ? std::string() : std::filesystem::path(last).parent_path().string();
     SDL_ShowOpenFileDialog(&ProController::DialogCallback, this, window_, cdl ? kCdlFilter : kLutFilter, 1,
                            dir.empty() ? nullptr : dir.c_str(), false);
+}
+
+void ProController::OpenCompareDialog() {
+    {
+        std::lock_guard<std::mutex> lock(dialogMutex_);
+        if (dialogOpen_) return;
+        dialogOpen_ = true;
+        pendingDialogIsCdl_ = false;
+        pendingDialogIsCompare_ = true;
+    }
+    const std::string cur = host_.currentMedia ? host_.currentMedia() : std::string();
+    std::string dir = cur.empty() ? std::string() : std::filesystem::path(cur).parent_path().string();
+    SDL_ShowOpenFileDialog(&ProController::DialogCallback, this, window_, nullptr, 0, dir.empty() ? nullptr : dir.c_str(),
+                           false);
+}
+
+// The clip wipe's B: open it when the wipe is on, follow the open clip, drop it otherwise.
+void ProController::TickCompareClip() {
+    const std::string other = CompareOther();
+    if (wipe_ != Wipe::Clips || other.empty()) {
+        if (compareClip_.IsOpen()) {
+            compareClip_.Close();
+            if (renderer_) renderer_->ClearCompare();
+        }
+        if (wipe_ == Wipe::Clips) wipe_ = Wipe::Off;  // the B clip went away
+        return;
+    }
+    if (compareClip_.Path() != other) {
+        if (renderer_) renderer_->ClearCompare();
+        std::string err;
+        if (!compareClip_.Open(other, &err)) {
+            if (host_.toast) host_.toast("B: " + err);
+            wipe_ = Wipe::Off;
+            return;
+        }
+    }
+    const double pos = host_.mediaPosition ? host_.mediaPosition() : -1.0;
+    const double start = host_.mediaStart ? host_.mediaStart() : 0.0;
+    const bool paused = host_.mediaPaused && host_.mediaPaused();
+    compareClip_.FollowA(pos, start, paused, renderer_, (double)SDL_GetTicksNS() * 1e-9);
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +320,10 @@ void ProController::SetMode(ViewMode m, bool announce) {
 void ProController::SetWipe(Wipe w, bool announce) {
     if (w == Wipe::Eyes && !stereoSource_) {
         if (host_.toast) host_.toast("The eye wipe needs a stereo source");
+        return;
+    }
+    if (w == Wipe::Clips && CompareOther().empty()) {
+        if (host_.toast) host_.toast("Load a B clip first (Inspector > View > Load B..., or --compare=<file>)");
         return;
     }
     wipe_ = w;
@@ -438,7 +485,16 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
                 case SDLK_6:
                     SetMode(mode_ == ViewMode::FalseColour ? ViewMode::Stereo3D : ViewMode::FalseColour, true);
                     return true;
-                case SDLK_8: SetWipe((Wipe)(((int)wipe_ + 1) % (int)Wipe::Count), true); return true;
+                case SDLK_8: {  // the next wipe this source can do (eyes need stereo, clips a B clip)
+                    Wipe w = wipe_;
+                    for (int i = 0; i < (int)Wipe::Count; ++i) {
+                        w = (Wipe)(((int)w + 1) % (int)Wipe::Count);
+                        if ((w == Wipe::Eyes && !stereoSource_) || (w == Wipe::Clips && CompareOther().empty())) continue;
+                        break;
+                    }
+                    SetWipe(w, true);
+                    return true;
+                }
                 case SDLK_9: {
                     channel_ = (Channel)(((int)channel_ + 1) % (int)Channel::Count);
                     if (host_.toast) host_.toast(std::string("Channel: ") + ChannelName(channel_));
@@ -528,19 +584,27 @@ void ProController::Tick(const Status& st) {
     }
     rightOnlyView_ = mode_ == ViewMode::RightOnly;
     std::string path;
-    bool isCdl = false;
+    bool isCdl = false, isCompare = false;
     {
         std::lock_guard<std::mutex> lock(dialogMutex_);
         if (dialogReady_) {
             path = dialogPath_;
             isCdl = dialogIsCdl_;
+            isCompare = dialogIsCompare_;
             dialogReady_ = false;
         }
     }
     if (!path.empty()) {
-        if (isCdl) LoadCdl(path);
-        else LoadLut(path);
+        if (isCompare) {
+            compare_[1 - compareSide_] = path;  // the clip not showing becomes B
+            SetWipe(Wipe::Clips, true);
+        } else if (isCdl) {
+            LoadCdl(path);
+        } else {
+            LoadLut(path);
+        }
     }
+    TickCompareClip();
     if (lutPending_ && renderer_) {
         lutPending_ = false;
         const float dmin = lut_.domainMin[0], dmax = lut_.domainMax[0];
@@ -663,12 +727,25 @@ void ProController::BuildWipeLine(const Status& st) {
     const float my = (y0 + y1) * 0.5f;  // a grab handle
     dl->AddCircleFilled(ImVec2(x, my), wgt * 3.0f, IM_COL32(255, 255, 255, 230));
     dl->AddCircle(ImVec2(x, my), wgt * 3.0f, IM_COL32(0, 0, 0, 160), 0, 1.5f);
-    const char* l = wipe_ == Wipe::Grade ? "source" : "left eye";
-    const char* r = wipe_ == Wipe::Grade ? "graded" : "right eye";
+    std::string la = wipe_ == Wipe::Grade ? "source" : "left eye";
+    std::string ra = wipe_ == Wipe::Grade ? "graded" : "right eye";
+    if (wipe_ == Wipe::Clips) {
+        const std::string cur = host_.currentMedia ? host_.currentMedia() : std::string();
+        la = "A: " + (cur.empty() ? std::string("this clip") : BaseName(cur));
+        ra = "B: " + BaseName(CompareOther());
+    }
+    const char* l = la.c_str();
+    const char* r = ra.c_str();
     const ImVec2 ls = ImGui::CalcTextSize(l);
-    const float ty = y1 - ls.y - 70.0f;
-    dl->AddText(ImVec2(x - ls.x - 10.0f, ty), IM_COL32(255, 255, 255, 220), l);
-    dl->AddText(ImVec2(x + 10.0f, ty), IM_COL32(255, 255, 255, 220), r);
+    const float ty = my + wgt * 3.0f + 8.0f;  // under the handle, clear of the transport bar
+    const ImVec2 rs = ImGui::CalcTextSize(r);
+    const float pad = 4.0f;
+    dl->AddRectFilled(ImVec2(x - ls.x - 10.0f - pad, ty - pad), ImVec2(x - 10.0f + pad, ty + ls.y + pad),
+                      IM_COL32(0, 0, 0, 170), 3.0f);
+    dl->AddRectFilled(ImVec2(x + 10.0f - pad, ty - pad), ImVec2(x + 10.0f + rs.x + pad, ty + rs.y + pad),
+                      IM_COL32(0, 0, 0, 170), 3.0f);
+    dl->AddText(ImVec2(x - ls.x - 10.0f, ty), IM_COL32(255, 255, 255, 235), l);
+    dl->AddText(ImVec2(x + 10.0f, ty), IM_COL32(255, 255, 255, 235), r);
 #else
     (void)st;
 #endif
@@ -864,12 +941,19 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
             ImGui::SetNextItemWidth(itemW);
             if (ImGui::BeginCombo("Wipe (8)", WipeName(wipe_))) {
                 for (int i = 0; i < (int)Wipe::Count; ++i) {
-                    ImGui::BeginDisabled((Wipe)i == Wipe::Eyes && !st.stereo);
+                    ImGui::BeginDisabled(((Wipe)i == Wipe::Eyes && !st.stereo) ||
+                                         ((Wipe)i == Wipe::Clips && CompareOther().empty()));
                     if (ImGui::Selectable(WipeName((Wipe)i), wipe_ == (Wipe)i)) SetWipe((Wipe)i, false);
                     ImGui::EndDisabled();
                 }
                 ImGui::EndCombo();
             }
+            if (ImGui::SmallButton("Load B...")) OpenCompareDialog();
+            ImGui::SameLine();
+            if (CompareOther().empty())
+                ImGui::TextDisabled("no B clip");
+            else
+                ImGui::TextDisabled("B: %s", BaseName(CompareOther()).c_str());
             if (wipe_ != Wipe::Off) {
                 ImGui::SetNextItemWidth(itemW);
                 ImGui::SliderFloat("Wipe at", &wipePos_, 0.0f, 1.0f, "%.2f");

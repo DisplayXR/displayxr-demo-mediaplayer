@@ -95,10 +95,16 @@ Inspector > View > Wipe at). Press **`8`** to cycle the wipe modes:
   eyes are shown the same split picture, so it looks flat on purpose. If the rig's eyes do
   not match (one higher than the other, a different colour, out of sync), the picture jumps
   at the line.
+- **Clip A | B**: left of the line the open clip (A), right of it a second clip (B), at the
+  same moment: version 1 against version 2 of a shot, or a graded render against the
+  plate. Click **Load B...** (Inspector > View) to pick B, or start the player with
+  `--compare=<file>`. B follows A: it plays and pauses with A, and frame steps and seeks
+  land on the same moment. Both sides go through the same look (exposure, CDL, LUT). B can
+  be a movie or a still. Use clips of the same size and stereo packing.
 - **Off**.
 
-Comparing two *different clips* (version 1 against version 2 of a shot) is not in this
-version yet; **`B`** swaps between two clips at the same position instead (see A/B compare).
+**`B`** swaps the whole picture between the two clips at the same position (see A/B
+compare); with the clip wipe on, it swaps which clip is on which side.
 
 ## Colour
 
@@ -199,9 +205,10 @@ not a photo of the panel.
 
 ## A/B compare
 
-Start the player with `--compare=<file>` (or the `set_compare` agent tool), then press
-**`B`** to swap between the open clip and the compare clip at the same position. The status
-bar shows **[A]** or **[B]**.
+Pick a second clip with **Load B...** (Inspector > View), `--compare=<file>` or the
+`set_compare` agent tool. Then press **`B`** to swap the whole picture between the open
+clip and the compare clip at the same position (the status bar shows **[A]** or **[B]**),
+or use the **Clip A | B** wipe (`8`) to see both at once, split by the line.
 
 ## All keys
 

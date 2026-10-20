@@ -22,6 +22,9 @@ layout(binding = 1) uniform sampler2D plane1;  // U (I420) or interleaved UV (NV
 layout(binding = 2) uniform sampler2D plane2;  // V (I420 only)
 #ifdef MP_GRADE
 layout(binding = 3) uniform sampler3D lut3d;   // grade LUT (Media Player Pro); 1x1x1 dummy otherwise
+layout(binding = 4) uniform sampler2D planeB0; // Pro compare source B (the clip wipe), as plane0..2
+layout(binding = 5) uniform sampler2D planeB1;
+layout(binding = 6) uniform sampler2D planeB2;
 #endif
 
 layout(push_constant) uniform PushConstants {
@@ -44,7 +47,8 @@ layout(push_constant) uniform PushConstants {
     int yuvMatrix;   // 0 = BT.709 (default: base content unchanged), 1 = BT.601, 2 = BT.2020 NCL
     float zebraLevel;// > 0: diagonal stripes where the graded luma is at or above it (0..1)
     int viewFlags;   // bits 0-2 channel (0 RGB, 1 R, 2 G, 3 B, 4 alpha, 5 luma); bits 4-5 wipe
-                     // (0 off, 1 before | after the grade, 2 left eye | right eye)
+                     // (0 off, 1 before | after the grade, 2 left eye | right eye, 3 clip A | B);
+                     // B's sampling: bits 8-9 mode, 10 full range, 11-12 matrix, 13 P016, 14 bound
     uint wipeGamma;  // low 16 bits: wipe position across the picture (unorm16); high 16 bits:
                      // display gamma x 4096 (0 = 1.0)
 #endif
@@ -119,6 +123,47 @@ vec3 SampleSource(vec2 uv) {
 }
 
 #ifdef MP_GRADE
+// The compare source B (the clip wipe): SampleSource's maths with B's planes and B's own
+// mode / range / matrix / bit depth from viewFlags.
+vec3 YuvToRgbMatrix(int m, float yb, float ub, float vb) {
+    if (m == 1) return vec3(yb + 1.402 * vb, yb - 0.344136 * ub - 0.714136 * vb, yb + 1.772 * ub);
+    if (m == 2) return vec3(yb + 1.4746 * vb, yb - 0.164553 * ub - 0.571353 * vb, yb + 1.8814 * ub);
+    return vec3(yb + 1.5748 * vb, yb - 0.1873 * ub - 0.4681 * vb, yb + 1.8556 * ub);
+}
+
+vec3 SampleSourceB(vec2 uv) {
+    const int mode = (pc.viewFlags >> 8) & 3;
+    const bool full = ((pc.viewFlags >> 10) & 1) != 0;
+    const int matrix = (pc.viewFlags >> 11) & 3;
+    const bool p16 = ((pc.viewFlags >> 13) & 1) != 0;
+    if (mode == 0) return texture(planeB0, uv).rgb;
+    float y = texture(planeB0, uv).r;
+    float u, v;
+    if (mode == 2) {
+        vec2 c = texture(planeB1, uv).rg;
+        u = c.r;
+        v = c.g;
+    } else {
+        u = texture(planeB1, uv).r;
+        v = texture(planeB2, uv).r;
+    }
+    float yb, ub, vb;
+    if (p16 && !full) {
+        yb = (y * 65535.0 / 64.0 - 64.0) / 876.0;
+        ub = (u * 65535.0 / 64.0 - 512.0) / 896.0;
+        vb = (v * 65535.0 / 64.0 - 512.0) / 896.0;
+    } else if (full) {
+        yb = y;
+        ub = u - 0.5;
+        vb = v - 0.5;
+    } else {
+        yb = (y - 16.0 / 255.0) * (255.0 / 219.0);
+        ub = (u - 128.0 / 255.0) * (255.0 / 224.0);
+        vb = (v - 128.0 / 255.0) * (255.0 / 224.0);
+    }
+    return clamp(YuvToRgbMatrix(matrix, yb, ub, vb), 0.0, 1.0);
+}
+
 vec3 SceneLinearToDisplayReferred(vec3 c) {
     return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
 }
@@ -176,6 +221,9 @@ void main() {
     const bool pastWipe = wipe != 0 && vUV.x >= wipePos;
     if (wipe == 1 && !pastWipe) c = SampleSource(uv);
     if (wipe == 2 && pastWipe) c = Grade(SampleSource(uv + pc.otherDelta));
+    // 3: right of the line the compare clip B, at the same point of the same eye, graded
+    // the same way (both versions seen through one look). Without B bound, A stays.
+    if (wipe == 3 && pastWipe && ((pc.viewFlags >> 14) & 1) != 0) c = Grade(SampleSourceB(uv));
     graded = c;  // zebras judge the picture as shown on each side of the wipe
 #endif
 
