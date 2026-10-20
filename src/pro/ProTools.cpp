@@ -28,10 +28,16 @@ void ProController::RegisterTools(const RegisterFn& reg) {
     reg("get_grade", "Read the grade: LUT, CDL (slope/offset/power/saturation), exposure, bypass.",
         "{\"type\":\"object\"}");
     reg("set_view",
-        "Set the QC view: 3d, left, right, difference (|left - right| x4) or anaglyph; optional "
-        "zoom (1 = fit) applied to both eyes.",
+        "Set the QC view: 3d, left, right, difference (|left - right| x4), anaglyph or false_colour; "
+        "optional zoom (1 = fit) applied to both eyes; channel isolation (rgb, red, green, blue, "
+        "alpha, luma); display gamma (0.25..4, 1 = none); a wipe (off, grade = source | graded, "
+        "eyes = left eye | right eye) at wipe_pos (0..1 across the picture).",
         "{\"type\":\"object\",\"properties\":{\"view\":{\"type\":\"string\",\"enum\":[\"3d\",\"left\",\"right\","
-        "\"difference\",\"anaglyph\"]},\"zoom\":{\"type\":\"number\",\"minimum\":1}}}");
+        "\"difference\",\"anaglyph\",\"false_colour\"]},\"zoom\":{\"type\":\"number\",\"minimum\":1},"
+        "\"channel\":{\"type\":\"string\",\"enum\":[\"rgb\",\"red\",\"green\",\"blue\",\"alpha\",\"luma\"]},"
+        "\"gamma\":{\"type\":\"number\",\"minimum\":0.25,\"maximum\":4},"
+        "\"wipe\":{\"type\":\"string\",\"enum\":[\"off\",\"grade\",\"eyes\"]},"
+        "\"wipe_pos\":{\"type\":\"number\",\"minimum\":0,\"maximum\":1}}}");
     reg("get_rig_status",
         "Read the live rig checks for a side-by-side stereo source: vertical error (full-res px, + = "
         "right eye lower), roll (degrees), near / far screen parallax (% of eye width, negative = in "
@@ -141,13 +147,34 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
                                    : v == "right"      ? ViewMode::RightOnly
                                    : v == "difference" ? ViewMode::Difference
                                    : v == "anaglyph"   ? ViewMode::Anaglyph
+                                   : v == "false_colour" ? ViewMode::FalseColour
                                                        : ViewMode::Count;
-                if (m == ViewMode::Count) return err("view must be 3d|left|right|difference|anaglyph");
+                if (m == ViewMode::Count) return err("view must be 3d|left|right|difference|anaglyph|false_colour");
                 SetMode(m, true);
             }
             float z;
             if (Num(a, "zoom", z)) SetZoom(std::max(1.0f, z));
-            result = json{{"view", ViewModeName(mode_)}, {"zoom", zoom_}}.dump();
+            std::string ch;
+            if (Str(a, "channel", ch)) {
+                const char* names[] = {"rgb", "red", "green", "blue", "alpha", "luma"};
+                int found = -1;
+                for (int i = 0; i < (int)Channel::Count; ++i)
+                    if (ch == names[i]) found = i;
+                if (found < 0) return err("channel must be rgb|red|green|blue|alpha|luma");
+                channel_ = (Channel)found;
+            }
+            float g;
+            if (Num(a, "gamma", g)) gamma_ = std::clamp(g, 0.25f, 4.0f);
+            std::string w;
+            if (Str(a, "wipe", w)) {
+                const Wipe m = w == "off" ? Wipe::Off : w == "grade" ? Wipe::Grade : w == "eyes" ? Wipe::Eyes : Wipe::Count;
+                if (m == Wipe::Count) return err("wipe must be off|grade|eyes");
+                SetWipe(m, true);
+            }
+            float wp;
+            if (Num(a, "wipe_pos", wp)) wipePos_ = std::clamp(wp, 0.0f, 1.0f);
+            result = json{{"view", ViewModeName(mode_)}, {"zoom", zoom_}, {"channel", ChannelName(channel_)},
+                          {"gamma", gamma_}, {"wipe", WipeName(wipe_)}, {"wipe_pos", wipePos_}}.dump();
             return true;
         }
         if (tool == "set_ocio") {

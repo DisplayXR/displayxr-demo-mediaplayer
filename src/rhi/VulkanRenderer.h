@@ -23,6 +23,8 @@
 #include <vk_frame_ring.h>  // displayxr-common: dxr::VkFrameRing (INV-4.10)
 
 #include <cstdint>
+
+#include "rhi/PushPack.h"
 #include <utility>
 #include <vector>
 
@@ -56,7 +58,12 @@ struct GradeParams {
     bool lutOn = false;          // ignored unless a LUT was uploaded (HasLut3D)
     int qcMode = 0;              // 0 normal, 1 eye difference, 2 anaglyph, 3 false colour
     float zebraLevel = 0.0f;     // > 0: zebras at or above this graded luma (0..1)
+    int channel = 0;             // 0 RGB, 1 R, 2 G, 3 B, 4 alpha, 5 luma (shown as grey)
+    int wipeMode = 0;            // 0 off, 1 before | after the grade, 2 left eye | right eye
+    float wipePos = 0.5f;        // the wipe line across the picture, 0..1
+    float gamma = 1.0f;          // display gamma trim, applied after the grade and QC view
 };
+
 
 class VulkanRenderer {
 public:
