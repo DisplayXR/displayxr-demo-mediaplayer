@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 using namespace mp;
@@ -337,7 +338,105 @@ void SyncConfirmVotes() {
 
 }  // namespace
 
+// The luma box filter as it was before it ran threaded with integer sums (float sums, one
+// thread): the threaded integer version must equal it bit for bit.
+std::vector<float> ReferenceLuma(const FrameRing::Frame& f, int analysisW, bool rightEye, int& aw, int& ah) {
+    const bool p16 = f.format == PixFormat::P016;
+    const int fullEye = f.width / 2;
+    aw = std::min(analysisW, fullEye);
+    const float sx = (float)fullEye / (float)aw;
+    ah = std::max(16, (int)std::lround(f.height / sx));
+    const float sy = (float)f.height / (float)ah;
+    const int W = f.width, x0 = rightEye ? fullEye : 0;
+    std::vector<float> dst((size_t)aw * ah), colSum((size_t)fullEye);
+    for (int y = 0; y < ah; ++y) {
+        const int ya = std::min(f.height - 1, (int)(y * sy));
+        const int yb = std::max(ya + 1, std::min(f.height, (int)((y + 1) * sy)));
+        std::fill(colSum.begin(), colSum.end(), 0.f);
+        for (int yy = ya; yy < yb; ++yy) {
+            const size_t r = (size_t)yy * W + x0;
+            if (p16) {
+                const uint16_t* src = reinterpret_cast<const uint16_t*>(f.plane[0].data()) + r;
+                for (int x = 0; x < fullEye; ++x) colSum[x] += (float)src[x] * (1.0f / 256.0f);
+            } else {
+                const uint8_t* src = f.plane[0].data() + r;
+                for (int x = 0; x < fullEye; ++x) colSum[x] += (float)src[x];
+            }
+        }
+        float* d = dst.data() + (size_t)y * aw;
+        for (int x = 0; x < aw; ++x) {
+            const int xa = std::min(fullEye - 1, (int)(x * sx));
+            const int xb = std::max(xa + 1, std::min(fullEye, (int)((x + 1) * sx)));
+            float acc = 0.f;
+            for (int xx = xa; xx < xb; ++xx) acc += colSum[xx];
+            d[x] = acc / (float)((xb - xa) * (yb - ya));
+        }
+    }
+    return dst;
+}
+
+// The downsample runs on several threads; every analysis pixel and both mean colours must
+// be bit-identical to the one-thread result (each output row is independent, each mean is
+// summed on one thread). Odd sizes so the chunks do not divide evenly.
+void ThreadedDownsampleIsExact() {
+    TestSignalConfig cfg;
+    cfg.eyeW = 965;  // a 1930x1086 frame
+    cfg.eyeH = 1086;
+    cfg.vShiftPx = 3.0f;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 17, px);
+    const FrameRing::Frame nv12 = ToFrame(px);
+    // The same picture as P016 (10/16-bit capture), MSB-aligned with a low byte set.
+    FrameRing::Frame p016 = nv12;
+    p016.format = PixFormat::P016;
+    for (int pl = 0; pl < 2; ++pl) {
+        const std::vector<uint8_t>& src = nv12.plane[pl];
+        std::vector<uint8_t> wide(src.size() * 2);
+        for (size_t i = 0; i < src.size(); ++i) {
+            wide[i * 2] = (uint8_t)(i * 37);  // low byte
+            wide[i * 2 + 1] = src[i];         // high byte
+        }
+        p016.plane[pl] = std::move(wide);
+    }
+    const FrameRing::Frame* frame = &nv12;
+    auto run = [&](const char* threads, StereoLayout layout, bool swap) {
+        const FrameRing::Frame& f = *frame;
+#if defined(_WIN32)
+        _putenv_s("MEDIAPLAYER_RIG_THREADS", threads);
+#else
+        setenv("MEDIAPLAYER_RIG_THREADS", threads, 1);
+#endif
+        rig::EyePair e;
+        CHECK(rig::Downsample(f, layout, 333, e, swap), "downsample");
+        return e;
+    };
+    for (int fmt = 0; fmt < 2; ++fmt)
+    for (int swap = 0; swap < 2; ++swap) {
+        frame = fmt == 0 ? &nv12 : &p016;
+        const rig::EyePair one = run("1", StereoLayout::SbsFull, swap != 0);
+        int raw = 0, rah = 0;
+        const std::vector<float> refL = ReferenceLuma(*frame, 333, swap != 0, raw, rah);
+        const std::vector<float> refR = ReferenceLuma(*frame, 333, swap == 0, raw, rah);
+        CHECK(one.left == refL && one.right == refR, "integer luma bit-identical to the original float box filter");
+        for (const char* t : {"2", "3", "7"}) {
+            const rig::EyePair many = run(t, StereoLayout::SbsFull, swap != 0);
+            CHECK(one.eyeW == many.eyeW && one.h == many.h, "same analysis size");
+            CHECK(one.left == many.left && one.right == many.right, "threaded luma bit-identical to one thread");
+            bool colourSame = true;
+            for (int e = 0; e < 2; ++e)
+                for (int k = 0; k < 3; ++k) colourSame = colourSame && one.meanRgb[e][k] == many.meanRgb[e][k];
+            CHECK(colourSame, "threaded mean colours bit-identical to one thread");
+        }
+    }
+#if defined(_WIN32)
+    _putenv_s("MEDIAPLAYER_RIG_THREADS", "");
+#else
+    unsetenv("MEDIAPLAYER_RIG_THREADS");
+#endif
+}
+
 int main() {
+    ThreadedDownsampleIsExact();
     CleanRig();
     VerticalFault();
     ColourFault();

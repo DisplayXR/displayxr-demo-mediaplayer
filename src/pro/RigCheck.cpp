@@ -11,6 +11,7 @@
 #include <ctime>
 #include <future>
 #include <iterator>
+#include <thread>
 
 namespace mp::rig {
 
@@ -103,10 +104,6 @@ bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, E
     if (f.width < 64 || f.height < 32 || f.plane[0].empty()) return false;
     if (f.format != PixFormat::NV12 && f.format != PixFormat::I420 && f.format != PixFormat::P016) return false;
     const bool p16 = f.format == PixFormat::P016;  // 16-bit samples, MSB-aligned
-    auto lumaAt = [&](size_t i) -> float {
-        return p16 ? (float)reinterpret_cast<const uint16_t*>(f.plane[0].data())[i] / 256.0f
-                   : (float)f.plane[0][i];
-    };
     const int fullEye = f.width / 2;
     const int aw = std::min(analysisW, fullEye);
     const float sx = (float)fullEye / (float)aw;
@@ -120,68 +117,128 @@ bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, E
     out.left.resize((size_t)aw * ah);
     out.right.resize((size_t)aw * ah);
     const int W = f.width;
-    std::vector<float> colSum((size_t)fullEye);
-    for (int eye = 0; eye < 2; ++eye) {
+    // The work is the same per output row and per eye, so it runs on several threads and
+    // the render thread waits for them: every analysis pixel and the mean colours are
+    // computed exactly as on one thread (each mean on one thread, so its sum order holds).
+    // At 7680x2160 SBS this was 8-9 ms a call (max ~24) on the render thread, ~9 calls a
+    // second during bursts (#120 review, 2026-10-19).
+    auto lumaRows = [&](int eye, int yBegin, int yEnd) {
         std::vector<float>& dst = eye == 0 ? out.left : out.right;
         // the eye as SHOWN: with the eyes swapped the right half feeds the left eye
         const int x0 = (eye ^ (swapEyes ? 1 : 0)) * fullEye;
+        // Integer sums: the samples are integers (P016 scaled by 1/256 at the end), every
+        // partial sum stays under 2^24, so the result is the float sum bit for bit.
+        std::vector<uint32_t> colSum((size_t)fullEye);
         // A box over each analysis pixel's whole footprint (sx x sy source pixels). Sampling
         // a 2x2 corner of a 3x3 footprint, as this did, skips five source pixels in nine:
         // an edge moving through the skipped rows does not move in the analysis image,
         // so sub-pixel motion is quantised and a frame of motion at 48p (~0.3 px here)
         // vanished - the eye-sync reading split between the true delay and its neighbour
         // or read "in step" (tmp-mp-pro, 2026-10-18).
-        for (int y = 0; y < ah; ++y) {
+        for (int y = yBegin; y < yEnd; ++y) {
             const int ya = std::min(f.height - 1, (int)(y * sy));
             const int yb = std::max(ya + 1, std::min(f.height, (int)((y + 1) * sy)));
-            std::fill(colSum.begin(), colSum.end(), 0.f);
+            std::fill(colSum.begin(), colSum.end(), 0u);
             for (int yy = ya; yy < yb; ++yy) {
                 const size_t r = (size_t)yy * W + x0;
                 if (p16) {
                     const uint16_t* src = reinterpret_cast<const uint16_t*>(f.plane[0].data()) + r;
-                    for (int x = 0; x < fullEye; ++x) colSum[x] += (float)src[x] * (1.0f / 256.0f);
+                    for (int x = 0; x < fullEye; ++x) colSum[x] += src[x];
                 } else {
                     const uint8_t* src = f.plane[0].data() + r;
-                    for (int x = 0; x < fullEye; ++x) colSum[x] += (float)src[x];
+                    for (int x = 0; x < fullEye; ++x) colSum[x] += src[x];
                 }
             }
+            const float unit = p16 ? 1.0f / 256.0f : 1.0f;
             float* d = dst.data() + (size_t)y * aw;
             for (int x = 0; x < aw; ++x) {
                 const int xa = std::min(fullEye - 1, (int)(x * sx));
                 const int xb = std::max(xa + 1, std::min(fullEye, (int)((x + 1) * sx)));
-                float acc = 0.f;
+                uint32_t acc = 0;
                 for (int xx = xa; xx < xb; ++xx) acc += colSum[xx];
-                d[x] = acc / (float)((xb - xa) * (yb - ya));
+                d[x] = ((float)acc * unit) / (float)((xb - xa) * (yb - ya));
             }
         }
-        // mean colour over the central 80 %, on a coarse grid of chroma samples
-        double sy_ = 0, su = 0, sv = 0;
-        int n = 0;
-        const int cw = W / 2, chh = f.height / 2;
-        // Whole rows, every 7th: a sparse grid aliases with periodic content (a 16 px
-        // grid on a drifting 160 px grating read one eye 15 % brighter for a burst now
-        // and then, and the colour alert latched that peak - tmp-mp-pro 2026-10-18).
-        for (int y = f.height / 10; y < f.height * 9 / 10; y += 7) {
-            for (int x = fullEye / 10; x < fullEye * 9 / 10; ++x) {
-                const int gx = x0 + x;
-                sy_ += lumaAt((size_t)y * W + gx);
-                if (p16) {
-                    const uint16_t* uv = reinterpret_cast<const uint16_t*>(f.plane[1].data()) + (size_t)(y / 2) * W + (gx & ~1);
-                    su += uv[0] / 256.0;
-                    sv += uv[1] / 256.0;
-                } else if (f.format == PixFormat::NV12) {
-                    const uint8_t* uv = f.plane[1].data() + (size_t)(y / 2) * W + (gx & ~1);
-                    su += uv[0];
-                    sv += uv[1];
-                } else {
-                    su += f.plane[1][(size_t)(y / 2) * cw + gx / 2];
-                    sv += f.plane[2][(size_t)(y / 2) * cw + gx / 2];
+    };
+    // Mean colour over the central 80 %: whole rows, every 7th. A sparse grid aliases with
+    // periodic content (a 16 px grid on a drifting 160 px grating read one eye 15 % brighter
+    // for a burst now and then, and the colour alert latched that peak - tmp-mp-pro
+    // 2026-10-18). Summed in integers per chunk of rows: the samples are integers (P016 in
+    // 1/256 steps), so the total is exact and equals the old double sum bit for bit.
+    struct Sums {
+        uint64_t y = 0, u = 0, v = 0;
+        int64_t n = 0;
+    };
+    const int rowFirst = f.height / 10, rowEnd = f.height * 9 / 10;
+    const int rowCount = rowFirst < rowEnd ? (rowEnd - rowFirst + 6) / 7 : 0;
+    const int xFirst = fullEye / 10, xEnd = fullEye * 9 / 10;
+    const int cw = W / 2;
+    auto meanRows = [&](int eye, int kBegin, int kEnd) {
+        const int x0 = (eye ^ (swapEyes ? 1 : 0)) * fullEye;
+        Sums s;
+        for (int k = kBegin; k < kEnd; ++k) {
+            const int y = rowFirst + 7 * k;
+            if (p16) {
+                const uint16_t* Y = reinterpret_cast<const uint16_t*>(f.plane[0].data()) + (size_t)y * W;
+                const uint16_t* UV = reinterpret_cast<const uint16_t*>(f.plane[1].data()) + (size_t)(y / 2) * W;
+                for (int x = xFirst; x < xEnd; ++x) {
+                    const int gx = x0 + x;
+                    s.y += Y[gx];
+                    s.u += UV[gx & ~1];
+                    s.v += UV[(gx & ~1) + 1];
                 }
-                ++n;
+            } else if (f.format == PixFormat::NV12) {
+                const uint8_t* Y = f.plane[0].data() + (size_t)y * W;
+                const uint8_t* UV = f.plane[1].data() + (size_t)(y / 2) * W;
+                for (int x = xFirst; x < xEnd; ++x) {
+                    const int gx = x0 + x;
+                    s.y += Y[gx];
+                    s.u += UV[gx & ~1];
+                    s.v += UV[(gx & ~1) + 1];
+                }
+            } else {
+                const uint8_t* Y = f.plane[0].data() + (size_t)y * W;
+                const uint8_t* U = f.plane[1].data() + (size_t)(y / 2) * cw;
+                const uint8_t* V = f.plane[2].data() + (size_t)(y / 2) * cw;
+                for (int x = xFirst; x < xEnd; ++x) {
+                    const int gx = x0 + x;
+                    s.y += Y[gx];
+                    s.u += U[gx / 2];
+                    s.v += V[gx / 2];
+                }
             }
+            s.n += std::max(0, xEnd - xFirst);
         }
-        (void)chh;
-        if (n > 0) YuvToRgb((float)(sy_ / n), (float)(su / n), (float)(sv / n), f.fullRange, out.meanRgb[eye]);
+        return s;
+    };
+    // Threads per eye: up to 4. MEDIAPLAYER_RIG_THREADS=<n> pins it (tests compare 1 vs n).
+    int chunks = std::clamp((int)std::thread::hardware_concurrency() / 2, 1, 4);
+    if (const char* t = std::getenv("MEDIAPLAYER_RIG_THREADS")) chunks = std::clamp(std::atoi(t), 1, 16);
+    std::vector<std::future<void>> jobs;
+    std::vector<std::future<Sums>> means[2];
+    for (int eye = 0; eye < 2; ++eye)
+        for (int c = 0; c < chunks; ++c) {
+            means[eye].push_back(std::async(std::launch::async, meanRows, eye, rowCount * c / chunks,
+                                            rowCount * (c + 1) / chunks));
+            const int y0 = ah * c / chunks, y1 = ah * (c + 1) / chunks;
+            if (c == chunks - 1 && eye == 1) continue;  // the last chunk runs here
+            jobs.push_back(std::async(std::launch::async, lumaRows, eye, y0, y1));
+        }
+    lumaRows(1, ah * (chunks - 1) / chunks, ah);
+    for (auto& j : jobs) j.get();
+    const double scale = p16 ? 1.0 / 256.0 : 1.0;
+    for (int eye = 0; eye < 2; ++eye) {
+        Sums t;
+        for (auto& m : means[eye]) {
+            const Sums s = m.get();
+            t.y += s.y;
+            t.u += s.u;
+            t.v += s.v;
+            t.n += s.n;
+        }
+        if (t.n > 0)
+            YuvToRgb((float)((double)t.y * scale / (double)t.n), (float)((double)t.u * scale / (double)t.n),
+                     (float)((double)t.v * scale / (double)t.n), f.fullRange, out.meanRgb[eye]);
     }
     return true;
 }
@@ -653,7 +710,26 @@ void RigMonitor::Submit(const FrameRing::Frame& f, StereoLayout layout, int eyeO
     }
     EyePair e;
     e.serial = f.serial;
-    if (!Downsample(f, layout, 640, e, swapEyes)) {
+    const auto dt0 = std::chrono::steady_clock::now();
+    const bool downOk = Downsample(f, layout, 640, e, swapEyes);
+    {
+        // Render-thread cost of the downsample, logged every 5 s (measurement aid).
+        static double sum = 0.0, mx = 0.0, nextLog = 0.0;
+        static int cnt = 0;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dt0).count();
+        sum += ms;
+        mx = std::max(mx, ms);
+        ++cnt;
+        if (now >= nextLog) {
+            if (nextLog > 0.0)
+                std::fprintf(stderr, "[mediaplayer][INFO ] Rig check (render thread): downsample %d x avg %.2f max %.2f ms\n",
+                             cnt, sum / cnt, mx);
+            sum = mx = 0.0;
+            cnt = 0;
+            nextLog = now + 5.0;
+        }
+    }
+    if (!downOk) {
         burst_.clear();
         return;
     }
