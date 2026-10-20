@@ -158,6 +158,10 @@ jobs:
           assert_present "$APP/Resources/displayxr/icon_sbs\.png" "manifest 3D icon"
           if [ "$MISSING" -ne 0 ]; then echo "Payload listing:"; cat "$EXPAND_DIR/files"; exit 1; fi
           echo "PASS: .pkg payload contains app + MoltenVK/Vulkan/OpenXR + FFmpeg dylibs + DisplayXR manifest/icons."
+          # Every Mach-O in the shipped payload loads only bundle-relative paths (v1.14.2
+          # shipped /opt/homebrew/lib + /tmp/openxr-install/lib rpaths ahead of the bundle).
+          pkgutil --expand-full "$PKG" "$EXPAND_DIR/full"
+          bash installer/macos/check_bundle_paths.sh "$EXPAND_DIR/full/mediaplayer.pkg/Payload/Applications/Stereo Media Player.app"
 
       - name: Assert Pro .pkg payload (regression guard)
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -204,6 +208,8 @@ jobs:
           fi
           if [ "$MISSING" -ne 0 ]; then echo "Payload listing:"; cat "$EXPAND_DIR/files"; exit 1; fi
           echo "PASS: Pro .pkg payload contains Media Player Pro.app + MoltenVK/Vulkan/OpenXR + FFmpeg + OpenColorIO dylibs + manifest/icons."
+          pkgutil --expand-full "$PKG" "$EXPAND_DIR/full"
+          bash installer/macos/check_bundle_paths.sh "$EXPAND_DIR/full/mediaplayer_pro.pkg/Payload/Applications/Media Player Pro.app"
 
       - name: Upload installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
