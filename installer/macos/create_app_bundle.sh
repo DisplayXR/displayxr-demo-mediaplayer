@@ -138,7 +138,7 @@ DXR_SRC="$REPO_ROOT/displayxr"
 DXR_DST="$APP_BUNDLE/Contents/Resources/displayxr"
 DXR_MANIFEST_SRC="$DXR_SRC/$MANIFEST_BASENAME"
 mkdir -p "$DXR_DST"
-for f in icon.png icon_sbs.png idle.png logo.png; do
+for f in icon.png icon_sbs.png icon_pro.png icon_pro_sbs.png idle.png logo.png; do
     if [ ! -f "$DXR_SRC/$f" ]; then
         echo "Error: $DXR_SRC/$f missing (app manifest icon / idle logo)" >&2
         exit 1
