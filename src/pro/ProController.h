@@ -20,6 +20,7 @@
 #include "color/Cdl.h"
 #include "color/CubeLut.h"
 #include "pro/CompareClip.h"
+#include "pro/LookLoader.h"
 #include "pro/OcioBake.h"
 #include "pro/Overlays.h"
 #include "pro/ResolveLink.h"
@@ -105,10 +106,12 @@ public:
     // set the initial view, so a headless atlas dump can prove them without keystrokes.
     void ApplyTestEnv();
 
-    // Launch-time looks (--lut / --cdl, or MEDIAPLAYER_LUT / MEDIAPLAYER_CDL).
+    // Launch-time looks (--lut / --cdl, or MEDIAPLAYER_LUT / MEDIAPLAYER_CDL). A LUT
+    // (and an OCIO bake) loads asynchronously: it applies a few frames later, in Tick().
     void LoadLut(const std::string& path);
     void LoadCdl(const std::string& path);
     // An OpenColorIO transform baked into the grade's 3D LUT (needs a build with MP_OCIO_ROOT).
+    // True = queued; config / colour-space errors surface later as lutError_.
     bool LoadOcio(const ocio::Request& req, std::string* err = nullptr);
     // A/B compare: the B clip; B (key) swaps to the other at the same position.
     void SetCompareB(const std::string& path) { compare_[1] = path; }
@@ -213,7 +216,9 @@ private:
     std::string lutPath_, lutName_;
     color::Cdl cdl_;
     std::string cdlPath_, cdlName_;
-    bool lutPending_ = false;      // lut_ parsed, waiting for the render thread to upload
+    LookLoader looks_;             // parses / bakes LUTs off the render thread
+    std::string lutLoading_;       // source of the look being built ('' = none)
+    std::string lutError_;         // why the last look failed ('' = it did not)
 
     // File dialog result (SDL may call back on another thread).
     std::mutex dialogMutex_;
@@ -244,6 +249,7 @@ private:
     bool wipeDragging_ = false;
     CompareClip compareClip_;                    // B for Wipe::Clips, following the open clip
     void TickCompareClip();
+    void TickLooks();  // apply a look the loader finished (render thread)
     std::string CompareOther() const { return compare_[1 - compareSide_]; }  // the clip not showing
     bool NearWipeLine(float x, float y) const;  // window points
 

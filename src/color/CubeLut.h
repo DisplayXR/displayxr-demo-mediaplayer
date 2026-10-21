@@ -11,6 +11,8 @@
 // silently misread — on-set looks are 3D LUTs.
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -32,5 +34,8 @@ bool ParseCube(const std::string& text, CubeLut& out, std::string& error);
 
 // Read + parse a `.cube` file from disk.
 bool LoadCube(const std::string& path, CubeLut& out, std::string& error);
+
+// `count` RGB float triplets as RGBA16F texels (alpha 1.0), the GPU LUT's format.
+std::vector<uint16_t> PackRgba16f(const float* rgb, size_t count);
 
 }  // namespace mp::color
