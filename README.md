@@ -30,12 +30,15 @@ decode → atlas → submit path; the runtime + display processor do all weaving
 
 **Stereo layout resolution**, in priority order:
 
-1. **Filename** — the `*_2x1` / `*_half_2x1` convention.
+1. **Filename** — the `*_2x1` / `*_half_2x1` convention for side-by-side, `*_1x2` /
+   `*_half_1x2` for top-bottom (left eye on top), and the release tokens `TB` / `OU` /
+   `TAB` / `H-OU` as whole words of the file name (half unless the name says `full`).
 2. **Container metadata** — a LIF or MPO container, or `AVStereo3D` side data from MKV
    `StereoMode`, MP4 `st3d`, or an H.264 frame-packing SEI (which also says whether the
-   eyes are packed R|L).
+   eyes are packed R|L). Side-by-side and top-bottom packings are read; the frame aspect
+   settles full vs half.
 3. **Content** — cross-correlation of the two halves, which may conclude **mono only on
-   unambiguous evidence**.
+   unambiguous evidence**. Side-by-side only: top-bottom is never guessed from pixels.
 4. **Otherwise the file is assumed to be stereo**, with the frame aspect settling
    full-SBS vs half-SBS.
 
@@ -75,7 +78,7 @@ scripts/run_mediaplayer_handle_vk_macos.sh assets/test_LR_2x1.png
 ```
 
 Keys: **V** cycles display modes, **SHIFT+TAB** toggles the HUD, **L** cycles the stereo
-layout override (auto / mono / SBS-full / SBS-half), **Esc** quits. Transport follows the
+layout override (auto / mono / SBS-full / SBS-half / TB-full / TB-half), **Esc** quits. Transport follows the
 editor convention (Resolve, Premiere, Avid, RV): **Space** play/pause, **Left** / **Right**
 one frame back/forward (**Shift** for a 5-frame jump; `[` / `]` do the same), **Up** /
 **Down** previous/next asset in the folder. On a still, where there is no frame to step,
