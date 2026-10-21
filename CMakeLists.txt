@@ -645,6 +645,16 @@ if(MP_BUILD_TESTS)
     target_include_directories(stereo_detect_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME stereo_detect COMMAND stereo_detect_test)
 
+    # Stereo packing (#128): eye rects / per-eye aspect for SBS and top-bottom, the TB
+    # full/half choice and the filename hints.
+    add_executable(stereo_packing_test
+        tests/stereo_packing_test.cpp
+        src/media/StereoDetect.cpp
+        src/media/MediaSource.cpp
+        src/Log.cpp)
+    target_include_directories(stereo_packing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME stereo_packing COMMAND stereo_packing_test)
+
     # Live camera source (#90): denylist / selector / format choice. Pure, no SDL.
     add_executable(camera_select_test
         tests/camera_select_test.cpp

@@ -355,7 +355,7 @@ void ProController::ClampPan() {
     if (zoom_ <= 1.0001f) { zoom_ = 1.0f; panX_ = panY_ = 0.0f; }
 }
 
-void ProController::ApplyViewTransform(ViewUV* uvs, uint32_t n, bool stereo, bool eyesSwapped) {
+void ProController::ApplyViewTransform(ViewUV* uvs, uint32_t n, bool stereo, bool eyesSwapped, bool topBottom) {
     stereoSource_ = stereo;
     if (!stereo && wipe_ == Wipe::Eyes) wipe_ = Wipe::Off;
     if (!stereo && mode_ != ViewMode::Stereo3D) {
@@ -363,8 +363,10 @@ void ProController::ApplyViewTransform(ViewUV* uvs, uint32_t n, bool stereo, boo
         if (mode_ == ViewMode::Difference || mode_ == ViewMode::Anaglyph) mode_ = ViewMode::Stereo3D;
     }
 
-    // The two eyes' halves of a side-by-side frame. For mono both are the whole frame.
-    const ViewUV halfA{0.0f, 0.0f, 0.5f, 1.0f}, halfB{0.5f, 0.0f, 0.5f, 1.0f};
+    // The two eyes' halves of a packed frame (side-by-side or top-bottom, #128). For
+    // mono both are the whole frame.
+    const ViewUV halfA = topBottom ? ViewUV{0.0f, 0.0f, 1.0f, 0.5f} : ViewUV{0.0f, 0.0f, 0.5f, 1.0f};
+    const ViewUV halfB = topBottom ? ViewUV{0.0f, 0.5f, 1.0f, 0.5f} : ViewUV{0.5f, 0.0f, 0.5f, 1.0f};
     const ViewUV leftUv = !stereo ? uvs[0] : (eyesSwapped ? halfB : halfA);
     const ViewUV rightUv = !stereo ? uvs[0] : (eyesSwapped ? halfA : halfB);
 

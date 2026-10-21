@@ -32,6 +32,13 @@ enum class StereoLayout {
     // produces Dual (it is a container fact, decided before a frame is decoded), so
     // Dual is a legal value of this enum that simply never reaches the vote.
     Dual,
+    // Top-bottom / over-under (#128): left eye on top, right eye below. FULL keeps each
+    // eye at native resolution (the frame is twice an eye's height); HALF squeezed each
+    // eye vertically and is stretched back on display. Appended after Dual for the same
+    // reason as Dual: the pixel detector never produces them, so StereoVote's tallies
+    // (Mono/SbsFull/SbsHalf only) are untouched.
+    TbFull,
+    TbHalf,
 };
 
 // Which layer of the layered detector actually decided the layout. Ordered loosely by

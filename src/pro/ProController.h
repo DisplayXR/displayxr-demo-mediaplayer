@@ -135,7 +135,8 @@ public:
     // (the user's swap XOR the container's). The QC views address the two halves
     // directly, so they work even when every display view maps to the same eye (no
     // viewer tracked).
-    void ApplyViewTransform(ViewUV* uvs, uint32_t viewCount, bool stereo, bool eyesSwapped);
+    void ApplyViewTransform(ViewUV* uvs, uint32_t viewCount, bool stereo, bool eyesSwapped,
+                            bool topBottom = false);
 
     // The inspector (ImGui). `uiAlpha` is the trunk's auto-hide fade; a pinned
     // inspector ignores it and stays up.
