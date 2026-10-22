@@ -3,6 +3,7 @@
 #include "media/ImageSequence.h"
 
 #include "Log.h"
+#include "media/EyeAssign.h"
 #include "media/ImageDecoder.h"
 #include "media/StereoPacking.h"
 #include "media/LifLoader.h"
@@ -719,11 +720,14 @@ void App::RenderOneFrame() {
         window_.PixelSize(canvasW, canvasH);
         xr_.ComputeViewRects(canvasW, canvasH, rects);
 
-        // Map the 2-view source onto the N display views by eye-X vs the views' center.
+        // Map the 2-view source onto the N display views by eye-X vs the views' center
+        // (collapsed untracked eyes all get the left half: see media/EyeAssign.h).
+        float eyeX[XrSession::kMaxViews];
         float minX = frame.views[0].pose.position.x;
         float maxX = minX;
-        for (uint32_t v = 1; v < frame.viewCount; ++v) {
+        for (uint32_t v = 0; v < frame.viewCount; ++v) {
             const float x = frame.views[v].pose.position.x;
+            eyeX[v] = x;
             if (x < minX) minX = x;
             if (x > maxX) maxX = x;
         }
@@ -737,7 +741,7 @@ void App::RenderOneFrame() {
             // mediaEyeSwap_ is the container's word that the packing is R|L; XOR it in so
             // it composes with the user's X toggle instead of overriding it.
             const bool isLeft =
-                (frame.views[v].pose.position.x <= centerX) != (swapEyes_ != mediaEyeSwap_);
+                eyes::IsLeftView(eyeX, frame.viewCount, v) != (swapEyes_ != mediaEyeSwap_);
             isLeftView[v] = isLeft;
             colors[v] = isLeft ? kLeftImage : kRightImage;  // RED|BLUE fallback
             // Mono AND Dual both sample the WHOLE source per eye: mono because there

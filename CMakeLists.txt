@@ -670,6 +670,11 @@ if(MP_BUILD_TESTS)
     target_include_directories(auto_convergence_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME auto_convergence COMMAND auto_convergence_test)
 
+    # Eye assignment (#80): which source half each view samples, tracked or not. Header-only.
+    add_executable(eye_assign_test tests/eye_assign_test.cpp)
+    target_include_directories(eye_assign_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME eye_assign COMMAND eye_assign_test)
+
     # Stream-URL source (#93): the scheme classifier / host / redaction. Pure, no FFmpeg.
     add_executable(stream_url_test
         tests/stream_url_test.cpp
