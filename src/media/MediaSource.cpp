@@ -59,6 +59,8 @@ const char* LayoutName(StereoLayout l) {
         case StereoLayout::SbsFull: return "SBS-full";
         case StereoLayout::SbsHalf: return "SBS-half";
         case StereoLayout::Dual:    return "Dual";
+        case StereoLayout::TbFull:  return "TB-full";
+        case StereoLayout::TbHalf:  return "TB-half";
         default: return "mono";
     }
 }
@@ -78,6 +80,25 @@ bool MediaSource::LayoutFromFilename(const std::string& path, StereoLayout& out)
     const std::string lower = Lower(path);
     if (Contains(lower, "half_2x1")) { out = StereoLayout::SbsHalf; return true; }
     if (Contains(lower, "2x1")) { out = StereoLayout::SbsFull; return true; }
+    // Top-bottom (#128): `*_1x2` / `*_half_1x2` mirror the SBS convention; the common
+    // release tokens (TB, OU, TAB, H-OU, ...) are matched as whole words of the FILE
+    // name, so "tabletop", "output" or a directory called tb never trip them. A bare
+    // token is half (what those releases nearly always are) unless it says full.
+    const size_t slash = lower.find_last_of("/\\");
+    const std::string base = slash == std::string::npos ? lower : lower.substr(slash + 1);
+    if (Contains(base, "half_1x2")) { out = StereoLayout::TbHalf; return true; }
+    if (Contains(base, "1x2")) { out = StereoLayout::TbFull; return true; }
+    bool tb = false, full = false;
+    std::string tok;
+    for (size_t i = 0; i <= base.size(); ++i) {
+        const char ch = i < base.size() ? base[i] : '.';
+        if (std::isalnum((unsigned char)ch)) { tok += ch; continue; }
+        if (tok == "tb" || tok == "ou" || tok == "tab" || tok == "htb" || tok == "hou") tb = true;
+        if (tok == "ftb" || tok == "fou") tb = full = true;
+        if (tok == "full") full = true;
+        tok.clear();
+    }
+    if (tb) { out = full ? StereoLayout::TbFull : StereoLayout::TbHalf; return true; }
     return false;
 }
 

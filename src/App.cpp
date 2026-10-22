@@ -4,6 +4,7 @@
 
 #include "Log.h"
 #include "media/ImageDecoder.h"
+#include "media/StereoPacking.h"
 #include "media/LifLoader.h"
 #include "media/MediaSource.h"
 #include "media/MpoLoader.h"
@@ -130,12 +131,10 @@ double SteadySeconds() {
         .count();
 }
 
-// Per-eye display aspect (width/height): full SBS packs two eyes across the width
-// (each eye half-width); half-SBS and mono use the full frame width.
+// Per-eye display aspect (width/height): a FULL packing halves the frame along its
+// packing axis (SBS: width, TB: height); half packings and mono use the whole frame.
 float PerEyeAspect(StereoLayout layout, int frameW, int frameH) {
-    if (frameH <= 0) return 1.0f;
-    const float eyeW = (layout == StereoLayout::SbsFull) ? (float)frameW * 0.5f : (float)frameW;
-    return eyeW / (float)frameH;
+    return packing::PerEyeAspect(layout, frameW, frameH);
 }
 
 // "Match min-to-min": scale `contentAspect` so the content's SHORTER screen side equals
@@ -753,8 +752,11 @@ void App::RenderOneFrame() {
                 !convertBound_) {
                 uvs[v] = {0.0f, 0.0f, 1.0f, 1.0f};
             } else {
-                uvs[v] = isLeft ? ViewUV{0.0f, 0.0f, 0.5f, 1.0f}
-                                : ViewUV{0.5f, 0.0f, 0.5f, 1.0f};
+                // A converted mono picture is two eyes side by side (SBS-full).
+                const packing::EyeRect e =
+                    packing::Eye(convertBound_ && !packing::IsPacked(layout_) ? StereoLayout::SbsFull : layout_,
+                                 isLeft);
+                uvs[v] = ViewUV{e.x, e.y, e.w, e.h};
             }
         }
 
@@ -765,7 +767,7 @@ void App::RenderOneFrame() {
             const bool stereoSrc =
                 (layout_ != StereoLayout::Mono && layout_ != StereoLayout::Dual) || convertBound_;
             pro_.ApplyViewTransform(uvs, frame.viewCount, stereoSrc && hasMedia_ && !isLogo_,
-                                    swapEyes_ != mediaEyeSwap_);
+                                    swapEyes_ != mediaEyeSwap_, packing::IsTb(layout_));
             pro_.Tick(ProStatus());
         }
 #endif
@@ -1324,6 +1326,9 @@ void App::ReadStereoEnv() {
         else if (std::strcmp(l, "sbshalf") == 0) layoutForcedValue_ = StereoLayout::SbsHalf;
         else if (std::strcmp(l, "sbsfull") == 0 || std::strcmp(l, "sbs") == 0)
             layoutForcedValue_ = StereoLayout::SbsFull;
+        else if (std::strcmp(l, "tbhalf") == 0 || std::strcmp(l, "tb") == 0)
+            layoutForcedValue_ = StereoLayout::TbHalf;
+        else if (std::strcmp(l, "tbfull") == 0) layoutForcedValue_ = StereoLayout::TbFull;
         else layoutForced_ = false;   // "auto" or anything unrecognised
         LOG_INFO("Stereo layout forced: %s", layoutForced_ ? l : "auto");
     }
@@ -1363,7 +1368,9 @@ bool App::LoadMedia(const std::string& path) {
             meta.eyeSwap = pr.metaInvert;
             // AVStereo3D says "side by side" but is silent on full vs half — settle that
             // from the frame aspect, the same way the content path does.
-            if (meta.layout != StereoLayout::Mono && pr.width > 0 && pr.height > 0) {
+            if (packing::IsTb(meta.layout) && pr.width > 0 && pr.height > 0) {
+                meta.layout = packing::ChooseTbFullOrHalf((float)pr.width / (float)pr.height);
+            } else if (meta.layout != StereoLayout::Mono && pr.width > 0 && pr.height > 0) {
                 bool ambiguous = false;
                 meta.layout = StereoDetect::ChooseFullOrHalf(
                     (float)pr.width / (float)pr.height, ambiguous);
@@ -1586,7 +1593,7 @@ void App::CycleLayoutOverride() {
         LOG_INFO("Layout override ignored: this file carries one view per track (Dual)");
         return;
     }
-    // auto -> mono -> SBS-full -> SBS-half -> auto
+    // auto -> mono -> SBS-full -> SBS-half -> TB-full -> TB-half -> auto
     if (!layoutPinned_) {
         layoutPinned_ = true;
         layoutPinnedValue_ = StereoLayout::Mono;
@@ -1594,6 +1601,10 @@ void App::CycleLayoutOverride() {
         layoutPinnedValue_ = StereoLayout::SbsFull;
     } else if (layoutPinnedValue_ == StereoLayout::SbsFull) {
         layoutPinnedValue_ = StereoLayout::SbsHalf;
+    } else if (layoutPinnedValue_ == StereoLayout::SbsHalf) {
+        layoutPinnedValue_ = StereoLayout::TbFull;
+    } else if (layoutPinnedValue_ == StereoLayout::TbFull) {
+        layoutPinnedValue_ = StereoLayout::TbHalf;
     } else {
         layoutPinned_ = false;
     }
@@ -2779,7 +2790,7 @@ void App::SetupAgentTools() {
         "automatic detection. Mirrors the L key. The override applies to the currently "
         "loaded file only and is dropped when other media is loaded.",
         "{\"type\":\"object\",\"properties\":{\"layout\":{\"type\":\"string\","
-        "\"enum\":[\"auto\",\"mono\",\"sbs_full\",\"sbs_half\"],"
+        "\"enum\":[\"auto\",\"mono\",\"sbs_full\",\"sbs_half\",\"tb_full\",\"tb_half\"],"
         "\"description\":\"Layout to pin, or 'auto' to restore detection.\"}},"
         "\"required\":[\"layout\"]}");
 
@@ -3214,13 +3225,15 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         else if (want == "mono") value = StereoLayout::Mono;
         else if (want == "sbs_full") value = StereoLayout::SbsFull;
         else if (want == "sbs_half") value = StereoLayout::SbsHalf;
+        else if (want == "tb_full") value = StereoLayout::TbFull;
+        else if (want == "tb_half") value = StereoLayout::TbHalf;
         else {
             success = false;
-            return "{\"error\":\"layout must be auto|mono|sbs_full|sbs_half\"}";
+            return "{\"error\":\"layout must be auto|mono|sbs_full|sbs_half|tb_full|tb_half\"}";
         }
         // Reuse the cycle's re-derivation rather than duplicating it: step until the
-        // state matches (the cycle has 4 stops, so this always terminates).
-        for (int i = 0; i < 4; ++i) {
+        // state matches (the cycle has 6 stops, so this always terminates).
+        for (int i = 0; i < 6; ++i) {
             if (layoutPinned_ == pin && (!pin || layoutPinnedValue_ == value)) break;
             CycleLayoutOverride();
         }
@@ -3427,8 +3440,8 @@ void App::InitPro() {
     };
     h.oneToOneZoom = [this] {
         // One source pixel per tile pixel: the eye's source width over its on-tile width.
-        const bool sbs = layout_ != StereoLayout::Mono && layout_ != StereoLayout::Dual;
-        const float eyeW = (float)mediaW_ * (sbs ? 0.5f : 1.0f);
+        // An SBS eye is half the frame wide; a TB or mono eye spans the full width.
+        const float eyeW = (float)mediaW_ * packing::Eye(layout_, true).w;
         return proTileContentW_ > 1.f ? std::max(1.0f, eyeW / proTileContentW_) : 1.0f;
     };
     h.pictureInHud = [this](float& x, float& y, float& w, float& hh) {

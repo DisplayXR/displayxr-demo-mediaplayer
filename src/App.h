@@ -101,7 +101,7 @@ private:
     // Transient toast (e.g. convergence %). Shows `msg` for a short time, then fades.
     void ShowToast(const std::string& msg);
 
-    // Stereo layout override (#45): cycle auto -> mono -> SBS-full -> SBS-half -> auto.
+    // Stereo layout override (#45, #128): cycle auto -> mono -> SBS-full -> SBS-half -> TB-full -> TB-half -> auto.
     // Re-derives layout_ and contentAspect_ in place; never touches the decoder.
     void CycleLayoutOverride();
     // "SBS-full — detected" / "mono — from filename" / "SBS-full (R|L) — metadata" ...

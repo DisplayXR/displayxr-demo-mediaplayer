@@ -68,6 +68,15 @@ bool ReadStereo3D(const AVFrame* f, StereoLayout& layout, bool& invert, const ch
             layout = StereoLayout::SbsFull;
             why = "stereo3d: side-by-side";
             return true;
+        case AV_STEREO3D_TOPBOTTOM:
+            if (s3->view != AV_STEREO3D_VIEW_PACKED) {
+                why = "stereo3d: single-view stream (not packed)";
+                return true;
+            }
+            // Silent on full vs half too; the caller settles it from the frame aspect.
+            layout = StereoLayout::TbFull;
+            why = "stereo3d: top-bottom";
+            return true;
         case AV_STEREO3D_2D:
             why = "stereo3d: explicitly 2D";
             return true;

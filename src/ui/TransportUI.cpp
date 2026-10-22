@@ -439,7 +439,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 ImGui::SameLine();
                 if (ImGui::Button(layoutBtn)) Fire(a.CycleLayout);
                 if (ImGui::IsItemHovered() && !s.layoutTooltip.empty()) {
-                    ImGui::SetTooltip("%s\nL cycles: auto / mono / SBS-full / SBS-half",
+                    ImGui::SetTooltip("%s\nL cycles: auto / mono / SBS-full / SBS-half / TB-full / TB-half",
                                       s.layoutTooltip.c_str());
                 }
             }
