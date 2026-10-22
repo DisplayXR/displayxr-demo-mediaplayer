@@ -9,7 +9,7 @@
 // MANAGED eye tracking the vendor collapses the eyes on tracking loss as its "go flat"
 // signal (runtime docs/specs/vendor/eye-tracking-modes.md). A display that then shows view
 // 0 alone looks the same either way, but one that keeps weaving for that single eye point
-// (Leia "Show left view when nobody is tracked" = off) would interlace two different halves
+// (e.g. a "show left view when nobody is tracked" setting turned off) would interlace two different halves
 // into a ghost; the same half in every view gives it a clean 2D image. Mapping the
 // collapsed case by view order was tried for #80 and rejected for that reason.
 
