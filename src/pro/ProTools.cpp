@@ -22,10 +22,12 @@ void ProController::RegisterTools(const RegisterFn& reg) {
     reg("set_grade",
         "Set Media Player Pro's grade: a .cube 3D LUT path, an ASC CDL file (.cc/.ccc/.cdl), "
         "exposure in stops (-4..4, linear light) and bypass. Arguments left out keep their "
-        "current value. Returns the grade.",
+        "current value. Returns the grade. A LUT loads in the background: the reply carries "
+        "lut_loading, and get_grade shows the LUT (or lut_error) once it applies.",
         "{\"type\":\"object\",\"properties\":{\"lut\":{\"type\":\"string\"},\"cdl\":{\"type\":\"string\"},"
         "\"exposure\":{\"type\":\"number\"},\"bypass\":{\"type\":\"boolean\"}}}");
-    reg("get_grade", "Read the grade: LUT, CDL (slope/offset/power/saturation), exposure, bypass.",
+    reg("get_grade", "Read the grade: LUT (with lut_loading / lut_error), CDL (slope/offset/power/"
+        "saturation), exposure, bypass.",
         "{\"type\":\"object\"}");
     reg("set_view",
         "Set the QC view: 3d, left, right, difference (|left - right| x4), anaglyph or false_colour; "
@@ -67,7 +69,8 @@ void ProController::RegisterTools(const RegisterFn& reg) {
     reg("set_ocio",
         "Bake an OpenColorIO transform into the grade's LUT: config (a path, an ocio:// built-in, or "
         "empty for $OCIO), src = the picture's colour space, then display + view (default: the "
-        "config's) or dst = a target colour space; optional looks. Needs a build with OpenColorIO.",
+        "config's) or dst = a target colour space; optional looks. Needs a build with OpenColorIO. "
+        "Bakes in the background: poll get_grade until lut_loading is empty (lut or lut_error).",
         "{\"type\":\"object\",\"properties\":{\"config\":{\"type\":\"string\"},\"src\":{\"type\":\"string\"},"
         "\"display\":{\"type\":\"string\"},\"view\":{\"type\":\"string\"},\"dst\":{\"type\":\"string\"},"
         "\"looks\":{\"type\":\"string\"}},\"required\":[\"src\"]}");
@@ -117,6 +120,7 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
         };
         auto gradeJson = [&]() {
             return json{{"lut", lutName_}, {"lut_on", grade_.lutOn},
+                        {"lut_loading", lutLoading_}, {"lut_error", lutError_},
                         {"cdl", cdlName_}, {"cdl_on", grade_.cdlOn},
                         {"slope", {grade_.slope[0], grade_.slope[1], grade_.slope[2]}},
                         {"offset", {grade_.offset[0], grade_.offset[1], grade_.offset[2]}},
@@ -126,8 +130,8 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
         if (tool == "set_grade") {
             std::string p;
             if (Str(a, "lut", p)) {
-                LoadLut(p);
-                if (lutPath_ != p) return err("LUT not loaded: " + p);
+                LoadLut(p);  // asynchronous: get_grade's lut_loading / lut_error report it
+                if (lutLoading_ != p) return err("LUT not loaded: " + lutError_);
             }
             if (Str(a, "cdl", p)) {
                 LoadCdl(p);
@@ -195,7 +199,7 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             Str(a, "looks", req.looks);
             std::string e;
             if (!LoadOcio(req, &e)) return err(e);
-            result = json{{"lut", lutName_}, {"lut_size", lut_.size}}.dump();
+            result = json{{"lut_loading", lutLoading_}}.dump();  // get_grade reports the result
             return true;
         }
         if (tool == "describe_ocio") {

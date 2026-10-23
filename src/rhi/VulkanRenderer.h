@@ -182,6 +182,8 @@ public:
     // texture. `domainMin/Max` are the LUT's input domain (scalar: the same for R, G, B).
     // A one-off blocking upload (user action, not per frame). Returns false on failure.
     bool UploadLut3D(const float* rgb, uint32_t size, float domainMin, float domainMax);
+    // The same with the texels already packed (color::PackRgba16f), e.g. on a loader thread.
+    bool UploadLut3DPacked(const uint16_t* rgba16f, uint32_t size, float domainMin, float domainMax);
     void ClearLut3D();
     bool HasLut3D() const { return lut_.view != VK_NULL_HANDLE; }
 

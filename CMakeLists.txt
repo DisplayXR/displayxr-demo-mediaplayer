@@ -456,6 +456,7 @@ function(mp_add_player tgt is_pro)
         target_sources(${tgt} PRIVATE
             src/pro/ProController.cpp
             src/pro/ProTools.cpp         # agent tools: grade, view, station
+            src/pro/LookLoader.cpp       # LUT parse / OCIO bake off the render thread
             src/pro/LivePixels.cpp       # UYVY / v210 / BGRA -> NV12 / P016 for capture cards
             src/pro/LiveSourceBase.cpp   # shared ring + stats of the Pro live sources
             src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)
@@ -726,6 +727,9 @@ if(MP_BUILD_TESTS)
     add_executable(compare_clip_test tests/compare_clip_test.cpp)
     target_include_directories(compare_clip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME compare_clip COMMAND compare_clip_test)
+    add_executable(look_loader_test tests/look_loader_test.cpp src/pro/LookLoader.cpp src/color/CubeLut.cpp)
+    target_include_directories(look_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME look_loader COMMAND look_loader_test)
     add_executable(overlays_test tests/overlays_test.cpp src/pro/Overlays.cpp)
     target_include_directories(overlays_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME overlays COMMAND overlays_test)

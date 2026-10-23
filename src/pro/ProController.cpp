@@ -153,20 +153,19 @@ void ProController::AddFlatRectOfCurrentWindow() {
 // ---------------------------------------------------------------------------
 
 void ProController::LoadLut(const std::string& path) {
-    color::CubeLut lut;
-    std::string err;
-    if (!color::LoadCube(path, lut, err)) {
-        LOG_WARN("Pro: LUT %s rejected: %s", path.c_str(), err.c_str());
-        if (host_.toast) host_.toast("LUT not loaded: " + err);
+    // Parsing runs on the look loader's thread (a 65^3 .cube is ~210 ms); Tick() applies
+    // the result. Only an unreadable path fails here, so a typo is reported at once.
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(std::filesystem::u8path(path), ec)) {
+        lutError_ = "cannot open " + path;
+        LOG_WARN("Pro: LUT %s rejected: %s", path.c_str(), lutError_.c_str());
+        if (host_.toast) host_.toast("LUT not loaded: " + lutError_);
         return;
     }
-    lut_ = std::move(lut);
-    lutPath_ = path;
-    lutName_ = lut_.title.empty() ? BaseName(path) : lut_.title;
-    lutPending_ = true;  // uploaded on the render thread in Tick()
-    grade_.lutOn = true;
-    LOG_INFO("Pro: LUT %s (%d^3) loaded", path.c_str(), lut_.size);
-    if (host_.toast) host_.toast("LUT: " + lutName_);
+    lutError_.clear();
+    lutLoading_ = path;
+    looks_.Submit([path](color::CubeLut& lut, std::string& err) { return color::LoadCube(path, lut, err); },
+                  path, /*isOcio=*/false);
 }
 
 void ProController::LoadCdl(const std::string& path) {
@@ -192,21 +191,21 @@ void ProController::LoadCdl(const std::string& path) {
 }
 
 bool ProController::LoadOcio(const ocio::Request& req, std::string* errOut) {
-    color::CubeLut lut;
-    std::string err;
-    if (!ocio::Bake(req, lut, err)) {
+    // The bake runs on the look loader's thread (~40 ms at 65^3); Tick() applies it.
+    if (!ocio::Available()) {
+        std::string err;
+        color::CubeLut none;
+        ocio::Bake(req, none, err);  // the stub's message says how to get OCIO
+        lutError_ = err;
         LOG_WARN("Pro: OCIO bake failed: %s", err.c_str());
         if (host_.toast) host_.toast("OCIO: " + err);
         if (errOut) *errOut = err;
         return false;
     }
-    lut_ = std::move(lut);
-    lutPath_ = req.config.empty() ? "$OCIO" : req.config;
-    lutName_ = lut_.title;
-    lutPending_ = true;  // uploaded on the render thread in Tick()
-    grade_.lutOn = true;
-    LOG_INFO("Pro: %s (%d^3 baked)", lutName_.c_str(), lut_.size);
-    if (host_.toast) host_.toast(lutName_);
+    lutError_.clear();
+    lutLoading_ = req.config.empty() ? "$OCIO" : req.config;
+    looks_.Submit([req](color::CubeLut& lut, std::string& err) { return ocio::Bake(req, lut, err); },
+                  lutLoading_, /*isOcio=*/true);
     return true;
 }
 
@@ -561,6 +560,35 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
 // Per frame
 // ---------------------------------------------------------------------------
 
+void ProController::TickLooks() {
+    LookLoader::Result r;
+    if (!looks_.Take(r)) return;
+    lutLoading_.clear();
+    if (!r.ok) {
+        lutError_ = r.err;
+        LOG_WARN("Pro: %s %s rejected: %s", r.isOcio ? "OCIO bake" : "LUT", r.source.c_str(), r.err.c_str());
+        if (host_.toast) host_.toast(std::string(r.isOcio ? "OCIO: " : "LUT not loaded: ") + r.err);
+        return;
+    }
+    const float dmin = r.lut.domainMin[0], dmax = r.lut.domainMax[0];
+    if (r.lut.domainMin[0] != r.lut.domainMin[1] || r.lut.domainMin[0] != r.lut.domainMin[2] ||
+        r.lut.domainMax[0] != r.lut.domainMax[1] || r.lut.domainMax[0] != r.lut.domainMax[2])
+        LOG_WARN("Pro: LUT has a per-channel domain; using the red channel's (%.3f..%.3f)", dmin, dmax);
+    if (renderer_ && !renderer_->UploadLut3DPacked(r.rgba16f.data(), (uint32_t)r.lut.size, dmin, dmax)) {
+        lutError_ = "LUT upload failed";
+        if (host_.toast) host_.toast(lutError_);
+        grade_.lutOn = false;
+        return;
+    }
+    lut_ = std::move(r.lut);
+    lutPath_ = r.source;
+    lutName_ = r.isOcio || !lut_.title.empty() ? lut_.title : BaseName(r.source);
+    grade_.lutOn = true;
+    LOG_INFO("Pro: %s %s (%d^3) in %.1f ms off the render thread", r.isOcio ? "baked" : "loaded",
+             lutName_.c_str(), lut_.size, r.ms);
+    if (host_.toast) host_.toast(r.isOcio ? lutName_ : "LUT: " + lutName_);
+}
+
 void ProController::Tick(const Status& st) {
     stereoSource_ = st.stereo;
     station_.SetSignalFps(st.live ? st.sourceFps : 0.0f);
@@ -607,17 +635,7 @@ void ProController::Tick(const Status& st) {
         }
     }
     TickCompareClip();
-    if (lutPending_ && renderer_) {
-        lutPending_ = false;
-        const float dmin = lut_.domainMin[0], dmax = lut_.domainMax[0];
-        if (lut_.domainMin[0] != lut_.domainMin[1] || lut_.domainMin[0] != lut_.domainMin[2] ||
-            lut_.domainMax[0] != lut_.domainMax[1] || lut_.domainMax[0] != lut_.domainMax[2])
-            LOG_WARN("Pro: LUT has a per-channel domain; using the red channel's (%.3f..%.3f)", dmin, dmax);
-        if (!renderer_->UploadLut3D(lut_.rgb.data(), (uint32_t)lut_.size, dmin, dmax)) {
-            if (host_.toast) host_.toast("LUT upload failed");
-            grade_.lutOn = false;
-        }
-    }
+    TickLooks();
     if (!renderer_) return;
     GradeParams g = grade_;
     if (bypass_ || st.isLogo) {
@@ -873,6 +891,10 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
         // --- Looks ----------------------------------------------------------
         if (ImGui::CollapsingHeader("Looks", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (ImGui::Button("Load .cube...")) OpenLookDialog(false);
+            if (!lutLoading_.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("loading %s...", BaseName(lutLoading_).c_str());
+            }
             if (!lutName_.empty()) {
                 ImGui::SameLine();
                 ImGui::Checkbox("On##lut", &grade_.lutOn);

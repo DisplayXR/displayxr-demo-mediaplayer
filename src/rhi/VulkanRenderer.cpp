@@ -17,6 +17,7 @@
 #include "VulkanRenderer.h"
 
 #include "ColorPolicy.h"  // swapchain encoding policy (#78)
+#include "color/CubeLut.h"  // PackRgba16f for the 3D LUT
 #include "Log.h"
 #include "rhi/Shaders.h"
 
@@ -68,28 +69,6 @@ struct DrawPush {
 static_assert(sizeof(DrawPush) == 128, "DrawPush must match the shader's PushConstants");
 static_assert(sizeof(DrawPush) <= 128, "push block over the guaranteed 128-byte minimum");
 
-// IEEE 754 binary32 -> binary16 (round half up on the dropped bits), for the RGBA16F LUT.
-uint16_t FloatToHalf(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, 4);
-    const uint32_t sign = (x >> 16) & 0x8000u;
-    const uint32_t e32 = (x >> 23) & 0xffu;
-    int32_t exp = (int32_t)e32 - 127 + 15;
-    uint32_t mant = x & 0x7fffffu;
-    if (e32 == 0xffu) return (uint16_t)(sign | 0x7c00u | (mant ? 0x200u : 0));
-    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
-    if (exp <= 0) {
-        if (exp < -10) return (uint16_t)sign;
-        mant |= 0x800000u;
-        const uint32_t shift = (uint32_t)(14 - exp);
-        uint32_t h = mant >> shift;
-        if ((mant >> (shift - 1)) & 1u) h += 1;
-        return (uint16_t)(sign | h);
-    }
-    uint32_t h = sign | ((uint32_t)exp << 10) | (mant >> 13);
-    if (mant & 0x1000u) h += 1;  // a carry into the exponent is the correct rounding
-    return (uint16_t)h;
-}
 }  // namespace
 
 VulkanRenderer::~VulkanRenderer() { Shutdown(); }
@@ -1524,16 +1503,15 @@ void VulkanRenderer::DestroyLut(Lut3D& l, bool deferred) {
 }
 
 bool VulkanRenderer::UploadLut3D(const float* rgb, uint32_t size, float domainMin, float domainMax) {
-    if (!rgb || size < 2 || size > 256 || device_ == VK_NULL_HANDLE) return false;
-    const size_t count = (size_t)size * size * size;
-    std::vector<uint16_t> px(count * 4);
-    for (size_t i = 0; i < count; ++i) {
-        px[i * 4 + 0] = FloatToHalf(rgb[i * 3 + 0]);
-        px[i * 4 + 1] = FloatToHalf(rgb[i * 3 + 1]);
-        px[i * 4 + 2] = FloatToHalf(rgb[i * 3 + 2]);
-        px[i * 4 + 3] = 0x3c00u;  // 1.0
-    }
-    if (!CreateLutImage(lut_, size, px.data())) return false;
+    if (!rgb || size < 2 || size > 256) return false;
+    const std::vector<uint16_t> px = color::PackRgba16f(rgb, (size_t)size * size * size);
+    return UploadLut3DPacked(px.data(), size, domainMin, domainMax);
+}
+
+bool VulkanRenderer::UploadLut3DPacked(const uint16_t* rgba16f, uint32_t size, float domainMin,
+                                       float domainMax) {
+    if (!rgba16f || size < 2 || size > 256 || device_ == VK_NULL_HANDLE) return false;
+    if (!CreateLutImage(lut_, size, rgba16f)) return false;
     lut_.domainMin = domainMin;
     lut_.domainMax = domainMax;
     LOG_INFO("LUT: uploaded %u^3 (domain %.3f..%.3f)", size, domainMin, domainMax);

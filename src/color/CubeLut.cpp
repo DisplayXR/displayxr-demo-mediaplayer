@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -15,6 +16,29 @@ std::string Trim(const std::string& s) {
     if (b == std::string::npos) return {};
     size_t e = s.find_last_not_of(" \t\r\n");
     return s.substr(b, e - b + 1);
+}
+
+// IEEE 754 binary32 -> binary16 (round half up on the dropped bits), for the RGBA16F LUT.
+uint16_t FloatToHalf(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const uint32_t e32 = (x >> 23) & 0xffu;
+    int32_t exp = (int32_t)e32 - 127 + 15;
+    uint32_t mant = x & 0x7fffffu;
+    if (e32 == 0xffu) return (uint16_t)(sign | 0x7c00u | (mant ? 0x200u : 0));
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        const uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t h = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) h += 1;
+        return (uint16_t)(sign | h);
+    }
+    uint32_t h = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    if (mant & 0x1000u) h += 1;  // a carry into the exponent is the correct rounding
+    return (uint16_t)h;
 }
 
 bool Fail(std::string& error, int line, const char* what) {
@@ -100,6 +124,17 @@ bool LoadCube(const std::string& path, CubeLut& out, std::string& error) {
     std::stringstream ss;
     ss << f.rdbuf();
     return ParseCube(ss.str(), out, error);
+}
+
+std::vector<uint16_t> PackRgba16f(const float* rgb, size_t count) {
+    std::vector<uint16_t> px(count * 4);
+    for (size_t i = 0; i < count; ++i) {
+        px[i * 4 + 0] = FloatToHalf(rgb[i * 3 + 0]);
+        px[i * 4 + 1] = FloatToHalf(rgb[i * 3 + 1]);
+        px[i * 4 + 2] = FloatToHalf(rgb[i * 3 + 2]);
+        px[i * 4 + 3] = 0x3c00u;  // 1.0
+    }
+    return px;
 }
 
 }  // namespace mp::color
