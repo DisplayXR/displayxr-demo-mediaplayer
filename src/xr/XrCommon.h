@@ -26,26 +26,6 @@
 #else
 #  include <openxr/XR_DXR_xlib_window_binding.h>
 #  include <openxr/XR_DXR_wayland_surface_binding.h>
-// The xlib binding header (spec v1) deliberately does NOT carry the
-// window-space layer block its cocoa/win32 siblings share — but EndFrame still
-// needs the type declared. Mirror the wire-shared #ifndef-guarded block here
-// verbatim until the xlib header (or a neutral header) picks it up.
-#ifndef XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
-#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR ((XrStructureType)1004999002)
-
-typedef struct XrCompositionLayerWindowSpaceDXR {
-    XrStructureType             type;       //!< Must be XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
-    const void* XR_MAY_ALIAS    next;       //!< Pointer to next structure in chain
-    XrCompositionLayerFlags     layerFlags; //!< e.g. XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
-    XrSwapchainSubImage         subImage;   //!< Source swapchain + rect
-    float                       x;          //!< Left edge, fraction of window width  [0..1]
-    float                       y;          //!< Top edge, fraction of window height   [0..1]
-    float                       width;      //!< Fraction of window width  [0..1]
-    float                       height;     //!< Fraction of window height [0..1]
-    float                       disparity;  //!< Horizontal shift, fraction of window width.
-                                            //!< 0 = screen depth, negative = toward viewer
-} XrCompositionLayerWindowSpaceDXR;
-#endif
 #endif
 
 #include "Log.h"
