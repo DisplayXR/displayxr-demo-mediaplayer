@@ -440,7 +440,7 @@ int App::Run() {
         keepRunning = window_.PumpEvents();
         const auto nowT = std::chrono::steady_clock::now();
         bool activity = window_.TakeMouseActivity();   // any input revives the UI
-        if (window_.TakeCycleModeRequest()) { xr_.RequestNextMode(); userModeChoice_ = true; activity = true; }  // 'V'
+        if (window_.TakeCycleModeRequest()) { CycleRenderingMode(); activity = true; }  // 'V'
         if (window_.TakeToggleHudRequest()) {                        // SHIFT+TAB (master)
             showHud_ = !showHud_;
             LOG_INFO("HUD %s", showHud_ ? "on" : "off");
@@ -572,6 +572,7 @@ int App::Run() {
         }
         if (activity) lastActivity_ = nowT;
         xr_.PollEvents();
+        if (xr_.TakeModeChanged()) OnRenderingModeChanged();
 
         // Open-file results: the workspace picker completion (drained by PollEvents)
         // and the native dialog (parked off-thread). Either may yield a new path.
@@ -625,6 +626,17 @@ void App::RenderOneFrame() {
 
     // Advance UI fades + the slideshow machine (may swap media at a fade's mid-black).
     TickUi();
+
+    // Mode chip at start-up: name the mode the session came up in, once. Skipped when a
+    // request is about to change it anyway (MEDIAPLAYER_START_MODE, Pro's auto-3D) - the
+    // mode-changed event names the new one - and while the idle screen borrows a flat
+    // mode, which is handed back (and so named) when media opens.
+    if (!initialModeToastDone_ && xr_.HasRenderingModes()) {
+        initialModeToastDone_ = true;
+        const bool startModeWillChange =
+            startMode_ >= 0 && !startModeRequested_ && (uint32_t)startMode_ != xr_.CurrentModeIndex();
+        if (!startModeWillChange && pendingModeRequest_ < 0 && idleModeRequested_ < 0) ToastRenderingMode();
+    }
 
     if (startMode_ >= 0 && !startModeRequested_) {
         xr_.RequestMode((uint32_t)startMode_);
@@ -1163,7 +1175,7 @@ void App::BuildTransportUI() {
 
     ui::TransportActions actions;
     actions.Open = [this] { RequestOpenFile(); };
-    actions.NextMode = [this] { xr_.RequestNextMode(); userModeChoice_ = true; };
+    actions.NextMode = [this] { CycleRenderingMode(); };
     actions.CycleLayout = [this] { CycleLayoutOverride(); };
     actions.ToggleSlideshow = [this] { ToggleSlideshow(); };
     actions.TogglePlayback = [this] { TogglePlayback(); };
@@ -2455,6 +2467,7 @@ void App::ClearIdleLogo() {
         // The borrow was never sent (media replaced the logo before the first frame,
         // e.g. a live input opened during Init): cancel it rather than go flat.
         pendingModeRequest_ = -1;
+        silentModeTarget_ = -1;
     } else if (modeBeforeIdle_ >= 0 && idleModeRequested_ >= 0 &&
                (xr_.CurrentModeIndex() == (uint32_t)idleModeRequested_ ||
                 xr_.CurrentModeIndex() == (uint32_t)modeBeforeIdle_)) {  // sent, change not yet reported
@@ -2473,6 +2486,32 @@ void App::RequestFlatModeForIdle() {
     modeBeforeIdle_ = (int32_t)xr_.CurrentModeIndex();
     idleModeRequested_ = flat;
     pendingModeRequest_ = flat;
+    silentModeTarget_ = flat;  // no mode chip for the borrow itself, see OnRenderingModeChanged
+}
+
+void App::CycleRenderingMode() {
+    userModeChoice_ = true;
+    silentModeTarget_ = -1;  // whatever the panel lands on now is the user's doing: name it
+    // Accepted requests are named by the mode-changed event; say so only when nothing
+    // will change (no rendering-mode extension, a single mode, or a workspace lock).
+    if (xr_.RequestNextMode()) return;
+    ShowToast(xr_.HasRenderingModes() ? std::string("Mode: ") + xr_.ActiveModeName() + " (no other mode)"
+                                      : std::string("Display mode switching unavailable"));
+}
+
+void App::ToastRenderingMode() { ShowToast(std::string("Mode: ") + xr_.ActiveModeName()); }
+
+void App::OnRenderingModeChanged() {
+    // Every switch is named - V, the Mode button, the player's own requests (Pro's
+    // auto-3D, Convert to 3D, the idle screen's hand-back) and changes made outside the
+    // app - except the idle screen's flat borrow: that is plumbing for the 2D logo, and
+    // naming it would show "Mode: 2D" each time the player goes idle, then the real
+    // mode right after when media opens.
+    if (silentModeTarget_ >= 0 && xr_.CurrentModeIndex() == (uint32_t)silentModeTarget_) {
+        silentModeTarget_ = -1;
+        return;
+    }
+    ToastRenderingMode();
 }
 
 void App::TogglePlayback() {

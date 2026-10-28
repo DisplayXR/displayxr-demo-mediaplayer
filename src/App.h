@@ -138,6 +138,11 @@ private:
     // Both edges only QUEUE the request — it is issued from RenderOneFrame, because
     // LoadIdleLogo() runs during Init, before the session is running.
     void RequestFlatModeForIdle();
+    // Mode chip: V / the Mode button cycle the display's rendering mode, and every mode
+    // change shows a toast naming the new mode (the plug-in's mode name).
+    void CycleRenderingMode();
+    void ToastRenderingMode();
+    void OnRenderingModeChanged();  // the runtime reported a rendering-mode change
     void TogglePlayback();   // play/pause (video+audio); restarts if the clip already ended
     void ToggleMute();       // silence audio (keeps playing); persists across clips
     void StepFrame(int n);   // pause + step n frames (']' +1 / '[' -1)
@@ -397,6 +402,10 @@ private:
     bool userModeChoice_ = false;  // V / the Mode button was used: Pro's auto-3D stays out
     int32_t modeBeforeIdle_ = -1;
     int32_t idleModeRequested_ = -1;
+    // Mode chip: the idle borrow's target, whose change event is not toasted (consumed by
+    // that event; cleared by a user mode change); and the once-at-start-up toast.
+    int32_t silentModeTarget_ = -1;
+    bool initialModeToastDone_ = false;
 
     // "Convert to 3D" (XR_DXR_lift). convertBound_: the renderer's texture is a converted
     // side-by-side result, so the per-view UVs treat the content as SBS-full while layout_
