@@ -67,8 +67,9 @@ pixel). Both eyes zoom together, so depth stays right.
 
 **Stereo**: **`X`** swaps the eyes, **`-`** / **`=`** shift the convergence (where the
 screen plane sits in the scene), **`0`** resets it, **`Backspace`** converges once
-automatically, **`A`** keeps converging automatically on a live source. **`V`** switches the
-display between 2D and 3D modes.
+automatically, **`A`** keeps converging automatically on a live source. **`V`** steps through
+the display's modes (2D, 3D, and any others the display offers); a chip names the new mode for
+about two seconds whenever it changes, and once at start-up.
 
 ### Channels and gamma
 
@@ -226,7 +227,7 @@ or use the **Clip A | B** wipe (`8`) to see both at once, split by the line.
 | `G` | grade bypass |
 | `X`, `-` / `=`, `0`, `Backspace`, `A` | swap eyes, convergence, reset, converge once, auto-converge |
 | `L`, `Shift+L` | stereo layout override, convert 2D to 3D |
-| `V` | 2D / 3D display mode |
+| `V` | next display mode (2D / 3D / others the display offers; a chip names it) |
 | `D`, `R`, `T` | depth overlay, rig history strip, timecode |
 | `N` | snapshot |
 | `J` | next live input |

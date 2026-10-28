@@ -259,11 +259,22 @@ public:
                               ViewRect* rects) const;
     // Cycle to the next requestable rendering mode (the 'V' key). No-op when the
     // rendering-mode extension is unavailable or the mode is workspace-locked.
-    void RequestNextMode();
+    // Returns true when a request went out and the runtime accepted it (the switch
+    // itself is reported later by the rendering-mode-changed event).
+    bool RequestNextMode();
     // Request a specific mode by index (used by MEDIAPLAYER_START_MODE for testing).
     void RequestMode(uint32_t modeIndex);
     // modeIndex of the mode the runtime says is active right now.
     uint32_t CurrentModeIndex() const { return currentModeIndex_; }
+    // True once per XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR drained by PollEvents
+    // (several in one poll collapse to one). The new mode is CurrentModeIndex().
+    bool TakeModeChanged() {
+        const bool c = modeChanged_;
+        modeChanged_ = false;
+        return c;
+    }
+    // True once the runtime has listed its rendering modes (XR_DXR_display_info).
+    bool HasRenderingModes() const { return !modes_.empty(); }
     // A requestable FLAT mode: one view, and hardware 3D off so the lenticular
     // element is off too. Mono content in a 3D mode is not wrong, just soft —
     // the lens splits a sharp image across the eyes. Returns -1 when the runtime
@@ -333,6 +344,7 @@ private:
     // expose them, in which case we fall back to the max view count + derived tiling.
     std::vector<RenderingMode> modes_;
     uint32_t currentModeIndex_ = 0;  // modeIndex value of the active mode
+    bool modeChanged_ = false;       // latched by the mode-changed event, see TakeModeChanged
     PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumModes_ = nullptr;
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestMode_ = nullptr;
 

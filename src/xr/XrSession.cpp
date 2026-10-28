@@ -736,10 +736,10 @@ const char* XrSession::ActiveModeName() const {
     return m ? m->name : "default";
 }
 
-void XrSession::RequestNextMode() {
+bool XrSession::RequestNextMode() {
     if (!pfnRequestMode_ || modes_.empty()) {
         LOG_INFO("Mode switch unavailable (no rendering-mode extension)");
-        return;
+        return false;
     }
     // Find the current mode's position, then advance to the next *requestable* one.
     size_t cur = 0;
@@ -750,11 +750,16 @@ void XrSession::RequestNextMode() {
         const RenderingMode& cand = modes_[(cur + step) % modes_.size()];
         if (cand.requestable) {
             LOG_INFO("Requesting rendering mode [%u] '%s'", cand.modeIndex, cand.name);
-            pfnRequestMode_(session_, cand.modeIndex);
-            return;
+            const XrResult r = pfnRequestMode_(session_, cand.modeIndex);
+            if (XR_FAILED(r)) {
+                LOG_INFO("Rendering mode request refused (XrResult %d)", (int)r);
+                return false;
+            }
+            return true;
         }
     }
     LOG_INFO("No other requestable rendering mode available");
+    return false;
 }
 
 int32_t XrSession::FindFlatMode() const {
@@ -1014,6 +1019,7 @@ void XrSession::PollEvents() {
             case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
                 auto* e = reinterpret_cast<XrEventDataRenderingModeChangedDXR*>(&event);
                 currentModeIndex_ = e->currentModeIndex;
+                modeChanged_ = true;
                 LOG_INFO("Rendering mode changed: %u -> %u ('%s': %u views %ux%u)",
                          e->previousModeIndex, e->currentModeIndex, ActiveModeName(),
                          ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());
