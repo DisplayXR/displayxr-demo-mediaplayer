@@ -55,7 +55,8 @@ jobs:
           fetch-depth: 0
       - id: filter
         run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
+          # Tags and manual runs always build (a dispatch has no base commit to diff).
+          if [ "${{ github.ref_type }}" = "tag" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
