@@ -1,0 +1,9 @@
+# Entitlements map for scripts/macos_sign_notarize.sh sign-tree --entitlements-map.
+# One '<glob> <plist>' pair per line. <glob> matches the path relative to the
+# signed tree (the .pkg payload root); <plist> is relative to this file.
+# Anything not listed is signed with NO entitlements (hardened runtime only).
+#
+# The real player binaries live in Contents/Resources/ (the bundle's
+# CFBundleExecutable is a shell launcher that execs them), base and Pro alike.
+*Contents/Resources/mediaplayer_handle_vk_macos       player.entitlements
+*Contents/Resources/mediaplayer_pro_handle_vk_macos   player.entitlements
