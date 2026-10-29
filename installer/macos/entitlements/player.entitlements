@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	The player runs the DisplayXR runtime in-process (the system-installed
+	openxr_displayxr.dylib), which dlopen()s the vendor display-processor and
+	input plug-ins, signed with the vendors' own Team IDs (ADR-019). Pro also
+	loads Blackmagic's DeckLink API bundle. Library validation would refuse
+	all of them under the hardened runtime.
+	-->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<!--
+	Live camera input (UVC / AVFoundation). Under the hardened runtime the
+	camera is denied without this, even with NSCameraUsageDescription set.
+	-->
+	<key>com.apple.security.device.camera</key>
+	<true/>
+</dict>
+</plist>

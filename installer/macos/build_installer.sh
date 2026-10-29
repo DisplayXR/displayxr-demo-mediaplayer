@@ -16,7 +16,10 @@
 #   2. pkgbuild --root <staging>          → mediaplayer.pkg  (component .pkg)
 #   3. productbuild --distribution ...    → DisplayXRMediaPlayer-<v>.pkg
 #
-# Ad-hoc signed only (Signature=adhoc). Developer ID signing is a parallel effort.
+# Signing: the payload is signed by scripts/macos_sign_notarize.sh sign-tree as the
+# last step before pkgbuild — Developer ID + hardened runtime when
+# DXR_MACOS_APP_IDENTITY is set (CI on release tags), ad-hoc otherwise. The product
+# archive is signed + notarized afterwards by CI (build-macos.yml), not here.
 # Runtime dependency: expects the DisplayXR runtime .pkg installed first (its
 # postinstall registers /etc/xdg/openxr/1/active_runtime.json).
 set -euo pipefail
@@ -66,6 +69,25 @@ mkdir -p "$APPS_DIR"
 
 # Strip stray AppleDouble / .DS_Store metadata.
 find "$PAYLOAD_ROOT" \( -name '._*' -o -name '.DS_Store' \) -delete
+
+# --- Final code signature on the payload ---
+# MUST stay the last thing that touches the payload: any edit to a Mach-O or to
+# the bundle after this breaks the seal. Entitlements come from
+# installer/macos/entitlements/map. With DXR_MACOS_SIGN_FALLBACK=adhoc (CI on
+# signed tag builds) a failed Developer ID signature (typically Apple's
+# timestamp server) degrades to ad-hoc instead of failing the build, and is
+# recorded in $DXR_MACOS_SIGN_STATUS_FILE so CI does not try to notarize it.
+SIGN="$SCRIPT_DIR/../../scripts/macos_sign_notarize.sh"
+ENT_MAP="$SCRIPT_DIR/entitlements/map"
+if ! "$SIGN" sign-tree "$PAYLOAD_ROOT" --entitlements-map "$ENT_MAP"; then
+    if [ -n "${DXR_MACOS_APP_IDENTITY:-}" ] && [ "${DXR_MACOS_SIGN_FALLBACK:-}" = "adhoc" ]; then
+        echo "::warning::Developer ID signing of $APP_NAME failed - falling back to ad-hoc; this .pkg will NOT be notarized"
+        [ -n "${DXR_MACOS_SIGN_STATUS_FILE:-}" ] && echo "adhoc-fallback $PRODUCT_LABEL" >> "$DXR_MACOS_SIGN_STATUS_FILE"
+        DXR_MACOS_APP_IDENTITY="" "$SIGN" sign-tree "$PAYLOAD_ROOT" --entitlements-map "$ENT_MAP"
+    else
+        exit 1
+    fi
+fi
 
 # --- pkgbuild: component package ---
 COMPONENT_PKG="$WORK_DIR/$COMPONENT_NAME"

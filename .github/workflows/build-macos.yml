@@ -13,6 +13,13 @@ name: Build macOS
 #              make_latest:false, so whichever job reaches softprops first creates it
 #              and the other only adds its asset; never "latest", no versions.json).
 #
+# Signing (runtime #280): on a v* / pro-v* tag in the canonical repo, the released
+# .pkg is Developer ID signed (payload + product archive), notarized and stapled,
+# using the DisplayXR org secrets and scripts/macos_sign_notarize.sh (a verbatim copy
+# of displayxr-runtime's). A manual dispatch with sign=true does the same for both
+# .pkgs, as a test. Signing never gates publishing: any failure ships the .pkg
+# unsigned with a warning, exactly as before.
+#
 # The DetectChanges job + docs_only step gating let this workflow be a required
 # status check (the "Build macOS" job always runs and reports success in ~30s
 # on doc-only PRs, skipping the heavy build) without blocking doc PRs. Mirrors
@@ -23,7 +30,12 @@ on:
   push:
     branches: [ main ]
     tags: [ 'v*', 'pro-v*' ]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: 'Sign + notarize both .pkgs (tests the release signing path without a tag)'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -100,12 +112,70 @@ jobs:
           echo "pro_version=$PRO_VERSION" >> "$GITHUB_OUTPUT"
           echo "VERSION=$VERSION PRO_VERSION=$PRO_VERSION"
 
+      - name: macOS signing gate (#280)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        id: signgate
+        env:
+          SIGN_INPUT: ${{ inputs.sign }}
+        run: |
+          # Which .pkg globs get the product signature + notarization.
+          if [ "$GITHUB_REPOSITORY" != "DisplayXR/displayxr-demo-mediaplayer" ]; then
+            echo "::notice::macOS signing skipped - $GITHUB_REPOSITORY is not the canonical repo; the .pkg ships unsigned."
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/tags/pro-v* ]]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"; echo "pkgs=DisplayXRMediaPlayerPro-*.pkg" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"; echo "pkgs=DisplayXRMediaPlayer-*.pkg" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$SIGN_INPUT" = "true" ]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"; echo "pkgs=DisplayXRMediaPlayer-*.pkg DisplayXRMediaPlayerPro-*.pkg" >> "$GITHUB_OUTPUT"
+          else
+            echo "macOS signing skipped - not a release tag build ($GITHUB_REF); the .pkgs ship unsigned."
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Secrets enter the environment ONLY in this step, and only on an eligible
+      # build. The script never echoes them (no `set -x`).
+      - name: Import signing identities into a temporary keychain
+        if: needs.DetectChanges.outputs.docs_only != 'true' && steps.signgate.outputs.eligible == 'true'
+        id: keychain
+        env:
+          MACOS_APP_CERT_P12: ${{ secrets.MACOS_APP_CERT_P12 }}
+          MACOS_APP_CERT_PASSWORD: ${{ secrets.MACOS_APP_CERT_PASSWORD }}
+          MACOS_INSTALLER_CERT_P12: ${{ secrets.MACOS_INSTALLER_CERT_P12 }}
+          MACOS_INSTALLER_CERT_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          if ! MISSING=$(./scripts/macos_sign_notarize.sh ci-secrets-check); then
+            echo "::notice::macOS signing skipped - org secrets not provisioned: $MISSING. The .pkg ships unsigned."
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Writes DXR_MACOS_{KEYCHAIN,APP_IDENTITY,INSTALLER_IDENTITY} and
+          # DXR_NOTARY_KEY_{PATH,ID} / DXR_NOTARY_ISSUER into $GITHUB_ENV.
+          if ./scripts/macos_sign_notarize.sh ci-keychain-setup --env-out "$GITHUB_ENV"; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::macOS signing DISABLED - importing the signing identities failed (see log above). The .pkg ships UNSIGNED."
+            ./scripts/macos_sign_notarize.sh ci-keychain-teardown || true
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # With the keychain set up, build_installer.sh's sign-tree gives every payload
+      # Mach-O its Developer ID + hardened-runtime signature as its last step.
+      # DXR_MACOS_INSTALLER_IDENTITY is withheld so the product archives come out
+      # unsigned; the released one is signed + notarized below, with the unsigned
+      # .pkg as the fallback.
       - name: Build demo + Pro + installers
         if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
           DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
           MP_PRO_VERSION: ${{ steps.version.outputs.pro_version }}
-        run: ./scripts/build_macos.sh --installer --pro --ocio
+          DXR_MACOS_SIGN_FALLBACK: adhoc
+          DXR_MACOS_SIGN_STATUS_FILE: ${{ runner.temp }}/dxr-macos-sign-status
+        run: env -u DXR_MACOS_INSTALLER_IDENTITY ./scripts/build_macos.sh --installer --pro --ocio
 
       # MP_BUILD_TESTS defaults OFF, so nothing ran ctest before this — the unit tests
       # existed but never executed in CI. Re-configure the tree build_macos.sh already
@@ -211,6 +281,54 @@ jobs:
           pkgutil --expand-full "$PKG" "$EXPAND_DIR/full"
           bash installer/macos/check_bundle_paths.sh "$EXPAND_DIR/full/mediaplayer_pro.pkg/Payload/Applications/Media Player Pro.app"
 
+      - name: Sign, notarize and staple the .pkg (#280)
+        if: needs.DetectChanges.outputs.docs_only != 'true' && steps.keychain.outputs.sign == 'true'
+        id: notarize
+        timeout-minutes: 60
+        env:
+          PKG_GLOBS: ${{ steps.signgate.outputs.pkgs }}
+          DXR_MACOS_SIGN_STATUS_FILE: ${{ runner.temp }}/dxr-macos-sign-status
+        run: |
+          set -uo pipefail
+          SUMMARY=""
+          for GLOB in $PKG_GLOBS; do
+            PKG=$(find _package -maxdepth 1 -name "$GLOB" -type f | head -1)
+            [ -n "$PKG" ] || { echo "::error::no $GLOB in _package/"; exit 1; }
+            NAME=$(basename "$PKG")
+            LABEL="${NAME%%-*}"  # DisplayXRMediaPlayer / DisplayXRMediaPlayerPro
+            if grep -q "adhoc-fallback $LABEL\$" "$DXR_MACOS_SIGN_STATUS_FILE" 2>/dev/null; then
+              echo "::warning::$NAME ships UNSIGNED - Developer ID signing of its payload fell back to ad-hoc (see the build step)."
+              SUMMARY="$SUMMARY $NAME=unsigned(payload-fallback)"
+              continue
+            fi
+            cp "$PKG" "$RUNNER_TEMP/$NAME.unsigned"
+            # finalize-pkg = productsign -> notarytool submit --wait -> stapler staple;
+            # verify-pkg = pkgutil --check-signature + stapler validate + spctl
+            # --assess --type install "Notarized Developer ID".
+            if ./scripts/macos_sign_notarize.sh finalize-pkg "$PKG" \
+               && ./scripts/macos_sign_notarize.sh verify-pkg "$PKG"; then
+              echo "::notice::$NAME is Developer ID signed, notarized and stapled."
+              SUMMARY="$SUMMARY $NAME=notarized"
+            else
+              # Signing never gates publishing.
+              echo "::warning::$NAME ships UNSIGNED - productsign / notarization / stapling failed (see log above). Re-run this job to retry."
+              cp -f "$RUNNER_TEMP/$NAME.unsigned" "$PKG"
+              SUMMARY="$SUMMARY $NAME=unsigned(sign/notarize failed)"
+            fi
+          done
+          echo "result=${SUMMARY# }" >> "$GITHUB_OUTPUT"
+
+      - name: Signature summary
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          RESULT: ${{ steps.notarize.outputs.result || 'unsigned (signing not enabled for this build)' }}
+        run: |
+          echo "macOS installers: $RESULT"
+          { echo "### macOS installer signatures"; echo; echo "$RESULT"; echo
+            for PKG in _package/*.pkg; do
+              echo "\`$(basename "$PKG")\`"; echo '```'; pkgutil --check-signature "$PKG" 2>&1 | head -6 || true; echo '```'
+            done; } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v6
@@ -254,3 +372,10 @@ jobs:
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
+
+      - name: Remove the temporary signing keychain
+        if: always()
+        run: |
+          if [ -x scripts/macos_sign_notarize.sh ]; then
+            ./scripts/macos_sign_notarize.sh ci-keychain-teardown
+          fi
