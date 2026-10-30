@@ -379,6 +379,19 @@ std::string Station::RigStatusJson() const {
     out["timecode"] = timecode_;
     out["tc_fps"] = signalFps_;
     out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
+    if (decklink_.GetState() != LiveState::Closed) {
+        // capture health (#141): the "Done when" of a two-input 4K60 run reads these
+        const LiveStats ls = decklink_.GetStats();
+        json dl = {{"delivered_fps", ls.deliveredFps}, {"signal_fps", ls.fps}, {"published", ls.published},
+                   {"late_frames", ls.lateFrames}, {"dropped", ls.dropped}};
+        if (decklink_.IsPair()) {
+            const DeckLinkSource::PairStats ps = decklink_.GetPairStats();
+            dl["pairs"] = ps.pairs;
+            dl["unpaired"] = ps.unpaired;
+            dl["max_skew_ms"] = ps.maxAbsSkewMs;
+        }
+        out["decklink"] = dl;
+    }
     return out.dump();
 }
 
@@ -657,6 +670,9 @@ void Station::BuildSignalLines(bool live) {
         const int dark = decklink_.GetStats().noSignalEyes;
         if (dark & 1) ImGui::TextColored(kBad, decklink_.IsPair() ? "Left eye: NO SIGNAL" : "NO SIGNAL");
         if (dark & 2) ImGui::TextColored(kBad, "Right eye: NO SIGNAL");
+        const uint64_t late = decklink_.GetStats().lateFrames;
+        if (late) ImGui::TextColored(kWarn, "Capture late: %llu frames skipped (CPU too slow to convert)",
+                                     (unsigned long long)late);
     }
     if (decklink_.IsPair()) {
         const DeckLinkSource::PairStats ps = decklink_.GetPairStats();

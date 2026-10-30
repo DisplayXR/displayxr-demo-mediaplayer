@@ -51,6 +51,8 @@ struct LiveStats {
     int eyeOffsetFrames = -1;
     double fps = 0.0;             // the signal's nominal rate (DeckLink / test), 0 = unknown
     int noSignalEyes = 0;         // DeckLink: bit 0 = left / only input dark, bit 1 = right
+    uint64_t lateFrames = 0;      // DeckLink: card frames skipped because the converter was
+                                  // still busy with the previous one (the newest is kept)
 };
 
 class LiveProducer {

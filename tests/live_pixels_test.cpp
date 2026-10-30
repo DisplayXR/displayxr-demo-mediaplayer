@@ -7,6 +7,7 @@
 #include "pro/LivePixels.h"
 #include "pro/TestSignalSource.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -140,6 +141,47 @@ void V210Pr108Vectors() {
     CHECK(ok, "#108 v210 vectors: every luma and chroma sample kept at 10 bits");
 }
 
+// The fused v210 unpack (#141) against a per-sample reference, on random frames whose
+// width is not a multiple of 6 or 48 (a partial last group, rows padded to 128 bytes),
+// with an odd height (a last row with no chroma partner), placed at x0 = 6.
+void V210MatchesReference() {
+    uint32_t seed = 12345;
+    auto rnd = [&] { return (seed = seed * 1664525u + 1013904223u) >> 8; };
+    const int sizes[][2] = {{6, 2}, {8, 2}, {10, 3}, {12, 4}, {722, 7}, {1280, 6}, {1920, 4}};
+    bool ok = true;
+    for (const auto& sz : sizes) {
+        const int w = sz[0], h = sz[1], rb = ((w + 47) / 48) * 128;
+        std::vector<uint8_t> src((size_t)rb * h);
+        for (uint8_t& b : src) b = (uint8_t)rnd();
+        // sample k of row r (Cb Y Cr Y ... order), 10 bits
+        auto sample = [&](int r, int k) {
+            uint32_t word;
+            std::memcpy(&word, src.data() + (size_t)r * rb + (size_t)(k / 3) * 4, 4);
+            return (int)((word >> (10 * (k % 3))) & 0x3ff);
+        };
+        auto yAt = [&](int r, int x) { return sample(r, 2 * x + 1); };
+        auto cAt = [&](int r, int pair, int cr) { return sample(r, 4 * pair + (cr ? 2 : 0)); };
+        mp::livepix::P016 d;
+        d.Resize(w + 12, h);
+        std::fill(d.y.begin(), d.y.end(), (uint16_t)7);
+        std::fill(d.uv.begin(), d.uv.end(), (uint16_t)7);
+        mp::livepix::V210ToP016(src.data(), rb, w, h, d, 6);
+        for (int r = 0; r < h; ++r)
+            for (int x = 0; x < d.width; ++x) {
+                const bool in = x >= 6 && x < 6 + w;
+                ok = ok && d.y[(size_t)r * d.width + x] == (in ? (uint16_t)(yAt(r, x - 6) << 6) : 7);
+            }
+        for (int r = 0; r + 1 < h; r += 2)
+            for (int p = 0; p < w / 2; ++p)
+                for (int c = 0; c < 2; ++c) {
+                    const int want = ((cAt(r, p, c) + cAt(r + 1, p, c) + 1) >> 1) << 6;
+                    ok = ok && d.uv[(size_t)(r / 2) * d.width + 6 + 2 * p + c] == want;
+                }
+        ok = ok && d.uv[0] == 7 && d.uv[(size_t)d.width - 1] == 7;  // outside the eye: untouched
+    }
+    CHECK(ok, "v210: every luma and averaged chroma sample matches the per-sample reference");
+}
+
 // PR #108's UYVY-into-the-right-half vector (8-bit NV12 path).
 void UyvyPr108Vector() {
     const uint8_t src[2][8] = {{10, 100, 20, 101, 30, 102, 40, 103}, {12, 110, 22, 111, 32, 112, 42, 113}};
@@ -244,6 +286,7 @@ int main() {
     V210Basics();
     UyvyWidens();
     V210Pr108Vectors();
+    V210MatchesReference();
     UyvyPr108Vector();
     BgraMatrixTagRoundTrips();
     if (g_failures) {

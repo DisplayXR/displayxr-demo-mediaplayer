@@ -342,9 +342,16 @@ std::string ListText(const std::vector<std::string>& names) {
     return s;
 }
 
-// One eye's frame -> P016 at column x0 of dst (10-bit kept; 8-bit and RGB widened).
+// One eye's pixels as the card delivered them, copied out of the SDK's buffer so the
+// callback can return before they are converted (#141).
+struct RawPixels {
+    std::vector<uint8_t> bytes;
+    int w = 0, h = 0, rowBytes = 0;
+    BMDPixelFormat pf = bmdFormat10BitYUV;
+};
+
 // False when the frame's pixels cannot be read.
-bool ConvertEye(IDeckLinkVideoFrame* f, livepix::P016& dst, int x0) {
+bool CopyPixels(IDeckLinkVideoFrame* f, RawPixels& out) {
     void* bytes = nullptr;
 #if MP_DL_SDK_HAS_VIDEO_BUFFER
     IDeckLinkVideoBuffer* buf = nullptr;
@@ -355,21 +362,29 @@ bool ConvertEye(IDeckLinkVideoFrame* f, livepix::P016& dst, int x0) {
     const bool ok = SUCCEEDED(f->GetBytes(&bytes)) && bytes;
 #endif
     if (ok) {
-        const int w = (int)f->GetWidth(), h = (int)f->GetHeight();
-        const int rowBytes = (int)f->GetRowBytes();
-        const BMDPixelFormat pf = f->GetPixelFormat();
-        if (pf == bmdFormat10BitYUV)
-            livepix::V210ToP016((const uint8_t*)bytes, rowBytes, w & ~1, h & ~1, dst, x0);
-        else if (pf == bmdFormat8BitBGRA)
-            livepix::BgraToP016((const uint8_t*)bytes, rowBytes, w & ~1, h & ~1, dst, x0);
-        else
-            livepix::UyvyToP016((const uint8_t*)bytes, rowBytes, w & ~1, h & ~1, dst, x0);
+        out.w = (int)f->GetWidth();
+        out.h = (int)f->GetHeight();
+        out.rowBytes = (int)f->GetRowBytes();
+        out.pf = f->GetPixelFormat();
+        const uint8_t* b = (const uint8_t*)bytes;
+        out.bytes.assign(b, b + (size_t)out.rowBytes * out.h);  // same size after warm-up: no allocation
 #if MP_DL_SDK_HAS_VIDEO_BUFFER
         buf->EndAccess(bmdBufferAccessRead);
 #endif
     }
     Release(buf);
     return ok;
+}
+
+// One eye's copied pixels -> P016 at column x0 of dst (10-bit kept; 8-bit and RGB widened).
+void ConvertEye(const RawPixels& p, livepix::P016& dst, int x0) {
+    const int w = p.w & ~1, h = p.h & ~1;
+    if (p.pf == bmdFormat10BitYUV)
+        livepix::V210ToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
+    else if (p.pf == bmdFormat8BitBGRA)
+        livepix::BgraToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
+    else
+        livepix::UyvyToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
 }
 
 // The frame's timecode as text and as a frame count at the full frame rate (-1 when it
@@ -417,15 +432,18 @@ int ReadTimecode(IDeckLinkVideoInputFrame* f, int fpsInt, char* text, size_t n, 
 
 // The signal's colorimetry from the frame's metadata (VPID / HDMI InfoFrame as the card
 // reports it): the Y'CbCr matrix the shader must decode with, and the transfer as a tag.
-// Frames without metadata keep the converters' SD/HD rule.
-void ReadColour(IDeckLinkVideoFrame* f, ColorMatrix& matrix, ColorTransfer& transfer, bool& warnedHdr) {
+// Frames without metadata keep the converters' SD/HD rule (`hasMatrix` stays false).
+void ReadColour(IDeckLinkVideoFrame* f, bool& hasMatrix, ColorMatrix& matrix, ColorTransfer& transfer,
+                bool& warnedHdr) {
     IDeckLinkVideoFrameMetadataExtensions* md = nullptr;
     if (FAILED(f->QueryInterface(IID_IDeckLinkVideoFrameMetadataExtensions, (void**)&md)) || !md) return;
     int64_t v = 0;
     if (SUCCEEDED(md->GetInt(bmdDeckLinkFrameMetadataColorspace, &v))) {
+        hasMatrix = true;
         if (v == bmdColorspaceRec601) matrix = ColorMatrix::BT601;
         else if (v == bmdColorspaceRec709) matrix = ColorMatrix::BT709;
         else if (v == bmdColorspaceRec2020) matrix = ColorMatrix::BT2020;
+        else hasMatrix = false;
     }
     if ((f->GetFlags() & bmdFrameContainsHDRMetadata) &&
         SUCCEEDED(md->GetInt(bmdDeckLinkFrameMetadataHDRElectroOpticalTransferFunc, &v))) {
@@ -496,6 +514,7 @@ struct DeckLinkCapture {
 
     // Format changed on an input: the pairing history is from the old signal.
     void ResetPairing() {  // cap.m held
+        ++generation;  // frames already queued in the lanes are from the old signal
         pairer.Reset();
         hwT0 = INT64_MIN;
         framesIn[0] = framesIn[1] = 0;
@@ -515,45 +534,135 @@ struct DeckLinkCapture {
         src->SetNoSignal(eye, on);
     }
 
-    void OnFrame(int eye, IDeckLinkVideoInputFrame* f) {
-        if (!alive) return;
-        const int w = (int)f->GetWidth() & ~1, h = (int)f->GetHeight() & ~1;
-        const double now = LiveProducer::NowSeconds();
-        char tc[16];
-        int key = ReadTimecode(f, fpsInt, tc, sizeof(tc), tcFullCount[eye]);
-        BMDTimeValue hwTime = 0, hwDur = 0;
+    // ---- the hand-off (#141). The card's callback must return within a frame or the
+    // card drops frames; a 4K v210 eye takes ~7 ms to unpack and a pair another ~3 ms to
+    // compose, so the callback only copies the pixels out (~1.3 ms at 4K) and reads the
+    // frame's metadata, and each input's own lane thread converts, pairs and publishes.
+    // A lane holds one pending frame: if the next arrives first, the pending one is
+    // replaced (newest wins) and counted in LiveStats::lateFrames.
+    struct RawFrame {
+        RawPixels px, right;  // right: dual-stream 3D's right eye
+        bool dual = false;
+        bool hasMatrix = false;
+        ColorMatrix matrix = ColorMatrix::BT709;
+        ColorTransfer transfer = ColorTransfer::SDR;
+        double now = 0.0;
+        char tc[16] = {0};
+        int key = -1;
         int64_t hwNs = -1, durNs = 0;
-        if (SUCCEEDED(f->GetHardwareReferenceTimestamp(1000000000, &hwTime, &hwDur))) {
-            hwNs = (int64_t)hwTime;
-            durNs = (int64_t)hwDur;
+        uint32_t generation = 0;
+    };
+    struct Lane {
+        std::mutex m;
+        std::condition_variable cv;
+        RawFrame slot[3];  // one being filled, one pending, one being converted
+        int pending = -1, busy = -1;
+        bool quit = false;
+        std::thread th;
+    };
+    Lane lanes[2];
+    std::atomic<uint32_t> generation{0};  // bumped on a format change: queued frames are stale
+
+    void StartLanes(int n) {
+        for (int e = 0; e < n; ++e) lanes[e].th = std::thread([this, e] { LaneLoop(e); });
+    }
+    void StopLanes() {
+        for (Lane& l : lanes) {
+            {
+                std::lock_guard<std::mutex> lk(l.m);
+                l.quit = true;
+            }
+            l.cv.notify_all();
+            if (l.th.joinable()) l.th.join();
         }
+    }
+
+    // On the card's thread: copy and timestamp, nothing else.
+    void Enqueue(int eye, IDeckLinkVideoInputFrame* f) {
+        if (!alive) return;
+        Lane& lane = lanes[eye];
+        int s = 0;
+        {
+            std::lock_guard<std::mutex> lk(lane.m);
+            while (s == lane.pending || s == lane.busy) ++s;
+        }
+        RawFrame& r = lane.slot[s];  // ours alone until it is made pending below
+        r.now = LiveProducer::NowSeconds();
+        r.generation = generation.load();
+        r.key = ReadTimecode(f, fpsInt, r.tc, sizeof(r.tc), tcFullCount[eye]);
+        BMDTimeValue hwTime = 0, hwDur = 0;
+        r.hwNs = -1;
+        r.durNs = 0;
+        if (SUCCEEDED(f->GetHardwareReferenceTimestamp(1000000000, &hwTime, &hwDur))) {
+            r.hwNs = (int64_t)hwTime;
+            r.durNs = (int64_t)hwDur;
+        }
+        if (!CopyPixels(f, r.px)) {
+            if (!warnedConvert) LOG_WARN("decklink: cannot read the frame pixels (driver older than this build's SDK?)");
+            warnedConvert = true;
+            return;
+        }
+        r.hasMatrix = false;
+        r.transfer = ColorTransfer::SDR;
+        ReadColour(f, r.hasMatrix, r.matrix, r.transfer, warnedHdr);
+        r.dual = !pair && dual;
+        if (r.dual) {
+            IDeckLinkVideoFrame3DExtensions* ext = nullptr;
+            IDeckLinkVideoFrame* right = nullptr;
+            const bool haveRight = SUCCEEDED(f->QueryInterface(IID_IDeckLinkVideoFrame3DExtensions, (void**)&ext)) &&
+                                   SUCCEEDED(ext->GetFrameForRightEye(&right)) && right && CopyPixels(right, r.right);
+            Release(right);
+            Release(ext);
+            // No right eye: showing the left in both halves would read as a perfect
+            // rig to the checks and to the viewer, so this is a no-signal, not a frame.
+            NoSignal(1, !haveRight);
+            if (!haveRight) return;
+        }
+        bool late = false;
+        {
+            std::lock_guard<std::mutex> lk(lane.m);
+            late = lane.pending >= 0;
+            lane.pending = s;
+        }
+        lane.cv.notify_one();
+        if (late && alive) src->CountLate();
+    }
+
+    void LaneLoop(int eye) {
+        Lane& lane = lanes[eye];
+        for (;;) {
+            int s;
+            {
+                std::unique_lock<std::mutex> lk(lane.m);
+                lane.cv.wait(lk, [&] { return lane.quit || lane.pending >= 0; });
+                if (lane.quit) return;
+                s = lane.busy = lane.pending;
+                lane.pending = -1;
+            }
+            const RawFrame& r = lane.slot[s];
+            if (r.generation == generation.load()) Process(eye, r);
+            std::lock_guard<std::mutex> lk(lane.m);
+            lane.busy = -1;
+        }
+    }
+
+    // On the input's lane thread: convert, pair, publish.
+    void Process(int eye, const RawFrame& r) {
+        if (!alive) return;
+        const int w = r.px.w & ~1, h = r.px.h & ~1;
         if (!pair) {
-            // one input: only this card thread touches `out`; the lock keeps Stop() simple
+            // one input: only this lane touches `out`; the lock keeps Stop() simple
             std::lock_guard<std::mutex> lk(m);
-            out.Resize(dual ? 2 * w : w, h);
-            if (!ConvertEye(f, out, 0)) {
-                if (!warnedConvert) LOG_WARN("decklink: cannot read the frame pixels (driver older than this build's SDK?)");
-                warnedConvert = true;
-                return;
-            }
-            ReadColour(f, out.matrix, out.transfer, warnedHdr);
-            if (dual) {
-                IDeckLinkVideoFrame3DExtensions* ext = nullptr;
-                IDeckLinkVideoFrame* right = nullptr;
-                const bool haveRight = SUCCEEDED(f->QueryInterface(IID_IDeckLinkVideoFrame3DExtensions, (void**)&ext)) &&
-                                       SUCCEEDED(ext->GetFrameForRightEye(&right)) && right && ConvertEye(right, out, w);
-                Release(right);
-                Release(ext);
-                // No right eye: showing the left in both halves would read as a perfect
-                // rig to the checks and to the viewer, so this is a no-signal, not a frame.
-                NoSignal(1, !haveRight);
-                if (!haveRight) return;
-            }
-            if (alive) src->Publish(out, /*fullRange=*/false, now, tc[0] ? tc : nullptr, dual ? 0 : -1);
+            out.Resize(r.dual ? 2 * w : w, h);
+            ConvertEye(r.px, out, 0);
+            if (r.dual) ConvertEye(r.right, out, w);
+            if (r.hasMatrix) out.matrix = r.matrix;
+            out.transfer = r.transfer;
+            if (alive) src->Publish(out, /*fullRange=*/false, r.now, r.tc[0] ? r.tc : nullptr, r.dual ? 0 : -1);
             return;
         }
         // Pair: claim this eye's oldest slot, convert into it WITHOUT the lock (the two
-        // card threads convert in parallel; a busy slot is never chosen), then decide.
+        // lanes convert in parallel; a busy slot is never chosen), then decide.
         int slot;
         {
             std::lock_guard<std::mutex> lk(m);
@@ -562,29 +671,27 @@ struct DeckLinkCapture {
         }
         EyeFrame& ef = hist[eye][slot];
         ef.px.Resize(w, h);
-        if (!ConvertEye(f, ef.px, 0)) {
-            if (!warnedConvert) LOG_WARN("decklink: cannot read the frame pixels (driver older than this build's SDK?)");
-            warnedConvert = true;
-            return;
-        }
-        ReadColour(f, ef.px.matrix, ef.px.transfer, warnedHdr);
-        ef.arrived = now;
-        ef.hwNs = hwNs;
+        ConvertEye(r.px, ef.px, 0);
+        if (r.hasMatrix) ef.px.matrix = r.matrix;
+        ef.px.transfer = r.transfer;
+        ef.arrived = r.now;
+        ef.hwNs = r.hwNs;
+        int key = r.key;
         bool hwKey = false;
-        if (key < 0 && hwNs >= 0 && sameCard) {
+        if (key < 0 && r.hwNs >= 0 && sameCard) {
             int64_t t0 = hwT0.load();
             if (t0 == INT64_MIN) {
-                hwT0.compare_exchange_strong(t0, hwNs);
+                hwT0.compare_exchange_strong(t0, r.hwNs);
                 t0 = hwT0.load();
             }
-            const int64_t period = durNs > 0 ? durNs : (int64_t)std::llround(1e9 / std::max(1.0, fpsExact.load()));
-            key = HwClockKey(hwNs, t0, period);
+            const int64_t period = r.durNs > 0 ? r.durNs : (int64_t)std::llround(1e9 / std::max(1.0, fpsExact.load()));
+            key = HwClockKey(r.hwNs, t0, period);
             hwKey = true;
         }
-        std::memcpy(ef.tc, tc, sizeof(tc));
+        std::memcpy(ef.tc, r.tc, sizeof(r.tc));
         std::lock_guard<std::mutex> lk(m);
         ++framesIn[eye];
-        const TimecodePairer::Decision d = pairer.Add(eye, slot, key, now, 1.0 / std::max(1.0, fpsExact.load()));
+        const TimecodePairer::Decision d = pairer.Add(eye, slot, key, r.now, 1.0 / std::max(1.0, fpsExact.load()));
         if (!d.publish || !alive) return;
         if (noSignal[1 - eye]) return;  // the other eye is dark: never fuse it with a stale frame
         {
@@ -612,26 +719,15 @@ struct DeckLinkCapture {
             warnedUnsynced = true;
         }
         const EyeFrame& l = hist[0][d.slot[0]];
-        const EyeFrame& r = hist[1][d.slot[1]];
-        const int cw = std::min(l.px.width, r.px.width), ch = std::min(l.px.height, r.px.height);
-        if ((l.px.width != r.px.width || l.px.height != r.px.height) && !warnedSize) {
+        const EyeFrame& rt = hist[1][d.slot[1]];
+        if ((l.px.width != rt.px.width || l.px.height != rt.px.height) && !warnedSize) {
             LOG_WARN("decklink: the two inputs differ in size (%dx%d vs %dx%d)", l.px.width, l.px.height,
-                     r.px.width, r.px.height);
+                     rt.px.width, rt.px.height);
             warnedSize = true;
         }
-        out.Resize(2 * cw, ch);
-        out.matrix = l.px.matrix;  // the left eye's colorimetry stands for the pair
-        out.transfer = l.px.transfer;
-        for (int row = 0; row < ch; ++row) {
-            std::memcpy(out.y.data() + (size_t)row * out.width, l.px.y.data() + (size_t)row * l.px.width, (size_t)cw * 2);
-            std::memcpy(out.y.data() + (size_t)row * out.width + cw, r.px.y.data() + (size_t)row * r.px.width, (size_t)cw * 2);
-        }
-        for (int row = 0; row < ch / 2; ++row) {
-            std::memcpy(out.uv.data() + (size_t)row * out.width, l.px.uv.data() + (size_t)row * l.px.width, (size_t)cw * 2);
-            std::memcpy(out.uv.data() + (size_t)row * out.width + cw, r.px.uv.data() + (size_t)row * r.px.width, (size_t)cw * 2);
-        }
-        src->Publish(out, /*fullRange=*/false, std::min(l.arrived, r.arrived), l.tc[0] ? l.tc : nullptr,
-                     d.offsetFrames);
+        // (the pair is composed straight into the ring: no intermediate side-by-side frame)
+        src->PublishPair(l.px, rt.px, /*fullRange=*/false, std::min(l.arrived, rt.arrived),
+                         l.tc[0] ? l.tc : nullptr, d.offsetFrames);
     }
 };
 
@@ -743,7 +839,7 @@ public:
             return S_OK;  // keep showing the last picture; the stall watchdog flags it
         }
         cap_->NoSignal(eye_, false);
-        cap_->OnFrame(eye_, frame);
+        cap_->Enqueue(eye_, frame);
         return S_OK;
     }
 
@@ -806,6 +902,7 @@ void DeckLinkSource::Worker() {
     cap.src = this;
     cap.pair = pair;
     cap.dual = cfg_.stereo == DeckLinkConfig::Stereo::Dual;
+    cap.StartLanes(nInputs);  // before any input streams: the callbacks hand frames to these
 
     IDeckLinkInput* inputs[2] = {nullptr, nullptr};
     Callback* callbacks[2] = {nullptr, nullptr};
@@ -930,6 +1027,7 @@ void DeckLinkSource::Worker() {
     // The SDK does not promise that no callback is still running when StopStreams returns:
     // give one in flight time to see `alive` and return before our references go.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    cap.StopLanes();  // `alive` is clear: a lane mid-frame publishes nothing and returns
     for (int e = 0; e < 2; ++e) {
         Release(callbacks[e]);
         Release(inputs[e]);
