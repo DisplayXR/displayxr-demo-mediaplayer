@@ -65,7 +65,9 @@ void ProController::RegisterTools(const RegisterFn& reg) {
     reg("export_qc_report",
         "Write this session's QC report to a new Pictures/DisplayXR/qc_<time> folder: report.html "
         "(alerts, snapshots with both eyes, notes, rig numbers, depth budget; self-contained), "
-        "markers.edl (DaVinci Resolve timeline markers) and markers.csv. Returns the paths.",
+        "markers.edl (DaVinci Resolve timeline markers) and markers.csv. Returns the paths at once "
+        "(writing: true); the files are written in the background, report.html last, so the "
+        "report is complete once report.html exists.",
         "{\"type\":\"object\"}");
     reg("list_inputs", "List the station's configured live inputs (name, spec) and which one is live.",
         "{\"type\":\"object\"}");

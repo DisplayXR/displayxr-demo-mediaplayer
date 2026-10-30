@@ -233,7 +233,8 @@ folder in `Pictures\DisplayXR\` (`qc_` and the date and time) with:
 - **markers.csv** - every row with the rig numbers, for a spreadsheet or another editor.
 
 Alerts and snapshots without a source timecode are in the report and the CSV but not in the
-EDL.
+EDL. The report is written in the background, so the live picture keeps playing; the
+button reads **Writing QC report...** until it is done, then a message gives the folder.
 
 ## A/B compare
 
