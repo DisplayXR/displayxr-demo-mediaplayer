@@ -2,7 +2,10 @@
 #include "pro/Station.h"
 
 #include "Log.h"
+#include "media/ImageDecoder.h"
+#include "pro/QcReport.h"
 #include "pro/Thumbnail.h"
+#include "stb_image_write.h"  // implementation compiled in src/rhi/VulkanRenderer.cpp
 
 #include <nlohmann/json.hpp>
 #include <SDL3/SDL.h>
@@ -79,6 +82,17 @@ void Station::Init(StationHost host, const StationOptions& opt) {
     opt_ = opt;
     showTimecode_ = opt.timecode;
     rig_.SetBudget(opt.budget);
+    // The QC report's session (#137): alerts logged from here on (the log is appended to
+    // across sessions) and the clock it started at.
+    {
+        char stamp[32];
+        sessionClock_ = Clock(stamp, sizeof(stamp));
+        sessionDate_ = std::string(stamp, 8);
+        std::error_code ec;
+        const std::string folder = Folder();
+        const std::filesystem::path log = std::filesystem::path(folder) / "station_alerts.jsonl";
+        if (!folder.empty() && std::filesystem::exists(log, ec)) alertsOffset_ = std::filesystem::file_size(log, ec);
+    }
     for (const std::string& in : opt.inputs) {
         const size_t eq = in.find('=');
         Input d;
@@ -88,6 +102,7 @@ void Station::Init(StationHost host, const StationOptions& opt) {
     }
     if (!inputs_.empty() && opt.startFirstInput) SwitchInput(0);
     if (const char* f = std::getenv("MEDIAPLAYER_PRO_SNAPSHOT_FRAME")) testSnapshotFrame_ = std::atoi(f);
+    if (const char* f = std::getenv("MEDIAPLAYER_PRO_QC_EXPORT_FRAME")) testQcExportFrame_ = std::atoi(f);
     if (const char* d = std::getenv("MEDIAPLAYER_PRO_DECKLINK_DIALOG"); d && *d && *d != '0') OpenDeckLinkDialog();
 }
 
@@ -181,6 +196,11 @@ void Station::Tick() {
         pendingSnapshot_ = true;
         const char* n = std::getenv("MEDIAPLAYER_PRO_SNAPSHOT_NOTE");
         pendingSnapshotNote_ = n ? n : "";
+    }
+    // ...and MEDIAPLAYER_PRO_QC_EXPORT_FRAME=N exports the QC report after N ticks.
+    if (testQcExportFrame_ > 0 && testFrames_ == testQcExportFrame_) {
+        std::string dir, e;
+        if (!ExportQcReport(dir, e)) LOG_WARN("Station: QC report failed: %s", e.c_str());
     }
     if (pendingSnapshot_) {
         pendingSnapshot_ = false;
@@ -327,6 +347,143 @@ void Station::SaveNote(size_t i) {
     std::ofstream(s.notePath) << j.dump(2) << "\n";
 }
 
+namespace {
+// A snapshot's capture (both eyes) as a JPEG at most `maxW` wide, for the report. "" when
+// it cannot be read.
+std::string ReportThumbnail(const std::string& path, int maxW) {
+    std::error_code ec;
+    if (path.empty() || !std::filesystem::exists(path, ec)) return {};
+    const DecodedImage img = ImageDecoder::Load(path);
+    if (!img.Valid()) return {};
+    const int w = std::min(maxW, img.width), h = std::max(1, (int)((long long)img.height * w / img.width));
+    std::vector<uint8_t> rgb((size_t)w * h * 3);
+    for (int y = 0; y < h; ++y) {
+        const int y0 = (int)((long long)y * img.height / h);
+        const int y1 = std::max(y0 + 1, (int)((long long)(y + 1) * img.height / h));
+        for (int x = 0; x < w; ++x) {
+            // box filter over the source pixels this one covers
+            const int x0 = (int)((long long)x * img.width / w);
+            const int x1 = std::max(x0 + 1, (int)((long long)(x + 1) * img.width / w));
+            unsigned sum[3] = {0, 0, 0}, n = 0;
+            for (int sy = y0; sy < y1; ++sy)
+                for (int sx = x0; sx < x1; ++sx, ++n) {
+                    const uint8_t* p = img.pixels.data() + ((size_t)sy * img.width + sx) * 4;
+                    sum[0] += p[0];
+                    sum[1] += p[1];
+                    sum[2] += p[2];
+                }
+            for (int c = 0; c < 3; ++c) rgb[((size_t)y * w + x) * 3 + c] = (uint8_t)((sum[c] + n / 2) / n);
+        }
+    }
+    std::string jpeg;
+    stbi_write_jpg_to_func(
+        [](void* ctx, void* data, int size) { static_cast<std::string*>(ctx)->append((const char*)data, (size_t)size); },
+        &jpeg, w, h, 3, rgb.data(), 85);
+    return jpeg;
+}
+
+std::string IsoDate(const char* stamp) {  // "YYYYMMDD..." -> "YYYY-MM-DD"
+    return std::string(stamp, 4) + "-" + std::string(stamp + 4, 2) + "-" + std::string(stamp + 6, 2);
+}
+}  // namespace
+
+bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untimed) {
+    LogNewAlerts();  // closed episodes reach the log first
+    const std::string folder = Folder();
+    if (folder.empty()) {
+        error = "no station folder (Pictures/DisplayXR)";
+        return false;
+    }
+    char stamp[32];
+    const std::string clock = Clock(stamp, sizeof(stamp));
+    qc::Session s;
+    s.title = "QC " + IsoDate(stamp) + " " + clock.substr(0, 5);
+    s.input = InputName();
+    s.started = (sessionDate_.size() == 8 ? IsoDate(sessionDate_.c_str()) + " " : std::string()) + sessionClock_;
+    s.exported = IsoDate(stamp) + " " + clock;
+    s.tcFps = signalFps_;
+    const rig::Budget b = rig_.GetBudget();
+    s.budgetNearPct = b.nearPct;
+    s.budgetFarPct = b.farPct;
+    s.budgetVerticalPx = b.maxVerticalPx;
+    s.budgetDeltaE = b.maxDeltaE;
+    s.budgetEdgePct = b.edgePct;
+    // Closed alerts: this session's part of the log (the in-memory history keeps only 20).
+    {
+        std::ifstream log((std::filesystem::path(folder) / "station_alerts.jsonl").string(), std::ios::binary);
+        if (log) {
+            log.seekg((std::streamoff)alertsOffset_);
+            std::string line;
+            while (std::getline(log, line)) {
+                const nlohmann::json j = nlohmann::json::parse(line, nullptr, false);
+                if (!j.is_object()) continue;
+                qc::Alert a;
+                a.what = j.value("what", "");
+                a.timecode = j.value("timecode", "");
+                a.endTimecode = j.value("end_timecode", "");
+                a.clock = j.value("time", "");
+                a.tcFps = j.value("tc_fps", 0);
+                a.durationS = j.value("duration_s", 0.0);
+                a.open = j.value("open", false);
+                s.alerts.push_back(a);
+            }
+        }
+    }
+    const double now = LiveProducer::NowSeconds();
+    for (const rig::Alert& ra : rig_.Alerts()) {  // still over budget now
+        if (ra.end >= 0) continue;
+        qc::Alert a;
+        a.what = ra.what;
+        a.timecode = ra.timecode;
+        a.clock = ra.wallClock;
+        a.tcFps = signalFps_;
+        a.durationS = now - ra.start;
+        a.open = true;
+        s.alerts.push_back(a);
+    }
+    // in the order they started (the log has the closed ones first)
+    std::stable_sort(s.alerts.begin(), s.alerts.end(), [](const qc::Alert& x, const qc::Alert& y) { return x.clock < y.clock; });
+    for (const Snapshot& sn : snapshots_) {
+        qc::Snapshot q;
+        q.image = sn.image;
+        q.thumbJpeg = ReportThumbnail(sn.image, 1280);
+        q.note = sn.note;
+        q.timecode = sn.timecode;
+        q.clock = sn.clock;
+        q.tcFps = sn.tcFps;
+        q.eyeSyncFrames = sn.eyeSync;
+        q.rig.measured = sn.rig.ok;
+        q.rig.verticalPx = sn.rig.verticalPx;
+        q.rig.rollDeg = sn.rig.rollDeg;
+        q.rig.nearPct = sn.rig.nearPct;
+        q.rig.farPct = sn.rig.farPct;
+        q.rig.deltaE = sn.rig.deltaE;
+        for (int e = 0; e < 2; ++e) {
+            q.rig.edgeMeasured[e] = sn.rig.edge[e].measured;
+            q.rig.edgePct[e] = sn.rig.edge[e].parallaxPct;
+        }
+        s.snapshots.push_back(q);
+    }
+    const std::filesystem::path dir = std::filesystem::path(folder) / (std::string("qc_") + stamp);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    auto write = [&](const char* name, const std::string& text) {
+        std::ofstream f((dir / name).string(), std::ios::binary);
+        f << text;
+        return (bool)f;
+    };
+    if (ec || !write("report.html", qc::MakeHtml(s)) || !write("markers.edl", qc::MakeEdl(s)) ||
+        !write("markers.csv", qc::MakeCsv(s))) {
+        error = "cannot write " + dir.string();
+        return false;
+    }
+    dirOut = dir.string();
+    if (untimed) *untimed = qc::RowsWithoutTimecode(s);
+    LOG_INFO("Station: QC report (%zu alerts, %zu snapshots) -> %s", s.alerts.size(), s.snapshots.size(),
+             dirOut.c_str());
+    return true;
+}
+
 void Station::LogNewAlerts() {
     double newest = alertsLoggedUntil_;
     std::string dir;
@@ -448,6 +605,18 @@ bool Station::DispatchTool(const std::string& tool, const std::string& argsJson,
         if (!TakeSnapshot(note)) return err("snapshot failed (the runtime has no atlas capture?)");
         const Snapshot& s = snapshots_.back();
         result = json{{"image", s.image}, {"note_file", s.notePath}, {"timecode", s.timecode}}.dump();
+        return true;
+    }
+    if (tool == "export_qc_report") {
+        std::string dir, e;
+        int untimed = 0;
+        if (!ExportQcReport(dir, e, &untimed)) return err(e);
+        const std::filesystem::path d(dir);
+        result = json{{"folder", dir},
+                      {"report", (d / "report.html").string()},
+                      {"markers_edl", (d / "markers.edl").string()},
+                      {"markers_csv", (d / "markers.csv").string()},
+                      {"rows_without_timecode", untimed}}.dump();
         return true;
     }
     if (tool == "list_inputs") {
@@ -758,6 +927,15 @@ void Station::BuildSnapshotsSection() {
     std::snprintf(head, sizeof(head), "Snapshots - %zu  (N)###snaps", snapshots_.size());
     if (!ImGui::CollapsingHeader(head, ImGuiTreeNodeFlags_DefaultOpen)) return;
     if (ImGui::Button("Snapshot")) TakeSnapshot("");
+    ImGui::SameLine();
+    if (ImGui::Button("Export QC report")) {
+        std::string dir, e;
+        if (ExportQcReport(dir, e)) {
+            if (host_.toast) host_.toast("QC report: " + dir);
+        } else if (host_.toast) {
+            host_.toast("QC report failed: " + e);
+        }
+    }
     for (size_t k = snapshots_.size(); k-- > 0;) {
         Snapshot& s = snapshots_[k];
         ImGui::PushID((int)k);

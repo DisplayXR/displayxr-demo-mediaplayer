@@ -204,6 +204,21 @@ frame) and press `N`.
 A snapshot is the picture that goes to the 3D display (the two eye views side by side),
 not a photo of the panel.
 
+### QC report
+
+Click **Export QC report** (next to **Snapshot**) to hand the session on. It makes a new
+folder in `Pictures\DisplayXR\` (`qc_` and the date and time) with:
+
+- **report.html** - every rig alert of this session (timecode, how long, what), and every
+  snapshot with both eyes, its note and its rig numbers (over-budget numbers in red). One
+  file: the pictures are inside it, so it can be emailed as is.
+- **markers.edl** - the same as timeline markers for DaVinci Resolve (*Timeline > Import >
+  Timeline Markers from EDL*): alerts red, snapshots blue, at their source timecode.
+- **markers.csv** - every row with the rig numbers, for a spreadsheet or another editor.
+
+Alerts and snapshots without a source timecode are in the report and the CSV but not in the
+EDL.
+
 ## A/B compare
 
 Pick a second clip with **Load B...** (Inspector > View), `--compare=<file>` or the

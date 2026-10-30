@@ -70,6 +70,9 @@ public:
     // Agent tools for the station (called from ProController::DispatchTool).
     bool DispatchTool(const std::string& tool, const std::string& argsJson, std::string& result, bool& success);
     bool TakeSnapshot(const std::string& note);
+    // The session's QC report (#137): report.html + markers.edl + markers.csv in a new
+    // Pictures/DisplayXR/qc_<stamp>/ folder. `untimed` = rows with no timecode (not in the EDL).
+    bool ExportQcReport(std::string& dir, std::string& error, int* untimed = nullptr);
     // The rig checks as JSON (get_rig_status; also in the Resolve panel's status file).
     std::string RigStatusJson() const;
     // Where snapshots, notes, alerts and the Resolve link files live (Pictures/DisplayXR).
@@ -135,11 +138,13 @@ private:
     char dlgMode_[8] = "";            // starting format FourCC; empty = 1080p25 (auto-detect follows)
     std::string pendingDeckLinkSpec_;  // "0+1,sdi": the "DeckLink" input's spec, opened in Tick()
     bool OpenDeckLinkSpec(const std::string& spec);
-    int testFrames_ = 0, testSnapshotFrame_ = -1;
+    int testFrames_ = 0, testSnapshotFrame_ = -1, testQcExportFrame_ = -1;
     std::string timecode_;
     int signalFps_ = 0;
     double delayMs_ = 0.0;
     double alertsLoggedUntil_ = 0.0;
+    uintmax_t alertsOffset_ = 0;              // station_alerts.jsonl size when the session began
+    std::string sessionClock_, sessionDate_;  // HH:MM:SS / YYYYMMDD the session began
     bool shutDown_ = false;  // App::Shutdown() and ~Station() both call Shutdown(): flush once
     struct Snapshot {
         std::string image, notePath, timecode, clock;
