@@ -32,6 +32,13 @@ protected:
     // The 16-bit (P016) twin: 10-bit capture kept to the GPU.
     void Publish(const livepix::P016& f, bool fullRange, double captureSec, const char* timecode,
                  int eyeOffsetFrames);
+    // Two eyes composed side by side straight into the ring (no intermediate frame; a
+    // 4K pair is 50 MB a copy). Sizes may differ: the smaller one is used. The left eye's
+    // colour tags stand for the pair.
+    void PublishPair(const livepix::P016& l, const livepix::P016& r, bool fullRange, double captureSec,
+                     const char* timecode, int eyeOffsetFrames);
+    // A frame the source had to skip before converting it (LiveStats::lateFrames).
+    void CountLate();
     // Streaming (or Opening) -> Stalled when nothing was published for stallSec since
     // the last frame (or since the open): an input with no cable never streams at all.
     void CheckStall(double stallSec);

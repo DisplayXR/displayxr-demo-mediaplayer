@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pro/LiveSourceBase.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace mp {
@@ -82,6 +83,45 @@ void LiveSourceBase::Publish(const livepix::P016& src, bool fullRange, double ca
     std::memset(f.timecode, 0, sizeof(f.timecode));
     if (timecode) std::strncpy(f.timecode, timecode, sizeof(f.timecode) - 1);
     Published(src.width, src.height, fullRange, eyeOffsetFrames, ring_.Publish());
+}
+
+void LiveSourceBase::PublishPair(const livepix::P016& l, const livepix::P016& r, bool fullRange,
+                                 double captureSec, const char* timecode, int eyeOffsetFrames) {
+    const int cw = std::min(l.width, r.width), ch = std::min(l.height, r.height) & ~1;
+    if (cw <= 0 || ch <= 0) return;
+    const int w = 2 * cw;
+    FrameRing::Frame& f = ring_.WriteBuffer();
+    f.plane[0].resize((size_t)w * ch * 2);  // same size after warm-up: no allocation
+    f.plane[1].resize((size_t)w * (ch / 2) * 2);
+    uint16_t* y = reinterpret_cast<uint16_t*>(f.plane[0].data());
+    uint16_t* uv = reinterpret_cast<uint16_t*>(f.plane[1].data());
+    const size_t eyeBytes = (size_t)cw * 2;
+    for (int row = 0; row < ch; ++row) {
+        std::memcpy(y + (size_t)row * w, l.y.data() + (size_t)row * l.width, eyeBytes);
+        std::memcpy(y + (size_t)row * w + cw, r.y.data() + (size_t)row * r.width, eyeBytes);
+    }
+    for (int row = 0; row < ch / 2; ++row) {
+        std::memcpy(uv + (size_t)row * w, l.uv.data() + (size_t)row * l.width, eyeBytes);
+        std::memcpy(uv + (size_t)row * w + cw, r.uv.data() + (size_t)row * r.width, eyeBytes);
+    }
+    f.width = w;
+    f.height = ch;
+    f.format = PixFormat::P016;
+    f.fullRange = fullRange;
+    f.gpu = false;
+    f.gpuSharedTexture = nullptr;
+    f.gpuSharedHandle = nullptr;
+    f.captureSec = captureSec;
+    f.matrix = l.matrix;
+    f.transfer = l.transfer;
+    std::memset(f.timecode, 0, sizeof(f.timecode));
+    if (timecode) std::strncpy(f.timecode, timecode, sizeof(f.timecode) - 1);
+    Published(w, ch, fullRange, eyeOffsetFrames, ring_.Publish());
+}
+
+void LiveSourceBase::CountLate() {
+    std::lock_guard<std::mutex> lk(statsMutex_);
+    ++stats_.lateFrames;
 }
 
 void LiveSourceBase::Published(int w, int h, bool fullRange, int eyeOffsetFrames, bool dropped) {

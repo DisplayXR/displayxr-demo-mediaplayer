@@ -88,46 +88,45 @@ void V210ToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, in
     if (!src || w <= 0 || h <= 1 || x0 < 0 || x0 + w > dst.width || h > dst.height) return;
     dst.matrix = DefaultMatrixForHeight(h);
     w &= ~1;
-    // one row -> Y (w) + chroma pairs (w/2 each), 10-bit values
-    // per-thread scratch (two card threads may convert at once), sized once per format
-    thread_local std::vector<uint16_t> ya, cba, cra, cbb, crb;
-    ya.resize((size_t)w);
-    for (std::vector<uint16_t>* v : {&cba, &cra, &cbb, &crb}) v->resize((size_t)w / 2 + 3);
-    auto unpack = [&](const uint8_t* row, std::vector<uint16_t>& cb, std::vector<uint16_t>& cr, bool wantY) {
-        const uint32_t* wd = reinterpret_cast<const uint32_t*>(row);
-        for (int g = 0, px = 0; px < w; ++g, px += 6) {
-            const uint32_t a = wd[4 * g], b = wd[4 * g + 1], c = wd[4 * g + 2], d = wd[4 * g + 3];
-            const uint16_t s[12] = {(uint16_t)(a & 0x3ff), (uint16_t)((a >> 10) & 0x3ff), (uint16_t)((a >> 20) & 0x3ff),
-                                    (uint16_t)(b & 0x3ff), (uint16_t)((b >> 10) & 0x3ff), (uint16_t)((b >> 20) & 0x3ff),
-                                    (uint16_t)(c & 0x3ff), (uint16_t)((c >> 10) & 0x3ff), (uint16_t)((c >> 20) & 0x3ff),
-                                    (uint16_t)(d & 0x3ff), (uint16_t)((d >> 10) & 0x3ff), (uint16_t)((d >> 20) & 0x3ff)};
-            // Cb0 Y0 Cr0 Y1 Cb2 Y2 Cr2 Y3 Cb4 Y4 Cr4 Y5
-            const int pair = px / 2;
-            cb[(size_t)pair] = s[0];
-            cr[(size_t)pair] = s[2];
-            cb[(size_t)pair + 1] = s[4];
-            cr[(size_t)pair + 1] = s[6];
-            cb[(size_t)pair + 2] = s[8];
-            cr[(size_t)pair + 2] = s[10];
-            if (wantY) {
-                const uint16_t yy[6] = {s[1], s[3], s[5], s[7], s[9], s[11]};
-                for (int k = 0; k < 6 && px + k < w; ++k) ya[(size_t)(px + k)] = yy[k];
-            }
+    // One pass per row pair, straight into dst: a 4K60 eye has ~16 ms, and the
+    // unpack-to-scratch-then-copy version this replaced took 15.6 ms of it (#141).
+    // Group = 6 pixels in 4 words: Cb0 Y0 Cr0 | Y1 Cb2 Y2 | Cr2 Y3 Cb4 | Y4 Cr4 Y5.
+    auto s = [](uint32_t v, int k) { return (uint16_t)((v >> (10 * k)) & 0x3ff); };
+    const int full = w / 6;  // whole groups; a width that is not a multiple of 6 ends in a partial one
+    auto rowY = [&](const uint32_t* wd, uint16_t* yo) {
+        for (int g = 0; g < full; ++g, wd += 4, yo += 6) {
+            yo[0] = (uint16_t)(s(wd[0], 1) << 6);
+            yo[1] = (uint16_t)(s(wd[1], 0) << 6);
+            yo[2] = (uint16_t)(s(wd[1], 2) << 6);
+            yo[3] = (uint16_t)(s(wd[2], 1) << 6);
+            yo[4] = (uint16_t)(s(wd[3], 0) << 6);
+            yo[5] = (uint16_t)(s(wd[3], 2) << 6);
         }
+        if (w == 6 * full) return;  // (not past the last row's end when it fits the padding exactly)
+        const uint16_t yy[6] = {s(wd[0], 1), s(wd[1], 0), s(wd[1], 2), s(wd[2], 1), s(wd[3], 0), s(wd[3], 2)};
+        for (int k = 0; k < w - 6 * full; ++k) yo[k] = (uint16_t)(yy[k] << 6);  // the group is in the row's padding
     };
-    for (int row = 0; row < h; ++row) {
-        const bool even = (row & 1) == 0;
-        unpack(src + (size_t)row * srcRowBytes, even ? cba : cbb, even ? cra : crb, true);
-        uint16_t* yo = dst.y.data() + (size_t)row * dst.width + x0;
-        for (int x = 0; x < w; ++x) yo[x] = (uint16_t)(ya[(size_t)x] << 6);
-        if (!even) {
-            uint16_t* uvo = dst.uv.data() + (size_t)(row / 2) * dst.width + x0;
-            for (int i = 0; i < w / 2; ++i) {
-                uvo[2 * i] = (uint16_t)(((cba[(size_t)i] + cbb[(size_t)i] + 1) >> 1) << 6);
-                uvo[2 * i + 1] = (uint16_t)(((cra[(size_t)i] + crb[(size_t)i] + 1) >> 1) << 6);
-            }
+    auto avg = [](uint16_t a, uint16_t b) { return (uint16_t)(((a + b + 1) >> 1) << 6); };
+    for (int row = 0; row + 1 < h; row += 2) {
+        const uint32_t* a = reinterpret_cast<const uint32_t*>(src + (size_t)row * srcRowBytes);
+        const uint32_t* b = reinterpret_cast<const uint32_t*>(src + (size_t)(row + 1) * srcRowBytes);
+        rowY(a, dst.y.data() + (size_t)row * dst.width + x0);
+        rowY(b, dst.y.data() + (size_t)(row + 1) * dst.width + x0);
+        // 4:2:2 -> 4:2:0: average the two rows' chroma
+        uint16_t* uvo = dst.uv.data() + (size_t)(row / 2) * dst.width + x0;
+        for (int g = 0, pair = 0; pair < w / 2; ++g, pair += 3) {
+            const uint32_t* p = a + 4 * g;
+            const uint32_t* q = b + 4 * g;
+            const uint16_t c[6] = {avg(s(p[0], 0), s(q[0], 0)), avg(s(p[0], 2), s(q[0], 2)),
+                                   avg(s(p[1], 1), s(q[1], 1)), avg(s(p[2], 0), s(q[2], 0)),
+                                   avg(s(p[2], 2), s(q[2], 2)), avg(s(p[3], 1), s(q[3], 1))};
+            const int n = std::min(3, w / 2 - pair);
+            std::memcpy(uvo + 2 * pair, c, sizeof(uint16_t) * 2 * (size_t)n);
         }
     }
+    if (h & 1)  // an odd last row: its luma (no chroma row to pair with)
+        rowY(reinterpret_cast<const uint32_t*>(src + (size_t)(h - 1) * srcRowBytes),
+             dst.y.data() + (size_t)(h - 1) * dst.width + x0);
 }
 
 void UyvyToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0) {
