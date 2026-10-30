@@ -109,7 +109,7 @@ struct VideoDecoder::Impl {
     ID3D11PixelShader* convPS = nullptr;
     ID3D11SamplerState* convSampler = nullptr;
     ID3D11RasterizerState* convRaster = nullptr;    // cull-none, solid
-    ID3D11Buffer* convCB = nullptr;                 // { float fullRange; } per-frame
+    ID3D11Buffer* convCB = nullptr;                 // { float fullRange, matrix; } per-frame
     ID3D11Texture2D* nv12Intermediate = nullptr;    // SRV-able copy target for the decoded slice
     ID3D11ShaderResourceView* srvY = nullptr;       // R8   over plane 0
     ID3D11ShaderResourceView* srvUV = nullptr;      // R8G8 over plane 1
@@ -289,7 +289,7 @@ static const char* kConvertHLSL = R"(
 Texture2D<float>  texY  : register(t0);
 Texture2D<float2> texUV : register(t1);
 SamplerState samp : register(s0);
-cbuffer Params : register(b0) { float uFullRange; float3 _pad; };
+cbuffer Params : register(b0) { float uFullRange; float uMatrix; float2 _pad; };
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 VSOut vsMain(uint vid : SV_VertexID) {
     VSOut o;
@@ -309,7 +309,14 @@ float4 psMain(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         ub = (u - 128.0 / 255.0) * (255.0 / 224.0);
         vb = (v - 128.0 / 255.0) * (255.0 / 224.0);
     }
-    float3 rgb = float3(yb + 1.5748 * vb, yb - 0.1873 * ub - 0.4681 * vb, yb + 1.8556 * ub);
+    // the stream's matrix, with the coefficients shaders/sbs.frag YuvToRgb uses (#140)
+    float3 rgb;
+    if (uMatrix > 1.5)       // BT.2020 non-constant luminance (Kr .2627, Kb .0593)
+        rgb = float3(yb + 1.4746 * vb, yb - 0.164553 * ub - 0.571353 * vb, yb + 1.8814 * ub);
+    else if (uMatrix > 0.5)  // BT.601 (Kr .299, Kb .114)
+        rgb = float3(yb + 1.402 * vb, yb - 0.344136 * ub - 0.714136 * vb, yb + 1.772 * ub);
+    else                     // BT.709
+        rgb = float3(yb + 1.5748 * vb, yb - 0.1873 * ub - 0.4681 * vb, yb + 1.8556 * ub);
     return float4(saturate(rgb), 1.0);
 }
 )";
@@ -692,8 +699,17 @@ void VideoDecoder::DecodeLoop() {
         // slot's shared RGBA texture) and hand the renderer that handle — Vulkan imports a plain
         // single-plane RGBA image (no multiplanar plane-alignment mismatch). Skips the CPU
         // download/convert/upload. Any failure disables interop and falls through to the CPU path.
+        // Only an 8-bit NV12 surface: the convert pass reads NV12 planes into an 8-bit RGBA
+        // target, so a 10-bit (P010) decode takes the CPU path, which keeps 16 bits (#140).
+        const AVHWFramesContext* hwFrames =
+            f->hw_frames_ctx ? reinterpret_cast<const AVHWFramesContext*>(f->hw_frames_ctx->data) : nullptr;
+        if (interopActive_ && hwFrames && hwFrames->sw_format != AV_PIX_FMT_NV12 && !warnedZeroCopyFormat_) {
+            LOG_INFO("VideoDecoder: %s surfaces: zero-copy is 8-bit NV12 only, using the CPU path",
+                     av_get_pix_fmt_name(hwFrames->sw_format));
+            warnedZeroCopyFormat_ = true;
+        }
         if (interopActive_ && impl_->hwPixFmt != AV_PIX_FMT_NONE && f->format == impl_->hwPixFmt &&
-            impl_->d3dContext && impl_->d3dHwctx) {
+            hwFrames && hwFrames->sw_format == AV_PIX_FMT_NV12 && impl_->d3dContext && impl_->d3dHwctx) {
             FrameRing::Frame& dst = ring_.WriteBuffer();
             // (Re)create this slot's shared RGBA texture on first use or a size change.
             if (dst.gpuSharedTexture && (dst.width != f->width || dst.height != f->height)) {
@@ -728,7 +744,7 @@ void VideoDecoder::DecodeLoop() {
                     rd.CullMode = D3D11_CULL_NONE;
                     impl_->d3dDevice->CreateRasterizerState(&rd, &impl_->convRaster);
                     D3D11_BUFFER_DESC bd = {};
-                    bd.ByteWidth = 16;  // { float fullRange; float3 pad; }
+                    bd.ByteWidth = 16;  // { float fullRange; float matrix; float2 pad; }
                     bd.Usage = D3D11_USAGE_DEFAULT;
                     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
                     impl_->d3dDevice->CreateBuffer(&bd, nullptr, &impl_->convCB);
@@ -780,7 +796,7 @@ void VideoDecoder::DecodeLoop() {
                 ID3D11RenderTargetView* rtv = nullptr;
                 if (SUCCEEDED(impl_->d3dDevice->CreateRenderTargetView(rgba, nullptr, &rtv))) {
                     const float full = (f->color_range == AVCOL_RANGE_JPEG) ? 1.0f : 0.0f;
-                    float cb[4] = {full, 0, 0, 0};
+                    float cb[4] = {full, (float)(int)MatrixOf(f, impl_->codec), 0, 0};
                     ctx->UpdateSubresource(impl_->convCB, 0, nullptr, cb, 0, 0);
                     D3D11_VIEWPORT vp = {0, 0, (float)f->width, (float)f->height, 0, 1};
                     ID3D11ShaderResourceView* srvs[2] = {impl_->srvY, impl_->srvUV};
@@ -821,6 +837,8 @@ void VideoDecoder::DecodeLoop() {
                 dst.format = PixFormat::RGBA;  // convert already did YUV->RGB + range expand
                 dst.fullRange = false;
                 dst.gpu = true;
+                dst.matrix = MatrixOf(f, impl_->codec);  // (applied above; the tag is for the UI / tools)
+                dst.transfer = TransferOf(f, impl_->codec);
                 const int64_t ticks = (f->best_effort_timestamp != AV_NOPTS_VALUE)
                                           ? f->best_effort_timestamp
                                           : f->pts;
