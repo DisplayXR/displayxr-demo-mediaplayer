@@ -127,8 +127,10 @@ in smooth gradients (skies, vignettes) after a strong grade or LUT. Start the pl
 mediaplayer_pro_handle_vk_win.exe --10bit clip.mov
 ```
 
-It needs DisplayXR runtime 2.53 or newer and the Leia plug-in 2.17 or newer; with an older
-runtime the player logs a warning and the picture stays 8-bit. On Windows the installer
+It requires DisplayXR runtime 2.53 or newer and the Leia plug-in 2.17 or newer; do not
+use it with older versions (the player logs a warning at start-up when the runtime is
+older). It only applies when the player runs on its own: under the DisplayXR Shell the
+Shell composes the picture and `--10bit` has no effect. On Windows the installer
 adds a **Media Player Pro (10-bit)** shortcut that does the same. `--8bit` (or setting
 `MEDIAPLAYER_PRO_10BIT=0`) goes back to the default. Setting `MEDIAPLAYER_PRO_10BIT=1` in
 the environment turns it on without the flag.
