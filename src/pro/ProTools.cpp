@@ -62,6 +62,11 @@ void ProController::RegisterTools(const RegisterFn& reg) {
         "Capture both eyes as shown (graded) to a PNG in Pictures/DisplayXR, with a JSON note "
         "beside it: the note text, timecode and rig numbers.",
         "{\"type\":\"object\",\"properties\":{\"note\":{\"type\":\"string\"}}}");
+    reg("export_qc_report",
+        "Write this session's QC report to a new Pictures/DisplayXR/qc_<time> folder: report.html "
+        "(alerts, snapshots with both eyes, notes, rig numbers, depth budget; self-contained), "
+        "markers.edl (DaVinci Resolve timeline markers) and markers.csv. Returns the paths.",
+        "{\"type\":\"object\"}");
     reg("list_inputs", "List the station's configured live inputs (name, spec) and which one is live.",
         "{\"type\":\"object\"}");
     reg("select_input", "Switch to a configured input, by index (from list_inputs) or name.",

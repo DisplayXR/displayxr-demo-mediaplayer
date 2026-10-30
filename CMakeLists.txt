@@ -464,6 +464,7 @@ function(mp_add_player tgt is_pro)
             src/pro/DeckLinkSource.cpp   # Blackmagic DeckLink SDI / HDMI input
             src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
             src/pro/Station.cpp          # inputs, timecode / delay, rig UI, snapshots
+            src/pro/QcReport.cpp         # the session's QC report: HTML + marker EDL / CSV
             src/pro/ResolveLink.cpp      # the live Resolve panel: file protocol + follow
             src/pro/ProResolve.cpp       # the live Resolve panel: station side
             src/pro/Thumbnail.cpp        # input-list thumbnails (left eye, CPU)
@@ -711,6 +712,9 @@ if(MP_BUILD_TESTS)
     target_include_directories(live_pixels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
     add_test(NAME live_pixels COMMAND live_pixels_test)
+    add_executable(qc_report_test tests/qc_report_test.cpp src/pro/QcReport.cpp)
+    target_include_directories(qc_report_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME qc_report COMMAND qc_report_test)
     add_executable(timecode_pairer_test tests/timecode_pairer_test.cpp src/pro/TimecodePairer.cpp)
     target_include_directories(timecode_pairer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME timecode_pairer COMMAND timecode_pairer_test)
