@@ -14,6 +14,7 @@
 #include "media/LiveProducer.h"
 #include "media/StereoTypes.h"
 #include "pro/DeckLinkSource.h"
+#include "pro/QcExporter.h"
 #include "pro/RigCheck.h"
 #include "pro/TestSignalSource.h"
 
@@ -72,7 +73,10 @@ public:
     bool TakeSnapshot(const std::string& note);
     // The session's QC report (#137): report.html + markers.edl + markers.csv in a new
     // Pictures/DisplayXR/qc_<stamp>/ folder. `untimed` = rows with no timecode (not in the EDL).
+    // The session is gathered here; thumbnails and files are written on the QC exporter's
+    // thread, report.html last. True = queued, `dir` = where it goes; Tick() reports the end.
     bool ExportQcReport(std::string& dir, std::string& error, int* untimed = nullptr);
+    bool QcExportBusy() const { return qcExport_.Busy(); }
     // The rig checks as JSON (get_rig_status; also in the Resolve panel's status file).
     std::string RigStatusJson() const;
     // Where snapshots, notes, alerts and the Resolve link files live (Pictures/DisplayXR).
@@ -110,6 +114,7 @@ private:
     // The newest pixel-measured eye sync of the last 2 s (-1 none); lateEye +1 right, -1 left.
     int MeasuredEyeSync(int* lateEye) const;
     void SaveNote(size_t i);
+    void TickQcExport();  // finished QC reports: log + toast
 
     StationHost host_;
     StationOptions opt_;
@@ -143,6 +148,7 @@ private:
     int signalFps_ = 0;
     double delayMs_ = 0.0;
     double alertsLoggedUntil_ = 0.0;
+    QcExporter qcExport_;  // QC report thumbnails + file writes, off the render thread
     uintmax_t alertsOffset_ = 0;              // station_alerts.jsonl size when the session began
     std::string sessionClock_, sessionDate_;  // HH:MM:SS / YYYYMMDD the session began
     bool shutDown_ = false;  // App::Shutdown() and ~Station() both call Shutdown(): flush once

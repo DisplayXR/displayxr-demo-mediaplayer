@@ -202,6 +202,7 @@ void Station::Tick() {
         std::string dir, e;
         if (!ExportQcReport(dir, e)) LOG_WARN("Station: QC report failed: %s", e.c_str());
     }
+    TickQcExport();
     if (pendingSnapshot_) {
         pendingSnapshot_ = false;
         TakeSnapshot(pendingSnapshotNote_);
@@ -388,6 +389,7 @@ std::string IsoDate(const char* stamp) {  // "YYYYMMDD..." -> "YYYY-MM-DD"
 }  // namespace
 
 bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untimed) {
+    const double t0 = LiveProducer::NowSeconds();
     LogNewAlerts();  // closed episodes reach the log first
     const std::string folder = Folder();
     if (folder.empty()) {
@@ -445,8 +447,7 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
     std::stable_sort(s.alerts.begin(), s.alerts.end(), [](const qc::Alert& x, const qc::Alert& y) { return x.clock < y.clock; });
     for (const Snapshot& sn : snapshots_) {
         qc::Snapshot q;
-        q.image = sn.image;
-        q.thumbJpeg = ReportThumbnail(sn.image, 1280);
+        q.image = sn.image;  // its thumbnail is made on the exporter's thread
         q.note = sn.note;
         q.timecode = sn.timecode;
         q.clock = sn.clock;
@@ -467,21 +468,54 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
     const std::filesystem::path dir = std::filesystem::path(folder) / (std::string("qc_") + stamp);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    auto write = [&](const char* name, const std::string& text) {
-        std::ofstream f((dir / name).string(), std::ios::binary);
-        f << text;
-        return (bool)f;
-    };
-    if (ec || !write("report.html", qc::MakeHtml(s)) || !write("markers.edl", qc::MakeEdl(s)) ||
-        !write("markers.csv", qc::MakeCsv(s))) {
+    if (ec) {
         error = "cannot write " + dir.string();
         return false;
     }
     dirOut = dir.string();
     if (untimed) *untimed = qc::RowsWithoutTimecode(s);
-    LOG_INFO("Station: QC report (%zu alerts, %zu snapshots) -> %s", s.alerts.size(), s.snapshots.size(),
-             dirOut.c_str());
+    // Decoding each snapshot's full SBS capture for its thumbnail took a second or more with
+    // a few 8K snapshots, so the rest runs on the exporter's thread. The job owns its copy
+    // of the session (no reference to the station).
+    LOG_INFO("Station: QC report (%zu alerts, %zu snapshots) gathered in %.1f ms, writing -> %s",
+             s.alerts.size(), s.snapshots.size(), (LiveProducer::NowSeconds() - t0) * 1000.0, dirOut.c_str());
+    qcExport_.Submit([s = std::move(s), dir]() mutable {
+        QcExporter::Result r;
+        r.dir = dir.string();
+        r.alerts = s.alerts.size();
+        r.snapshots = s.snapshots.size();
+        for (qc::Snapshot& q : s.snapshots) q.thumbJpeg = ReportThumbnail(q.image, 1280);
+        auto write = [&](const std::filesystem::path& path, const std::string& text) {
+            std::ofstream f(path.string(), std::ios::binary);
+            f << text;
+            return (bool)f;
+        };
+        // report.html last, through a rename: once it exists the report is complete.
+        const std::filesystem::path html = dir / "report.html", part = dir / "report.html.part";
+        std::error_code rec;
+        if (!write(dir / "markers.edl", qc::MakeEdl(s)) || !write(dir / "markers.csv", qc::MakeCsv(s)) ||
+            !write(part, qc::MakeHtml(s)) || (std::filesystem::rename(part, html, rec), rec)) {
+            r.err = "cannot write " + dir.string();
+            return r;
+        }
+        r.ok = true;
+        return r;
+    });
     return true;
+}
+
+void Station::TickQcExport() {
+    QcExporter::Result r;
+    while (qcExport_.Take(r)) {
+        if (r.ok) {
+            LOG_INFO("Station: QC report written in %.0f ms (%zu alerts, %zu snapshots) -> %s", r.ms, r.alerts,
+                     r.snapshots, r.dir.c_str());
+            if (host_.toast) host_.toast("QC report: " + r.dir);
+        } else {
+            LOG_WARN("Station: QC report failed: %s", r.err.c_str());
+            if (host_.toast) host_.toast("QC report failed: " + r.err);
+        }
+    }
 }
 
 void Station::LogNewAlerts() {
@@ -629,7 +663,8 @@ bool Station::DispatchTool(const std::string& tool, const std::string& argsJson,
                       {"report", (d / "report.html").string()},
                       {"markers_edl", (d / "markers.edl").string()},
                       {"markers_csv", (d / "markers.csv").string()},
-                      {"rows_without_timecode", untimed}}.dump();
+                      {"rows_without_timecode", untimed},
+                      {"writing", true}}.dump();
         return true;
     }
     if (tool == "list_inputs") {
@@ -944,13 +979,10 @@ void Station::BuildSnapshotsSection() {
     if (!ImGui::CollapsingHeader(head, ImGuiTreeNodeFlags_DefaultOpen)) return;
     if (ImGui::Button("Snapshot")) TakeSnapshot("");
     ImGui::SameLine();
-    if (ImGui::Button("Export QC report")) {
+    if (ImGui::Button(QcExportBusy() ? "Writing QC report...###qc" : "Export QC report###qc")) {
         std::string dir, e;
-        if (ExportQcReport(dir, e)) {
-            if (host_.toast) host_.toast("QC report: " + dir);
-        } else if (host_.toast) {
-            host_.toast("QC report failed: " + e);
-        }
+        if (!ExportQcReport(dir, e) && host_.toast) host_.toast("QC report failed: " + e);
+        // success is toasted by TickQcExport once the files are written
     }
     for (size_t k = snapshots_.size(); k-- > 0;) {
         Snapshot& s = snapshots_[k];

@@ -465,6 +465,7 @@ function(mp_add_player tgt is_pro)
             src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
             src/pro/Station.cpp          # inputs, timecode / delay, rig UI, snapshots
             src/pro/QcReport.cpp         # the session's QC report: HTML + marker EDL / CSV
+            src/pro/QcExporter.cpp       # writes QC reports off the render thread
             src/pro/ResolveLink.cpp      # the live Resolve panel: file protocol + follow
             src/pro/ProResolve.cpp       # the live Resolve panel: station side
             src/pro/Thumbnail.cpp        # input-list thumbnails (left eye, CPU)
@@ -734,6 +735,9 @@ if(MP_BUILD_TESTS)
     add_executable(look_loader_test tests/look_loader_test.cpp src/pro/LookLoader.cpp src/color/CubeLut.cpp)
     target_include_directories(look_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME look_loader COMMAND look_loader_test)
+    add_executable(qc_exporter_test tests/qc_exporter_test.cpp src/pro/QcExporter.cpp)
+    target_include_directories(qc_exporter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME qc_exporter COMMAND qc_exporter_test)
     add_executable(overlays_test tests/overlays_test.cpp src/pro/Overlays.cpp)
     target_include_directories(overlays_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME overlays COMMAND overlays_test)
