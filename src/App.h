@@ -38,6 +38,7 @@ public:
         bool camera = false;         // --camera[=<selector>]: start on the live camera
         std::string cameraSelector;  // "" / auto | index | name substring (CameraSelect)
         int cameraFps = 0;           // --camera-fps=<N>; 0 = highest <= 60
+        int proAtlas10Bit = -1;      // Pro --10bit (1) / --8bit (0); -1 = MEDIAPLAYER_PRO_10BIT, else 8-bit
         // --auto-conv[=nearest|sharp|centre] (#92); MEDIAPLAYER_AUTO_CONV fills it when the
         // command line did not. Empty policy = nearest.
         bool autoConv = false;

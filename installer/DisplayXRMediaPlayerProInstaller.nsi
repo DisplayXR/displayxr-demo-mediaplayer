@@ -296,6 +296,9 @@ Section "Start Menu Shortcut" SecShortcut
     CreateShortCut "$SMPROGRAMS\DisplayXR\Media Player Pro.lnk" \
         "$INSTDIR\mediaplayer_pro_handle_vk_win.exe" "" \
         "$INSTDIR\mediaplayer_pro_handle_vk_win.exe" 0
+    ; The same app with a 10-bit panel atlas (#143; runtime 2.53+ / Leia plug-in 2.17+).
+    ; A second shortcut, not the default, until the hardware validation pass (#142).
+    CreateShortCut "$SMPROGRAMS\DisplayXR\Media Player Pro (10-bit).lnk"         "$INSTDIR\mediaplayer_pro_handle_vk_win.exe" "--10bit"         "$INSTDIR\mediaplayer_pro_handle_vk_win.exe" 0
 SectionEnd
 
 ;--------------------------------
@@ -340,6 +343,7 @@ Section "Uninstall"
     RMDir "$PROGRAMFILES64\DisplayXR\Apps"
 
     Delete "$SMPROGRAMS\DisplayXR\Media Player Pro.lnk"
+    Delete "$SMPROGRAMS\DisplayXR\Media Player Pro (10-bit).lnk"
     ; Don't RMDir $SMPROGRAMS\DisplayXR — the runtime's own shortcuts may live there.
 
     DeleteRegKey HKLM "Software\DisplayXR\Apps\MediaPlayerPro"

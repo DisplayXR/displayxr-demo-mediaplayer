@@ -134,6 +134,8 @@ bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, b
             o.cdlPath = a.substr(6);
         } else if (a == "--camera-list") {
             list = true;
+        } else if (a == "--10bit" || a == "--8bit") {  // Media Player Pro: the panel atlas depth (#143)
+            o.proAtlas10Bit = a == "--10bit" ? 1 : 0;
         } else {
             rest.push_back(a);
         }
@@ -203,6 +205,31 @@ int main(int argc, char* argv[]) {
     }
 #endif
     if (listCameras) return PrintCameraList();
+#if MEDIAPLAYER_PRO
+    // The panel atlas depth (#143). The runtime reads DXR_ATLAS_FORMAT when it loads, so it
+    // goes into the process environment here, before the first OpenXR call. An explicit
+    // DXR_ATLAS_FORMAT always wins. 8-bit stays the default until the hardware validation
+    // pass (#142): a 10-bit atlas needs runtime v2.53+ (warned about once the runtime's
+    // version is known, XrSession) and the Leia plug-in v2.17+ for the right colours.
+    {
+        int want = launch.proAtlas10Bit;
+        if (want < 0) {
+            const char* e = std::getenv("MEDIAPLAYER_PRO_10BIT");
+            if (e && *e) want = *e != '0' ? 1 : 0;
+        }
+        const char* explicitFormat = std::getenv("DXR_ATLAS_FORMAT");
+        if (want == 1 && !(explicitFormat && *explicitFormat)) {
+#if defined(_WIN32)
+            _putenv_s("DXR_ATLAS_FORMAT", "rgb10a2");
+#else
+            setenv("DXR_ATLAS_FORMAT", "rgb10a2", 1);
+#endif
+            LOG_INFO("Pro: 10-bit panel atlas requested (DXR_ATLAS_FORMAT=rgb10a2)");
+        } else if (want == 1) {
+            LOG_INFO("Pro: --10bit ignored, DXR_ATLAS_FORMAT=%s is set explicitly", explicitFormat);
+        }
+    }
+#endif
 
     // The media path is the first remaining argument that is not a flag.
     const char* mediaPath = nullptr;

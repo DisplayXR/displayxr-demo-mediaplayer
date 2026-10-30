@@ -161,6 +161,21 @@ bool XrSession::InitInstanceAndSystem() {
 
     XR_CHECK(xrCreateInstance(&ci, &instance_));
     LOG_INFO("OpenXR instance created");
+    {
+        XrInstanceProperties props{XR_TYPE_INSTANCE_PROPERTIES};
+        if (XR_SUCCEEDED(xrGetInstanceProperties(instance_, &props))) {
+            const uint64_t v = props.runtimeVersion;
+            LOG_INFO("Runtime: %s %u.%u.%u", props.runtimeName, (unsigned)XR_VERSION_MAJOR(v),
+                     (unsigned)XR_VERSION_MINOR(v), (unsigned)XR_VERSION_PATCH(v));
+            // A deep panel atlas (Pro --10bit, #143) is honoured end to end from v2.53 (the
+            // Vulkan split's deposit carries it); older runtimes keep 8-bit or ignore it.
+            const char* fmt = std::getenv("DXR_ATLAS_FORMAT");
+            if (fmt && *fmt && v < XR_MAKE_VERSION(2, 53, 0))
+                LOG_WARN("DXR_ATLAS_FORMAT=%s needs DisplayXR runtime 2.53 or newer for a 10-bit panel "
+                         "picture; this runtime is %u.%u.%u", fmt, (unsigned)XR_VERSION_MAJOR(v),
+                         (unsigned)XR_VERSION_MINOR(v), (unsigned)XR_VERSION_PATCH(v));
+        }
+    }
 
     // Resolve the file-picker entry point (extension function — must go through
     // xrGetInstanceProcAddr, never the loader's exported symbols).

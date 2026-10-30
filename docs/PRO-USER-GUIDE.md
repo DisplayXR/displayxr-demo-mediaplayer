@@ -117,6 +117,22 @@ compare); with the clip wipe on, it swaps which clip is on which side.
 
 The grade is applied in this order: exposure, then the CDL, then the LUT.
 
+### 10-bit to the panel
+
+By default the picture reaches the display at 8 bits per channel, which can show banding
+in smooth gradients (skies, vignettes) after a strong grade or LUT. Start the player with
+**`--10bit`** to keep it at 10 bits all the way to the panel:
+
+```
+mediaplayer_pro_handle_vk_win.exe --10bit clip.mov
+```
+
+It needs DisplayXR runtime 2.53 or newer and the Leia plug-in 2.17 or newer; with an older
+runtime the player logs a warning and the picture stays 8-bit. On Windows the installer
+adds a **Media Player Pro (10-bit)** shortcut that does the same. `--8bit` (or setting
+`MEDIAPLAYER_PRO_10BIT=0`) goes back to the default. Setting `MEDIAPLAYER_PRO_10BIT=1` in
+the environment turns it on without the flag.
+
 ## Overlays (framing)
 
 Inspector > Overlays. They stay on the picture when the panels fade.
