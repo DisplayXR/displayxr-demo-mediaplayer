@@ -511,7 +511,7 @@ int App::Run() {
             uint32_t pw = 0, ph = 0, cw = 0, ch = 0;
             window_.PointSize(pw, ph);
             window_.PixelSize(cw, ch);
-            if (LiveSource() && hasMedia_ && pw && ph && cw && ch) {
+            if (AutoConvApplies() && pw && ph && cw && ch) {  // live or a stereo file
                 const XrSession::ViewRect fit = MatchMinRect({0, 0, cw, ch}, FitAspect());
                 const float px = cx * (float)cw / (float)pw, py = cy * (float)ch / (float)ph;
                 const float u = (px - (float)fit.x) / (float)std::max(1u, fit.w);
@@ -674,6 +674,8 @@ void App::RenderOneFrame() {
             } else if (isStream_) {
                 SettleLiveLayout(*vf, "Stream");
                 SampleAutoConv(*vf);  // streams converge like the camera (#93 follow-up)
+            } else if (isVideo_) {
+                SampleAutoConv(*vf);  // a playing clip converges like a stream (Part of #128)
             }
             // "Convert to 3D": hand the frame to the converter (latest-wins, one in flight).
             // While a converted picture is bound it REPLACES the source, so the source frame
@@ -716,6 +718,7 @@ void App::RenderOneFrame() {
             convertAtStart_ = false;
     }
     PumpConvert(SteadySeconds());  // "Convert to 3D": poll + upload a landed result (no-op off)
+    SampleAutoConvStatic();  // a still / a paused clip: measured once per change (Part of #128)
     TickAutoConv();  // smoothed auto-convergence shift (#92); exactly 0 while never enabled
     UpdateDepthCursor();
 
@@ -1001,8 +1004,8 @@ void App::RenderOneFrame() {
                               swapEyes_ ? "swapped" : "normal",
                               ((isLive_ && livePaused_) || (isStream_ && streamPaused_)) ? "  [FROZEN]"
                               : (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "",
-                              LiveSource() ? "\n" : "",
-                              LiveSource() ? AutoConvHudText().c_str() : "");  // #92
+                              (LiveSource() || autoConvEnabled_) ? "\n" : "",
+                              (LiveSource() || autoConvEnabled_) ? AutoConvHudText().c_str() : "");  // #92
                 // The layout label carries its provenance ("— detected" / "— from
                 // filename" / ...), so the buffer needs headroom over the old 320.
                 const std::string layoutLabel = LayoutLabel();
@@ -1101,6 +1104,7 @@ void App::BuildTransportUI() {
         if (cameraDevs_[i].id == camera_.DeviceId()) uiState_.cameraCurrent = (int)i;
     if (isLive_) uiState_.mediaFilename.clear();
     uiState_.autoConvOn = autoConvEnabled_;
+    uiState_.autoConvFile = !LiveSource() && AutoConvApplies();  // a stereo file (Part of #128)
     {
         char t[64];
         if (autoConvEnabled_)
@@ -1186,11 +1190,13 @@ void App::BuildTransportUI() {
     };
     actions.Seek = [this](float sec, bool preview) {
         video_.Seek(sec, preview);
+        AutoConvNewPicture(/*newMedia=*/false);  // a jump: snap, never glide across it
         if (!preview) ResetConvertStream();  // a jump: no pre-seek result may land after it
     };
     actions.ScrubHeld = [this] { audio_.SetPaused(true); };
     actions.ScrubReleased = [this](float sec) {
         video_.Seek(sec, /*preview=*/false);
+        AutoConvNewPicture(/*newMedia=*/false);
         ResetConvertStream();
         audio_.Seek(sec);
         if (!video_.Paused()) audio_.SetPaused(false);
@@ -1407,6 +1413,7 @@ bool App::LoadMedia(const std::string& path) {
         ApplyLayout(vinfo);
         mediaConvergence_ = 0.0f;  // no baked convergence for video
         mediaAutoConvAvailable_ = false;
+        AutoConvNewPicture(/*newMedia=*/true);  // frames are sampled as they play
         KeepStillForConvert(nullptr, 0, 0);  // a video converts from its decoded frames
 #if MEDIAPLAYER_PRO
         pro_.OnStill(nullptr, 0, 0, layout_);  // scopes follow the frames again
@@ -1464,6 +1471,12 @@ bool App::LoadMedia(const std::string& path) {
         mediaConvergence_ = lif.convergence;  // baked reconvergence from the LIF
         mediaAutoConvAvailable_ = lif.stereo && !lif.hasConvergence;  // estimate available
         mediaAutoConvergence_ = lif.autoConvergence;
+        // The author's convergence wins: auto-conv stands aside on a LIF that carries one
+        // (never stacked on the baked shift). One without it converges like an MPO.
+        AutoConvNewPicture(/*newMedia=*/true);
+        mediaHasBakedConv_ = lif.hasConvergence;
+        if (!mediaHasBakedConv_)
+            KeepStillForAutoConv(lif.image.pixels.data(), lif.image.width, lif.image.height);
         KeepStillForConvert(lif.image.pixels.data(), lif.image.width, lif.image.height);
 #if MEDIAPLAYER_PRO
         pro_.OnStill(lif.image.pixels.data(), lif.image.width, lif.image.height, layout_);
@@ -1510,6 +1523,8 @@ bool App::LoadMedia(const std::string& path) {
             mediaConvergence_ = 0.0f;   // MPO carries no baked convergence...
             mediaAutoConvAvailable_ = true;   // ...so the estimate is always on offer
             mediaAutoConvergence_ = mpo.autoConvergence;
+            AutoConvNewPicture(/*newMedia=*/true);
+            KeepStillForAutoConv(mpo.image.pixels.data(), mpo.image.width, mpo.image.height);
             KeepStillForConvert(mpo.image.pixels.data(), mpo.image.width, mpo.image.height);
 #if MEDIAPLAYER_PRO
             pro_.OnStill(mpo.image.pixels.data(), mpo.image.width, mpo.image.height, layout_);
@@ -1548,6 +1563,8 @@ bool App::LoadMedia(const std::string& path) {
     ApplyLayout(imgInfo);
     mediaConvergence_ = 0.0f;  // plain SBS image carries no baked convergence
     mediaAutoConvAvailable_ = false;
+    AutoConvNewPicture(/*newMedia=*/true);
+    KeepStillForAutoConv(img.pixels.data(), img.width, img.height);
     KeepStillForConvert(img.pixels.data(), img.width, img.height);
 #if MEDIAPLAYER_PRO
     pro_.OnStill(img.pixels.data(), img.width, img.height, layout_);
@@ -2114,6 +2131,8 @@ void App::SetAutoConv(bool on, const char* why) {
         autoConvMin_ = autoConvMax_ = autoConvergence_;
         autoConvSum_ = autoConvMsSum_ = autoConvMsMax_ = 0.0;
         autoConvTicks_ = autoConvMeasures_ = 0;
+        autoConvKey_ = AutoConvKey{};  // a still / paused clip is measured afresh
+        autoConvChangePending_ = 0;
     }
     LOG_INFO("auto-conv %s (%s, policy %s)", on ? "ON" : "OFF", why,
              autoconv::PolicyName(autoConvPolicy_));
@@ -2138,27 +2157,142 @@ void App::SetAutoConvFocus(float u, float v) {
     else ShowToast("Auto-conv: subject pinned");
 }
 
-void App::SampleAutoConv(const FrameRing::Frame& f) {
-    if (!autoConvEnabled_ || !LiveSource() || LivePaused()) return;
-    if (layout_ != StereoLayout::SbsFull && layout_ != StereoLayout::SbsHalf) return;
-    if (f.gpu || f.plane[0].empty() || f.width < 64 || f.height < 32) return;
-    const double nowMs = CameraSource::NowSeconds() * 1000.0;
-    if (nowMs - autoConvLastSubmitMs_ < 200.0) return;  // ~5 Hz
+bool App::AutoConvApplies() const {
+    if (!hasMedia_ || isLogo_ || !packing::IsPacked(layout_)) return false;
+    return LiveSource() || !mediaHasBakedConv_;
+}
+
+const uint8_t* App::AutoConvLuma8(const FrameRing::Frame& f) {
+    if (f.format != PixFormat::P016) return f.plane[0].data();
+    // 16-bit (Pro's 10-bit path): the measurement is 8-bit.
+    const size_t n = (size_t)f.width * (size_t)f.height;
+    autoConvLuma8_.resize(n);
+    const uint16_t* s16 = reinterpret_cast<const uint16_t*>(f.plane[0].data());
+    for (size_t i = 0; i < n; ++i) autoConvLuma8_[i] = (uint8_t)(s16[i] >> 8);
+    return autoConvLuma8_.data();
+}
+
+App::AutoConvKey App::AutoConvKeyNow(int64_t serial) const {
+    AutoConvKey k;
+    k.valid = true;
+    k.media = autoConvMedia_;
+    k.serial = serial;
+    k.layout = layout_;
+    k.swap = (swapEyes_ != mediaEyeSwap_);
+    k.policy = autoConvPolicy_;
+    if (autoConvPolicy_ == autoconv::SubjectPolicy::Focus && autoConvHasFocus_) {
+        k.fx = autoConvFocus_[0];
+        k.fy = autoConvFocus_[1];
+    }
+    return k;
+}
+
+void App::SubmitAutoConv(const uint8_t* luma, int w, int h, double nowMs) {
     autoConvLastSubmitMs_ = nowMs;
     // Measure on the halves the viewer's eyes actually see (X / container swap).
     const bool swap = (swapEyes_ != mediaEyeSwap_);
     const bool focus = autoConvPolicy_ == autoconv::SubjectPolicy::Focus && autoConvHasFocus_;
-    const uint8_t* luma = f.plane[0].data();
-    if (f.format == PixFormat::P016) {  // 16-bit (Pro's 10-bit path): the measurement is 8-bit
-        const size_t n = (size_t)f.width * (size_t)f.height;
-        autoConvLuma8_.resize(n);
-        const uint16_t* s16 = reinterpret_cast<const uint16_t*>(f.plane[0].data());
-        for (size_t i = 0; i < n; ++i) autoConvLuma8_[i] = (uint8_t)(s16[i] >> 8);
-        luma = autoConvLuma8_.data();
-    }
     autoConvDownsampleMs_ =
-        autoConvWorker_.Submit(luma, f.width, f.width, f.height, swap,
-                               autoConvPolicy_, focus ? autoConvFocus_ : nullptr, nowMs);
+        autoConvWorker_.Submit(luma, w, w, h, layout_, swap, autoConvPolicy_,
+                               focus ? autoConvFocus_ : nullptr, nowMs, ++autoConvTag_);
+    if (nowMs < autoConvSnapUntilMs_) autoConvSnapLastTag_ = autoConvTag_;
+}
+
+void App::SampleAutoConv(const FrameRing::Frame& f) {
+    if (!isVideo_ && !LiveSource()) return;
+    if (isVideo_) autoConvHeldFrame_ = &f;  // the static path re-reads it while paused
+    if (!autoConvEnabled_ || !AutoConvApplies()) return;
+    if (LiveSource() && LivePaused()) return;
+    // A paused / ended clip shows one picture: SampleAutoConvStatic measures it (a frame
+    // step or a seek lands here as a new frame and is picked up there, unthrottled).
+    if (isVideo_ && (video_.Paused() || video_.Ended())) return;
+    // Zero-copy (#28) frames carry no CPU pixels: not measured (the CPU path is the default).
+    if (f.gpu || f.plane[0].empty() || f.width < 64 || f.height < 32) return;
+    const double nowMs = CameraSource::NowSeconds() * 1000.0;
+    if (nowMs - autoConvLastSubmitMs_ < 200.0) return;  // ~5 Hz
+    SubmitAutoConv(AutoConvLuma8(f), f.width, f.height, nowMs);
+    if (isVideo_) autoConvKey_ = AutoConvKeyNow(f.serial);
+}
+
+void App::SampleAutoConvStatic() {
+    if (!autoConvEnabled_ || LiveSource() || !AutoConvApplies()) return;
+    const uint8_t* luma = nullptr;
+    int w = 0, h = 0;
+    int64_t serial = 0;
+    const FrameRing::Frame* f = nullptr;
+    if (isVideo_) {
+        if (!(video_.Paused() || video_.Ended())) return;  // playing: SampleAutoConv
+        f = autoConvHeldFrame_;
+        if (!f || f->gpu || f->plane[0].empty() || f->width < 64 || f->height < 32) return;
+        serial = f->serial;
+    } else if (autoConvStill_.empty()) {
+        return;
+    }
+    const AutoConvKey k = AutoConvKeyNow(serial);
+    if (k.Same(autoConvKey_)) return;
+    if (f) {
+        luma = AutoConvLuma8(*f);
+        w = f->width;
+        h = f->height;
+    } else {
+        luma = autoConvStill_.data();
+        w = autoConvStillW_;
+        h = autoConvStillH_;
+    }
+    // One picture: every measurement starts clean (no median-of-3 across a layout or eye
+    // order change). A different frame (new file, seek, step) snaps; the same picture
+    // measured differently (layout, X, policy, the focus pin, A turned on) glides, unthrottled.
+    const bool newPicture =
+        autoConvKey_.valid && (k.media != autoConvKey_.media || k.serial != autoConvKey_.serial);
+    autoConvWorker_.RequestReset();
+    SubmitAutoConv(luma, w, h, CameraSource::NowSeconds() * 1000.0);
+    autoConvChangePending_ = std::max(autoConvChangePending_, newPicture ? 2 : 1);
+    autoConvChangeFrom_ = autoConvTag_;
+    autoConvKey_ = k;
+}
+
+void App::AutoConvNewPicture(bool newMedia) {
+    autoConvWorker_.RequestReset();  // applied before the next submission is measured
+    autoConvChangePending_ = 2;
+    autoConvChangeFrom_ = autoConvTag_ + 1;  // whatever is in flight is the old picture
+    autoConvLastSubmitMs_ = -1e9;            // measure the first frame after it at once
+    // The decoder lands a seek on its next iteration, so the first frame or two sampled
+    // after it may still be the old position: every submission in this window snaps.
+    autoConvSnapUntilMs_ = CameraSource::NowSeconds() * 1000.0 + 500.0;
+    if (!newMedia) return;
+    // A new file: the old file's shift means nothing here. Drop it now (0 until the first
+    // measurement snaps in), and forget the old file's still / held frame.
+    autoConvCtl_.Reset();
+    autoConvergence_ = 0.0f;
+    ++autoConvMedia_;
+    autoConvKey_ = AutoConvKey{};
+    autoConvHeldFrame_ = nullptr;
+    autoConvStill_.clear();
+    autoConvStillW_ = autoConvStillH_ = 0;
+    mediaHasBakedConv_ = false;
+}
+
+void App::KeepStillForAutoConv(const uint8_t* rgba, int w, int h) {
+    // A still's luma (BT.709 weights), box-averaged to <= 1920 wide: the estimator works at
+    // <= 240 px per eye anyway, and this keeps an 8K pair to a few MB. Kept whether or not
+    // auto-conv is on, so A can be pressed later; a layout override re-measures from it.
+    autoConvStill_.clear();
+    autoConvStillW_ = autoConvStillH_ = 0;
+    if (!rgba || w < 64 || h < 32) return;
+    const int f = std::max(1, (w + 1919) / 1920);
+    const int ow = w / f, oh = h / f;
+    autoConvStill_.resize((size_t)ow * oh);
+    for (int y = 0; y < oh; ++y)
+        for (int x = 0; x < ow; ++x) {
+            uint32_t sum = 0;
+            for (int dy = 0; dy < f; ++dy) {
+                const uint8_t* p = rgba + ((size_t)(y * f + dy) * w + (size_t)x * f) * 4;
+                for (int dx = 0; dx < f; ++dx, p += 4) sum += 54u * p[0] + 183u * p[1] + 19u * p[2];
+            }
+            autoConvStill_[(size_t)y * ow + x] = (uint8_t)(sum / (256u * (uint32_t)(f * f)));
+        }
+    autoConvStillW_ = ow;
+    autoConvStillH_ = oh;
 }
 
 void App::TickAutoConv() {
@@ -2173,10 +2307,20 @@ void App::TickAutoConv() {
         ++autoConvMeasures_;
         autoConvMsSum_ += r.ms;
         autoConvMsMax_ = std::max(autoConvMsMax_, r.ms);
-        if (autoConvEnabled_ && LiveSource()) autoConvCtl_.Update(r);
+        // While a change is pending, a measurement of the old picture (submitted before the
+        // seek / load / re-measure) must not steer; the first one after it carries the change.
+        const bool stale = autoConvChangePending_ && r.tag < autoConvChangeFrom_;
+        if (autoConvEnabled_ && AutoConvApplies() && !stale) {
+            if (autoConvChangePending_) {
+                autoConvCtl_.ExpectChange(autoConvChangePending_ == 2);
+                autoConvChangePending_ = 0;
+            } else if (r.tag <= autoConvSnapLastTag_) {
+                autoConvCtl_.ExpectChange(true);  // still inside a seek's settle window
+            }
+            autoConvCtl_.Update(r);
+        }
     }
-    const bool stereo = layout_ == StereoLayout::SbsFull || layout_ == StereoLayout::SbsHalf;
-    autoConvCtl_.Tick(dt, autoConvEnabled_ && LiveSource() && stereo);
+    autoConvCtl_.Tick(dt, autoConvEnabled_ && AutoConvApplies());
     autoConvergence_ = autoConvCtl_.Value();
     if (!autoConvEnabled_) return;
     autoConvMin_ = std::min(autoConvMin_, autoConvergence_);
@@ -2201,6 +2345,11 @@ std::string App::AutoConvHudText() const {
     char t[128];
     if (!autoConvEnabled_) {
         std::snprintf(t, sizeof(t), "autoconv OFF");
+    } else if (!AutoConvApplies()) {
+        // On, but nothing to measure: mono / Dual, or a LIF whose own convergence wins.
+        std::snprintf(t, sizeof(t), "autoconv ON  idle (%s)",
+                      hasMedia_ && packing::IsPacked(layout_) && mediaHasBakedConv_ ? "LIF convergence"
+                                                                                    : "not stereo");
     } else {
         std::snprintf(t, sizeof(t), "autoconv ON %s  d=%+.1f%%  conv=%+.1f%%  ncc %.2f  %.1f ms",
                       autoconv::PolicyName(autoConvPolicy_), autoConvLast_.disparityFrac * 100.0f,
@@ -2534,6 +2683,7 @@ void App::TogglePlayback() {
     if (video_.Ended()) {
         video_.Seek(0.0);          // restart a clip that already ran to the end
         ResetConvertStream();
+        AutoConvNewPicture(/*newMedia=*/false);
         video_.SetPaused(false);
         audio_.Seek(0.0);
         audio_.SetPaused(false);
@@ -2562,6 +2712,7 @@ void App::StepFrame(int n) {
     if (t < 0.0) t = 0.0;
     video_.Seek(t);             // exact
     ResetConvertStream();
+    AutoConvNewPicture(/*newMedia=*/false);
     audio_.Seek(t);             // keep audio aligned for the eventual resume
     uiState_.scrubTarget = (float)t;    // hold the scrubber knob until the frame lands
 }
@@ -2857,9 +3008,10 @@ void App::SetupAgentTools() {
 
     xr_.RegisterMcpTool(
         "set_auto_convergence",
-        "Live auto-convergence (#92): measure the subject's stereo disparity and shift the "
-        "eyes so it sits at the display plane. DEFAULT OFF. 'enabled' turns it on/off (the "
-        "shift ramps back to 0 when off). 'policy' picks the subject: nearest (the nearest "
+        "Auto-convergence (#92): measure the subject's stereo disparity and shift the "
+        "eyes so it sits at the display plane. Live camera / stream and stereo files (SBS or "
+        "TB video and stills; a LIF with its own convergence keeps it). DEFAULT OFF. "
+        "'enabled' turns it on/off (the shift ramps back to 0 when off). 'policy' picks the subject: nearest (the nearest "
         "strong depth plane - a person at the camera), sharp (the sharpest blocks - shallow "
         "depth of field), centre (centre-weighted), focus (needs focus_x/focus_y). "
         "focus_x/focus_y (0..1, normalised over one eye's picture) pin the subject and imply "
@@ -2968,6 +3120,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
     auto fillAutoConv = [this](json& o) {
         const autoconv::Result& l = autoConvLast_;
         o["auto_conv_enabled"] = autoConvEnabled_;
+        o["auto_conv_active"] = autoConvEnabled_ && AutoConvApplies();  // something to measure
         o["auto_conv_policy"] = autoconv::PolicyName(autoConvPolicy_);
         o["auto_conv_value"] = autoConvergence_;  // applied per-eye shift, fraction of eye width
         o["auto_conv_target"] = autoConvCtl_.Target();
@@ -3176,6 +3329,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         if (durationS > 0.0 && t > durationS) t = durationS;
         video_.Seek(t);             // exact
         ResetConvertStream();
+        AutoConvNewPicture(/*newMedia=*/false);
         audio_.Seek(t);             // keep audio aligned
         uiState_.scrubTarget = (float)t;    // hold the scrubber knob until the decode lands
         out["position_s"] = t;
@@ -3509,6 +3663,7 @@ void App::InitPro() {
     h.seekMedia = [this](double s, bool paused) {
         if (!isVideo_) return;
         video_.Seek(s);
+        AutoConvNewPicture(/*newMedia=*/false);
         if (paused && !video_.Paused()) TogglePlayback();
     };
     h.mediaStart = [this] { return isVideo_ ? video_.StartSeconds() : 0.0; };

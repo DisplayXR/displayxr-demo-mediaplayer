@@ -2,6 +2,8 @@
 // Port of displayxr-web js/call/disparity.js (see AutoConvergence.h for the contract).
 #include "media/AutoConvergence.h"
 
+#include "media/StereoPacking.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -481,6 +483,66 @@ int DownsampleFactorFor(int frameWidth) {
     return std::max(1, (E + kMaxEyeWidth - 1) / kMaxEyeWidth);
 }
 
+namespace {
+// One eye (strided, top-left at `eye`) into columns [xOff, xOff + ow) of an outW-wide gray
+// image: the same box (f <= 2) / quarter-point (f > 2) rule as DownsampleLuma.
+void SampleEye(const uint8_t* eye, int stride, int f, int ow, int oh, uint8_t* out, int outW,
+               int xOff) {
+    if (f <= 2) {
+        const int n = f * f;
+        for (int y = 0; y < oh; ++y) {
+            uint8_t* row = out + (size_t)y * outW + xOff;
+            for (int x = 0; x < ow; ++x) {
+                int sum = 0;
+                for (int dy = 0; dy < f; ++dy) {
+                    const uint8_t* o = eye + (size_t)(y * f + dy) * stride + (size_t)x * f;
+                    for (int dx = 0; dx < f; ++dx) sum += o[dx];
+                }
+                row[x] = (uint8_t)(sum / n);
+            }
+        }
+        return;
+    }
+    const int a = f >> 2, c = (3 * f) >> 2;
+    for (int y = 0; y < oh; ++y) {
+        const uint8_t* r0 = eye + (size_t)(y * f + a) * stride;
+        const uint8_t* r1 = eye + (size_t)(y * f + c) * stride;
+        uint8_t* row = out + (size_t)y * outW + xOff;
+        for (int x = 0; x < ow; ++x) {
+            const int x0 = x * f + a, x1 = x * f + c;
+            row[x] = (uint8_t)((r0[x0] + r0[x1] + r1[x0] + r1[x1]) >> 2);
+        }
+    }
+}
+}  // namespace
+
+bool DownsampleStereo(const uint8_t* src, int stride, int srcW, int srcH, StereoLayout layout,
+                      bool swapEyes, std::vector<uint8_t>& out, int& outW, int& outH) {
+    if (packing::IsSbs(layout)) {  // bit-identical to the live path before TB existed
+        DownsampleLuma(src, stride, srcW, srcH, DownsampleFactorFor(srcW), swapEyes, out, outW,
+                       outH);
+        return true;
+    }
+    if (!packing::IsTb(layout)) return false;
+    // Top-bottom: each eye's rect from StereoPacking, laid side by side (viewer's left eye
+    // in the left half), so the estimator below sees the same SBS image it always does.
+    const packing::EyeRect l = packing::Eye(layout, !swapEyes);
+    const packing::EyeRect r = packing::Eye(layout, swapEyes);
+    const int ew = (int)(l.w * (float)srcW), eh = (int)(l.h * (float)srcH);
+    const int f = DownsampleFactorFor(2 * ew);  // the eye is the frame's full width
+    const int ow = ew / f, oh = eh / f;
+    if (ow <= 0 || oh <= 0) return false;
+    auto origin = [&](const packing::EyeRect& e) {
+        return src + (size_t)(e.y * (float)srcH + 0.5f) * stride + (size_t)(e.x * (float)srcW + 0.5f);
+    };
+    outW = 2 * ow;
+    outH = oh;
+    out.resize((size_t)outW * oh);
+    SampleEye(origin(l), stride, f, ow, oh, out.data(), outW, 0);
+    SampleEye(origin(r), stride, f, ow, oh, out.data(), outW, ow);
+    return true;
+}
+
 // ---- policies ------------------------------------------------------------------------------
 const char* PolicyName(SubjectPolicy p) {
     switch (p) {
@@ -514,13 +576,12 @@ void DisparityEstimator::Reset() {
 Result DisparityEstimator::Measure(const uint8_t* y, int stride, int w, int h,
                                    StereoLayout layout, SubjectPolicy policy,
                                    const float* focusUV, double nowMs, bool swapEyes) {
-    if (layout != StereoLayout::SbsFull && layout != StereoLayout::SbsHalf) {
+    int ow = 0, oh = 0;
+    if (!DownsampleStereo(y, stride, w, h, layout, swapEyes, small_, ow, oh)) {
         Result r;
         r.rule = "mono";
         return r;
     }
-    int ow = 0, oh = 0;
-    DownsampleLuma(y, stride, w, h, DownsampleFactorFor(w), swapEyes, small_, ow, oh);
     return MeasureGray(small_.data(), ow, oh, policy, focusUV, nowMs);
 }
 
@@ -701,9 +762,18 @@ void AutoConvergenceController::Update(const Result& r) {
     const char* c = "";
     const float t = TargetFor(r, &c);
     clamp_ = c;
-    if (!hasTarget_ || r.sceneCut) fast_ = true;
+    if (!hasTarget_ || r.sceneCut || expect_ == 1) fast_ = true;
     target_ = t;
     hasTarget_ = true;
+    if (expect_ == 2) {  // a different picture: no glide across the cut
+        value_ = t;
+        fast_ = false;
+    }
+    expect_ = 0;
+}
+
+void AutoConvergenceController::ExpectChange(bool snap) {
+    expect_ = std::max(expect_, snap ? 2 : 1);
 }
 
 void AutoConvergenceController::Tick(double dt, bool enabled) {
@@ -734,6 +804,7 @@ void AutoConvergenceController::Reset() {
     hasTarget_ = false;
     fast_ = false;
     wasEnabled_ = false;
+    expect_ = 0;
     clamp_ = "";
 }
 
@@ -757,8 +828,9 @@ void AutoConvergenceWorker::Stop() {
     if (thread_.joinable()) thread_.join();
 }
 
-double AutoConvergenceWorker::Submit(const uint8_t* y, int stride, int w, int h, bool swapEyes,
-                                     SubjectPolicy policy, const float* focusUV, double nowMs) {
+double AutoConvergenceWorker::Submit(const uint8_t* y, int stride, int w, int h,
+                                     StereoLayout layout, bool swapEyes, SubjectPolicy policy,
+                                     const float* focusUV, double nowMs, uint64_t tag) {
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<uint8_t> local;
     {
@@ -767,16 +839,18 @@ double AutoConvergenceWorker::Submit(const uint8_t* y, int stride, int w, int h,
         local.swap(staging_);
     }
     int ow = 0, oh = 0;
-    DownsampleLuma(y, stride, w, h, DownsampleFactorFor(w), swapEyes, local, ow, oh);
+    const bool packed = DownsampleStereo(y, stride, w, h, layout, swapEyes, local, ow, oh);
     {
         std::lock_guard<std::mutex> lk(m_);
         staging_.swap(local);
+        if (!packed) return 0.0;  // nothing to measure (the buffer goes back untouched)
         sw_ = ow;
         sh_ = oh;
         policy_ = policy;
         hasFocus_ = focusUV != nullptr;
         if (focusUV) { focus_[0] = focusUV[0]; focus_[1] = focusUV[1]; }
         nowMs_ = nowMs;
+        tag_ = tag;
         pending_ = true;
     }
     cv_.notify_one();
@@ -804,6 +878,7 @@ void AutoConvergenceWorker::Main() {
         bool hasFocus;
         float focus[2];
         double now;
+        uint64_t tag;
         bool reset;
         {
             std::unique_lock<std::mutex> lk(m_);
@@ -818,12 +893,14 @@ void AutoConvergenceWorker::Main() {
             focus[0] = focus_[0];
             focus[1] = focus_[1];
             now = nowMs_;
+            tag = tag_;
             reset = resetReq_;
             resetReq_ = false;
         }
         if (reset) est_.Reset();
         if (work_.size() < (size_t)w * h || w <= 0) continue;
-        const Result r = est_.MeasureGray(work_.data(), w, h, policy, hasFocus ? focus : nullptr, now);
+        Result r = est_.MeasureGray(work_.data(), w, h, policy, hasFocus ? focus : nullptr, now);
+        r.tag = tag;
         std::lock_guard<std::mutex> lk(m_);
         result_ = r;
         hasResult_ = true;
