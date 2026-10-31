@@ -4,15 +4,19 @@
 // synthetic SBS pairs with KNOWN disparities, d = x_left - x_right, positive = in front of
 // the display plane. Plus what this port adds: the pluggable subject policies, the comfort
 // clamp, the rate limit / scene-cut snap, DEFAULT OFF, and the sign through the same shift
-// expression the draw code uses (autoconv::ConvergenceShiftPx).
+// expression the draw code uses (autoconv::ConvergenceShiftPx). And top-bottom packings plus
+// the file-playback plumbing (Part of #128): a TB pair measures exactly as its SBS twin,
+// the worker returns the submission's tag, and ExpectChange snaps / glides.
 
 #include "media/AutoConvergence.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <thread>
 #include <vector>
 
 using namespace mp::autoconv;
@@ -438,6 +442,142 @@ void TestSignThroughUvMath() {
     CHECK(xL - xR > 0, "unshifted subject is crossed");
 }
 
+// ---- top-bottom + files (Part of #128) ----------------------------------------------------
+
+// The same eye pair stacked top-bottom (left eye on top): E x 2H.
+std::vector<uint8_t> TbFromSbs(const std::vector<uint8_t>& sbs, int E, int H) {
+    std::vector<uint8_t> tb((size_t)E * 2 * H);
+    for (int eye = 0; eye < 2; ++eye)
+        for (int y = 0; y < H; ++y)
+            std::memcpy(&tb[(size_t)(eye * H + y) * E], &sbs[(size_t)y * 2 * E + eye * E], (size_t)E);
+    return tb;
+}
+
+void TestTopBottomMatchesSbs() {
+    const int E = 240, H = 135, S = 4;
+    for (int d : {24, -8}) {
+        const int dSubject = d + 20;  // a nearer square: the nearest mode
+        auto g = Sbs(E, H, {{d, Texture(41), {}}, {dSubject, Texture(42), Rect(90, 35, 150, 95)}});
+        const int sbsStride = 2 * E * S + 64;
+        auto sbsFull = Upscale(g, 2 * E, H, S, sbsStride);
+        auto tb = TbFromSbs(g, E, H);
+        const int tbStride = E * S + 32;
+        auto tbFull = Upscale(tb, E, 2 * H, S, tbStride);
+
+        // The estimator is fed the same sub-planes: the downsampled image is byte-identical.
+        std::vector<uint8_t> a, b;
+        int aw = 0, ah = 0, bw = 0, bh = 0;
+        CHECK(DownsampleStereo(sbsFull.data(), sbsStride, 2 * E * S, H * S,
+                               mp::StereoLayout::SbsFull, false, a, aw, ah),
+              "sbs packs");
+        CHECK(DownsampleStereo(tbFull.data(), tbStride, E * S, 2 * H * S, mp::StereoLayout::TbFull,
+                               false, b, bw, bh),
+              "tb packs");
+        CHECK(aw == bw && ah == bh && a == b, "tb d=%d: same gray as sbs (%dx%d vs %dx%d)", d, aw,
+              ah, bw, bh);
+        // With the eyes swapped too (the viewer's left eye is then the bottom picture).
+        const bool sw1 = DownsampleStereo(sbsFull.data(), sbsStride, 2 * E * S, H * S,
+                                          mp::StereoLayout::SbsFull, true, a, aw, ah);
+        const bool sw2 = DownsampleStereo(tbFull.data(), tbStride, E * S, 2 * H * S,
+                                          mp::StereoLayout::TbHalf, true, b, bw, bh);
+        CHECK(sw1 && sw2 && a == b, "tb d=%d: swapped gray matches swapped sbs", d);
+
+        // ...so the measured shift is the SBS one, full and half.
+        DisparityEstimator es;
+        const Result rs = es.Measure(sbsFull.data(), sbsStride, 2 * E * S, H * S,
+                                     mp::StereoLayout::SbsFull, SubjectPolicy::Nearest, nullptr, 0.0);
+        const float want = (float)dSubject / (float)E;
+        for (mp::StereoLayout lay : {mp::StereoLayout::TbFull, mp::StereoLayout::TbHalf}) {
+            DisparityEstimator et;
+            const Result rt = et.Measure(tbFull.data(), tbStride, E * S, 2 * H * S, lay,
+                                         SubjectPolicy::Nearest, nullptr, 0.0);
+            CHECK(rs.ok && rt.ok && rt.disparityFrac == rs.disparityFrac &&
+                      std::fabs(rt.disparityFrac - want) < 0.006f,
+                  "tb d=%d layout=%d: frac %.4f, sbs %.4f, want %.4f", d, (int)lay,
+                  rt.disparityFrac, rs.disparityFrac, want);
+            AutoConvergenceController cs, ct;
+            CHECK(ct.TargetFor(rt, nullptr) == cs.TargetFor(rs, nullptr), "tb: same target shift");
+        }
+    }
+    {
+        // Eye swap on TB: the viewer's left eye now sees the bottom picture -> the sign flips.
+        auto tb = TbFromSbs(Sbs(E, H, {{8, Texture(44), {}}}), E, H);
+        DisparityEstimator ea, eb;
+        const Result a = ea.Measure(tb.data(), E, E, 2 * H, mp::StereoLayout::TbFull,
+                                    SubjectPolicy::Nearest, nullptr, 0.0, /*swap=*/false);
+        const Result b = eb.Measure(tb.data(), E, E, 2 * H, mp::StereoLayout::TbFull,
+                                    SubjectPolicy::Nearest, nullptr, 0.0, /*swap=*/true);
+        CHECK(a.ok && b.ok && a.disparityFrac > 0 && std::fabs(a.disparityFrac + b.disparityFrac) < 0.005f,
+              "tb swap flips the sign: %.4f vs %.4f", a.disparityFrac, b.disparityFrac);
+    }
+    // Unpacked layouts are not measured: mono is one picture, Dual's right eye is another
+    // decoder's frame.
+    std::vector<uint8_t> g((size_t)480 * 270, 90), out;
+    int w = 0, h = 0;
+    CHECK(!DownsampleStereo(g.data(), 480, 480, 270, mp::StereoLayout::Mono, false, out, w, h) &&
+              !DownsampleStereo(g.data(), 480, 480, 270, mp::StereoLayout::Dual, false, out, w, h),
+          "mono / dual do not pack");
+    DisparityEstimator est;
+    const Result rd = est.Measure(g.data(), 480, 480, 270, mp::StereoLayout::Dual,
+                                  SubjectPolicy::Nearest, nullptr, 0.0);
+    CHECK(std::strcmp(rd.rule, "mono") == 0, "dual is not measured");
+}
+
+void TestWorkerTopBottomTag() {
+    const int E = 240, H = 135, S = 2, d = 24;
+    auto tb = TbFromSbs(Sbs(E, H, {{d, Texture(43), {}}}), E, H);
+    auto full = Upscale(tb, E, 2 * H, S, E * S);
+    AutoConvergenceWorker w;
+    w.Start();
+    w.Submit(full.data(), E * S, E * S, 2 * H * S, mp::StereoLayout::TbFull, false,
+             SubjectPolicy::Nearest, nullptr, 0.0, /*tag=*/77);
+    Result r;
+    bool got = false;
+    for (int i = 0; i < 400 && !got; ++i) {
+        got = w.TakeResult(r);
+        if (!got) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(got && r.tag == 77 && r.ok && std::fabs(r.disparityFrac - (float)d / (float)E) < 0.006f,
+          "worker tb: got=%d tag=%llu frac=%.4f", got, (unsigned long long)r.tag, r.disparityFrac);
+    // An unpacked layout submits nothing.
+    w.Submit(full.data(), E * S, E * S, 2 * H * S, mp::StereoLayout::Mono, false,
+             SubjectPolicy::Nearest, nullptr, 0.0, 78);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(!w.TakeResult(r), "worker: mono submits nothing");
+    w.Stop();
+}
+
+void TestExpectChange() {
+    const double dt = 1.0 / 60.0;
+    AutoConvergenceController c;
+    c.Update(Synthetic(0.10f, 0.10f, 0.10f));  // target -0.05
+    for (int i = 0; i < 60 * 5; ++i) c.Tick(dt, true);
+    CHECK(std::fabs(c.Value() + 0.05f) < 0.001f, "locked: %.4f", c.Value());
+    // A seek / new file / frame step: the value jumps to the new target at once.
+    c.ExpectChange(/*snap=*/true);
+    c.Update(Synthetic(-0.02f, -0.02f, -0.02f));  // target +0.01
+    CHECK(c.Value() == c.Target() && std::fabs(c.Value() - 0.01f) < 1e-6f, "snap: %.4f", c.Value());
+    c.Tick(dt, true);
+    CHECK(std::fabs(c.Value() - 0.01f) < 1e-6f, "snap holds: %.4f", c.Value());
+    // A dropout does not consume a pending snap.
+    c.ExpectChange(true);
+    c.Update(Result{});
+    CHECK(std::fabs(c.Value() - 0.01f) < 1e-6f, "dropout: no jump");
+    c.Update(Synthetic(0.04f, 0.04f, 0.04f));  // target -0.02
+    CHECK(std::fabs(c.Value() + 0.02f) < 1e-6f, "snap waited for a value: %.4f", c.Value());
+    // The same picture re-measured (layout / swap / policy on a still): no jump, but no
+    // 0.2 %/s rate limit either - it arrives within a few seconds.
+    c.ExpectChange(/*snap=*/false);
+    c.Update(Synthetic(0.0f, 0.0f, 0.0f));  // target 0
+    CHECK(std::fabs(c.Value() + 0.02f) < 1e-6f, "glide does not jump");
+    for (int i = 0; i < 60 * 5; ++i) c.Tick(dt, true);
+    CHECK(std::fabs(c.Value()) < 0.0005f, "glide skips the rate limit: %.4f", c.Value());
+    // Without it, the same 2 % step is rate limited (0.2 %/s -> ~0.6 % in 3 s).
+    c.Update(Synthetic(0.04f, 0.04f, 0.04f));
+    for (int i = 0; i < 60 * 3; ++i) c.Tick(dt, true);
+    CHECK(c.Value() > -0.0075f, "rate limited without ExpectChange: %.4f", c.Value());
+}
+
 }  // namespace
 
 int main() {
@@ -460,6 +600,9 @@ int main() {
     TestComfortClamp();
     TestTemporal();
     TestSignThroughUvMath();
+    TestTopBottomMatchesSbs();
+    TestWorkerTopBottomTag();
+    TestExpectChange();
     if (g_failures) {
         std::fprintf(stderr, "auto_convergence_test: %d failure(s)\n", g_failures);
         return 1;

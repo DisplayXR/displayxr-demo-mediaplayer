@@ -128,18 +128,37 @@ camera backend off, so there no camera is found. SDL's Windows driver has no hot
 so after an unplug use **Rescan** in the Camera menu (or press `C`): it re-lists the
 devices and re-opens the same camera as soon as it is back.
 
-## Auto-convergence (live, #92)
+## Auto-convergence (live and files, SBS and TB, #92)
 
-**Off by default**: the live picture is shown raw unless you turn this on. When on, the
+**Off by default**: the picture is shown raw unless you turn this on. When on, the
 player measures how far apart the subject sits in the two eyes and shifts the eyes in
 opposite directions so the subject lands at the display plane. It measures the pixels
 (NCC block matching on a downsampled luma plane, ~5 Hz, on a side thread). There is no
 face detection and no calibration. Manual `-` / `=` convergence still applies on top.
-It works the same on the live camera and on a stream URL.
+It works on the live camera, a stream URL, and stereo files: video, image sequences and
+stills (SBS JPG/PNG, MPO, LIF). Side-by-side and top-bottom packings (full and half) are
+both measured, on the eyes as shown (`X` and a container's R|L flag are respected).
+
+What it does with each source:
+- **Live / stream, or a playing clip**: frames are measured as they arrive, ~5 Hz, and
+  the shift is smoothed (below).
+- **A paused clip or a still** has one picture. It is measured once, and again only when
+  something the measurement depends on changes: the layout, `X`, the subject policy, a
+  pinned focus point, or turning auto-conv on.
+- **A seek, a frame step or a new file** is a different picture: the shift snaps to the
+  new measurement instead of gliding across the cut. A new file starts from 0, so a mono
+  file never inherits the previous one's shift. A scene cut found during playback skips
+  the rate limit and glides quickly to the new scene.
+- **A LIF that carries its own convergence keeps it**: auto-conv stands aside (the HUD
+  says `idle (LIF convergence)`) and is never stacked on the baked shift. A LIF without
+  one is measured like an MPO. `Backspace` (converge once from the file) is unchanged.
+- **Not measured**: mono, the `Dual` two-track layout (this player decodes the first
+  track only, so the second eye is not there to compare), a "Convert to 3D" picture,
+  and zero-copy (`MEDIAPLAYER_ZEROCOPY=1`, Windows) frames, which carry no CPU pixels.
 
 | control | effect |
 |---|---|
-| `A` / the **Auto-conv** button in the live top bar | on / off (turning it off glides the shift back to 0) |
+| `A` / the **Auto-conv** button in the top bar (live, or a stereo file) | on / off (turning it off glides the shift back to 0) |
 | `Shift+A` | subject policy: nearest -> sharp -> centre |
 | `Ctrl+click` on the picture | pin the subject under the cursor (policy `focus`, template-tracked) |
 | `--auto-conv[=nearest\|sharp\|centre]`, `MEDIAPLAYER_AUTO_CONV=<policy>` | start with it on. The CLI wins over the env var. `1`/`on` = the default policy, `0`/`off` = off. |
@@ -163,7 +182,10 @@ On top of that measurement:
 - A low-pass and a 0.2 %-of-eye-width-per-second rate limit smooth the shift. A scene cut
   is the exception: the shift snaps to the new scene.
 
-The HUD shows `autoconv ON nearest  d=…  conv=…  ncc …  … ms`.
+The HUD shows `autoconv ON nearest  d=…  conv=…  ncc …  … ms` (for a file, while it is
+on), or `autoconv ON  idle (…)` when there is nothing to measure. The log prints the same
+once a second (`autoconv: nearest d=… conv=… target=…`), and `get_status` adds
+`auto_conv_active`.
 
 The measurement is a port of displayxr-web's `js/call/disparity.js` (the 3D video call's
 auto-convergence), and it keeps that file's thresholds so web and native converge the

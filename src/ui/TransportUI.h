@@ -99,8 +99,10 @@ struct TransportState {
     float cameraFps = 0.0f;                // frames the camera delivered per second
     float panelFps = 0.0f;                 // frames the app submitted per second
     float frameAgeMs = 0.0f;               // camera publish -> GPU upload age
-    // Auto-convergence toggle (#92), shown next to Layout while live.
+    // Auto-convergence toggle (#92), shown next to Layout while live - and for a stereo
+    // (SBS / TB) file, video or still (Part of #128).
     bool autoConvOn = false;
+    bool autoConvFile = false;
     std::string autoConvLabel;             // "Auto-conv: off" / "Auto-conv: nearest -1.6%"
     // Stream URL source (#93) - only read when caps.url.
     bool isStream = false;

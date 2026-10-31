@@ -185,10 +185,24 @@ private:
     // entered by Ctrl+click / the MCP tool). SampleAutoConv hands the frame the renderer
     // just acquired to the worker (~5 Hz, downsampled in place, no full-frame copy);
     // TickAutoConv advances the smoothed shift every rendered frame.
+    // Files too (Part of #128): a PLAYING clip samples its frames like a live source; a
+    // still or a paused / ended clip has one picture, which SampleAutoConvStatic measures
+    // once and again only when what the measurement depends on changes. A new file, a seek
+    // and a frame step are a different picture: the shift snaps (AutoConvNewPicture). A LIF
+    // carrying its own convergence keeps it: auto-conv stands aside (AutoConvApplies).
     void SetAutoConv(bool on, const char* why);
     void SetAutoConvPolicy(autoconv::SubjectPolicy p);
     void SetAutoConvFocus(float u, float v);  // left-eye normalised; switches to Focus
     void SampleAutoConv(const FrameRing::Frame& f);
+    void SampleAutoConvStatic();
+    void SubmitAutoConv(const uint8_t* luma, int w, int h, double nowMs);
+    const uint8_t* AutoConvLuma8(const FrameRing::Frame& f);  // P016 -> 8-bit, else plane[0]
+    void AutoConvNewPicture(bool newMedia);  // a seek (false) or a new file (true): snap
+    void KeepStillForAutoConv(const uint8_t* rgba, int w, int h);
+    // Packed stereo on screen (SBS or TB) from a live source or a file, not a LIF's own
+    // convergence. Mono, Dual (this leg decodes its first track only), the idle logo and a
+    // bound "Convert to 3D" picture (layout_ stays Mono) never measure.
+    bool AutoConvApplies() const;
     void TickAutoConv();
     std::string AutoConvHudText() const;
 
@@ -349,6 +363,34 @@ private:
     float autoConvMin_ = 0.0f, autoConvMax_ = 0.0f;
     double autoConvSum_ = 0.0, autoConvMsSum_ = 0.0, autoConvMsMax_ = 0.0;
     uint64_t autoConvTicks_ = 0, autoConvMeasures_ = 0;
+    // Files (Part of #128). Every submission carries a tag; a measurement of a frame from
+    // before a seek / load (tag < autoConvChangeFrom_) is dropped while a change is pending.
+    uint64_t autoConvTag_ = 0;
+    int autoConvChangePending_ = 0;    // 0 none, 1 glide (same picture), 2 snap (new picture)
+    uint64_t autoConvChangeFrom_ = 0;
+    double autoConvSnapUntilMs_ = -1e9;  // a seek's settle window: submissions in it snap
+    uint64_t autoConvSnapLastTag_ = 0;   // the last submission made inside that window
+    uint64_t autoConvMedia_ = 0;       // bumped per file load
+    bool mediaHasBakedConv_ = false;   // a LIF with its own convergence: auto-conv stands aside
+    const FrameRing::Frame* autoConvHeldFrame_ = nullptr;  // video_'s frame on screen (consumer slot)
+    std::vector<uint8_t> autoConvStill_;  // a still's luma (<= 1920 wide), kept at load
+    int autoConvStillW_ = 0, autoConvStillH_ = 0;
+    // What the last file submission measured; the static path re-measures when it differs.
+    struct AutoConvKey {
+        bool valid = false;
+        uint64_t media = 0;
+        int64_t serial = 0;  // the clip frame's ring serial (0 for a still)
+        StereoLayout layout = StereoLayout::Mono;
+        bool swap = false;
+        autoconv::SubjectPolicy policy = autoconv::SubjectPolicy::Nearest;
+        float fx = -1.f, fy = -1.f;  // the focus pin (-1 = none)
+        bool Same(const AutoConvKey& o) const {
+            return valid && o.valid && media == o.media && serial == o.serial && layout == o.layout &&
+                   swap == o.swap && policy == o.policy && fx == o.fx && fy == o.fy;
+        }
+    };
+    AutoConvKey autoConvKey_;
+    AutoConvKey AutoConvKeyNow(int64_t serial) const;
 
     // Stream URL (#93). isStream_ excludes isLive_ and isVideo_ (a stream is not a
     // seekable video: no transport bar, no scrub, no slideshow).
