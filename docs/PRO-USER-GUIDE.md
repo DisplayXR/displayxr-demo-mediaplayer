@@ -247,10 +247,37 @@ The defaults, and how to change them when starting the player:
 
 | Check | Default | Option |
 |---|---|---|
-| Depth budget (nearest, farthest) | -2 % to +1 % | `--depth-budget=-2,1` |
+| Depth budget (nearest, farthest) | -2 % to +1 % | `--depth-budget=-2,1`, or `--depth-budget=comfort` for -1 % to +2 % |
 | Vertical error | 1 px | `--vertical-limit=1` |
 | Colour match | dE 2 | `--colour-limit=2` |
 | Frame edges (nearest allowed at the edge) | -0.3 % | `--edge-limit=-0.3` |
+
+### Target screen
+
+The same picture has more depth on a screen that fills more of your view (a cinema) and
+less on one that fills less. **Target screen** (Inspector) judges the depth for the screen
+the picture is made for: **Cinema** (10 m wide, seen from 12 m), **Home TV** (65", 1.44 m
+from 2.5 m), **Monitor** (27", 0.60 m from 0.65 m), **Tablet** (11", 0.25 m from 0.40 m)
+or **Custom** (your width and distance). It is **Off** by default.
+
+- **Show at the target's size** (on when you pick a target) shows the picture on the 3D
+  panel at the size it appears from a seat in front of the target. The depth then looks
+  as it will there: things in front of or behind the screen by the same angles. The
+  picture is cropped when the target fills more of the view than the panel does, and gets
+  a black border when it fills less. The Inspector shows the scale (`Picture x1.45,
+  cropped`). It uses the panel's size and the viewing distance the runtime reports, and
+  the player window's size: a smaller window shows less of the picture.
+- The rig check's near and far are also given **for the target**: millimetres on its
+  screen and arcminutes (′) at its viewing distance. When the background's parallax is
+  wider than the eyes are apart, the eyes have to turn outwards (diverge); past 0.5° the
+  rig check raises **Background diverges on the target screen**. The Inspector shows
+  where that starts (`Diverges past +1.7%` on the cinema).
+- **Depth budget -1 / +2 %** sets the depth limits to 1 % in front, 2 % behind.
+
+`MEDIAPLAYER_PRO_TARGET=cinema` (or `tv`, `monitor`, `tablet`, `<width>x<distance>` in
+metres) starts with a target; `MEDIAPLAYER_PRO_TARGET_PREVIEW=0` keeps the picture at the
+panel's size. An agent uses `set_target_screen`; `get_rig_status` and snapshot notes carry
+a `target` block.
 
 ## Snapshots
 

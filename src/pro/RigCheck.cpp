@@ -911,22 +911,24 @@ void RigMonitor::AddSampleLocked(const Sample& s, const std::string& tc) {
 }
 
 namespace {
-// The alert texts, per run: near, far, vertical, colour.
-const char* const kClosedFmt[6] = {
+// The alert texts, per run: near, far, vertical, colour, edges, target divergence.
+const char* const kClosedFmt[7] = {
     "Foreground at %+.1f%% for %.0f s (near limit %+.1f%%)",
     "Background at %+.1f%% for %.0f s (far limit %+.1f%%)",
     "Vertical error %.1f px for %.0f s (limit %.1f px)",
     "Colour mismatch dE %.1f for %.0f s (limit %.1f)",
     "Left edge violation at %+.1f%% for %.0f s (edge limit %+.1f%%)",
     "Right edge violation at %+.1f%% for %.0f s (edge limit %+.1f%%)",
+    "Background diverges on the target screen at %+.1f%% for %.0f s (limit %+.1f%%)",
 };
-const char* const kOpenFmt[6] = {
+const char* const kOpenFmt[7] = {
     "Foreground at %+.1f%% for %.0f s (now)",
     "Background at %+.1f%% for %.0f s (now)",
     "Vertical error %.1f px for %.0f s (now)",
     "Colour mismatch dE %.1f for %.0f s (now)",
     "Left edge violation at %+.1f%% for %.0f s (now)",
     "Right edge violation at %+.1f%% for %.0f s (now)",
+    "Background diverges on the target screen at %+.1f%% for %.0f s (now)",
 };
 // An open run is closed when the picture has not measured for this long (a cut to black,
 // a lost signal): it would otherwise stay "now" until the next good sample.
@@ -940,7 +942,8 @@ void RigMonitor::CloseRun(int i, double end, const std::string& endTc) {
     const double dur = end - r.since;
     if (dur >= 0.5) {
         const float limits[kRuns] = {budget_.nearPct, budget_.farPct, budget_.maxVerticalPx,
-                                     budget_.maxDeltaE, budget_.edgePct, budget_.edgePct};
+                                     budget_.maxDeltaE, budget_.edgePct, budget_.edgePct,
+                                     budget_.divergeFarPct};
         Alert a;
         a.start = r.since;
         a.end = end;
@@ -974,8 +977,10 @@ void RigMonitor::UpdateAlerts(const Sample& s, const std::string& tc) {
                               std::fabs(s.verticalPx) > budget_.maxVerticalPx,
                               s.deltaE > budget_.maxDeltaE,
                               s.edgeMeasured[0] && s.edgePct[0] < budget_.edgePct,
-                              s.edgeMeasured[1] && s.edgePct[1] < budget_.edgePct};
-    const float value[kRuns] = {s.nearPct, s.farPct, std::fabs(s.verticalPx), s.deltaE, s.edgePct[0], s.edgePct[1]};
+                              s.edgeMeasured[1] && s.edgePct[1] < budget_.edgePct,
+                              budget_.divergeFarPct > 0.0f && s.farPct > budget_.divergeFarPct};
+    const float value[kRuns] = {s.nearPct, s.farPct, std::fabs(s.verticalPx), s.deltaE, s.edgePct[0], s.edgePct[1],
+                                s.farPct};
     for (int i = 0; i < kRuns; ++i) {
         Run& r = runs_[i];
         if (over[i]) {
@@ -985,7 +990,7 @@ void RigMonitor::UpdateAlerts(const Sample& s, const std::string& tc) {
                 r.tc = tc;
                 r.clock = WallClock(s.t);
             } else {
-                const bool lowerIsWorse = i == 0 || i >= 4;  // near and the edges: further in front is worse
+                const bool lowerIsWorse = i == 0 || i == 4 || i == 5;  // near and the edges: further in front is worse
                 r.worst = lowerIsWorse ? std::min(r.worst, value[i]) : std::max(r.worst, value[i]);
             }
         } else {

@@ -21,6 +21,7 @@
 #include "color/CubeLut.h"
 #include "pro/CompareClip.h"
 #include "pro/LookLoader.h"
+#include "pro/TargetScreen.h"
 #include "pro/OcioBake.h"
 #include "pro/Overlays.h"
 #include "pro/ResolveLink.h"
@@ -98,6 +99,12 @@ struct Host {
     // runtime before display_info v24) and its OS device name. False when unknown.
     std::function<bool(std::string& key, std::string& deviceName)> panelIdentity;
     std::function<bool()> displaysChanged;  // true once after the runtime's displays-changed event
+    // #135 target-screen preview: show the picture at the angular size it has on a screen
+    // widthM wide seen from distanceM (0, 0 = off); the scale it is shown at; the panel's
+    // width and nominal viewing distance (false when the runtime does not say).
+    std::function<void(float widthM, float distanceM)> setTargetScreen;
+    std::function<float()> pictureScale;
+    std::function<bool(float& widthM, float& viewerM)> panelGeometry;
     // An RGBA texture for ImGui::Image (scope pictures), per slot: upload `rgba` (nullptr =
     // no change) and return its ImTextureID, nullptr when there is none.
     std::function<void*(int slot, int w, int h, const uint8_t* rgba)> userTexture;
@@ -121,6 +128,8 @@ public:
     // `uninstall`, deletes the panel's file).
     void LoadCalibration(const std::string& cube, bool install);
     void ClearCalibration(bool uninstall);
+    // #135: judge (and preview) the depth for a target screen; an off Screen = this panel.
+    void SetTarget(const target::Screen& t);
     // An OpenColorIO transform baked into the grade's 3D LUT (needs a build with MP_OCIO_ROOT).
     // True = queued; config / colour-space errors surface later as lutError_.
     bool LoadOcio(const ocio::Request& req, std::string* err = nullptr);
@@ -246,6 +255,15 @@ private:
     void ResolveCalibration();     // find this panel's key; auto-load its installed file
     void TickCalibration();        // apply a calibration the loader finished
     std::string CalibrationLabel() const;
+
+    // Target screen (#135): off by default. With one set, the rig check reports depth in
+    // its terms and alerts on background divergence; with the preview on (the default once
+    // a target is chosen), the picture is shown at the angular size it has there.
+    target::Screen target_;
+    bool targetPreview_ = true;
+    bool targetDirty_ = false;     // push target_ / targetPreview_ to the app + station
+    float customTargetW_ = 3.0f, customTargetD_ = 4.0f;
+    void ApplyTarget();
 
     // File dialog result (SDL may call back on another thread).
     std::mutex dialogMutex_;

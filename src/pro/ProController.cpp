@@ -94,6 +94,19 @@ void ProController::ApplyTestEnv() {
     // MEDIAPLAYER_PRO_CAL=<.cube> loads one for this run only (not installed).
     if (const char* b = std::getenv("MEDIAPLAYER_PRO_CAL_BYPASS")) calBypass_ = (*b && *b != '0');
     if (const char* c = std::getenv("MEDIAPLAYER_PRO_CAL"); c && *c) calPath_ = c;
+    // #135: MEDIAPLAYER_PRO_TARGET=cinema|tv|monitor|tablet|<width_m>x<distance_m>;
+    // MEDIAPLAYER_PRO_TARGET_PREVIEW=0 keeps the picture at the panel's size.
+    if (const char* t = std::getenv("MEDIAPLAYER_PRO_TARGET"); t && *t) {
+        target::Screen s;
+        float w = 0.0f, d = 0.0f;
+        if (target::PresetByName(t, s)) SetTarget(s);
+        else if (std::sscanf(t, "%fx%f", &w, &d) == 2 && w > 0.0f && d > 0.0f) SetTarget({"Custom", w, d});
+        else LOG_WARN("Pro: MEDIAPLAYER_PRO_TARGET=%s: expected cinema|tv|monitor|tablet|<width_m>x<distance_m>", t);
+    }
+    if (const char* p = std::getenv("MEDIAPLAYER_PRO_TARGET_PREVIEW")) {
+        targetPreview_ = !(*p == '0');
+        targetDirty_ = true;
+    }
     if (const char* c = std::getenv("MEDIAPLAYER_PRO_COMPARE_FRAME")) testCompareFrame_ = std::atoi(c);
     if (const char* p = std::getenv("MEDIAPLAYER_PRO_PIN")) inspectorPinned_ = (*p && *p != '0');
     if (const char* f = std::getenv("MEDIAPLAYER_PRO_PANELS_3D")) flatPanels_ = !(*f && *f != '0');
@@ -712,6 +725,29 @@ void ProController::OpenCalibrationDialog() {
                            dir.empty() ? nullptr : dir.c_str(), false);
 }
 
+// ---------------------------------------------------------------------------
+// Target screen (#135)
+// ---------------------------------------------------------------------------
+
+void ProController::SetTarget(const target::Screen& t) {
+    target_ = t.On() ? t : target::Screen{};
+    targetDirty_ = true;
+    if (target_.On())
+        LOG_INFO("Pro: target screen %s, %.2f m wide at %.2f m (diverges past %+.2f%%)", target_.name.c_str(),
+                 target_.widthM, target_.distanceM, target::DivergenceLimitPct(target_));
+    else
+        LOG_INFO("Pro: target screen off");
+}
+
+void ProController::ApplyTarget() {
+    targetDirty_ = false;
+    const bool preview = target_.On() && targetPreview_;
+    if (host_.setTargetScreen) host_.setTargetScreen(preview ? target_.widthM : 0.0f, preview ? target_.distanceM : 0.0f);
+    rig::Budget b = station_.RigBudget();
+    b.divergeFarPct = target_.On() ? target::DivergenceLimitPct(target_) : 0.0f;
+    station_.SetRigBudget(b);
+}
+
 void ProController::Tick(const Status& st) {
     stereoSource_ = st.stereo;
     station_.SetSignalFps(st.live ? st.sourceFps : 0.0f);
@@ -783,6 +819,8 @@ void ProController::Tick(const Status& st) {
         }
     }
     TickCalibration();
+    if (targetDirty_) ApplyTarget();
+    station_.SetTarget(target_, host_.pictureScale ? host_.pictureScale() : 1.0f);
     if (!renderer_) return;
     GradeParams g = grade_;
     if (bypass_ || st.isLogo) {
@@ -959,6 +997,11 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
                        : grade_.cdlOn ? "CDL" : "no look");
         if (!bypass_ && std::fabs(grade_.exposure) > 0.005f) add(" %+.1f EV", grade_.exposure);
         add("  |  %s", CalibrationLabel().c_str());
+        if (target_.On()) {
+            const float k = host_.pictureScale ? host_.pictureScale() : 1.0f;
+            if (targetPreview_ && std::fabs(k - 1.0f) > 0.005f) add("  |  as on %s x%.2f", target_.name.c_str(), k);
+            else add("  |  for %s", target_.name.c_str());
+        }
         if (station_.ShowTimecode() && !tc.empty()) add("  |  TC %s", tc.c_str());
         const rig::Result r = station_.RigLast();
         if (st.stereo && st.hasPicture && r.ok) add("  |  near %+.1f%%  far %+.1f%%", r.nearPct, r.farPct);
@@ -1202,6 +1245,62 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
 
         // --- Rig check (Phase 2) --------------------------------------------
         station_.BuildRigSection(st.stereo && st.hasPicture);  // measured (Phase 2)
+
+        // --- Target screen (#135): the depth as it plays on the screen it is made for ---
+        if (ImGui::CollapsingHeader("Target screen", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const std::vector<target::Screen>& pre = target::Presets();
+            int cur = 0;  // 0 off, 1..N presets, N+1 custom
+            if (target_.On()) {
+                cur = (int)pre.size() + 1;
+                for (size_t i = 0; i < pre.size(); ++i)
+                    if (pre[i].name == target_.name) cur = (int)i + 1;
+            }
+            std::vector<const char*> names = {"Off (this panel)"};
+            for (const target::Screen& p : pre) names.push_back(p.name.c_str());
+            names.push_back("Custom");
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
+            if (ImGui::Combo("Target", &cur, names.data(), (int)names.size())) {
+                if (cur == 0) SetTarget({});
+                else if (cur <= (int)pre.size()) SetTarget(pre[(size_t)cur - 1]);
+                else SetTarget({"Custom", customTargetW_, customTargetD_});
+            }
+            if (cur == (int)pre.size() + 1) {
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
+                bool ch = ImGui::DragFloat("Width (m)", &customTargetW_, 0.01f, 0.1f, 30.0f, "%.2f");
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
+                ch |= ImGui::DragFloat("Distance (m)", &customTargetD_, 0.01f, 0.2f, 40.0f, "%.2f");
+                if (ch) SetTarget({"Custom", std::max(0.1f, customTargetW_), std::max(0.2f, customTargetD_)});
+            }
+            if (target_.On()) {
+                ImGui::TextDisabled("%.2f m wide, seen from %.2f m", target_.widthM, target_.distanceM);
+                if (ImGui::Checkbox("Show at the target's size", &targetPreview_)) targetDirty_ = true;
+                const float k = host_.pictureScale ? host_.pictureScale() : 1.0f;
+                float pw = 0.0f, pd = 0.0f;
+                const bool geom = host_.panelGeometry && host_.panelGeometry(pw, pd);
+                if (!geom) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Panel size unknown: no preview");
+                else if (targetPreview_)
+                    ImGui::TextDisabled("Picture x%.2f%s (panel %.2f m at %.2f m)", k,
+                                        k > 1.005f ? ", cropped" : k < 0.995f ? ", bordered" : "", pw, pd);
+                const rig::Result r = station_.RigLast();
+                if (r.ok && st.stereo && st.hasPicture) {
+                    const target::Depth n = target::AtParallax(target_, r.nearPct), f = target::AtParallax(target_, r.farPct);
+                    ImGui::Text("Near %+.0f mm  %+.0f'   Far %+.0f mm  %+.0f'", n.mm, n.arcmin, f.mm, f.arcmin);
+                    if (f.divergenceDeg > 0.0f)
+                        ImGui::TextColored(f.divergenceDeg > target::kDivergenceCapDeg ? ImVec4(1.0f, 0.4f, 0.35f, 1.0f)
+                                                                                      : ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                           "Background diverges %.2f deg", f.divergenceDeg);
+                }
+                ImGui::TextDisabled("Diverges past %+.1f%% (%.1f deg)", target::DivergenceLimitPct(target_),
+                                    target::kDivergenceCapDeg);
+            }
+            if (ImGui::SmallButton("Depth budget -1 / +2 %")) {
+                rig::Budget b = station_.RigBudget();
+                b.nearPct = -1.0f;
+                b.farPct = 2.0f;
+                station_.SetRigBudget(b);
+                if (host_.toast) host_.toast("Depth budget -1 / +2 %");
+            }
+        }
         if (FlatNow()) AddFlatRectOfCurrentWindow();
     }
     ImGui::End();

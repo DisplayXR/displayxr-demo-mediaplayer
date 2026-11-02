@@ -204,6 +204,27 @@ bool App::PanelIdentity(std::string& key, std::string& deviceName) const {
 }
 
 
+// #135: the picture at the angular size it has on Pro's target screen. k = (W_t / D_t) /
+// (W_p / D_p), W_p = the fitted picture's width on the panel (canvas pixels at the panel's
+// metres per pixel), D_p = the nominal viewing distance; the same formula as
+// target::PictureScale. Off (or the panel's size unknown) = the fit unchanged.
+XrSession::ViewRect App::TargetScaled(XrSession::ViewRect fit) {
+    proPictureScale_ = 1.0f;
+    const float panelW = xr_.DisplayWidthMeters(), dist = xr_.NominalViewerDistance();
+    const uint32_t panelPx = xr_.DisplayPixelWidth();
+    if (proTargetW_ <= 0.0f || proTargetD_ <= 0.0f || panelW <= 0.0f || dist <= 0.0f || !panelPx || !fit.w) return fit;
+    const float picW = (float)fit.w * panelW / (float)panelPx;
+    const float k = (proTargetW_ / proTargetD_) / (picW / dist);
+    if (!(k > 0.05f && k < 20.0f)) return fit;
+    proPictureScale_ = k;
+    const float cx = (float)fit.x + 0.5f * (float)fit.w, cy = (float)fit.y + 0.5f * (float)fit.h;
+    fit.w = (uint32_t)((float)fit.w * k + 0.5f);
+    fit.h = (uint32_t)((float)fit.h * k + 0.5f);
+    fit.x = (int32_t)std::lround(cx - 0.5f * (float)fit.w);
+    fit.y = (int32_t)std::lround(cy - 0.5f * (float)fit.h);
+    return fit;
+}
+
 bool App::Initialize(const char* mediaPath) {
     // Default 1280x720; MEDIAPLAYER_WINDOW="WxH" or the uniform "WxH+X+Y" form
     // overrides (X,Y absolute virtual-desktop px — pins the window there and skips
@@ -556,7 +577,7 @@ int App::Run() {
             window_.PointSize(pw, ph);
             window_.PixelSize(cw, ch);
             if (AutoConvApplies() && pw && ph && cw && ch) {  // live or a stereo file
-                const XrSession::ViewRect fit = MatchMinRect({0, 0, cw, ch}, FitAspect());
+                const XrSession::ViewRect fit = TargetScaled(MatchMinRect({0, 0, cw, ch}, FitAspect()));
                 const float px = cx * (float)cw / (float)pw, py = cy * (float)ch / (float)ph;
                 const float u = (px - (float)fit.x) / (float)std::max(1u, fit.w);
                 const float v = (py - (float)fit.y) / (float)std::max(1u, fit.h);
@@ -847,7 +868,9 @@ void App::RenderOneFrame() {
             // longer axis), then scale into each tile (handles non-uniform modes).
             const float sx = xr_.ActiveViewScaleX();
             const float sy = xr_.ActiveViewScaleY();
-            const XrSession::ViewRect viewFit = MatchMinRect({0, 0, canvasW, canvasH}, FitAspect());
+            // #135: Pro's target-screen preview scales the picture about its centre (the
+            // tile scissor crops it when it grows past the tile).
+            const XrSession::ViewRect viewFit = TargetScaled(MatchMinRect({0, 0, canvasW, canvasH}, FitAspect()));
             const int32_t lbx = (int32_t)((float)viewFit.x * sx);  // horizontal inset of the content
             // Convergence = horizontal image translation: shift the two eyes' content
             // oppositely within their tiles, moving the zero-disparity plane. A LIF's
@@ -3789,6 +3812,16 @@ void App::InitPro() {
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
     h.setDesqueeze = [this](float f) { proDesqueeze_ = f > 0.1f ? f : 1.0f; };
     h.mediaFps = [this] { return isVideo_ ? video_.FrameRate() : 0.0; };
+    h.setTargetScreen = [this](float widthM, float distanceM) {
+        proTargetW_ = widthM > 0.0f ? widthM : 0.0f;
+        proTargetD_ = distanceM > 0.0f ? distanceM : 0.0f;
+    };
+    h.pictureScale = [this] { return proPictureScale_; };
+    h.panelGeometry = [this](float& widthM, float& viewerM) {
+        widthM = xr_.DisplayWidthMeters();
+        viewerM = xr_.NominalViewerDistance();
+        return widthM > 0.0f && viewerM > 0.0f;
+    };
     h.displayDeviceName = [this] { return xr_.DisplayDeviceName(); };
     h.panelIdentity = [this](std::string& key, std::string& deviceName) { return PanelIdentity(key, deviceName); };
     h.displaysChanged = [this] { return xr_.TakeDisplaysChanged(); };

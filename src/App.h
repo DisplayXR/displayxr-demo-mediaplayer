@@ -271,6 +271,12 @@ private:
     // default display. Falls back to the default display's device name on a runtime that
     // does not enumerate.
     bool PanelIdentity(std::string& key, std::string& deviceName) const;
+    // #135 Pro target-screen preview: the target's picture width and viewing distance (0 =
+    // off) and the scale last applied. TargetScaled() scales the fitted picture about its
+    // centre so it subtends the angle it does on the target (pro/TargetScreen.h).
+    float proTargetW_ = 0.0f, proTargetD_ = 0.0f;
+    float proPictureScale_ = 1.0f;
+    XrSession::ViewRect TargetScaled(XrSession::ViewRect fit);
 
     // Layered stereo-layout detection (#45). layoutSignal_ records WHICH layer decided
     // layout_, so the HUD can name it. autoInfo_ caches the automatic verdict, which is

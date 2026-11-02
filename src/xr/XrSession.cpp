@@ -264,6 +264,8 @@ bool XrSession::InitInstanceAndSystem() {
         if (XR_SUCCEEDED(xrGetSystemProperties(instance_, systemId_, &props))) {
             displayPixelWidth_ = di.displayPixelWidth;
             displayPixelHeight_ = di.displayPixelHeight;
+            displayWidthM_ = di.displaySizeMeters.width;
+            nominalViewerZ_ = di.nominalViewerPositionInDisplaySpace.z;
             displayDesktopLeft_ = desktopPos.left;
             displayDesktopTop_ = desktopPos.top;
             displayDeviceName_.assign(desktopInfo.deviceName,

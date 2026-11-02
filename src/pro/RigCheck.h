@@ -166,6 +166,9 @@ struct Budget {
     float maxVerticalPx = 1.0f;
     float maxDeltaE = 2.0f;
     float edgePct = -0.3f;  // nearest parallax allowed at the left / right frame edge
+    // #135: > 0 = the far parallax at which the TARGET screen's background diverges past
+    // the cap (target::DivergenceLimitPct); 0 = no target screen, no divergence alert.
+    float divergeFarPct = 0.0f;
 };
 
 struct Sample {
@@ -242,8 +245,8 @@ private:
     StereoLayout pendingLayout_ = StereoLayout::SbsFull;
     bool pendingSwap_ = false;
     uint64_t generation_ = 0;  // bumped by Reset: a measurement started before it is dropped
-    // open alert runs: near, far, vertical, colour, left edge, right edge
-    static constexpr int kRuns = 6;
+    // open alert runs: near, far, vertical, colour, left edge, right edge, divergence (#135)
+    static constexpr int kRuns = 7;
     struct Run {
         double since = -1;
         float worst = 0;

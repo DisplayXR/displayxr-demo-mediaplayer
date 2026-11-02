@@ -148,6 +148,11 @@ public:
         displaysChanged_ = false;
         return c;
     }
+    // The panel's physical width (m), native pixel width and nominal viewing distance (m)
+    // from XR_DXR_display_info; 0 when unknown. Pro's target-screen preview uses them (#135).
+    float DisplayWidthMeters() const { return displayWidthM_; }
+    uint32_t DisplayPixelWidth() const { return displayPixelWidth_; }
+    float NominalViewerDistance() const { return nominalViewerZ_; }
 
     // Window-space HUD swapchain (created in Initialize if the runtime supports it).
     bool HasHud() const { return hasHud_; }
@@ -429,6 +434,8 @@ private:
     std::string displayDeviceName_;
     bool displaysChanged_ = false;
     PFN_xrEnumerateDisplaysDXR pfnEnumerateDisplays_ = nullptr;
+    float displayWidthM_ = 0.0f;
+    float nominalViewerZ_ = 0.0f;
 
     // Session state machine.
     XrSessionState sessionState_ = XR_SESSION_STATE_UNKNOWN;
