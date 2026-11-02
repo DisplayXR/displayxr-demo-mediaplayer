@@ -4,6 +4,7 @@
 
 #include "Log.h"
 #include "media/EyeAssign.h"
+#include "media/HeifLoader.h"
 #include "media/ImageDecoder.h"
 #include "media/StereoPacking.h"
 #include "media/LifLoader.h"
@@ -251,6 +252,8 @@ bool App::Initialize(const char* mediaPath) {
     // argument may be a single file OR a folder — for a folder we load the first
     // supported asset (sorted), and LoadMedia builds the prev/next list from it.
     ReadStereoEnv();   // must precede the first LoadMedia below
+    // Stereo HEIC (#154) is offered only when this build's FFmpeg reads HEIF items.
+    MediaSource::SetHeifSupported(HeifLoader::Available());
 #if MEDIAPLAYER_PRO
     // Pro review formats (MXF, EXR / DPX / TIFF sequences, 10-bit kept): before any load.
     VideoDecoder::SetProFormats(true);
@@ -1078,7 +1081,7 @@ void App::BuildTransportUI() {
         currentMediaPath_.empty() ? std::string()
                                   : std::filesystem::path(currentMediaPath_).filename().string();
     uiState_.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
-    uiState_.layoutName = convertBound_ ? kConvertedLayoutName : MediaSource::LayoutName(layout_);
+    uiState_.layoutName = convertBound_ ? kConvertedLayoutName : LayoutShortName();
     uiState_.layoutTooltip = LayoutLabel();
     uiState_.layoutPinned = layoutPinned_;
     uiState_.positionSeconds = video_.PositionSeconds();
@@ -1389,8 +1392,12 @@ bool App::LoadMedia(const std::string& path) {
             meta.layout = pr.metaLayout;
             meta.eyeSwap = pr.metaInvert;
             // AVStereo3D says "side by side" but is silent on full vs half — settle that
-            // from the frame aspect, the same way the content path does.
-            if (packing::IsTb(meta.layout) && pr.width > 0 && pr.height > 0) {
+            // from the frame aspect, the same way the content path does. MV-HEVC (#154) is
+            // full SBS by construction (the decoder composes two full views), whatever the
+            // aspect: a portrait phone pair is narrower than any SBS threshold.
+            if (pr.multiview) {
+                meta.format = "MV-HEVC";
+            } else if (packing::IsTb(meta.layout) && pr.width > 0 && pr.height > 0) {
                 meta.layout = packing::ChooseTbFullOrHalf((float)pr.width / (float)pr.height);
             } else if (meta.layout != StereoLayout::Mono && pr.width > 0 && pr.height > 0) {
                 bool ambiguous = false;
@@ -1398,14 +1405,21 @@ bool App::LoadMedia(const std::string& path) {
                     (float)pr.width / (float)pr.height, ambiguous);
             }
         }
-        const MediaInfo vinfo = MediaSource::Resolve(
+        MediaInfo vinfo = MediaSource::Resolve(
             path, MediaKind::Video, pr.ok ? pr.width : 0, pr.ok ? pr.height : 0,
             manual, pr.haveMeta ? &meta : nullptr,
             pr.content.decided ? &pr.content : nullptr);
+        if (vinfo.signal == StereoSignal::Metadata) vinfo.format = meta.format;
 
         if (!video_.Open(path)) {
             LOG_ERROR("Open: cannot decode video '%s'", path.c_str());
             return false;
+        }
+        if (pr.multiview && !video_.IsMultiview() && vinfo.signal == StereoSignal::Metadata) {
+            // The probe saw MV-HEVC but this decoder cannot output both views: it plays the
+            // base view alone, so the frame is one view wide.
+            vinfo.layout = StereoLayout::Mono;
+            vinfo.format = "";
         }
         isVideo_ = true;
         hasMedia_ = true;
@@ -1486,6 +1500,56 @@ bool App::LoadMedia(const std::string& path) {
         contentAspect_ = PerEyeAspect(layout_, lif.image.width, lif.image.height);
         LOG_INFO("Displaying %s LIF (%s), per-eye aspect %.3f, baked convergence %+.4f",
                  lif.stereo ? "stereo" : "mono", path.c_str(), contentAspect_, mediaConvergence_);
+        currentMediaPath_ = path;
+        RebuildFolderList(path);
+        return true;
+    }
+    // HEIC / HEIF (#154): a stereo pair (`ster` group: Apple spatial photos, Galaxy 3D
+    // Capture photos) composes to SBS like MPO; any other HEIC shows its primary image, and
+    // the ordinary layered resolution still applies to it (a `*_2x1.heic` stays SBS).
+    if (HeifLoader::IsHeifPath(path)) {
+        HeifResult heif = HeifLoader::Load(path);
+        if (!heif.ok) {
+            LOG_ERROR("Open: cannot load HEIF '%s'", path.c_str());
+            return false;
+        }
+        if (!renderer_.UploadTexture(heif.image.pixels.data(), (uint32_t)heif.image.width,
+                                     (uint32_t)heif.image.height)) {
+            return false;
+        }
+        isVideo_ = false;
+        hasMedia_ = true;
+        ClearIdleLogo();
+        MediaInfo hinfo;
+        if (heif.stereo) {
+            hinfo.kind = MediaKind::Image;
+            hinfo.layout = manual ? *manual : heif.layout;
+            hinfo.signal = manual ? StereoSignal::Manual : StereoSignal::Metadata;
+            hinfo.confidence = 1.0f;
+            hinfo.format = "stereo HEIC";
+            autoInfo_ = MediaInfo{MediaKind::Image, heif.layout, StereoSignal::Metadata, false, 1.0f, "stereo HEIC"};
+        } else {
+            // A plain phone photo: the container says 2D. The filename rule still outranks it.
+            MediaInfo meta;
+            meta.layout = StereoLayout::Mono;
+            hinfo = MediaSource::Resolve(path, MediaKind::Image, heif.image.width, heif.image.height, manual, &meta,
+                                         nullptr);
+        }
+        ApplyLayout(hinfo);
+        mediaConvergence_ = 0.0f;                 // HEIC carries no baked convergence...
+        mediaAutoConvAvailable_ = heif.stereo;    // ...so, like MPO, the estimate is on offer
+        mediaAutoConvergence_ = heif.autoConvergence;
+        AutoConvNewPicture(/*newMedia=*/true);
+        KeepStillForAutoConv(heif.image.pixels.data(), heif.image.width, heif.image.height);
+        KeepStillForConvert(heif.image.pixels.data(), heif.image.width, heif.image.height);
+#if MEDIAPLAYER_PRO
+        pro_.OnStill(heif.image.pixels.data(), heif.image.width, heif.image.height, layout_);
+#endif
+        mediaW_ = heif.image.width;
+        mediaH_ = heif.image.height;
+        contentAspect_ = PerEyeAspect(layout_, heif.image.width, heif.image.height);
+        LOG_INFO("Displaying %s HEIC (%s), per-eye aspect %.3f", heif.stereo ? "stereo" : "flat", path.c_str(),
+                 contentAspect_);
         currentMediaPath_ = path;
         RebuildFolderList(path);
         return true;
@@ -1609,9 +1673,17 @@ void App::ApplyLayout(const MediaInfo& info) {
     if (info.signal == StereoSignal::Content) ShowToast(LayoutLabel());
 }
 
+std::string App::LayoutShortName() const {
+    // MV-HEVC / stereo HEIC (#154) are composed to SBS-full internally; name the format the
+    // user recognises instead, unless they have pinned another layout.
+    const bool showFormat = !layoutPinned_ && autoInfo_.format && *autoInfo_.format &&
+                            layout_ == autoInfo_.layout && layoutSignal_ == autoInfo_.signal;
+    return showFormat ? std::string(autoInfo_.format) : std::string(MediaSource::LayoutName(layout_));
+}
+
 std::string App::LayoutLabel() const {
     if (convertBound_) return kConvertedLayoutName;  // "Convert to 3D" result on screen
-    std::string s = MediaSource::LayoutName(layout_);
+    std::string s = LayoutShortName();
     if (mediaEyeSwap_) s += " (R|L)";
     s += " — ";
     s += MediaSource::SignalName(layoutSignal_);
@@ -3362,6 +3434,8 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["folder_count"] = static_cast<uint64_t>(folderFiles_.size());
         out["layout"] = MediaSource::LayoutName(layout_);
         out["layout_signal"] = MediaSource::SignalName(layoutSignal_);
+        // "MV-HEVC" / "stereo HEIC" when the container itself is the stereo signal (#154)
+        out["source_format"] = std::string(autoInfo_.format ? autoInfo_.format : "");
         out["layout_confidence"] = layoutConfidence_;
         out["layout_pinned"] = layoutPinned_;
         out["eye_swap"] = mediaEyeSwap_;
@@ -3593,7 +3667,7 @@ void App::RequestOpenFile() {
 
     static const SDL_DialogFileFilter kFilters[] = {
         // Keep in sync with MediaSource::IsSupported — SDL wants its own filter string.
-        {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png;lif;mpo"},
+        {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png;lif;mpo;heic;heif;hif"},
         {"All files", "*"},
     };
     SDL_ShowOpenFileDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this,

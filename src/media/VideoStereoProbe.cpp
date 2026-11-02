@@ -14,6 +14,7 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 #include <libavutil/stereo3d.h>
 }
+#include "SpatialFFmpeg.h"  // MV-HEVC (#154)
 #endif
 
 namespace mp {
@@ -161,6 +162,21 @@ VideoStereoProbe::Result VideoStereoProbe::Run(const std::string& path, bool wan
     if (stream < 0 || !codec) return out;
 
     AVStream* st = c.fmt->streams[stream];
+    // MV-HEVC (#154): a container fact, like LVF's two tracks. VideoDecoder composes the two
+    // views side by side, so the clip IS full SBS at twice the view width — say so and skip
+    // the pre-roll (the base view alone would look mono to every other layer).
+    if (spatial::ff::IsMvHevcStream(st)) {
+        out.ok = true;
+        out.multiview = true;
+        out.width = st->codecpar->width * 2;
+        out.height = st->codecpar->height;
+        out.haveMeta = true;
+        out.metaLayout = StereoLayout::SbsFull;
+        out.elapsedMs = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+        LOG_INFO("VideoStereoProbe: '%s' MV-HEVC %dx%d per view -> both views side by side (%.0fms)", path.c_str(),
+                 st->codecpar->width, st->codecpar->height, out.elapsedMs);
+        return out;
+    }
     c.dec = avcodec_alloc_context3(codec);
     if (!c.dec) return out;
     if (avcodec_parameters_to_context(c.dec, st->codecpar) < 0) return out;

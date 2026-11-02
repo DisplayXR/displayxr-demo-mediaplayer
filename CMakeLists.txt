@@ -165,8 +165,8 @@ FetchContent_Declare(imgui
 FetchContent_MakeAvailable(imgui)
 
 # --- nlohmann/json (header-only) for parsing the LIF container's JSON metadata.
-#     Lightweight (no link step), so LIF support is on the default path — unlike the
-#     heavier libheif behind MEDIAPLAYER_WITH_HEIF.
+#     Lightweight (no link step), so LIF support is on the default path. (HEIC needs no
+#     library either: HeifLoader reads it through FFmpeg, #154.)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(nlohmann_json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
@@ -277,6 +277,8 @@ function(mp_add_player tgt is_pro)
         src/media/ImageDecoder.cpp
         src/media/LifLoader.cpp
         src/media/MpoLoader.cpp
+        src/media/HeifLoader.cpp     # stereo HEIC (#154): HEIF `ster` pair via FFmpeg's HEIF demuxer
+        src/media/SpatialMedia.cpp   # MV-HEVC / HEIC eye order + HEIF box walk (#154), pure
         src/media/MediaSource.cpp
         src/media/StereoCompose.cpp
         src/media/StereoDetect.cpp
@@ -790,6 +792,34 @@ if(MP_BUILD_TESTS)
         endif()
         add_test(NAME short_clip COMMAND short_clip_test)
     endif()
+
+    # Phone spatial capture (#154): eye order + the HEIF `ster` walk (pure, always), and the
+    # committed MV-HEVC / stereo HEIC fixtures through the real VideoDecoder + HeifLoader
+    # when FFmpeg is linked (skips those parts on an FFmpeg older than 7.1).
+    if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
+        add_executable(spatial_media_test tests/spatial_media_test.cpp src/media/SpatialMedia.cpp
+            src/media/HeifLoader.cpp src/media/StereoCompose.cpp src/media/ImageDecoder.cpp
+            src/media/VideoDecoder.cpp src/media/VideoStereoProbe.cpp src/media/StereoDetect.cpp
+            src/media/MediaSource.cpp src/media/ImageSequence.cpp src/Log.cpp)
+        target_include_directories(spatial_media_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+        target_compile_definitions(spatial_media_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1
+            MP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+        if(TARGET PkgConfig::FFMPEG)
+            target_link_libraries(spatial_media_test PRIVATE PkgConfig::FFMPEG)
+        else()
+            target_link_libraries(spatial_media_test PRIVATE mp_ffmpeg)
+        endif()
+        if(WIN32)
+            target_link_libraries(spatial_media_test PRIVATE d3d11 dxgi d3dcompiler)
+        endif()
+    else()
+        add_executable(spatial_media_test tests/spatial_media_test.cpp src/media/SpatialMedia.cpp)
+        target_include_directories(spatial_media_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(spatial_media_test PRIVATE
+            MP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    endif()
+    add_test(NAME spatial_media COMMAND spatial_media_test)
 
     # The Resolve panel (tools/resolve) against a fake Resolve; needs Python 3.
     find_package(Python3 COMPONENTS Interpreter QUIET)
