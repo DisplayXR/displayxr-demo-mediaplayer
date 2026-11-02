@@ -3748,6 +3748,7 @@ void App::InitPro() {
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
     h.setDesqueeze = [this](float f) { proDesqueeze_ = f > 0.1f ? f : 1.0f; };
     h.mediaFps = [this] { return isVideo_ ? video_.FrameRate() : 0.0; };
+    h.displayDeviceName = [this] { return xr_.DisplayDeviceName(); };
     // Scope pictures: one ImGui texture per slot, (re)made when the size changes.
     auto scopeIds = std::make_shared<std::vector<std::array<int, 3>>>(4, std::array<int, 3>{-1, 0, 0});
     h.userTexture = [this, scopeIds](int slot, int w, int hh, const uint8_t* rgba) -> void* {

@@ -251,6 +251,11 @@ bool XrSession::InitInstanceAndSystem() {
         XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
         XrDisplayDesktopPositionDXR desktopPos = {};
         desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
+        // v18: the monitor's stable OS name (Pro's per-panel calibration key, #133). An
+        // older runtime ignores the unknown chain entry and leaves it zeroed.
+        XrDisplayDesktopInfoDXR desktopInfo = {};
+        desktopInfo.type = XR_TYPE_DISPLAY_DESKTOP_INFO_DXR;
+        desktopPos.next = &desktopInfo;
         di.next = &desktopPos;
         props.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(instance_, systemId_, &props))) {
@@ -258,6 +263,8 @@ bool XrSession::InitInstanceAndSystem() {
             displayPixelHeight_ = di.displayPixelHeight;
             displayDesktopLeft_ = desktopPos.left;
             displayDesktopTop_ = desktopPos.top;
+            displayDeviceName_.assign(desktopInfo.deviceName,
+                                      strnlen(desktopInfo.deviceName, sizeof(desktopInfo.deviceName)));
             LOG_INFO("Display: %ux%u px, %.3fx%.3f m, desktop pos (%d, %d)",
                      displayPixelWidth_, displayPixelHeight_,
                      di.displaySizeMeters.width, di.displaySizeMeters.height,

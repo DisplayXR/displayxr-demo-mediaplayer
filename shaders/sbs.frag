@@ -25,6 +25,7 @@ layout(binding = 3) uniform sampler3D lut3d;   // grade LUT (Media Player Pro); 
 layout(binding = 4) uniform sampler2D planeB0; // Pro compare source B (the clip wipe), as plane0..2
 layout(binding = 5) uniform sampler2D planeB1;
 layout(binding = 6) uniform sampler2D planeB2;
+layout(binding = 7) uniform sampler3D calLut;  // per-panel display calibration (#133); 1x1x1 dummy otherwise
 #endif
 
 layout(push_constant) uniform PushConstants {
@@ -49,6 +50,7 @@ layout(push_constant) uniform PushConstants {
     int viewFlags;   // bits 0-2 channel (0 RGB, 1 R, 2 G, 3 B, 4 alpha, 5 luma); bits 4-5 wipe
                      // (0 off, 1 before | after the grade, 2 left eye | right eye, 3 clip A | B);
                      // B's sampling: bits 8-9 mode, 10 full range, 11-12 matrix, 13 P016, 14 bound
+                     // bit 15: display calibration on (calLut, domain 0..1)
     uint wipeGamma;  // low 16 bits: wipe position across the picture (unorm16); high 16 bits:
                      // display gamma x 4096 (0 = 1.0)
 #endif
@@ -238,6 +240,13 @@ void main() {
         c = vec3(l, r, r);
     } else if (pc.qcMode == 3) {   // false colour
         c = FalseColour(c);
+    }
+    // Display calibration (#133): corrects THIS panel towards its target, so it follows the
+    // show grade and the QC views (they are what the panel should show) and comes before
+    // the gamma trim. Its domain is 0..1, the size is the texture's.
+    if (((pc.viewFlags >> 15) & 1) != 0) {
+        const float n = float(textureSize(calLut, 0).x);
+        c = texture(calLut, clamp(c, 0.0, 1.0) * ((n - 1.0) / n) + 0.5 / n).rgb;
     }
     // Display gamma trim, then channel isolation (a channel or luma shown as grey).
     const float gammaTrim = float(pc.wipeGamma >> 16) / 4096.0;

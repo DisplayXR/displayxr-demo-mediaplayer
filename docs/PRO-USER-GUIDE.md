@@ -117,6 +117,34 @@ compare); with the clip wipe on, it swaps which clip is on which side.
 
 The grade is applied in this order: exposure, then the CDL, then the LUT.
 
+### Display calibration
+
+The grade is the show's look and follows the content. A **display calibration** corrects
+the panel itself, so that it shows Rec.709 / D65 / gamma 2.4 (or a site standard)
+correctly. It belongs to the unit: each panel has its own, and the player loads it by
+itself whenever it runs on that panel.
+
+- **Calibrate panel...** (Inspector > Colour) loads a `.cube` 3D LUT made for this panel by
+  a calibration tool (DisplayCAL, Calman, ColourSpace: export a 3D LUT for your target).
+  The player keeps a copy for this panel, so from then on it loads at start-up.
+- The Inspector shows **Display: <name>**, or **Display: not calibrated** in amber when the
+  panel has none; the status line shows the same. Hover it for the panel's key and file.
+- **`Shift+G`** (or **Bypass calibration**) turns the calibration off and on. **`G`** does
+  not touch it: bypassing the grade still shows the picture through the calibration.
+- **Remove** deletes this panel's calibration.
+
+It is applied after the grade and the QC views, and before the gamma trim. The LUT must
+cover 0..1 (the usual `DOMAIN` for a display calibration); one with another domain is
+refused with a message.
+
+Panels are told apart by their EDID (maker, product and serial number), so moving the
+cable to another port keeps the calibration. The files live in
+`%APPDATA%\DisplayXR\MediaPlayerPro\calibration\<panel>.cube` (macOS:
+`~/Library/Application Support/DisplayXR/MediaPlayerPro/calibration`). Set
+`MEDIAPLAYER_PRO_CAL_DIR` to use another folder, for example one shared by a site;
+`MEDIAPLAYER_PRO_CAL=<file.cube>` loads a calibration for one run without keeping it.
+An agent can do the same with `set_display_calibration`.
+
 ### 10-bit to the panel
 
 By default the picture reaches the display at 8 bits per channel, which can show banding
@@ -257,7 +285,7 @@ or use the **Clip A | B** wipe (`8`) to see both at once, split by the line.
 | `7`, `8`, `9` | zebras, wipe, channel |
 | `W`, `P`, `Q` | scopes, pixel probe, frame line |
 | wheel, middle-drag, `H`, `Z` | zoom, pan, fit, 1:1 |
-| `G` | grade bypass |
+| `G`, `Shift+G` | grade bypass, display calibration bypass |
 | `X`, `-` / `=`, `0`, `Backspace`, `A` | swap eyes, convergence, reset, converge once, auto-converge |
 | `L`, `Shift+L` | stereo layout override, convert 2D to 3D |
 | `V` | next display mode (2D / 3D / others the display offers; a chip names it) |

@@ -93,6 +93,7 @@ struct Host {
     std::function<void()> toggleFullscreen;
     std::function<void(float)> setDesqueeze;  // anamorphic: stretch the picture's width
     std::function<double()> mediaFps;         // the open video's frame rate, 0 when not a video
+    std::function<std::string()> displayDeviceName;  // the 3D panel's OS monitor name (#133)
     // An RGBA texture for ImGui::Image (scope pictures), per slot: upload `rgba` (nullptr =
     // no change) and return its ImTextureID, nullptr when there is none.
     std::function<void*(int slot, int w, int h, const uint8_t* rgba)> userTexture;
@@ -110,6 +111,12 @@ public:
     // (and an OCIO bake) loads asynchronously: it applies a few frames later, in Tick().
     void LoadLut(const std::string& path);
     void LoadCdl(const std::string& path);
+    // Per-panel display calibration (#133). Load `cube` as this panel's calibration and,
+    // with `install`, keep it for this panel (copied to its file in the calibration folder,
+    // so it loads automatically from then on). ClearCalibration drops it (and with
+    // `uninstall`, deletes the panel's file).
+    void LoadCalibration(const std::string& cube, bool install);
+    void ClearCalibration(bool uninstall);
     // An OpenColorIO transform baked into the grade's 3D LUT (needs a build with MP_OCIO_ROOT).
     // True = queued; config / colour-space errors surface later as lutError_.
     bool LoadOcio(const ocio::Request& req, std::string* err = nullptr);
@@ -220,16 +227,33 @@ private:
     std::string lutLoading_;       // source of the look being built ('' = none)
     std::string lutError_;         // why the last look failed ('' = it did not)
 
+    // Display calibration (#133): per panel, after the grade and QC views. Not part of the
+    // show grade, so G (bypass all) leaves it on; Shift+G bypasses it.
+    LookLoader calLoader_;         // its own loader: a look load must not supersede it
+    bool calResolved_ = false;     // the panel key was looked up (first Tick)
+    std::string calKey_;           // this panel's key (pro/DisplayCalibration.h)
+    std::string calPath_, calName_;
+    std::string calLoading_, calError_;
+    bool calInstall_ = false;      // the pending load is kept for this panel once it applies
+    bool calLoaded_ = false;       // a calibration LUT is on the GPU
+    bool calBypass_ = false;       // Shift+G / the Inspector / set_display_calibration
+    void ResolveCalibration();     // find this panel's key; auto-load its installed file
+    void TickCalibration();        // apply a calibration the loader finished
+    std::string CalibrationLabel() const;
+
     // File dialog result (SDL may call back on another thread).
     std::mutex dialogMutex_;
     std::string dialogPath_;
     bool dialogIsCdl_ = false;
     bool dialogIsCompare_ = false;  // the "Load B..." dialog (the clip wipe's compare clip)
+    bool dialogIsCal_ = false;      // the display calibration dialog (#133)
     bool dialogReady_ = false;
     bool dialogOpen_ = false;
     bool pendingDialogIsCdl_ = false;
     bool pendingDialogIsCompare_ = false;
+    bool pendingDialogIsCal_ = false;
     void OpenCompareDialog();
+    void OpenCalibrationDialog();
 
     bool inspectorPinned_ = false;  // Tab / the Pin box: panels stay up; unpinned they follow the UI fade
     std::vector<FlatRect> flatRects_;

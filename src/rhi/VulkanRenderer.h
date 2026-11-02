@@ -62,6 +62,10 @@ struct GradeParams {
     int wipeMode = 0;            // 0 off, 1 before | after the grade, 2 left eye | right eye
     float wipePos = 0.5f;        // the wipe line across the picture, 0..1
     float gamma = 1.0f;          // display gamma trim, applied after the grade and QC view
+    // Per-panel display calibration (#133), after the grade and QC view, before the gamma
+    // trim. Ignored unless a calibration LUT was uploaded (HasCalibrationLut). Not part of
+    // the show grade: bypassing the grade keeps it.
+    bool calOn = false;
 };
 
 
@@ -186,6 +190,10 @@ public:
     bool UploadLut3DPacked(const uint16_t* rgba16f, uint32_t size, float domainMin, float domainMax);
     void ClearLut3D();
     bool HasLut3D() const { return lut_.view != VK_NULL_HANDLE; }
+    // The per-panel display calibration LUT (#133) at binding 7, domain 0..1.
+    bool UploadCalibrationLut(const uint16_t* rgba16f, uint32_t size);
+    void ClearCalibrationLut();
+    bool HasCalibrationLut() const { return cal_.view != VK_NULL_HANDLE; }
 
     // `rects` are the per-view content rects (the viewport — may be convergence-
     // shifted); `clipRects` are the per-view tile bounds the drawing is scissored to,
@@ -277,7 +285,7 @@ private:
         VkImageView view = VK_NULL_HANDLE;
         uint32_t size = 0;
         float domainMin = 0.f, domainMax = 1.f;
-    } lut_, lutDummy_;
+    } lut_, cal_, lutDummy_;  // cal_: the display calibration LUT at binding 7
     bool CreateLutImage(Lut3D& dst, uint32_t n, const uint16_t* rgba16f);
     void DestroyLut(Lut3D& l, bool deferred);
 

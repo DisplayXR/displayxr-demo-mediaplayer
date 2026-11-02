@@ -126,6 +126,10 @@ public:
     // True when the session was created with transparent-background compositing
     // (MEDIAPLAYER_TRANSPARENT=1) — the renderer should clear letterbox to alpha 0.
     bool TransparentBackground() const { return transparentBg_; }
+    // The OS name of the 3D panel's monitor (XrDisplayDesktopInfoDXR::deviceName, display_info
+    // v18: \.\DISPLAY1 on Windows, the display UUID on macOS, the RandR output on Linux).
+    // Empty on an older runtime. Pro keys its per-panel calibration on it (#133).
+    const std::string& DisplayDeviceName() const { return displayDeviceName_; }
 
     // Window-space HUD swapchain (created in Initialize if the runtime supports it).
     bool HasHud() const { return hasHud_; }
@@ -404,6 +408,7 @@ private:
     // display_info v16). (0, 0) = primary/unknown — the safe default.
     int32_t displayDesktopLeft_ = 0;
     int32_t displayDesktopTop_ = 0;
+    std::string displayDeviceName_;
 
     // Session state machine.
     XrSessionState sessionState_ = XR_SESSION_STATE_UNKNOWN;
