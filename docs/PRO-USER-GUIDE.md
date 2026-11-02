@@ -137,8 +137,16 @@ It is applied after the grade and the QC views, and before the gamma trim. The L
 cover 0..1 (the usual `DOMAIN` for a display calibration); one with another domain is
 refused with a message.
 
-Panels are told apart by their EDID (maker, product and serial number), so moving the
-cable to another port keeps the calibration. The files live in
+Each panel is recognised by the key the DisplayXR runtime gives it (the one
+`displayxr-cli displays --claims` prints), on the display the player's window is on; drag
+the window to another 3D panel and its calibration follows. The key comes from the
+panel's EDID and, when the EDID carries no serial number, from the serial the panel's
+plug-in reports, so moving the cable to another port usually keeps the calibration. Two
+cases do not: a panel that reports a different product code on each input, and a panel
+with no serial at all, whose key follows the port. With a DisplayXR runtime that does not
+report the key yet (`XR_DXR_display_info` before v24), the OS display name (`DISPLAY1` on
+Windows) stands in, which follows the port.
+The Inspector shows the key when you hover the calibration line. The files live in
 `%APPDATA%\DisplayXR\MediaPlayerPro\calibration\<panel>.cube` (macOS:
 `~/Library/Application Support/DisplayXR/MediaPlayerPro/calibration`). Set
 `MEDIAPLAYER_PRO_CAL_DIR` to use another folder, for example one shared by a site;

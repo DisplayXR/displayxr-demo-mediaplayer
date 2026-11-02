@@ -8,33 +8,26 @@
 // D65 / gamma 2.4, a site standard) and follows the unit, so it is keyed by the panel's
 // identity and loaded automatically whenever the player runs on that panel.
 //
-// The identity is the monitor's EDID: manufacturer, product code and serial, the same
-// <PNP>-<PROD>-<SERIAL> shape displayxr-cli uses for screen keys. XR_DXR_display_info
-// only names the OS device (\\.\DISPLAY1 on Windows), which changes when the cable
-// moves port, so on Windows the EDID is read from the device's registry key (no admin
-// needed). Where that fails, and on macOS / Linux, the OS device name is the key.
+// The identity is the runtime's stable per-display key (XrDisplayStableKeyDXR,
+// XR_DXR_display_info v24): the key `displayxr-cli displays --claims` prints, built from
+// the panel's EDID and, where the EDID has no serial, the serial the vendor plug-in
+// reports. It survives a reboot and a desktop rearrangement. The player looks up the
+// display its window is on (XrSession::EnumerateDisplays) and asks again when the
+// displays change or the window moves. A runtime older than v24 has no key: the OS
+// device name (\\.\DISPLAY1, a RandR output) stands in, which follows the port.
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
 #include <string>
 
 namespace mp::pro::cal {
 
-// "<PNP>-<PROD>-<SERIAL>" from a 128-byte (or longer) EDID block: PNP = the three-letter
-// manufacturer id, PROD = the product code as 4 hex digits, SERIAL = the 0xFF monitor
-// serial descriptor if present, else the 32-bit serial number in decimal; with neither,
-// "<PNP>-<PROD>". Empty when the block is not an EDID (bad header or too short).
-std::string PanelKeyFromEdid(const uint8_t* edid, size_t size);
-
-// A key safe to use as a file name: letters, digits, '-' and '_' kept, everything else '_'.
-// Empty input gives "default".
+// A key safe to use as a file name: letters, digits, '-' and '_' kept, everything else '_',
+// with the leading run of '_' a device prefix leaves dropped. Empty input gives "default".
 std::string SanitizeKey(const std::string& key);
 
-// The panel key for the OS display device the player is on (XrDisplayDesktopInfoDXR::
-// deviceName). Windows: from the monitor's EDID, falling back to the sanitized device
-// name. Elsewhere: the sanitized device name. "default" when the name is empty.
-std::string PanelKeyForDevice(const std::string& deviceName);
+// The key to store a panel's calibration under: the runtime's stable key as it is (it is
+// file-safe by contract) when it has one, else the sanitized OS device name, else "default".
+std::string PanelKey(const std::string& runtimeKey, const std::string& deviceName);
 
 // The folder calibration LUTs live in (created on demand by Install):
 //   Windows: %APPDATA%\DisplayXR\MediaPlayerPro\calibration

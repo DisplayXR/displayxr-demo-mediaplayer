@@ -183,6 +183,9 @@ bool XrSession::InitInstanceAndSystem() {
         xrGetInstanceProcAddr(instance_, "xrRequestFilePickerDXR",
                               (PFN_xrVoidFunction*)&pfnRequestFilePicker_);
     }
+    if (hasDisplayInfoExt_) {  // per-display enumeration (display_info v20+), for Pro's panel key
+        xrGetInstanceProcAddr(instance_, "xrEnumerateDisplaysDXR", (PFN_xrVoidFunction*)&pfnEnumerateDisplays_);
+    }
     if (hasAtlasCaptureExt_) {
         xrGetInstanceProcAddr(instance_, "xrCaptureAtlasDXR",
                               (PFN_xrVoidFunction*)&pfnCaptureAtlasEXT_);
@@ -993,6 +996,35 @@ bool XrSession::ReleaseHudImage() {
     return XR_SUCCEEDED(xrReleaseSwapchainImage(hudSwapchain_.handle, &rel));
 }
 
+bool XrSession::EnumerateDisplays(std::vector<DisplayEntry>& out) const {
+    out.clear();
+    if (!pfnEnumerateDisplays_ || instance_ == XR_NULL_HANDLE) return false;
+    uint32_t n = 0;
+    if (XR_FAILED(pfnEnumerateDisplays_(instance_, systemId_, 0, &n, nullptr)) || n == 0) return false;
+    std::vector<XrDisplayDXR> d(n);
+    std::vector<XrDisplayStableKeyDXR> k(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        k[i] = {};
+        k[i].type = XR_TYPE_DISPLAY_STABLE_KEY_DXR;  // v24; an older runtime leaves key ""
+        d[i] = {};
+        d[i].type = XR_TYPE_DISPLAY_DXR;
+        d[i].next = &k[i];
+    }
+    if (XR_FAILED(pfnEnumerateDisplays_(instance_, systemId_, n, &n, d.data()))) return false;
+    for (uint32_t i = 0; i < n && i < d.size(); ++i) {
+        DisplayEntry e;
+        e.key.assign(k[i].key, strnlen(k[i].key, sizeof(k[i].key)));
+        e.deviceName.assign(d[i].deviceName, strnlen(d[i].deviceName, sizeof(d[i].deviceName)));
+        e.x = d[i].desktopRect.offset.x;
+        e.y = d[i].desktopRect.offset.y;
+        e.w = (uint32_t)std::max(0, d[i].desktopRect.extent.width);
+        e.h = (uint32_t)std::max(0, d[i].desktopRect.extent.height);
+        e.systemDefault = (d[i].flags & XR_DISPLAY_SYSTEM_DEFAULT_BIT_DXR) != 0;
+        out.push_back(e);
+    }
+    return !out.empty();
+}
+
 void XrSession::PollEvents() {
     XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
     while (xrPollEvent(instance_, &event) == XR_SUCCESS) {
@@ -1047,6 +1079,9 @@ void XrSession::PollEvents() {
                          ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());
                 break;
             }
+            case (XrStructureType)XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR:
+                displaysChanged_ = true;  // Pro looks up its panel again (#133)
+                break;
             case (XrStructureType)XR_TYPE_EVENT_DATA_INPUT_PROVIDERS_CHANGED_DXR:
                 if (inputEventHandler_)
                     inputEventHandler_(reinterpret_cast<const XrEventDataBaseHeader*>(&event));

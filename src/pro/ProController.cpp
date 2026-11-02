@@ -610,8 +610,11 @@ void ProController::TickLooks() {
 
 void ProController::ResolveCalibration() {
     calResolved_ = true;
-    const std::string dev = host_.displayDeviceName ? host_.displayDeviceName() : std::string();
-    calKey_ = cal::PanelKeyForDevice(dev);
+    std::string runtimeKey, dev;
+    if (!(host_.panelIdentity && host_.panelIdentity(runtimeKey, dev)) && host_.displayDeviceName)
+        dev = host_.displayDeviceName();
+    calKey_ = cal::PanelKey(runtimeKey, dev);
+    calKeyFromRuntime_ = !runtimeKey.empty();
     if (!calPath_.empty()) {  // MEDIAPLAYER_PRO_CAL: this run only
         LOG_INFO("Pro: display calibration from MEDIAPLAYER_PRO_CAL (panel %s)", calKey_.c_str());
         LoadCalibration(calPath_, /*install=*/false);
@@ -623,8 +626,9 @@ void ProController::ResolveCalibration() {
         LOG_INFO("Pro: display calibration for panel %s: %s", calKey_.c_str(), file.c_str());
         LoadCalibration(file, /*install=*/false);
     } else {
-        LOG_WARN("Pro: panel %s (%s) has no display calibration (looked for %s)", calKey_.c_str(),
-                 dev.empty() ? "device name unknown" : dev.c_str(), file.c_str());
+        LOG_WARN("Pro: panel %s (%s, %s) has no display calibration (looked for %s)", calKey_.c_str(),
+                 dev.empty() ? "device name unknown" : dev.c_str(),
+                 calKeyFromRuntime_ ? "runtime key" : "no runtime key: device name", file.c_str());
     }
 }
 
@@ -759,6 +763,25 @@ void ProController::Tick(const Status& st) {
     TickCompareClip();
     TickLooks();
     if (!calResolved_) ResolveCalibration();
+    // Follow the panel: the runtime's displays changed, or (checked once a second) the
+    // window now sits on another display. A run-only calibration (MEDIAPLAYER_PRO_CAL) stays.
+    if (calResolved_ && (++calCheckTicks_ >= 60 || (host_.displaysChanged && host_.displaysChanged()))) {
+        calCheckTicks_ = 0;
+        std::string runtimeKey, dev;
+        if (host_.panelIdentity && host_.panelIdentity(runtimeKey, dev)) {
+            const std::string key = cal::PanelKey(runtimeKey, dev);
+            if (key != calKey_ && std::getenv("MEDIAPLAYER_PRO_CAL") == nullptr) {
+                LOG_INFO("Pro: the window is now on panel %s (was %s)", key.c_str(), calKey_.c_str());
+                if (calLoaded_) {
+                    if (renderer_) renderer_->ClearCalibrationLut();
+                    calLoaded_ = false;
+                    calName_.clear();
+                    calPath_.clear();
+                }
+                ResolveCalibration();
+            }
+        }
+    }
     TickCalibration();
     if (!renderer_) return;
     GradeParams g = grade_;

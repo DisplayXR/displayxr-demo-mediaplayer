@@ -94,6 +94,10 @@ struct Host {
     std::function<void(float)> setDesqueeze;  // anamorphic: stretch the picture's width
     std::function<double()> mediaFps;         // the open video's frame rate, 0 when not a video
     std::function<std::string()> displayDeviceName;  // the 3D panel's OS monitor name (#133)
+    // #133: the display the player's window is on: the runtime's stable key ("" on a
+    // runtime before display_info v24) and its OS device name. False when unknown.
+    std::function<bool(std::string& key, std::string& deviceName)> panelIdentity;
+    std::function<bool()> displaysChanged;  // true once after the runtime's displays-changed event
     // An RGBA texture for ImGui::Image (scope pictures), per slot: upload `rgba` (nullptr =
     // no change) and return its ImTextureID, nullptr when there is none.
     std::function<void*(int slot, int w, int h, const uint8_t* rgba)> userTexture;
@@ -232,6 +236,8 @@ private:
     LookLoader calLoader_;         // its own loader: a look load must not supersede it
     bool calResolved_ = false;     // the panel key was looked up (first Tick)
     std::string calKey_;           // this panel's key (pro/DisplayCalibration.h)
+    bool calKeyFromRuntime_ = false;  // the runtime's stable key (display_info v24), not the device name
+    int calCheckTicks_ = 0;        // frames since the panel was last looked up
     std::string calPath_, calName_;
     std::string calLoading_, calError_;
     bool calInstall_ = false;      // the pending load is kept for this panel once it applies

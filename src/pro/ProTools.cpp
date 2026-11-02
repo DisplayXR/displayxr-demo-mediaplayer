@@ -134,7 +134,8 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             return true;
         };
         auto calibrationJson = [&]() {
-            return json{{"panel", calKey_}, {"name", calLoaded_ ? calName_ : std::string()},
+            return json{{"panel", calKey_}, {"panel_key_source", calKeyFromRuntime_ ? "runtime" : "device_name"},
+                        {"name", calLoaded_ ? calName_ : std::string()},
                         {"on", calLoaded_ && !calBypass_}, {"bypass", calBypass_},
                         {"loading", calLoading_}, {"error", calError_},
                         {"file", cal::CalibrationPathFor(calKey_)}};

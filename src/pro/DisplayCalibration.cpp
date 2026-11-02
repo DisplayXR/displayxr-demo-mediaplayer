@@ -18,38 +18,6 @@ namespace mp::pro::cal {
 
 namespace fs = std::filesystem;
 
-std::string PanelKeyFromEdid(const uint8_t* e, size_t size) {
-    static const uint8_t kHeader[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
-    if (!e || size < 128) return {};
-    for (int i = 0; i < 8; ++i)
-        if (e[i] != kHeader[i]) return {};
-
-    // Manufacturer: three 5-bit letters, big-endian in bytes 8-9 ('A' = 1).
-    const unsigned m = ((unsigned)e[8] << 8) | e[9];
-    char pnp[4] = {(char)('A' - 1 + ((m >> 10) & 31)), (char)('A' - 1 + ((m >> 5) & 31)),
-                   (char)('A' - 1 + (m & 31)), 0};
-    for (int i = 0; i < 3; ++i)
-        if (pnp[i] < 'A' || pnp[i] > 'Z') pnp[i] = '_';
-    const unsigned prod = (unsigned)e[10] | ((unsigned)e[11] << 8);  // little-endian
-    char head[16];
-    std::snprintf(head, sizeof(head), "%s-%04X", pnp, prod);
-
-    // The serial string descriptor (tag 0xFF) in one of the four 18-byte descriptors.
-    for (int d = 0; d < 4; ++d) {
-        const uint8_t* p = e + 54 + d * 18;
-        if (p[0] == 0 && p[1] == 0 && p[3] == 0xFF) {
-            std::string s;
-            for (int i = 5; i < 18 && p[i] != 0x0A && p[i] != 0; ++i) s += (char)p[i];
-            while (!s.empty() && s.back() == ' ') s.pop_back();
-            if (!s.empty()) return SanitizeKey(std::string(head) + "-" + s);
-        }
-    }
-    const uint32_t serial = (uint32_t)e[12] | ((uint32_t)e[13] << 8) | ((uint32_t)e[14] << 16) |
-                            ((uint32_t)e[15] << 24);
-    if (serial != 0) return std::string(head) + "-" + std::to_string(serial);
-    return head;
-}
-
 std::string SanitizeKey(const std::string& key) {
     std::string out;
     for (char c : key) {
@@ -63,42 +31,14 @@ std::string SanitizeKey(const std::string& key) {
     return out.substr(first);
 }
 
-#if defined(_WIN32)
-// The EDID of the monitor on GDI device `gdi` (\\.\DISPLAY1). EnumDisplayDevices with
-// EDD_GET_DEVICE_INTERFACE_NAME gives the monitor's interface path,
-//   \\?\DISPLAY#ACR0000#5&2a1b3c&0&UID4353#{e6f07b5f-...}
-// whose middle two parts are its key under HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY;
-// "Device Parameters\EDID" there is readable without admin rights.
-static bool ReadEdid(const std::string& gdi, std::string& key) {
-    DISPLAY_DEVICEA mon = {};
-    mon.cb = sizeof(mon);
-    for (DWORD i = 0; EnumDisplayDevicesA(gdi.c_str(), i, &mon, EDD_GET_DEVICE_INTERFACE_NAME); ++i) {
-        if (!(mon.StateFlags & DISPLAY_DEVICE_ACTIVE)) { mon.cb = sizeof(mon); continue; }
-        std::string id = mon.DeviceID;  // \\?\DISPLAY#ACR0000#5&...&UID4353#{guid}
-        const size_t a = id.find('#');
-        const size_t b = a == std::string::npos ? a : id.find('#', a + 1);
-        const size_t c = b == std::string::npos ? b : id.find('#', b + 1);
-        if (c == std::string::npos) return false;
-        const std::string sub = "SYSTEM\\CurrentControlSet\\Enum\\DISPLAY\\" + id.substr(a + 1, b - a - 1) + "\\" +
-                                id.substr(b + 1, c - b - 1) + "\\Device Parameters";
-        uint8_t edid[512];
-        DWORD n = sizeof(edid);
-        if (RegGetValueA(HKEY_LOCAL_MACHINE, sub.c_str(), "EDID", RRF_RT_REG_BINARY, nullptr, edid, &n) !=
-            ERROR_SUCCESS)
-            return false;
-        key = PanelKeyFromEdid(edid, n);
-        return !key.empty();
-    }
-    return false;
-}
-#endif
-
-std::string PanelKeyForDevice(const std::string& deviceName) {
-    if (deviceName.empty()) return "default";
-#if defined(_WIN32)
-    std::string key;
-    if (ReadEdid(deviceName, key)) return key;
-#endif
+std::string PanelKey(const std::string& runtimeKey, const std::string& deviceName) {
+    // The runtime's key is file-safe by contract and is kept as it is (it may carry '@',
+    // "AUO-B194@HDMI-1"), so the file name matches `displayxr-cli displays --claims`.
+    // Only a key that would leave the folder is sanitized.
+    if (!runtimeKey.empty())
+        return runtimeKey.find_first_of("/\\:*?\"<>|") == std::string::npos && runtimeKey != "." && runtimeKey != ".."
+                   ? runtimeKey
+                   : SanitizeKey(runtimeKey);
     return SanitizeKey(deviceName);
 }
 
@@ -124,7 +64,7 @@ std::string CalibrationDir() {
 std::string CalibrationPathFor(const std::string& key) {
     const std::string dir = CalibrationDir();
     if (dir.empty()) return {};
-    return (fs::u8path(dir) / (SanitizeKey(key) + ".cube")).u8string();
+    return (fs::u8path(dir) / (PanelKey(key, "") + ".cube")).u8string();  // PanelKey: kept as is unless unsafe
 }
 
 bool Install(const std::string& cube, const std::string& key, std::string& err) {
