@@ -208,9 +208,28 @@ bool App::PanelIdentity(std::string& key, std::string& deviceName) const {
 // (W_p / D_p), W_p = the fitted picture's width on the panel (canvas pixels at the panel's
 // metres per pixel), D_p = the nominal viewing distance; the same formula as
 // target::PictureScale. Off (or the panel's size unknown) = the fit unchanged.
+void App::UpdateViewerDistance(const XrView* views, uint32_t n, uint32_t canvasW) {
+    const float panelW = xr_.DisplayWidthMeters();
+    const uint32_t panelPx = xr_.DisplayPixelWidth();
+    if (!views || n == 0 || !canvasW || panelW <= 0.0f || !panelPx) return;
+    const float canvasM = (float)canvasW * panelW / (float)panelPx;
+    float sum = 0.0f;
+    int k = 0;
+    for (uint32_t i = 0; i < n && i < 2; ++i) {
+        const float spread = std::tan(views[i].fov.angleRight) - std::tan(views[i].fov.angleLeft);
+        if (spread <= 1e-3f) continue;
+        const float d = canvasM / spread;
+        if (d > 0.15f && d < 5.0f) sum += d, ++k;
+    }
+    if (!k) return;
+    const float d = sum / (float)k;
+    proViewerDistM_ = proViewerDistM_ <= 0.0f ? d : proViewerDistM_ + 0.03f * (d - proViewerDistM_);
+}
+
 XrSession::ViewRect App::TargetScaled(XrSession::ViewRect fit) {
     proPictureScale_ = 1.0f;
-    const float panelW = xr_.DisplayWidthMeters(), dist = xr_.NominalViewerDistance();
+    const float panelW = xr_.DisplayWidthMeters();
+    const float dist = proViewerDistM_ > 0.0f ? proViewerDistM_ : xr_.NominalViewerDistance();
     const uint32_t panelPx = xr_.DisplayPixelWidth();
     if (proTargetW_ <= 0.0f || proTargetD_ <= 0.0f || panelW <= 0.0f || dist <= 0.0f || !panelPx || !fit.w) return fit;
     const float picW = (float)fit.w * panelW / (float)panelPx;
@@ -869,7 +888,8 @@ void App::RenderOneFrame() {
             const float sx = xr_.ActiveViewScaleX();
             const float sy = xr_.ActiveViewScaleY();
             // #135: Pro's target-screen preview scales the picture about its centre (the
-            // tile scissor crops it when it grows past the tile).
+            // tile scissor crops it when it grows past the tile), for the viewer's distance.
+            UpdateViewerDistance(frame.views, std::min(frame.viewCount, frame.locatedCount), canvasW);
             const XrSession::ViewRect viewFit = TargetScaled(MatchMinRect({0, 0, canvasW, canvasH}, FitAspect()));
             const int32_t lbx = (int32_t)((float)viewFit.x * sx);  // horizontal inset of the content
             // Convergence = horizontal image translation: shift the two eyes' content
@@ -3817,6 +3837,7 @@ void App::InitPro() {
         proTargetD_ = distanceM > 0.0f ? distanceM : 0.0f;
     };
     h.pictureScale = [this] { return proPictureScale_; };
+    h.viewerDistance = [this] { return proViewerDistM_ > 0.0f ? proViewerDistM_ : xr_.NominalViewerDistance(); };
     h.panelGeometry = [this](float& widthM, float& viewerM) {
         widthM = xr_.DisplayWidthMeters();
         viewerM = xr_.NominalViewerDistance();

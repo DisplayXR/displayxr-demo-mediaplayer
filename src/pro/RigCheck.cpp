@@ -2,6 +2,7 @@
 #include "pro/RigCheck.h"
 
 #include "media/LiveProducer.h"
+#include "pro/TargetScreen.h"
 
 #include <algorithm>
 #include <chrono>
@@ -930,6 +931,19 @@ const char* const kOpenFmt[7] = {
     "Right edge violation at %+.1f%% for %.0f s (now)",
     "Background diverges on the target screen at %+.1f%% for %.0f s (now)",
 };
+// #135: a depth alert's worst value in the target screen's terms, appended to its text:
+// " [-201 mm, -58' on Cinema]", or the divergence angle for the divergence run. Empty
+// without a target, and for the vertical / colour runs.
+std::string TargetNote(const Budget& b, int run, float worst) {
+    if (b.targetWidthM <= 0.0f || b.targetDistanceM <= 0.0f) return {};
+    if (!(run == 0 || run == 1 || run == 4 || run == 5 || run == 6)) return {};
+    const mp::pro::target::Depth d = mp::pro::target::AtParallax({b.targetName, b.targetWidthM, b.targetDistanceM}, worst);
+    char s[96];
+    if (run == 6) std::snprintf(s, sizeof(s), " [%.2f deg on %s]", d.divergenceDeg, b.targetName.c_str());
+    else std::snprintf(s, sizeof(s), " [%+.0f mm, %+.0f' on %s]", d.mm, d.arcmin, b.targetName.c_str());
+    return s;
+}
+
 // An open run is closed when the picture has not measured for this long (a cut to black,
 // a lost signal): it would otherwise stay "now" until the next good sample.
 constexpr double kAlertExpireSec = 2.0;
@@ -949,7 +963,7 @@ void RigMonitor::CloseRun(int i, double end, const std::string& endTc) {
         a.end = end;
         char b[160];
         std::snprintf(b, sizeof(b), kClosedFmt[i], r.worst, std::max(1.0, std::round(dur)), limits[i]);
-        a.what = b;
+        a.what = std::string(b) + TargetNote(budget_, i, r.worst);
         a.timecode = r.tc;
         a.endTimecode = endTc;
         a.wallClock = r.clock;
@@ -1048,7 +1062,7 @@ std::vector<Alert> RigMonitor::Alerts() const {
         x.end = -1.0;
         char b[160];
         std::snprintf(b, sizeof(b), kOpenFmt[i], r.worst, now - r.since);
-        x.what = b;
+        x.what = std::string(b) + TargetNote(budget_, i, r.worst);
         x.timecode = r.tc;
         x.wallClock = r.clock;
         a.push_back(x);

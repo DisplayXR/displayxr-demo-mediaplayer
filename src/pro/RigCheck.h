@@ -169,6 +169,10 @@ struct Budget {
     // #135: > 0 = the far parallax at which the TARGET screen's background diverges past
     // the cap (target::DivergenceLimitPct); 0 = no target screen, no divergence alert.
     float divergeFarPct = 0.0f;
+    // #135: the target screen the alerts also quote their depth for ("[-201 mm, -58' on
+    // Cinema]"); width 0 = none.
+    std::string targetName;
+    float targetWidthM = 0.0f, targetDistanceM = 0.0f;
 };
 
 struct Sample {

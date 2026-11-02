@@ -104,6 +104,7 @@ struct Host {
     // width and nominal viewing distance (false when the runtime does not say).
     std::function<void(float widthM, float distanceM)> setTargetScreen;
     std::function<float()> pictureScale;
+    std::function<float()> viewerDistance;  // m: the tracked viewer, else the nominal distance
     std::function<bool(float& widthM, float& viewerM)> panelGeometry;
     // An RGBA texture for ImGui::Image (scope pictures), per slot: upload `rgba` (nullptr =
     // no change) and return its ImTextureID, nullptr when there is none.

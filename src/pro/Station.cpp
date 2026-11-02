@@ -554,6 +554,7 @@ std::string Station::RigStatusJson() const {
     out["timecode"] = timecode_;
     out["tc_fps"] = signalFps_;
     out["target"] = target_.On() ? TargetJson(target_, pictureScale_, r) : nlohmann::json(nullptr);
+    if (target_.On() && viewerDistanceM_ > 0.0f) out["target"]["viewer_distance_m"] = viewerDistanceM_;
     out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
     if (decklink_.GetState() != LiveState::Closed) {
         // capture health (#141): the "Done when" of a two-input 4K60 run reads these

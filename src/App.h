@@ -277,6 +277,12 @@ private:
     float proTargetW_ = 0.0f, proTargetD_ = 0.0f;
     float proPictureScale_ = 1.0f;
     XrSession::ViewRect TargetScaled(XrSession::ViewRect fit);
+    // The viewer's distance from the panel as the runtime renders it this frame (follows
+    // eye tracking; the nominal distance when nobody is tracked), smoothed over ~0.5 s.
+    // From each eye's off-axis frustum: the canvas's physical width over
+    // tan(right) - tan(left), so it does not depend on where the reference space sits.
+    float proViewerDistM_ = 0.0f;
+    void UpdateViewerDistance(const XrView* views, uint32_t n, uint32_t canvasW);
 
     // Layered stereo-layout detection (#45). layoutSignal_ records WHICH layer decided
     // layout_, so the HUD can name it. autoInfo_ caches the automatic verdict, which is

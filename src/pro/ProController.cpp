@@ -745,6 +745,9 @@ void ProController::ApplyTarget() {
     if (host_.setTargetScreen) host_.setTargetScreen(preview ? target_.widthM : 0.0f, preview ? target_.distanceM : 0.0f);
     rig::Budget b = station_.RigBudget();
     b.divergeFarPct = target_.On() ? target::DivergenceLimitPct(target_) : 0.0f;
+    b.targetName = target_.name;
+    b.targetWidthM = target_.widthM;
+    b.targetDistanceM = target_.distanceM;
     station_.SetRigBudget(b);
 }
 
@@ -820,7 +823,8 @@ void ProController::Tick(const Status& st) {
     }
     TickCalibration();
     if (targetDirty_) ApplyTarget();
-    station_.SetTarget(target_, host_.pictureScale ? host_.pictureScale() : 1.0f);
+    station_.SetTarget(target_, host_.pictureScale ? host_.pictureScale() : 1.0f,
+                       host_.viewerDistance ? host_.viewerDistance() : 0.0f);
     if (!renderer_) return;
     GradeParams g = grade_;
     if (bypass_ || st.isLogo) {
@@ -1279,8 +1283,9 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                 const bool geom = host_.panelGeometry && host_.panelGeometry(pw, pd);
                 if (!geom) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Panel size unknown: no preview");
                 else if (targetPreview_)
-                    ImGui::TextDisabled("Picture x%.2f%s (panel %.2f m at %.2f m)", k,
-                                        k > 1.005f ? ", cropped" : k < 0.995f ? ", bordered" : "", pw, pd);
+                    ImGui::TextDisabled("Picture x%.2f%s (panel %.2f m, you at %.2f m)", k,
+                                        k > 1.005f ? ", cropped" : k < 0.995f ? ", bordered" : "", pw,
+                                        host_.viewerDistance ? host_.viewerDistance() : pd);
                 const rig::Result r = station_.RigLast();
                 if (r.ok && st.stereo && st.hasPicture) {
                     const target::Depth n = target::AtParallax(target_, r.nearPct), f = target::AtParallax(target_, r.farPct);
