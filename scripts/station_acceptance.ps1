@@ -233,14 +233,16 @@ if (Want "P4") {
 # ---------------------------------------------------------------- R: rig checks on the built-in test rig
 # The default test signal: moving discs at known depths over a gradient, faults dialled in.
 # $stopEarly: end the run as soon as $ok holds (a fault found); otherwise run the full time.
-function Rig-Run([string]$id, [string]$what, [hashtable]$faults, [string[]]$extra, [scriptblock]$ok, [int]$seconds = 25, [bool]$stopEarly = $true) {
+# $detail: what to print instead of the alert list (a check judged on a number, not an alert).
+function Rig-Run([string]$id, [string]$what, [hashtable]$faults, [string[]]$extra, [scriptblock]$ok, [int]$seconds = 25, [bool]$stopEarly = $true, [scriptblock]$detail = $null) {
     $envs = @{ MEDIAPLAYER_PRO_DEPTH_OVERLAY = "1" }
     foreach ($k in $faults.Keys) { $envs[$k] = $faults[$k] }
     $until = if ($stopEarly) { $ok } else { { param($s) $false } }
     $r = Run-Player "${id}_rig" (@("--test-signal") + $extra) $envs -dumpFrame 400 -seconds $seconds -until $until
     if (-not $r.status -or -not $r.status.rig) { Report $id $what "FAIL" "no station status (is Pictures\DisplayXR writable?)"; return }
     $alerts = @($r.status.rig.alerts | ForEach-Object { $_.what }) -join " | "
-    if (& $ok $r.status) { Report $id $what "PASS" $alerts } else { Report $id $what "FAIL" "alerts: [$alerts]" }
+    $said = if ($detail) { & $detail $r.status } else { $alerts }
+    if (& $ok $r.status) { Report $id $what "PASS" $said } else { Report $id $what "FAIL" $(if ($detail) { $said } else { "alerts: [$alerts]" }) }
 }
 # The test scene sits at about -2.0 % (foreground) / +1.2 % (background), so the other checks
 # use a -3,2 budget it fits inside, and R4 tightens it to make the depth alert fire.
@@ -249,7 +251,7 @@ if (Want "R1") { Rig-Run "R1" "Rig: clean rig raises no alert" @{} @($roomy) { p
 if (Want "R2") { Rig-Run "R2" "Rig: 4 px vertical error is flagged" @{ MEDIAPLAYER_TEST_VSHIFT = "4" } @($roomy) { param($s) @($s.rig.alerts | Where-Object { $_.what -match "ertical" }).Count -gt 0 } }
 if (Want "R3") { Rig-Run "R3" "Rig: colour mismatch is flagged" @{ MEDIAPLAYER_TEST_GAIN_R = "1.25" } @($roomy) { param($s) @($s.rig.alerts | Where-Object { $_.what -match "olou" }).Count -gt 0 } }
 if (Want "R4") { Rig-Run "R4" "Rig: depth over budget is flagged" @{} @("--depth-budget=-0.5,0.5") { param($s) @($s.rig.alerts | Where-Object { $_.what -match "ground at" }).Count -gt 0 } }
-if (Want "R5") { Rig-Run "R5" "Rig: 2-frame eye delay is measured" @{ MEDIAPLAYER_TEST_EYE_DELAY = "2" } @($roomy) { param($s) $s.rig.eye_sync_measured_frames -eq 2 } 40 }
+if (Want "R5") { Rig-Run "R5" "Rig: 2-frame eye delay is measured" @{ MEDIAPLAYER_TEST_EYE_DELAY = "2" } @($roomy) { param($s) $s.rig.eye_sync_measured_frames -eq 2 } 40 $true { param($s) "measured $($s.rig.eye_sync_measured_frames) frames, $($s.rig.eye_sync_late_eye) eye late (injected 2)" } }
 
 # ---------------------------------------------------------------- Q: snapshot + QC report
 if (Want "Q1") {
