@@ -152,7 +152,8 @@ public:
     // Window-space HUD swapchain (created in Initialize if the runtime supports it).
     bool HasHud() const { return hasHud_; }
     // The panel's physical size and the nominal viewing distance (XR_DXR_display_info; 0 =
-    // unknown). The VR viewer's life-size field of view comes from these (#155).
+    // unknown). The VR viewer's life-size field of view (#155) and Pro's target-screen
+    // preview (#135) come from these.
     float DisplayWidthMeters() const { return displayWidthM_; }
     uint32_t DisplayPixelWidth() const { return displayPixelWidth_; }
     float NominalViewerDistance() const { return nominalViewerZ_; }

@@ -27,6 +27,16 @@ void ProController::RegisterTools(const RegisterFn& reg) {
         "lut_loading, and get_grade shows the LUT (or lut_error) once it applies.",
         "{\"type\":\"object\",\"properties\":{\"lut\":{\"type\":\"string\"},\"cdl\":{\"type\":\"string\"},"
         "\"exposure\":{\"type\":\"number\"},\"bypass\":{\"type\":\"boolean\"}}}");
+    reg("set_target_screen",
+        "Judge the depth for the screen the picture is made for (#135): target cinema, tv, monitor, "
+        "tablet or off, or a custom width_m + distance_m. With a target, get_rig_status reports near / "
+        "far in its terms (mm, arcminutes, background divergence) and the rig check alerts when the "
+        "background diverges past 0.5 deg there. preview (default true) shows the picture on the panel "
+        "at the angular size it has on the target, so the depth reads as it will there (the picture "
+        "crops or gets a border). Returns the target, the preview scale and the depth in its terms.",
+        "{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\",\"enum\":[\"off\",\"cinema\",\"tv\",\"monitor\",\"tablet\"]},"
+        "\"width_m\":{\"type\":\"number\",\"minimum\":0.1},\"distance_m\":{\"type\":\"number\",\"minimum\":0.2},"
+        "\"preview\":{\"type\":\"boolean\"}}}");
     reg("set_display_calibration",
         "Set this panel's display calibration (#133): a .cube 3D LUT (domain 0..1) from a calibration "
         "tool (DisplayCAL, Calman, ColourSpace), applied after the grade and QC views. It is kept for "
@@ -164,6 +174,32 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             if (Num(a, "exposure", ev)) grade_.exposure = std::clamp(ev, -4.0f, 4.0f);
             if (a.contains("bypass") && a["bypass"].is_boolean()) bypass_ = a["bypass"].get<bool>();
             result = gradeJson().dump();
+            return true;
+        }
+        if (tool == "set_target_screen") {
+            std::string t;
+            float w = 0.0f, d = 0.0f;
+            if (Str(a, "target", t)) {
+                target::Screen s;
+                if (t == "off") SetTarget({});
+                else if (target::PresetByName(t, s)) SetTarget(s);
+                else return err("target must be off|cinema|tv|monitor|tablet");
+            }
+            if (Num(a, "width_m", w) | Num(a, "distance_m", d)) {
+                if (w <= 0.0f) w = target_.On() ? target_.widthM : 0.0f;
+                if (d <= 0.0f) d = target_.On() ? target_.distanceM : 0.0f;
+                if (w < 0.1f || d < 0.2f) return err("a custom target needs width_m >= 0.1 and distance_m >= 0.2");
+                SetTarget({"Custom", w, d});
+            }
+            if (a.contains("preview") && a["preview"].is_boolean()) {
+                targetPreview_ = a["preview"].get<bool>();
+                targetDirty_ = true;
+            }
+            ApplyTarget();
+            const json rs = json::parse(station_.RigStatusJson(), nullptr, false);
+            result = json{{"preview", targetPreview_ && target_.On()},
+                          {"target", rs.is_object() && rs.contains("target") ? rs["target"] : json(nullptr)}}
+                         .dump();
             return true;
         }
         if (tool == "set_display_calibration") {
