@@ -152,6 +152,18 @@ bool Window::PumpEvents() {
             ctrlClickX_ = e.button.x;
             ctrlClickY_ = e.button.y;
         }
+        // VR viewer (#155): left-drag, wheel and double-click are reported; the app uses
+        // them only while a VR projection is on screen and ImGui does not want the mouse.
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT) {
+            leftDown_ = !(SDL_GetModState() & SDL_KMOD_CTRL);
+            if (e.button.clicks == 2) doubleClick_ = true;
+        }
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_LEFT) leftDown_ = false;
+        if (e.type == SDL_EVENT_MOUSE_MOTION && leftDown_ && (e.motion.state & SDL_BUTTON_LMASK)) {
+            viewDragX_ += e.motion.xrel;
+            viewDragY_ += e.motion.yrel;
+        }
+        if (e.type == SDL_EVENT_MOUSE_WHEEL) wheelSteps_ += e.wheel.y;
         if (e.type == SDL_EVENT_WINDOW_MOUSE_ENTER) { mouseInWindow_ = true; mouseActivity_ = true; }
         if (e.type == SDL_EVENT_WINDOW_MOUSE_LEAVE) { mouseInWindow_ = false; mouseLeft_ = true; }
         // Drag and drop (#44). SDL3 delivers this on Windows, macOS and X11 through the
@@ -183,7 +195,13 @@ bool Window::PumpEvents() {
         if (e.type == SDL_EVENT_KEY_DOWN && !keyboardCaptured_) {
             // Convergence nudges repeat while held; everything else is one-shot. The
             // convergence keys form the contiguous `0 - =` cluster: `=`/`-` nudge, `0` resets.
-            if (e.key.key == SDLK_EQUALS) ++convergenceSteps_;
+            const bool arrow = e.key.key == SDLK_LEFT || e.key.key == SDLK_RIGHT || e.key.key == SDLK_UP ||
+                               e.key.key == SDLK_DOWN;
+            if (arrowsPanView_ && arrow) {  // VR viewer: the arrows steer (repeat counts)
+                viewNudgeX_ += e.key.key == SDLK_RIGHT ? 1 : e.key.key == SDLK_LEFT ? -1 : 0;
+                viewNudgeY_ += e.key.key == SDLK_UP ? 1 : e.key.key == SDLK_DOWN ? -1 : 0;
+            }
+            else if (e.key.key == SDLK_EQUALS) ++convergenceSteps_;
             else if (e.key.key == SDLK_MINUS) --convergenceSteps_;
             else if (e.key.key == SDLK_RIGHTBRACKET) ++frameStepRequest_;  // ']' next frame
             else if (e.key.key == SDLK_LEFTBRACKET) --frameStepRequest_;   // '[' prev frame
@@ -205,8 +223,10 @@ bool Window::PumpEvents() {
                 if (e.key.key == SDLK_BACKSPACE) autoConvergeRequested_ = true;
                 if (e.key.key == SDLK_X) swapEyesRequested_ = true;
                 if (e.key.key == SDLK_SPACE) togglePauseRequested_ = true;
-                if (e.key.key == SDLK_UP) prevMediaRequested_ = true;
-                if (e.key.key == SDLK_DOWN) nextMediaRequested_ = true;
+                if (e.key.key == SDLK_UP || e.key.key == SDLK_PAGEUP) prevMediaRequested_ = true;
+                if (e.key.key == SDLK_DOWN || e.key.key == SDLK_PAGEDOWN) nextMediaRequested_ = true;
+                if (e.key.key == SDLK_R) recenterRequested_ = true;          // VR re-centre (#155)
+                if (e.key.key == SDLK_P) cycleProjectionRequested_ = true;   // VR projection (#155)
                 if (e.key.key == SDLK_S) toggleSlideshowRequested_ = true;
                 if (e.key.key == SDLK_M) toggleMuteRequested_ = true;
                 if (e.key.key == SDLK_L) {
@@ -344,6 +364,44 @@ bool Window::TakeCtrlClick(float& x, float& y) {
 bool Window::TakeOpenUrlRequest() {
     bool v = openUrlRequested_;
     openUrlRequested_ = false;
+    return v;
+}
+
+bool Window::TakeViewNudge(int& dx, int& dy) {
+    dx = viewNudgeX_;
+    dy = viewNudgeY_;
+    viewNudgeX_ = viewNudgeY_ = 0;
+    return dx != 0 || dy != 0;
+}
+
+bool Window::TakeViewDrag(float& dx, float& dy) {
+    dx = viewDragX_;
+    dy = viewDragY_;
+    viewDragX_ = viewDragY_ = 0.0f;
+    return dx != 0.0f || dy != 0.0f;
+}
+
+float Window::TakeWheelSteps() {
+    const float v = wheelSteps_;
+    wheelSteps_ = 0.0f;
+    return v;
+}
+
+bool Window::TakeDoubleClick() {
+    const bool v = doubleClick_;
+    doubleClick_ = false;
+    return v;
+}
+
+bool Window::TakeRecenterRequest() {
+    const bool v = recenterRequested_;
+    recenterRequested_ = false;
+    return v;
+}
+
+bool Window::TakeCycleProjectionRequest() {
+    const bool v = cycleProjectionRequested_;
+    cycleProjectionRequested_ = false;
     return v;
 }
 

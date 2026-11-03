@@ -12,6 +12,7 @@
 #include "media/LiftClient.h"
 #include "media/MediaSource.h"
 #include "media/VideoDecoder.h"
+#include "media/VrView.h"
 #include "platform/Window.h"
 #include "rhi/VulkanRenderer.h"
 #include "ui/ImGuiLayer.h"
@@ -82,7 +83,10 @@ private:
     // Open-file. RequestOpenFile tries the workspace picker, else a native dialog.
     // LoadMedia opens a path fresh; ReloadMedia tears down current media first.
     void RequestOpenFile();
-    bool LoadMedia(const std::string& path);
+    bool LoadMedia(const std::string& path);  // LoadMediaFile + the VR projection (#155)
+    bool LoadMediaFile(const std::string& path);
+    int loadSphKind_ = -1;           // the video probe's spherical metadata for this load (#155)
+    float loadSphCoverage_ = 0.0f;
     void ReloadMedia(const std::string& path);
 
     // Drag and drop (#44). Filters the batch through MediaSource::IsSupported, toasts
@@ -264,7 +268,42 @@ private:
     // The aspect the picture is fitted with: contentAspect_, stretched by Pro's anamorphic
     // desqueeze (1 in the base player).
     float proDesqueeze_ = 1.0f;
-    float FitAspect() const { return contentAspect_ * proDesqueeze_; }
+    // In the VR viewer (#155) the picture is a window into the scene that FILLS the window:
+    // the fit aspect is the canvas's own, so nothing is letterboxed.
+    float FitAspect() const;
+
+    // --- VR180 / VR360 viewer (#155) -------------------------------------------------
+    // A VR source is a PROJECTION on top of the packing (layout_ still says SBS / TB /
+    // mono). Detected per file: container spherical metadata, then file-name hints; `P`
+    // and MCP set_layout {projection} pin it; MEDIAPLAYER_VR seeds a pin for headless runs.
+    vr::Projection vrAuto_ = vr::Projection::None;  // detected for the current media
+    const char* vrSignal_ = "";                     // "metadata" / "filename" / "manual" / ""
+    bool vrPinned_ = false;
+    vr::Projection vrPinnedValue_ = vr::Projection::None;
+    bool vrForced_ = false;                          // MEDIAPLAYER_VR
+    vr::Projection vrForcedValue_ = vr::Projection::None;
+    vr::Projection vrProj_ = vr::Projection::None;   // effective
+    float vrFisheyeFovDeg_ = 180.0f;                 // dual-fisheye lens FOV (set_layout)
+    vr::ViewState vrView_;                           // yaw / pitch / fov the user steers
+    vr::Limits vrLimits_;
+    uint32_t vrViewGen_ = 0;                         // bumps on every view change (auto-conv)
+    std::vector<uint8_t> vrAutoConvBuf_;             // the rendered eye windows, SBS luma
+    bool VrActive() const;
+    bool VrStereo() const { return packing::IsPacked(layout_); }
+    // Life-size horizontal FOV for the current window, and the effective FOV (zoomed).
+    float VrDefaultFovDeg() const;
+    float VrFovDeg() const { return vrView_.fovDeg > 0.0f ? vrView_.fovDeg : VrDefaultFovDeg(); }
+    float VrWindowAspect() const;
+    // Resolve the projection for freshly loaded media (after ApplyLayout): spherical
+    // metadata (kind / coverage from VideoStereoProbe, kind < 0 = none), then the name.
+    // A VR source whose packing no strong layer decided takes the packing its aspect implies.
+    void ResolveVr(const std::string& path, int sphericalKind, float sphericalCoverageDeg, int frameW, int frameH);
+    void SetVrProjectionPin(bool pin, vr::Projection p, const char* why);
+    void CycleVrProjection();  // `P`: auto -> flat -> VR180 -> VR360 -> fisheye -> auto
+    void VrSteer(float dYawDeg, float dPitchDeg, float fovScale);  // clamps, bumps vrViewGen_
+    void VrRecenter(const char* why);
+    void VrHandleInput(bool& activity);
+    std::string VrViewJson() const;  // MCP get_view / set_view result
 
     // Layered stereo-layout detection (#45). layoutSignal_ records WHICH layer decided
     // layout_, so the HUD can name it. autoInfo_ caches the automatic verdict, which is
@@ -387,9 +426,10 @@ private:
         bool swap = false;
         autoconv::SubjectPolicy policy = autoconv::SubjectPolicy::Nearest;
         float fx = -1.f, fy = -1.f;  // the focus pin (-1 = none)
+        uint32_t vrGen = 0;          // the VR view (#155): a pan / zoom is a new picture to measure
         bool Same(const AutoConvKey& o) const {
             return valid && o.valid && media == o.media && serial == o.serial && layout == o.layout &&
-                   swap == o.swap && policy == o.policy && fx == o.fx && fy == o.fy;
+                   swap == o.swap && policy == o.policy && fx == o.fx && fy == o.fy && vrGen == o.vrGen;
         }
     };
     AutoConvKey autoConvKey_;

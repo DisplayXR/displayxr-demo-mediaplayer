@@ -54,6 +54,13 @@ struct VideoStereoProbe {
         // must not re-derive full-vs-half from the aspect (a portrait pair is narrow).
         bool multiview = false;
 
+        // VR180 / VR360 (#155): the container's spherical projection (MP4 sv3d / proj, MKV
+        // Projection, Apple APMP), reduced for vr::FromSpherical: kind 0 equirect, 1 bounded
+        // equirect (VR180), 2 half equirect, 3 fisheye; -1 none / unsupported.
+        bool haveSpherical = false;
+        int sphericalKind = -1;
+        float sphericalCoverageDeg = 0.0f;  // horizontal coverage of an equirect
+
         StereoDetectResult content;  // voted; decided=false if not run or inconclusive
         int framesExamined = 0;
         int votes = 0;
@@ -63,6 +70,10 @@ struct VideoStereoProbe {
     // `wantContent=false` stops after the first decoded frame's metadata check — used
     // when the filename already decided the layout and we only want the eye-swap hint.
     static Result Run(const std::string& path, bool wantContent, int budgetMs = 250);
+
+    // Only the spherical metadata (no decode): what Run() fills into haveSpherical & co,
+    // for the loads that skip Run() (a pinned layout). Returns haveSpherical.
+    static bool ReadSpherical(const std::string& path, int& kind, float& coverageDeg);
 };
 
 } // namespace mp
