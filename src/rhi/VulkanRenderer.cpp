@@ -609,6 +609,26 @@ bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, con
     return true;
 }
 
+void VulkanRenderer::SetSourceHdr(int transfer, bool bt2020, float peakNits) {
+    sourceTransfer_ = (transfer >= 1 && transfer <= 3) ? transfer : 0;
+    sourceBt2020_ = bt2020;
+    sourcePeak_ = peakNits > 0.0f ? peakNits : 0.0f;
+}
+
+VulkanRenderer::HdrState VulkanRenderer::SourceHdr() const {
+    HdrState h;
+    if (sourceMode_ == 0) return h;  // an RGBA source (a still, a converted picture) is SDR
+    h.transfer = sourceTransfer_;
+    if (h.transfer == 0) return h;
+    h.raw = grade_.toneMap == 3;
+    h.bt2020 = sourceBt2020_;
+    h.rollOff = grade_.toneMap == 1 || (grade_.toneMap == 0 && (h.transfer == 1 || h.transfer == 2));
+    h.peakNits = grade_.peakNits > 0.0f ? grade_.peakNits : sourcePeak_ > 0.0f ? sourcePeak_ : 1000.0f;
+    if (h.transfer == 1) h.peakNits = 1000.0f;  // HLG: the OOTF's nominal display peak
+    h.pqShaper = grade_.lutPqShaper && h.transfer == 3 && !h.raw;
+    return h;
+}
+
 bool VulkanRenderer::UploadCompareTexture(const uint8_t* rgba, uint32_t width, uint32_t height) {
     if (!rgba || width == 0 || height == 0) return false;
     if (!EnsureDummy()) return false;
@@ -909,7 +929,13 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         pc.lutDomain[1] = 1.0f / std::max(1e-6f, lut_.domainMax - lut_.domainMin);
         pc.lutDomain[2] = (float)std::max(1u, lut_.size);
         pc.lutDomain[3] = source16_ ? 1.0f : 0.0f;  // MP_GRADE: 10-bit levels for P016
-        pc.yuvMatrix = sourceMode_ == 0 ? 0 : sourceMatrix_;  // RGBA sources ignore it
+        if (sourceMode_ == 0) {
+            pc.yuvMatrix = 0;  // RGBA sources ignore it
+        } else {
+            const HdrState h = SourceHdr();
+            pc.yuvMatrix = PackColourWord(sourceMatrix_, h.raw ? 0 : h.transfer, h.rollOff, h.bt2020, h.peakNits,
+                                          h.pqShaper && pc.lutOn > 0.5f);
+        }
         pc.zebraLevel = grade_.zebraLevel;
         pc.viewFlags = (grade_.channel & 7) | ((grade_.wipeMode & 3) << 4);
         if (compareMode_ >= 0)  // B's sampling: mode bits 8-9, full range 10, matrix 11-12, P016 13, bound 14

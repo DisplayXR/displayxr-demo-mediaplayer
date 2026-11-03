@@ -22,11 +22,16 @@ using json = nlohmann::json;
 void ProController::RegisterTools(const RegisterFn& reg) {
     reg("set_grade",
         "Set Media Player Pro's grade: a .cube 3D LUT path, an ASC CDL file (.cc/.ccc/.cdl), "
-        "exposure in stops (-4..4, linear light) and bypass. Arguments left out keep their "
+        "exposure in stops (-4..4, linear light) and bypass. HDR sources (HLG, PQ, scene-linear "
+        "EXR): tone_map auto (roll off HLG / PQ, clip EXR at white) | on | off (clip) | raw (the "
+        "signal unmapped, for a show LUT that expects PQ / HLG), peak_nits = the source's "
+        "brightest (0 = from the stream, else 1000). Arguments left out keep their "
         "current value. Returns the grade. A LUT loads in the background: the reply carries "
         "lut_loading, and get_grade shows the LUT (or lut_error) once it applies.",
         "{\"type\":\"object\",\"properties\":{\"lut\":{\"type\":\"string\"},\"cdl\":{\"type\":\"string\"},"
-        "\"exposure\":{\"type\":\"number\"},\"bypass\":{\"type\":\"boolean\"}}}");
+        "\"exposure\":{\"type\":\"number\"},\"bypass\":{\"type\":\"boolean\"},"
+        "\"tone_map\":{\"type\":\"string\",\"enum\":[\"auto\",\"on\",\"off\",\"raw\"]},"
+        "\"peak_nits\":{\"type\":\"number\"}}}");
     reg("set_target_screen",
         "Judge the depth for the screen the picture is made for (#135): target cinema, tv, monitor, "
         "tablet or off, or a custom width_m + distance_m. With a target, get_rig_status reports near / "
@@ -47,7 +52,8 @@ void ProController::RegisterTools(const RegisterFn& reg) {
         "{\"type\":\"object\",\"properties\":{\"cube\":{\"type\":\"string\"},\"keep\":{\"type\":\"boolean\"},"
         "\"clear\":{\"type\":\"boolean\"},\"bypass\":{\"type\":\"boolean\"}}}");
     reg("get_grade", "Read the grade: LUT (with lut_loading / lut_error), CDL (slope/offset/power/"
-        "saturation), exposure, bypass.",
+        "saturation), exposure, bypass, and the HDR mapping (tone_map, peak_nits, hdr = what "
+        "the current source gets: transfer, raw, roll_off, bt2020, peak_nits).",
         "{\"type\":\"object\"}");
     reg("set_view",
         "Set the QC view: 3d, left, right, difference (|left - right| x4), anaglyph or false_colour; "
@@ -152,6 +158,12 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
                         {"loading", calLoading_}, {"error", calError_},
                         {"file", cal::CalibrationPathFor(calKey_)}};
         };
+        auto HdrJson = [&]() {
+            const VulkanRenderer::HdrState h = renderer_ ? renderer_->SourceHdr() : VulkanRenderer::HdrState{};
+            return json{{"transfer", HdrTransferName(h.transfer)}, {"raw", h.raw}, {"roll_off", h.rollOff},
+                        {"bt2020", h.bt2020}, {"peak_nits", h.peakNits}, {"ocio_unclipped", h.pqShaper},
+                        {"summary", HdrSummary(h)}};
+        };
         auto gradeJson = [&]() {
             return json{{"lut", lutName_}, {"lut_on", grade_.lutOn},
                         {"lut_loading", lutLoading_}, {"lut_error", lutError_},
@@ -160,7 +172,9 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
                         {"offset", {grade_.offset[0], grade_.offset[1], grade_.offset[2]}},
                         {"power", {grade_.power[0], grade_.power[1], grade_.power[2]}},
                         {"saturation", grade_.saturation}, {"exposure", grade_.exposure}, {"bypass", bypass_},
-                        {"calibration", calibrationJson()}};
+                        {"calibration", calibrationJson()},
+                        {"tone_map", ToneMapName(grade_.toneMap)}, {"peak_nits", grade_.peakNits},
+                        {"hdr", HdrJson()}};
         };
         if (tool == "set_grade") {
             std::string p;
@@ -175,6 +189,13 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             float ev;
             if (Num(a, "exposure", ev)) grade_.exposure = std::clamp(ev, -4.0f, 4.0f);
             if (a.contains("bypass") && a["bypass"].is_boolean()) bypass_ = a["bypass"].get<bool>();
+            if (Str(a, "tone_map", p)) {
+                const int m = ToneMapFromName(p, -1);
+                if (m < 0) return err("tone_map must be auto, on, off or raw");
+                grade_.toneMap = m;
+            }
+            float nits;
+            if (Num(a, "peak_nits", nits)) grade_.peakNits = std::clamp(nits, 0.0f, 10000.0f);
             result = gradeJson().dump();
             return true;
         }

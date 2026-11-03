@@ -72,6 +72,12 @@ struct GradeParams {
     // trim. Ignored unless a calibration LUT was uploaded (HasCalibrationLut). Not part of
     // the show grade: bypassing the grade keeps it.
     bool calOn = false;
+    // HDR sources (#134): 0 auto (roll off HLG / PQ highlights, clip scene-linear EXR at
+    // white), 1 always roll off, 2 never (clip), 3 raw (the signal goes into the grade as
+    // if it were SDR, for a show LUT that expects PQ / HLG). peakNits 0 = the stream's own.
+    int toneMap = 0;
+    float peakNits = 0.0f;
+    bool lutPqShaper = false;    // the LUT is an OCIO bake expecting PQ-coded linear (EXR)
 };
 
 
@@ -143,6 +149,19 @@ public:
     bool UploadYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2,
                    uint32_t width, uint32_t height, int format, bool fullRange, int matrix = 0);
     int SourceMatrix() const { return sourceMatrix_; }  // last YUV upload's matrix (UI)
+    // The HDR tags of the source just uploaded (#134): transfer 0 SDR, 1 HLG, 2 PQ, 3 scene-
+    // linear stored as PQ; BT.2020 primaries; the stream's peak in nits (0 = unknown).
+    void SetSourceHdr(int transfer, bool bt2020, float peakNits);
+    // What the shader does with them under the current grade (UI / status / notes).
+    struct HdrState {
+        int transfer = 0;      // the source's (0 SDR, 1 HLG, 2 PQ, 3 scene-linear as PQ)
+        bool raw = false;      // tone map "raw": the shader treats it as SDR
+        bool rollOff = false;
+        bool bt2020 = false;
+        float peakNits = 0.0f;
+        bool pqShaper = false;  // scene-linear into an OCIO look, unclipped (see GradeParams)
+    };
+    HdrState SourceHdr() const;
 
     // Media Player Pro's clip-vs-clip wipe: a second source (B) at bindings 4..6, sampled by
     // the MP_GRADE shader right of the wipe line (GradeParams::wipeMode 3). Same formats and
@@ -257,6 +276,9 @@ private:
     float sourceFullRange_ = 0.0f;
     bool source16_ = false;          // P016: the MP_GRADE shader uses 10-bit limited levels
     int sourceMatrix_ = 0;           // YUV matrix pushed to the MP_GRADE shader (0 = BT.709)
+    int sourceTransfer_ = 0;         // HDR tags (#134), see SetSourceHdr
+    bool sourceBt2020_ = false;
+    float sourcePeak_ = 0.0f;
 
 #if defined(_WIN32)
     // Zero-copy interop state (#28). imports_ caches one entry per shared handle. The producer

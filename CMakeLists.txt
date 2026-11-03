@@ -877,6 +877,11 @@ if(MP_BUILD_TESTS)
     target_include_directories(color_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME color COMMAND color_test)
 
+    # HDR on the SDR panel (#134): color/ToneMap.h (header-only) + the push-word packing.
+    add_executable(tone_map_test tests/tone_map_test.cpp)
+    target_include_directories(tone_map_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME tone_map COMMAND tone_map_test)
+
     add_executable(mpo_parse_test
         tests/mpo_parse_test.cpp
         src/media/MpoLoader.cpp

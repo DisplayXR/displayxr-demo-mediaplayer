@@ -10,6 +10,7 @@
 #pragma once
 
 #include "color/CubeLut.h"
+#include "color/ToneMap.h"
 #include "media/FrameRing.h"
 #include "media/StereoTypes.h"
 
@@ -29,9 +30,13 @@ struct Grade {
     float slope[3] = {1.f, 1.f, 1.f}, offset[3] = {0.f, 0.f, 0.f}, power[3] = {1.f, 1.f, 1.f};
     float saturation = 1.0f;
     const color::CubeLut* lut = nullptr;  // used when non-null and Valid()
+    // The source's HDR mapping (#134), as the shader gets it. SDR (the default) skips it;
+    // otherwise it runs first and takes the exposure (hdr.exposure is ignored).
+    color::HdrParams hdr;
 };
 
-// One display-referred R'G'B' (0..1) through the grade, exactly as Grade() in sbs.frag.
+// One R'G'B' signal (0..1) through the HDR mapping and the grade, exactly as GradeSrc() in
+// sbs.frag.
 void ApplyGrade(const Grade& g, float rgb[3]);
 
 constexpr int kLevels = 256;   // waveform / histogram vertical resolution

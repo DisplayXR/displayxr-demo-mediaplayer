@@ -89,6 +89,36 @@ void GradeMaths() {
     CHECK(Near(o[0], 1.0f - LinearToSrgb(SrgbToLinear(0.5f) * 2.0f), 2e-3f), "exposure before the LUT");
 }
 
+// HDR (#134): the scopes measure the picture the shader shows. The mapping runs first and
+// takes the exposure, then the CDL / LUT see the SDR result; SDR never takes the HDR path.
+void HdrMaths() {
+    scopes::Grade g;
+    g.hdr.transfer = color::Transfer::PQ;
+    g.hdr.peakNits = 1000.0f;
+    const float sig = color::NitsToPq(500.0f);
+    float a[3] = {sig, sig, sig}, ref[3] = {sig, sig, sig};
+    scopes::ApplyGrade(g, a);
+    color::HdrToDisplay(g.hdr, ref);
+    CHECK(Near(a[0], ref[0]) && a[0] > 0.9f && a[0] < 1.0f, "PQ 500 nits: mapped as the shader does, below white");
+    g.exposure = -1.0f;  // the exposure goes into the mapping (linear light, before the roll-off)
+    float b[3] = {sig, sig, sig}, rb[3] = {sig, sig, sig};
+    scopes::ApplyGrade(g, b);
+    color::HdrParams p = g.hdr;
+    p.exposure = -1.0f;
+    color::HdrToDisplay(p, rb);
+    CHECK(Near(b[0], rb[0]) && b[0] < a[0], "HDR exposure applied once, inside the mapping");
+    const color::CubeLut inv = Lut(17, true);
+    g.exposure = 0.0f;
+    g.lut = &inv;
+    float c[3] = {sig, sig, sig};
+    scopes::ApplyGrade(g, c);
+    CHECK(Near(c[0], 1.0f - ref[0], 2e-3f), "the LUT sees the mapped (SDR) picture");
+    scopes::Grade sdr;  // transfer SDR: untouched, as before
+    float s[3] = {0.25f, 0.5f, 0.75f};
+    scopes::ApplyGrade(sdr, s);
+    CHECK(Near(s[0], 0.25f) && Near(s[2], 0.75f), "SDR skips the HDR mapping");
+}
+
 // An RGBA still: left eye = left half dark grey / right half light grey; right eye red.
 std::vector<uint8_t> Still(int w, int h) {
     std::vector<uint8_t> p((size_t)w * h * 4, 255);
@@ -236,6 +266,7 @@ void GatherAndWorker() {
 
 int main() {
     GradeMaths();
+    HdrMaths();
     ScopesReadTheLeftEye();
     VectorscopeHue();
     FramesNeedPixels();

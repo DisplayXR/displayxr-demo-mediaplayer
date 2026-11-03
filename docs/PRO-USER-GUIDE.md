@@ -117,6 +117,33 @@ compare); with the clip wipe on, it swaps which clip is on which side.
 
 The grade is applied in this order: exposure, then the CDL, then the LUT.
 
+### HDR sources
+
+HDR video (HLG or PQ, e.g. HDR10) and scene-linear EXR are shown on the panel as an SDR
+picture. The player recognises them from the file and the status bar says what it does,
+e.g. `PQ -> SDR 1000 nits`.
+
+- HDR reference white (203 nits) becomes the panel's white. Shadows and mid-tones are kept
+  as they are, and the highlights above them are rolled off smoothly (ITU-R BT.2390) so the
+  brightest part of the shot just reaches white instead of everything above white clipping.
+  BT.2020 colours are converted to the panel's BT.709.
+- **Exposure** acts on the HDR light before the roll-off: pull it down to see detail in
+  highlights.
+- **HDR tone map** (Inspector > Colour):
+  - **auto** (default): roll off HLG and PQ; clip EXR at white (EXR then looks as before,
+    and exposure brings back what is above white).
+  - **on**: always roll off, EXR included.
+  - **off**: clip everything above white.
+  - **raw**: no mapping at all. Use it with a show LUT that expects PQ or HLG input.
+- **Source peak (nits)**: the brightest the source gets, which sets where the roll-off ends.
+  0 takes it from the file (HDR10 metadata), else 1000. HLG always uses 1000.
+- The scopes, false colour and zebras measure the mapped picture.
+
+The CDL and the LUT apply after the mapping, to the SDR picture. One exception: with an
+**OpenColorIO** look on an EXR, the look gets the scene-linear values themselves, above 1.0
+included, so the OCIO view (e.g. ACES) does the tone mapping; the status bar then says
+`Linear -> OCIO look (unclipped)`. The compare clip B in the clip wipe is not mapped.
+
 ### Display calibration
 
 The grade is the show's look and follows the content. A **display calibration** corrects
