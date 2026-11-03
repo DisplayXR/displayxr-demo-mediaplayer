@@ -264,13 +264,15 @@ bool XrSession::InitInstanceAndSystem() {
         if (XR_SUCCEEDED(xrGetSystemProperties(instance_, systemId_, &props))) {
             displayPixelWidth_ = di.displayPixelWidth;
             displayPixelHeight_ = di.displayPixelHeight;
+            displayWidthM_ = di.displaySizeMeters.width;
+            nominalViewerZ_ = di.nominalViewerPositionInDisplaySpace.z;
             displayDesktopLeft_ = desktopPos.left;
             displayDesktopTop_ = desktopPos.top;
             displayDeviceName_.assign(desktopInfo.deviceName,
                                       strnlen(desktopInfo.deviceName, sizeof(desktopInfo.deviceName)));
-            LOG_INFO("Display: %ux%u px, %.3fx%.3f m, desktop pos (%d, %d)",
+            LOG_INFO("Display: %ux%u px, %.3fx%.3f m, nominal viewer %.3f m, desktop pos (%d, %d)",
                      displayPixelWidth_, displayPixelHeight_,
-                     di.displaySizeMeters.width, di.displaySizeMeters.height,
+                     di.displaySizeMeters.width, di.displaySizeMeters.height, nominalViewerZ_,
                      displayDesktopLeft_, displayDesktopTop_);
         }
     }

@@ -50,7 +50,7 @@ constexpr uint32_t kBindings = 8;  // 3 source planes, the grade LUT, 3 compare 
 struct DrawPush {
     float off[2];        //  0
     float scale[2];      //  8
-    int32_t mode;        // 16
+    int32_t mode;        // 16  bits 0-1 source format; bits 8+ VR flags (#155, vr::PackModeFlags)
     float fullRange;     // 20
     float srgbTarget;    // 24
     int32_t qcMode;      // 28
@@ -59,11 +59,11 @@ struct DrawPush {
     float lutOn;         // 44
     float cdlSlope[4];   // 48  .a = saturation
     float cdlOffset[4];  // 64  .a = CDL on
-    float cdlPower[4];   // 80
+    float cdlPower[4];   // 80  .a = VR window pitch, radians (#155)
     float lutDomain[4];  // 96  x = min, y = 1/(max-min), z = N
     int32_t yuvMatrix;   // 112 0 = BT.709 (default), 1 = BT.601, 2 = BT.2020 NCL
     float zebraLevel;    // 116 > 0: zebra stripes at or above this graded luma
-    int32_t viewFlags;   // 120 channel (bits 0-2) + wipe mode (bits 4-5)
+    int32_t viewFlags;   // 120 channel (bits 0-2) + wipe mode (bits 4-5); bits 16-31 VR heading (#155)
     uint32_t wipeGamma;  // 124 PackWipeGamma(): wipe position + display gamma
 };
 static_assert(sizeof(DrawPush) == 128, "DrawPush must match the shader's PushConstants");
@@ -889,7 +889,7 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         pc.off[1] = uvs[v].offY;
         pc.scale[0] = uvs[v].scaleX;
         pc.scale[1] = uvs[v].scaleY;
-        pc.mode = sourceMode_;
+        pc.mode = sourceMode_ | (int32_t)uvs[v].vrMode;  // vrMode = 0 unless a VR draw (#155)
         pc.fullRange = sourceFullRange_;
         pc.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
         pc.qcMode = grade_.qcMode;
@@ -904,6 +904,7 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         }
         pc.cdlSlope[3] = grade_.saturation;
         pc.cdlOffset[3] = grade_.cdlOn ? 1.0f : 0.0f;
+        pc.cdlPower[3] = uvs[v].vrPitch;  // the CDL power is RGB only
         pc.lutDomain[0] = lut_.domainMin;
         pc.lutDomain[1] = 1.0f / std::max(1e-6f, lut_.domainMax - lut_.domainMin);
         pc.lutDomain[2] = (float)std::max(1u, lut_.size);
@@ -915,6 +916,7 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
             pc.viewFlags |= (compareMode_ << 8) | ((compareFullRange_ ? 1 : 0) << 10) | (compareMatrix_ << 11) |
                             ((compare16_ ? 1 : 0) << 13) | (1 << 14);
         if (grade_.calOn && cal_.view) pc.viewFlags |= 1 << 15;  // display calibration (#133)
+        pc.viewFlags |= (int32_t)uvs[v].vrHeading;  // bits 16-31 (vr::PackHeading)
         pc.wipeGamma = PackWipeGamma(grade_.wipePos, grade_.gamma);
         vkCmdPushConstants(cmd, activeLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);

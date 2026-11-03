@@ -290,6 +290,7 @@ function(mp_add_player tgt is_pro)
         src/media/ImageSequence.cpp  # EXR / DPX / TIFF frames as one clip (Pro formats only)
         src/media/AutoConvergence.cpp  # live auto-convergence (#92): disparity.js port
         src/media/StreamUrl.cpp      # stream-URL classifier (#93)
+        src/media/VrView.cpp         # VR180 / VR360 viewer (#155): rectified window geometry, pure
         src/media/LiftClient.cpp     # "Convert to 3D": XR_DXR_lift VIEWS_MONO stream (CPU in / out)
         src/media/InputProviderClient.cpp  # XR_DXR_input_providers: the Input popup
         src/ui/Hud.cpp
@@ -667,6 +668,26 @@ if(MP_BUILD_TESTS)
         src/Log.cpp)
     target_include_directories(camera_select_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME camera_select COMMAND camera_select_test)
+
+    # VR180 / VR360 viewer (#155): the stereo pair stays rectified (vertical disparity ~0)
+    # across the whole pan / pitch range on synthetic scenes, plus clamps and detection.
+    # With FFmpeg it also reads the committed sv3d / st3d fixtures (tools/vr/make_vr_fixtures.py).
+    if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
+        add_executable(vr_view_test tests/vr_view_test.cpp src/media/VrView.cpp
+            src/media/VideoStereoProbe.cpp src/media/StereoDetect.cpp src/media/MediaSource.cpp
+            src/media/SpatialMedia.cpp src/Log.cpp)
+        target_compile_definitions(vr_view_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1
+            MP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+        if(TARGET PkgConfig::FFMPEG)
+            target_link_libraries(vr_view_test PRIVATE PkgConfig::FFMPEG)
+        else()
+            target_link_libraries(vr_view_test PRIVATE mp_ffmpeg)
+        endif()
+    else()
+        add_executable(vr_view_test tests/vr_view_test.cpp src/media/VrView.cpp)
+    endif()
+    target_include_directories(vr_view_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME vr_view COMMAND vr_view_test)
 
     # Auto-convergence (#92): synthetic SBS pairs with known disparity. Pure, no SDL.
     add_executable(auto_convergence_test
