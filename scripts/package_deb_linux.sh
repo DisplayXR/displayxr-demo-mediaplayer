@@ -5,6 +5,13 @@
 #
 #   ./scripts/package_deb_linux.sh            # build (if needed) + package
 #   ./scripts/package_deb_linux.sh --no-build # package an existing build-deb/
+#   ./scripts/package_deb_linux.sh --pro --no-build
+#                                             # Media Player Pro from the same build (#139)
+#
+# The build always includes Pro (MP_BUILD_PRO=ON), so one build feeds both packages.
+# Pro is its own package (displayxr-mediaplayer-pro, /usr/lib/displayxr-demos/
+# mediaplayer-pro) that installs alongside the Media Player, versioned from the
+# pro-v* tags as the Windows / macOS Pro installers are.
 #
 # Output: dist/<pkg>_<ver>_<arch>.deb
 #
@@ -74,6 +81,28 @@ EXTRA_RECOMMENDS="libpulse0, libxcursor1, libxi6, libxrandr2, libxfixes3"
 # VAAPI drivers are hardware-specific; without one FFmpeg falls back to software.
 EXTRA_SUGGESTS="va-driver-all"
 
+# Shell manifest + sidecar icons + version tags for this product.
+SHELL_MANIFEST="mediaplayer_handle_vk_win.displayxr.json"
+SIDECAR_ICONS="icon.png icon_sbs.png"
+TAG_PREFIX="v"
+PRO_NOTE=""
+
+PRO=0
+for a in "$@"; do [ "$a" = --pro ] && PRO=1; done
+if [ "$PRO" = 1 ]; then
+  # Media Player Pro (#139). Same build, same portability rules (the Pro code adds no
+  # system library); DeckLink and OpenColorIO are not built in (see PRO_NOTE).
+  APP="mediaplayer-pro"
+  PKG="displayxr-mediaplayer-pro"
+  DISPLAY_NAME="DisplayXR Media Player Pro"
+  DESCRIPTION="3D monitoring and review for glasses-free 3D displays: stereo QC, looks, rig checks."
+  BINARY="mediaplayer_pro_handle_vk_linux"
+  SHELL_MANIFEST="mediaplayer_pro_handle_vk_win.displayxr.json"
+  SIDECAR_ICONS="icon_pro.png icon_pro_sbs.png"
+  TAG_PREFIX="pro-v"
+  PRO_NOTE="This Linux build has no Blackmagic DeckLink input and no OpenColorIO (.cube LUTs and ASC CDLs work); live input is UVC cameras and the test signal."
+fi
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -84,7 +113,8 @@ FFMPEG_PREFIX="${FFMPEG_PREFIX:-/tmp/ffmpeg-slim-linux}"
 NO_BUILD=0
 for a in "$@"; do case "$a" in
   --no-build) NO_BUILD=1 ;;
-  *) echo "Unknown option: $a (supported: --no-build)" >&2; exit 2 ;;
+  --pro) : ;;
+  *) echo "Unknown option: $a (supported: --no-build, --pro)" >&2; exit 2 ;;
 esac; done
 
 command -v dpkg-deb >/dev/null 2>&1 || { echo "error: dpkg-deb not found — Debian/Ubuntu host/container only." >&2; exit 1; }
@@ -99,7 +129,8 @@ if [ "$NO_BUILD" = 0 ]; then
   echo "==> Building the private slim FFmpeg (scripts/build_ffmpeg_linux.sh)"
   FFMPEG_PREFIX="$FFMPEG_PREFIX" "$ROOT/scripts/build_ffmpeg_linux.sh"
   echo "==> Building via scripts/build_linux.sh (portable: static SDL3, bundled FFmpeg)"
-  BUILD_DIR="$BUILD_DIR" FFMPEG_ROOT="$FFMPEG_PREFIX" MP_LINUX_PORTABLE=ON "$ROOT/scripts/build_linux.sh"
+  BUILD_DIR="$BUILD_DIR" FFMPEG_ROOT="$FFMPEG_PREFIX" MP_LINUX_PORTABLE=ON MP_BUILD_PRO="${MP_BUILD_PRO:-ON}" \
+    "$ROOT/scripts/build_linux.sh"
 fi
 [ -x "$BIN" ] || { echo "error: demo binary $BIN missing (build, or drop --no-build)." >&2; exit 1; }
 # The static SDL3 must have compiled its X11 video + audio backends as runtime
@@ -115,9 +146,10 @@ done
 grep -q '^MP_LINUX_PORTABLE:BOOL=ON' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null \
   || { echo "error: $BUILD_DIR is not an MP_LINUX_PORTABLE build — it would link the distro FFmpeg." >&2; exit 1; }
 
-# --- Version: git describe → Debian-legal upstream version (v* tags only) ---
-RAW="$(git -C "$ROOT" describe --tags --always --dirty --match 'v[0-9]*' 2>/dev/null || echo 0.0.0)"
-VERSION="$(echo "$RAW" | sed -e 's/^v//' -e 's/-dirty$/+dirty/' -e 's/-\([0-9]\+\)-g/+\1.g/')"
+# --- Version: git describe → Debian-legal upstream version --------------------
+# v* tags for the Media Player, pro-v* for Pro (each product counts its own releases).
+RAW="$(git -C "$ROOT" describe --tags --always --dirty --match "${TAG_PREFIX}[0-9]*" 2>/dev/null || echo 0.0.0)"
+VERSION="$(echo "$RAW" | sed -e "s/^${TAG_PREFIX}//" -e 's/-dirty$/+dirty/' -e 's/-\([0-9]\+\)-g/+\1.g/')"
 case "$VERSION" in [0-9]*) : ;; *) VERSION="0.0.0+g$VERSION" ;; esac
 ARCH="$(dpkg --print-architecture)"
 
@@ -167,12 +199,11 @@ done
 # <exe-dir>/displayxr/{idle,logo}.png for the no-media idle screen, and the
 # workspace manifest/icons ride along (manifest renamed to the Linux binary).
 mkdir -p "$APPDIR/displayxr"
-for f in idle.png logo.png icon.png icon_sbs.png; do
+for f in idle.png logo.png $SIDECAR_ICONS; do
   [ -f "$ROOT/displayxr/$f" ] && install -m 0644 "$ROOT/displayxr/$f" "$APPDIR/displayxr/$f"
 done
-if [ -f "$ROOT/displayxr/mediaplayer_handle_vk_win.displayxr.json" ]; then
-  install -m 0644 "$ROOT/displayxr/mediaplayer_handle_vk_win.displayxr.json" \
-    "$APPDIR/displayxr/$BINARY.displayxr.json"
+if [ -f "$ROOT/displayxr/$SHELL_MANIFEST" ]; then
+  install -m 0644 "$ROOT/displayxr/$SHELL_MANIFEST" "$APPDIR/displayxr/$BINARY.displayxr.json"
 fi
 echo "==> displayxr/ sidecar staged (idle screen + manifest)"
 
@@ -211,7 +242,7 @@ EOF
 # binary: the launcher is what selects the vk_native compositor (the bundled
 # libs come from the binary's RUNPATH=$ORIGIN).
 # Generated from the repo's own manifest so the two cannot drift.
-SHELL_MANIFEST_SRC="$ROOT/displayxr/mediaplayer_handle_vk_win.displayxr.json"
+SHELL_MANIFEST_SRC="$ROOT/displayxr/$SHELL_MANIFEST"
 SHELL_REG_DIR="$STAGE/usr/share/displayxr/apps"
 mkdir -p "$APPDIR/displayxr" "$SHELL_REG_DIR"
 python3 - "$SHELL_MANIFEST_SRC" "$STAGE" "/usr/lib/displayxr-demos/$APP/displayxr" \
@@ -293,7 +324,7 @@ Recommends: $EXTRA_RECOMMENDS
 Suggests: $EXTRA_SUGGESTS
 Installed-Size: $INSTALLED_KB
 Maintainer: The DisplayXR Project <noreply@displayxr.dev>
-Homepage: https://github.com/DisplayXR/displayxr-demo-$APP
+Homepage: https://github.com/DisplayXR/displayxr-demo-mediaplayer
 Description: $DISPLAY_NAME
  $DESCRIPTION
  .
@@ -302,6 +333,9 @@ Description: $DISPLAY_NAME
  processor is active (sim-display fallback, or the Leia SR plug-in when
  installed). Launch from the menu or run '$PKG'.
 EOF
+if [ -n "$PRO_NOTE" ]; then
+  printf ' .\n %s\n' "$PRO_NOTE" >> "$STAGE/DEBIAN/control"
+fi
 
 mkdir -p "$DIST_DIR"
 DEB="$DIST_DIR/${PKG}_${VERSION}_${ARCH}.deb"

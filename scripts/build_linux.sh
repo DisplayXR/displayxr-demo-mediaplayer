@@ -61,6 +61,8 @@ BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
 EXTRA_ARGS=()
 [ -n "${FFMPEG_ROOT:-}" ] && EXTRA_ARGS+=("-DFFMPEG_ROOT=$FFMPEG_ROOT")
 [ -n "${MP_LINUX_PORTABLE:-}" ] && EXTRA_ARGS+=("-DMP_LINUX_PORTABLE=$MP_LINUX_PORTABLE")
+# MP_BUILD_PRO=ON also builds Media Player Pro (mediaplayer_pro_handle_vk_linux, #139).
+[ -n "${MP_BUILD_PRO:-}" ] && EXTRA_ARGS+=("-DMP_BUILD_PRO=$MP_BUILD_PRO")
 cmake -S . -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH="$OPENXR_DIR" \
@@ -69,6 +71,11 @@ cmake --build "$BUILD_DIR"
 
 BIN="$BUILD_DIR/mediaplayer_handle_vk_linux"
 [ -x "$BIN" ] || { echo "Error: expected binary not found at $BIN" >&2; exit 1; }
+if [ "${MP_BUILD_PRO:-}" = ON ]; then
+    PRO_BIN="$BUILD_DIR/mediaplayer_pro_handle_vk_linux"
+    [ -x "$PRO_BIN" ] || { echo "Error: MP_BUILD_PRO=ON but $PRO_BIN was not built" >&2; exit 1; }
+    echo "Built: $PRO_BIN"
+fi
 
 echo ""
 echo "Built: $BIN"
