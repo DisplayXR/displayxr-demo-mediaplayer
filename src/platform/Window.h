@@ -154,6 +154,20 @@ public:
     // auto-convergence subject). False if none.
     bool TakeCtrlClick(float& x, float& y);
     bool TakeOpenUrlRequest();         // Ctrl+U — the stream-URL popup (#93)
+
+    // --- VR180 / VR360 viewer (#155) ---
+    // While a VR projection is on screen the arrow keys steer the view instead of stepping
+    // frames / walking the folder (`[` / `]` still step, PageUp / PageDown walk the folder).
+    void SetArrowsPanView(bool on) { arrowsPanView_ = on; }
+    // Net arrow nudges since the last read (key-repeat counts): +x = Right, +y = Up.
+    bool TakeViewNudge(int& dx, int& dy);
+    // Left-button drag since the last read, in window points (Ctrl+drag excluded: that is
+    // the auto-convergence pin). The app ignores it while ImGui owns the mouse.
+    bool TakeViewDrag(float& dx, float& dy);
+    float TakeWheelSteps();            // net wheel notches since the last read (+ = up)
+    bool TakeDoubleClick();            // left double-click in the content
+    bool TakeRecenterRequest();        // `R` — re-centre the VR view
+    bool TakeCycleProjectionRequest(); // `P` — cycle the VR projection override
     // While an ImGui text field has focus the app's single-key shortcuts (Space, L, V,
     // ESC-quits, ...) must not fire on what the user types. The app sets this each frame
     // from ImGui's WantTextInput; PumpEvents then leaves key-downs to ImGui alone.
@@ -220,6 +234,20 @@ private:
     bool ctrlClick_ = false;
     float ctrlClickX_ = 0.0f, ctrlClickY_ = 0.0f;
     bool openUrlRequested_ = false;
+    // VR viewer input (#155).
+    bool arrowsPanView_ = false;
+    int viewNudgeX_ = 0, viewNudgeY_ = 0;
+    float viewDragX_ = 0.0f, viewDragY_ = 0.0f;
+    bool leftDown_ = false;
+    float wheelSteps_ = 0.0f;
+    bool doubleClick_ = false;
+    bool recenterRequested_ = false;
+    bool cycleProjectionRequested_ = false;
+#if defined(__linux__) && !defined(__ANDROID__)
+    float dragLastX_ = 0.0f, dragLastY_ = 0.0f;
+    uint32_t lastClickMs_ = 0;
+    int32_t lastClickX_ = 0, lastClickY_ = 0;
+#endif
     bool keyboardCaptured_ = false;
     std::vector<std::pair<uint32_t, uint32_t>> cameraEvents_;
     std::vector<std::string> dropBatch_;

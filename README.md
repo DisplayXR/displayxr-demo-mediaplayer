@@ -96,6 +96,41 @@ loads the first and makes the dropped set the list Up / Down and the slideshow w
 Dropping a **folder** opens its first asset and starts the slideshow, with the folder as
 that list — the same thing as passing the folder on the command line, plus playback.
 
+## VR180 / VR360 viewer (#155)
+
+VR180 and stereo VR360 files play as a **window into the scene**, steered with the mouse,
+instead of a flat, distorted packed frame. Each eye's half of the frame is projected onto the
+sphere and seen through a virtual camera window.
+
+- **Projections:** equirectangular half sphere (YouTube VR180) and full sphere (VR360), side by
+  side or top-bottom, and dual fisheye (raw VR180 camera files, equidistant, lens FOV 180 by
+  default). Mono 360 / 180 pans in 2D.
+- **Detection:** MP4 / MOV spherical metadata (`sv3d` / `proj` / `equi`, with `st3d` for the
+  packing), then file-name tokens (`vr180`, `180`, `180x180`, `360`, `vr360`, `fisheye`, with
+  `3dh` / `sbs` / `lr` and `3dv` / `tb` for the packing; a bare `180` / `360` only counts on a
+  frame of the right shape). **P** cycles the projection override (auto / flat / VR180 /
+  VR360 / fisheye); **L** still sets the packing. MCP: `set_layout {projection, fisheye_fov_deg}`.
+- **Controls:** drag pans and tilts, the wheel zooms, **double-click** or **R** re-centres,
+  the arrow keys pan in 5° steps (`[` / `]` step frames and PageUp / PageDown walk the folder
+  meanwhile). MCP `get_view` / `set_view {yaw_deg, pitch_deg, fov_deg, recenter}`.
+- **Life-size by default:** the window's field of view is the panel's real angular width at
+  the nominal viewing distance (`XR_DXR_display_info`). Zooming also scales the disparity;
+  auto-convergence (**A**) measures the rendered eye windows, so it keeps working.
+- **The stereo pair stays rectified.** The two source cameras sit on a fixed horizontal
+  baseline. Pitch is a real rotation about that baseline, so rows stay aligned. Yaw is **not**
+  a rotation, which would add vertical disparity off-centre and flatten depth by ~cos(yaw):
+  both eyes keep their image plane parallel to the baseline and the view pans as an
+  **off-axis (lens-shifted) window** across it, clamped to ±65° (`MEDIAPLAYER_VR_PAN_MAX`)
+  where its stretch becomes the trade. Stereo VR360 is omni-directional stereo; its window is
+  cylindrical (row = elevation), which keeps the rows aligned at every heading. Convergence
+  is a lens shift of the window too, so it never exposes a de-occlusion strip.
+  `tests/vr_view_test.cpp` measures the vertical disparity across the whole pan / pitch / zoom
+  range on synthetic scenes (≈0.003 px, against ~21 px for a naively rotated pair).
+- **Test media:** `tools/vr/make_vr_fixtures.py --assets DIR` renders synthetic VR180,
+  dual-fisheye and VR360 stills and clips (needs numpy + ffmpeg). Headless:
+  `MEDIAPLAYER_VR=equirect180|equirect360|fisheye|flat`, `MEDIAPLAYER_VR_VIEW=yaw,pitch[,fov]`.
+- Desktop only for now; Android touch control is a follow-up.
+
 ## Live camera (#90)
 
 A live **stereo camera** can stand in for a file: a side-by-side UVC webcam such as the

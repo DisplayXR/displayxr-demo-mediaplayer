@@ -225,6 +225,11 @@ void Window::HandleLinuxKey(uint32_t ks, uint32_t mods, bool repeat, bool* quit)
     const bool ctrl = (mods & DxrModCtrl) != 0;
     const bool shift = (mods & DxrModShift) != 0;
     // Convergence nudges and frame steps repeat while held; everything else is one-shot.
+    if (arrowsPanView_ && (ks == XK_Left || ks == XK_Right || ks == XK_Up || ks == XK_Down)) {
+        viewNudgeX_ += ks == XK_Right ? 1 : ks == XK_Left ? -1 : 0;  // VR viewer (#155)
+        viewNudgeY_ += ks == XK_Up ? 1 : ks == XK_Down ? -1 : 0;
+        return;
+    }
     if (ks == XK_equal) { ++convergenceSteps_; return; }
     if (ks == XK_minus) { --convergenceSteps_; return; }
     if (ks == XK_bracketright) { ++frameStepRequest_; return; }
@@ -244,8 +249,10 @@ void Window::HandleLinuxKey(uint32_t ks, uint32_t mods, bool repeat, bool* quit)
         case XK_BackSpace: autoConvergeRequested_ = true; break;
         case XK_x: swapEyesRequested_ = true; break;
         case XK_space: togglePauseRequested_ = true; break;
-        case XK_Up: prevMediaRequested_ = true; break;
-        case XK_Down: nextMediaRequested_ = true; break;
+        case XK_Up: case XK_Prior: prevMediaRequested_ = true; break;
+        case XK_Down: case XK_Next: nextMediaRequested_ = true; break;
+        case XK_r: recenterRequested_ = true; break;         // VR re-centre (#155)
+        case XK_p: cycleProjectionRequested_ = true; break;  // VR projection (#155)
         case XK_s: toggleSlideshowRequested_ = true; break;
         case XK_m: toggleMuteRequested_ = true; break;
         case XK_l:                                                // stereo layout override
@@ -305,6 +312,12 @@ bool Window::PumpEvents() {
                 case DxrWindowEvent::Type::Motion:
                     mouseX_ = (float)ev.x;
                     mouseY_ = (float)ev.y;
+                    if (leftDown_) {  // VR viewer drag (#155)
+                        viewDragX_ += (float)ev.x - dragLastX_;
+                        viewDragY_ += (float)ev.y - dragLastY_;
+                        dragLastX_ = (float)ev.x;
+                        dragLastY_ = (float)ev.y;
+                    }
                     if (!mouseInWindow_) { mouseInWindow_ = true; mouseActivity_ = true; }
                     break;
                 case DxrWindowEvent::Type::PointerLeave:
@@ -315,13 +328,33 @@ bool Window::PumpEvents() {
                     // Discrete pointer activity wakes the auto-hide UI (motion is
                     // polled by the app, jitter-immune). A window drag still counts.
                     mouseActivity_ = true;
+                    if (ev.button == 1 && !ev.window_drag && !(ev.mods & DxrModCtrl)) {
+                        leftDown_ = true;  // VR viewer drag + double-click (#155)
+                        dragLastX_ = (float)ev.x;
+                        dragLastY_ = (float)ev.y;
+                        const int32_t ddx = ev.x - lastClickX_, ddy = ev.y - lastClickY_;
+                        if (lastClickMs_ != 0 && ev.time_ms - lastClickMs_ < 400 && ddx * ddx + ddy * ddy < 64) {
+                            doubleClick_ = true;
+                            lastClickMs_ = 0;
+                        } else {
+                            lastClickMs_ = ev.time_ms ? ev.time_ms : 1;
+                            lastClickX_ = ev.x;
+                            lastClickY_ = ev.y;
+                        }
+                    }
                     if (ev.button == 1 && !ev.window_drag && (ev.mods & DxrModCtrl)) {
                         ctrlClick_ = true;  // #92: pin the auto-convergence subject
                         ctrlClickX_ = (float)ev.x;
                         ctrlClickY_ = (float)ev.y;
                     }
                     break;
-                case DxrWindowEvent::Type::Scroll: mouseActivity_ = true; break;
+                case DxrWindowEvent::Type::ButtonUp:
+                    if (ev.button == 1) leftDown_ = false;
+                    break;
+                case DxrWindowEvent::Type::Scroll:
+                    mouseActivity_ = true;
+                    wheelSteps_ += (float)ev.scroll_steps;
+                    break;
                 case DxrWindowEvent::Type::Drop:
                     // Drag and drop (#44): one event per drop, the whole batch.
                     dropBatch_ = ev.paths;
