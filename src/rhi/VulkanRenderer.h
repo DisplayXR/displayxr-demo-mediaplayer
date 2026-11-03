@@ -43,6 +43,12 @@ struct ViewUV {
     // UV offset from this view's sample to the same scene point in the OTHER eye. Only
     // read by the Pro QC views (difference / anaglyph); 0 everywhere else.
     float otherDX = 0.0f, otherDY = 0.0f;
+    // VR180 / VR360 viewer (#155): when vrMode != 0 the offset/scale above are the eye's
+    // TANGENT window, not a source rect, and the shader samples through the sphere. Built
+    // by vr::PackModeFlags / vr::PackHeading (src/media/VrView.h). All 0 = a flat draw.
+    uint32_t vrMode = 0;     // OR-ed into the push block's `mode` (bits 8+)
+    float vrPitch = 0.0f;    // radians
+    uint32_t vrHeading = 0;  // OR-ed into viewFlags (bits 16-31)
 };
 
 // Media Player Pro grade, applied in the source shader to every DrawViews draw:

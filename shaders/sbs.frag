@@ -8,6 +8,11 @@
 // uvOffset/uvScale select the SBS half: left eye = offset(0,0) scale(0.5,1), right eye =
 // offset(0.5,0) scale(0.5,1); a 2D source uses offset(0,0) scale(1,1).
 //
+// The VR180 / VR360 viewer (#155, desktop only, MP_GRADE): when `mode` carries VR flags
+// (bits 8+), uvOffset/uvScale are instead the eye's TANGENT window and VrLocalUV() maps it
+// through the sphere into the eye's rect - see src/media/VrView.h (SampleUV is the CPU twin
+// of VrLocalUV; keep them identical) and the push-block note there.
+//
 // MP_GRADE (defined for the DESKTOP build by scripts/gen_shaders.sh) adds the Media
 // Player Pro grade (exposure, ASC CDL, 3D LUT at binding 3) and the QC views, and
 // grows the push block to 116 bytes (yuvMatrix last). The Android leg compiles this same file WITHOUT
@@ -31,7 +36,7 @@ layout(binding = 7) uniform sampler3D calLut;  // per-panel display calibration 
 layout(push_constant) uniform PushConstants {
     vec2 uvOffset;
     vec2 uvScale;
-    int mode;        // 0 = RGBA, 1 = I420, 2 = NV12
+    int mode;        // bits 0-1: 0 = RGBA, 1 = I420, 2 = NV12. MP_GRADE: bits 8+ = VR flags (#155)
     float fullRange; // 1 = full/JPEG range, 0 = limited/MPEG range
     float srgbTarget;// 1 = the colour attachment is an _SRGB view (encodes on store)
 #ifdef MP_GRADE
@@ -43,14 +48,15 @@ layout(push_constant) uniform PushConstants {
     float lutOn;     // 1 = sample lut3d
     vec4 cdlSlope;   // .rgb = ASC slope, .a = ASC saturation
     vec4 cdlOffset;  // .rgb = ASC offset, .a = 1 when the CDL is on
-    vec4 cdlPower;   // .rgb = ASC power
+    vec4 cdlPower;   // .rgb = ASC power; .a = VR window pitch, radians (#155)
     vec4 lutDomain;  // .x = domain min, .y = 1/(max-min), .z = LUT size N, .w = 1 for P016
     int yuvMatrix;   // 0 = BT.709 (default: base content unchanged), 1 = BT.601, 2 = BT.2020 NCL
     float zebraLevel;// > 0: diagonal stripes where the graded luma is at or above it (0..1)
     int viewFlags;   // bits 0-2 channel (0 RGB, 1 R, 2 G, 3 B, 4 alpha, 5 luma); bits 4-5 wipe
                      // (0 off, 1 before | after the grade, 2 left eye | right eye, 3 clip A | B);
-                     // B's sampling: bits 8-9 mode, 10 full range, 11-12 matrix, 13 P016, 14 bound
-                     // bit 15: display calibration on (calLut, domain 0..1)
+                     // B's sampling: bits 8-9 mode, 10 full range, 11-12 matrix, 13 P016, 14 bound;
+                     // bit 15: display calibration on (calLut, domain 0..1);
+                     // bits 16-31: VR heading, unorm16 of a turn (#155)
     uint wipeGamma;  // low 16 bits: wipe position across the picture (unorm16); high 16 bits:
                      // display gamma x 4096 (0 = 1.0)
 #endif
@@ -84,13 +90,16 @@ vec3 YuvToRgb(float yb, float ub, float vb) {
                 yb + 1.8556 * ub);
 }
 
+// The source's pixel format (the low bits of `mode`; the VR viewer uses the rest).
+int SrcMode() { return pc.mode & 3; }
+
 // Fetch the display-referred RGB at `uv` (RGBA texture or planar YUV).
 vec3 SampleSource(vec2 uv) {
-    if (pc.mode == 0) return texture(plane0, uv).rgb;
+    if (SrcMode() == 0) return texture(plane0, uv).rgb;
 
     float y = texture(plane0, uv).r;
     float u, v;
-    if (pc.mode == 2) {            // NV12: chroma interleaved in .rg
+    if (SrcMode() == 2) {          // NV12: chroma interleaved in .rg
         vec2 c = texture(plane1, uv).rg;
         u = c.r;
         v = c.g;
@@ -209,9 +218,88 @@ vec3 FalseColour(vec3 c) {
 vec3 Grade(vec3 c) { return c; }
 #endif
 
+#ifdef MP_GRADE
+// ---- VR180 / VR360 viewer (#155) -------------------------------------------------------
+const float kPi = 3.14159265358979;
+int VrProj() { return (pc.mode >> 8) & 3; }  // 0 none, 1 equirect 180, 2 equirect 360, 3 fisheye
+
+// This draw's (or the other eye's) rect in the frame: SBS / TB halves or the whole frame.
+vec4 VrEyeRect(bool otherEye) {
+    int pk = (pc.mode >> 12) & 3;
+    bool second = (((pc.mode >> 14) & 1) != 0) != otherEye;
+    float k = second ? 0.5 : 0.0;
+    if (pk == 1) return vec4(k, 0.0, 0.5, 1.0);
+    if (pk == 2) return vec4(0.0, k, 1.0, 0.5);
+    return vec4(0.0, 0.0, 1.0, 1.0);
+}
+
+// Tangent coordinates -> eye-local source uv (.xy) and 1 inside the picture / 0 outside
+// (.z). vr::SampleUV in src/media/VrView.h, line for line.
+vec3 VrLocalUV(vec2 t, vec2 eyePx) {
+    int model = (pc.mode >> 10) & 3;
+    float heading = float(uint(pc.viewFlags) >> 16) / 65536.0 * 2.0 * kPi;
+    vec3 d;
+    if (model == 1) {              // cylinder (stereo ODS 360): row = tan(elevation)
+        float a = heading + atan(t.x);
+        float e = atan(t.y);
+        d = vec3(cos(e) * sin(a), sin(e), cos(e) * cos(a));
+    } else {                       // plane (off-axis window, pitch rotates) / free (mono)
+        float cp = cos(pc.cdlPower.a), sp = sin(pc.cdlPower.a);
+        vec3 c = vec3(t.x, t.y * cp + sp, -t.y * sp + cp);
+        float ch = cos(heading), sh = sin(heading);
+        d = vec3(c.x * ch + c.z * sh, c.y, -c.x * sh + c.z * ch);
+    }
+    int proj = VrProj();
+    if (proj == 3) {               // equidistant fisheye, image circle inscribed in the eye
+        float len = length(d);
+        float th = acos(clamp(len > 0.0 ? d.z / len : 1.0, -1.0, 1.0));
+        float halfFov = radians(float((pc.mode >> 16) & 511)) * 0.5;
+        float r = 0.5 * th / halfFov;
+        float rho = length(d.xy);
+        vec2 dir = rho > 1e-8 ? d.xy / rho : vec2(0.0);
+        float aspect = eyePx.y > 0.0 ? eyePx.x / eyePx.y : 1.0;
+        vec2 k = aspect > 1.0 ? vec2(1.0 / aspect, 1.0) : vec2(1.0, aspect);
+        return vec3(0.5 + dir.x * r * k.x, 0.5 - dir.y * r * k.y, th <= halfFov ? 1.0 : 0.0);
+    }
+    float lon = atan(d.x, d.z);
+    float lat = atan(d.y, length(d.xz));
+    float v = 0.5 - lat / kPi;
+    if (proj == 1) return vec3(lon / kPi + 0.5, v, abs(lon) <= 0.5 * kPi ? 1.0 : 0.0);
+    return vec3(fract(lon / (2.0 * kPi) + 0.5), v, 1.0);
+}
+
+// The frame uv a VR draw samples at tangent `t`, for this eye or the other one. .z = 0
+// where the projection has no picture (drawn black).
+vec3 VrFrameUV(vec2 t, bool otherEye) {
+    vec4 r = VrEyeRect(otherEye);
+    vec2 eyePx = r.zw * vec2(textureSize(plane0, 0));
+    vec3 l = VrLocalUV(t, eyePx);
+    // Stay half a texel inside the eye's rect: bilinear taps must not reach the other eye.
+    vec2 h = 0.5 / max(eyePx, vec2(1.0));
+    return vec3(r.xy + clamp(l.xy, h, 1.0 - h) * r.zw, l.z);
+}
+#endif
+
 void main() {
     vec2 uv = pc.uvOffset + vUV * pc.uvScale;
+#ifdef MP_GRADE
+    // VR viewer: uv was the tangent window; the source uv comes through the sphere.
+    // otherUv is where the same window point lands in the OTHER eye (the Pro QC views):
+    // for a VR draw otherDelta is a tangent offset (the eyes' convergence difference).
+    const bool vr = VrProj() != 0;
+    vec2 tan0 = uv;
+    float inPicture = 1.0;
+    if (vr) {
+        vec3 f = VrFrameUV(tan0, false);
+        uv = f.xy;
+        inPicture = f.z;
+    }
+    vec2 otherUv = vr ? VrFrameUV(tan0 + pc.otherDelta, true).xy : uv + pc.otherDelta;
+#endif
     vec3 graded = Grade(SampleSource(uv));
+#ifdef MP_GRADE
+    if (inPicture < 0.5) graded = vec3(0.0);
+#endif
     vec3 c = graded;
 #ifdef MP_GRADE
     const int channel = pc.viewFlags & 7;
@@ -222,7 +310,7 @@ void main() {
     // 2: left of it the left eye, right of it the right eye (otherDelta reaches it).
     const bool pastWipe = wipe != 0 && vUV.x >= wipePos;
     if (wipe == 1 && !pastWipe) c = SampleSource(uv);
-    if (wipe == 2 && pastWipe) c = Grade(SampleSource(uv + pc.otherDelta));
+    if (wipe == 2 && pastWipe) c = Grade(SampleSource(otherUv));
     // 3: right of the line the compare clip B, at the same point of the same eye, graded
     // the same way (both versions seen through one look). Without B bound, A stays.
     if (wipe == 3 && pastWipe && ((pc.viewFlags >> 14) & 1) != 0) c = Grade(SampleSourceB(uv));
@@ -231,10 +319,10 @@ void main() {
 
 #ifdef MP_GRADE
     if (pc.qcMode == 1) {          // eye difference: alignment / sync check
-        vec3 o = Grade(SampleSource(uv + pc.otherDelta));
+        vec3 o = Grade(SampleSource(otherUv));
         c = clamp(abs(c - o) * 4.0, 0.0, 1.0);
     } else if (pc.qcMode == 2) {   // anaglyph: red = this (left) eye, cyan = the other
-        vec3 o = Grade(SampleSource(uv + pc.otherDelta));
+        vec3 o = Grade(SampleSource(otherUv));
         float l = dot(c, vec3(0.299, 0.587, 0.114));
         float r = dot(o, vec3(0.299, 0.587, 0.114));
         c = vec3(l, r, r);
@@ -254,7 +342,7 @@ void main() {
     if (channel == 1) c = vec3(c.r);
     else if (channel == 2) c = vec3(c.g);
     else if (channel == 3) c = vec3(c.b);
-    else if (channel == 4) c = vec3(pc.mode == 0 ? texture(plane0, uv).a : 1.0);
+    else if (channel == 4) c = vec3(SrcMode() == 0 ? texture(plane0, uv).a : 1.0);
     else if (channel == 5) c = vec3(dot(c, vec3(0.2126, 0.7152, 0.0722)));
     if (pc.zebraLevel > 0.0 && pc.qcMode != 1 &&
         dot(graded, vec3(0.2126, 0.7152, 0.0722)) >= pc.zebraLevel) {
@@ -266,6 +354,9 @@ void main() {
     }
 #endif
 
-    float a = pc.mode == 0 ? texture(plane0, uv).a : 1.0;
+    float a = SrcMode() == 0 ? texture(plane0, uv).a : 1.0;
+#ifdef MP_GRADE
+    if (inPicture < 0.5) { c = vec3(0.0); a = 1.0; }
+#endif
     outColor = EncodeForTarget(vec4(c, a));
 }

@@ -270,9 +270,9 @@ bool XrSession::InitInstanceAndSystem() {
             displayDesktopTop_ = desktopPos.top;
             displayDeviceName_.assign(desktopInfo.deviceName,
                                       strnlen(desktopInfo.deviceName, sizeof(desktopInfo.deviceName)));
-            LOG_INFO("Display: %ux%u px, %.3fx%.3f m, desktop pos (%d, %d)",
+            LOG_INFO("Display: %ux%u px, %.3fx%.3f m, nominal viewer %.3f m, desktop pos (%d, %d)",
                      displayPixelWidth_, displayPixelHeight_,
-                     di.displaySizeMeters.width, di.displaySizeMeters.height,
+                     di.displaySizeMeters.width, di.displaySizeMeters.height, nominalViewerZ_,
                      displayDesktopLeft_, displayDesktopTop_);
         }
     }

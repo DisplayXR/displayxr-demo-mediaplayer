@@ -148,14 +148,15 @@ public:
         displaysChanged_ = false;
         return c;
     }
-    // The panel's physical width (m), native pixel width and nominal viewing distance (m)
-    // from XR_DXR_display_info; 0 when unknown. Pro's target-screen preview uses them (#135).
-    float DisplayWidthMeters() const { return displayWidthM_; }
-    uint32_t DisplayPixelWidth() const { return displayPixelWidth_; }
-    float NominalViewerDistance() const { return nominalViewerZ_; }
 
     // Window-space HUD swapchain (created in Initialize if the runtime supports it).
     bool HasHud() const { return hasHud_; }
+    // The panel's physical size and the nominal viewing distance (XR_DXR_display_info; 0 =
+    // unknown). The VR viewer's life-size field of view (#155) and Pro's target-screen
+    // preview (#135) come from these.
+    float DisplayWidthMeters() const { return displayWidthM_; }
+    uint32_t DisplayPixelWidth() const { return displayPixelWidth_; }
+    float NominalViewerDistance() const { return nominalViewerZ_; }
     // Ask for XR_DXR_local_3d_zone (call before Init). Only Media Player Pro does: it
     // shows its panels as flat 2D (HudSubmit::flat). HasLocal2D() after Init.
     void RequestLocal2D(bool on) { wantLocal2D_ = on; }
@@ -427,6 +428,8 @@ private:
     bool transparentBg_ = false;   // MEDIAPLAYER_TRANSPARENT — letterbox composes through
     uint32_t displayPixelWidth_ = 0;
     uint32_t displayPixelHeight_ = 0;
+    float displayWidthM_ = 0.0f;   // displaySizeMeters.width
+    float nominalViewerZ_ = 0.0f;  // nominalViewerPositionInDisplaySpace.z
     // 3D panel top-left in virtual-desktop pixels (XrDisplayDesktopPositionDXR,
     // display_info v16). (0, 0) = primary/unknown — the safe default.
     int32_t displayDesktopLeft_ = 0;
@@ -434,8 +437,6 @@ private:
     std::string displayDeviceName_;
     bool displaysChanged_ = false;
     PFN_xrEnumerateDisplaysDXR pfnEnumerateDisplays_ = nullptr;
-    float displayWidthM_ = 0.0f;
-    float nominalViewerZ_ = 0.0f;
 
     // Session state machine.
     XrSessionState sessionState_ = XR_SESSION_STATE_UNKNOWN;
