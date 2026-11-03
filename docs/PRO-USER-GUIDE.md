@@ -139,11 +139,18 @@ refused with a message.
 
 Each panel is recognised by the key the DisplayXR runtime gives it (the one
 `displayxr-cli displays --claims` prints), on the display the player's window is on; drag
-the window to another 3D panel and its calibration follows. The key comes from the
-panel's EDID and, when the EDID carries no serial number, from the serial the panel's
-plug-in reports, so moving the cable to another port usually keeps the calibration. Two
-cases do not: a panel that reports a different product code on each input, and a panel
-with no serial at all, whose key follows the port. With a DisplayXR runtime that does not
+the window to another 3D panel and its calibration follows. What the key is depends on
+what the panel reports:
+
+- The panel's plug-in reports the panel's own serial: the key uses it, and moving the
+  cable to another port keeps the calibration.
+- Otherwise, the panel's EDID has a serial number: the same, unless the panel reports a
+  different product code on each input.
+- Neither: the key includes the port (`...@DISPLAY1`), so the calibration stays with the
+  port, not the panel.
+
+Two connected monitors that would otherwise share a key also get the port added. With a
+DisplayXR runtime that does not
 report the key yet (`XR_DXR_display_info` before v24), the OS display name (`DISPLAY1` on
 Windows) stands in, which follows the port.
 The Inspector shows the key when you hover the calibration line. The files live in
