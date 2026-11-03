@@ -126,6 +126,28 @@ public:
     // True when the session was created with transparent-background compositing
     // (MEDIAPLAYER_TRANSPARENT=1) — the renderer should clear letterbox to alpha 0.
     bool TransparentBackground() const { return transparentBg_; }
+    // The OS name of the 3D panel's monitor (XrDisplayDesktopInfoDXR::deviceName, display_info
+    // v18: \.\DISPLAY1 on Windows, the display UUID on macOS, the RandR output on Linux).
+    // Empty on an older runtime. Pro keys its per-panel calibration on it (#133).
+    const std::string& DisplayDeviceName() const { return displayDeviceName_; }
+    // One connected display (xrEnumerateDisplaysDXR, display_info v20+): its OS device
+    // name, its desktop rect (the space the OS places windows in) and the runtime's stable
+    // per-display key (XrDisplayStableKeyDXR, v24; "" on an older runtime). Pro keys its
+    // per-panel calibration on it (#133).
+    struct DisplayEntry {
+        std::string key, deviceName;
+        int32_t x = 0, y = 0;
+        uint32_t w = 0, h = 0;
+        bool systemDefault = false;
+    };
+    // False when the runtime does not enumerate displays.
+    bool EnumerateDisplays(std::vector<DisplayEntry>& out) const;
+    // True once after XrEventDataDisplaysChangedDXR (a monitor added, removed, or rearranged).
+    bool TakeDisplaysChanged() {
+        const bool c = displaysChanged_;
+        displaysChanged_ = false;
+        return c;
+    }
 
     // Window-space HUD swapchain (created in Initialize if the runtime supports it).
     bool HasHud() const { return hasHud_; }
@@ -411,6 +433,9 @@ private:
     // display_info v16). (0, 0) = primary/unknown — the safe default.
     int32_t displayDesktopLeft_ = 0;
     int32_t displayDesktopTop_ = 0;
+    std::string displayDeviceName_;
+    bool displaysChanged_ = false;
+    PFN_xrEnumerateDisplaysDXR pfnEnumerateDisplays_ = nullptr;
 
     // Session state machine.
     XrSessionState sessionState_ = XR_SESSION_STATE_UNKNOWN;

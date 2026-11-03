@@ -460,6 +460,7 @@ function(mp_add_player tgt is_pro)
             src/pro/ProController.cpp
             src/pro/ProTools.cpp         # agent tools: grade, view, station
             src/pro/LookLoader.cpp       # LUT parse / OCIO bake off the render thread
+            src/pro/DisplayCalibration.cpp  # per-panel display calibration (#133)
             src/pro/LivePixels.cpp       # UYVY / v210 / BGRA -> NV12 / P016 for capture cards
             src/pro/LiveSourceBase.cpp   # shared ring + stats of the Pro live sources
             src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)
@@ -738,6 +739,12 @@ if(MP_BUILD_TESTS)
     add_executable(qc_report_test tests/qc_report_test.cpp src/pro/QcReport.cpp)
     target_include_directories(qc_report_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME qc_report COMMAND qc_report_test)
+    add_executable(display_calibration_test tests/display_calibration_test.cpp src/pro/DisplayCalibration.cpp)
+    target_include_directories(display_calibration_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(display_calibration_test PRIVATE shell32 ole32 advapi32)
+    endif()
+    add_test(NAME display_calibration COMMAND display_calibration_test)
     add_executable(timecode_pairer_test tests/timecode_pairer_test.cpp src/pro/TimecodePairer.cpp)
     target_include_directories(timecode_pairer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME timecode_pairer COMMAND timecode_pairer_test)

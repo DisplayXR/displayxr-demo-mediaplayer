@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pro/ProController.h"
+#include "pro/DisplayCalibration.h"
 
 #include "Log.h"
 
@@ -89,6 +90,10 @@ void ProController::ApplyTestEnv() {
     if (const char* d = std::getenv("MEDIAPLAYER_PRO_DEPTH_OVERLAY")) depthOverlay_ = (*d && *d != '0');
     if (const char* e = std::getenv("MEDIAPLAYER_PRO_EXPOSURE")) grade_.exposure = std::clamp((float)std::atof(e), -4.0f, 4.0f);
     if (const char* b = std::getenv("MEDIAPLAYER_PRO_BYPASS")) bypass_ = (*b && *b != '0');
+    // #133: MEDIAPLAYER_PRO_CAL_BYPASS=1 starts with the display calibration bypassed;
+    // MEDIAPLAYER_PRO_CAL=<.cube> loads one for this run only (not installed).
+    if (const char* b = std::getenv("MEDIAPLAYER_PRO_CAL_BYPASS")) calBypass_ = (*b && *b != '0');
+    if (const char* c = std::getenv("MEDIAPLAYER_PRO_CAL"); c && *c) calPath_ = c;
     if (const char* c = std::getenv("MEDIAPLAYER_PRO_COMPARE_FRAME")) testCompareFrame_ = std::atoi(c);
     if (const char* p = std::getenv("MEDIAPLAYER_PRO_PIN")) inspectorPinned_ = (*p && *p != '0');
     if (const char* f = std::getenv("MEDIAPLAYER_PRO_PANELS_3D")) flatPanels_ = !(*f && *f != '0');
@@ -243,6 +248,7 @@ void ProController::DialogCallback(void* userdata, const char* const* filelist, 
         self->dialogPath_ = filelist[0];
         self->dialogIsCdl_ = self->pendingDialogIsCdl_;
         self->dialogIsCompare_ = self->pendingDialogIsCompare_;
+        self->dialogIsCal_ = self->pendingDialogIsCal_;
         self->dialogReady_ = true;
     }
 }
@@ -254,6 +260,7 @@ void ProController::OpenLookDialog(bool cdl) {
         dialogOpen_ = true;
         pendingDialogIsCdl_ = cdl;
         pendingDialogIsCompare_ = false;
+        pendingDialogIsCal_ = false;
     }
     static const SDL_DialogFileFilter kLutFilter[] = {{"3D LUT (.cube)", "cube"}};
     static const SDL_DialogFileFilter kCdlFilter[] = {{"ASC CDL (.cc, .ccc, .cdl)", "cc;ccc;cdl"}};
@@ -270,6 +277,7 @@ void ProController::OpenCompareDialog() {
         dialogOpen_ = true;
         pendingDialogIsCdl_ = false;
         pendingDialogIsCompare_ = true;
+        pendingDialogIsCal_ = false;
     }
     const std::string cur = host_.currentMedia ? host_.currentMedia() : std::string();
     std::string dir = cur.empty() ? std::string() : std::filesystem::path(cur).parent_path().string();
@@ -542,6 +550,13 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
                     if (host_.toast) host_.toast(depthOverlay_ ? "Depth overlay on" : "Depth overlay off");
                     return true;
                 case SDLK_G:
+                    if (mod & SDL_KMOD_SHIFT) {  // #133: the display calibration, not the show grade
+                        calBypass_ = !calBypass_;
+                        if (host_.toast)
+                            host_.toast(!calLoaded_ ? "No display calibration for this panel"
+                                        : calBypass_ ? "Calibration bypassed" : "Calibration on");
+                        return true;
+                    }
                     bypass_ = !bypass_;
                     if (host_.toast) host_.toast(bypass_ ? "Grade bypassed" : "Grade on");
                     return true;
@@ -589,6 +604,114 @@ void ProController::TickLooks() {
     if (host_.toast) host_.toast(r.isOcio ? lutName_ : "LUT: " + lutName_);
 }
 
+// ---------------------------------------------------------------------------
+// Display calibration (#133)
+// ---------------------------------------------------------------------------
+
+void ProController::ResolveCalibration() {
+    calResolved_ = true;
+    std::string runtimeKey, dev;
+    if (!(host_.panelIdentity && host_.panelIdentity(runtimeKey, dev)) && host_.displayDeviceName)
+        dev = host_.displayDeviceName();
+    calKey_ = cal::PanelKey(runtimeKey, dev);
+    calKeyFromRuntime_ = !runtimeKey.empty();
+    if (!calPath_.empty()) {  // MEDIAPLAYER_PRO_CAL: this run only
+        LOG_INFO("Pro: display calibration from MEDIAPLAYER_PRO_CAL (panel %s)", calKey_.c_str());
+        LoadCalibration(calPath_, /*install=*/false);
+        return;
+    }
+    const std::string file = cal::CalibrationPathFor(calKey_);
+    std::error_code ec;
+    if (!file.empty() && std::filesystem::is_regular_file(std::filesystem::u8path(file), ec)) {
+        LOG_INFO("Pro: display calibration for panel %s: %s", calKey_.c_str(), file.c_str());
+        LoadCalibration(file, /*install=*/false);
+    } else {
+        LOG_WARN("Pro: panel %s (%s, %s) has no display calibration (looked for %s)", calKey_.c_str(),
+                 dev.empty() ? "device name unknown" : dev.c_str(),
+                 calKeyFromRuntime_ ? "runtime key" : "no runtime key: device name", file.c_str());
+    }
+}
+
+void ProController::LoadCalibration(const std::string& cube, bool install) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(std::filesystem::u8path(cube), ec)) {
+        calError_ = "cannot open " + cube;
+        LOG_WARN("Pro: calibration %s rejected: %s", cube.c_str(), calError_.c_str());
+        if (host_.toast) host_.toast("Calibration not loaded: " + calError_);
+        return;
+    }
+    calError_.clear();
+    calLoading_ = cube;
+    calInstall_ = install;
+    calLoader_.Submit([cube](color::CubeLut& lut, std::string& err) { return color::LoadCube(cube, lut, err); },
+                      cube, /*isOcio=*/false);
+}
+
+void ProController::TickCalibration() {
+    LookLoader::Result r;
+    if (!calLoader_.Take(r)) return;
+    calLoading_.clear();
+    auto fail = [&](const std::string& why) {
+        calError_ = why;
+        LOG_WARN("Pro: calibration %s rejected: %s", r.source.c_str(), why.c_str());
+        if (host_.toast) host_.toast("Calibration not loaded: " + why);
+    };
+    if (!r.ok) return fail(r.err);
+    // A display calibration maps display code values to display code values: 0..1 in.
+    for (int k = 0; k < 3; ++k)
+        if (std::fabs(r.lut.domainMin[k]) > 1e-4f || std::fabs(r.lut.domainMax[k] - 1.0f) > 1e-4f)
+            return fail("its DOMAIN is not 0..1 (a display calibration maps code values 0..1)");
+    if (!renderer_ || !renderer_->UploadCalibrationLut(r.rgba16f.data(), (uint32_t)r.lut.size))
+        return fail("upload failed");
+    if (calInstall_) {
+        std::string err;
+        if (!cal::Install(r.source, calKey_, err)) {
+            LOG_WARN("Pro: calibration applied for this run but not kept: %s", err.c_str());
+            if (host_.toast) host_.toast("Calibration applied, not kept: " + err);
+        } else {
+            LOG_INFO("Pro: calibration kept for panel %s: %s", calKey_.c_str(),
+                     cal::CalibrationPathFor(calKey_).c_str());
+        }
+    }
+    calPath_ = r.source;
+    calName_ = !r.lut.title.empty() ? r.lut.title : std::filesystem::u8path(r.source).filename().u8string();
+    calLoaded_ = true;
+    LOG_INFO("Pro: display calibration %s (%d^3) for panel %s", calName_.c_str(), r.lut.size, calKey_.c_str());
+    if (host_.toast) host_.toast("Calibration: " + calName_);
+}
+
+void ProController::ClearCalibration(bool uninstall) {
+    if (renderer_) renderer_->ClearCalibrationLut();
+    calLoaded_ = false;
+    calName_.clear();
+    calPath_.clear();
+    if (uninstall) {
+        std::string err;
+        if (!cal::Remove(calKey_, err)) calError_ = err;
+    }
+    if (host_.toast) host_.toast("Display calibration removed");
+}
+
+std::string ProController::CalibrationLabel() const {
+    if (!calLoaded_) return "display not calibrated";
+    return (calBypass_ ? "cal bypassed (" : "cal ") + calName_ + (calBypass_ ? ")" : "");
+}
+
+void ProController::OpenCalibrationDialog() {
+    {
+        std::lock_guard<std::mutex> lock(dialogMutex_);
+        if (dialogOpen_) return;
+        dialogOpen_ = true;
+        pendingDialogIsCdl_ = false;
+        pendingDialogIsCompare_ = false;
+        pendingDialogIsCal_ = true;
+    }
+    static const SDL_DialogFileFilter kFilter[] = {{"Display calibration 3D LUT (.cube)", "cube"}};
+    std::string dir = calPath_.empty() ? std::string() : std::filesystem::u8path(calPath_).parent_path().u8string();
+    SDL_ShowOpenFileDialog(&ProController::DialogCallback, this, window_, kFilter, 1,
+                           dir.empty() ? nullptr : dir.c_str(), false);
+}
+
 void ProController::Tick(const Status& st) {
     stereoSource_ = st.stereo;
     station_.SetSignalFps(st.live ? st.sourceFps : 0.0f);
@@ -614,18 +737,21 @@ void ProController::Tick(const Status& st) {
     }
     rightOnlyView_ = mode_ == ViewMode::RightOnly;
     std::string path;
-    bool isCdl = false, isCompare = false;
+    bool isCdl = false, isCompare = false, isCal = false;
     {
         std::lock_guard<std::mutex> lock(dialogMutex_);
         if (dialogReady_) {
             path = dialogPath_;
             isCdl = dialogIsCdl_;
             isCompare = dialogIsCompare_;
+            isCal = dialogIsCal_;
             dialogReady_ = false;
         }
     }
     if (!path.empty()) {
-        if (isCompare) {
+        if (isCal) {
+            LoadCalibration(path, /*install=*/true);
+        } else if (isCompare) {
             compare_[1 - compareSide_] = path;  // the clip not showing becomes B
             SetWipe(Wipe::Clips, true);
         } else if (isCdl) {
@@ -636,11 +762,34 @@ void ProController::Tick(const Status& st) {
     }
     TickCompareClip();
     TickLooks();
+    if (!calResolved_) ResolveCalibration();
+    // Follow the panel: the runtime's displays changed, or (checked once a second) the
+    // window now sits on another display. A run-only calibration (MEDIAPLAYER_PRO_CAL) stays.
+    if (calResolved_ && (++calCheckTicks_ >= 60 || (host_.displaysChanged && host_.displaysChanged()))) {
+        calCheckTicks_ = 0;
+        std::string runtimeKey, dev;
+        if (host_.panelIdentity && host_.panelIdentity(runtimeKey, dev)) {
+            const std::string key = cal::PanelKey(runtimeKey, dev);
+            if (key != calKey_ && std::getenv("MEDIAPLAYER_PRO_CAL") == nullptr) {
+                LOG_INFO("Pro: the window is now on panel %s (was %s)", key.c_str(), calKey_.c_str());
+                if (calLoaded_) {
+                    if (renderer_) renderer_->ClearCalibrationLut();
+                    calLoaded_ = false;
+                    calName_.clear();
+                    calPath_.clear();
+                }
+                ResolveCalibration();
+            }
+        }
+    }
+    TickCalibration();
     if (!renderer_) return;
     GradeParams g = grade_;
     if (bypass_ || st.isLogo) {
         g = GradeParams{};
     }
+    // The display calibration belongs to the panel, not the show: grade bypass keeps it.
+    g.calOn = calLoaded_ && !calBypass_;
     g.qcMode = st.isLogo                          ? 0
                : mode_ == ViewMode::Difference  ? 1
                : mode_ == ViewMode::Anaglyph    ? 2
@@ -809,6 +958,7 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
                        : grade_.lutOn && !lutName_.empty() ? lutName_.c_str()
                        : grade_.cdlOn ? "CDL" : "no look");
         if (!bypass_ && std::fabs(grade_.exposure) > 0.005f) add(" %+.1f EV", grade_.exposure);
+        add("  |  %s", CalibrationLabel().c_str());
         if (station_.ShowTimecode() && !tc.empty()) add("  |  TC %s", tc.c_str());
         const rig::Result r = station_.RigLast();
         if (st.stereo && st.hasPicture && r.ok) add("  |  near %+.1f%%  far %+.1f%%", r.nearPct, r.farPct);
@@ -1002,6 +1152,23 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
         // --- Color ----------------------------------------------------------
         if (ImGui::CollapsingHeader("Color", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("Bypass all (G)", &bypass_);
+            // #133: the panel's display calibration, outside the show grade (G leaves it on).
+            if (!calLoaded_ && calLoading_.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Display: not calibrated");
+            } else {
+                ImGui::TextDisabled("Display: %s", calLoading_.empty() ? calName_.c_str() : "loading...");
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Panel %s\n%s", calKey_.c_str(),
+                                  calError_.empty() ? cal::CalibrationPathFor(calKey_).c_str() : calError_.c_str());
+            ImGui::BeginDisabled(!calLoaded_);
+            ImGui::Checkbox("Bypass calibration (Shift+G)", &calBypass_);
+            ImGui::EndDisabled();
+            if (ImGui::SmallButton("Calibrate panel...")) OpenCalibrationDialog();
+            if (calLoaded_) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Remove")) ClearCalibration(/*uninstall=*/true);
+            }
             ImGui::BeginDisabled(bypass_);
             ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
             ImGui::SliderFloat("Exposure", &grade_.exposure, -4.0f, 4.0f, "%+.2f EV");

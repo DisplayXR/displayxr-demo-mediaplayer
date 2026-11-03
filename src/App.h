@@ -305,6 +305,13 @@ private:
     void VrHandleInput(bool& activity);
     std::string VrViewJson() const;  // MCP get_view / set_view result
 
+    // #133: the display the window is on, from the runtime's enumeration: on Windows the
+    // monitor Windows itself says holds the window (matched by GDI name, so no DPI maths),
+    // elsewhere the display whose desktop rect holds the window's centre; else the system
+    // default display. Falls back to the default display's device name on a runtime that
+    // does not enumerate.
+    bool PanelIdentity(std::string& key, std::string& deviceName) const;
+
     // Layered stereo-layout detection (#45). layoutSignal_ records WHICH layer decided
     // layout_, so the HUD can name it. autoInfo_ caches the automatic verdict, which is
     // what lets `L` toggle back out of a manual pin without re-decoding the media.

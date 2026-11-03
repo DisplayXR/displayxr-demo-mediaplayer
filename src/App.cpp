@@ -163,6 +163,47 @@ XrSession::ViewRect MatchMinRect(const XrSession::ViewRect& tile, float contentA
 }
 } // namespace
 
+bool App::PanelIdentity(std::string& key, std::string& deviceName) const {
+    key.clear();
+    deviceName.clear();
+    std::vector<XrSession::DisplayEntry> ds;
+    if (!xr_.EnumerateDisplays(ds)) {
+        deviceName = xr_.DisplayDeviceName();
+        return !deviceName.empty();
+    }
+    const XrSession::DisplayEntry* pick = nullptr;
+#if defined(_WIN32)
+    if (HWND hwnd = (HWND)window_.NativeHandle()) {
+        MONITORINFOEXW mi = {};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+            char name[64] = {};
+            WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, name, (int)sizeof(name), nullptr, nullptr);
+            for (const auto& d : ds)
+                if (_stricmp(d.deviceName.c_str(), name) == 0) pick = &d;
+        }
+    }
+#endif
+    if (!pick) {
+        if (SDL_Window* w = window_.SdlWindow()) {
+            int x = 0, y = 0, ww = 0, hh = 0;
+            SDL_GetWindowPosition(w, &x, &y);
+            SDL_GetWindowSize(w, &ww, &hh);
+            const int cx = x + ww / 2, cy = y + hh / 2;
+            for (const auto& d : ds)
+                if (cx >= d.x && cy >= d.y && cx < d.x + (int)d.w && cy < d.y + (int)d.h) pick = &d;
+        }
+    }
+    if (!pick)
+        for (const auto& d : ds)
+            if (d.systemDefault) pick = &d;
+    if (!pick) pick = &ds.front();
+    key = pick->key;
+    deviceName = pick->deviceName;
+    return true;
+}
+
+
 bool App::Initialize(const char* mediaPath) {
     // Default 1280x720; MEDIAPLAYER_WINDOW="WxH" or the uniform "WxH+X+Y" form
     // overrides (X,Y absolute virtual-desktop px — pins the window there and skips
@@ -4068,6 +4109,9 @@ void App::InitPro() {
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
     h.setDesqueeze = [this](float f) { proDesqueeze_ = f > 0.1f ? f : 1.0f; };
     h.mediaFps = [this] { return isVideo_ ? video_.FrameRate() : 0.0; };
+    h.displayDeviceName = [this] { return xr_.DisplayDeviceName(); };
+    h.panelIdentity = [this](std::string& key, std::string& deviceName) { return PanelIdentity(key, deviceName); };
+    h.displaysChanged = [this] { return xr_.TakeDisplaysChanged(); };
     // Scope pictures: one ImGui texture per slot, (re)made when the size changes.
     auto scopeIds = std::make_shared<std::vector<std::array<int, 3>>>(4, std::array<int, 3>{-1, 0, 0});
     h.userTexture = [this, scopeIds](int slot, int w, int hh, const uint8_t* rgba) -> void* {
