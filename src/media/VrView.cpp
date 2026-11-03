@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 
 namespace mp::vr {
 
@@ -176,7 +177,7 @@ void RenderEyeGray(const uint8_t* src, int srcW, int srcH, int srcStride, packin
     const float eyePxW = rect.w * (float)srcW, eyePxH = rect.h * (float)srcH;
     const float eyeAspect = eyePxH > 0.f ? eyePxW / eyePxH : 1.f;
     for (int y = 0; y < dstH; ++y) {
-        uint8_t* row = dst + (ptrdiff_t)y * dstStride;
+        uint8_t* row = dst + (std::ptrdiff_t)y * dstStride;
         const float t = ((float)y + 0.5f) / (float)dstH;
         for (int x = 0; x < dstW; ++x) {
             const float s = ((float)x + 0.5f) / (float)dstW;
@@ -195,7 +196,7 @@ void RenderEyeGray(const uint8_t* src, int srcW, int srcH, int srcStride, packin
             auto at = [&](int xx, int yy) -> float {
                 xx = xx < ex0 ? ex0 : xx > ex1 ? ex1 : xx;
                 yy = yy < ey0 ? ey0 : yy > ey1 ? ey1 : yy;
-                return (float)src[(ptrdiff_t)yy * srcStride + xx];
+                return (float)src[(std::ptrdiff_t)yy * srcStride + xx];
             };
             const float top = at(ix, iy) * (1.f - ax) + at(ix + 1, iy) * ax;
             const float bot = at(ix, iy + 1) * (1.f - ax) + at(ix + 1, iy + 1) * ax;
