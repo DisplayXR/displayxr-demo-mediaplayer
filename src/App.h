@@ -107,6 +107,9 @@ private:
     void CycleLayoutOverride();
     // "SBS-full — detected" / "mono — from filename" / "SBS-full (R|L) — metadata" ...
     std::string LayoutLabel() const;
+    // The packing name, or the container format when that is what the user knows it by
+    // ("MV-HEVC", "stereo HEIC", #154). LayoutLabel() = this + eye order + signal.
+    std::string LayoutShortName() const;
     // Commit a resolved layout: layout_, the provenance fields, and the manual pin
     // (cleared here rather than at load entry, so a FAILED load leaves the pin on the
     // media still being displayed).

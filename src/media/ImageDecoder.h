@@ -3,7 +3,7 @@
 // ImageDecoder (M1) — stb_image for JPG/PNG. Produces one tightly-packed RGBA8
 // buffer (the whole SBS frame) + dimensions. The SBS split happens later in the
 // sampler (UV sub-region per eye), so the decoder stays format-agnostic.
-// (Optional libheif behind MEDIAPLAYER_WITH_HEIF is a later addition.)
+// HEIC / HEIF stills are HeifLoader's (#154), decoded through FFmpeg, not here.
 #pragma once
 
 #include <cstdint>

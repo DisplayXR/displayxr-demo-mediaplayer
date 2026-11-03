@@ -39,6 +39,10 @@ struct MediaInfo {
     StereoSignal signal = StereoSignal::Default;  // which layer decided `layout`
     bool eyeSwap = false;                         // packing is R|L (metadata layer only)
     float confidence = 0.0f;                      // 0..1
+    // The container format when it IS the stereo signal and the user would not recognise
+    // the packing name (#154): "MV-HEVC" / "stereo HEIC" compose to SbsFull internally, so
+    // the HUD says the format instead. Static string; "" for everything else.
+    const char* format = "";
 };
 
 class MediaSource {
@@ -71,6 +75,11 @@ public:
     // player. Pro turns it on (with VideoDecoder::SetProFormats) before the first load.
     static void SetProFormats(bool on) { proFormats_ = on; }
     static inline bool proFormats_ = false;
+    // HEIC / HEIF stills (#154): offered only where HeifLoader can read them (a desktop build
+    // on FFmpeg 7.1+). Off by default, so the Android leg — which shares this file but not
+    // the loader — never lists a .heic it cannot open.
+    static void SetHeifSupported(bool on) { heifSupported_ = on; }
+    static inline bool heifSupported_ = false;
 
     static const char* KindName(MediaKind k);
     static const char* LayoutName(StereoLayout l);   // forwards to mp::LayoutName

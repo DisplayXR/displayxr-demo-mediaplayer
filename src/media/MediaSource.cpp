@@ -110,6 +110,13 @@ bool IsProReviewExt(const std::string& lower) {
             return true;
     return false;
 }
+// HEIC / HEIF stills (#154), when the build can read them (MediaSource::SetHeifSupported).
+bool IsHeifExt(const std::string& lower) {
+    for (const char* e : {".heic", ".heif", ".hif"})
+        if (lower.size() >= std::strlen(e) && lower.compare(lower.size() - std::strlen(e), std::string::npos, e) == 0)
+            return true;
+    return false;
+}
 }  // namespace
 
 MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int imageHeight) {
@@ -117,7 +124,7 @@ MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int ima
     MediaInfo info;
 
     if (EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png") ||
-        EndsWith(lower, ".mpo") || EndsWith(lower, ".lif")) {
+        EndsWith(lower, ".mpo") || EndsWith(lower, ".lif") || (heifSupported_ && IsHeifExt(lower))) {
         // .lif and .mpo are JPEG containers; their loaders compose the pair to SBS and
         // report the authoritative layout, so the layout decided below is unused for
         // those paths.
@@ -206,6 +213,7 @@ bool MediaSource::IsSupported(const std::string& path) {
     const std::string lower = Lower(path);
     return EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png") ||
            EndsWith(lower, ".lif") || EndsWith(lower, ".mpo") ||
+           (heifSupported_ && IsHeifExt(lower)) ||
            EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov") ||
            (proFormats_ && IsProReviewExt(lower));
 }

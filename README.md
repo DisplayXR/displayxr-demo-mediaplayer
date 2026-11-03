@@ -25,15 +25,17 @@ transport bar with per-eye parallax, convergence/L-R-swap controls, fullscreen, 
 and low-latency frame-exact scrubbing (M4); the macOS Vulkan path (M5); and Windows + macOS
 installers with CI release-on-tag (M6).
 
-Stereo images (JPG/PNG via stb_image, LIF and MPO containers) and SBS video share the same
-decode → atlas → submit path; the runtime + display processor do all weaving.
+Stereo images (JPG/PNG via stb_image, LIF and MPO containers, stereo HEIC) and SBS or MV-HEVC
+video share the same decode → atlas → submit path; the runtime + display processor do all
+weaving.
 
 **Stereo layout resolution**, in priority order:
 
 1. **Filename** — the `*_2x1` / `*_half_2x1` convention for side-by-side, `*_1x2` /
    `*_half_1x2` for top-bottom (left eye on top), and the release tokens `TB` / `OU` /
    `TAB` / `H-OU` as whole words of the file name (half unless the name says `full`).
-2. **Container metadata** — a LIF or MPO container, or `AVStereo3D` side data from MKV
+2. **Container metadata** — a LIF, MPO or stereo HEIC container, an MV-HEVC stream, or
+   `AVStereo3D` side data from MKV
    `StereoMode`, MP4 `st3d`, or an H.264 frame-packing SEI (which also says whether the
    eyes are packed R|L). Side-by-side and top-bottom packings are read; the frame aspect
    settles full vs half.
@@ -136,7 +138,7 @@ opposite directions so the subject lands at the display plane. It measures the p
 (NCC block matching on a downsampled luma plane, ~5 Hz, on a side thread). There is no
 face detection and no calibration. Manual `-` / `=` convergence still applies on top.
 It works on the live camera, a stream URL, and stereo files: video, image sequences and
-stills (SBS JPG/PNG, MPO, LIF). Side-by-side and top-bottom packings (full and half) are
+stills (SBS JPG/PNG, MPO, LIF, stereo HEIC), and MV-HEVC clips. Side-by-side and top-bottom packings (full and half) are
 both measured, on the eyes as shown (`X` and a container's R|L flag are respected).
 
 What it does with each source:
@@ -313,7 +315,8 @@ Set `MEDIAPLAYER_LOG_DEBUG=1` for verbose logs.
 
 | Type | Formats | Notes |
 |---|---|---|
-| Images | SBS JPG/PNG, LIF, MPO | layout from filename / container / content, else assumed stereo; HEIF behind `MEDIAPLAYER_WITH_HEIF` (off by default) |
+| Images | SBS JPG/PNG, LIF, MPO, HEIC | layout from filename / container / content, else assumed stereo |
+| Phone spatial capture | stereo HEIC photos, MV-HEVC video (`.mov` / `.mp4`), as written by Apple spatial capture and the Samsung Galaxy "3D Capture" mode | detected automatically, no conversion: both views are composed side by side (HUD: `MV-HEVC` / `stereo HEIC`). Eye order from the file: the HEIF `ster` group, the MV-HEVC eye tags, else base view = left. A HEIC with no stereo group shows its primary image flat. Desktop, FFmpeg 7.1+ (the shipped builds); MV-HEVC decodes in software. Not on Android yet |
 | Video | SBS H.264 / H.265 / AV1 (MP4/MKV/MOV) | hardware decode via FFmpeg, CPU fallback; `AVStereo3D` side data honoured incl. eye order |
 | 2D (mono) stills, video, live | anything above that is mono, or pinned Mono with `L` | optional **Convert to 3D** (Shift+L / top-bar toggle / MCP `set_convert_3d`): the runtime's `XR_DXR_lift` `VIEWS_MONO` task returns a side-by-side pair that replaces the picture. Off on every load. Hidden when the runtime has no `XR_DXR_lift`; greyed with the reason when the task cannot serve this session |
 

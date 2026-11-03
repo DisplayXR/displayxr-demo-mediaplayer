@@ -58,7 +58,8 @@ exactly like any third-party OpenXR app (and like the DisplayXR Unity plugin).
 ## Stack (keep it this small)
 
 OpenXR loader + **FFmpeg** (libav\*) + **SDL3** + **Dear ImGui** + **stb_image**
-(+ optional **libheif** behind `MEDIAPLAYER_WITH_HEIF`, OFF by default).
+(HEIC / stereo HEIC go through FFmpeg's HEIF demuxer, `src/media/HeifLoader.cpp`, #154;
+the libheif option the PRD reserved was never needed and is not wired).
 **Not used:** Qt/QML, VLC, OpenCV, TensorRT, CUDA-as-a-dependency, vendor SR SDK.
 CUDA/NVDEC may be used *transparently* when FFmpeg picks it — never a build dep.
 

@@ -118,7 +118,13 @@ public:
 #endif
 
     bool IsOpen() const { return open_; }
-    int Width() const { return width_; }    // full SBS frame width
+    int Width() const { return width_; }    // full SBS frame width (an MV-HEVC clip: both views)
+    // MV-HEVC (#154): the stream's two coded views are decoded and composed into one full
+    // side-by-side frame, left eye first, so Width() is twice a view's width.
+    bool IsMultiview() const { return multiview_; }
+    // True once the first pair decoded when the eye order came from the stream's own eye
+    // tags (3D reference displays info); false = no tags, base view taken as the left eye.
+    bool MultiviewEyesFromMetadata() const { return multiviewEyesFromMeta_.load(); }
     int Height() const { return height_; }
 
     // Active backend, for the HUD / logs. codecName_ is the FFmpeg codec (e.g. "hevc");
@@ -131,6 +137,9 @@ public:
 
 private:
     void DecodeLoop();
+    // avcodec_receive_frame, pairing MV-HEVC views into one side-by-side frame (#154).
+    int ReceiveFrame(::AVFrame* out);
+    void MvReset();   // drop a half-received view pair (after every decoder flush)
     // Live (#93): the connect / read / reconnect loop, run from DecodeLoop. `fill` is
     // DecodeLoop's frame->ring copier (AVFrame* passed as void*, header stays libav-free);
     // `timeBase` is re-pointed at each connection's video stream.
@@ -181,6 +190,8 @@ private:
     double startSec_ = 0.0;                     // set in Open()
     double frameRate_ = 0.0;                    // fps, for frame stepping
     bool open_ = false;
+    bool multiview_ = false;                       // MV-HEVC, both views composed (#154)
+    std::atomic<bool> multiviewEyesFromMeta_{false};
     static inline bool proFormats_ = false;
     double seqFps_ = 24.0;
     bool isSequence_ = false;

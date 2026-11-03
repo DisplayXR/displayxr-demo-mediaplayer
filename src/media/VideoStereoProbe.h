@@ -49,6 +49,10 @@ struct VideoStereoProbe {
         bool haveMeta = false;       // the stream carried AVStereo3D side data
         StereoLayout metaLayout = StereoLayout::Mono;
         bool metaInvert = false;     // AV_STEREO3D_FLAG_INVERT: the packing is R|L
+        // MV-HEVC (#154): two coded views in one stream. VideoDecoder composes them side by
+        // side, so width is BOTH views and metaLayout is SbsFull by construction; the caller
+        // must not re-derive full-vs-half from the aspect (a portrait pair is narrow).
+        bool multiview = false;
 
         StereoDetectResult content;  // voted; decided=false if not run or inconclusive
         int framesExamined = 0;

@@ -63,3 +63,6 @@ _android_build.log
 android/libs/
 __pycache__/
 *.pyc
+
+# Tiny spatial-capture fixtures (#154): a few KB each, made by tools/spatial/
+!tests/fixtures/*.mov
