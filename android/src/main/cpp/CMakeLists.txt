@@ -149,6 +149,8 @@ add_library(mediaplayer_vk_android SHARED
     # input is fed through ImGuiLayer::PushPointer().
     ${REPO_ROOT}/src/ui/TransportUI.cpp
     ${REPO_ROOT}/src/ui/ImGuiLayer.cpp
+    # The media browser (#160, docs/BROWSER.md).
+    ${REPO_ROOT}/src/browser/ThumbnailAtlas.cpp
     ${MP_IMGUI_SOURCES}
     ${SHADER_HEADERS})
 

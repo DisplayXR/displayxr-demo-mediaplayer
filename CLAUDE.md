@@ -29,6 +29,11 @@ bundle or `versions.json`). `mp_add_player()` in `CMakeLists.txt` builds both;
 - `shaders/sbs.frag` is shared with Android: Pro shader features stay behind
   `#ifdef MP_GRADE` (desktop compiles with `-DMP_GRADE`, Android without).
 
+## Media browser (read `docs/BROWSER.md`)
+
+The in-app gallery (#160), Android first. Read `docs/BROWSER.md` before touching
+`src/browser/`, `android/src/main/cpp/browser/` or `MediaStoreProvider.kt`.
+
 ## THE GOLDEN RULE — extension-wire-protocol only
 
 This app is coupled to the runtime **only by the OpenXR extension wire protocol**,
