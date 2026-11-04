@@ -933,11 +933,13 @@ const char* const kOpenFmt[7] = {
 };
 // #135: a depth alert's worst value in the target screen's terms, appended to its text:
 // " [-201 mm, -58' on Cinema]", or the divergence angle for the divergence run. Empty
-// without a target, and for the vertical / colour runs.
-std::string TargetNote(const Budget& b, int run, float worst) {
+// without a target, and for the vertical / colour runs. `worst` is the source's parallax,
+// except for the divergence run, which already includes `offsetPct` (convergence).
+std::string TargetNote(const Budget& b, int run, float worst, float offsetPct) {
     if (b.targetWidthM <= 0.0f || b.targetDistanceM <= 0.0f) return {};
     if (!(run == 0 || run == 1 || run == 4 || run == 5 || run == 6)) return {};
-    const mp::pro::target::Depth d = mp::pro::target::AtParallax({b.targetName, b.targetWidthM, b.targetDistanceM}, worst);
+    const mp::pro::target::Depth d = mp::pro::target::AtParallax({b.targetName, b.targetWidthM, b.targetDistanceM},
+                                                                 run == 6 ? worst : worst + offsetPct);
     char s[96];
     if (run == 6) std::snprintf(s, sizeof(s), " [%.2f deg on %s]", d.divergenceDeg, b.targetName.c_str());
     else std::snprintf(s, sizeof(s), " [%+.0f mm, %+.0f' on %s]", d.mm, d.arcmin, b.targetName.c_str());
@@ -963,7 +965,7 @@ void RigMonitor::CloseRun(int i, double end, const std::string& endTc) {
         a.end = end;
         char b[160];
         std::snprintf(b, sizeof(b), kClosedFmt[i], r.worst, std::max(1.0, std::round(dur)), limits[i]);
-        a.what = std::string(b) + TargetNote(budget_, i, r.worst);
+        a.what = std::string(b) + TargetNote(budget_, i, r.worst, targetParallaxOffsetPct_);
         a.timecode = r.tc;
         a.endTimecode = endTc;
         a.wallClock = r.clock;
@@ -986,15 +988,16 @@ void RigMonitor::UpdateAlerts(const Sample& s, const std::string& tc) {
     notOkSince_ = -1;
     lastGoodT_ = s.t;
     lastGoodTc_ = tc;
+    const float shownFarPct = s.farPct + targetParallaxOffsetPct_;
     const bool over[kRuns] = {s.nearPct < budget_.nearPct,
                               s.farPct > budget_.farPct,
                               std::fabs(s.verticalPx) > budget_.maxVerticalPx,
                               s.deltaE > budget_.maxDeltaE,
                               s.edgeMeasured[0] && s.edgePct[0] < budget_.edgePct,
                               s.edgeMeasured[1] && s.edgePct[1] < budget_.edgePct,
-                              budget_.divergeFarPct > 0.0f && s.farPct > budget_.divergeFarPct};
+                              budget_.divergeFarPct > 0.0f && shownFarPct > budget_.divergeFarPct};
     const float value[kRuns] = {s.nearPct, s.farPct, std::fabs(s.verticalPx), s.deltaE, s.edgePct[0], s.edgePct[1],
-                                s.farPct};
+                                shownFarPct};
     for (int i = 0; i < kRuns; ++i) {
         Run& r = runs_[i];
         if (over[i]) {
@@ -1016,6 +1019,11 @@ void RigMonitor::UpdateAlerts(const Sample& s, const std::string& tc) {
 void RigMonitor::SetBudget(const Budget& b) {
     std::lock_guard<std::mutex> lk(m_);
     budget_ = b;
+}
+
+void RigMonitor::SetTargetParallaxOffset(float pct) {
+    std::lock_guard<std::mutex> lk(m_);
+    targetParallaxOffsetPct_ = pct;
 }
 
 Budget RigMonitor::GetBudget() const {
@@ -1062,7 +1070,7 @@ std::vector<Alert> RigMonitor::Alerts() const {
         x.end = -1.0;
         char b[160];
         std::snprintf(b, sizeof(b), kOpenFmt[i], r.worst, now - r.since);
-        x.what = std::string(b) + TargetNote(budget_, i, r.worst);
+        x.what = std::string(b) + TargetNote(budget_, i, r.worst, targetParallaxOffsetPct_);
         x.timecode = r.tc;
         x.wallClock = r.clock;
         a.push_back(x);

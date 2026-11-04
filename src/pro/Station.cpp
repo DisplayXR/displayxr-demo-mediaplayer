@@ -295,12 +295,15 @@ int Station::MeasuredEyeSync(int* lateEye) const {
 }
 
 // #135: near / far in the target screen's terms: physical parallax, angular disparity at
-// the viewing distance, and how far the eyes diverge on the background.
-static nlohmann::json TargetJson(const target::Screen& t, float scale, const rig::Result& r) {
+// the viewing distance, and how far the eyes diverge on the background. For the picture as
+// shown: the measured parallax plus what convergence adds (parallaxOffsetPct).
+static nlohmann::json TargetJson(const target::Screen& t, float scale, const rig::Result& r, float parallaxOffsetPct) {
     nlohmann::json j = {{"name", t.name}, {"width_m", t.widthM}, {"distance_m", t.distanceM},
-                        {"picture_scale", scale}, {"divergence_limit_pct", target::DivergenceLimitPct(t)}};
+                        {"picture_scale", scale}, {"divergence_limit_pct", target::DivergenceLimitPct(t)},
+                        {"parallax_offset_pct", parallaxOffsetPct}};
     if (r.ok) {
-        const target::Depth n = target::AtParallax(t, r.nearPct), f = target::AtParallax(t, r.farPct);
+        const target::Depth n = target::AtParallax(t, r.nearPct + parallaxOffsetPct),
+                            f = target::AtParallax(t, r.farPct + parallaxOffsetPct);
         j["near_mm"] = n.mm;
         j["near_arcmin"] = n.arcmin;
         j["far_mm"] = f.mm;
@@ -329,6 +332,8 @@ bool Station::TakeSnapshot(const std::string& note) {
     s.clock = clock;
     s.rig = rig_.Last();
     s.target = target_;
+    s.pictureScale = pictureScale_;
+    s.parallaxOffsetPct = parallaxOffsetPct_;
     {
         const std::vector<rig::Sample> h = rig_.History(1.0);
         s.eyeSync = h.empty() ? -1 : h.back().eyeOffsetFrames;
@@ -360,7 +365,7 @@ void Station::SaveNote(size_t i) {
     }
     if (s.eyeSync >= 0) j["eye_sync_frames"] = s.eyeSync;
     if (s.rig.eyeSyncMeasuredFrames >= 0) j["eye_sync_measured_frames"] = s.rig.eyeSyncMeasuredFrames;
-    if (s.target.On()) j["target"] = TargetJson(s.target, 1.0f, s.rig);
+    if (s.target.On()) j["target"] = TargetJson(s.target, s.pictureScale, s.rig, s.parallaxOffsetPct);
     const rig::Budget b = rig_.GetBudget();
     j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"edge_pct", b.edgePct}};
     std::ofstream(s.notePath) << j.dump(2) << "\n";
@@ -587,7 +592,7 @@ std::string Station::RigStatusJson() const {
     out["alerts"] = alerts;
     out["timecode"] = timecode_;
     out["tc_fps"] = signalFps_;
-    out["target"] = target_.On() ? TargetJson(target_, pictureScale_, r) : nlohmann::json(nullptr);
+    out["target"] = target_.On() ? TargetJson(target_, pictureScale_, r, parallaxOffsetPct_) : nlohmann::json(nullptr);
     if (target_.On() && viewerDistanceM_ > 0.0f) out["target"]["viewer_distance_m"] = viewerDistanceM_;
     out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
     if (decklink_.GetState() != LiveState::Closed) {

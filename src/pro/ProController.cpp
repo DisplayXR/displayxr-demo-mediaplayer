@@ -762,6 +762,13 @@ void ProController::ApplyTarget() {
     b.targetWidthM = target_.widthM;
     b.targetDistanceM = target_.distanceM;
     station_.SetRigBudget(b);
+    PushTargetToStation();
+}
+
+void ProController::PushTargetToStation() {
+    station_.SetTarget(target_, host_.pictureScale ? host_.pictureScale() : 1.0f,
+                       host_.viewerDistance ? host_.viewerDistance() : 0.0f,
+                       host_.parallaxOffsetPct ? host_.parallaxOffsetPct() : 0.0f);
 }
 
 void ProController::Tick(const Status& st) {
@@ -836,8 +843,7 @@ void ProController::Tick(const Status& st) {
     }
     TickCalibration();
     if (targetDirty_) ApplyTarget();
-    station_.SetTarget(target_, host_.pictureScale ? host_.pictureScale() : 1.0f,
-                       host_.viewerDistance ? host_.viewerDistance() : 0.0f);
+    PushTargetToStation();
     if (!renderer_) return;
     // #134: an OCIO look follows the source: re-bake when an EXR comes or goes.
     if (lutIsOcio_ && lutLoading_.empty() && lutPqShaper_ != SourceIsSceneLinear()) LoadOcio(ocioReq_);
@@ -1308,13 +1314,19 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                 float pw = 0.0f, pd = 0.0f;
                 const bool geom = host_.panelGeometry && host_.panelGeometry(pw, pd);
                 if (!geom) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Panel size unknown: no preview");
+                else if (targetPreview_ && host_.previewLimited && host_.previewLimited())
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "This target is too large to preview");
                 else if (targetPreview_)
                     ImGui::TextDisabled("Picture x%.2f%s (panel %.2f m, you at %.2f m)", k,
                                         k > 1.005f ? ", cropped" : k < 0.995f ? ", bordered" : "", pw,
                                         host_.viewerDistance ? host_.viewerDistance() : pd);
                 const rig::Result r = station_.RigLast();
                 if (r.ok && st.stereo && st.hasPicture) {
-                    const target::Depth n = target::AtParallax(target_, r.nearPct), f = target::AtParallax(target_, r.farPct);
+                    // For the picture as shown, so the convergence is included.
+                    const float off = host_.parallaxOffsetPct ? host_.parallaxOffsetPct() : 0.0f;
+                    const target::Depth n = target::AtParallax(target_, r.nearPct + off),
+                                        f = target::AtParallax(target_, r.farPct + off);
+                    if (std::fabs(off) > 0.005f) ImGui::TextDisabled("Includes convergence: %+.2f%%", off);
                     ImGui::Text("Near %+.0f mm  %+.0f'   Far %+.0f mm  %+.0f'", n.mm, n.arcmin, f.mm, f.arcmin);
                     if (f.divergenceDeg > 0.0f)
                         ImGui::TextColored(f.divergenceDeg > target::kDivergenceCapDeg ? ImVec4(1.0f, 0.4f, 0.35f, 1.0f)

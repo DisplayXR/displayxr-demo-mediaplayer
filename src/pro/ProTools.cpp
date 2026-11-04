@@ -38,7 +38,9 @@ void ProController::RegisterTools(const RegisterFn& reg) {
         "far in its terms (mm, arcminutes, background divergence) and the rig check alerts when the "
         "background diverges past 0.5 deg there. preview (default true) shows the picture on the panel "
         "at the angular size it has on the target, so the depth reads as it will there (the picture "
-        "crops or gets a border). Returns the target, the preview scale and the depth in its terms.",
+        "crops or gets a border). Returns the target and the depth in its terms, for the picture as shown "
+        "(convergence included: parallax_offset_pct). picture_scale in the reply is the last frame's; "
+        "get_rig_status has the new one a frame later.",
         "{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\",\"enum\":[\"off\",\"cinema\",\"tv\",\"monitor\",\"tablet\"]},"
         "\"width_m\":{\"type\":\"number\",\"minimum\":0.1},\"distance_m\":{\"type\":\"number\",\"minimum\":0.2},"
         "\"preview\":{\"type\":\"boolean\"}}}");

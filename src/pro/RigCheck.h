@@ -211,6 +211,9 @@ public:
     void AddSample(const Sample& s, const std::string& timecode);
     void SetBudget(const Budget& b);
     Budget GetBudget() const;
+    // What convergence adds to the shown parallax (% of width). The measurements stay the
+    // source's; the target-screen figures and the divergence alert are for the picture as shown.
+    void SetTargetParallaxOffset(float pct);
     void Reset();
     // Snapshot for the UI / tools.
     Result Last() const;
@@ -248,6 +251,7 @@ private:
     uint64_t syncGen_ = 0;
     StereoLayout pendingLayout_ = StereoLayout::SbsFull;
     bool pendingSwap_ = false;
+    float targetParallaxOffsetPct_ = 0.0f;
     uint64_t generation_ = 0;  // bumped by Reset: a measurement started before it is dropped
     // open alert runs: near, far, vertical, colour, left edge, right edge, divergence (#135)
     static constexpr int kRuns = 7;

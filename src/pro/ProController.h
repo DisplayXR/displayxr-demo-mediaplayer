@@ -119,6 +119,8 @@ struct Host {
     // width and nominal viewing distance (false when the runtime does not say).
     std::function<void(float widthM, float distanceM)> setTargetScreen;
     std::function<float()> pictureScale;
+    std::function<bool()> previewLimited;     // the target's scale is too large to preview
+    std::function<float()> parallaxOffsetPct;  // what convergence adds to the shown parallax, % of width
     std::function<float()> viewerDistance;  // m: the tracked viewer, else the nominal distance
     std::function<bool(float& widthM, float& viewerM)> panelGeometry;
     // An RGBA texture for ImGui::Image (scope pictures), per slot: upload `rgba` (nullptr =
@@ -288,6 +290,7 @@ private:
     bool targetDirty_ = false;     // push target_ / targetPreview_ to the app + station
     float customTargetW_ = 3.0f, customTargetD_ = 4.0f;
     void ApplyTarget();
+    void PushTargetToStation();  // target_ and how the picture is shown, for its figures and alerts
 
     // File dialog result (SDL may call back on another thread).
     std::mutex dialogMutex_;
