@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pro/Overlays.h"
 
+#include "ui/UiScale.h"
+
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include <imgui.h>
 #endif
@@ -9,6 +11,8 @@
 #include <cstdio>
 
 namespace mp::pro {
+
+using ui::Px;
 
 namespace {
 
@@ -70,7 +74,7 @@ void DrawOverlays(const OverlaySettings& s, const BurnIn& b, float px, float py,
             dl->AddRectFilled(ImVec2(c.x, a.y), ImVec2(p1.x, c.y), shade);
         }
         dl->AddRect(a, c, IM_COL32(255, 210, 60, 230), 0.0f, 0, thin * 2.0f);
-        dl->AddText(ImVec2(a.x + 6.0f, a.y + 4.0f), IM_COL32(255, 210, 60, 230), FrameLineName(s.frameLine));
+        dl->AddText(ImVec2(a.x + Px(6.0f), a.y + Px(4.0f)), IM_COL32(255, 210, 60, 230), FrameLineName(s.frameLine));
     }
     if (s.safeAreas) {
         const float act = 0.93f, tit = 0.90f;
@@ -97,7 +101,7 @@ void DrawOverlays(const OverlaySettings& s, const BurnIn& b, float px, float py,
         nr += std::snprintf(right + nr, sizeof(right) - nr, "TC %s", b.timecode.c_str());
     if (s.burnFrame && b.frame >= 0)
         nr += std::snprintf(right + nr, sizeof(right) - nr, "%sF %lld", nr ? "   " : "", b.frame);
-    const float pad = 5.0f, inset = 10.0f;
+    const float pad = Px(5.0f), inset = Px(10.0f);
     auto label = [&](const char* t, bool alignRight) {
         if (!t[0]) return;
         const ImVec2 ts = ImGui::CalcTextSize(t);

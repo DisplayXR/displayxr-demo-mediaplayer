@@ -180,6 +180,14 @@ void Window::PixelSize(uint32_t& width, uint32_t& height) const {
 // space is the pixel space here.
 void Window::PointSize(uint32_t& width, uint32_t& height) const { PixelSize(width, height); }
 
+// The helper does not report a display scale, so the Linux UI and window stay at 100%.
+float Window::DisplayScale() const { return 1.0f; }
+float Window::ContentScaleAt(int, int) { return 1.0f; }
+void Window::SetSize(int width, int height) {
+    reqW_ = width;
+    reqH_ = height;
+}
+
 void Window::SetTitle(const char* title) {
     title_ = title ? title : "";
     if (lwin_) lwin_->set_title(title_.c_str());

@@ -468,6 +468,7 @@ private:
     int mediaW_ = 0;              // full frame dims, for the HUD label
     int mediaH_ = 0;
     std::vector<uint8_t> hudPixels_;  // CPU-rasterized HUD buffer
+    double lastHudResize_ = -1.0;     // SteadySeconds() of the last HUD swapchain resize
 
     // Frame / FPS tracking.
     uint64_t frames_ = 0;

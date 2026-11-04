@@ -83,6 +83,14 @@ public:
     void PixelSize(uint32_t& width, uint32_t& height) const;
     // Logical (point) size — the space SDL/ImGui mouse coordinates live in.
     void PointSize(uint32_t& width, uint32_t& height) const;
+    // The OS display scale of the window's monitor (1.0 at 100%, 2.0 on Retina): the
+    // desktop UI scale (ui/UiScale.h).
+    float DisplayScale() const;
+    // The factor a size meant for 100% scaling needs on the display under (x, y) (SDL
+    // global desktop coordinates): its scaling on Windows, 1.0 on macOS, whose window
+    // sizes are already in points.
+    static float ContentScaleAt(int x, int y);
+    void SetSize(int width, int height);
 
     void SetTitle(const char* title);
 

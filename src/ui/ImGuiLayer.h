@@ -53,6 +53,9 @@ public:
     // A touch leg's ui::ApplyMediaPlayerStyle metric scale. Set before Init, which applies
     // the style and rasterizes the font at ui::UiFontPx(scale).
     void SetMetricScale(float scale) { metricScale_ = scale; }
+    // HUD pixels per design unit (ui/UiScale.h). Before Init it only records the scale;
+    // after Init a change rebuilds the font and the style at the new scale.
+    void SetUiScale(float scale);
     void Shutdown();
     bool Ready() const { return ready_; }
 
@@ -136,6 +139,7 @@ private:
 
     bool ready_ = false;
     float metricScale_ = 1.0f;
+    void AddUiFont();
     void* nativeWindow_ = nullptr;  // borrowed SDL_Window*; used to fetch the live HWND (Win32)
     // Cursor in window points from SDL motion events — a fallback source. On Windows the
     // primary source is the raw WM_MOUSEMOVE position captured by the window-proc subclass

@@ -4,6 +4,7 @@
 #include "ColorPolicy.h"  // IsSrgb8 / UnormCounterpart (#78)
 #include "Log.h"
 #include "ui/TransportUI.h"
+#include "ui/UiScale.h"
 
 #include <vk_frame_ring.h>  // displayxr-common: dxr::VkFrameRing::tileBarrier (INV-4.10)
 
@@ -253,6 +254,29 @@ bool ImGuiLayer::RecreateTarget(VkFormat hudFormat, uint32_t hudWidth, uint32_t 
     return true;
 }
 
+void ImGuiLayer::AddUiFont() {
+    // Rasterized at the size it is drawn at, not a small font scaled up.
+    ImFontConfig fontCfg;
+    fontCfg.FontDataOwnedByAtlas = false;  // a static array, not ImGui's to free
+    static const ImWchar kGlyphs[] = {0x0020, 0x00FF, 0x2010, 0x2026, 0};  // Latin-1, dashes, quotes, ellipsis
+    ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void*)kUiFontTtf, (int)sizeof(kUiFontTtf),
+                                               ui::UiFontPx(metricScale_), &fontCfg, kGlyphs);
+}
+
+void ImGuiLayer::SetUiScale(float scale) {
+    if (!(scale > 0.0f) || scale == ui::g_uiScale) return;
+    ui::g_uiScale = scale;
+    if (!ready_) return;  // Init builds the font and the style at this scale
+    // The window moved to a display with another scale: rare, so idle the device rather
+    // than track which in-flight frame still samples the old font texture.
+    vkDeviceWaitIdle(device_);
+    ImGui_ImplVulkan_DestroyFontsTexture();
+    ImGui::GetIO().Fonts->Clear();
+    AddUiFont();
+    ImGui_ImplVulkan_CreateFontsTexture();
+    ui::ApplyMediaPlayerStyle(metricScale_);
+}
+
 bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice physicalDevice,
                       VkDevice device, VkQueue queue, uint32_t queueFamily, VkFormat hudFormat,
                       uint32_t hudWidth, uint32_t hudHeight,
@@ -284,12 +308,7 @@ bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice 
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;  // don't litter an imgui.ini next to the binary
-    // Rasterized at the size it is drawn at, not a small font scaled up.
-    ImFontConfig fontCfg;
-    fontCfg.FontDataOwnedByAtlas = false;  // a static array, not ImGui's to free
-    static const ImWchar kGlyphs[] = {0x0020, 0x00FF, 0x2010, 0x2026, 0};  // Latin-1, dashes, quotes, ellipsis
-    io.Fonts->AddFontFromMemoryTTF((void*)kUiFontTtf, (int)sizeof(kUiFontTtf),
-                                   ui::UiFontPx(metricScale_), &fontCfg, kGlyphs);
+    AddUiFont();
     ui::ApplyMediaPlayerStyle(metricScale_);
 
 #if defined(MEDIAPLAYER_IMGUI_SDL)
@@ -862,6 +881,7 @@ bool ImGuiLayer::RecreateTarget(VkFormat, uint32_t, uint32_t, const std::vector<
 void ImGuiLayer::PushPointer(int, float, float) {}
 void ImGuiLayer::ProcessEvent(const void*) {}
 void ImGuiLayer::BeginFrame(float, float, float, float, float, float) {}
+void ImGuiLayer::SetUiScale(float) {}
 void ImGuiLayer::RenderToHud(uint32_t, VkCommandBuffer) {}
 bool ImGuiLayer::WantCaptureMouse() const { return false; }
 void ImGuiLayer::SetCursorLocked(bool) {}

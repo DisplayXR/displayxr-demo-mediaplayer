@@ -200,8 +200,8 @@ struct TransportActions {
 // both, so the design is one design. Never branch on it anywhere else.
 void ApplyMediaPlayerStyle(float metricScale = 1.0f);
 
-// The UI font size in HUD pixels for the same metricScale: 24 on desktop, 28 on touch.
-// ImGuiLayer rasterizes the font at exactly this size.
+// The UI font size in HUD pixels for the same metricScale (desktop or touch), times the
+// UI scale (UiScale.h), rounded up. ImGuiLayer rasterizes the font at exactly this size.
 float UiFontPx(float metricScale = 1.0f);
 
 // Advance the purely-visual timers: the auto-hide fade and the toast fade.

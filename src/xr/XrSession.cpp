@@ -57,7 +57,7 @@ bool XrSession::Initialize(void* nativeWindowHandle, const PlaceWindowFn& placeW
     EnumerateRenderingModes();   // needs the session; informs swapchain sizing
     if (!CreateLocalSpace()) return false;
     if (!CreateSwapchain()) return false;
-    CreateHudSwapchain(1920, 1080);  // full-window overlay: top bar + transport + toast (16:9)
+    CreateHudSwapchain(1920, 1080);  // full-window overlay; App resizes it to the window (ResizeHud)
     LOG_INFO("OpenXR session ready (swapchain %ux%u fmt=%lld, active mode '%s': %u views %ux%u)",
              swapchain_.width, swapchain_.height, (long long)swapchain_.format,
              ActiveModeName(), ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());
@@ -909,6 +909,16 @@ bool XrSession::CreateSwapchain() {
     for (auto& img : images) swapchainVkImages_.push_back(img.image);
     LOG_INFO("SBS swapchain: %u images", imageCount);
     return true;
+}
+
+bool XrSession::ResizeHud(uint32_t width, uint32_t height) {
+    if (hudSwapchain_.handle != XR_NULL_HANDLE) {
+        xrDestroySwapchain(hudSwapchain_.handle);
+        hudSwapchain_.handle = XR_NULL_HANDLE;
+    }
+    hasHud_ = false;
+    CreateHudSwapchain(width, height);
+    return hasHud_;
 }
 
 void XrSession::CreateHudSwapchain(uint32_t width, uint32_t height) {

@@ -162,6 +162,7 @@ std::vector<XrSwapchainImageVulkanKHR> g_hud_xr_images;
 std::vector<VkImage> g_hud_vk_images;
 uint32_t g_hud_w = 0, g_hud_h = 0;
 VkFormat g_hud_format = VK_FORMAT_UNDEFINED;
+int32_t g_density_dpi = 0;  // AConfiguration_getDensity, read in android_main
 bool g_hud_ready = false;
 mp::ImGuiLayer g_imgui;
 mp::ui::TransportState g_ui_state;
@@ -1541,14 +1542,30 @@ swapchain_encoding()
 	return e;
 }
 
-// Create (or recreate) the HUD swapchain at the current per-eye tile size, and
-// point ImGui at it. Mirrors XrSession::CreateHudSwapchain on the desktop leg.
+// The HUD's size: the window's own pixel size, so the UI draws 1:1 (ui/UiScale.h).
+// ANativeWindow_getWidth/Height report the window even under a buffer-size override
+// (see the TRAP note above). The per-eye tile is only the fallback.
+void
+hud_target_size(uint32_t *w, uint32_t *h)
+{
+	ANativeWindow *win = g_app_window.load(std::memory_order_acquire);
+	if (win != nullptr && ANativeWindow_getWidth(win) > 0 && ANativeWindow_getHeight(win) > 0) {
+		*w = (uint32_t)ANativeWindow_getWidth(win);
+		*h = (uint32_t)ANativeWindow_getHeight(win);
+		return;
+	}
+	uint32_t cols = 0, rows = 0;
+	active_tile_dims(w, h, &cols, &rows);
+}
+
+// Create (or recreate) the HUD swapchain at hud_target_size, and point ImGui at it.
+// Mirrors XrSession::CreateHudSwapchain on the desktop leg.
 // Non-fatal: a failure just means no chrome this session.
 bool
 create_hud_swapchain()
 {
-	uint32_t render_w = 0, render_h = 0, cols = 0, rows = 0;
-	active_tile_dims(&render_w, &render_h, &cols, &rows);
+	uint32_t render_w = 0, render_h = 0;
+	hud_target_size(&render_w, &render_h);
 	if (render_w == 0 || render_h == 0) {
 		return false;
 	}
@@ -1656,6 +1673,9 @@ hud_init()
 		if (v > 0.5f && v < 4.0f) ui_scale = v;
 	}
 	g_imgui.SetMetricScale(ui_scale);  // before Init: the font is rasterized at its size
+	// The touch UI was tuned on the 320 dpi NP02J through a 1920x1200 HUD stretched to the
+	// 2560x1600 panel (x1.33). dpi / 240 keeps that size there and follows density elsewhere.
+	if (g_density_dpi > 0) g_imgui.SetUiScale((float)g_density_dpi / 240.0f);
 	if (!g_imgui.Init(nullptr, g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
 	                  g_vk_queue_family, g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images,
 	                  frames_in_flight())) {
@@ -2390,6 +2410,16 @@ render_frame()
 		                              g_ui_state.toastAlpha > 0.001f ||
 		                              g_ui_state.transitionAlpha > 0.001f;
 		if (!anything_visible) return false;
+		// Follow the window's pixel size (rotation, freeform resize) so the UI stays 1:1.
+		// Rare, so idle the device rather than track which frame still uses the old images.
+		uint32_t want_w = 0, want_h = 0;
+		hud_target_size(&want_w, &want_h);
+		if (want_w != g_hud_w || want_h != g_hud_h) {
+			vkDeviceWaitIdle(g_vk_device);
+			if (!create_hud_swapchain() ||
+			    !g_imgui.RecreateTarget(g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images))
+				return false;
+		}
 		XrSwapchainImageAcquireInfo hacq = {};
 		hacq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
 		uint32_t hud_idx = 0;
@@ -3064,6 +3094,7 @@ android_main(struct android_app *app)
 {
 	LOGI("mediaplayer_vk_android: android_main entered");
 	app->onAppCmd = handle_cmd;
+	g_density_dpi = AConfiguration_getDensity(app->config);
 	// Touch is NOT consumed via app->onInputEvent: on the legacy path the
 	// runtime's MonadoView overlay covers our window, so a NativeActivity never
 	// sees native input. Gestures arrive via MainActivity.dispatchTouchEvent

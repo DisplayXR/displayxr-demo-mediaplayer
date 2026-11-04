@@ -92,6 +92,21 @@ void Window::PointSize(uint32_t& width, uint32_t& height) const {
     height = (uint32_t)(h > 0 ? h : 0);
 }
 
+float Window::DisplayScale() const {
+    const float s = window_ ? SDL_GetWindowDisplayScale(window_) : 0.0f;
+    return s > 0.0f ? s : 1.0f;
+}
+
+float Window::ContentScaleAt(int x, int y) {
+    const SDL_Point p{x, y};
+    const float s = SDL_GetDisplayContentScale(SDL_GetDisplayForPoint(&p));
+    return s > 0.0f ? s : 1.0f;
+}
+
+void Window::SetSize(int width, int height) {
+    if (window_) SDL_SetWindowSize(window_, width, height);
+}
+
 void Window::SetTitle(const char* title) {
     if (window_) SDL_SetWindowTitle(window_, title);
 }
