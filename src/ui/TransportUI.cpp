@@ -74,9 +74,6 @@ void ApplyMediaPlayerStyle(float k) {
     s.GrabMinSize = 18.0f * k;
     // Hit-only padding: enlarges the grab/press rectangles, draws nothing.
     s.TouchExtraPadding = (k > 1.0f) ? ImVec2(10.0f, 14.0f) : ImVec2(0.0f, 0.0f);
-    // Legible against the HUD canvas (the desktop's long-standing 1.9), nudged up
-    // slightly for arm's-length tablet viewing.
-    ImGui::GetIO().FontGlobalScale = 1.9f * (k > 1.0f ? 1.15f : 1.0f);
 
     const ImVec4 accent(0.20f, 0.65f, 1.00f, 1.00f);
     ImVec4* c = s.Colors;
@@ -91,6 +88,11 @@ void ApplyMediaPlayerStyle(float k) {
     c[ImGuiCol_SliderGrabActive] = ImVec4(0.40f, 0.78f, 1.00f, 1.00f);
     c[ImGuiCol_CheckMark] = accent;
     c[ImGuiCol_Text] = ImVec4(0.92f, 0.94f, 0.97f, 1.00f);
+}
+
+float UiFontPx(float k) {
+    // Touch: nudged up for arm's-length tablet viewing, rounded up to a whole pixel.
+    return (k > 1.0f) ? std::ceil(24.0f * 1.15f) : 24.0f;
 }
 
 namespace {

@@ -1647,14 +1647,6 @@ hud_init()
 	if (!create_hud_swapchain()) {
 		return false;
 	}
-	if (!g_imgui.Init(nullptr, g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
-	                  g_vk_queue_family, g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images,
-	                  frames_in_flight())) {
-		LOGW("ImGuiLayer init failed — no chrome this session");
-		xrDestroySwapchain(g_hud_swapchain);
-		g_hud_swapchain = XR_NULL_HANDLE;
-		return false;
-	}
 	// The ONE sanctioned divergence from the desktop: metrics scale for fingers.
 	// Colours, rounding and every icon are identical — see ApplyMediaPlayerStyle.
 	float ui_scale = kTouchUiScale;
@@ -1663,7 +1655,15 @@ hud_init()
 		const float v = (float)atof(sprop);
 		if (v > 0.5f && v < 4.0f) ui_scale = v;
 	}
-	mp::ui::ApplyMediaPlayerStyle(ui_scale);
+	g_imgui.SetMetricScale(ui_scale);  // before Init: the font is rasterized at its size
+	if (!g_imgui.Init(nullptr, g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
+	                  g_vk_queue_family, g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images,
+	                  frames_in_flight())) {
+		LOGW("ImGuiLayer init failed, no chrome this session");
+		xrDestroySwapchain(g_hud_swapchain);
+		g_hud_swapchain = XR_NULL_HANDLE;
+		return false;
+	}
 
 	// Android can't back these: slideshow and prev/next need to enumerate a folder,
 	// and SAF hands us a file descriptor, not a path. Hidden, not disabled — a

@@ -63,13 +63,14 @@ FetchContent_MakeAvailable(nlohmann_json)
 #                            which this app never receives (the runtime's overlay covers
 #                            the window; touch arrives via dispatchTouchEvent -> JNI).
 #                            Input is fed by hand through ImGuiLayer::PushPointer().
-# No font asset: ImGui's embedded font is what the desktop uses too (only FontGlobalScale
-# is set), so typography matches with zero packaging changes.
+# The UI font is compiled in (cmake/UiFont.cmake, shared with the desktop), so typography
+# matches with zero packaging changes.
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
     GIT_TAG v1.91.5
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(imgui)
+include(${REPO_ROOT}/cmake/UiFont.cmake)
 set(MP_IMGUI_DIR "${imgui_SOURCE_DIR}")
 set(MP_IMGUI_SOURCES
     ${MP_IMGUI_DIR}/imgui.cpp
@@ -158,7 +159,8 @@ target_include_directories(mediaplayer_vk_android PRIVATE
     ${REPO_ROOT}/src                            # Log.h (impl = lif_log_android.cpp)
     ${REPO_ROOT}/src/media                      # LifLoader.h, ImageDecoder.h, MediaSource.h
     ${REPO_ROOT}/third_party/displayxr-openxr  # DisplayXR XR_EXT_* headers
-    ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)  # Dear ImGui + the Vulkan backend
+    ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends   # Dear ImGui + the Vulkan backend
+    ${MP_UI_FONT_INCLUDE_DIR})                  # ui_font.h
 
 # displayxr-common's header-only rules — the same target name the desktop links. A
 # linked target's include dirs come AFTER the target's own, so common/ stays LAST.

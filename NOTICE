@@ -10,3 +10,7 @@ that are copied verbatim from DisplayXR/displayxr-runtime and remain licensed
 under the Boost Software License 1.0 (BSL-1.0); see each file's
 SPDX-License-Identifier. Some carry Copyright Collabora, Ltd. (the XR_MNDX_*
 headers).
+
+The UI font, Inter (third_party/fonts/inter), is Copyright (c) 2016 The Inter
+Project Authors and licensed under the SIL Open Font License 1.1; see
+third_party/fonts/inter/LICENSE.txt.

@@ -163,6 +163,7 @@ FetchContent_Declare(imgui
     GIT_TAG v1.91.5
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(imgui)
+include(cmake/UiFont.cmake)
 
 # --- nlohmann/json (header-only) for parsing the LIF container's JSON metadata.
 #     Lightweight (no link step), so LIF support is on the default path. (HEIC needs no
@@ -319,7 +320,7 @@ function(mp_add_player tgt is_pro)
     endif()
 
     target_include_directories(${tgt} PRIVATE
-        ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)
+        ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends ${MP_UI_FONT_INCLUDE_DIR})
     # MEDIAPLAYER_IMGUI_SDL selects the SDL3 ImGui *platform* backend (input + dt) on
     # Windows / macOS. Desktop Linux has no SDL window: MEDIAPLAYER_IMGUI_DXRWIN feeds
     # ImGui from displayxr-common's window events instead. The Android leg defines

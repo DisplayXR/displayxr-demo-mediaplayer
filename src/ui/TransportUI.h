@@ -195,10 +195,14 @@ struct TransportActions {
 };
 
 // The player's "dark glass" look. `metricScale` is the ONE sanctioned divergence
-// between legs: 1.0 on desktop, ~1.6 on touch. It scales PADDING AND GRAB SIZES ONLY —
-// every colour, rounding radius and icon is identical on both, so the design is one
-// design. Never branch on it anywhere else.
+// between legs: 1.0 on desktop, ~1.6 on touch. It scales PADDING, GRAB SIZES AND THE
+// FONT SIZE (UiFontPx) ONLY: every colour, rounding radius and icon is identical on
+// both, so the design is one design. Never branch on it anywhere else.
 void ApplyMediaPlayerStyle(float metricScale = 1.0f);
+
+// The UI font size in HUD pixels for the same metricScale: 24 on desktop, 28 on touch.
+// ImGuiLayer rasterizes the font at exactly this size.
+float UiFontPx(float metricScale = 1.0f);
 
 // Advance the purely-visual timers: the auto-hide fade and the toast fade.
 // `uiAwake` is the caller's "should the chrome be visible" verdict (master
