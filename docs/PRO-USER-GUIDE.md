@@ -288,15 +288,18 @@ from 2.5 m), **Monitor** (27", 0.60 m from 0.65 m), **Tablet** (11", 0.25 m from
 or **Custom** (your width and distance). It is **Off** by default.
 
 - **Show at the target's size** (on when you pick a target) shows the picture on the 3D
-  panel at the size it appears from a seat in front of the target. The depth then looks
-  as it will there: things in front of or behind the screen by the same angles. The
+  panel at the size it appears from a seat in front of the target, at the current
+  convergence. The framing and every depth angle then match the target, and the screen
+  plane stays where it is. It is not the same experience: your eyes still focus and
+  converge at the panel, so a large screen's sense of depth and any divergence are not
+  felt here. Use the numbers below for those. The
   picture is cropped when the target fills more of the view than the panel does, and gets
   a black border when it fills less. The Inspector shows the scale (`Picture x1.45,
   cropped`). It uses the panel's size, how far you sit from it (followed by eye tracking,
   smoothed over about half a second; the runtime's nominal distance when nobody is
   tracked) and the player window's size: a smaller window shows less of the picture.
 - The rig check's near and far are also given **for the target**: millimetres on its
-  screen and arcminutes (′) at its viewing distance, and so do the depth alerts
+  screen and arcminutes (′) at its viewing distance, including the current convergence, and so do the depth alerts
   (`Foreground at -2.0% for 2 s [-203 mm, -58' on Cinema]`). When the background's parallax is
   wider than the eyes are apart, the eyes have to turn outwards (diverge); past 0.5° the
   rig check raises **Background diverges on the target screen**. The Inspector shows
