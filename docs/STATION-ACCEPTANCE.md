@@ -22,7 +22,7 @@ without the card checks, plus the 10-minute capture soak.
 
 ## 2. Run the automated checks
 
-The installer puts the script in `C:\Program Files\DisplayXR\Apps\MediaPlayerPro	oolscceptance\`
+The installer puts the script in `C:\Program Files\DisplayXR\Apps\MediaPlayerPro\tools\acceptance\`
 (also `scripts\station_acceptance.ps1` in the repo). From that folder:
 
 ```
