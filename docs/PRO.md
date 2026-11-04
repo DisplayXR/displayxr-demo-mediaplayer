@@ -237,14 +237,18 @@ log line `DeckLink input (Pro): ON (SDK x.y)`, then:
 6. Dual-stream 3D on one cable (a card that supports it; the Mini Recorder 4K does
    **not**, and the 8K Pro's support is per mode: `bmdSupportedVideoModeDualStream3D`):
    Auto switches to it, both eyes show, a signal that goes back to 2D leaves it.
-7. 4K60 two-input: frame rate held and no drops (conversion runs on the SDK callback
-   thread under one lock; if it drops, move the v210 unpack off that thread or onto the
-   GPU).
-8. RGB 4:4:4 and 12-bit, Rec.2020 / HLG / PQ from the VPID: shown with a warning (the
-   grade is BT.709 unless the colour tag says otherwise); audio and ancillary data are
-   ignored on purpose.
+7. 4K60 two-input: frame rate held and no drops, and 10-bit actually negotiated (the
+   8-bit fallback is only an INFO line; `get_rig_status` `decklink.bit_depth` says).
+8. RGB 4:4:4 and 12-bit: captured as 8-bit today, so depth is lost; Rec.2020 / HLG / PQ
+   from the VPID are tone-mapped to the SDR panel. Audio and ancillary data are ignored on
+   purpose.
 9. Resolve Studio's stereo output modes (side by side, dual-stream) into the same card;
    Desktop Video Setup / Media Express running at the same time (they claim the input).
+
+Also on first contact with a card: a format change during dual-stream 3D, including a mode
+the card refuses; stop, reopen and input switch while streaming; pulling the card or its
+Thunderbolt cable; Desktop Video older than the SDK with a card present (the card is listed,
+and opening it is what reports the driver as too old).
 
 Card facts that shape the plan: the **Mini Recorder 4K** is one input (SDI *or* HDMI, no
 dual-stream 3D, 2160p30 max), so it covers the single-cable Resolve case only; two-cable

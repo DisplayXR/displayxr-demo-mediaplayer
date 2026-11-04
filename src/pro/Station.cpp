@@ -511,7 +511,8 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
         auto write = [&](const std::filesystem::path& path, const std::string& text) {
             std::ofstream f(path.string(), std::ios::binary);
             f << text;
-            return (bool)f;
+            f.close();  // a full disk only shows here, when the buffer is written
+            return !f.fail();
         };
         // report.html last, through a rename: once it exists the report is complete.
         const std::filesystem::path html = dir / "report.html", part = dir / "report.html.part";
@@ -599,9 +600,12 @@ std::string Station::RigStatusJson() const {
         // capture health (#141): the "Done when" of a two-input 4K60 run reads these
         const LiveStats ls = decklink_.GetStats();
         json dl = {{"delivered_fps", ls.deliveredFps}, {"signal_fps", ls.fps}, {"published", ls.published},
-                   {"late_frames", ls.lateFrames}, {"dropped", ls.dropped}};
+                   {"late_frames", ls.lateFrames}, {"dropped", ls.dropped},
+                   {"width", ls.w}, {"height", ls.h}, {"bit_depth", DeckLinkSource::LastBitDepth()},
+                   {"eye_width", decklink_.IsPair() ? ls.w / 2 : ls.w}};  // a pair is shown side by side
         if (decklink_.IsPair()) {
             const DeckLinkSource::PairStats ps = decklink_.GetPairStats();
+            dl["pairing"] = ps.timecode ? "timecode" : ps.hwClockPairing ? "hardware_clock" : "newest";
             dl["pairs"] = ps.pairs;
             dl["unpaired"] = ps.unpaired;
             dl["max_skew_ms"] = ps.maxAbsSkewMs;
