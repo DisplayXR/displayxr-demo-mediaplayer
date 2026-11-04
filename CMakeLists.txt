@@ -290,6 +290,7 @@ function(mp_add_player tgt is_pro)
         src/media/ImageSequence.cpp  # EXR / DPX / TIFF frames as one clip (Pro formats only)
         src/media/AutoConvergence.cpp  # live auto-convergence (#92): disparity.js port
         src/media/StreamUrl.cpp      # stream-URL classifier (#93)
+        src/media/VrView.cpp         # VR180 / VR360 viewer (#155): rectified window geometry, pure
         src/media/LiftClient.cpp     # "Convert to 3D": XR_DXR_lift VIEWS_MONO stream (CPU in / out)
         src/media/InputProviderClient.cpp  # XR_DXR_input_providers: the Input popup
         src/ui/Hud.cpp
@@ -459,6 +460,8 @@ function(mp_add_player tgt is_pro)
             src/pro/ProController.cpp
             src/pro/ProTools.cpp         # agent tools: grade, view, station
             src/pro/LookLoader.cpp       # LUT parse / OCIO bake off the render thread
+            src/pro/DisplayCalibration.cpp  # per-panel display calibration (#133)
+            src/pro/TargetScreen.cpp     # target-screen depth model (#135)
             src/pro/LivePixels.cpp       # UYVY / v210 / BGRA -> NV12 / P016 for capture cards
             src/pro/LiveSourceBase.cpp   # shared ring + stats of the Pro live sources
             src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)
@@ -500,16 +503,22 @@ function(mp_add_player tgt is_pro)
     message(STATUS "Configured target: ${tgt}")
 endfunction()
 
-# Blackmagic DeckLink input (Pro, docs/PRO.md). The Desktop Video SDK is a registration
-# download and is never committed: point MP_DECKLINK_SDK_DIR (or the env var of the same
-# name) at the SDK zip or its extracted folder. Windows generates the COM header from the
+# Blackmagic DeckLink input (Pro, docs/PRO.md). The SDK's include folders are vendored in
+# third_party/decklink-sdk (their licence permits it; the rest of the SDK stays out, see the
+# README there) and are the default. MP_DECKLINK_SDK_DIR (or the env var of the same name)
+# overrides with another SDK zip or extracted folder; -DMP_DECKLINK_SDK_DIR=OFF builds
+# without DeckLink. Windows generates the COM header from the
 # SDK's IDL with midl at configure time (as Open RV does); macOS and Linux use the ready
 # headers in Mac/include and Linux/include plus the SDK's DeckLinkAPIDispatch.cpp, which
 # loads the installed DeckLinkAPI framework / libDeckLinkAPI.so at run time. Without the
 # SDK, Pro builds and its DeckLink input reports "no DeckLink support". The SDK's own
 # include folder stays on the include path everywhere for DeckLinkAPIVersion.h, which
 # DeckLinkSource.cpp uses to pick the 14.3+ frame-buffer API.
-set(MP_DECKLINK_SDK_DIR "$ENV{MP_DECKLINK_SDK_DIR}" CACHE PATH "Blackmagic DeckLink SDK zip or folder (Pro)")
+set(_dl_default "$ENV{MP_DECKLINK_SDK_DIR}")
+if(NOT _dl_default AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/decklink-sdk")
+    set(_dl_default "${CMAKE_CURRENT_SOURCE_DIR}/third_party/decklink-sdk")
+endif()
+set(MP_DECKLINK_SDK_DIR "${_dl_default}" CACHE PATH "Blackmagic DeckLink SDK zip or folder (Pro); OFF = no DeckLink")
 set(MP_DECKLINK_INCLUDE "")
 set(MP_DECKLINK_SDK_INCLUDE "")
 if(MP_DECKLINK_SDK_DIR)
@@ -563,7 +572,7 @@ if(MP_DECKLINK_SDK_DIR)
         message(STATUS "DeckLink input (Pro): ON (SDK ${_dl_ver}, ${_dl_inc})")
     endif()
 else()
-    message(STATUS "DeckLink input (Pro): OFF (set MP_DECKLINK_SDK_DIR to the Desktop Video SDK)")
+    message(STATUS "DeckLink input (Pro): OFF (MP_DECKLINK_SDK_DIR=${MP_DECKLINK_SDK_DIR})")
 endif()
 
 # OpenColorIO (Pro, optional): an OCIO 2.x install prefix (e.g. Open RV's build,
@@ -667,6 +676,26 @@ if(MP_BUILD_TESTS)
     target_include_directories(camera_select_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME camera_select COMMAND camera_select_test)
 
+    # VR180 / VR360 viewer (#155): the stereo pair stays rectified (vertical disparity ~0)
+    # across the whole pan / pitch range on synthetic scenes, plus clamps and detection.
+    # With FFmpeg it also reads the committed sv3d / st3d fixtures (tools/vr/make_vr_fixtures.py).
+    if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
+        add_executable(vr_view_test tests/vr_view_test.cpp src/media/VrView.cpp
+            src/media/VideoStereoProbe.cpp src/media/StereoDetect.cpp src/media/MediaSource.cpp
+            src/media/SpatialMedia.cpp src/Log.cpp)
+        target_compile_definitions(vr_view_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1
+            MP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+        if(TARGET PkgConfig::FFMPEG)
+            target_link_libraries(vr_view_test PRIVATE PkgConfig::FFMPEG)
+        else()
+            target_link_libraries(vr_view_test PRIVATE mp_ffmpeg)
+        endif()
+    else()
+        add_executable(vr_view_test tests/vr_view_test.cpp src/media/VrView.cpp)
+    endif()
+    target_include_directories(vr_view_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME vr_view COMMAND vr_view_test)
+
     # Auto-convergence (#92): synthetic SBS pairs with known disparity. Pure, no SDL.
     add_executable(auto_convergence_test
         tests/auto_convergence_test.cpp
@@ -717,6 +746,15 @@ if(MP_BUILD_TESTS)
     add_executable(qc_report_test tests/qc_report_test.cpp src/pro/QcReport.cpp)
     target_include_directories(qc_report_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME qc_report COMMAND qc_report_test)
+    add_executable(display_calibration_test tests/display_calibration_test.cpp src/pro/DisplayCalibration.cpp)
+    target_include_directories(display_calibration_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(display_calibration_test PRIVATE shell32 ole32 advapi32)
+    endif()
+    add_test(NAME display_calibration COMMAND display_calibration_test)
+    add_executable(target_screen_test tests/target_screen_test.cpp src/pro/TargetScreen.cpp)
+    target_include_directories(target_screen_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME target_screen COMMAND target_screen_test)
     add_executable(timecode_pairer_test tests/timecode_pairer_test.cpp src/pro/TimecodePairer.cpp)
     target_include_directories(timecode_pairer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME timecode_pairer COMMAND timecode_pairer_test)
@@ -739,7 +777,7 @@ if(MP_BUILD_TESTS)
     add_executable(overlays_test tests/overlays_test.cpp src/pro/Overlays.cpp)
     target_include_directories(overlays_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME overlays COMMAND overlays_test)
-    add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/LivePixels.cpp
+    add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/TargetScreen.cpp src/pro/LivePixels.cpp
         src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
     target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)

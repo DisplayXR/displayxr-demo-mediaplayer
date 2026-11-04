@@ -12,6 +12,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/frame.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/spherical.h>
 #include <libavutil/stereo3d.h>
 }
 #include "SpatialFFmpeg.h"  // MV-HEVC (#154)
@@ -24,6 +25,8 @@ namespace mp {
 VideoStereoProbe::Result VideoStereoProbe::Run(const std::string&, bool, int) {
     return VideoStereoProbe::Result{};
 }
+
+bool VideoStereoProbe::ReadSpherical(const std::string&, int&, float&) { return false; }
 
 #else
 
@@ -87,6 +90,60 @@ bool ReadStereo3D(const AVFrame* f, StereoLayout& layout, bool& invert, const ch
             why = "stereo3d: unsupported packing";
             return true;
     }
+}
+
+// VR180 / VR360 (#155): an AVSphericalMapping reduced to (kind, horizontal coverage) for
+// vr::FromSpherical. kind: 0 equirect, 1 bounded equirect, 2 half equirect, 3 fisheye.
+bool ReduceSpherical(const AVSphericalMapping* m, size_t size, int& kind, float& coverageDeg) {
+    if (!m || size < sizeof(AVSphericalMapping)) return false;
+    kind = -1;
+    coverageDeg = 360.0f;
+    switch (m->projection) {
+        case AV_SPHERICAL_EQUIRECTANGULAR: kind = 0; break;
+        case AV_SPHERICAL_EQUIRECTANGULAR_TILE: {
+            // Bounds are 0.32 fixed-point fractions of the full 360 x 180 frame cropped away:
+            // VR180 writes left = right = 0.25.
+            kind = 1;
+            const double l = (double)m->bound_left / 4294967296.0, r = (double)m->bound_right / 4294967296.0;
+            coverageDeg = (float)(360.0 * (1.0 - l - r));
+            break;
+        }
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 39, 100)  // FFmpeg 7.1: Apple APMP projections
+        case AV_SPHERICAL_HALF_EQUIRECTANGULAR: kind = 2; coverageDeg = 180.0f; break;
+        case AV_SPHERICAL_FISHEYE: kind = 3; coverageDeg = 0.0f; break;
+#endif
+        default: break;  // cubemap, rectilinear, parametric immersive: not supported
+    }
+    return true;
+}
+
+// The stream-level spherical side data (the MP4 / MOV demuxer attaches sv3d here). The API
+// moved: FFmpeg 6.1 introduced codecpar->coded_side_data and 8.0 removed
+// av_stream_get_side_data, whose size out-param itself changed int -> size_t at lavf 59.
+const AVSphericalMapping* StreamSpherical(const AVStream* st, size_t& size) {
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 31, 102)  // FFmpeg 6.1
+    const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data,
+                                                         st->codecpar->nb_coded_side_data, AV_PKT_DATA_SPHERICAL);
+    if (!sd) return nullptr;
+    size = sd->size;
+    return reinterpret_cast<const AVSphericalMapping*>(sd->data);
+#elif LIBAVFORMAT_VERSION_MAJOR >= 59
+    size_t sz = 0;
+    const uint8_t* p = av_stream_get_side_data(st, AV_PKT_DATA_SPHERICAL, &sz);
+    size = sz;
+    return reinterpret_cast<const AVSphericalMapping*>(p);
+#else
+    int sz = 0;  // ffmpeg 4.x (Ubuntu 22.04)
+    const uint8_t* p = av_stream_get_side_data(const_cast<AVStream*>(st), AV_PKT_DATA_SPHERICAL, &sz);
+    size = sz > 0 ? (size_t)sz : 0;
+    return reinterpret_cast<const AVSphericalMapping*>(p);
+#endif
+}
+
+void ReadStreamSpherical(const AVStream* st, VideoStereoProbe::Result& out) {
+    size_t sz = 0;
+    const AVSphericalMapping* m = StreamSpherical(st, sz);
+    if (m && ReduceSpherical(m, sz, out.sphericalKind, out.sphericalCoverageDeg)) out.haveSpherical = true;
 }
 
 // Analyse a decoded frame's luma plane. Handles >8-bit planar formats by sampling the
@@ -162,6 +219,7 @@ VideoStereoProbe::Result VideoStereoProbe::Run(const std::string& path, bool wan
     if (stream < 0 || !codec) return out;
 
     AVStream* st = c.fmt->streams[stream];
+    ReadStreamSpherical(st, out);  // VR180 / VR360 (#155)
     // MV-HEVC (#154): a container fact, like LVF's two tracks. VideoDecoder composes the two
     // views side by side, so the clip IS full SBS at twice the view width — say so and skip
     // the pre-roll (the base view alone would look mono to every other layer).
@@ -215,6 +273,12 @@ VideoStereoProbe::Result VideoStereoProbe::Run(const std::string& path, bool wan
         while (avcodec_receive_frame(c.dec, c.frame) >= 0) {
             ++out.framesExamined;
 
+            if (!out.haveSpherical) {  // decoders that export it per frame (#155)
+                const AVFrameSideData* sd = av_frame_get_side_data(c.frame, AV_FRAME_DATA_SPHERICAL);
+                if (sd && ReduceSpherical(reinterpret_cast<const AVSphericalMapping*>(sd->data), (size_t)sd->size,
+                                          out.sphericalKind, out.sphericalCoverageDeg))
+                    out.haveSpherical = true;
+            }
             if (!out.haveMeta) {
                 StereoLayout ml = StereoLayout::Mono;
                 bool inv = false;
@@ -257,12 +321,25 @@ VideoStereoProbe::Result VideoStereoProbe::Run(const std::string& path, bool wan
 
     out.elapsedMs =
         std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-    LOG_INFO("VideoStereoProbe: '%s' %dx%d frames=%d votes=%d meta=%s%s content=%s(%s) %.0fms",
+    LOG_INFO("VideoStereoProbe: '%s' %dx%d frames=%d votes=%d meta=%s%s spherical=%d/%.0f content=%s(%s) %.0fms",
              path.c_str(), out.width, out.height, out.framesExamined, out.votes,
              out.haveMeta ? metaWhy : "none", out.metaInvert ? " R|L" : "",
+             out.haveSpherical ? out.sphericalKind : -1, out.sphericalCoverageDeg,
              out.content.decided ? LayoutName(out.content.layout) : "undecided",
              out.content.reason, out.elapsedMs);
     return out;
+}
+
+bool VideoStereoProbe::ReadSpherical(const std::string& path, int& kind, float& coverageDeg) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return false;
+    Result r;
+    const int stream = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (stream >= 0) ReadStreamSpherical(fmt->streams[stream], r);
+    avformat_close_input(&fmt);
+    kind = r.sphericalKind;
+    coverageDeg = r.sphericalCoverageDeg;
+    return r.haveSpherical;
 }
 
 #endif  // MEDIAPLAYER_WITH_FFMPEG

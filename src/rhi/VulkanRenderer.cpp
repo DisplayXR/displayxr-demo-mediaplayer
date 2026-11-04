@@ -43,14 +43,14 @@ VkShaderModule MakeShaderModule(VkDevice device, const uint32_t* spv, size_t byt
 namespace mp {
 
 namespace {
-constexpr uint32_t kBindings = 7;  // 3 source planes, the grade LUT, 3 compare planes
+constexpr uint32_t kBindings = 8;  // 3 source planes, the grade LUT, 3 compare planes, the calibration LUT
 
 // Fragment push constants - must match `PushConstants` in shaders/sbs.frag (std430
 // push-constant offsets: vec2 at 8, vec4 at 16).
 struct DrawPush {
     float off[2];        //  0
     float scale[2];      //  8
-    int32_t mode;        // 16
+    int32_t mode;        // 16  bits 0-1 source format; bits 8+ VR flags (#155, vr::PackModeFlags)
     float fullRange;     // 20
     float srgbTarget;    // 24
     int32_t qcMode;      // 28
@@ -59,11 +59,11 @@ struct DrawPush {
     float lutOn;         // 44
     float cdlSlope[4];   // 48  .a = saturation
     float cdlOffset[4];  // 64  .a = CDL on
-    float cdlPower[4];   // 80
+    float cdlPower[4];   // 80  .a = VR window pitch, radians (#155)
     float lutDomain[4];  // 96  x = min, y = 1/(max-min), z = N
     int32_t yuvMatrix;   // 112 0 = BT.709 (default), 1 = BT.601, 2 = BT.2020 NCL
     float zebraLevel;    // 116 > 0: zebra stripes at or above this graded luma
-    int32_t viewFlags;   // 120 channel (bits 0-2) + wipe mode (bits 4-5)
+    int32_t viewFlags;   // 120 channel (bits 0-2) + wipe mode (bits 4-5); bits 16-31 VR heading (#155)
     uint32_t wipeGamma;  // 124 PackWipeGamma(): wipe position + display gamma
 };
 static_assert(sizeof(DrawPush) == 128, "DrawPush must match the shader's PushConstants");
@@ -762,8 +762,9 @@ void VulkanRenderer::BindDescriptors(VkDescriptorSet set) {
     VkWriteDescriptorSet writes[kBindings] = {};
     for (uint32_t i = 0; i < kBindings; ++i) {
         dii[i].sampler = sampler_;
-        if (i == 3) {   // the Pro grade LUT, or its 1x1x1 dummy
-            dii[i].imageView = lut_.view ? lut_.view : lutDummy_.view;
+        if (i == 3 || i == 7) {   // the Pro grade LUT / display calibration, or the 1x1x1 dummy
+            const Lut3D& l = i == 3 ? lut_ : cal_;
+            dii[i].imageView = l.view ? l.view : lutDummy_.view;
             dii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         } else if (i >= 4) {
             dii[i].imageView = bViews[i - 4] ? bViews[i - 4] : dummyView_;
@@ -888,7 +889,7 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         pc.off[1] = uvs[v].offY;
         pc.scale[0] = uvs[v].scaleX;
         pc.scale[1] = uvs[v].scaleY;
-        pc.mode = sourceMode_;
+        pc.mode = sourceMode_ | (int32_t)uvs[v].vrMode;  // vrMode = 0 unless a VR draw (#155)
         pc.fullRange = sourceFullRange_;
         pc.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
         pc.qcMode = grade_.qcMode;
@@ -903,6 +904,7 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         }
         pc.cdlSlope[3] = grade_.saturation;
         pc.cdlOffset[3] = grade_.cdlOn ? 1.0f : 0.0f;
+        pc.cdlPower[3] = uvs[v].vrPitch;  // the CDL power is RGB only
         pc.lutDomain[0] = lut_.domainMin;
         pc.lutDomain[1] = 1.0f / std::max(1e-6f, lut_.domainMax - lut_.domainMin);
         pc.lutDomain[2] = (float)std::max(1u, lut_.size);
@@ -913,6 +915,8 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         if (compareMode_ >= 0)  // B's sampling: mode bits 8-9, full range 10, matrix 11-12, P016 13, bound 14
             pc.viewFlags |= (compareMode_ << 8) | ((compareFullRange_ ? 1 : 0) << 10) | (compareMatrix_ << 11) |
                             ((compare16_ ? 1 : 0) << 13) | (1 << 14);
+        if (grade_.calOn && cal_.view) pc.viewFlags |= 1 << 15;  // display calibration (#133)
+        pc.viewFlags |= (int32_t)uvs[v].vrHeading;  // bits 16-31 (vr::PackHeading)
         pc.wipeGamma = PackWipeGamma(grade_.wipePos, grade_.gamma);
         vkCmdPushConstants(cmd, activeLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
@@ -1371,6 +1375,7 @@ void VulkanRenderer::Shutdown() {
     DestroyTexture();
     ClearCompare();
     DestroyLut(lut_, false);
+    DestroyLut(cal_, false);
     DestroyLut(lutDummy_, false);
     ring_.destroy();  // waits its fences, runs the deferred releases, frees cmds/fences
     if (sampler_) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
@@ -1519,5 +1524,14 @@ bool VulkanRenderer::UploadLut3DPacked(const uint16_t* rgba16f, uint32_t size, f
 }
 
 void VulkanRenderer::ClearLut3D() { DestroyLut(lut_, /*deferred=*/true); }
+
+bool VulkanRenderer::UploadCalibrationLut(const uint16_t* rgba16f, uint32_t size) {
+    if (!rgba16f || size < 2 || size > 256 || device_ == VK_NULL_HANDLE) return false;
+    if (!CreateLutImage(cal_, size, rgba16f)) return false;
+    LOG_INFO("Calibration LUT: uploaded %u^3", size);
+    return true;
+}
+
+void VulkanRenderer::ClearCalibrationLut() { DestroyLut(cal_, /*deferred=*/true); }
 
 } // namespace mp

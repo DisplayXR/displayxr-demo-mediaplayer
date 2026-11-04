@@ -117,6 +117,49 @@ compare); with the clip wipe on, it swaps which clip is on which side.
 
 The grade is applied in this order: exposure, then the CDL, then the LUT.
 
+### Display calibration
+
+The grade is the show's look and follows the content. A **display calibration** corrects
+the panel itself, so that it shows Rec.709 / D65 / gamma 2.4 (or a site standard)
+correctly. It belongs to the unit: each panel has its own, and the player loads it by
+itself whenever it runs on that panel.
+
+- **Calibrate panel...** (Inspector > Colour) loads a `.cube` 3D LUT made for this panel by
+  a calibration tool (DisplayCAL, Calman, ColourSpace: export a 3D LUT for your target).
+  The player keeps a copy for this panel, so from then on it loads at start-up.
+- The Inspector shows **Display: <name>**, or **Display: not calibrated** in amber when the
+  panel has none; the status line shows the same. Hover it for the panel's key and file.
+- **`Shift+G`** (or **Bypass calibration**) turns the calibration off and on. **`G`** does
+  not touch it: bypassing the grade still shows the picture through the calibration.
+- **Remove** deletes this panel's calibration.
+
+It is applied after the grade and the QC views, and before the gamma trim. The LUT must
+cover 0..1 (the usual `DOMAIN` for a display calibration); one with another domain is
+refused with a message.
+
+Each panel is recognised by the key the DisplayXR runtime gives it (the one
+`displayxr-cli displays --claims` prints), on the display the player's window is on; drag
+the window to another 3D panel and its calibration follows. What the key is depends on
+what the panel reports:
+
+- The panel's plug-in reports the panel's own serial: the key uses it, and moving the
+  cable to another port keeps the calibration.
+- Otherwise, the panel's EDID has a serial number: the same, unless the panel reports a
+  different product code on each input.
+- Neither: the key includes the port (`...@DISPLAY1`), so the calibration stays with the
+  port, not the panel.
+
+Two connected monitors that would otherwise share a key also get the port added. With a
+DisplayXR runtime that does not
+report the key yet (`XR_DXR_display_info` before v24), the OS display name (`DISPLAY1` on
+Windows) stands in, which follows the port.
+The Inspector shows the key when you hover the calibration line. The files live in
+`%APPDATA%\DisplayXR\MediaPlayerPro\calibration\<panel>.cube` (macOS:
+`~/Library/Application Support/DisplayXR/MediaPlayerPro/calibration`). Set
+`MEDIAPLAYER_PRO_CAL_DIR` to use another folder, for example one shared by a site;
+`MEDIAPLAYER_PRO_CAL=<file.cube>` loads a calibration for one run without keeping it.
+An agent can do the same with `set_display_calibration`.
+
 ### 10-bit to the panel
 
 By default the picture reaches the display at 8 bits per channel, which can show banding
@@ -204,10 +247,39 @@ The defaults, and how to change them when starting the player:
 
 | Check | Default | Option |
 |---|---|---|
-| Depth budget (nearest, farthest) | -2 % to +1 % | `--depth-budget=-2,1` |
+| Depth budget (nearest, farthest) | -2 % to +1 % | `--depth-budget=-2,1`, or `--depth-budget=comfort` for -1 % to +2 % |
 | Vertical error | 1 px | `--vertical-limit=1` |
 | Colour match | dE 2 | `--colour-limit=2` |
 | Frame edges (nearest allowed at the edge) | -0.3 % | `--edge-limit=-0.3` |
+
+### Target screen
+
+The same picture has more depth on a screen that fills more of your view (a cinema) and
+less on one that fills less. **Target screen** (Inspector) judges the depth for the screen
+the picture is made for: **Cinema** (10 m wide, seen from 12 m), **Home TV** (65", 1.44 m
+from 2.5 m), **Monitor** (27", 0.60 m from 0.65 m), **Tablet** (11", 0.25 m from 0.40 m)
+or **Custom** (your width and distance). It is **Off** by default.
+
+- **Show at the target's size** (on when you pick a target) shows the picture on the 3D
+  panel at the size it appears from a seat in front of the target. The depth then looks
+  as it will there: things in front of or behind the screen by the same angles. The
+  picture is cropped when the target fills more of the view than the panel does, and gets
+  a black border when it fills less. The Inspector shows the scale (`Picture x1.45,
+  cropped`). It uses the panel's size, how far you sit from it (followed by eye tracking,
+  smoothed over about half a second; the runtime's nominal distance when nobody is
+  tracked) and the player window's size: a smaller window shows less of the picture.
+- The rig check's near and far are also given **for the target**: millimetres on its
+  screen and arcminutes (′) at its viewing distance, and so do the depth alerts
+  (`Foreground at -2.0% for 2 s [-203 mm, -58' on Cinema]`). When the background's parallax is
+  wider than the eyes are apart, the eyes have to turn outwards (diverge); past 0.5° the
+  rig check raises **Background diverges on the target screen**. The Inspector shows
+  where that starts (`Diverges past +1.7%` on the cinema).
+- **Depth budget -1 / +2 %** sets the depth limits to 1 % in front, 2 % behind.
+
+`MEDIAPLAYER_PRO_TARGET=cinema` (or `tv`, `monitor`, `tablet`, `<width>x<distance>` in
+metres) starts with a target; `MEDIAPLAYER_PRO_TARGET_PREVIEW=0` keeps the picture at the
+panel's size. An agent uses `set_target_screen`; `get_rig_status` and snapshot notes carry
+a `target` block.
 
 ## Snapshots
 
@@ -257,7 +329,7 @@ or use the **Clip A | B** wipe (`8`) to see both at once, split by the line.
 | `7`, `8`, `9` | zebras, wipe, channel |
 | `W`, `P`, `Q` | scopes, pixel probe, frame line |
 | wheel, middle-drag, `H`, `Z` | zoom, pan, fit, 1:1 |
-| `G` | grade bypass |
+| `G`, `Shift+G` | grade bypass, display calibration bypass |
 | `X`, `-` / `=`, `0`, `Backspace`, `A` | swap eyes, convergence, reset, converge once, auto-converge |
 | `L`, `Shift+L` | stereo layout override, convert 2D to 3D |
 | `V` | next display mode (2D / 3D / others the display offers; a chip names it) |

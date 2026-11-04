@@ -21,6 +21,7 @@
 #include "color/CubeLut.h"
 #include "pro/CompareClip.h"
 #include "pro/LookLoader.h"
+#include "pro/TargetScreen.h"
 #include "pro/OcioBake.h"
 #include "pro/Overlays.h"
 #include "pro/ResolveLink.h"
@@ -93,6 +94,18 @@ struct Host {
     std::function<void()> toggleFullscreen;
     std::function<void(float)> setDesqueeze;  // anamorphic: stretch the picture's width
     std::function<double()> mediaFps;         // the open video's frame rate, 0 when not a video
+    std::function<std::string()> displayDeviceName;  // the 3D panel's OS monitor name (#133)
+    // #133: the display the player's window is on: the runtime's stable key ("" on a
+    // runtime before display_info v24) and its OS device name. False when unknown.
+    std::function<bool(std::string& key, std::string& deviceName)> panelIdentity;
+    std::function<bool()> displaysChanged;  // true once after the runtime's displays-changed event
+    // #135 target-screen preview: show the picture at the angular size it has on a screen
+    // widthM wide seen from distanceM (0, 0 = off); the scale it is shown at; the panel's
+    // width and nominal viewing distance (false when the runtime does not say).
+    std::function<void(float widthM, float distanceM)> setTargetScreen;
+    std::function<float()> pictureScale;
+    std::function<float()> viewerDistance;  // m: the tracked viewer, else the nominal distance
+    std::function<bool(float& widthM, float& viewerM)> panelGeometry;
     // An RGBA texture for ImGui::Image (scope pictures), per slot: upload `rgba` (nullptr =
     // no change) and return its ImTextureID, nullptr when there is none.
     std::function<void*(int slot, int w, int h, const uint8_t* rgba)> userTexture;
@@ -110,6 +123,14 @@ public:
     // (and an OCIO bake) loads asynchronously: it applies a few frames later, in Tick().
     void LoadLut(const std::string& path);
     void LoadCdl(const std::string& path);
+    // Per-panel display calibration (#133). Load `cube` as this panel's calibration and,
+    // with `install`, keep it for this panel (copied to its file in the calibration folder,
+    // so it loads automatically from then on). ClearCalibration drops it (and with
+    // `uninstall`, deletes the panel's file).
+    void LoadCalibration(const std::string& cube, bool install);
+    void ClearCalibration(bool uninstall);
+    // #135: judge (and preview) the depth for a target screen; an off Screen = this panel.
+    void SetTarget(const target::Screen& t);
     // An OpenColorIO transform baked into the grade's 3D LUT (needs a build with MP_OCIO_ROOT).
     // True = queued; config / colour-space errors surface later as lutError_.
     bool LoadOcio(const ocio::Request& req, std::string* err = nullptr);
@@ -220,16 +241,44 @@ private:
     std::string lutLoading_;       // source of the look being built ('' = none)
     std::string lutError_;         // why the last look failed ('' = it did not)
 
+    // Display calibration (#133): per panel, after the grade and QC views. Not part of the
+    // show grade, so G (bypass all) leaves it on; Shift+G bypasses it.
+    LookLoader calLoader_;         // its own loader: a look load must not supersede it
+    bool calResolved_ = false;     // the panel key was looked up (first Tick)
+    std::string calKey_;           // this panel's key (pro/DisplayCalibration.h)
+    bool calKeyFromRuntime_ = false;  // the runtime's stable key (display_info v24), not the device name
+    int calCheckTicks_ = 0;        // frames since the panel was last looked up
+    std::string calPath_, calName_;
+    std::string calLoading_, calError_;
+    bool calInstall_ = false;      // the pending load is kept for this panel once it applies
+    bool calLoaded_ = false;       // a calibration LUT is on the GPU
+    bool calBypass_ = false;       // Shift+G / the Inspector / set_display_calibration
+    void ResolveCalibration();     // find this panel's key; auto-load its installed file
+    void TickCalibration();        // apply a calibration the loader finished
+    std::string CalibrationLabel() const;
+
+    // Target screen (#135): off by default. With one set, the rig check reports depth in
+    // its terms and alerts on background divergence; with the preview on (the default once
+    // a target is chosen), the picture is shown at the angular size it has there.
+    target::Screen target_;
+    bool targetPreview_ = true;
+    bool targetDirty_ = false;     // push target_ / targetPreview_ to the app + station
+    float customTargetW_ = 3.0f, customTargetD_ = 4.0f;
+    void ApplyTarget();
+
     // File dialog result (SDL may call back on another thread).
     std::mutex dialogMutex_;
     std::string dialogPath_;
     bool dialogIsCdl_ = false;
     bool dialogIsCompare_ = false;  // the "Load B..." dialog (the clip wipe's compare clip)
+    bool dialogIsCal_ = false;      // the display calibration dialog (#133)
     bool dialogReady_ = false;
     bool dialogOpen_ = false;
     bool pendingDialogIsCdl_ = false;
     bool pendingDialogIsCompare_ = false;
+    bool pendingDialogIsCal_ = false;
     void OpenCompareDialog();
+    void OpenCalibrationDialog();
 
     bool inspectorPinned_ = false;  // Tab / the Pin box: panels stay up; unpinned they follow the UI fade
     std::vector<FlatRect> flatRects_;
