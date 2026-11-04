@@ -66,7 +66,7 @@ streams, auto-convergence, MCP tools. Plus:
 | 3D LUT | `.cube` (2..256, `DOMAIN_MIN/MAX`), from the inspector, a file drop, `--lut <file>` or `MEDIAPLAYER_LUT`. |
 | ASC CDL | `.cc` / `.ccc` / `.cdl` (slope, offset, power, saturation; editable in the inspector), from the inspector, a drop, `--cdl <file>` or `MEDIAPLAYER_CDL`. |
 | Exposure | ±4 stops in linear light. Right-click the slider to reset. |
-| Grade bypass | `G` |
+| Grade bypass, display calibration bypass (#133) | `G`, `Shift+G` |
 | Full screen | `F` / `F11` / double-click the picture (macOS binds `F11` to Show Desktop, so use `F` or the double-click there). Escape leaves full screen and never quits. Full screen unpins the panels so only the picture and the timecode show; leaving restores the pin. |
 | Live inputs | `src/pro/Station`: named inputs, `J` or the inspector's **Inputs** switches. Each row shows a thumbnail of the feed (left eye, refreshed twice a second while live; the others keep their last frame and say how old it is - only one input captures at a time). `--input="Rig=decklink:0+1,sdi"`, `--input="Resolve=decklink:2,sbs"`, `--input="Witness=camera:Integrated"`, `--input="Test=test:1920x1080@24"`, `url:<u>`; shorthands `--decklink[=<dev>]` `--decklink-right=` `--decklink-input=sdi\|hdmi` `--decklink-stereo=auto\|mono\|sbs\|dual\|pair` `--decklink-mode=Hp25`, `--test-signal[=WxH@fps]`; `--decklink-list` prints the cards. |
 | DeckLink setup dialog | *DeckLink setup...* in the Station panel: left / right device (right = "none" for one cable), connection (SDI / HDMI / as set in Desktop Video), stereo packing (auto / side by side / dual-stream 3D / mono), start format; *Open* adds or replaces the "DeckLink" input and switches to it. Says plainly when the build has no SDK or no card / driver is present. |
@@ -81,8 +81,8 @@ streams, auto-convergence, MCP tools. Plus:
 | YUV matrix + transfer | Each frame carries a colour tag (`FrameRing::Frame::matrix` / `transfer`). Matrix: BT.709, BT.601 or BT.2020 non-constant-luminance, from the stream's `colorspace` (unspecified: BT.601 at 576 lines and below, else BT.709); live inputs tag BT.601 for SD (`livepix` sets `Nv12/P016::matrix`, a source may overwrite it from the card's colorimetry). The MP_GRADE shader picks the matrix from the push block (`yuvMatrix`, 0 = BT.709, so BT.709 content is unchanged; Android's shader is untouched). Transfer (SDR / HLG / PQ) is a **tag only**: HLG and PQ are shown without tone mapping. 8/10-bit level maths unchanged. |
 | A/B compare | `B` swaps to the other clip at the same position (`--compare=<file>` or `set_compare`). |
 | OpenColorIO | Optional (`-DMP_OCIO_ROOT=<OCIO 2.x install>`, e.g. Open RV's `_build/RV_DEPS_OCIO/install`, plus `MP_OCIO_DLL_DIR` for its DLLs on Windows; on macOS the Homebrew keg, `$(brew --prefix opencolorio)`, which `build_macos.sh --ocio` installs and passes; the macOS CI build and `.pkg` include it): `--ocio=<config\|ocio://default> --ocio-src=<space>` and `--ocio-display= --ocio-view=` or `--ocio-dst=`, `--ocio-looks=`; baked to a 65³ LUT in the grade's LUT slot. |
-| 10-bit panel picture | `--10bit` (or `MEDIAPLAYER_PRO_10BIT=1`) asks the runtime for an R10G10B10A2 atlas (`DXR_ATLAS_FORMAT=rgb10a2`, set in the player's environment before the runtime loads; an explicit `DXR_ATLAS_FORMAT` wins, `--8bit` forces the default). The grade already runs at float precision from 10-bit sources (P016); this keeps the last step, the atlas the display processor weaves, at 10 bits, so gradients in grades and LUTs do not band on the panel. Needs DisplayXR runtime **v2.53+** (the Vulkan weave-on-scanout split carries the deep atlas; the player warns at start-up when the runtime is older) and the Leia plug-in **v2.17+** (one sRGB encode, matching colours). Verified on Windows on a Leia panel (2026-10-29: R10G10B10A2 ring, no format mismatches, eyeball pass on grade wipe and gradients). The atlas capture skips the pre-weave dump for a deep format and writes only `.woven.png`. Off by default until the hardware validation pass (#142). |
-| Agent tools | `set_grade`, `get_grade`, `set_view`, `set_depth_overlay`, `get_rig_status`, `set_depth_budget`, `snapshot`, `list_inputs`, `select_input`, `open_decklink`, `set_ocio`, `describe_ocio`, `set_compare`, `get_resolve_link`, `set_resolve_follow` (next to the player's own). |
+| 10-bit panel picture | `--10bit` (or `MEDIAPLAYER_PRO_10BIT=1`) asks the runtime for an R10G10B10A2 atlas (`DXR_ATLAS_FORMAT=rgb10a2`, set in the player's environment before the runtime loads; an explicit `DXR_ATLAS_FORMAT` wins, `--8bit` forces the default). The grade already runs at float precision from 10-bit sources (P016); this keeps the last step, the atlas the display processor weaves, at 10 bits, which is intended to avoid banding in gradients after grades and LUTs (no gradient / banding test has been run yet; that is part of #142). Needs DisplayXR runtime **v2.53+** (the Vulkan weave-on-scanout split carries the deep atlas; the player warns at start-up when the runtime is older) and the Leia plug-in **v2.17+** (one sRGB encode, matching colours). Verified on Windows on a Leia panel (2026-10-29: R10G10B10A2 ring, no format mismatches, picture correct by eye). Do not use it with an older runtime or plug-in: below runtime v2.53 a deep atlas retires the Vulkan split, and with a Leia plug-in older than v2.17 that retire path can crash (fixed in displayxr-leia-plugin#438). Under the DisplayXR Shell or another workspace controller the service composes the picture, so `--10bit` on the player has no effect there. The atlas capture skips the pre-weave dump for a deep format and writes only `.woven.png`. Off by default until the hardware validation pass (#142). |
+| Agent tools | `set_grade`, `get_grade`, `set_view`, `set_depth_overlay`, `get_rig_status`, `set_depth_budget`, `snapshot`, `list_inputs`, `select_input`, `open_decklink`, `set_ocio`, `describe_ocio`, `set_compare`, `get_resolve_link`, `set_resolve_follow`, `set_display_calibration`, `set_target_screen` (next to the player's own). |
 | Resolve panel | `tools/resolve/DisplayXR_Station_Panel.py`, a window inside Resolve (Workspace > Workflow Integrations in Resolve Studio - the Pro installer puts it there when Resolve is installed; or Workspace > Scripts). **Markers live**: snapshot notes become blue markers and rig alerts red markers on the current timeline as they happen, at their timecodes (SMPTE drop-frame counted properly), never twice. **Timecode follow**: Resolve's playhead and the clip under it reach the station; when the station can open the same media file it follows - plays while Resolve plays (correcting drift past 0.5 s), lands on the exact frame when Resolve parks (Resolve's API has no play state, so it is inferred from the playhead). The inspector shows "Resolve <timeline> TC" and a *Follow Resolve* box. **Station in Resolve**: input, timecode, rig numbers and the open alert; *Go to station TC* moves Resolve's playhead there; *Snapshot* takes a station snapshot with a note typed in Resolve; double-click a listed note / alert to jump to it. The two talk through files in the station folder (`station_status.json`, `resolve_link.json`, `resolve_commands.jsonl`; `src/pro/ResolveLink.h`), so no port and either side can start first. `--once` (or no UI) adds the markers once and exits. |
 
 Grade order is exposure → CDL → LUT, the order an on-set chain applies a CDL under a
@@ -104,7 +104,7 @@ blocking readback deadlocks the app (the atlas capture already contains the HUD)
 | `7`, `8`, `9` | zebras, wipe, channel |
 | `W`, `P`, `Q` | scopes, pixel probe, cycle the frame line |
 | wheel, middle-drag, `H`, `Z` | zoom, pan, fit, 1:1 |
-| `G` | grade bypass |
+| `G`, `Shift+G` | grade bypass, display calibration bypass |
 | `D` | depth overlay |
 | `T`, `R` | timecode, 60 s history strip |
 | `N` | snapshot (note editable in the Station panel) |
@@ -179,8 +179,8 @@ otherwise the frame pairs unfolded with the field mark, drop-frame counted the S
    publishes into the same `FrameRing` the camera uses, so the render path is untouched.
    Two inputs, frame-synced into one SBS frame (two-cable stereo), plus single-cable
    SBS. Upload as NV12 / v210-unpacked like the camera path. Suki's Open RV port already
-   has DeckLink input code to port. Build it behind `MP_DECKLINK_SDK_DIR` (the SDK is a
-   registration download; never commit it). Needs a card: a DeckLink Mini Recorder 4K
+   has DeckLink input code to port. Build it behind `MP_DECKLINK_SDK_DIR` (the SDK's
+   include folders are vendored in `third_party/decklink-sdk` and are the default). Needs a card: a DeckLink Mini Recorder 4K
    (~$235, 1x 6G-SDI + HDMI, 2160p30) to start, a DeckLink 8K Pro G2 (~$855, 4x 12G-SDI)
    for the real rig.
 2. **Timecode overlay and measured end-to-end delay (Phase 1).** SDI timecode from the
@@ -202,7 +202,8 @@ pair.
 
 None of the DeckLink code has run against a signal yet. The hardware-free half (v210 /
 UYVY unpack, the timecode and clock keys, the pairer) is unit-tested; everything below
-needs a card. Build with `-DMP_DECKLINK_SDK_DIR=<SDK>` on the box that has it, confirm the
+needs a card. Any Pro build has it (the vendored `third_party/decklink-sdk` is the
+default; `-DMP_DECKLINK_SDK_DIR=<SDK>` picks another, `=OFF` none); confirm the
 log line `DeckLink input (Pro): ON (SDK x.y)`, then:
 
 1. `--decklink-list` names the inputs; Desktop Video's version is at least the SDK's

@@ -25,15 +25,17 @@ transport bar with per-eye parallax, convergence/L-R-swap controls, fullscreen, 
 and low-latency frame-exact scrubbing (M4); the macOS Vulkan path (M5); and Windows + macOS
 installers with CI release-on-tag (M6).
 
-Stereo images (JPG/PNG via stb_image, LIF and MPO containers) and SBS video share the same
-decode → atlas → submit path; the runtime + display processor do all weaving.
+Stereo images (JPG/PNG via stb_image, LIF and MPO containers, stereo HEIC) and SBS or MV-HEVC
+video share the same decode → atlas → submit path; the runtime + display processor do all
+weaving.
 
 **Stereo layout resolution**, in priority order:
 
 1. **Filename** — the `*_2x1` / `*_half_2x1` convention for side-by-side, `*_1x2` /
    `*_half_1x2` for top-bottom (left eye on top), and the release tokens `TB` / `OU` /
    `TAB` / `H-OU` as whole words of the file name (half unless the name says `full`).
-2. **Container metadata** — a LIF or MPO container, or `AVStereo3D` side data from MKV
+2. **Container metadata** — a LIF, MPO or stereo HEIC container, an MV-HEVC stream, or
+   `AVStereo3D` side data from MKV
    `StereoMode`, MP4 `st3d`, or an H.264 frame-packing SEI (which also says whether the
    eyes are packed R|L). Side-by-side and top-bottom packings are read; the frame aspect
    settles full vs half.
@@ -94,6 +96,41 @@ loads the first and makes the dropped set the list Up / Down and the slideshow w
 Dropping a **folder** opens its first asset and starts the slideshow, with the folder as
 that list — the same thing as passing the folder on the command line, plus playback.
 
+## VR180 / VR360 viewer (#155)
+
+VR180 and stereo VR360 files play as a **window into the scene**, steered with the mouse,
+instead of a flat, distorted packed frame. Each eye's half of the frame is projected onto the
+sphere and seen through a virtual camera window.
+
+- **Projections:** equirectangular half sphere (YouTube VR180) and full sphere (VR360), side by
+  side or top-bottom, and dual fisheye (raw VR180 camera files, equidistant, lens FOV 180 by
+  default). Mono 360 / 180 pans in 2D.
+- **Detection:** MP4 / MOV spherical metadata (`sv3d` / `proj` / `equi`, with `st3d` for the
+  packing), then file-name tokens (`vr180`, `180`, `180x180`, `360`, `vr360`, `fisheye`, with
+  `3dh` / `sbs` / `lr` and `3dv` / `tb` for the packing; a bare `180` / `360` only counts on a
+  frame of the right shape). **P** cycles the projection override (auto / flat / VR180 /
+  VR360 / fisheye); **L** still sets the packing. MCP: `set_layout {projection, fisheye_fov_deg}`.
+- **Controls:** drag pans and tilts, the wheel zooms, **double-click** or **R** re-centres,
+  the arrow keys pan in 5° steps (`[` / `]` step frames and PageUp / PageDown walk the folder
+  meanwhile). MCP `get_view` / `set_view {yaw_deg, pitch_deg, fov_deg, recenter}`.
+- **Life-size by default:** the window's field of view is the panel's real angular width at
+  the nominal viewing distance (`XR_DXR_display_info`). Zooming also scales the disparity;
+  auto-convergence (**A**) measures the rendered eye windows, so it keeps working.
+- **The stereo pair stays rectified.** The two source cameras sit on a fixed horizontal
+  baseline. Pitch is a real rotation about that baseline, so rows stay aligned. Yaw is **not**
+  a rotation, which would add vertical disparity off-centre and flatten depth by ~cos(yaw):
+  both eyes keep their image plane parallel to the baseline and the view pans as an
+  **off-axis (lens-shifted) window** across it, clamped to ±65° (`MEDIAPLAYER_VR_PAN_MAX`)
+  where its stretch becomes the trade. Stereo VR360 is omni-directional stereo; its window is
+  cylindrical (row = elevation), which keeps the rows aligned at every heading. Convergence
+  is a lens shift of the window too, so it never exposes a de-occlusion strip.
+  `tests/vr_view_test.cpp` measures the vertical disparity across the whole pan / pitch / zoom
+  range on synthetic scenes (≈0.003 px, against ~21 px for a naively rotated pair).
+- **Test media:** `tools/vr/make_vr_fixtures.py --assets DIR` renders synthetic VR180,
+  dual-fisheye and VR360 stills and clips (needs numpy + ffmpeg). Headless:
+  `MEDIAPLAYER_VR=equirect180|equirect360|fisheye|flat`, `MEDIAPLAYER_VR_VIEW=yaw,pitch[,fov]`.
+- Desktop only for now; Android touch control is a follow-up.
+
 ## Live camera (#90)
 
 A live **stereo camera** can stand in for a file: a side-by-side UVC webcam such as the
@@ -128,18 +165,37 @@ camera backend off, so there no camera is found. SDL's Windows driver has no hot
 so after an unplug use **Rescan** in the Camera menu (or press `C`): it re-lists the
 devices and re-opens the same camera as soon as it is back.
 
-## Auto-convergence (live, #92)
+## Auto-convergence (live and files, SBS and TB, #92)
 
-**Off by default**: the live picture is shown raw unless you turn this on. When on, the
+**Off by default**: the picture is shown raw unless you turn this on. When on, the
 player measures how far apart the subject sits in the two eyes and shifts the eyes in
 opposite directions so the subject lands at the display plane. It measures the pixels
 (NCC block matching on a downsampled luma plane, ~5 Hz, on a side thread). There is no
 face detection and no calibration. Manual `-` / `=` convergence still applies on top.
-It works the same on the live camera and on a stream URL.
+It works on the live camera, a stream URL, and stereo files: video, image sequences and
+stills (SBS JPG/PNG, MPO, LIF, stereo HEIC), and MV-HEVC clips. Side-by-side and top-bottom packings (full and half) are
+both measured, on the eyes as shown (`X` and a container's R|L flag are respected).
+
+What it does with each source:
+- **Live / stream, or a playing clip**: frames are measured as they arrive, ~5 Hz, and
+  the shift is smoothed (below).
+- **A paused clip or a still** has one picture. It is measured once, and again only when
+  something the measurement depends on changes: the layout, `X`, the subject policy, a
+  pinned focus point, or turning auto-conv on.
+- **A seek, a frame step or a new file** is a different picture: the shift snaps to the
+  new measurement instead of gliding across the cut. A new file starts from 0, so a mono
+  file never inherits the previous one's shift. A scene cut found during playback skips
+  the rate limit and glides quickly to the new scene.
+- **A LIF that carries its own convergence keeps it**: auto-conv stands aside (the HUD
+  says `idle (LIF convergence)`) and is never stacked on the baked shift. A LIF without
+  one is measured like an MPO. `Backspace` (converge once from the file) is unchanged.
+- **Not measured**: mono, the `Dual` two-track layout (this player decodes the first
+  track only, so the second eye is not there to compare), a "Convert to 3D" picture,
+  and zero-copy (`MEDIAPLAYER_ZEROCOPY=1`, Windows) frames, which carry no CPU pixels.
 
 | control | effect |
 |---|---|
-| `A` / the **Auto-conv** button in the live top bar | on / off (turning it off glides the shift back to 0) |
+| `A` / the **Auto-conv** button in the top bar (live, or a stereo file) | on / off (turning it off glides the shift back to 0) |
 | `Shift+A` | subject policy: nearest -> sharp -> centre |
 | `Ctrl+click` on the picture | pin the subject under the cursor (policy `focus`, template-tracked) |
 | `--auto-conv[=nearest\|sharp\|centre]`, `MEDIAPLAYER_AUTO_CONV=<policy>` | start with it on. The CLI wins over the env var. `1`/`on` = the default policy, `0`/`off` = off. |
@@ -163,7 +219,10 @@ On top of that measurement:
 - A low-pass and a 0.2 %-of-eye-width-per-second rate limit smooth the shift. A scene cut
   is the exception: the shift snaps to the new scene.
 
-The HUD shows `autoconv ON nearest  d=…  conv=…  ncc …  … ms`.
+The HUD shows `autoconv ON nearest  d=…  conv=…  ncc …  … ms` (for a file, while it is
+on), or `autoconv ON  idle (…)` when there is nothing to measure. The log prints the same
+once a second (`autoconv: nearest d=… conv=… target=…`), and `get_status` adds
+`auto_conv_active`.
 
 The measurement is a port of displayxr-web's `js/call/disparity.js` (the 3D video call's
 auto-convergence), and it keeps that file's thresholds so web and native converge the
@@ -291,7 +350,8 @@ Set `MEDIAPLAYER_LOG_DEBUG=1` for verbose logs.
 
 | Type | Formats | Notes |
 |---|---|---|
-| Images | SBS JPG/PNG, LIF, MPO | layout from filename / container / content, else assumed stereo; HEIF behind `MEDIAPLAYER_WITH_HEIF` (off by default) |
+| Images | SBS JPG/PNG, LIF, MPO, HEIC | layout from filename / container / content, else assumed stereo |
+| Phone spatial capture | stereo HEIC photos, MV-HEVC video (`.mov` / `.mp4`), as written by Apple spatial capture and the Samsung Galaxy "3D Capture" mode | detected automatically, no conversion: both views are composed side by side (HUD: `MV-HEVC` / `stereo HEIC`). Eye order from the file: the HEIF `ster` group, the MV-HEVC eye tags, else base view = left. A HEIC with no stereo group shows its primary image flat. Desktop, FFmpeg 7.1+ (the shipped builds); MV-HEVC decodes in software. Not on Android yet |
 | Video | SBS H.264 / H.265 / AV1 (MP4/MKV/MOV) | hardware decode via FFmpeg, CPU fallback; `AVStereo3D` side data honoured incl. eye order |
 | 2D (mono) stills, video, live | anything above that is mono, or pinned Mono with `L` | optional **Convert to 3D** (Shift+L / top-bar toggle / MCP `set_convert_3d`): the runtime's `XR_DXR_lift` `VIEWS_MONO` task returns a side-by-side pair that replaces the picture. Off on every load. Hidden when the runtime has no `XR_DXR_lift`; greyed with the reason when the task cannot serve this session |
 

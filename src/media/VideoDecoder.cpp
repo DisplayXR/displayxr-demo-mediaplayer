@@ -36,6 +36,7 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
+#include "media/SpatialFFmpeg.h"  // MV-HEVC (#154): stream test, eye order, side-by-side compose
 #endif
 
 namespace mp {
@@ -92,6 +93,13 @@ struct VideoDecoder::Impl {
     AVFrame* f32Out = nullptr;
     int swsFW = 0, swsFH = 0, swsFFmt = -1;
     std::vector<float> oetf;                    // linear [0,1] -> sRGB samples, lerped
+    // MV-HEVC (#154): both views are decoded and glued into one full-SBS frame.
+    bool mv = false;
+    AVFrame* mvPending = nullptr;               // the first view of the current pair
+    AVFrame* mvTmp = nullptr;                   // receive target
+    bool mvHave = false;                        // mvPending holds a view
+    bool mvLogged = false;                      // eye order logged once per open
+    bool mvWarnedCompose = false;
 
 #if defined(_WIN32)
     // Zero-copy interop (#28): non-owning handles into the D3D11VA device FFmpeg decodes
@@ -129,6 +137,8 @@ struct VideoDecoder::Impl {
         if (convVS) convVS->Release();
 #endif
         if (sws) sws_freeContext(sws);
+        if (mvPending) av_frame_free(&mvPending);
+        if (mvTmp) av_frame_free(&mvTmp);
         if (swFrame) av_frame_free(&swFrame);
         if (convFrame) av_frame_free(&convFrame);
         if (codec) avcodec_free_context(&codec);
@@ -574,13 +584,19 @@ bool VideoDecoder::Open(const std::string& path) {
         return false;
     }
     codecName_ = dec->name;
+    // MV-HEVC (#154): a stereo phone clip (spatial video / 3D capture) carries the second eye
+    // as a second coded layer of the same stream. Decode both views and compose them side
+    // by side, so the clip reaches the player as an ordinary full-SBS frame.
+    impl_->mv = spatial::ff::IsMvHevcStream(impl_->fmt->streams[impl_->videoStream]);
+    multiview_ = impl_->mv;
+    multiviewEyesFromMeta_ = false;
     if (!OpenVideoCodec(dec, path)) {
         impl_.reset();
         return false;
     }
     AVStream* st = impl_->fmt->streams[impl_->videoStream];
 
-    width_ = impl_->codec->width;
+    width_ = impl_->codec->width * (impl_->mv ? 2 : 1);
     height_ = impl_->codec->height;
     frameRate_ = av_q2d(st->avg_frame_rate);
     if (frameRate_ <= 0.0) frameRate_ = av_q2d(st->r_frame_rate);
@@ -598,8 +614,8 @@ bool VideoDecoder::Open(const std::string& path) {
     seekRequest_.store(-1.0);
     ended_.store(false);
     open_ = true;
-    LOG_INFO("VideoDecoder: '%s' %dx%d codec=%s backend=%s dur=%.1fs", path.c_str(), width_,
-             height_, codecName_, hwName_, durationSec_);
+    LOG_INFO("VideoDecoder: '%s' %dx%d codec=%s backend=%s dur=%.1fs%s", path.c_str(), width_,
+             height_, codecName_, hwName_, durationSec_, impl_->mv ? " MV-HEVC (both views, SBS)" : "");
 
 #if defined(_WIN32)
     // Cache the D3D11 device/context for the zero-copy copy path (#28).
@@ -626,7 +642,12 @@ bool VideoDecoder::OpenVideoCodec(const void* decoder, const std::string& label)
     // the device won't init or the hw-configured decoder won't open.
     impl_->codec = avcodec_alloc_context3(dec);
     avcodec_parameters_to_context(impl_->codec, st->codecpar);
-    const bool wantHw = TryEnableHwAccel(dec);
+    // MV-HEVC (#154) decodes in software: FFmpeg's hwaccels decode the base layer only, so a
+    // hardware context would silently drop the second eye. Phone stereo is 1080p-class per
+    // eye, which multithreaded software HEVC handles in real time.
+    const bool wantHw = impl_->mv ? false : TryEnableHwAccel(dec);
+    AVDictionary* codecOpts = nullptr;
+    if (impl_->mv) av_dict_set(&codecOpts, "view_ids", "-1", 0);  // every view, not just the base
     // Always allow auto multithreading. Hardware decode ignores thread_count; but when a
     // stream is too wide for the GPU (PickHwFormat falls back to software PER FRAME), this
     // is what keeps that fallback multithreaded instead of crawling on one core — the case
@@ -636,7 +657,15 @@ bool VideoDecoder::OpenVideoCodec(const void* decoder, const std::string& label)
     // queue beyond what the codec needs).
     if (live_) impl_->codec->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
-    int rc = avcodec_open2(impl_->codec, dec, nullptr);
+    int rc = avcodec_open2(impl_->codec, dec, codecOpts ? &codecOpts : nullptr);
+    if (codecOpts) {
+        if (av_dict_get(codecOpts, "view_ids", nullptr, 0)) {  // the decoder did not take it
+            LOG_WARN("VideoDecoder: this FFmpeg's HEVC decoder cannot output MV-HEVC views; base view only");
+            impl_->mv = false;
+            multiview_ = false;
+        }
+        av_dict_free(&codecOpts);
+    }
     if (rc < 0 && wantHw) {
         LOG_WARN("VideoDecoder: hwaccel '%s' failed to open decoder; retrying software",
                  hwName_);
@@ -1001,6 +1030,7 @@ void VideoDecoder::DecodeLoop() {
             av_seek_frame(impl_->fmt, impl_->videoStream, (int64_t)(sk / timeBase),
                           AVSEEK_FLAG_BACKWARD);
             avcodec_flush_buffers(impl_->codec);
+            MvReset();
             firstPtsSec = -1.0;
             audioGiveUp = false;  // re-arm audio sync at the new position
 
@@ -1018,7 +1048,7 @@ void VideoDecoder::DecodeLoop() {
                 const int sent = avcodec_send_packet(impl_->codec, pkt);
                 av_packet_unref(pkt);
                 if (sent != 0) continue;
-                while (!stop_.load() && avcodec_receive_frame(impl_->codec, frame) == 0) {
+                while (!stop_.load() && ReceiveFrame(frame) == 0) {
                     // Read the PTS off the raw decoded frame — cheap, no GPU download. Only
                     // the frame we actually display is downloaded/converted (fillFrame);
                     // decoding past intermediate frames is fast, downloading them is not.
@@ -1069,7 +1099,7 @@ void VideoDecoder::DecodeLoop() {
             // every clip lost its last few frames. Wall-clock paced.
             avcodec_send_packet(impl_->codec, nullptr);
             while (!stop_.load() && seekRequest_.load() < 0.0 &&
-                   avcodec_receive_frame(impl_->codec, frame) == 0) {
+                   ReceiveFrame(frame) == 0) {
                 const double ptsSec = fillFrame(frame);
                 if (ptsSec <= -2.0) continue;
                 if (ptsSec >= 0.0) {
@@ -1094,11 +1124,13 @@ void VideoDecoder::DecodeLoop() {
                 }
                 ring_.Publish();
             }
-            avcodec_flush_buffers(impl_->codec);  // reusable after the drain (loop / seek)
+            avcodec_flush_buffers(impl_->codec);
+            MvReset();  // reusable after the drain (loop / seek)
             if (loopEnabled_.load()) {
                 // EOF (or error) -> loop back to the start.
                 av_seek_frame(impl_->fmt, impl_->videoStream, 0, AVSEEK_FLAG_BACKWARD);
                 avcodec_flush_buffers(impl_->codec);
+                MvReset();
                 firstPtsSec = -1.0;
                 audioGiveUp = false;  // re-arm audio sync after looping to the start
                 wallStart = clock::now();
@@ -1116,7 +1148,7 @@ void VideoDecoder::DecodeLoop() {
         }
 
         if (avcodec_send_packet(impl_->codec, pkt) == 0) {
-            while (!stop_.load() && avcodec_receive_frame(impl_->codec, frame) == 0) {
+            while (!stop_.load() && ReceiveFrame(frame) == 0) {
                 const double ptsSec = fillFrame(frame);
                 if (ptsSec <= -2.0) continue;  // dropped
                 if (ptsSec >= 0.0) {
@@ -1165,6 +1197,68 @@ void VideoDecoder::DecodeLoop() {
 
     av_frame_free(&frame);
     av_packet_free(&pkt);
+}
+
+void VideoDecoder::MvReset() {
+    if (!impl_) return;
+    if (impl_->mvPending) av_frame_unref(impl_->mvPending);
+    impl_->mvHave = false;
+}
+
+// avcodec_receive_frame, except that an MV-HEVC stream (#154) yields ONE frame per access
+// unit: its two views composed side by side, left eye first. Same return contract (0, or
+// AVERROR(EAGAIN) / AVERROR_EOF / an error), so every call site stays a plain receive loop.
+//
+// The decoder emits the views of an access unit back to back (base view first). They are
+// paired on equal timestamps and distinct view ids; a view whose partner never came (a
+// damaged second layer, a stream whose extra layer is not a stereo view) is shown in both
+// halves rather than dropped, so the clip still plays, flat, instead of freezing.
+int VideoDecoder::ReceiveFrame(AVFrame* out) {
+    Impl& im = *impl_;
+    if (!im.mv) return avcodec_receive_frame(im.codec, out);
+    if (!im.mvPending) im.mvPending = av_frame_alloc();
+    if (!im.mvTmp) im.mvTmp = av_frame_alloc();
+    if (!im.mvPending || !im.mvTmp) return AVERROR(ENOMEM);
+    for (;;) {
+        const int r = avcodec_receive_frame(im.codec, im.mvTmp);
+        if (r != 0) return r;
+        if (!im.mvHave) {
+            av_frame_move_ref(im.mvPending, im.mvTmp);
+            im.mvHave = true;
+            continue;
+        }
+        const AVFrame* a = im.mvPending;
+        const AVFrame* b = im.mvTmp;
+        const int va = spatial::ff::ViewIdOf(a), vb = spatial::ff::ViewIdOf(b);
+        const bool partners = a->pts == b->pts && (va < 0 || vb < 0 || va != vb);
+        if (!partners) {
+            // The pending view lost its partner: show it to both eyes, keep the new one.
+            const bool ok = spatial::ff::ComposeSideBySide(a, a, out);
+            av_frame_unref(im.mvPending);
+            av_frame_move_ref(im.mvPending, im.mvTmp);
+            if (ok) return 0;
+            continue;
+        }
+        const spatial::EyeOrder eo = spatial::ResolveEyeOrder(spatial::ff::HintOf(a), spatial::ff::HintOf(b), va, vb);
+        if (!im.mvLogged) {
+            im.mvLogged = true;
+            multiviewEyesFromMeta_ = eo.fromMetadata;
+            LOG_INFO("VideoDecoder: MV-HEVC views %d,%d -> left eye = view %d (%s)", va, vb, eo.firstIsLeft ? va : vb,
+                     eo.fromMetadata ? "stream eye tags" : "no eye tags: base view = left");
+        }
+        const AVFrame* L = eo.firstIsLeft ? a : b;
+        const AVFrame* R = eo.firstIsLeft ? b : a;
+        const bool ok = spatial::ff::ComposeSideBySide(L, R, out);
+        if (!ok && !im.mvWarnedCompose) {
+            im.mvWarnedCompose = true;
+            LOG_ERROR("VideoDecoder: MV-HEVC views %dx%d %s cannot be composed side by side; dropping frames",
+                      a->width, a->height, av_get_pix_fmt_name((AVPixelFormat)a->format));
+        }
+        av_frame_unref(im.mvPending);
+        av_frame_unref(im.mvTmp);
+        im.mvHave = false;
+        if (ok) return 0;
+    }
 }
 
 void VideoDecoder::Seek(double seconds, bool preview) {
@@ -1443,7 +1537,7 @@ void VideoDecoder::LiveLoop(const std::function<double(void*)>& fill, double& ti
                 winBytes += (uint64_t)pkt->size;
                 if (pkt->stream_index == impl_->videoStream &&
                     avcodec_send_packet(impl_->codec, pkt) == 0) {
-                    while (!stop_.load() && avcodec_receive_frame(impl_->codec, frame) == 0) {
+                    while (!stop_.load() && ReceiveFrame(frame) == 0) {
                         const double pts = fill(frame);
                         if (pts <= -2.0) continue;  // hw download failed: dropped
                         if (pts >= 0.0) positionSec_.store(pts);

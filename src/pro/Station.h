@@ -16,6 +16,7 @@
 #include "pro/DeckLinkSource.h"
 #include "pro/QcExporter.h"
 #include "pro/RigCheck.h"
+#include "pro/TargetScreen.h"
 #include "pro/TestSignalSource.h"
 
 #include <functional>
@@ -105,6 +106,15 @@ public:
     // The live signal's frame rate (rounded), written with every timecode (notes, alerts,
     // the Resolve link) so a 50p timecode can be placed on a 25p timeline. 0 = unknown.
     void SetSignalFps(float fps) { signalFps_ = fps > 1.0f ? (int)(fps + 0.5f) : 0; }
+    void SetRigBudget(const rig::Budget& b) { rig_.SetBudget(b); }
+    // #135: the target screen the depth is judged for (off = this panel only), and the
+    // preview scale the picture is shown at. get_rig_status and snapshot notes report the
+    // depth in its terms too.
+    void SetTarget(const target::Screen& t, float pictureScale, float viewerDistanceM = 0.0f) {
+        target_ = t;
+        pictureScale_ = pictureScale;
+        viewerDistanceM_ = viewerDistanceM;
+    }
     int SignalFps() const { return signalFps_; }
     double DelayMs() const { return delayMs_; }
 
@@ -145,6 +155,9 @@ private:
     bool OpenDeckLinkSpec(const std::string& spec);
     int testFrames_ = 0, testSnapshotFrame_ = -1, testQcExportFrame_ = -1;
     std::string timecode_;
+    target::Screen target_;
+    float pictureScale_ = 1.0f;
+    float viewerDistanceM_ = 0.0f;
     int signalFps_ = 0;
     double delayMs_ = 0.0;
     double alertsLoggedUntil_ = 0.0;
@@ -161,6 +174,7 @@ private:
         int eyeSync = -1;          // frames between the paired inputs (-1 unknown)
         char note[160] = {0};
         rig::Result rig;
+        target::Screen target;  // #135: the target screen when it was taken
     };
     std::vector<Snapshot> snapshots_;
 };

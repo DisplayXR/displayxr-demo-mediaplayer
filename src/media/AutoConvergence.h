@@ -184,6 +184,16 @@ void DownsampleLuma(const uint8_t* src, int stride, int srcW, int srcH, int fact
 // The factor that brings a per-eye width to <= kMaxEyeWidth.
 int DownsampleFactorFor(int frameWidth);
 
+// The eyes of a PACKED frame as a downsampled SBS gray image (the viewer's left eye in the
+// left half), so one estimator serves every packing. SbsFull/SbsHalf go through
+// DownsampleLuma unchanged. TbFull/TbHalf take each eye's rect from StereoPacking (left
+// eye on top) and lay the two side by side; an eye is the frame's full width, so the
+// factor brings THAT to <= kMaxEyeWidth. A half packing's vertical squeeze does not change
+// a horizontal disparity as a fraction of eye width. False (out untouched) for an unpacked
+// layout: mono has one picture, and Dual's second eye is another decoder's frame.
+bool DownsampleStereo(const uint8_t* src, int stride, int srcW, int srcH, StereoLayout layout,
+                      bool swapEyes, std::vector<uint8_t>& out, int& outW, int& outH);
+
 // ---- the estimator ----------------------------------------------------------------------
 
 enum class SubjectPolicy {
@@ -207,6 +217,7 @@ struct Result {
     float nearFrac = 0.f;      // 95th percentile of confident block d (the nearest content)
     float farFrac = 0.f;       // 5th percentile (the farthest content)
     const char* rule = "none"; // mode | track | focus | sharp | centre | sharp>centre | none | mono
+    uint64_t tag = 0;          // the caller's tag of the submission this measured (worker)
     double ms = 0.0;           // measurement time (this call)
     float focusU = 0.f, focusV = 0.f;  // subject point, left-eye normalised
     float sceneMad = 0.f;      // mean |dI| vs the previous downsampled frame
@@ -218,9 +229,10 @@ class DisparityEstimator {
 public:
     static constexpr float kSceneCutMad = 20.f;
 
-    // Measure a full-resolution luma plane. `layout` must be SbsFull or SbsHalf (the eye is
-    // half the frame width either way; the half-SBS squeeze does not change a horizontal
-    // disparity expressed as a fraction of eye width). `focusUV` = left-eye normalised.
+    // Measure a full-resolution luma plane. `layout` must be packed: SBS or TB, full or half
+    // (DownsampleStereo; a half packing's squeeze does not change a horizontal disparity
+    // expressed as a fraction of eye width). Anything else returns rule "mono".
+    // `focusUV` = left-eye normalised.
     Result Measure(const uint8_t* y, int stride, int w, int h, StereoLayout layout,
                    SubjectPolicy policy, const float* focusUV, double nowMs,
                    bool swapEyes = false);
@@ -271,6 +283,11 @@ public:
     // median-of-3 already holds). A scene cut or the first value skips the rate limit
     // until the value has caught up once.
     void Update(const Result& r);
+    // The next measurement that carries a value is of a CHANGED picture. snap = a different
+    // picture (a seek, a new file, a frame step): the value jumps straight to its target, as
+    // the cut hides the jump. !snap = the same picture measured differently (a still's
+    // layout / eye swap / policy changed): the rate limit is skipped, the low-pass glides.
+    void ExpectChange(bool snap);
     // Advance the applied value by dt seconds (render rate). Disabled -> glides to 0
     // (low-pass only, no rate limit) and lands on exactly 0.
     void Tick(double dt, bool enabled);
@@ -287,6 +304,7 @@ private:
     bool hasTarget_ = false;
     bool fast_ = false;  // rate limit skipped until caught up (first lock / scene cut / off)
     bool wasEnabled_ = false;
+    int expect_ = 0;  // ExpectChange pending: 0 none, 1 glide, 2 snap
     const char* clamp_ = "";
 };
 
@@ -301,9 +319,12 @@ public:
     void Start();
     void Stop();
     bool Running() const { return thread_.joinable(); }
-    // Returns the downsample time in ms.
-    double Submit(const uint8_t* y, int stride, int w, int h, bool swapEyes,
-                  SubjectPolicy policy, const float* focusUV, double nowMs);
+    // Returns the downsample time in ms. `layout` is any packed layout (DownsampleStereo);
+    // an unpacked one submits nothing. `tag` comes back in Result::tag, so the caller can
+    // tell a measurement of a frame from before a seek from one after it.
+    double Submit(const uint8_t* y, int stride, int w, int h, StereoLayout layout,
+                  bool swapEyes, SubjectPolicy policy, const float* focusUV, double nowMs,
+                  uint64_t tag = 0);
     bool TakeResult(Result& out);
     void RequestReset();
 
@@ -321,6 +342,7 @@ private:
     bool hasFocus_ = false;
     float focus_[2] = {0.f, 0.f};
     double nowMs_ = 0.0;
+    uint64_t tag_ = 0;
     bool hasResult_ = false;
     Result result_{};
     DisparityEstimator est_;  // worker-owned

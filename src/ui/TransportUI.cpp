@@ -539,8 +539,9 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     ImGui::EndPopup();
                 }
             }
-            // Auto-convergence (#92): live only. Highlighted while on.
-            if (((s.caps.camera && s.isLive) || (s.caps.url && s.isStream)) && !s.autoConvLabel.empty()) {
+            // Auto-convergence (#92): live, or a stereo file. Highlighted while on.
+            if (((s.caps.camera && s.isLive) || (s.caps.url && s.isStream) || s.autoConvFile) &&
+                !s.autoConvLabel.empty()) {
                 ImGui::SameLine();
                 if (s.autoConvOn)
                     ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));

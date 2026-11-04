@@ -4,6 +4,7 @@
 
 #include "Log.h"
 #include "media/EyeAssign.h"
+#include "media/HeifLoader.h"
 #include "media/ImageDecoder.h"
 #include "media/StereoPacking.h"
 #include "media/LifLoader.h"
@@ -162,6 +163,87 @@ XrSession::ViewRect MatchMinRect(const XrSession::ViewRect& tile, float contentA
 }
 } // namespace
 
+bool App::PanelIdentity(std::string& key, std::string& deviceName) const {
+    key.clear();
+    deviceName.clear();
+    std::vector<XrSession::DisplayEntry> ds;
+    if (!xr_.EnumerateDisplays(ds)) {
+        deviceName = xr_.DisplayDeviceName();
+        return !deviceName.empty();
+    }
+    const XrSession::DisplayEntry* pick = nullptr;
+#if defined(_WIN32)
+    if (HWND hwnd = (HWND)window_.NativeHandle()) {
+        MONITORINFOEXW mi = {};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+            char name[64] = {};
+            WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, name, (int)sizeof(name), nullptr, nullptr);
+            for (const auto& d : ds)
+                if (_stricmp(d.deviceName.c_str(), name) == 0) pick = &d;
+        }
+    }
+#endif
+    if (!pick) {
+        if (SDL_Window* w = window_.SdlWindow()) {
+            int x = 0, y = 0, ww = 0, hh = 0;
+            SDL_GetWindowPosition(w, &x, &y);
+            SDL_GetWindowSize(w, &ww, &hh);
+            const int cx = x + ww / 2, cy = y + hh / 2;
+            for (const auto& d : ds)
+                if (cx >= d.x && cy >= d.y && cx < d.x + (int)d.w && cy < d.y + (int)d.h) pick = &d;
+        }
+    }
+    if (!pick)
+        for (const auto& d : ds)
+            if (d.systemDefault) pick = &d;
+    if (!pick) pick = &ds.front();
+    key = pick->key;
+    deviceName = pick->deviceName;
+    return true;
+}
+
+
+// #135: the picture at the angular size it has on Pro's target screen. k = (W_t / D_t) /
+// (W_p / D_p), W_p = the fitted picture's width on the panel (canvas pixels at the panel's
+// metres per pixel), D_p = the nominal viewing distance; the same formula as
+// target::PictureScale. Off (or the panel's size unknown) = the fit unchanged.
+void App::UpdateViewerDistance(const XrView* views, uint32_t n, uint32_t canvasW) {
+    const float panelW = xr_.DisplayWidthMeters();
+    const uint32_t panelPx = xr_.DisplayPixelWidth();
+    if (!views || n == 0 || !canvasW || panelW <= 0.0f || !panelPx) return;
+    const float canvasM = (float)canvasW * panelW / (float)panelPx;
+    float sum = 0.0f;
+    int k = 0;
+    for (uint32_t i = 0; i < n && i < 2; ++i) {
+        const float spread = std::tan(views[i].fov.angleRight) - std::tan(views[i].fov.angleLeft);
+        if (spread <= 1e-3f) continue;
+        const float d = canvasM / spread;
+        if (d > 0.15f && d < 5.0f) sum += d, ++k;
+    }
+    if (!k) return;
+    const float d = sum / (float)k;
+    proViewerDistM_ = proViewerDistM_ <= 0.0f ? d : proViewerDistM_ + 0.03f * (d - proViewerDistM_);
+}
+
+XrSession::ViewRect App::TargetScaled(XrSession::ViewRect fit) {
+    proPictureScale_ = 1.0f;
+    const float panelW = xr_.DisplayWidthMeters();
+    const float dist = proViewerDistM_ > 0.0f ? proViewerDistM_ : xr_.NominalViewerDistance();
+    const uint32_t panelPx = xr_.DisplayPixelWidth();
+    if (proTargetW_ <= 0.0f || proTargetD_ <= 0.0f || panelW <= 0.0f || dist <= 0.0f || !panelPx || !fit.w) return fit;
+    const float picW = (float)fit.w * panelW / (float)panelPx;
+    const float k = (proTargetW_ / proTargetD_) / (picW / dist);
+    if (!(k > 0.05f && k < 20.0f)) return fit;
+    proPictureScale_ = k;
+    const float cx = (float)fit.x + 0.5f * (float)fit.w, cy = (float)fit.y + 0.5f * (float)fit.h;
+    fit.w = (uint32_t)((float)fit.w * k + 0.5f);
+    fit.h = (uint32_t)((float)fit.h * k + 0.5f);
+    fit.x = (int32_t)std::lround(cx - 0.5f * (float)fit.w);
+    fit.y = (int32_t)std::lround(cy - 0.5f * (float)fit.h);
+    return fit;
+}
+
 bool App::Initialize(const char* mediaPath) {
     // Default 1280x720; MEDIAPLAYER_WINDOW="WxH" or the uniform "WxH+X+Y" form
     // overrides (X,Y absolute virtual-desktop px — pins the window there and skips
@@ -251,6 +333,8 @@ bool App::Initialize(const char* mediaPath) {
     // argument may be a single file OR a folder — for a folder we load the first
     // supported asset (sorted), and LoadMedia builds the prev/next list from it.
     ReadStereoEnv();   // must precede the first LoadMedia below
+    // Stereo HEIC (#154) is offered only when this build's FFmpeg reads HEIF items.
+    MediaSource::SetHeifSupported(HeifLoader::Available());
 #if MEDIAPLAYER_PRO
     // Pro review formats (MXF, EXR / DPX / TIFF sequences, 10-bit kept): before any load.
     VideoDecoder::SetProFormats(true);
@@ -511,8 +595,8 @@ int App::Run() {
             uint32_t pw = 0, ph = 0, cw = 0, ch = 0;
             window_.PointSize(pw, ph);
             window_.PixelSize(cw, ch);
-            if (LiveSource() && hasMedia_ && pw && ph && cw && ch) {
-                const XrSession::ViewRect fit = MatchMinRect({0, 0, cw, ch}, FitAspect());
+            if (AutoConvApplies() && pw && ph && cw && ch) {  // live or a stereo file
+                const XrSession::ViewRect fit = TargetScaled(MatchMinRect({0, 0, cw, ch}, FitAspect()));
                 const float px = cx * (float)cw / (float)pw, py = cy * (float)ch / (float)ph;
                 const float u = (px - (float)fit.x) / (float)std::max(1u, fit.w);
                 const float v = (py - (float)fit.y) / (float)std::max(1u, fit.h);
@@ -548,6 +632,7 @@ int App::Run() {
         if (window_.TakeToggleSlideshowRequest()) { ToggleSlideshow(); activity = true; } // 'S'
         if (window_.TakeToggleMuteRequest()) { ToggleMute(); activity = true; }            // 'M'
         if (window_.TakeCycleLayoutRequest()) { CycleLayoutOverride(); activity = true; }  // 'L'
+        VrHandleInput(activity);  // VR viewer (#155): drag / wheel / arrows / R / P
         if (window_.TakeConvertRequest()) { SetConvert(!lift_.On(), "key"); activity = true; }  // Shift+L
         if (window_.TakeToggleCameraRequest()) { ToggleLive(); activity = true; }          // 'C'
         if (window_.TakeOpenUrlRequest()) { OpenUrlPrompt(); activity = true; }            // Ctrl+U
@@ -674,6 +759,8 @@ void App::RenderOneFrame() {
             } else if (isStream_) {
                 SettleLiveLayout(*vf, "Stream");
                 SampleAutoConv(*vf);  // streams converge like the camera (#93 follow-up)
+            } else if (isVideo_) {
+                SampleAutoConv(*vf);  // a playing clip converges like a stream (Part of #128)
             }
             // "Convert to 3D": hand the frame to the converter (latest-wins, one in flight).
             // While a converted picture is bound it REPLACES the source, so the source frame
@@ -716,6 +803,7 @@ void App::RenderOneFrame() {
             convertAtStart_ = false;
     }
     PumpConvert(SteadySeconds());  // "Convert to 3D": poll + upload a landed result (no-op off)
+    SampleAutoConvStatic();  // a still / a paused clip: measured once per change (Part of #128)
     TickAutoConv();  // smoothed auto-convergence shift (#92); exactly 0 while never enabled
     UpdateDepthCursor();
 
@@ -782,8 +870,9 @@ void App::RenderOneFrame() {
         {
             const bool stereoSrc =
                 (layout_ != StereoLayout::Mono && layout_ != StereoLayout::Dual) || convertBound_;
-            pro_.ApplyViewTransform(uvs, frame.viewCount, stereoSrc && hasMedia_ && !isLogo_,
-                                    swapEyes_ != mediaEyeSwap_, packing::IsTb(layout_));
+            if (!VrActive())  // the VR viewer owns pan / zoom (#155)
+                pro_.ApplyViewTransform(uvs, frame.viewCount, stereoSrc && hasMedia_ && !isLogo_,
+                                        swapEyes_ != mediaEyeSwap_, packing::IsTb(layout_));
             pro_.Tick(ProStatus());
         }
 #endif
@@ -800,7 +889,10 @@ void App::RenderOneFrame() {
             // longer axis), then scale into each tile (handles non-uniform modes).
             const float sx = xr_.ActiveViewScaleX();
             const float sy = xr_.ActiveViewScaleY();
-            const XrSession::ViewRect viewFit = MatchMinRect({0, 0, canvasW, canvasH}, FitAspect());
+            // #135: Pro's target-screen preview scales the picture about its centre (the
+            // tile scissor crops it when it grows past the tile), for the viewer's distance.
+            UpdateViewerDistance(frame.views, std::min(frame.viewCount, frame.locatedCount), canvasW);
+            const XrSession::ViewRect viewFit = TargetScaled(MatchMinRect({0, 0, canvasW, canvasH}, FitAspect()));
             const int32_t lbx = (int32_t)((float)viewFit.x * sx);  // horizontal inset of the content
             // Convergence = horizontal image translation: shift the two eyes' content
             // oppositely within their tiles, moving the zero-disparity plane. A LIF's
@@ -819,6 +911,29 @@ void App::RenderOneFrame() {
                 contentRects[v].y = rects[v].y + (int32_t)((float)viewFit.y * sy + 0.5f);
                 contentRects[v].w = (uint32_t)((float)viewFit.w * sx + 0.5f);
                 contentRects[v].h = (uint32_t)((float)viewFit.h * sy + 0.5f);
+            }
+            if (VrActive()) {
+                // VR viewer (#155): each view samples its eye through the sphere. The
+                // convergence shift becomes a horizontal lens shift of the window (still a
+                // rectified pair, and the scene continues past the edge, so there is no
+                // de-occlusion strip): the content rect stays put and cdx goes to 0.
+                const float hfov = VrFovDeg();
+                const float aspect = (float)viewFit.w / (float)std::max(1u, viewFit.h);
+                const bool stereo = VrStereo();
+                const vr::Model model = vr::ModelFor(vrProj_, stereo);
+                for (uint32_t v = 0; v < frame.viewCount; ++v) {
+                    const float shift = (float)cdx[v] / (float)std::max(1u, contentRects[v].w);
+                    contentRects[v].x -= cdx[v];
+                    cdx[v] = 0;
+                    const vr::EyeWindow w = vr::ComputeWindow(vrProj_, stereo, vrView_, hfov, aspect, shift);
+                    ViewUV u{w.x0, w.y0, w.sx, w.sy};
+                    // The other eye's window differs only by the opposite shift (Pro QC views).
+                    u.otherDX = 2.0f * shift * w.sx;
+                    u.vrMode = vr::PackModeFlags(vrProj_, model, layout_, stereo && !isLeftView[v], vrFisheyeFovDeg_);
+                    u.vrPitch = w.pitchRad;
+                    u.vrHeading = vr::PackHeading(w.headingRad);
+                    uvs[v] = u;
+                }
             }
 
 #if MEDIAPLAYER_PRO
@@ -1001,8 +1116,8 @@ void App::RenderOneFrame() {
                               swapEyes_ ? "swapped" : "normal",
                               ((isLive_ && livePaused_) || (isStream_ && streamPaused_)) ? "  [FROZEN]"
                               : (isVideo_ && video_.Paused()) ? "  [PAUSED]" : "",
-                              LiveSource() ? "\n" : "",
-                              LiveSource() ? AutoConvHudText().c_str() : "");  // #92
+                              (LiveSource() || autoConvEnabled_) ? "\n" : "",
+                              (LiveSource() || autoConvEnabled_) ? AutoConvHudText().c_str() : "");  // #92
                 // The layout label carries its provenance ("— detected" / "— from
                 // filename" / ...), so the buffer needs headroom over the old 320.
                 const std::string layoutLabel = LayoutLabel();
@@ -1075,7 +1190,9 @@ void App::BuildTransportUI() {
         currentMediaPath_.empty() ? std::string()
                                   : std::filesystem::path(currentMediaPath_).filename().string();
     uiState_.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
-    uiState_.layoutName = convertBound_ ? kConvertedLayoutName : MediaSource::LayoutName(layout_);
+    uiState_.layoutName = convertBound_ ? kConvertedLayoutName
+                          : VrActive()  ? std::string(vr::ProjectionName(vrProj_)) + " " + LayoutShortName()  // #155
+                                        : LayoutShortName();
     uiState_.layoutTooltip = LayoutLabel();
     uiState_.layoutPinned = layoutPinned_;
     uiState_.positionSeconds = video_.PositionSeconds();
@@ -1101,6 +1218,7 @@ void App::BuildTransportUI() {
         if (cameraDevs_[i].id == camera_.DeviceId()) uiState_.cameraCurrent = (int)i;
     if (isLive_) uiState_.mediaFilename.clear();
     uiState_.autoConvOn = autoConvEnabled_;
+    uiState_.autoConvFile = !LiveSource() && AutoConvApplies();  // a stereo file (Part of #128)
     {
         char t[64];
         if (autoConvEnabled_)
@@ -1186,11 +1304,13 @@ void App::BuildTransportUI() {
     };
     actions.Seek = [this](float sec, bool preview) {
         video_.Seek(sec, preview);
+        AutoConvNewPicture(/*newMedia=*/false);  // a jump: snap, never glide across it
         if (!preview) ResetConvertStream();  // a jump: no pre-seek result may land after it
     };
     actions.ScrubHeld = [this] { audio_.SetPaused(true); };
     actions.ScrubReleased = [this](float sec) {
         video_.Seek(sec, /*preview=*/false);
+        AutoConvNewPicture(/*newMedia=*/false);
         ResetConvertStream();
         audio_.Seek(sec);
         if (!video_.Paused()) audio_.SetPaused(false);
@@ -1348,9 +1468,34 @@ void App::ReadStereoEnv() {
         else layoutForced_ = false;   // "auto" or anything unrecognised
         LOG_INFO("Stereo layout forced: %s", layoutForced_ ? l : "auto");
     }
+    // VR viewer (#155): MEDIAPLAYER_VR pins a projection for headless runs (flat |
+    // equirect180 | equirect360 | fisheye); MEDIAPLAYER_VR_VIEW = "yaw,pitch[,fov]" in degrees
+    // opens every file at that view; the clamps and the fisheye lens FOV are tunable.
+    if (const char* v = std::getenv("MEDIAPLAYER_VR")) {
+        vrForced_ = vr::ParseProjectionId(v, vrForcedValue_);
+        LOG_INFO("VR projection forced: %s", vrForced_ ? v : "auto");
+    }
+    if (const char* v = std::getenv("MEDIAPLAYER_VR_PAN_MAX")) vrLimits_.panMaxDeg = (float)std::atof(v);
+    if (const char* v = std::getenv("MEDIAPLAYER_VR_PITCH_MAX")) vrLimits_.pitchMaxDeg = (float)std::atof(v);
+    if (const char* v = std::getenv("MEDIAPLAYER_VR_FISHEYE_FOV")) vrFisheyeFovDeg_ = (float)std::atof(v);
 }
 
 bool App::LoadMedia(const std::string& path) {
+    loadSphKind_ = -1;
+    loadSphCoverage_ = 0.0f;
+    if (!LoadMediaFile(path)) return false;
+    ResolveVr(path, loadSphKind_, loadSphCoverage_, mediaW_, mediaH_);  // #155, every kind of file
+    if (const char* v = std::getenv("MEDIAPLAYER_VR_VIEW")) {
+        float y = 0.f, p = 0.f, f = 0.f;
+        if (std::sscanf(v, "%f,%f,%f", &y, &p, &f) >= 2) {
+            vrView_ = vr::ViewState{y, p, f};
+            vr::Clamp(vrView_, vrProj_, VrStereo(), VrFovDeg(), VrWindowAspect(), vrLimits_);
+        }
+    }
+    return true;
+}
+
+bool App::LoadMediaFile(const std::string& path) {
     const MediaInfo probeInfo = MediaSource::Identify(path);
 
     // Layered layout resolution (#45). Work out up front which layers we even need:
@@ -1378,13 +1523,23 @@ bool App::LoadMedia(const std::string& path) {
         VideoStereoProbe::Result pr;
         if (detectMode_ != DetectMode::Off && !manual)
             pr = VideoStereoProbe::Run(path, wantContent);
+        else if (detectMode_ != DetectMode::Off)  // a pinned layout still wants the projection (#155)
+            pr.haveSpherical = VideoStereoProbe::ReadSpherical(path, pr.sphericalKind, pr.sphericalCoverageDeg);
+        if (pr.haveSpherical) {
+            loadSphKind_ = pr.sphericalKind;
+            loadSphCoverage_ = pr.sphericalCoverageDeg;
+        }
         MediaInfo meta;
         if (pr.haveMeta) {
             meta.layout = pr.metaLayout;
             meta.eyeSwap = pr.metaInvert;
             // AVStereo3D says "side by side" but is silent on full vs half — settle that
-            // from the frame aspect, the same way the content path does.
-            if (packing::IsTb(meta.layout) && pr.width > 0 && pr.height > 0) {
+            // from the frame aspect, the same way the content path does. MV-HEVC (#154) is
+            // full SBS by construction (the decoder composes two full views), whatever the
+            // aspect: a portrait phone pair is narrower than any SBS threshold.
+            if (pr.multiview) {
+                meta.format = "MV-HEVC";
+            } else if (packing::IsTb(meta.layout) && pr.width > 0 && pr.height > 0) {
                 meta.layout = packing::ChooseTbFullOrHalf((float)pr.width / (float)pr.height);
             } else if (meta.layout != StereoLayout::Mono && pr.width > 0 && pr.height > 0) {
                 bool ambiguous = false;
@@ -1392,14 +1547,21 @@ bool App::LoadMedia(const std::string& path) {
                     (float)pr.width / (float)pr.height, ambiguous);
             }
         }
-        const MediaInfo vinfo = MediaSource::Resolve(
+        MediaInfo vinfo = MediaSource::Resolve(
             path, MediaKind::Video, pr.ok ? pr.width : 0, pr.ok ? pr.height : 0,
             manual, pr.haveMeta ? &meta : nullptr,
             pr.content.decided ? &pr.content : nullptr);
+        if (vinfo.signal == StereoSignal::Metadata) vinfo.format = meta.format;
 
         if (!video_.Open(path)) {
             LOG_ERROR("Open: cannot decode video '%s'", path.c_str());
             return false;
+        }
+        if (pr.multiview && !video_.IsMultiview() && vinfo.signal == StereoSignal::Metadata) {
+            // The probe saw MV-HEVC but this decoder cannot output both views: it plays the
+            // base view alone, so the frame is one view wide.
+            vinfo.layout = StereoLayout::Mono;
+            vinfo.format = "";
         }
         isVideo_ = true;
         hasMedia_ = true;
@@ -1407,6 +1569,7 @@ bool App::LoadMedia(const std::string& path) {
         ApplyLayout(vinfo);
         mediaConvergence_ = 0.0f;  // no baked convergence for video
         mediaAutoConvAvailable_ = false;
+        AutoConvNewPicture(/*newMedia=*/true);  // frames are sampled as they play
         KeepStillForConvert(nullptr, 0, 0);  // a video converts from its decoded frames
 #if MEDIAPLAYER_PRO
         pro_.OnStill(nullptr, 0, 0, layout_);  // scopes follow the frames again
@@ -1464,6 +1627,12 @@ bool App::LoadMedia(const std::string& path) {
         mediaConvergence_ = lif.convergence;  // baked reconvergence from the LIF
         mediaAutoConvAvailable_ = lif.stereo && !lif.hasConvergence;  // estimate available
         mediaAutoConvergence_ = lif.autoConvergence;
+        // The author's convergence wins: auto-conv stands aside on a LIF that carries one
+        // (never stacked on the baked shift). One without it converges like an MPO.
+        AutoConvNewPicture(/*newMedia=*/true);
+        mediaHasBakedConv_ = lif.hasConvergence;
+        if (!mediaHasBakedConv_)
+            KeepStillForAutoConv(lif.image.pixels.data(), lif.image.width, lif.image.height);
         KeepStillForConvert(lif.image.pixels.data(), lif.image.width, lif.image.height);
 #if MEDIAPLAYER_PRO
         pro_.OnStill(lif.image.pixels.data(), lif.image.width, lif.image.height, layout_);
@@ -1473,6 +1642,56 @@ bool App::LoadMedia(const std::string& path) {
         contentAspect_ = PerEyeAspect(layout_, lif.image.width, lif.image.height);
         LOG_INFO("Displaying %s LIF (%s), per-eye aspect %.3f, baked convergence %+.4f",
                  lif.stereo ? "stereo" : "mono", path.c_str(), contentAspect_, mediaConvergence_);
+        currentMediaPath_ = path;
+        RebuildFolderList(path);
+        return true;
+    }
+    // HEIC / HEIF (#154): a stereo pair (`ster` group: Apple spatial photos, Galaxy 3D
+    // Capture photos) composes to SBS like MPO; any other HEIC shows its primary image, and
+    // the ordinary layered resolution still applies to it (a `*_2x1.heic` stays SBS).
+    if (HeifLoader::IsHeifPath(path)) {
+        HeifResult heif = HeifLoader::Load(path);
+        if (!heif.ok) {
+            LOG_ERROR("Open: cannot load HEIF '%s'", path.c_str());
+            return false;
+        }
+        if (!renderer_.UploadTexture(heif.image.pixels.data(), (uint32_t)heif.image.width,
+                                     (uint32_t)heif.image.height)) {
+            return false;
+        }
+        isVideo_ = false;
+        hasMedia_ = true;
+        ClearIdleLogo();
+        MediaInfo hinfo;
+        if (heif.stereo) {
+            hinfo.kind = MediaKind::Image;
+            hinfo.layout = manual ? *manual : heif.layout;
+            hinfo.signal = manual ? StereoSignal::Manual : StereoSignal::Metadata;
+            hinfo.confidence = 1.0f;
+            hinfo.format = "stereo HEIC";
+            autoInfo_ = MediaInfo{MediaKind::Image, heif.layout, StereoSignal::Metadata, false, 1.0f, "stereo HEIC"};
+        } else {
+            // A plain phone photo: the container says 2D. The filename rule still outranks it.
+            MediaInfo meta;
+            meta.layout = StereoLayout::Mono;
+            hinfo = MediaSource::Resolve(path, MediaKind::Image, heif.image.width, heif.image.height, manual, &meta,
+                                         nullptr);
+        }
+        ApplyLayout(hinfo);
+        mediaConvergence_ = 0.0f;                 // HEIC carries no baked convergence...
+        mediaAutoConvAvailable_ = heif.stereo;    // ...so, like MPO, the estimate is on offer
+        mediaAutoConvergence_ = heif.autoConvergence;
+        AutoConvNewPicture(/*newMedia=*/true);
+        KeepStillForAutoConv(heif.image.pixels.data(), heif.image.width, heif.image.height);
+        KeepStillForConvert(heif.image.pixels.data(), heif.image.width, heif.image.height);
+#if MEDIAPLAYER_PRO
+        pro_.OnStill(heif.image.pixels.data(), heif.image.width, heif.image.height, layout_);
+#endif
+        mediaW_ = heif.image.width;
+        mediaH_ = heif.image.height;
+        contentAspect_ = PerEyeAspect(layout_, heif.image.width, heif.image.height);
+        LOG_INFO("Displaying %s HEIC (%s), per-eye aspect %.3f", heif.stereo ? "stereo" : "flat", path.c_str(),
+                 contentAspect_);
         currentMediaPath_ = path;
         RebuildFolderList(path);
         return true;
@@ -1510,6 +1729,8 @@ bool App::LoadMedia(const std::string& path) {
             mediaConvergence_ = 0.0f;   // MPO carries no baked convergence...
             mediaAutoConvAvailable_ = true;   // ...so the estimate is always on offer
             mediaAutoConvergence_ = mpo.autoConvergence;
+            AutoConvNewPicture(/*newMedia=*/true);
+            KeepStillForAutoConv(mpo.image.pixels.data(), mpo.image.width, mpo.image.height);
             KeepStillForConvert(mpo.image.pixels.data(), mpo.image.width, mpo.image.height);
 #if MEDIAPLAYER_PRO
             pro_.OnStill(mpo.image.pixels.data(), mpo.image.width, mpo.image.height, layout_);
@@ -1548,6 +1769,8 @@ bool App::LoadMedia(const std::string& path) {
     ApplyLayout(imgInfo);
     mediaConvergence_ = 0.0f;  // plain SBS image carries no baked convergence
     mediaAutoConvAvailable_ = false;
+    AutoConvNewPicture(/*newMedia=*/true);
+    KeepStillForAutoConv(img.pixels.data(), img.width, img.height);
     KeepStillForConvert(img.pixels.data(), img.width, img.height);
 #if MEDIAPLAYER_PRO
     pro_.OnStill(img.pixels.data(), img.width, img.height, layout_);
@@ -1592,9 +1815,18 @@ void App::ApplyLayout(const MediaInfo& info) {
     if (info.signal == StereoSignal::Content) ShowToast(LayoutLabel());
 }
 
+std::string App::LayoutShortName() const {
+    // MV-HEVC / stereo HEIC (#154) are composed to SBS-full internally; name the format the
+    // user recognises instead, unless they have pinned another layout.
+    const bool showFormat = !layoutPinned_ && autoInfo_.format && *autoInfo_.format &&
+                            layout_ == autoInfo_.layout && layoutSignal_ == autoInfo_.signal;
+    return showFormat ? std::string(autoInfo_.format) : std::string(MediaSource::LayoutName(layout_));
+}
+
 std::string App::LayoutLabel() const {
     if (convertBound_) return kConvertedLayoutName;  // "Convert to 3D" result on screen
-    std::string s = MediaSource::LayoutName(layout_);
+    std::string s = LayoutShortName();
+    if (VrActive()) s = std::string(vr::ProjectionName(vrProj_)) + " " + s;  // #155
     if (mediaEyeSwap_) s += " (R|L)";
     s += " — ";
     s += MediaSource::SignalName(layoutSignal_);
@@ -1887,6 +2119,7 @@ void App::SettleLiveLayout(const FrameRing::Frame& f, const char* tag) {
         layoutSignal_ = StereoSignal::Manual;
     }
     contentAspect_ = PerEyeAspect(layout_, mediaW_, mediaH_);
+    if (firstFrame) ResolveVr("", -1, 0.0f, mediaW_, mediaH_);  // no detection live; `P` pins (#155)
     LOG_INFO("%s: %dx%d %s frames, %s, per-eye aspect %.3f", tag, mediaW_, mediaH_,
              f.format == PixFormat::NV12 ? "NV12" : "I420", LayoutLabel().c_str(),
              contentAspect_);
@@ -2101,6 +2334,180 @@ void App::PollLive() {
     }
 }
 
+// --- VR180 / VR360 viewer (#155) -------------------------------------------------------
+
+float App::FitAspect() const {
+    if (VrActive()) return VrWindowAspect();  // the window into the scene fills the window
+    return contentAspect_ * proDesqueeze_;
+}
+
+bool App::VrActive() const {
+    return vrProj_ != vr::Projection::None && hasMedia_ && !isLogo_ && !convertBound_;
+}
+
+float App::VrWindowAspect() const {
+    uint32_t cw = 0, ch = 0;
+    window_.PixelSize(cw, ch);
+    return (cw && ch) ? (float)cw / (float)ch : 16.0f / 9.0f;
+}
+
+float App::VrDefaultFovDeg() const {
+    // Life-size: the window's physical width on the panel, seen from the nominal viewing
+    // distance. The window's share of the panel comes from its pixel width.
+    uint32_t cw = 0, ch = 0;
+    window_.PixelSize(cw, ch);
+    const float panelM = xr_.DisplayWidthMeters();
+    const uint32_t panelPx = xr_.DisplayPixelWidth();
+    float frac = (panelPx && cw) ? (float)cw / (float)panelPx : 1.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    const float dist = xr_.NominalViewerDistance() > 0.05f ? xr_.NominalViewerDistance() : 0.6f;
+    const float fov = vr::LifeSizeHFovDeg(panelM * frac, dist);
+    return std::min(vrLimits_.fovMaxDeg, std::max(vrLimits_.fovMinDeg, fov));
+}
+
+void App::ResolveVr(const std::string& path, int sphKind, float sphCoverage, int frameW, int frameH) {
+    vrAuto_ = vr::Projection::None;
+    vrSignal_ = "";
+    vrView_ = vr::ViewState{};  // every file opens re-centred, life-size
+    ++vrViewGen_;
+    vrPinned_ = vrForced_;
+    vrPinnedValue_ = vrForcedValue_;
+    const float aspect = (frameW > 0 && frameH > 0) ? (float)frameW / (float)frameH : 0.0f;
+    int packingHint = -1;
+    if (sphKind >= 0) {
+        vrAuto_ = vr::FromSpherical(sphKind, sphCoverage);
+        if (vrAuto_ != vr::Projection::None) vrSignal_ = "metadata";
+    }
+    if (vrAuto_ == vr::Projection::None && !path.empty()) {
+        vr::Projection fp = vr::Projection::None;
+        int hint = -1;
+        // A name is a hint, not a fact: honoured only on a frame shaped like that projection.
+        if (vr::ProjectionFromFilename(path, fp, hint) && vr::AspectPlausible(fp, aspect)) {
+            vrAuto_ = fp;
+            vrSignal_ = "filename";
+            packingHint = hint;
+        }
+    }
+    vrProj_ = vrPinned_ ? vrPinnedValue_ : vrAuto_;
+    if (vrPinned_) vrSignal_ = "manual";
+    if (vrProj_ == vr::Projection::None) return;
+    // The packing: a strong layer (the user, container stereo metadata, an explicit name)
+    // keeps its word; otherwise the projection's known eye aspect decides (a 2:1 frame is
+    // SBS for VR180 but MONO for VR360).
+    const bool strong = layoutSignal_ == StereoSignal::Manual || layoutSignal_ == StereoSignal::Metadata ||
+                        layoutSignal_ == StereoSignal::Filename;
+    if (!strong) {
+        StereoLayout l = packingHint == 1   ? StereoLayout::SbsFull
+                         : packingHint == 2 ? StereoLayout::TbFull
+                         : packingHint == 0 ? StereoLayout::Mono
+                                            : vr::PackingFromAspect(vrProj_, aspect);
+        if (l != layout_) LOG_INFO("VR: packing %s -> %s (from the %s frame aspect %.2f)", MediaSource::LayoutName(layout_),
+                                   MediaSource::LayoutName(l), vr::ProjectionName(vrProj_), aspect);
+        layout_ = l;
+        if (layoutSignal_ != StereoSignal::Manual) autoInfo_.layout = l;  // L -> auto lands here
+        contentAspect_ = PerEyeAspect(layout_, mediaW_, mediaH_);
+    }
+    LOG_INFO("VR: %s %s (%s), default FOV %.1f deg", vr::ProjectionName(vrProj_), MediaSource::LayoutName(layout_),
+             vrSignal_, VrDefaultFovDeg());
+    ShowToast(std::string(vr::ProjectionName(vrProj_)) + " viewer: drag to look around, scroll to zoom, R re-centres");
+}
+
+void App::SetVrProjectionPin(bool pin, vr::Projection p, const char* why) {
+    vrPinned_ = pin;
+    vrPinnedValue_ = p;
+    vrForced_ = false;  // an explicit choice retires the MEDIAPLAYER_VR seed
+    vrProj_ = pin ? p : vrAuto_;
+    vrSignal_ = pin ? "manual" : (vrAuto_ != vr::Projection::None ? vrSignal_ : "");
+    vrView_ = vr::ViewState{};
+    ++vrViewGen_;
+    LOG_INFO("VR projection %s: %s (%s)", pin ? "pinned" : "auto", vr::ProjectionName(vrProj_), why);
+    ShowToast(std::string("Projection: ") + (pin ? "" : "auto - ") + vr::ProjectionName(vrProj_));
+}
+
+void App::CycleVrProjection() {
+    using P = vr::Projection;
+    // auto -> flat -> VR180 -> VR360 -> fisheye -> auto
+    if (!vrPinned_) SetVrProjectionPin(true, P::None, "key");
+    else if (vrPinnedValue_ == P::None) SetVrProjectionPin(true, P::Equirect180, "key");
+    else if (vrPinnedValue_ == P::Equirect180) SetVrProjectionPin(true, P::Equirect360, "key");
+    else if (vrPinnedValue_ == P::Equirect360) SetVrProjectionPin(true, P::Fisheye, "key");
+    else SetVrProjectionPin(false, vrAuto_, "key");
+}
+
+void App::VrSteer(float dYawDeg, float dPitchDeg, float fovScale) {
+    const float fov0 = VrFovDeg();
+    vrView_.yawDeg += dYawDeg;
+    vrView_.pitchDeg += dPitchDeg;
+    if (fovScale != 1.0f) vrView_.fovDeg = fov0 * fovScale;
+    vr::Clamp(vrView_, vrProj_, VrStereo(), VrFovDeg(), VrWindowAspect(), vrLimits_);
+    ++vrViewGen_;
+}
+
+void App::VrRecenter(const char* why) {
+    vrView_ = vr::ViewState{};
+    ++vrViewGen_;
+    LOG_INFO("VR view re-centred (%s)", why);
+    ShowToast("View re-centred");
+}
+
+void App::VrHandleInput(bool& activity) {
+    window_.SetArrowsPanView(VrActive());
+    if (window_.TakeCycleProjectionRequest()) {  // 'P'
+        CycleVrProjection();
+        activity = true;
+    }
+    float dx = 0.f, dy = 0.f;
+    const bool dragged = window_.TakeViewDrag(dx, dy);
+    const float wheel = window_.TakeWheelSteps();
+    const bool dbl = window_.TakeDoubleClick();
+    const bool recenter = window_.TakeRecenterRequest();
+    int nx = 0, ny = 0;
+    const bool nudged = window_.TakeViewNudge(nx, ny);
+    if (!VrActive()) return;  // flat media: the gestures keep their usual meaning (or none)
+    const bool uiMouse = imgui_.Ready() && imgui_.WantCaptureMouse();
+    if (recenter || (dbl && !uiMouse)) {
+        VrRecenter(recenter ? "R" : "double-click");
+        activity = true;
+        return;
+    }
+    if (dragged && !uiMouse) {
+        // Grab the scene: dragging right turns the view left. One window width of drag is
+        // one field of view.
+        uint32_t pw = 0, ph = 0;
+        window_.PointSize(pw, ph);
+        const float degPerPt = VrFovDeg() / (float)std::max(1u, pw);
+        VrSteer(-dx * degPerPt, dy * degPerPt, 1.0f);
+    }
+    if (wheel != 0.0f && !uiMouse) VrSteer(0.f, 0.f, std::pow(0.9f, wheel));  // up = zoom in
+    if (nudged) {
+        VrSteer(5.0f * (float)nx, 5.0f * (float)ny, 1.0f);
+        activity = true;
+    }
+}
+
+std::string App::VrViewJson() const {
+    nlohmann::json o;
+    o["active"] = VrActive();
+    o["projection"] = vr::ProjectionId(vrProj_);
+    o["projection_signal"] = vrSignal_;
+    o["projection_pinned"] = vrPinned_;
+    o["detected_projection"] = vr::ProjectionId(vrAuto_);
+    o["stereo"] = VrStereo();
+    o["layout"] = MediaSource::LayoutName(layout_);
+    const vr::Model m = vr::ModelFor(vrProj_, VrStereo());
+    o["model"] = m == vr::Model::Plane ? "plane (off-axis window, rectified)"
+                 : m == vr::Model::Cylinder ? "cylinder (ODS 360, rectified)"
+                                            : "free (mono)";
+    o["yaw_deg"] = vrView_.yawDeg;
+    o["pitch_deg"] = vrView_.pitchDeg;
+    o["fov_deg"] = VrFovDeg();
+    o["fov_default_deg"] = VrDefaultFovDeg();
+    o["pan_max_deg"] = vrLimits_.panMaxDeg;
+    o["pitch_max_deg"] = vrLimits_.pitchMaxDeg;
+    o["fisheye_fov_deg"] = vrFisheyeFovDeg_;
+    return o.dump();
+}
+
 // --- Auto-convergence (#92) ----------------------------------------------------------
 
 void App::SetAutoConv(bool on, const char* why) {
@@ -2114,6 +2521,8 @@ void App::SetAutoConv(bool on, const char* why) {
         autoConvMin_ = autoConvMax_ = autoConvergence_;
         autoConvSum_ = autoConvMsSum_ = autoConvMsMax_ = 0.0;
         autoConvTicks_ = autoConvMeasures_ = 0;
+        autoConvKey_ = AutoConvKey{};  // a still / paused clip is measured afresh
+        autoConvChangePending_ = 0;
     }
     LOG_INFO("auto-conv %s (%s, policy %s)", on ? "ON" : "OFF", why,
              autoconv::PolicyName(autoConvPolicy_));
@@ -2138,27 +2547,167 @@ void App::SetAutoConvFocus(float u, float v) {
     else ShowToast("Auto-conv: subject pinned");
 }
 
-void App::SampleAutoConv(const FrameRing::Frame& f) {
-    if (!autoConvEnabled_ || !LiveSource() || LivePaused()) return;
-    if (layout_ != StereoLayout::SbsFull && layout_ != StereoLayout::SbsHalf) return;
-    if (f.gpu || f.plane[0].empty() || f.width < 64 || f.height < 32) return;
-    const double nowMs = CameraSource::NowSeconds() * 1000.0;
-    if (nowMs - autoConvLastSubmitMs_ < 200.0) return;  // ~5 Hz
+bool App::AutoConvApplies() const {
+    if (!hasMedia_ || isLogo_ || !packing::IsPacked(layout_)) return false;
+    return LiveSource() || !mediaHasBakedConv_;
+}
+
+const uint8_t* App::AutoConvLuma8(const FrameRing::Frame& f) {
+    if (f.format != PixFormat::P016) return f.plane[0].data();
+    // 16-bit (Pro's 10-bit path): the measurement is 8-bit.
+    const size_t n = (size_t)f.width * (size_t)f.height;
+    autoConvLuma8_.resize(n);
+    const uint16_t* s16 = reinterpret_cast<const uint16_t*>(f.plane[0].data());
+    for (size_t i = 0; i < n; ++i) autoConvLuma8_[i] = (uint8_t)(s16[i] >> 8);
+    return autoConvLuma8_.data();
+}
+
+App::AutoConvKey App::AutoConvKeyNow(int64_t serial) const {
+    AutoConvKey k;
+    k.valid = true;
+    k.media = autoConvMedia_;
+    k.serial = serial;
+    k.layout = layout_;
+    k.swap = (swapEyes_ != mediaEyeSwap_);
+    k.policy = autoConvPolicy_;
+    k.vrGen = VrActive() ? vrViewGen_ : 0u;
+    if (autoConvPolicy_ == autoconv::SubjectPolicy::Focus && autoConvHasFocus_) {
+        k.fx = autoConvFocus_[0];
+        k.fy = autoConvFocus_[1];
+    }
+    return k;
+}
+
+void App::SubmitAutoConv(const uint8_t* luma, int w, int h, double nowMs) {
     autoConvLastSubmitMs_ = nowMs;
     // Measure on the halves the viewer's eyes actually see (X / container swap).
     const bool swap = (swapEyes_ != mediaEyeSwap_);
     const bool focus = autoConvPolicy_ == autoconv::SubjectPolicy::Focus && autoConvHasFocus_;
-    const uint8_t* luma = f.plane[0].data();
-    if (f.format == PixFormat::P016) {  // 16-bit (Pro's 10-bit path): the measurement is 8-bit
-        const size_t n = (size_t)f.width * (size_t)f.height;
-        autoConvLuma8_.resize(n);
-        const uint16_t* s16 = reinterpret_cast<const uint16_t*>(f.plane[0].data());
-        for (size_t i = 0; i < n; ++i) autoConvLuma8_[i] = (uint8_t)(s16[i] >> 8);
-        luma = autoConvLuma8_.data();
+    if (VrActive()) {
+        // VR viewer (#155): measure what the eyes are SHOWN - each eye's window rendered
+        // through the sphere (no convergence shift), side by side - so the shift the
+        // controller returns is a fraction of the window's width, as the draw applies it.
+        const float aspect = VrWindowAspect();
+        const int ew = 480, eh = std::max(32, (int)(480.0f / std::max(0.25f, aspect)));
+        vrAutoConvBuf_.assign((size_t)ew * 2 * eh, 0);
+        const vr::EyeWindow win = vr::ComputeWindow(vrProj_, VrStereo(), vrView_, VrFovDeg(), aspect, 0.0f);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int e = 0; e < 2; ++e)
+            vr::RenderEyeGray(luma, w, h, w, vr::EyeRectFor(layout_, (e == 1) != swap), vrProj_, vrFisheyeFovDeg_, win,
+                              vrAutoConvBuf_.data() + e * ew, ew, eh, ew * 2);
+        const double renderMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        autoConvDownsampleMs_ = renderMs + autoConvWorker_.Submit(vrAutoConvBuf_.data(), ew * 2, ew * 2, eh,
+                                                                  StereoLayout::SbsFull, false, autoConvPolicy_,
+                                                                  focus ? autoConvFocus_ : nullptr, nowMs, ++autoConvTag_);
+        if (nowMs < autoConvSnapUntilMs_) autoConvSnapLastTag_ = autoConvTag_;
+        return;
     }
     autoConvDownsampleMs_ =
-        autoConvWorker_.Submit(luma, f.width, f.width, f.height, swap,
-                               autoConvPolicy_, focus ? autoConvFocus_ : nullptr, nowMs);
+        autoConvWorker_.Submit(luma, w, w, h, layout_, swap, autoConvPolicy_,
+                               focus ? autoConvFocus_ : nullptr, nowMs, ++autoConvTag_);
+    if (nowMs < autoConvSnapUntilMs_) autoConvSnapLastTag_ = autoConvTag_;
+}
+
+void App::SampleAutoConv(const FrameRing::Frame& f) {
+    if (!isVideo_ && !LiveSource()) return;
+    if (isVideo_) autoConvHeldFrame_ = &f;  // the static path re-reads it while paused
+    if (!autoConvEnabled_ || !AutoConvApplies()) return;
+    if (LiveSource() && LivePaused()) return;
+    // A paused / ended clip shows one picture: SampleAutoConvStatic measures it (a frame
+    // step or a seek lands here as a new frame and is picked up there, unthrottled).
+    if (isVideo_ && (video_.Paused() || video_.Ended())) return;
+    // Zero-copy (#28) frames carry no CPU pixels: not measured (the CPU path is the default).
+    if (f.gpu || f.plane[0].empty() || f.width < 64 || f.height < 32) return;
+    const double nowMs = CameraSource::NowSeconds() * 1000.0;
+    if (nowMs - autoConvLastSubmitMs_ < 200.0) return;  // ~5 Hz
+    SubmitAutoConv(AutoConvLuma8(f), f.width, f.height, nowMs);
+    if (isVideo_) autoConvKey_ = AutoConvKeyNow(f.serial);
+}
+
+void App::SampleAutoConvStatic() {
+    if (!autoConvEnabled_ || LiveSource() || !AutoConvApplies()) return;
+    const uint8_t* luma = nullptr;
+    int w = 0, h = 0;
+    int64_t serial = 0;
+    const FrameRing::Frame* f = nullptr;
+    if (isVideo_) {
+        if (!(video_.Paused() || video_.Ended())) return;  // playing: SampleAutoConv
+        f = autoConvHeldFrame_;
+        if (!f || f->gpu || f->plane[0].empty() || f->width < 64 || f->height < 32) return;
+        serial = f->serial;
+    } else if (autoConvStill_.empty()) {
+        return;
+    }
+    const AutoConvKey k = AutoConvKeyNow(serial);
+    if (k.Same(autoConvKey_)) return;
+    // A VR drag changes the view every frame: re-measure at most ~7 Hz while it moves.
+    if (VrActive() && autoConvKey_.valid && k.vrGen != autoConvKey_.vrGen &&
+        CameraSource::NowSeconds() * 1000.0 - autoConvLastSubmitMs_ < 150.0)
+        return;
+    if (f) {
+        luma = AutoConvLuma8(*f);
+        w = f->width;
+        h = f->height;
+    } else {
+        luma = autoConvStill_.data();
+        w = autoConvStillW_;
+        h = autoConvStillH_;
+    }
+    // One picture: every measurement starts clean (no median-of-3 across a layout or eye
+    // order change). A different frame (new file, seek, step) snaps; the same picture
+    // measured differently (layout, X, policy, the focus pin, A turned on) glides, unthrottled.
+    const bool newPicture =
+        autoConvKey_.valid && (k.media != autoConvKey_.media || k.serial != autoConvKey_.serial);
+    autoConvWorker_.RequestReset();
+    SubmitAutoConv(luma, w, h, CameraSource::NowSeconds() * 1000.0);
+    autoConvChangePending_ = std::max(autoConvChangePending_, newPicture ? 2 : 1);
+    autoConvChangeFrom_ = autoConvTag_;
+    autoConvKey_ = k;
+}
+
+void App::AutoConvNewPicture(bool newMedia) {
+    autoConvWorker_.RequestReset();  // applied before the next submission is measured
+    autoConvChangePending_ = 2;
+    autoConvChangeFrom_ = autoConvTag_ + 1;  // whatever is in flight is the old picture
+    autoConvLastSubmitMs_ = -1e9;            // measure the first frame after it at once
+    // The decoder lands a seek on its next iteration, so the first frame or two sampled
+    // after it may still be the old position: every submission in this window snaps.
+    autoConvSnapUntilMs_ = CameraSource::NowSeconds() * 1000.0 + 500.0;
+    if (!newMedia) return;
+    // A new file: the old file's shift means nothing here. Drop it now (0 until the first
+    // measurement snaps in), and forget the old file's still / held frame.
+    autoConvCtl_.Reset();
+    autoConvergence_ = 0.0f;
+    ++autoConvMedia_;
+    autoConvKey_ = AutoConvKey{};
+    autoConvHeldFrame_ = nullptr;
+    autoConvStill_.clear();
+    autoConvStillW_ = autoConvStillH_ = 0;
+    mediaHasBakedConv_ = false;
+}
+
+void App::KeepStillForAutoConv(const uint8_t* rgba, int w, int h) {
+    // A still's luma (BT.709 weights), box-averaged to <= 1920 wide: the estimator works at
+    // <= 240 px per eye anyway, and this keeps an 8K pair to a few MB. Kept whether or not
+    // auto-conv is on, so A can be pressed later; a layout override re-measures from it.
+    autoConvStill_.clear();
+    autoConvStillW_ = autoConvStillH_ = 0;
+    if (!rgba || w < 64 || h < 32) return;
+    const int f = std::max(1, (w + 1919) / 1920);
+    const int ow = w / f, oh = h / f;
+    autoConvStill_.resize((size_t)ow * oh);
+    for (int y = 0; y < oh; ++y)
+        for (int x = 0; x < ow; ++x) {
+            uint32_t sum = 0;
+            for (int dy = 0; dy < f; ++dy) {
+                const uint8_t* p = rgba + ((size_t)(y * f + dy) * w + (size_t)x * f) * 4;
+                for (int dx = 0; dx < f; ++dx, p += 4) sum += 54u * p[0] + 183u * p[1] + 19u * p[2];
+            }
+            autoConvStill_[(size_t)y * ow + x] = (uint8_t)(sum / (256u * (uint32_t)(f * f)));
+        }
+    autoConvStillW_ = ow;
+    autoConvStillH_ = oh;
 }
 
 void App::TickAutoConv() {
@@ -2173,10 +2722,20 @@ void App::TickAutoConv() {
         ++autoConvMeasures_;
         autoConvMsSum_ += r.ms;
         autoConvMsMax_ = std::max(autoConvMsMax_, r.ms);
-        if (autoConvEnabled_ && LiveSource()) autoConvCtl_.Update(r);
+        // While a change is pending, a measurement of the old picture (submitted before the
+        // seek / load / re-measure) must not steer; the first one after it carries the change.
+        const bool stale = autoConvChangePending_ && r.tag < autoConvChangeFrom_;
+        if (autoConvEnabled_ && AutoConvApplies() && !stale) {
+            if (autoConvChangePending_) {
+                autoConvCtl_.ExpectChange(autoConvChangePending_ == 2);
+                autoConvChangePending_ = 0;
+            } else if (r.tag <= autoConvSnapLastTag_) {
+                autoConvCtl_.ExpectChange(true);  // still inside a seek's settle window
+            }
+            autoConvCtl_.Update(r);
+        }
     }
-    const bool stereo = layout_ == StereoLayout::SbsFull || layout_ == StereoLayout::SbsHalf;
-    autoConvCtl_.Tick(dt, autoConvEnabled_ && LiveSource() && stereo);
+    autoConvCtl_.Tick(dt, autoConvEnabled_ && AutoConvApplies());
     autoConvergence_ = autoConvCtl_.Value();
     if (!autoConvEnabled_) return;
     autoConvMin_ = std::min(autoConvMin_, autoConvergence_);
@@ -2201,6 +2760,11 @@ std::string App::AutoConvHudText() const {
     char t[128];
     if (!autoConvEnabled_) {
         std::snprintf(t, sizeof(t), "autoconv OFF");
+    } else if (!AutoConvApplies()) {
+        // On, but nothing to measure: mono / Dual, or a LIF whose own convergence wins.
+        std::snprintf(t, sizeof(t), "autoconv ON  idle (%s)",
+                      hasMedia_ && packing::IsPacked(layout_) && mediaHasBakedConv_ ? "LIF convergence"
+                                                                                    : "not stereo");
     } else {
         std::snprintf(t, sizeof(t), "autoconv ON %s  d=%+.1f%%  conv=%+.1f%%  ncc %.2f  %.1f ms",
                       autoconv::PolicyName(autoConvPolicy_), autoConvLast_.disparityFrac * 100.0f,
@@ -2534,6 +3098,7 @@ void App::TogglePlayback() {
     if (video_.Ended()) {
         video_.Seek(0.0);          // restart a clip that already ran to the end
         ResetConvertStream();
+        AutoConvNewPicture(/*newMedia=*/false);
         video_.SetPaused(false);
         audio_.Seek(0.0);
         audio_.SetPaused(false);
@@ -2562,6 +3127,7 @@ void App::StepFrame(int n) {
     if (t < 0.0) t = 0.0;
     video_.Seek(t);             // exact
     ResetConvertStream();
+    AutoConvNewPicture(/*newMedia=*/false);
     audio_.Seek(t);             // keep audio aligned for the eventual resume
     uiState_.scrubTarget = (float)t;    // hold the scrubber knob until the frame lands
 }
@@ -2834,8 +3400,33 @@ void App::SetupAgentTools() {
         "loaded file only and is dropped when other media is loaded.",
         "{\"type\":\"object\",\"properties\":{\"layout\":{\"type\":\"string\","
         "\"enum\":[\"auto\",\"mono\",\"sbs_full\",\"sbs_half\",\"tb_full\",\"tb_half\"],"
-        "\"description\":\"Layout to pin, or 'auto' to restore detection.\"}},"
-        "\"required\":[\"layout\"]}");
+        "\"description\":\"Layout to pin, or 'auto' to restore detection.\"},"
+        "\"projection\":{\"type\":\"string\","
+        "\"enum\":[\"auto\",\"flat\",\"equirect180\",\"equirect360\",\"fisheye\"],"
+        "\"description\":\"VR180 / VR360 viewer (#155, mirrors the P key): the spherical projection "
+        "each eye holds, or 'flat' for an ordinary picture, or 'auto' (container metadata, then the "
+        "file name). The packing still comes from 'layout'.\"},"
+        "\"fisheye_fov_deg\":{\"type\":\"number\",\"minimum\":90,\"maximum\":250,"
+        "\"description\":\"Dual-fisheye lens field of view (default 180).\"}}}");
+
+    xr_.RegisterMcpTool(
+        "get_view",
+        "VR180 / VR360 viewer (#155): read the view - whether a VR projection is active, the "
+        "projection and what decided it, the model (plane = stereo VR180 off-axis window, "
+        "cylinder = stereo VR360, free = mono), yaw / pitch / horizontal FOV in degrees, the "
+        "life-size default FOV and the clamps. Requires no arguments.",
+        "{\"type\":\"object\"}");
+
+    xr_.RegisterMcpTool(
+        "set_view",
+        "VR180 / VR360 viewer (#155): steer the window into the scene. yaw_deg (+ = right; for "
+        "stereo VR180 an off-axis pan clamped to +-pan_max_deg so the pair stays rectified, for "
+        "VR360 a heading that wraps), pitch_deg (+ = up), fov_deg (horizontal; 0 = life-size). "
+        "Omitted fields keep their value; recenter=true resets all three first. Errors when no "
+        "VR projection is on screen. Returns get_view.",
+        "{\"type\":\"object\",\"properties\":{"
+        "\"yaw_deg\":{\"type\":\"number\"},\"pitch_deg\":{\"type\":\"number\"},"
+        "\"fov_deg\":{\"type\":\"number\",\"minimum\":0},\"recenter\":{\"type\":\"boolean\"}}}");
 
     xr_.RegisterMcpTool(
         "list_cameras",
@@ -2857,9 +3448,10 @@ void App::SetupAgentTools() {
 
     xr_.RegisterMcpTool(
         "set_auto_convergence",
-        "Live auto-convergence (#92): measure the subject's stereo disparity and shift the "
-        "eyes so it sits at the display plane. DEFAULT OFF. 'enabled' turns it on/off (the "
-        "shift ramps back to 0 when off). 'policy' picks the subject: nearest (the nearest "
+        "Auto-convergence (#92): measure the subject's stereo disparity and shift the "
+        "eyes so it sits at the display plane. Live camera / stream and stereo files (SBS or "
+        "TB video and stills; a LIF with its own convergence keeps it). DEFAULT OFF. "
+        "'enabled' turns it on/off (the shift ramps back to 0 when off). 'policy' picks the subject: nearest (the nearest "
         "strong depth plane - a person at the camera), sharp (the sharpest blocks - shallow "
         "depth of field), centre (centre-weighted), focus (needs focus_x/focus_y). "
         "focus_x/focus_y (0..1, normalised over one eye's picture) pin the subject and imply "
@@ -2968,6 +3560,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
     auto fillAutoConv = [this](json& o) {
         const autoconv::Result& l = autoConvLast_;
         o["auto_conv_enabled"] = autoConvEnabled_;
+        o["auto_conv_active"] = autoConvEnabled_ && AutoConvApplies();  // something to measure
         o["auto_conv_policy"] = autoconv::PolicyName(autoConvPolicy_);
         o["auto_conv_value"] = autoConvergence_;  // applied per-eye shift, fraction of eye width
         o["auto_conv_target"] = autoConvCtl_.Target();
@@ -3176,6 +3769,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         if (durationS > 0.0 && t > durationS) t = durationS;
         video_.Seek(t);             // exact
         ResetConvertStream();
+        AutoConvNewPicture(/*newMedia=*/false);
         audio_.Seek(t);             // keep audio aligned
         uiState_.scrubTarget = (float)t;    // hold the scrubber knob until the decode lands
         out["position_s"] = t;
@@ -3208,8 +3802,12 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["folder_count"] = static_cast<uint64_t>(folderFiles_.size());
         out["layout"] = MediaSource::LayoutName(layout_);
         out["layout_signal"] = MediaSource::SignalName(layoutSignal_);
+        // "MV-HEVC" / "stereo HEIC" when the container itself is the stereo signal (#154)
+        out["source_format"] = std::string(autoInfo_.format ? autoInfo_.format : "");
         out["layout_confidence"] = layoutConfidence_;
         out["layout_pinned"] = layoutPinned_;
+        out["vr_projection"] = vr::ProjectionId(VrActive() ? vrProj_ : vr::Projection::None);  // #155
+        out["vr_projection_signal"] = vrSignal_;
         out["eye_swap"] = mediaEyeSwap_;
         out["swap_eyes"] = swapEyes_;
         out["live"] = isLive_;
@@ -3256,12 +3854,42 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         }
         return out.dump();
     }
-    if (tool == "set_layout") {
-        if (!args.contains("layout") || !args["layout"].is_string()) {
+    if (tool == "get_view") return VrViewJson();
+    if (tool == "set_view") {
+        if (!VrActive()) {
             success = false;
-            return "{\"error\":\"missing required string arg 'layout'\"}";
+            return "{\"error\":\"no VR projection on screen (set_layout projection=... or a VR180 / VR360 file)\"}";
         }
-        const std::string want = args["layout"].get<std::string>();
+        if (args.value("recenter", false)) vrView_ = vr::ViewState{};
+        if (args.contains("yaw_deg") && args["yaw_deg"].is_number()) vrView_.yawDeg = args["yaw_deg"].get<float>();
+        if (args.contains("pitch_deg") && args["pitch_deg"].is_number())
+            vrView_.pitchDeg = args["pitch_deg"].get<float>();
+        if (args.contains("fov_deg") && args["fov_deg"].is_number()) vrView_.fovDeg = args["fov_deg"].get<float>();
+        VrSteer(0.f, 0.f, 1.0f);  // clamp + re-measure
+        return VrViewJson();
+    }
+    if (tool == "set_layout") {
+        const bool hasLayout = args.contains("layout") && args["layout"].is_string();
+        const bool hasProj = args.contains("projection") && args["projection"].is_string();
+        if (args.contains("fisheye_fov_deg") && args["fisheye_fov_deg"].is_number()) {
+            vrFisheyeFovDeg_ = std::min(250.0f, std::max(90.0f, args["fisheye_fov_deg"].get<float>()));
+            ++vrViewGen_;
+        }
+        if (hasProj) {
+            const std::string pj = args["projection"].get<std::string>();
+            vr::Projection p = vr::Projection::None;
+            if (pj == "auto") SetVrProjectionPin(false, vrAuto_, "mcp");
+            else if (vr::ParseProjectionId(pj, p)) SetVrProjectionPin(true, p, "mcp");
+            else {
+                success = false;
+                return "{\"error\":\"projection must be auto|flat|equirect180|equirect360|fisheye\"}";
+            }
+        }
+        if (!hasLayout && !hasProj && !args.contains("fisheye_fov_deg")) {
+            success = false;
+            return "{\"error\":\"give 'layout' and/or 'projection'\"}";
+        }
+        const std::string want = hasLayout ? args["layout"].get<std::string>() : std::string();
         bool pin = true;
         StereoLayout value = StereoLayout::Mono;
         if (want == "auto") pin = false;
@@ -3270,6 +3898,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         else if (want == "sbs_half") value = StereoLayout::SbsHalf;
         else if (want == "tb_full") value = StereoLayout::TbFull;
         else if (want == "tb_half") value = StereoLayout::TbHalf;
+        else if (!hasLayout) pin = layoutPinned_, value = layoutPinnedValue_;  // projection only
         else {
             success = false;
             return "{\"error\":\"layout must be auto|mono|sbs_full|sbs_half|tb_full|tb_half\"}";
@@ -3283,6 +3912,9 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["layout"] = MediaSource::LayoutName(layout_);
         out["layout_signal"] = MediaSource::SignalName(layoutSignal_);
         out["layout_pinned"] = layoutPinned_;
+        out["vr_projection"] = vr::ProjectionId(VrActive() ? vrProj_ : vr::Projection::None);
+        out["vr_projection_pinned"] = vrPinned_;
+        out["fisheye_fov_deg"] = vrFisheyeFovDeg_;
         return out.dump();
     }
 
@@ -3439,7 +4071,7 @@ void App::RequestOpenFile() {
 
     static const SDL_DialogFileFilter kFilters[] = {
         // Keep in sync with MediaSource::IsSupported — SDL wants its own filter string.
-        {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png;lif;mpo"},
+        {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png;lif;mpo;heic;heif;hif"},
         {"All files", "*"},
     };
     SDL_ShowOpenFileDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this,
@@ -3509,6 +4141,7 @@ void App::InitPro() {
     h.seekMedia = [this](double s, bool paused) {
         if (!isVideo_) return;
         video_.Seek(s);
+        AutoConvNewPicture(/*newMedia=*/false);
         if (paused && !video_.Paused()) TogglePlayback();
     };
     h.mediaStart = [this] { return isVideo_ ? video_.StartSeconds() : 0.0; };
@@ -3519,6 +4152,20 @@ void App::InitPro() {
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
     h.setDesqueeze = [this](float f) { proDesqueeze_ = f > 0.1f ? f : 1.0f; };
     h.mediaFps = [this] { return isVideo_ ? video_.FrameRate() : 0.0; };
+    h.setTargetScreen = [this](float widthM, float distanceM) {
+        proTargetW_ = widthM > 0.0f ? widthM : 0.0f;
+        proTargetD_ = distanceM > 0.0f ? distanceM : 0.0f;
+    };
+    h.pictureScale = [this] { return proPictureScale_; };
+    h.viewerDistance = [this] { return proViewerDistM_ > 0.0f ? proViewerDistM_ : xr_.NominalViewerDistance(); };
+    h.panelGeometry = [this](float& widthM, float& viewerM) {
+        widthM = xr_.DisplayWidthMeters();
+        viewerM = xr_.NominalViewerDistance();
+        return widthM > 0.0f && viewerM > 0.0f;
+    };
+    h.displayDeviceName = [this] { return xr_.DisplayDeviceName(); };
+    h.panelIdentity = [this](std::string& key, std::string& deviceName) { return PanelIdentity(key, deviceName); };
+    h.displaysChanged = [this] { return xr_.TakeDisplaysChanged(); };
     // Scope pictures: one ImGui texture per slot, (re)made when the size changes.
     auto scopeIds = std::make_shared<std::vector<std::array<int, 3>>>(4, std::array<int, 3>{-1, 0, 0});
     h.userTexture = [this, scopeIds](int slot, int w, int hh, const uint8_t* rgba) -> void* {
@@ -3549,6 +4196,15 @@ void App::InitPro() {
             wantKeys = ImGui::GetIO().WantTextInput;
 #endif
         }
+#if !(defined(__linux__) && !defined(__ANDROID__))
+        // The VR viewer (#155) owns the wheel, drag and double-click while it is on screen.
+        if (VrActive()) {
+            const uint32_t t = static_cast<const SDL_Event*>(ev)->type;
+            if (t == SDL_EVENT_MOUSE_WHEEL || t == SDL_EVENT_MOUSE_BUTTON_DOWN || t == SDL_EVENT_MOUSE_BUTTON_UP ||
+                t == SDL_EVENT_MOUSE_MOTION)
+                return;
+        }
+#endif
         pro_.HandleEvent(ev, wantMouse, wantKeys);
     });
 

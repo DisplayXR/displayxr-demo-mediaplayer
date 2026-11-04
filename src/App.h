@@ -12,6 +12,7 @@
 #include "media/LiftClient.h"
 #include "media/MediaSource.h"
 #include "media/VideoDecoder.h"
+#include "media/VrView.h"
 #include "platform/Window.h"
 #include "rhi/VulkanRenderer.h"
 #include "ui/ImGuiLayer.h"
@@ -82,7 +83,10 @@ private:
     // Open-file. RequestOpenFile tries the workspace picker, else a native dialog.
     // LoadMedia opens a path fresh; ReloadMedia tears down current media first.
     void RequestOpenFile();
-    bool LoadMedia(const std::string& path);
+    bool LoadMedia(const std::string& path);  // LoadMediaFile + the VR projection (#155)
+    bool LoadMediaFile(const std::string& path);
+    int loadSphKind_ = -1;           // the video probe's spherical metadata for this load (#155)
+    float loadSphCoverage_ = 0.0f;
     void ReloadMedia(const std::string& path);
 
     // Drag and drop (#44). Filters the batch through MediaSource::IsSupported, toasts
@@ -107,6 +111,9 @@ private:
     void CycleLayoutOverride();
     // "SBS-full — detected" / "mono — from filename" / "SBS-full (R|L) — metadata" ...
     std::string LayoutLabel() const;
+    // The packing name, or the container format when that is what the user knows it by
+    // ("MV-HEVC", "stereo HEIC", #154). LayoutLabel() = this + eye order + signal.
+    std::string LayoutShortName() const;
     // Commit a resolved layout: layout_, the provenance fields, and the manual pin
     // (cleared here rather than at load entry, so a FAILED load leaves the pin on the
     // media still being displayed).
@@ -185,10 +192,24 @@ private:
     // entered by Ctrl+click / the MCP tool). SampleAutoConv hands the frame the renderer
     // just acquired to the worker (~5 Hz, downsampled in place, no full-frame copy);
     // TickAutoConv advances the smoothed shift every rendered frame.
+    // Files too (Part of #128): a PLAYING clip samples its frames like a live source; a
+    // still or a paused / ended clip has one picture, which SampleAutoConvStatic measures
+    // once and again only when what the measurement depends on changes. A new file, a seek
+    // and a frame step are a different picture: the shift snaps (AutoConvNewPicture). A LIF
+    // carrying its own convergence keeps it: auto-conv stands aside (AutoConvApplies).
     void SetAutoConv(bool on, const char* why);
     void SetAutoConvPolicy(autoconv::SubjectPolicy p);
     void SetAutoConvFocus(float u, float v);  // left-eye normalised; switches to Focus
     void SampleAutoConv(const FrameRing::Frame& f);
+    void SampleAutoConvStatic();
+    void SubmitAutoConv(const uint8_t* luma, int w, int h, double nowMs);
+    const uint8_t* AutoConvLuma8(const FrameRing::Frame& f);  // P016 -> 8-bit, else plane[0]
+    void AutoConvNewPicture(bool newMedia);  // a seek (false) or a new file (true): snap
+    void KeepStillForAutoConv(const uint8_t* rgba, int w, int h);
+    // Packed stereo on screen (SBS or TB) from a live source or a file, not a LIF's own
+    // convergence. Mono, Dual (this leg decodes its first track only), the idle logo and a
+    // bound "Convert to 3D" picture (layout_ stays Mono) never measure.
+    bool AutoConvApplies() const;
     void TickAutoConv();
     std::string AutoConvHudText() const;
 
@@ -247,7 +268,61 @@ private:
     // The aspect the picture is fitted with: contentAspect_, stretched by Pro's anamorphic
     // desqueeze (1 in the base player).
     float proDesqueeze_ = 1.0f;
-    float FitAspect() const { return contentAspect_ * proDesqueeze_; }
+    // In the VR viewer (#155) the picture is a window into the scene that FILLS the window:
+    // the fit aspect is the canvas's own, so nothing is letterboxed.
+    float FitAspect() const;
+
+    // --- VR180 / VR360 viewer (#155) -------------------------------------------------
+    // A VR source is a PROJECTION on top of the packing (layout_ still says SBS / TB /
+    // mono). Detected per file: container spherical metadata, then file-name hints; `P`
+    // and MCP set_layout {projection} pin it; MEDIAPLAYER_VR seeds a pin for headless runs.
+    vr::Projection vrAuto_ = vr::Projection::None;  // detected for the current media
+    const char* vrSignal_ = "";                     // "metadata" / "filename" / "manual" / ""
+    bool vrPinned_ = false;
+    vr::Projection vrPinnedValue_ = vr::Projection::None;
+    bool vrForced_ = false;                          // MEDIAPLAYER_VR
+    vr::Projection vrForcedValue_ = vr::Projection::None;
+    vr::Projection vrProj_ = vr::Projection::None;   // effective
+    float vrFisheyeFovDeg_ = 180.0f;                 // dual-fisheye lens FOV (set_layout)
+    vr::ViewState vrView_;                           // yaw / pitch / fov the user steers
+    vr::Limits vrLimits_;
+    uint32_t vrViewGen_ = 0;                         // bumps on every view change (auto-conv)
+    std::vector<uint8_t> vrAutoConvBuf_;             // the rendered eye windows, SBS luma
+    bool VrActive() const;
+    bool VrStereo() const { return packing::IsPacked(layout_); }
+    // Life-size horizontal FOV for the current window, and the effective FOV (zoomed).
+    float VrDefaultFovDeg() const;
+    float VrFovDeg() const { return vrView_.fovDeg > 0.0f ? vrView_.fovDeg : VrDefaultFovDeg(); }
+    float VrWindowAspect() const;
+    // Resolve the projection for freshly loaded media (after ApplyLayout): spherical
+    // metadata (kind / coverage from VideoStereoProbe, kind < 0 = none), then the name.
+    // A VR source whose packing no strong layer decided takes the packing its aspect implies.
+    void ResolveVr(const std::string& path, int sphericalKind, float sphericalCoverageDeg, int frameW, int frameH);
+    void SetVrProjectionPin(bool pin, vr::Projection p, const char* why);
+    void CycleVrProjection();  // `P`: auto -> flat -> VR180 -> VR360 -> fisheye -> auto
+    void VrSteer(float dYawDeg, float dPitchDeg, float fovScale);  // clamps, bumps vrViewGen_
+    void VrRecenter(const char* why);
+    void VrHandleInput(bool& activity);
+    std::string VrViewJson() const;  // MCP get_view / set_view result
+
+    // #133: the display the window is on, from the runtime's enumeration: on Windows the
+    // monitor Windows itself says holds the window (matched by GDI name, so no DPI maths),
+    // elsewhere the display whose desktop rect holds the window's centre; else the system
+    // default display. Falls back to the default display's device name on a runtime that
+    // does not enumerate.
+    bool PanelIdentity(std::string& key, std::string& deviceName) const;
+    // #135 Pro target-screen preview: the target's picture width and viewing distance (0 =
+    // off) and the scale last applied. TargetScaled() scales the fitted picture about its
+    // centre so it subtends the angle it does on the target (pro/TargetScreen.h).
+    float proTargetW_ = 0.0f, proTargetD_ = 0.0f;
+    float proPictureScale_ = 1.0f;
+    XrSession::ViewRect TargetScaled(XrSession::ViewRect fit);
+    // The viewer's distance from the panel as the runtime renders it this frame (follows
+    // eye tracking; the nominal distance when nobody is tracked), smoothed over ~0.5 s.
+    // From each eye's off-axis frustum: the canvas's physical width over
+    // tan(right) - tan(left), so it does not depend on where the reference space sits.
+    float proViewerDistM_ = 0.0f;
+    void UpdateViewerDistance(const XrView* views, uint32_t n, uint32_t canvasW);
 
     // Layered stereo-layout detection (#45). layoutSignal_ records WHICH layer decided
     // layout_, so the HUD can name it. autoInfo_ caches the automatic verdict, which is
@@ -349,6 +424,35 @@ private:
     float autoConvMin_ = 0.0f, autoConvMax_ = 0.0f;
     double autoConvSum_ = 0.0, autoConvMsSum_ = 0.0, autoConvMsMax_ = 0.0;
     uint64_t autoConvTicks_ = 0, autoConvMeasures_ = 0;
+    // Files (Part of #128). Every submission carries a tag; a measurement of a frame from
+    // before a seek / load (tag < autoConvChangeFrom_) is dropped while a change is pending.
+    uint64_t autoConvTag_ = 0;
+    int autoConvChangePending_ = 0;    // 0 none, 1 glide (same picture), 2 snap (new picture)
+    uint64_t autoConvChangeFrom_ = 0;
+    double autoConvSnapUntilMs_ = -1e9;  // a seek's settle window: submissions in it snap
+    uint64_t autoConvSnapLastTag_ = 0;   // the last submission made inside that window
+    uint64_t autoConvMedia_ = 0;       // bumped per file load
+    bool mediaHasBakedConv_ = false;   // a LIF with its own convergence: auto-conv stands aside
+    const FrameRing::Frame* autoConvHeldFrame_ = nullptr;  // video_'s frame on screen (consumer slot)
+    std::vector<uint8_t> autoConvStill_;  // a still's luma (<= 1920 wide), kept at load
+    int autoConvStillW_ = 0, autoConvStillH_ = 0;
+    // What the last file submission measured; the static path re-measures when it differs.
+    struct AutoConvKey {
+        bool valid = false;
+        uint64_t media = 0;
+        int64_t serial = 0;  // the clip frame's ring serial (0 for a still)
+        StereoLayout layout = StereoLayout::Mono;
+        bool swap = false;
+        autoconv::SubjectPolicy policy = autoconv::SubjectPolicy::Nearest;
+        float fx = -1.f, fy = -1.f;  // the focus pin (-1 = none)
+        uint32_t vrGen = 0;          // the VR view (#155): a pan / zoom is a new picture to measure
+        bool Same(const AutoConvKey& o) const {
+            return valid && o.valid && media == o.media && serial == o.serial && layout == o.layout &&
+                   swap == o.swap && policy == o.policy && fx == o.fx && fy == o.fy && vrGen == o.vrGen;
+        }
+    };
+    AutoConvKey autoConvKey_;
+    AutoConvKey AutoConvKeyNow(int64_t serial) const;
 
     // Stream URL (#93). isStream_ excludes isLive_ and isVideo_ (a stream is not a
     // seekable video: no transport bar, no scrub, no slideshow).

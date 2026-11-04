@@ -294,6 +294,22 @@ int Station::MeasuredEyeSync(int* lateEye) const {
     return -1;
 }
 
+// #135: near / far in the target screen's terms: physical parallax, angular disparity at
+// the viewing distance, and how far the eyes diverge on the background.
+static nlohmann::json TargetJson(const target::Screen& t, float scale, const rig::Result& r) {
+    nlohmann::json j = {{"name", t.name}, {"width_m", t.widthM}, {"distance_m", t.distanceM},
+                        {"picture_scale", scale}, {"divergence_limit_pct", target::DivergenceLimitPct(t)}};
+    if (r.ok) {
+        const target::Depth n = target::AtParallax(t, r.nearPct), f = target::AtParallax(t, r.farPct);
+        j["near_mm"] = n.mm;
+        j["near_arcmin"] = n.arcmin;
+        j["far_mm"] = f.mm;
+        j["far_arcmin"] = f.arcmin;
+        j["divergence_deg"] = f.divergenceDeg;
+    }
+    return j;
+}
+
 bool Station::TakeSnapshot(const std::string& note) {
     char stamp[32];
     const std::string clock = Clock(stamp, sizeof(stamp));
@@ -312,6 +328,7 @@ bool Station::TakeSnapshot(const std::string& note) {
     s.tcFps = signalFps_;
     s.clock = clock;
     s.rig = rig_.Last();
+    s.target = target_;
     {
         const std::vector<rig::Sample> h = rig_.History(1.0);
         s.eyeSync = h.empty() ? -1 : h.back().eyeOffsetFrames;
@@ -343,6 +360,7 @@ void Station::SaveNote(size_t i) {
     }
     if (s.eyeSync >= 0) j["eye_sync_frames"] = s.eyeSync;
     if (s.rig.eyeSyncMeasuredFrames >= 0) j["eye_sync_measured_frames"] = s.rig.eyeSyncMeasuredFrames;
+    if (s.target.On()) j["target"] = TargetJson(s.target, 1.0f, s.rig);
     const rig::Budget b = rig_.GetBudget();
     j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"edge_pct", b.edgePct}};
     std::ofstream(s.notePath) << j.dump(2) << "\n";
@@ -562,13 +580,15 @@ std::string Station::RigStatusJson() const {
     out["eye_sync_measured_frames"] = MeasuredEyeSync(&late);  // from the pixels, -1 = not measured
     out["eye_sync_late_eye"] = late > 0 ? "right" : late < 0 ? "left" : "none";
     out["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
-                     {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}};
+                     {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}, {"divergence_far_pct", b.divergeFarPct}};
     json alerts = json::array();
     for (const rig::Alert& al : rig_.Alerts())
         alerts.push_back({{"what", al.what}, {"timecode", al.timecode}, {"time", al.wallClock}, {"open", al.end < 0}});
     out["alerts"] = alerts;
     out["timecode"] = timecode_;
     out["tc_fps"] = signalFps_;
+    out["target"] = target_.On() ? TargetJson(target_, pictureScale_, r) : nlohmann::json(nullptr);
+    if (target_.On() && viewerDistanceM_ > 0.0f) out["target"]["viewer_distance_m"] = viewerDistanceM_;
     out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
     if (decklink_.GetState() != LiveState::Closed) {
         // capture health (#141): the "Done when" of a two-input 4K60 run reads these

@@ -88,10 +88,13 @@ bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, b
             listDeckLink = true;
         } else if (a == "--test-signal" || a.rfind("--test-signal=", 0) == 0) {
             o.proInputs.push_back("Test rig=test:" + (a.size() > 13 ? a.substr(14) : std::string()));
+        } else if (a == "--depth-budget=comfort") {
+            o.proBudget[0] = -1.0f;  // #135: -1 / +2 % (in front / behind), the plan-review preset
+            o.proBudget[1] = 2.0f;
         } else if (a.rfind("--depth-budget=", 0) == 0) {
             if (std::sscanf(a.c_str() + 15, "%f,%f", &o.proBudget[0], &o.proBudget[1]) != 2 ||
                 o.proBudget[0] >= o.proBudget[1]) {
-                LOG_ERROR("--depth-budget: expected near,far in %% of eye width (e.g. -2,1)");
+                LOG_ERROR("--depth-budget: expected near,far in %% of eye width (e.g. -2,1), or comfort (-1,2)");
                 return false;
             }
         } else if (a.rfind("--vertical-limit=", 0) == 0) {
