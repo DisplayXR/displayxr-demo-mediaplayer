@@ -76,12 +76,16 @@ void CompareClip::FollowA(double posA, double startA, bool pausedA, VulkanRender
         if (f->gpu || f->plane[0].empty()) return;  // B decodes to CPU planes (no interop LUID)
         if (f->format == PixFormat::RGBA)
             renderer->UploadCompareTexture(f->plane[0].data(), (uint32_t)f->width, (uint32_t)f->height);
-        else
-            renderer->UploadCompareYUV(f->plane[0].data(), f->plane[1].data(),
-                                       f->format == PixFormat::I420 ? f->plane[2].data() : nullptr,
-                                       (uint32_t)f->width, (uint32_t)f->height,
-                                       f->format == PixFormat::P016 ? 2 : f->format == PixFormat::NV12 ? 1 : 0,
-                                       f->fullRange, (int)f->matrix);
+        else if (renderer->UploadCompareYUV(f->plane[0].data(), f->plane[1].data(),
+                                            f->format == PixFormat::I420 ? f->plane[2].data() : nullptr,
+                                            (uint32_t)f->width, (uint32_t)f->height,
+                                            f->format == PixFormat::P016 ? 2 : f->format == PixFormat::NV12 ? 1 : 0,
+                                            f->fullRange, (int)f->matrix)) {
+            // B's HDR tags (#169), the way App tags A: HDR on the BT.2020 matrix is BT.2020.
+            const bool hdr = f->transfer == ColorTransfer::HLG || f->transfer == ColorTransfer::PQ;
+            renderer->SetCompareHdr((int)f->transfer, f->primaries2020 || (hdr && f->matrix == ColorMatrix::BT2020),
+                                    f->peakNits);
+        }
     }
 }
 

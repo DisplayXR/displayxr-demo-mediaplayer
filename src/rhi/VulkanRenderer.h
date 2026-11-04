@@ -162,6 +162,9 @@ public:
         bool pqShaper = false;  // scene-linear into an OCIO look, unclipped (see GradeParams)
     };
     HdrState SourceHdr() const;
+    // The same decision for any tags under the current grade (the compare clip B, the
+    // "Convert to 3D" input frame): transfer 0 SDR, 1 HLG, 2 PQ, 3 scene-linear as PQ.
+    HdrState HdrFor(int transfer, bool bt2020, float peakNits) const;
 
     // Media Player Pro's clip-vs-clip wipe: a second source (B) at bindings 4..6, sampled by
     // the MP_GRADE shader right of the wipe line (GradeParams::wipeMode 3). Same formats and
@@ -171,6 +174,8 @@ public:
     bool UploadCompareYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2, uint32_t width,
                           uint32_t height, int format, bool fullRange, int matrix = 0);
     void ClearCompare();
+    // B's HDR tags (#169), as SetSourceHdr for A; an RGBA B upload resets them to SDR.
+    void SetCompareHdr(int transfer, bool bt2020, float peakNits);
     bool HasCompare() const { return compareMode_ >= 0; }
 
 #if defined(_WIN32)
@@ -273,6 +278,9 @@ private:
     int compareMode_ = -1;           // B: -1 none, else as sourceMode_
     bool compareFullRange_ = false, compare16_ = false;
     int compareMatrix_ = 0;
+    int compareTransfer_ = 0;        // B's HDR tags (#169), see SetCompareHdr
+    bool compareBt2020_ = false;
+    float comparePeak_ = 0.0f;
     float sourceFullRange_ = 0.0f;
     bool source16_ = false;          // P016: the MP_GRADE shader uses 10-bit limited levels
     int sourceMatrix_ = 0;           // YUV matrix pushed to the MP_GRADE shader (0 = BT.709)

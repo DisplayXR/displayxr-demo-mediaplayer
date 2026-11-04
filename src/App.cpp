@@ -3327,6 +3327,31 @@ void App::SubmitConvertFrame(const FrameRing::Frame& f, double nowSec) {
                                                   : 3;
     lift::FitExtent((uint32_t)f.width, (uint32_t)f.height, lift::LiftClient::kMaxInputLongEdge,
                     convertInW_, convertInH_);
+#if MEDIAPLAYER_PRO
+    // An HDR frame (#169): the converter takes an SDR picture, and its RGBA result is drawn as
+    // SDR, so tone-map here the way the shader shows the source (no grade, no exposure: the
+    // grade runs on the result). Scene-linear EXR was handed over as raw PQ code (white ~148).
+    if (fmt != 3 && f.transfer != ColorTransfer::SDR) {
+        const bool hdr = f.transfer == ColorTransfer::HLG || f.transfer == ColorTransfer::PQ;
+        const VulkanRenderer::HdrState h =
+            renderer_.HdrFor((int)f.transfer, f.primaries2020 || (hdr && f.matrix == ColorMatrix::BT2020), f.peakNits);
+        if (!h.raw) {
+            color::HdrParams p;
+            p.transfer = (color::Transfer)h.transfer;
+            p.bt2020 = h.bt2020;
+            p.rollOff = h.rollOff;
+            p.peakNits = h.peakNits;
+            const color::HdrDisplayTable table(p);
+            if (!lift::ConvertHdrYuvToRgba(f.plane[0].data(), f.plane[1].data(),
+                                           fmt == 0 ? f.plane[2].data() : nullptr, (uint32_t)f.width,
+                                           (uint32_t)f.height, fmt, f.fullRange, (int)f.matrix, table, convertInW_,
+                                           convertInH_, convertIn_))
+                return;
+            lift_.Submit(convertIn_.data(), convertInW_, convertInH_, convertInW_ * 4, f.serial, nowSec);
+            return;
+        }
+    }
+#endif
     if (!lift::ConvertYuvToRgba(f.plane[0].data(), f.plane[1].data(),
                                 fmt == 0 ? f.plane[2].data() : nullptr, (uint32_t)f.width,
                                 (uint32_t)f.height, fmt, f.fullRange, convertInW_, convertInH_,
