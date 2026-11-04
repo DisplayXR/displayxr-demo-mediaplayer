@@ -7,11 +7,12 @@ without the card checks, plus the 10-minute capture soak.
 
 ## 1. Set up
 
-- **DisplayXR runtime 2.53 or newer** and the **Leia plug-in 2.17 or newer** (the
-  DisplayXR bundle installs both). Older versions must not be used with `--10bit`.
+- **DisplayXR runtime 2.61 or newer** and the **Leia plug-in 2.17 or newer** (the
+  DisplayXR bundle installs both). Display calibration needs 2.61 (it keys the `.cube`
+  files by the display's stable key); older versions must not be used with `--10bit`.
 - **Media Player Pro** installer (`DisplayXRMediaPlayerProSetup-*.exe`).
-- **Blackmagic Desktop Video** (the DeckLink driver), the version the player was built
-  against or newer. Restart after installing it.
+- **Blackmagic Desktop Video 16.0 or newer** (the DeckLink driver; the player is built
+  against SDK 16.0 and refuses an older driver). Restart after installing it.
 - The **DeckLink 8K Pro G2 in an x8 or x16 slot**. It is a PCIe Gen 3 x8 card and is not
   supported in an x4 slot: two 4K60 inputs need about 2.7 GB/s, close to what an x4 slot
   carries. Desktop Video Setup shows the link width.
@@ -21,7 +22,8 @@ without the card checks, plus the 10-minute capture soak.
 
 ## 2. Run the automated checks
 
-From the folder with the script (`scripts\station_acceptance.ps1` in the repo):
+The installer puts the script in `C:\Program Files\DisplayXR\Apps\MediaPlayerPro	oolscceptance\`
+(also `scripts\station_acceptance.ps1` in the repo). From that folder:
 
 ```
 powershell -ExecutionPolicy Bypass -File station_acceptance.ps1
@@ -41,7 +43,7 @@ them); `-Connection hdmi` for HDMI.
 | id | checks | passes when |
 |---|---|---|
 | E1 | runtime selftest | `displayxr-cli selftest` exits 0 |
-| E2 | versions | runtime 2.53+, Leia plug-in 2.17+ |
+| E2 | versions | runtime 2.61+, Leia plug-in 2.17+; with `-DeckLink` also Desktop Video 16.0+ |
 | E3 | machine | (recorded: CPU, RAM, GPU, driver, OS) |
 | P1 | the picture reaches the display, both eyes | the two views differ (needs a tracked viewer) |
 | P2 | QC view: left eye | both views show the left eye |

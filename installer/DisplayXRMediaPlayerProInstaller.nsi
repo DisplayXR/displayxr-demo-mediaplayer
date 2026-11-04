@@ -288,6 +288,17 @@ Section "DaVinci Resolve panel" SecResolve
     SetOutPath "$INSTDIR"
 SectionEnd
 
+; The station acceptance kit (#142, docs/STATION-ACCEPTANCE.md): run on a new station with
+;   powershell -ExecutionPolicy Bypass -File "<install dir>\tools\acceptance\station_acceptance.ps1" -DeckLink
+; It finds the installed player through HKLM\Software\DisplayXR\Apps\MediaPlayerPro.
+Section "Station acceptance kit" SecAcceptance
+    SetShellVarContext all
+    SetOutPath "$INSTDIR\tools\acceptance"
+    File "${SOURCE_DIR}\scripts\station_acceptance.ps1"
+    File "${SOURCE_DIR}\docs\STATION-ACCEPTANCE.md"
+    SetOutPath "$INSTDIR"
+SectionEnd
+
 Section "Start Menu Shortcut" SecShortcut
     SetShellVarContext all
     CreateDirectory "$SMPROGRAMS\DisplayXR"
@@ -336,6 +347,9 @@ Section "Uninstall"
     RMDir "$INSTDIR\displayxr"
     Delete "$INSTDIR\tools\resolve\DisplayXR_Station_Panel.py"
     RMDir "$INSTDIR\tools\resolve"
+    Delete "$INSTDIR\tools\acceptance\station_acceptance.ps1"
+    Delete "$INSTDIR\tools\acceptance\STATION-ACCEPTANCE.md"
+    RMDir "$INSTDIR\tools\acceptance"
     RMDir "$INSTDIR\tools"
     Delete "$APPDATA\Blackmagic Design\DaVinci Resolve\Support\Workflow Integration Plugins\DisplayXR_Station_Panel.py"
     Delete "$INSTDIR\Uninstall.exe"

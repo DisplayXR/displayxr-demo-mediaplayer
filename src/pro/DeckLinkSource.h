@@ -57,6 +57,9 @@ public:
     // Why there is nothing to open: "" when a device is present, else no SDK in this
     // build / Blackmagic Desktop Video driver not installed / no card found.
     static std::string UnavailableReason();
+    // The installed Desktop Video's API version ("16.0.1"); "" when unknown, no driver
+    // or no SDK in this build. --decklink-list prints it (station acceptance E2 reads it).
+    static std::string DriverVersionText();
 
     // Two-input stereo: how far apart the paired frames were on the card's hardware
     // reference clock, and how many frames never made it into a pair.
