@@ -265,6 +265,7 @@ option(MP_LINUX_PORTABLE "Linux: RUNPATH=\$ORIGIN + stage bundled libs next to t
 
 function(mp_add_player tgt is_pro)
     add_executable(${tgt}
+        $<$<CXX_COMPILER_ID:MSVC>:windows/utf8.manifest>  # narrow strings are UTF-8 (paths)
         src/main.cpp
         src/color/CubeLut.cpp    # Pro looks; compiled into both so the trunk stays one source list
         src/color/Cdl.cpp
@@ -544,7 +545,7 @@ if(MP_DECKLINK_SDK_DIR)
     file(GLOB_RECURSE _dl_found "${_dl_root}/*/${_dl_plat}/include/${_dl_probe}" "${_dl_root}/${_dl_plat}/include/${_dl_probe}")
     list(LENGTH _dl_found _dl_n)
     if(_dl_n EQUAL 0)
-        message(FATAL_ERROR "MP_DECKLINK_SDK_DIR=${MP_DECKLINK_SDK_DIR}: no ${_dl_plat}/include/${_dl_probe} in it. Point it at the Blackmagic DeckLink SDK (folder or .zip), or leave it unset for a build without DeckLink.")
+        message(FATAL_ERROR "MP_DECKLINK_SDK_DIR=${MP_DECKLINK_SDK_DIR}: no ${_dl_plat}/include/${_dl_probe} in it. Point it at the Blackmagic DeckLink SDK (folder or .zip), or set it to OFF for a build without DeckLink.")
     endif()
     list(GET _dl_found 0 _dl_found)
     get_filename_component(_dl_inc "${_dl_found}" DIRECTORY)

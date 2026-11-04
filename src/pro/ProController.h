@@ -275,6 +275,7 @@ private:
     int calCheckTicks_ = 0;        // frames since the panel was last looked up
     std::string calPath_, calName_;
     std::string calLoading_, calError_;
+    uint64_t calLoadId_ = 0;       // the load still wanted; another finishing is dropped
     bool calInstall_ = false;      // the pending load is kept for this panel once it applies
     bool calLoaded_ = false;       // a calibration LUT is on the GPU
     bool calBypass_ = false;       // Shift+G / the Inspector / set_display_calibration

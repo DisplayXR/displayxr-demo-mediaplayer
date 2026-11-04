@@ -56,6 +56,8 @@ struct HwFormatHook {
 
 // The stream's Y'CbCr matrix / transfer (FrameRing tags). The frame's own fields win, the
 // codec context's are the fallback; an unspecified matrix follows the SD/HD rule.
+static ColorTransfer TransferOf(const AVFrame* f, const AVCodecContext* c);
+
 static ColorMatrix MatrixOf(const AVFrame* f, const AVCodecContext* c) {
     AVColorSpace cs = f ? f->colorspace : AVCOL_SPC_UNSPECIFIED;
     if (cs == AVCOL_SPC_UNSPECIFIED && c) cs = c->colorspace;
@@ -66,7 +68,10 @@ static ColorMatrix MatrixOf(const AVFrame* f, const AVCodecContext* c) {
     case AVCOL_SPC_FCC: return ColorMatrix::BT601;
     case AVCOL_SPC_BT2020_NCL:
     case AVCOL_SPC_BT2020_CL: return ColorMatrix::BT2020;  // CL is rare; NCL is the closest we draw
-    default: return DefaultMatrixForHeight(f ? f->height : (c ? c->height : 0));
+    default:
+        // HLG and PQ are BT.2020 by definition: an untagged matrix does not follow the SD/HD rule.
+        if (TransferOf(f, c) != ColorTransfer::SDR) return ColorMatrix::BT2020;
+        return DefaultMatrixForHeight(f ? f->height : (c ? c->height : 0));
     }
 }
 
@@ -81,21 +86,25 @@ static ColorTransfer TransferOf(const AVFrame* f, const AVCodecContext* c) {
 static bool PrimariesAre2020(const AVFrame* f, const AVCodecContext* c) {
     AVColorPrimaries p = f ? f->color_primaries : AVCOL_PRI_UNSPECIFIED;
     if (p == AVCOL_PRI_UNSPECIFIED && c) p = c->color_primaries;
-    return p == AVCOL_PRI_BT2020;
+    // Untagged primaries on HLG / PQ: BT.2020, as for the matrix.
+    return p == AVCOL_PRI_BT2020 || (p == AVCOL_PRI_UNSPECIFIED && TransferOf(f, c) != ColorTransfer::SDR);
 }
 
 // The brightest the stream says it gets (nits): MaxCLL, else the mastering display's peak.
 // Frames carry it on keyframes (HEVC SEI), the container on the stream, so the last value
-// seen is kept. 0 = never said.
+// seen is kept. 0 = never said. A value below HDR reference white is not a believable peak for
+// HDR video, and trusting it would clip everything above it: it counts as not said.
+constexpr float kMinBelievablePeakNits = 203.0f;
 static float PeakNitsOf(const AVFrame* f) {
     if (!f) return 0.0f;
     if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL)) {
         const auto* cll = (const AVContentLightMetadata*)sd->data;
-        if (cll->MaxCLL > 0) return (float)cll->MaxCLL;
+        if ((float)cll->MaxCLL >= kMinBelievablePeakNits) return (float)cll->MaxCLL;
     }
     if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) {
         const auto* md = (const AVMasteringDisplayMetadata*)sd->data;
-        if (md->has_luminance && md->max_luminance.den > 0) return (float)av_q2d(md->max_luminance);
+        if (md->has_luminance && md->max_luminance.den > 0 && av_q2d(md->max_luminance) >= kMinBelievablePeakNits)
+            return (float)av_q2d(md->max_luminance);
     }
     return 0.0f;
 }
@@ -109,12 +118,13 @@ static float StreamPeakNits(const AVStream* st) {
     if (const AVPacketSideData* sd =
             av_packet_side_data_get(cp->coded_side_data, cp->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL)) {
         const auto* cll = (const AVContentLightMetadata*)sd->data;
-        if (cll->MaxCLL > 0) return (float)cll->MaxCLL;
+        if ((float)cll->MaxCLL >= kMinBelievablePeakNits) return (float)cll->MaxCLL;
     }
     if (const AVPacketSideData* sd = av_packet_side_data_get(cp->coded_side_data, cp->nb_coded_side_data,
                                                              AV_PKT_DATA_MASTERING_DISPLAY_METADATA)) {
         const auto* md = (const AVMasteringDisplayMetadata*)sd->data;
-        if (md->has_luminance && md->max_luminance.den > 0) return (float)av_q2d(md->max_luminance);
+        if (md->has_luminance && md->max_luminance.den > 0 && av_q2d(md->max_luminance) >= kMinBelievablePeakNits)
+            return (float)av_q2d(md->max_luminance);
     }
     return 0.0f;
 #endif

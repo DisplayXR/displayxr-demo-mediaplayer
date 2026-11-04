@@ -2,6 +2,7 @@
 #include "pro/QcExporter.h"
 
 #include <chrono>
+#include <exception>
 #include <utility>
 
 namespace mp::pro {
@@ -51,7 +52,12 @@ void QcExporter::Run() {
         }
         const auto t0 = std::chrono::steady_clock::now();
         Result r;
-        if (job) r = job();
+        try {
+            if (job) r = job();
+        } catch (const std::exception& e) {  // e.g. no memory for an 8K snapshot's thumbnail
+            r = Result{};
+            r.err = e.what();
+        }
         r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         {
             std::lock_guard<std::mutex> lk(mu_);
