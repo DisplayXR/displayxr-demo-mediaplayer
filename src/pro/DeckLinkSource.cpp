@@ -234,7 +234,10 @@ std::string Take(String s) {
     std::free((void*)s);  // the SDK strdup()s what it returns
     return out;
 }
-bool IsIUnknown(REFIID a) { return std::memcmp(&a, &IID_IUnknown, sizeof(REFIID)) == 0; }
+bool IsIUnknown(REFIID a) {
+    const REFIID u = IID_IUnknown;  // a compound literal in LinuxCOM.h: no address to take
+    return std::memcmp(&a, &u, sizeof(u)) == 0;
+}
 #endif
 using Bool = bool;
 struct ComScope {};
