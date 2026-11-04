@@ -38,7 +38,10 @@ powershell -ExecutionPolicy Bypass -File station_acceptance.ps1 -DeckLink -Only 
 ```
 
 `-Left` / `-Right` take a device number or part of its name (`--decklink-list` shows
-them); `-Connection hdmi` for HDMI.
+them); `-Connection hdmi` for HDMI. This run also checks the Desktop Video version (E2).
+
+D2 and D3 fail unless the capture really is 3840-wide eyes at 60 fps and 10-bit. For a rig
+that feeds something else, say so: `-ExpectEyeWidth 1920 -ExpectFps 23.98 -ExpectBits 10`.
 
 | id | checks | passes when |
 |---|---|---|
