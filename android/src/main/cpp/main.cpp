@@ -67,6 +67,8 @@
 #include "ColorPolicy.h"  // swapchain encoding policy, shared with the desktop leg (#78)
 #include "ui/ImGuiLayer.h"
 #include "ui/TransportUI.h"
+#include "browser/AndroidMediaProvider.h"
+#include "browser/MediaBrowser.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
 #include "LifLoader.h"  // SHARED desktop LIF parser (src/media/, referenced by CMake)
 #include "MediaSource.h"   // SHARED layered stereo-layout resolver (#45)
@@ -165,6 +167,13 @@ VkFormat g_hud_format = VK_FORMAT_UNDEFINED;
 int32_t g_density_dpi = 0;  // AConfiguration_getDensity, read in android_main
 bool g_hud_ready = false;
 mp::ImGuiLayer g_imgui;
+// The media browser (#160). Defined after g_imgui: its thumbnails use ImGui's descriptors.
+mp::browser::MediaBrowser g_browser;
+std::atomic<bool> g_browser_ready{false};  // read by nativeBack on the UI thread
+bool g_browsing = false;  // the browser is up; media loading clears it (leave_splash)
+// Back in the player, the Load button, a tap on the splash: show_browser() next loop.
+std::atomic<bool> g_browser_request{false};
+bool g_paused_for_background = false;  // APP_CMD_PAUSE paused the video; RESUME undoes it
 mp::ui::TransportState g_ui_state;
 mp::ui::TransportActions g_ui_actions;
 // Set once if the runtime rejects the window-space layer. Suppresses the layer AND
@@ -380,12 +389,6 @@ const char *const kIdleArt = "idle.png";  // bundled asset (repo displayxr/)
 // Desktop App.cpp's idle backdrop grey (kIdleBg*).
 constexpr uint8_t kIdleBg[3] = {31, 31, 33};  // 0.12,0.12,0.13 * 255
 
-// Opening the SAF picker while the XR session runs leaves the runtime's weave
-// overlay on screen with the last frame — the picker opens UNDERNEATH it,
-// invisible (runtime-side bug, #523 family). Workaround: tear the whole XR
-// instance down right before the picker opens (the overlay drops with it) and
-// rebuild from scratch when the activity resumes.
-
 // A file the user picked via SAF: fd + byte range, published from the JNI
 // thread and serviced (decoder reopen) on the android_main thread.
 std::atomic<int> g_pick_fd{-1};
@@ -453,6 +456,7 @@ static void
 leave_splash()
 {
 	g_showing_splash.store(false, std::memory_order_relaxed);
+	g_browsing = false;
 	if (g_splash_mode_requested >= 0 && g_mode_before_splash >= 0 &&
 	    g_active_mode == g_splash_mode_requested) {
 		g_pending_mode_request = g_mode_before_splash;
@@ -1482,6 +1486,12 @@ active_tile_dims(uint32_t *render_w, uint32_t *render_h, uint32_t *cols, uint32_
 	*rows = r;
 }
 
+bool
+browser_showing()
+{
+	return g_browser_ready.load(std::memory_order_relaxed) && g_browsing;
+}
+
 // Create the SINGLE tiled-atlas swapchain, sized worst-case over all modes AND
 // both orientations (the swapchain is never recreated on rotation, so it must
 // hold either orientation's largest tile layout; each frame renders a
@@ -1651,6 +1661,19 @@ create_hud_swapchain()
 	return true;
 }
 
+void
+toggle_playback()
+{
+	g_video.togglePaused();
+	// The right eye must pause WITH the master. Left running it would fill its
+	// reader pool with frames the paused master will not reach for as long as the
+	// pause lasts, and on resume the pairing rule would hold the right eye frozen
+	// until the master caught up. Both start unpaused and are only ever toggled
+	// here, so they cannot drift out of phase.
+	if (g_stereo_dual) g_video_right.togglePaused();
+	g_audio.setPaused(g_video.paused());  // mirror play/pause to audio
+}
+
 // Bring up the shared ImGui chrome. `debug.dxr.mp.ws_ui=0` disables it (the same
 // kill-switch modelviewer ships), leaving a bare projection layer.
 bool
@@ -1699,17 +1722,11 @@ hud_init()
 	g_ui_state.caps.layout = false;
 	g_ui_state.hitTargetScale = 1.35f;
 
-	g_ui_actions.Open = [] { g_open_picker_request.store(true, std::memory_order_relaxed); };
-	g_ui_actions.TogglePlayback = [] {
-		g_video.togglePaused();
-		// The right eye must pause WITH the master. Left running it would fill its
-		// reader pool with frames the paused master will not reach for as long as the
-		// pause lasts, and on resume the pairing rule would hold the right eye frozen
-		// until the master caught up. Both start unpaused and are only ever toggled
-		// here, so they cannot drift out of phase.
-		if (g_stereo_dual) g_video_right.togglePaused();
-		g_audio.setPaused(g_video.paused());  // mirror play/pause to audio
+	g_ui_actions.Open = [] {
+		(g_browser_ready.load(std::memory_order_relaxed) ? g_browser_request : g_open_picker_request)
+		    .store(true, std::memory_order_relaxed);
 	};
+	g_ui_actions.TogglePlayback = toggle_playback;
 	// AMediaExtractor has no cheap keyframe-preview mode here, so `preview` is
 	// ignored; the shared machine's follow-up exact seek is idempotent.
 	// Both eyes seek together. Their IDRs sit at identical PTS, so SEEK_CLOSEST_SYNC
@@ -1959,6 +1976,42 @@ load_splash(struct android_app *app)
 		LOGI("No media — showing the DisplayXR idle screen (%dx%d square)", side, side);
 	}
 	return ok;
+}
+
+// Stop whatever plays, before the next media or the browser replaces it.
+void
+stop_media()
+{
+	// ORDER MATTERS. The slave holds a pacingMaster_ pointer to g_video and
+	// its decode thread reads that decoder's published state while it waits
+	// its turn; stopping the master first leaves the slave keeping station
+	// against a decoder that will never advance again. Stop the follower,
+	// then the thing it follows.
+	LOGI("[LVF] teardown: stop_dual");
+	stop_dual();  // right-eye decoder + convergence curve of the OLD clip
+	LOGI("[LVF] teardown: g_video.stop");
+	g_video.stop();
+	LOGI("[LVF] teardown: g_audio.stop");
+	g_audio.stop();
+	// The old decoder's AImageReader is gone; drop the renderer's
+	// imports of its buffers (and the refs keeping them alive) before
+	// the new reader hands out a fresh pool. See resetVideoAhb().
+	LOGI("[LVF] teardown: resetVideoAhb");
+	g_sbs.resetVideoAhb();
+	LOGI("[LVF] teardown: complete");
+	g_scene_loaded.store(false, std::memory_order_relaxed);
+}
+
+// The browser sits over the idle screen, which borrows the flat mode while it shows.
+void
+show_browser(struct android_app *app)
+{
+	if (!g_showing_splash.load(std::memory_order_relaxed)) {
+		stop_media();
+		load_splash(app);
+	}
+	g_browsing = true;
+	g_browser.Refresh();
 }
 
 // Bake the LIF's intended zero-disparity plane into the composed full-SBS
@@ -2405,9 +2458,10 @@ render_frame()
 	auto record_hud = [&]() -> bool {
 		if (!chrome_available) return false;
 		fill_transport_state();
+		const bool browsing = browser_showing();
 		// Skip the whole HUD path when nothing is visible — steady playback must
 		// cost nothing. Same gate as the desktop.
-		const bool anything_visible = g_ui_state.fadeAlpha > 0.001f ||
+		const bool anything_visible = browsing || g_ui_state.fadeAlpha > 0.001f ||
 		                              g_ui_state.toastAlpha > 0.001f ||
 		                              g_ui_state.transitionAlpha > 0.001f;
 		if (!anything_visible) return false;
@@ -2431,7 +2485,13 @@ render_frame()
 		if (xrWaitSwapchainImage(g_hud_swapchain, &hwait) == XR_SUCCESS) {
 			// The HUD IS the tile, so the remap is the identity rect.
 			g_imgui.BeginFrame((float)g_hud_w, (float)g_hud_h, 0.0f, 0.0f, 1.0f, 1.0f);
-			mp::ui::BuildTransportUI(g_ui_state, g_ui_actions);
+			if (browsing) {
+				if (g_browser.Build() == mp::browser::MediaBrowser::Action::OtherFiles)
+					g_open_picker_request.store(true, std::memory_order_relaxed);
+				g_browser.RecordUploads(g_sbs.frameCmd());
+			} else {
+				mp::ui::BuildTransportUI(g_ui_state, g_ui_actions);
+			}
 			g_imgui.RenderToHud(hud_idx, g_sbs.frameCmd());
 			hud_active = true;
 		}
@@ -2625,8 +2685,9 @@ render_frame()
 		// a button still held from the trickled DOWN event) swallowed the gesture.
 		if (!chrome_available) {
 			if (!g_is_video) g_open_picker_request.store(true, std::memory_order_relaxed);
-		} else if (!has_media) {
-			g_open_picker_request.store(true, std::memory_order_relaxed);
+		} else if (!has_media && !browser_showing()) {
+			(g_browser_ready.load(std::memory_order_relaxed) ? g_browser_request : g_open_picker_request)
+			    .store(true, std::memory_order_relaxed);
 		}
 		LOGI("tap: has_media=%d chrome=%d imgui_capture=%d -> picker=%d", (int)has_media,
 		     (int)chrome_available, (int)g_imgui.WantCaptureMouse(),
@@ -2809,6 +2870,13 @@ bring_up(struct android_app *app)
 	if (ok) {
 		// Non-fatal: without it the app plays fine, just with no chrome.
 		hud_init();
+		if (g_hud_ready && !g_browser_ready.load(std::memory_order_relaxed)) {
+			g_browser_ready.store(
+			    g_browser.Initialize(&mp::browser::AndroidMediaProvider::Instance(), g_vk_phys_device,
+			                         g_vk_device, frames_in_flight(),
+			                         std::string(app->activity->internalDataPath) + "/stereo_verdicts.txt"),
+			    std::memory_order_relaxed);
+		}
 	}
 	if (!ok) {
 		LOGI("Bring-up failed; see logs.");
@@ -2907,6 +2975,20 @@ handle_cmd(struct android_app *app, int32_t cmd)
 		 */
 		forget_hint_buffer_geometry();
 #endif
+		break;
+	case APP_CMD_PAUSE:
+		// Home or recents mid-video pauses it; the app icon (RESUME) plays on.
+		if (g_is_video && !g_video.paused()) {
+			toggle_playback();
+			g_paused_for_background = true;
+		}
+		LOGI("APP_CMD_PAUSE (paused the video: %d)", (int)g_paused_for_background);
+		if (g_browser_ready.load(std::memory_order_relaxed)) g_browser.Save();  // it may be killed now
+		break;
+	case APP_CMD_RESUME:
+		LOGI("APP_CMD_RESUME (resuming the video: %d)", (int)g_paused_for_background);
+		if (g_paused_for_background && g_is_video && g_video.paused()) toggle_playback();
+		g_paused_for_background = false;
 		break;
 	case APP_CMD_DESTROY:
 		LOGI("APP_CMD_DESTROY");
@@ -3076,6 +3158,17 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 	}
 }
 
+// MainActivity.onBackPressed (UI thread). In the player, Back returns to the browser and
+// this returns true; anywhere else it returns false and Java sends the app home.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeBack(JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	if (!g_browser_ready.load(std::memory_order_relaxed) || g_showing_splash.load(std::memory_order_relaxed))
+		return JNI_FALSE;
+	g_browser_request.store(true, std::memory_order_relaxed);
+	return JNI_TRUE;
+}
+
 // Java polls this once per Choreographer frame; a true result means "launch
 // ACTION_OPEN_DOCUMENT" (only Java can). Consumed on read.
 extern "C" JNIEXPORT jboolean JNICALL
@@ -3146,6 +3239,7 @@ android_main(struct android_app *app)
 				const XrResult mr = g_pfnReqMode(g_session, (uint32_t)want);
 				LOGI("xrRequestDisplayRenderingModeDXR(%d) -> %d", want, (int)mr);
 			}
+			if (g_browser_request.exchange(false, std::memory_order_relaxed)) show_browser(app);
 			const int pick = g_pick_fd.exchange(-1, std::memory_order_acquire);
 			if (pick >= 0) {
 				const long long off = g_pick_off.load(std::memory_order_relaxed);
@@ -3155,24 +3249,7 @@ android_main(struct android_app *app)
 				const bool is_jpeg = have_magic && magic[0] == 0xFF && magic[1] == 0xD8;
 				const bool is_png = have_magic && magic[0] == 0x89 && magic[1] == 'P' &&
 				                    magic[2] == 'N' && magic[3] == 'G';
-				// ORDER MATTERS. The slave holds a pacingMaster_ pointer to g_video and
-				// its decode thread reads that decoder's published state while it waits
-				// its turn; stopping the master first leaves the slave keeping station
-				// against a decoder that will never advance again. Stop the follower,
-				// then the thing it follows.
-				LOGI("[LVF] teardown: stop_dual");
-				stop_dual();  // right-eye decoder + convergence curve of the OLD clip
-				LOGI("[LVF] teardown: g_video.stop");
-				g_video.stop();
-				LOGI("[LVF] teardown: g_audio.stop");
-				g_audio.stop();
-				// The old decoder's AImageReader is gone; drop the renderer's
-				// imports of its buffers (and the refs keeping them alive) before
-				// the new reader hands out a fresh pool. See resetVideoAhb().
-				LOGI("[LVF] teardown: resetVideoAhb");
-				g_sbs.resetVideoAhb();
-				LOGI("[LVF] teardown: complete");
-				g_scene_loaded.store(false, std::memory_order_relaxed);
+				stop_media();
 				g_pick_pending.store(false, std::memory_order_relaxed);
 				if (is_jpeg || is_png) {
 					if (!load_picked_image(app, pick, off, len)) {

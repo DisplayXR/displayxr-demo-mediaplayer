@@ -2,8 +2,8 @@
 //
 // TouchScroller: the vertical scroll offset of one list under a finger or a mouse. ImGui
 // has no touch scrolling, so this does it: a drag past the slop scrolls, a fling keeps
-// going and slows to a stop, a press that stops a fling only stops it, and a press that
-// never moved past the slop is a tap. Pure logic, render thread. Times in seconds,
+// going and slows to a stop, a press that stops a fling only stops it (unless the fling
+// was nearly done), and a press that never moved past the slop is a tap. Pure logic, render thread. Times in seconds,
 // distances in pixels; the offset grows as the content moves up.
 #pragma once
 
@@ -41,6 +41,7 @@ private:
     };
 
     float Clamp(float offset) const;
+    float FlingLeft(double t) const;  // the distance a fling still travels from `t`, px
 
     float slop_ = 0.0f;
     float limit_ = 0.0f;

@@ -53,6 +53,8 @@ public:
 
     // Read the library again, e.g. each time the browser is shown.
     void Refresh();
+    // Write the 3D verdicts to disk, e.g. when the app goes to the background.
+    void Save() { classifier_.Save(); }
     // Emit the browser, between ImGuiLayer::BeginFrame and RenderToHud.
     Action Build();
     // Record this frame's thumbnail uploads into the frame command buffer, before

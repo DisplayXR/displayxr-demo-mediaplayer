@@ -14,6 +14,7 @@
 //   3. Wake the DisplayXR runtime out of Android's "stopped" state before
 //      xrCreateInstance and, if it can't be reached, prompt the user.
 //   4. Host MediaStoreProvider, the Java half of the media browser (#160).
+//   5. Back (the player returns to the browser) and full screen.
 //
 // Vendor-neutral + out-of-process (ADR-025): no CNSDK, no CAMERA — the OOP
 // runtime service owns eye tracking. Binds to whichever runtime flavor is
@@ -28,6 +29,7 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Point
 import android.hardware.display.DisplayManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -35,6 +37,9 @@ import android.util.Log
 import android.view.Choreographer
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.Toast
 
@@ -99,6 +104,9 @@ class MainActivity : NativeActivity() {
     // Picker dismissed without a selection — native resumes the previous asset
     // (it blanks the scene while a pick is pending to avoid a stale-frame flash).
     private external fun nativePickCancelled()
+
+    // Back. True when native took it (the player returns to the browser).
+    private external fun nativeBack(): Boolean
 
     // This window's live on-screen rect + the panel extent in the SAME rotation
     // (XR_DXR_android_surface_binding / ADR-036 D6). The runtime anchors the
@@ -422,6 +430,35 @@ class MainActivity : NativeActivity() {
                 ).show()
             }
         }, 2500)
+    }
+
+    @Deprecated("NativeActivity has no OnBackPressedDispatcher")
+    override fun onBackPressed() {
+        val handled = try { nativeBack() } catch (_: Throwable) { false }
+        // Home, not finish(): the XR session and the browser's place survive a relaunch.
+        if (!handled) moveTaskToBack(true)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
+    }
+
+    // Full screen: the status and nav bars would cover the browser's top bar and the
+    // player's controls. A swipe from an edge shows them for a moment.
+    private fun hideSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.insetsController?.let {
+                it.hide(WindowInsets.Type.systemBars())
+                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {

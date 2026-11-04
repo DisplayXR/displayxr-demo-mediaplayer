@@ -2,7 +2,8 @@
 //
 // Unit tests for the media browser's TouchScroller (#160): tap vs drag, the drag follows
 // the finger past the slop, a fling travels speed x tau and stops at the ends, a finger
-// that stopped before lifting does not fling, and a press that stops a fling is no tap.
+// that stopped before lifting does not fling, and a press that stops a fling is no tap
+// unless the fling was nearly done.
 
 #include "browser/TouchScroller.h"
 
@@ -113,6 +114,13 @@ void TestCatch() {
     CHECK(!s.Release(t + 1.1), "and is no tap");
     s.Press(100.0f, 500.0f, t + 2.0);
     CHECK(s.Release(t + 2.1), "the next press is a tap again");
+
+    TouchScroller tail = Make(100000.0f);
+    const double t2 = DragUp(tail, 1200.0f, 12);
+    tail.Release(t2);
+    tail.Update(t2 + 1.7);  // 480 px in all, about 7 px left: still moving
+    tail.Press(100.0f, 500.0f, t2 + 1.7);
+    CHECK(tail.Release(t2 + 1.8), "a press on a fling with less than the slop to go is a tap");
 }
 
 }  // namespace

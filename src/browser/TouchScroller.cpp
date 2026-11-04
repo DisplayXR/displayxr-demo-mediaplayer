@@ -18,10 +18,16 @@ void TouchScroller::SetOffset(float offset) {
     flinging_ = false;
 }
 
+float TouchScroller::FlingLeft(double t) const {
+    return std::fabs(flingSpeed_ * (float)(kFlingTau * std::exp(-(t - flingT0_) / kFlingTau)));
+}
+
 void TouchScroller::Press(float x, float y, double t) {
     pressed_ = true;
     dragging_ = false;
-    tap_ = !flinging_;  // a press that stops a fling is not a tap
+    // A press that stops a fling is not a tap, unless less than the slop was left to
+    // travel: the fling looked stopped.
+    tap_ = !flinging_ || FlingLeft(t) < slop_;
     flinging_ = false;
     pressX_ = x;
     pressY_ = y;
@@ -81,7 +87,7 @@ void TouchScroller::Update(double t) {
     const float target = flingOffset0_ + (float)(flingSpeed_ * kFlingTau * (1.0 - decay));
     offset_ = Clamp(target);
     // Stop at an end, or once less than half a pixel of travel remains.
-    if (offset_ != target || std::fabs(flingSpeed_ * kFlingTau * decay) < 0.5) flinging_ = false;
+    if (offset_ != target || FlingLeft(t) < 0.5f) flinging_ = false;
 }
 
 } // namespace mp::browser
