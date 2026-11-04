@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "browser/AndroidMediaProvider.h"
 
+#include "LifLoader.h"
+#include "lvf_probe_android.h"
+
 #include <jni.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <string>
 #include <utility>
@@ -37,9 +42,9 @@ bool AndroidMediaProvider::TakeItems(std::vector<MediaItem>& out) {
     return true;
 }
 
-void AndroidMediaProvider::WantThumbnails(const std::vector<int64_t>& ids, uint32_t maxEdge) {
+void AndroidMediaProvider::WantThumbnails(const std::vector<ThumbnailRequest>& wanted, uint32_t maxEdge) {
     std::lock_guard<std::mutex> lock(mutex_);
-    wanted_ = ids;
+    wanted_ = wanted;
     wantedEdge_ = maxEdge;
     wantedChanged_ = true;
 }
@@ -84,11 +89,11 @@ bool AndroidMediaProvider::TakeRefreshRequest() {
     return std::exchange(refreshRequested_, false);
 }
 
-bool AndroidMediaProvider::TakeWantedThumbnails(std::vector<int64_t>& ids, uint32_t& maxEdge) {
+bool AndroidMediaProvider::TakeWantedThumbnails(std::vector<ThumbnailRequest>& wanted, uint32_t& maxEdge) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!wantedChanged_) return false;
     wantedChanged_ = false;
-    ids = wanted_;
+    wanted = wanted_;
     maxEdge = wantedEdge_;
     return true;
 }
@@ -127,6 +132,25 @@ std::vector<jlong> Longs(JNIEnv* env, jlongArray array) {
     std::vector<jlong> out(env->GetArrayLength(array));
     env->GetLongArrayRegion(array, 0, (jsize)out.size(), out.data());
     return out;
+}
+
+// Is the file itself 3D: a two-track (LVF) video, or a LIF? Closes `fd`.
+bool File3D(int fd, bool video) {
+    if (fd < 0) return false;
+    struct stat st{};
+    bool is3D = false;
+    if (fstat(fd, &st) == 0) {
+        if (video) {
+            is3D = mp::LvfProbeAndroid::RunFd(fd, 0, st.st_size).ok;
+        } else {
+            auto readAt = [fd](uint64_t offset, void* dst, size_t size) {
+                return pread(fd, dst, size, (off_t)offset) == (ssize_t)size;
+            };
+            is3D = mp::LifLoader::IsLif(readAt, (uint64_t)st.st_size);
+        }
+    }
+    close(fd);
+    return is3D;
 }
 
 } // namespace
@@ -169,9 +193,11 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeSetItems(
 }
 
 // `rgba` is width x height x 4 bytes, or null (0 x 0) when no thumbnail could be made.
+// `fd` is the file, opened for this call and closed here (-1 if it could not be opened):
+// it is read on this Java thread for Thumbnail::file3D.
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeThumbnail(
-    JNIEnv* env, jobject /*thiz*/, jlong id, jint width, jint height, jbyteArray rgba)
+    JNIEnv* env, jobject /*thiz*/, jlong id, jint width, jint height, jbyteArray rgba, jint fd, jboolean video)
 {
     mp::browser::Thumbnail t;
     t.id = id;
@@ -181,6 +207,7 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeThumbnail(
         t.rgba.resize((size_t)width * height * 4);
         env->GetByteArrayRegion(rgba, 0, (jsize)t.rgba.size(), (jbyte*)t.rgba.data());
     }
+    t.file3D = File3D(fd, video != JNI_FALSE);
     AndroidMediaProvider::Instance().AddThumbnail(std::move(t));
 }
 
@@ -198,18 +225,25 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeTakeRefresh
     return AndroidMediaProvider::Instance().TakeRefreshRequest() ? JNI_TRUE : JNI_FALSE;
 }
 
-// The new wanted list, or null if it has not changed. edgeOut[0] receives the max edge.
+// The new wanted list, or null if it has not changed: pairs of (id, 1 to check the file
+// or 0). edgeOut[0] receives the max edge.
 extern "C" JNIEXPORT jlongArray JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeTakeWantedThumbnails(
     JNIEnv* env, jobject /*thiz*/, jintArray edgeOut)
 {
-    std::vector<int64_t> ids;
+    std::vector<mp::browser::ThumbnailRequest> wanted;
     uint32_t maxEdge = 0;
-    if (!AndroidMediaProvider::Instance().TakeWantedThumbnails(ids, maxEdge)) return nullptr;
+    if (!AndroidMediaProvider::Instance().TakeWantedThumbnails(wanted, maxEdge)) return nullptr;
     const jint edge = (jint)maxEdge;
     env->SetIntArrayRegion(edgeOut, 0, 1, &edge);
-    jlongArray out = env->NewLongArray((jsize)ids.size());
-    env->SetLongArrayRegion(out, 0, (jsize)ids.size(), (const jlong*)ids.data());
+    std::vector<jlong> pairs;
+    pairs.reserve(wanted.size() * 2);
+    for (const mp::browser::ThumbnailRequest& w : wanted) {
+        pairs.push_back((jlong)w.id);
+        pairs.push_back(w.checkFile ? 1 : 0);
+    }
+    jlongArray out = env->NewLongArray((jsize)pairs.size());
+    env->SetLongArrayRegion(out, 0, (jsize)pairs.size(), pairs.data());
     return out;
 }
 

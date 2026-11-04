@@ -47,7 +47,8 @@ class MediaStoreProvider(
         private const val TYPE_IMAGE = 0
         private const val TYPE_VIDEO = 1
 
-        private const val THUMBNAIL_THREADS = 2
+        // 4, not 2: 272 thumbnails in 1.8 s instead of 2.4 s on the NP02J.
+        private const val THUMBNAIL_THREADS = 4
         private const val PREFS = "media_browser"
         private const val PREF_ASKED = "permission_asked"
     }
@@ -79,9 +80,11 @@ class MediaStoreProvider(
         albums: Array<String>,
         folders: Array<String>,
     )
-    private external fun nativeThumbnail(id: Long, width: Int, height: Int, rgba: ByteArray?)
+    // `fd` is the file itself (or -1), for native to check whether it is 3D. Native closes it.
+    private external fun nativeThumbnail(id: Long, width: Int, height: Int, rgba: ByteArray?, fd: Int, video: Boolean)
     private external fun nativeTakeAccessRequest(): Boolean
     private external fun nativeTakeRefreshRequest(): Boolean
+    // Pairs of (id, 1 to check the file or 0), or null if unchanged.
     private external fun nativeTakeWantedThumbnails(edgeOut: IntArray): LongArray?
     private external fun nativeTakeOpenRequest(): Long
 
@@ -94,6 +97,7 @@ class MediaStoreProvider(
     // twice while its thumbnail is on its way to native. Guarded by `lock`.
     private val lock = Any()
     private var wanted = LongArray(0)
+    private var checkFile = HashSet<Long>()
     private var wantedEdge = 0
     private val inFlight = HashSet<Long>()
     private val made = HashSet<Long>()
@@ -104,7 +108,11 @@ class MediaStoreProvider(
     fun poll() {
         if (nativeTakeAccessRequest()) requestAccess()
         if (nativeTakeRefreshRequest()) refresh()
-        nativeTakeWantedThumbnails(edgeOut)?.let { setWanted(it, edgeOut[0]) }
+        nativeTakeWantedThumbnails(edgeOut)?.let { pairs ->
+            val ids = LongArray(pairs.size / 2) { pairs[2 * it] }
+            val check = (0 until pairs.size / 2).filter { pairs[2 * it + 1] != 0L }.mapTo(HashSet()) { pairs[2 * it] }
+            setWanted(ids, check, edgeOut[0])
+        }
         val open = nativeTakeOpenRequest()
         if (open >= 0) open(open)
     }
@@ -227,9 +235,10 @@ class MediaStoreProvider(
 
     // ---------------------------------------------------------------- thumbnails
 
-    private fun setWanted(ids: LongArray, edge: Int) {
+    private fun setWanted(ids: LongArray, check: HashSet<Long>, edge: Int) {
         synchronized(lock) {
             wanted = ids
+            checkFile = check
             wantedEdge = edge
             made.retainAll(ids.toHashSet())
             while (ids.isNotEmpty() && workers < THUMBNAIL_THREADS) {
@@ -244,6 +253,7 @@ class MediaStoreProvider(
         while (true) {
             val id: Long
             val edge: Int
+            val check: Boolean
             synchronized(lock) {
                 val next = wanted.firstOrNull { it !in inFlight && it !in made }
                 if (next == null) {
@@ -252,25 +262,34 @@ class MediaStoreProvider(
                 }
                 id = next
                 edge = wantedEdge
+                check = id in checkFile
                 inFlight += id
             }
-            val bitmap = thumbnail(id, edge)
+            val row = rows[id]
+            val bitmap = row?.let { thumbnail(it, edge) }
+            val rgba = bitmap?.let {
+                val pixels = ByteBuffer.allocate(it.width * it.height * 4)
+                it.copyPixelsToBuffer(pixels) // ARGB_8888 is laid out R, G, B, A in memory
+                pixels.array()
+            }
             synchronized(lock) {
                 inFlight -= id
                 made += id
             }
-            if (bitmap == null) {
-                nativeThumbnail(id, 0, 0, null)
-            } else {
-                val pixels = ByteBuffer.allocate(bitmap.width * bitmap.height * 4)
-                bitmap.copyPixelsToBuffer(pixels) // ARGB_8888 is laid out R, G, B, A in memory
-                nativeThumbnail(id, bitmap.width, bitmap.height, pixels.array())
-            }
+            nativeThumbnail(
+                id, bitmap?.width ?: 0, bitmap?.height ?: 0, rgba,
+                if (check && row != null) detachedFd(row) else -1, row?.type == TYPE_VIDEO,
+            )
         }
     }
 
-    private fun thumbnail(id: Long, edge: Int): Bitmap? {
-        val row = rows[id] ?: return null
+    private fun detachedFd(row: Row): Int = try {
+        activity.contentResolver.openFileDescriptor(row.uri, "r")?.detachFd() ?: -1
+    } catch (e: FileNotFoundException) {
+        -1
+    }
+
+    private fun thumbnail(row: Row, edge: Int): Bitmap? {
         var bitmap = try {
             activity.contentResolver.loadThumbnail(row.uri, Size(edge, edge), null)
         } catch (e: IOException) {

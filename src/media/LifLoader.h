@@ -16,6 +16,9 @@
 #include "ImageDecoder.h"   // DecodedImage
 #include "StereoTypes.h"    // StereoLayout
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <string>
 
 namespace mp {
@@ -39,6 +42,11 @@ public:
     // commonly ship with a .jpg extension, so the dispatch must detect them by content,
     // not just by a .lif name. Reads only the last 2 bytes.
     static bool IsLif(const std::string& path);
+
+    // The same sniff for a caller with no path (the media browser's 3D badge reads through
+    // a file descriptor, #160): `readAt` reads `size` bytes at `offset`, false on failure.
+    using ReadAtFn = std::function<bool(uint64_t offset, void* dst, size_t size)>;
+    static bool IsLif(const ReadAtFn& readAt, uint64_t fileSize);
 
     // Parse `path` and produce a renderable image:
     //   * 2+ views  -> compose left|right into a full-SBS RGBA buffer (SbsFull, stereo=true)

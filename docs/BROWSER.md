@@ -38,13 +38,14 @@ android/src/main/java/.../
   MediaStoreProvider.kt         MediaStore query, permissions, thumbnails, opening a file
 
 tests/
-  media_library_test.cpp, thumbnail_cache_test.cpp, touch_scroller_test.cpp
+  media_library_test.cpp, stereo_classifier_test.cpp, thumbnail_cache_test.cpp,
+  touch_scroller_test.cpp
 ```
 
 ## Rules
 
 - Browser code lives in the folders above. `src/browser/` has no JNI, no MediaStore and
-  no file paths: it reaches the platform only through `MediaProvider`.
+  no media paths: it reaches the device's media only through `MediaProvider`.
 - Existing classes get wiring only (Android `main.cpp`, `MainActivity.kt`, the build
   lists). Extend one only when the capability belongs to it: the MPO switch in
   `MediaSource` (like its HEIC switch) and an fd variant of the LIF check in `LifLoader`.
@@ -63,6 +64,8 @@ tests/
 
 - The render thread owns `MediaBrowser`, `MediaLibrary`, `ThumbnailCache` and
   `ThumbnailAtlas`, like the rest of the ImGui UI.
+- `StereoClassifier` is driven from the render thread and runs the content check on its
+  own worker thread.
 - `MediaStoreProvider` runs on the Android UI thread and a thumbnail executor.
 - Java to native: Java hands results (the item list, thumbnails, the permission state) to
   `AndroidMediaProvider` through JNI calls, which queue them under a mutex. The browser
@@ -77,10 +80,11 @@ tests/
 
 The player's layout resolver assumes stereo unless mono is proven (`MediaSource.h`).
 That is right for playback but would badge every photo, so a badge needs positive
-evidence: the filename convention, a LIF trailer, a two-track LVF, container stereo
-metadata, or a decided stereo verdict from the content check on the thumbnail. Verdicts
-are cached by MediaStore id, date modified and size. The verdict also picks the
-thumbnail crop (the left eye for side by side, the top for top-bottom).
+evidence. `StereoClassifier.h` lists the evidence and its order. The file's own
+evidence (a LIF, a two-track video) is read by the provider while it makes the
+thumbnail, as `Thumbnail::file3D`. The verdict also picks the thumbnail
+crop: the left eye for side by side, the top for top-bottom, the whole thumbnail for a
+LIF or two-track video, whose thumbnail is already one view.
 
 ## Android behaviour
 

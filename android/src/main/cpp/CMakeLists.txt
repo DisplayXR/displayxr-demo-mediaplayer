@@ -151,6 +151,7 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/ui/ImGuiLayer.cpp
     # The media browser (#160, docs/BROWSER.md).
     ${REPO_ROOT}/src/browser/MediaLibrary.cpp
+    ${REPO_ROOT}/src/browser/StereoClassifier.cpp
     ${REPO_ROOT}/src/browser/ThumbnailAtlas.cpp
     browser/AndroidMediaProvider.cpp
     ${MP_IMGUI_SOURCES}

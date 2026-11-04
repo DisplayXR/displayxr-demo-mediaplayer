@@ -727,6 +727,18 @@ if(MP_BUILD_TESTS)
     target_include_directories(media_library_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME media_library COMMAND media_library_test)
 
+    # Media browser (#160): 3D badge evidence and the verdict cache. Pure, one worker thread.
+    add_executable(stereo_classifier_test
+        tests/stereo_classifier_test.cpp
+        src/browser/StereoClassifier.cpp
+        src/media/MediaSource.cpp
+        src/media/StereoDetect.cpp
+        src/Log.cpp)
+    target_include_directories(stereo_classifier_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    find_package(Threads REQUIRED)
+    target_link_libraries(stereo_classifier_test PRIVATE Threads::Threads)
+    add_test(NAME stereo_classifier COMMAND stereo_classifier_test)
+
     # "Convert to 3D" (XR_DXR_lift spec v4): the LiftClient state machine over a fake
     # entry-point table, plus the CPU frame preparation. No runtime, no loader, no GPU.
     add_executable(lift_client_test
