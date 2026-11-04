@@ -123,9 +123,13 @@ HDR video (HLG or PQ, e.g. HDR10) and scene-linear EXR are shown on the panel as
 picture. The player recognises them from the file and the status bar says what it does,
 e.g. `PQ -> SDR 1000 nits`.
 
-- HDR reference white (203 nits) becomes the panel's white. Shadows and mid-tones are kept
-  as they are, and the highlights above them are rolled off smoothly (ITU-R BT.2390) so the
-  brightest part of the shot just reaches white instead of everything above white clipping.
+- HDR levels are scaled so 203 nits (reference white) would be the panel's white, then the
+  highlights are rolled off smoothly (ITU-R BT.2390) so the brightest part of the shot just
+  reaches white instead of everything above white clipping. The roll-off starts below
+  reference white, so reference white itself lands a little under white: about code 229 of
+  255 for a 1000-nit source, 208 for 4000 nits. Shadows are kept as they are.
+- HLG and PQ with untagged primaries or matrix are taken as BT.2020. A file with no HDR tag
+  at all is shown as SDR; there is no control to force it yet.
   BT.2020 colours are converted to the panel's BT.709.
 - **Exposure** acts on the HDR light before the roll-off: pull it down to see detail in
   highlights.
@@ -160,7 +164,8 @@ itself whenever it runs on that panel.
   not touch it: bypassing the grade still shows the picture through the calibration.
 - **Remove** deletes this panel's calibration.
 
-It is applied after the grade and the QC views, and before the gamma trim. The LUT must
+It is the last step: after the grade, the QC views, the gamma trim and the channel views,
+so a gamma trim is a choice you see through the calibration. The LUT must
 cover 0..1 (the usual `DOMAIN` for a display calibration); one with another domain is
 refused with a message.
 

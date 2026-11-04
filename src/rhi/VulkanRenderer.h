@@ -68,8 +68,8 @@ struct GradeParams {
     int wipeMode = 0;            // 0 off, 1 before | after the grade, 2 left eye | right eye
     float wipePos = 0.5f;        // the wipe line across the picture, 0..1
     float gamma = 1.0f;          // display gamma trim, applied after the grade and QC view
-    // Per-panel display calibration (#133), after the grade and QC view, before the gamma
-    // trim. Ignored unless a calibration LUT was uploaded (HasCalibrationLut). Not part of
+    // Per-panel display calibration (#133), the last transform: after the grade, QC view,
+    // gamma trim and channel view. Ignored unless a calibration LUT was uploaded (HasCalibrationLut). Not part of
     // the show grade: bypassing the grade keeps it.
     bool calOn = false;
     // HDR sources (#134): 0 auto (roll off HLG / PQ highlights, clip scene-linear EXR at

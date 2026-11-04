@@ -54,6 +54,9 @@ int main() {
     CHECK(Install(src.string(), "AUO-B194@HDMI-1", err));
     CHECK(std::filesystem::exists(dir / "AUO-B194@HDMI-1.cube"));
     CHECK(Install((dir / "AUO-B194@HDMI-1.cube").string(), "AUO-B194@HDMI-1", err));  // the installed file itself
+    // Over an existing calibration: replaced whole, no temporary left behind.
+    CHECK(Install(src.string(), "AUO-B194@HDMI-1", err));
+    CHECK(!std::filesystem::exists(dir / "AUO-B194@HDMI-1.cube.tmp"));
     CHECK(Remove("AUO-B194@HDMI-1", err));
     CHECK(!std::filesystem::exists(dir / "AUO-B194@HDMI-1.cube"));
     CHECK(Remove("AUO-B194@HDMI-1", err));  // nothing to remove is fine

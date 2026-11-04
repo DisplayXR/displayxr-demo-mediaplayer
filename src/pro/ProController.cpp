@@ -636,6 +636,8 @@ void ProController::TickLooks() {
 
 void ProController::ResolveCalibration() {
     calResolved_ = true;
+    calLoadId_ = 0;  // a load still running was for the previous panel
+    calLoading_.clear();
     std::string runtimeKey, dev;
     if (!(host_.panelIdentity && host_.panelIdentity(runtimeKey, dev)) && host_.displayDeviceName)
         dev = host_.displayDeviceName();
@@ -669,13 +671,14 @@ void ProController::LoadCalibration(const std::string& cube, bool install) {
     calError_.clear();
     calLoading_ = cube;
     calInstall_ = install;
-    calLoader_.Submit([cube](color::CubeLut& lut, std::string& err) { return color::LoadCube(cube, lut, err); },
-                      cube, /*isOcio=*/false);
+    calLoadId_ = calLoader_.Submit([cube](color::CubeLut& lut, std::string& err) { return color::LoadCube(cube, lut, err); },
+                                   cube, /*isOcio=*/false);
 }
 
 void ProController::TickCalibration() {
     LookLoader::Result r;
     if (!calLoader_.Take(r)) return;
+    if (r.id != calLoadId_) return;  // for a panel the window left, or since removed
     calLoading_.clear();
     auto fail = [&](const std::string& why) {
         calError_ = why;
@@ -707,6 +710,8 @@ void ProController::TickCalibration() {
 }
 
 void ProController::ClearCalibration(bool uninstall) {
+    calLoadId_ = 0;
+    calLoading_.clear();
     if (renderer_) renderer_->ClearCalibrationLut();
     calLoaded_ = false;
     calName_.clear();

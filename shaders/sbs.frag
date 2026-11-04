@@ -410,13 +410,6 @@ void main() {
     } else if (pc.qcMode == 3) {   // false colour
         c = FalseColour(c);
     }
-    // Display calibration (#133): corrects THIS panel towards its target, so it follows the
-    // show grade and the QC views (they are what the panel should show) and comes before
-    // the gamma trim. Its domain is 0..1, the size is the texture's.
-    if (((pc.viewFlags >> 15) & 1) != 0) {
-        const float n = float(textureSize(calLut, 0).x);
-        c = texture(calLut, clamp(c, 0.0, 1.0) * ((n - 1.0) / n) + 0.5 / n).rgb;
-    }
     // Display gamma trim, then channel isolation (a channel or luma shown as grey).
     const float gammaTrim = float(pc.wipeGamma >> 16) / 4096.0;
     if (gammaTrim > 0.0 && abs(gammaTrim - 1.0) > 0.001) c = pow(clamp(c, 0.0, 1.0), vec3(1.0 / gammaTrim));
@@ -425,6 +418,13 @@ void main() {
     else if (channel == 3) c = vec3(c.b);
     else if (channel == 4) c = vec3(SrcMode() == 0 ? texture(plane0, uv).a : 1.0);
     else if (channel == 5) c = vec3(dot(c, vec3(0.2126, 0.7152, 0.0722)));
+    // Display calibration (#133): corrects THIS panel towards its target, so it is the last
+    // transform: the grade, QC views, gamma trim and channel views are what the panel should
+    // show. Its domain is 0..1, the size is the texture's.
+    if (((pc.viewFlags >> 15) & 1) != 0) {
+        const float n = float(textureSize(calLut, 0).x);
+        c = texture(calLut, clamp(c, 0.0, 1.0) * ((n - 1.0) / n) + 0.5 / n).rgb;
+    }
     if (pc.zebraLevel > 0.0 && pc.qcMode != 1 &&
         dot(graded, vec3(0.2126, 0.7152, 0.0722)) >= pc.zebraLevel) {
         // Stripes in SOURCE pixels, 45 degrees, 16 px period: both eyes stripe the same
