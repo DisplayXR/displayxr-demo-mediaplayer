@@ -3095,6 +3095,7 @@ android_main(struct android_app *app)
 	LOGI("mediaplayer_vk_android: android_main entered");
 	app->onAppCmd = handle_cmd;
 	g_density_dpi = AConfiguration_getDensity(app->config);
+	mp::MediaSource::SetMpoSupported(false);
 	// Touch is NOT consumed via app->onInputEvent: on the legacy path the
 	// runtime's MonadoView overlay covers our window, so a NativeActivity never
 	// sees native input. Gestures arrive via MainActivity.dispatchTouchEvent

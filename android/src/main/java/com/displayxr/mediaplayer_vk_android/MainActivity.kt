@@ -13,6 +13,7 @@
 //      returns 1 when the Load button asks Java to open the SAF video picker.
 //   3. Wake the DisplayXR runtime out of Android's "stopped" state before
 //      xrCreateInstance and, if it can't be reached, prompt the user.
+//   4. Host MediaStoreProvider, the Java half of the media browser (#160).
 //
 // Vendor-neutral + out-of-process (ADR-025): no CNSDK, no CAMERA — the OOP
 // runtime service owns eye tracking. Binds to whichever runtime flavor is
@@ -152,6 +153,8 @@ class MainActivity : NativeActivity() {
     private var miniLayoutW = 0
     private var miniLayoutH = 0
 
+    private lateinit var mediaStore: MediaStoreProvider
+
     private val rectCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!rectPollRunning) return
@@ -161,6 +164,7 @@ class MainActivity : NativeActivity() {
             } catch (_: Throwable) {
                 // Native lib not bound yet; the next frame retries.
             }
+            mediaStore.poll()
             Choreographer.getInstance().postFrameCallback(this)
         }
     }
@@ -398,6 +402,7 @@ class MainActivity : NativeActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        mediaStore = MediaStoreProvider(this) { fd, length, name -> nativeOpenVideoFd(fd, 0L, length, name) }
         pushRotation()
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
             .registerDisplayListener(displayListener, null)
@@ -424,9 +429,15 @@ class MainActivity : NativeActivity() {
         pushRotation()
     }
 
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == MediaStoreProvider.REQUEST_PERMISSION) mediaStore.onPermissionResult()
+    }
+
     override fun onResume() {
         super.onResume()
         pushRotation()
+        mediaStore.onResume()
         if (!rectPollRunning) {
             // Forget the last sample so the first frame after a resume always
             // re-pushes: the surface was destroyed and rebuilt underneath us and
@@ -445,6 +456,7 @@ class MainActivity : NativeActivity() {
     }
 
     override fun onDestroy() {
+        mediaStore.close()
         try {
             (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
                 .unregisterDisplayListener(displayListener)

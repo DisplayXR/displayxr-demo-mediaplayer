@@ -80,6 +80,10 @@ public:
     // the loader — never lists a .heic it cannot open.
     static void SetHeifSupported(bool on) { heifSupported_ = on; }
     static inline bool heifSupported_ = false;
+    // MPO stereo stills: on by default; the Android leg turns it off, having no MPO loader
+    // (its media browser must not list one, #160).
+    static void SetMpoSupported(bool on) { mpoSupported_ = on; }
+    static inline bool mpoSupported_ = true;
 
     static const char* KindName(MediaKind k);
     static const char* LayoutName(StereoLayout l);   // forwards to mp::LayoutName

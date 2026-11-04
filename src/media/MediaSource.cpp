@@ -212,7 +212,7 @@ MediaInfo MediaSource::Resolve(const std::string& path, MediaKind kind,
 bool MediaSource::IsSupported(const std::string& path) {
     const std::string lower = Lower(path);
     return EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png") ||
-           EndsWith(lower, ".lif") || EndsWith(lower, ".mpo") ||
+           EndsWith(lower, ".lif") || (mpoSupported_ && EndsWith(lower, ".mpo")) ||
            (heifSupported_ && IsHeifExt(lower)) ||
            EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov") ||
            (proFormats_ && IsProReviewExt(lower));

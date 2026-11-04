@@ -717,6 +717,16 @@ if(MP_BUILD_TESTS)
     target_include_directories(stream_url_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME stream_url COMMAND stream_url_test)
 
+    # Media browser (#160): the library's supported set, sources, filter and sort. Pure.
+    add_executable(media_library_test
+        tests/media_library_test.cpp
+        src/browser/MediaLibrary.cpp
+        src/media/MediaSource.cpp
+        src/media/StereoDetect.cpp
+        src/Log.cpp)
+    target_include_directories(media_library_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME media_library COMMAND media_library_test)
+
     # "Convert to 3D" (XR_DXR_lift spec v4): the LiftClient state machine over a fake
     # entry-point table, plus the CPU frame preparation. No runtime, no loader, no GPU.
     add_executable(lift_client_test
