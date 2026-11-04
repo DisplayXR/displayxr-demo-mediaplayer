@@ -91,7 +91,8 @@ PRO=0
 for a in "$@"; do [ "$a" = --pro ] && PRO=1; done
 if [ "$PRO" = 1 ]; then
   # Media Player Pro (#139). Same build, same portability rules (the Pro code adds no
-  # system library); DeckLink and OpenColorIO are not built in (see PRO_NOTE).
+  # system library: DeckLink is loaded at run time from Blackmagic's Desktop Video
+  # driver, #164); OpenColorIO is not built in (see PRO_NOTE).
   APP="mediaplayer-pro"
   PKG="displayxr-mediaplayer-pro"
   DISPLAY_NAME="DisplayXR Media Player Pro"
@@ -100,7 +101,7 @@ if [ "$PRO" = 1 ]; then
   SHELL_MANIFEST="mediaplayer_pro_handle_vk_win.displayxr.json"
   SIDECAR_ICONS="icon_pro.png icon_pro_sbs.png"
   TAG_PREFIX="pro-v"
-  PRO_NOTE="This Linux build has no Blackmagic DeckLink input and no OpenColorIO (.cube LUTs and ASC CDLs work); live input is UVC cameras and the test signal."
+  PRO_NOTE="Live input: UVC cameras, the test signal, and Blackmagic DeckLink cards when Blackmagic Desktop Video is installed (not part of this package). No OpenColorIO in this build; .cube LUTs and ASC CDLs work."
 fi
 
 set -euo pipefail

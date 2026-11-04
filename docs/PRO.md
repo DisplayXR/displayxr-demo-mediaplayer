@@ -154,8 +154,10 @@ launcher `/usr/bin/displayxr-mediaplayer-pro`, DisplayXR Shell registration
 `mediaplayer-pro`) from the same portable build as the Media Player's `.deb` (built on
 Ubuntu 22.04, static SDL3, bundled slim FFmpeg; the package script builds Pro by default),
 so one package installs on 22.04, 24.04 and 26.04 next to the Media Player. Versioned from
-the `pro-v*` tags. This build has no DeckLink and no OpenColorIO (stated in the package
-description); `.cube` LUTs and CDLs work, live input is UVC and the test signal.
+the `pro-v*` tags. DeckLink is built in from the vendored SDK headers (#164) and loads
+`libDeckLinkAPI.so` from Blackmagic's Desktop Video at run time, which the station installs
+separately; there is no OpenColorIO (stated in the package description), `.cube` LUTs and
+CDLs work.
 `build-linux.yml` builds Pro in every lane (`MP_BUILD_PRO=ON`) and its `DebInstall` legs
 install Pro next to the Media Player in clean 22.04 / 24.04 / 26.04 containers.
 
