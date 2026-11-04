@@ -503,16 +503,22 @@ function(mp_add_player tgt is_pro)
     message(STATUS "Configured target: ${tgt}")
 endfunction()
 
-# Blackmagic DeckLink input (Pro, docs/PRO.md). The Desktop Video SDK is a registration
-# download and is never committed: point MP_DECKLINK_SDK_DIR (or the env var of the same
-# name) at the SDK zip or its extracted folder. Windows generates the COM header from the
+# Blackmagic DeckLink input (Pro, docs/PRO.md). The SDK's include folders are vendored in
+# third_party/decklink-sdk (their licence permits it; the rest of the SDK stays out, see the
+# README there) and are the default. MP_DECKLINK_SDK_DIR (or the env var of the same name)
+# overrides with another SDK zip or extracted folder; -DMP_DECKLINK_SDK_DIR=OFF builds
+# without DeckLink. Windows generates the COM header from the
 # SDK's IDL with midl at configure time (as Open RV does); macOS and Linux use the ready
 # headers in Mac/include and Linux/include plus the SDK's DeckLinkAPIDispatch.cpp, which
 # loads the installed DeckLinkAPI framework / libDeckLinkAPI.so at run time. Without the
 # SDK, Pro builds and its DeckLink input reports "no DeckLink support". The SDK's own
 # include folder stays on the include path everywhere for DeckLinkAPIVersion.h, which
 # DeckLinkSource.cpp uses to pick the 14.3+ frame-buffer API.
-set(MP_DECKLINK_SDK_DIR "$ENV{MP_DECKLINK_SDK_DIR}" CACHE PATH "Blackmagic DeckLink SDK zip or folder (Pro)")
+set(_dl_default "$ENV{MP_DECKLINK_SDK_DIR}")
+if(NOT _dl_default AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/decklink-sdk")
+    set(_dl_default "${CMAKE_CURRENT_SOURCE_DIR}/third_party/decklink-sdk")
+endif()
+set(MP_DECKLINK_SDK_DIR "${_dl_default}" CACHE PATH "Blackmagic DeckLink SDK zip or folder (Pro); OFF = no DeckLink")
 set(MP_DECKLINK_INCLUDE "")
 set(MP_DECKLINK_SDK_INCLUDE "")
 if(MP_DECKLINK_SDK_DIR)
@@ -566,7 +572,7 @@ if(MP_DECKLINK_SDK_DIR)
         message(STATUS "DeckLink input (Pro): ON (SDK ${_dl_ver}, ${_dl_inc})")
     endif()
 else()
-    message(STATUS "DeckLink input (Pro): OFF (set MP_DECKLINK_SDK_DIR to the Desktop Video SDK)")
+    message(STATUS "DeckLink input (Pro): OFF (MP_DECKLINK_SDK_DIR=${MP_DECKLINK_SDK_DIR})")
 endif()
 
 # OpenColorIO (Pro, optional): an OCIO 2.x install prefix (e.g. Open RV's build,

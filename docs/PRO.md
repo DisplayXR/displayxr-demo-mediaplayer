@@ -179,8 +179,8 @@ otherwise the frame pairs unfolded with the field mark, drop-frame counted the S
    publishes into the same `FrameRing` the camera uses, so the render path is untouched.
    Two inputs, frame-synced into one SBS frame (two-cable stereo), plus single-cable
    SBS. Upload as NV12 / v210-unpacked like the camera path. Suki's Open RV port already
-   has DeckLink input code to port. Build it behind `MP_DECKLINK_SDK_DIR` (the SDK is a
-   registration download; never commit it). Needs a card: a DeckLink Mini Recorder 4K
+   has DeckLink input code to port. Build it behind `MP_DECKLINK_SDK_DIR` (the SDK's
+   include folders are vendored in `third_party/decklink-sdk` and are the default). Needs a card: a DeckLink Mini Recorder 4K
    (~$235, 1x 6G-SDI + HDMI, 2160p30) to start, a DeckLink 8K Pro G2 (~$855, 4x 12G-SDI)
    for the real rig.
 2. **Timecode overlay and measured end-to-end delay (Phase 1).** SDI timecode from the
@@ -202,7 +202,8 @@ pair.
 
 None of the DeckLink code has run against a signal yet. The hardware-free half (v210 /
 UYVY unpack, the timecode and clock keys, the pairer) is unit-tested; everything below
-needs a card. Build with `-DMP_DECKLINK_SDK_DIR=<SDK>` on the box that has it, confirm the
+needs a card. Any Pro build has it (the vendored `third_party/decklink-sdk` is the
+default; `-DMP_DECKLINK_SDK_DIR=<SDK>` picks another, `=OFF` none); confirm the
 log line `DeckLink input (Pro): ON (SDK x.y)`, then:
 
 1. `--decklink-list` names the inputs; Desktop Video's version is at least the SDK's

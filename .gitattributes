@@ -16,3 +16,7 @@
 *.mp4 binary
 *.pkg binary
 *.exe binary
+
+# Blackmagic DeckLink SDK headers, vendored verbatim (third_party/decklink-sdk/README.md):
+# keep the SDK's own bytes and line endings.
+third_party/decklink-sdk/*/include/** -text
