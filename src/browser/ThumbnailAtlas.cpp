@@ -222,6 +222,8 @@ bool ThumbnailAtlas::Get(int slot, Thumb& out) const {
     out.texture = (ImTextureID)page.descriptor;
     out.uv0 = ImVec2((x + 0.5f) / pw, (y + 0.5f) / ph);
     out.uv1 = ImVec2((x + size.w - 0.5f) / pw, (y + size.h - 0.5f) / ph);
+    out.w = size.w;
+    out.h = size.h;
     return true;
 }
 

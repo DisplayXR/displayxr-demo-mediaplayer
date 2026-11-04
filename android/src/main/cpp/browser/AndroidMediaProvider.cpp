@@ -166,12 +166,10 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeSetAccess(
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeSetItems(
     JNIEnv* env, jobject /*thiz*/, jlongArray ids, jobjectArray names, jintArray types, jlongArray dates,
-    jlongArray modified, jlongArray sizes, jlongArray durations, jlongArray albumIds, jobjectArray albums,
-    jobjectArray folders)
+    jlongArray modified, jlongArray sizes, jlongArray durations, jobjectArray folders)
 {
     const std::vector<jlong> id = Longs(env, ids), date = Longs(env, dates), mod = Longs(env, modified),
-                             size = Longs(env, sizes), duration = Longs(env, durations),
-                             albumId = Longs(env, albumIds);
+                             size = Longs(env, sizes), duration = Longs(env, durations);
     std::vector<jint> type(id.size());
     env->GetIntArrayRegion(types, 0, (jsize)type.size(), type.data());
 
@@ -185,8 +183,6 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeSetItems(
         item.modified = mod[i];
         item.bytes = size[i];
         item.durationMs = duration[i];
-        item.albumId = albumId[i];
-        item.album = StringAt(env, albums, (jsize)i);
         item.folder = StringAt(env, folders, (jsize)i);
     }
     AndroidMediaProvider::Instance().SetItems(std::move(items));

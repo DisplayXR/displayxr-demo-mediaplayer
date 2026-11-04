@@ -20,8 +20,6 @@ struct MediaItem {
     int64_t modified = 0;    // last modified, seconds since the epoch
     int64_t bytes = 0;
     int64_t durationMs = 0;  // videos only
-    int64_t albumId = 0;     // the folder it is in (MediaStore BUCKET_ID)
-    std::string album;       // that folder's name, e.g. "Camera"
     std::string folder;      // its path in shared storage, e.g. "DCIM/Camera/"
 };
 

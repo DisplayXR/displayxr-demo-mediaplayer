@@ -24,6 +24,7 @@ public:
     struct Thumb {
         ImTextureID texture{};
         ImVec2 uv0, uv1;  // the slot's image, inset half a texel so filtering stays inside it
+        uint32_t w = 0, h = 0;  // the image's size, px
     };
 
     ThumbnailAtlas() = default;

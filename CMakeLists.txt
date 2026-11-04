@@ -739,6 +739,16 @@ if(MP_BUILD_TESTS)
     target_link_libraries(stereo_classifier_test PRIVATE Threads::Threads)
     add_test(NAME stereo_classifier COMMAND stereo_classifier_test)
 
+    # Media browser (#160): media id to thumbnail slot, least recently drawn reuse. Pure.
+    add_executable(thumbnail_cache_test tests/thumbnail_cache_test.cpp src/browser/ThumbnailCache.cpp)
+    target_include_directories(thumbnail_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME thumbnail_cache COMMAND thumbnail_cache_test)
+
+    # Media browser (#160): drag, fling and tap for touch scrolling. Pure.
+    add_executable(touch_scroller_test tests/touch_scroller_test.cpp src/browser/TouchScroller.cpp)
+    target_include_directories(touch_scroller_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME touch_scroller COMMAND touch_scroller_test)
+
     # "Convert to 3D" (XR_DXR_lift spec v4): the LiftClient state machine over a fake
     # entry-point table, plus the CPU frame preparation. No runtime, no loader, no GPU.
     add_executable(lift_client_test

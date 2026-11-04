@@ -62,8 +62,6 @@ class MediaStoreProvider(
         val modified: Long,
         val size: Long,
         val durationMs: Long,
-        val albumId: Long,
-        val album: String,
         val folder: String,
     )
 
@@ -76,8 +74,6 @@ class MediaStoreProvider(
         modified: LongArray,
         sizes: LongArray,
         durations: LongArray,
-        albumIds: LongArray,
-        albums: Array<String>,
         folders: Array<String>,
     )
     // `fd` is the file itself (or -1), for native to check whether it is 3D. Native closes it.
@@ -198,8 +194,6 @@ class MediaStoreProvider(
                 LongArray(list.size) { list[it].modified },
                 LongArray(list.size) { list[it].size },
                 LongArray(list.size) { list[it].durationMs },
-                LongArray(list.size) { list[it].albumId },
-                Array(list.size) { list[it].album },
                 Array(list.size) { list[it].folder },
             )
             Log.i(TAG, "media browser: ${list.size} items")
@@ -214,8 +208,6 @@ class MediaStoreProvider(
             MediaStore.MediaColumns.DATE_MODIFIED,
             MediaStore.MediaColumns.SIZE,
             MediaStore.MediaColumns.DURATION,
-            MediaStore.MediaColumns.BUCKET_ID,
-            MediaStore.MediaColumns.BUCKET_DISPLAY_NAME,
             MediaStore.MediaColumns.RELATIVE_PATH,
         )
         activity.contentResolver.query(collection, columns, null, null, null)?.use { c ->
@@ -227,7 +219,7 @@ class MediaStoreProvider(
                 out += Row(
                     id, ContentUris.withAppendedId(collection, id), name, type,
                     if (taken > 0) taken else modified * 1000, modified, c.getLong(4), c.getLong(5),
-                    c.getLong(6), c.getString(7) ?: "", c.getString(8) ?: "",
+                    c.getString(6) ?: "",
                 )
             }
         }

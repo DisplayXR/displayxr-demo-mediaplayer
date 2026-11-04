@@ -9,18 +9,20 @@ This is the developer reference.
 ## Scope
 
 In: images and videos from the Android MediaStore, a sidebar of sources (All media,
-Camera, Downloads, albums, "Other files..." for the system picker), a square-tile grid,
-3D and duration badges, and view options (Both / 3D / 2D, All / Videos / Images, newest
-or oldest first).
+Camera, Downloads, Pictures, Movies, Unsupported, "Other files..." for the system picker),
+a square-tile grid, 3D and duration badges, and view options (Both / 3D / 2D, All /
+Videos / Images, newest or oldest first).
 
 Out for now: a desktop browser; the VR badge; MPO, HEIC and MV-HEVC on Android. Files
-Android cannot open (MPO, HEIC) are hidden from the gallery.
+the player cannot open are listed under Unsupported with their format, so the formats
+left to do stay visible. MediaStore does not index MPO, JPS or JFIF as media, so the
+gallery cannot list them; "Other files..." reaches them.
 
 ## Structure
 
 ```
 src/browser/                    namespace mp::browser, platform-neutral
-  MediaItem.h                   one media entry: id, name, kind, size, duration, album, date
+  MediaItem.h                   one media entry: id, name, kind, size, duration, date, folder
   MediaLibrary.{h,cpp}          the item list, sources, filter and sort
   MediaProvider.h               the interface a platform implements: permission, refresh,
                                 thumbnails, open
