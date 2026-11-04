@@ -15,7 +15,7 @@ This is the developer reference. For using the player, see the
 | Binary | `mediaplayer_handle_vk_<plat>` | `mediaplayer_pro_handle_vk_<plat>` |
 | Build | always | `MP_BUILD_PRO` (ON by default on Windows, OFF elsewhere; `scripts/build_macos.sh --pro`) |
 | Compile flag | `MEDIAPLAYER_PRO=0` | `MEDIAPLAYER_PRO=1` + `src/pro/` |
-| Installer | `DisplayXRMediaPlayerSetup-X.Y.Z.exe`, `DisplayXRMediaPlayer-X.Y.Z.pkg` | `DisplayXRMediaPlayerProSetup-X.Y.Z.exe`, `DisplayXRMediaPlayerPro-X.Y.Z.pkg` |
+| Installer | `DisplayXRMediaPlayerSetup-X.Y.Z.exe`, `DisplayXRMediaPlayer-X.Y.Z.pkg` | `DisplayXRMediaPlayerProSetup-X.Y.Z.exe`, `DisplayXRMediaPlayerPro-X.Y.Z.pkg`, `displayxr-mediaplayer-pro_X.Y.Z_amd64.deb` |
 | Install dir | `Program Files\DisplayXR\Demos\MediaPlayer`, `/Applications/Stereo Media Player.app` | `Program Files\DisplayXR\Apps\MediaPlayerPro`, `/Applications/Media Player Pro.app` |
 | macOS bundle / pkg id | `com.displayxr.mediaplayer` | `com.displayxr.mediaplayer.pro` (installs alongside) |
 | Release tag | `vX.Y.Z` | `pro-vX.Y.Z` |
@@ -148,11 +148,24 @@ instead of over it. Its launcher opens no sample image (Pro starts on the idle s
 Run a dev build with
 `XR_RUNTIME_JSON=<runtime>/build/openxr_displayxr-dev.json build/mediaplayer_pro_handle_vk_macos`.
 
-CI (`build-windows.yml`, `build-macos.yml`) builds and validates both apps and both
+**Linux (#139).** `scripts/package_deb_linux.sh --pro` packages Pro as
+`displayxr-mediaplayer-pro_X.Y.Z_amd64.deb` (`/usr/lib/displayxr-demos/mediaplayer-pro`,
+launcher `/usr/bin/displayxr-mediaplayer-pro`, DisplayXR Shell registration
+`mediaplayer-pro`) from the same portable build as the Media Player's `.deb` (built on
+Ubuntu 22.04, static SDL3, bundled slim FFmpeg; the package script builds Pro by default),
+so one package installs on 22.04, 24.04 and 26.04 next to the Media Player. Versioned from
+the `pro-v*` tags. DeckLink is built in from the vendored SDK headers (#164) and loads
+`libDeckLinkAPI.so` from Blackmagic's Desktop Video at run time, which the station installs
+separately; there is no OpenColorIO (stated in the package description), `.cube` LUTs and
+CDLs work.
+`build-linux.yml` builds Pro in every lane (`MP_BUILD_PRO=ON`) and its `DebInstall` legs
+install Pro next to the Media Player in clean 22.04 / 24.04 / 26.04 containers.
+
+CI (`build-windows.yml`, `build-macos.yml`, `build-linux.yml`) builds and validates both apps and both
 installers on every PR and runs the unit tests on both (Windows skips `decode_formats`,
 whose fixtures need FFmpeg encoders that the slim decode-only FFmpeg lacks). A
 `pro-vX.Y.Z` tag publishes only the Pro installers (the `.exe` from Windows, the `.pkg`
-from macOS) on one release named "Media Player Pro X.Y.Z" that is never marked latest and
+from macOS, the `.deb` from Linux) on one release named "Media Player Pro X.Y.Z" that is never marked latest and
 never dispatches the `versions.json` bump. Both jobs pass the same name / prerelease /
 `make_latest: false` to `softprops/action-gh-release`, so whichever finishes first creates
 the release and the other adds its asset. Android's version stamps match `v[0-9]*` only, so `pro-v*` tags
