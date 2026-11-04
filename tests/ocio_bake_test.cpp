@@ -5,6 +5,7 @@
 // (the same sampling the shader does). Skipped when the build has no OpenColorIO.
 
 #include "pro/OcioBake.h"
+#include "color/ToneMap.h"
 
 #include <algorithm>
 #include <cmath>
@@ -76,6 +77,23 @@ int main() {
     const float white[3] = {1, 1, 1};
     if (lut.Valid()) Sample(lut, white, out);
     CHECK(std::fabs(out[0] - 1.0f) < 0.005f, "white stays white");
+
+    // #134: scene-linear EXR into an OCIO look. The LUT is indexed by PQ code of
+    // (linear x 203 nits), the bake decodes it, so values above 1.0 reach the transform:
+    // linear -> ACEScct (log, keeps them) for 0.18, 1.0 and 4.0 (two stops over white).
+    r.src = "Linear Rec.709 (sRGB)";
+    r.dst = "ACEScct";
+    r.linearPqInput = true;
+    CHECK(mp::ocio::Bake(r, lut, err), err.c_str());
+    for (float v : {0.18f, 1.0f, 4.0f}) {
+        const float code = mp::color::NitsToPq(v * mp::color::kRefWhiteNits);
+        const float in[3] = {code, code, code};
+        if (lut.Valid()) Sample(lut, in, out);
+        const float expect = (std::log2(v) + 9.72f) / 17.52f;  // ACEScct above its toe
+        std::printf("  scene-linear %.2f via PQ code %.3f -> ACEScct %.4f (expect %.4f)\n", v, code, out[1], expect);
+        CHECK(std::fabs(out[1] - expect) < 0.01f, "PQ-coded linear input decoded before the transform");
+    }
+    r.linearPqInput = false;
 
     // a display / view bake runs (ACEScct log -> the default display's default view)
     r.dst.clear();

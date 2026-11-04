@@ -782,6 +782,14 @@ void App::RenderOneFrame() {
                                     (uint32_t)vf->height,
                                     i420 ? 0 : vf->format == PixFormat::P016 ? 2 : 1, vf->fullRange,
                                     (int)vf->matrix);  // the frame's colour tag (BT.709 default)
+#if MEDIAPLAYER_PRO
+                // HDR (#134): the shader maps HLG / PQ / scene-linear EXR to the SDR panel. A
+                // live source tags HDR but not primaries; HDR on the BT.2020 matrix is BT.2020.
+                const bool hdr = vf->transfer == ColorTransfer::HLG || vf->transfer == ColorTransfer::PQ;
+                renderer_.SetSourceHdr((int)vf->transfer,
+                                       vf->primaries2020 || (hdr && vf->matrix == ColorMatrix::BT2020),
+                                       vf->peakNits);
+#endif
             }
         }
     }

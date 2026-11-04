@@ -20,4 +20,22 @@ inline void UnpackWipeGamma(uint32_t v, float& pos, float& gamma) {
     gamma = (float)(v >> 16) / 4096.0f;
 }
 
+// The shader's `yuvMatrix` word (#134): bits 0-1 the Y'CbCr matrix (unchanged, so an SDR
+// frame packs to exactly the matrix as before), bits 4-5 the HDR transfer (0 SDR, 1 HLG,
+// 2 PQ, 3 scene-linear stored as PQ), bit 6 the highlight roll-off, bit 7 BT.2020 primaries,
+// bit 8 the PQ shaper for an OCIO look (ToneMap.h HdrParams::pqShaper), bits 16-31 the
+// source peak in nits. SDR ignores everything but the matrix.
+inline int32_t PackColourWord(int matrix, int transfer, bool rollOff, bool bt2020, float peakNits,
+                              bool pqShaper = false) {
+    uint32_t w = (uint32_t)(matrix & 3);
+    if (transfer <= 0 || transfer > 3) return (int32_t)w;
+    const float pk = peakNits < 1.0f ? 1.0f : peakNits > 10000.0f ? 10000.0f : peakNits;
+    w |= (uint32_t)transfer << 4;
+    if (rollOff) w |= 1u << 6;
+    if (bt2020) w |= 1u << 7;
+    if (pqShaper) w |= 1u << 8;
+    w |= (uint32_t)(pk + 0.5f) << 16;
+    return (int32_t)w;
+}
+
 }  // namespace mp

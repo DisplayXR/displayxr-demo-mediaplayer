@@ -114,7 +114,11 @@ uint8_t Glow(uint32_t count, float logNorm) {
 }  // namespace
 
 void ApplyGrade(const Grade& g, float c[3]) {
-    if (g.exposure != 0.0f) {
+    if (color::IsHdr(g.hdr)) {
+        color::HdrParams p = g.hdr;
+        p.exposure = g.exposure;
+        color::HdrToDisplay(p, c);
+    } else if (g.exposure != 0.0f) {
         const float m = std::exp2(g.exposure);
         for (int k = 0; k < 3; ++k) c[k] = LinearToSrgb(Clamp01(SrgbToLinear(Clamp01(c[k])) * m));
     }
@@ -191,6 +195,8 @@ bool Gather(const FrameRing::Frame& f, StereoLayout layout, int analysisW, Frame
     mini.fullRange = f.fullRange;
     mini.matrix = f.matrix;
     mini.transfer = f.transfer;
+    mini.primaries2020 = f.primaries2020;
+    mini.peakNits = f.peakNits;
     mini.gpu = false;
     mini.serial = f.serial;
     // Source column / row of each mini sample (pixel centres).

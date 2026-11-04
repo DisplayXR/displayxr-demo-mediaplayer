@@ -3,6 +3,7 @@
 #include "media/ImageSequence.h"
 
 #include "Log.h"
+#include "color/ToneMap.h"  // scene-linear EXR -> PQ code (#134)
 
 #include <algorithm>
 #include <cctype>
@@ -33,6 +34,7 @@ extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>  // <d3d11.h> already included above (guarded)
 #endif
 #include <libavutil/imgutils.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
@@ -76,6 +78,48 @@ static ColorTransfer TransferOf(const AVFrame* f, const AVCodecContext* c) {
     return ColorTransfer::SDR;
 }
 
+static bool PrimariesAre2020(const AVFrame* f, const AVCodecContext* c) {
+    AVColorPrimaries p = f ? f->color_primaries : AVCOL_PRI_UNSPECIFIED;
+    if (p == AVCOL_PRI_UNSPECIFIED && c) p = c->color_primaries;
+    return p == AVCOL_PRI_BT2020;
+}
+
+// The brightest the stream says it gets (nits): MaxCLL, else the mastering display's peak.
+// Frames carry it on keyframes (HEVC SEI), the container on the stream, so the last value
+// seen is kept. 0 = never said.
+static float PeakNitsOf(const AVFrame* f) {
+    if (!f) return 0.0f;
+    if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL)) {
+        const auto* cll = (const AVContentLightMetadata*)sd->data;
+        if (cll->MaxCLL > 0) return (float)cll->MaxCLL;
+    }
+    if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) {
+        const auto* md = (const AVMasteringDisplayMetadata*)sd->data;
+        if (md->has_luminance && md->max_luminance.den > 0) return (float)av_q2d(md->max_luminance);
+    }
+    return 0.0f;
+}
+static float StreamPeakNits(const AVStream* st) {
+#if LIBAVCODEC_VERSION_MAJOR < 61  // coded_side_data is FFmpeg 6.1+ (Ubuntu 22.04 has 4.4)
+    (void)st;
+    return 0.0f;
+#else
+    if (!st || !st->codecpar) return 0.0f;
+    const AVCodecParameters* cp = st->codecpar;
+    if (const AVPacketSideData* sd =
+            av_packet_side_data_get(cp->coded_side_data, cp->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL)) {
+        const auto* cll = (const AVContentLightMetadata*)sd->data;
+        if (cll->MaxCLL > 0) return (float)cll->MaxCLL;
+    }
+    if (const AVPacketSideData* sd = av_packet_side_data_get(cp->coded_side_data, cp->nb_coded_side_data,
+                                                             AV_PKT_DATA_MASTERING_DISPLAY_METADATA)) {
+        const auto* md = (const AVMasteringDisplayMetadata*)sd->data;
+        if (md->has_luminance && md->max_luminance.den > 0) return (float)av_q2d(md->max_luminance);
+    }
+    return 0.0f;
+#endif
+}
+
 struct VideoDecoder::Impl {
     AVFormatContext* fmt = nullptr;
     AVCodecContext* codec = nullptr;
@@ -92,7 +136,8 @@ struct VideoDecoder::Impl {
     AVFrame* f32Frame = nullptr;
     AVFrame* f32Out = nullptr;
     int swsFW = 0, swsFH = 0, swsFFmt = -1;
-    std::vector<float> oetf;                    // linear [0,1] -> sRGB samples, lerped
+    std::vector<float> oetf;                    // scene linear -> PQ code samples, lerped (#134)
+    float peakNits = 0.0f;                      // last light-level metadata seen (#134)
     // MV-HEVC (#154): both views are decoded and glued into one full-SBS frame.
     bool mv = false;
     AVFrame* mvPending = nullptr;               // the first view of the current pair
@@ -447,16 +492,12 @@ AVFrame* VideoDecoder::FloatToP016(AVFrame* src) {
         sws_scale(im.swsF, src->data, src->linesize, 0, src->height, im.f32Frame->data, im.f32Frame->linesize);
         g = im.f32Frame;
     }
-    // linear -> sRGB OETF as a lerped table: 16385 samples keep the error under 0.1 of a
-    // 16-bit code (the toe is linear, so it is exact there).
-    constexpr int kOetfN = 16384;
-    if (im.oetf.empty()) {
-        im.oetf.resize(kOetfN + 1);
-        for (int i = 0; i <= kOetfN; ++i) {
-            const double l = (double)i / kOetfN;
-            im.oetf[(size_t)i] = (float)(l <= 0.0031308 ? 12.92 * l : 1.055 * std::pow(l, 1.0 / 2.4) - 0.055);
-        }
-    }
+    // Scene linear -> PQ code of (linear x 203 nits) (#134): 1.0 is HDR reference white and
+    // values up to ~49x it survive, where the sRGB encode this replaced clipped at 1.0. The
+    // shader decodes it back (ColorTransfer::LinearPq). A lerped table indexed by the eighth
+    // root of the value, which straightens PQ's steep toe (color::EncodeLinearPq).
+    constexpr int kOetfN = color::kLinearPqTableN;
+    if (im.oetf.empty()) color::BuildLinearPqTable(im.oetf);
     if (!im.f32Out || im.f32Out->width != w || im.f32Out->height != h) {
         if (!im.f32Out) im.f32Out = av_frame_alloc();
         av_frame_unref(im.f32Out);
@@ -466,14 +507,8 @@ AVFrame* VideoDecoder::FloatToP016(AVFrame* src) {
         if (av_frame_get_buffer(im.f32Out, 32) < 0) return nullptr;
     }
     const float* lut = im.oetf.data();
-    // Branch-free: clamp to [0,1] (values > 1.0 clip - an OCIO view is the tool for HDR EXR;
-    // fmin/fmax also send NaN to 0), then lerp the table.
-    const int oetfN = kOetfN;  // a copy: MSVC will not capture a constexpr implicitly
-    auto enc = [lut, oetfN](float v) -> float {
-        const float t = std::fmin(std::fmax(v, 0.0f), 1.0f) * (float)oetfN;
-        const int i = (std::min)((int)t, oetfN - 1);  // parenthesised: windows.h min()
-        return lut[i] + (lut[i + 1] - lut[i]) * (t - (float)i);
-    };
+    (void)kOetfN;
+    auto enc = [lut](float v) -> float { return color::EncodeLinearPq(lut, v); };
     // 10-bit limited levels at 16-bit precision, MSB-aligned like P010 - what the shader's
     // P016 branch reads ((v*65535/64 - 64)/876): Y 64..940, C 64..960 (x64), fraction kept.
     auto q16 = [](float v) -> uint16_t { return (uint16_t)std::fmin(std::fmax(v + 0.5f, 0.0f), 65535.0f); };
@@ -588,6 +623,7 @@ bool VideoDecoder::Open(const std::string& path) {
     // as a second coded layer of the same stream. Decode both views and compose them side
     // by side, so the clip reaches the player as an ordinary full-SBS frame.
     impl_->mv = spatial::ff::IsMvHevcStream(impl_->fmt->streams[impl_->videoStream]);
+    impl_->peakNits = StreamPeakNits(impl_->fmt->streams[impl_->videoStream]);  // #134
     multiview_ = impl_->mv;
     multiviewEyesFromMeta_ = false;
     if (!OpenVideoCodec(dec, path)) {
@@ -868,6 +904,9 @@ void VideoDecoder::DecodeLoop() {
                 dst.gpu = true;
                 dst.matrix = MatrixOf(f, impl_->codec);  // (applied above; the tag is for the UI / tools)
                 dst.transfer = TransferOf(f, impl_->codec);
+                dst.primaries2020 = PrimariesAre2020(f, impl_->codec);
+                if (const float pk = PeakNitsOf(f)) impl_->peakNits = pk;
+                dst.peakNits = impl_->peakNits;
                 const int64_t ticks = (f->best_effort_timestamp != AV_NOPTS_VALUE)
                                           ? f->best_effort_timestamp
                                           : f->pts;
@@ -989,6 +1028,13 @@ void VideoDecoder::DecodeLoop() {
         else
             dst.matrix = outFmt == PixFormat::P016 ? ColorMatrix::BT709 : ColorMatrix::BT601;
         dst.transfer = TransferOf(src, impl_->codec);
+        dst.primaries2020 = PrimariesAre2020(src, impl_->codec);
+        if (const float pk = PeakNitsOf(f)) impl_->peakNits = pk;  // f: the hw copy drops side data
+        dst.peakNits = impl_->peakNits;
+        if (outFmt == PixFormat::P016 && desc && (desc->flags & AV_PIX_FMT_FLAG_FLOAT)) {
+            dst.transfer = ColorTransfer::LinearPq;  // FloatToP016 stored PQ of linear x 203 nits
+            dst.primaries2020 = false;               // OpenEXR's default (linear Rec.709 / sRGB)
+        }
         const int cw = (yuv->width + 1) / 2, ch = (yuv->height + 1) / 2;
         copyPlane(dst.plane[0], yuv->data[0], yuv->linesize[0], yuv->width, yuv->height);
         if (outFmt == PixFormat::P016) {

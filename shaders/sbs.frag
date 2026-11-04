@@ -50,7 +50,10 @@ layout(push_constant) uniform PushConstants {
     vec4 cdlOffset;  // .rgb = ASC offset, .a = 1 when the CDL is on
     vec4 cdlPower;   // .rgb = ASC power; .a = VR window pitch, radians (#155)
     vec4 lutDomain;  // .x = domain min, .y = 1/(max-min), .z = LUT size N, .w = 1 for P016
-    int yuvMatrix;   // 0 = BT.709 (default: base content unchanged), 1 = BT.601, 2 = BT.2020 NCL
+    int yuvMatrix;   // bits 0-1: 0 = BT.709 (default: base content unchanged), 1 = BT.601,
+                     // 2 = BT.2020 NCL. Pro HDR (#134, 0 for SDR): bits 4-5 transfer (1 HLG,
+                     // 2 PQ, 3 scene-linear stored as PQ), bit 6 roll-off, bit 7 BT.2020
+                     // primaries, bit 8 PQ shaper for an OCIO look, bits 16-31 source peak
     float zebraLevel;// > 0: diagonal stripes where the graded luma is at or above it (0..1)
     int viewFlags;   // bits 0-2 channel (0 RGB, 1 R, 2 G, 3 B, 4 alpha, 5 luma); bits 4-5 wipe
                      // (0 off, 1 before | after the grade, 2 left eye | right eye, 3 clip A | B);
@@ -80,9 +83,9 @@ vec4 EncodeForTarget(vec4 c) {
 // and for yuvMatrix 0 this is exactly the BT.709 expression the shader always used.
 vec3 YuvToRgb(float yb, float ub, float vb) {
 #ifdef MP_GRADE
-    if (pc.yuvMatrix == 1)         // BT.601 (Kr .299, Kb .114): SD video, JPEG-era sources
+    if ((pc.yuvMatrix & 3) == 1)       // BT.601 (Kr .299, Kb .114): SD video, JPEG-era sources
         return vec3(yb + 1.402 * vb, yb - 0.344136 * ub - 0.714136 * vb, yb + 1.772 * ub);
-    if (pc.yuvMatrix == 2)         // BT.2020 non-constant luminance (Kr .2627, Kb .0593)
+    if ((pc.yuvMatrix & 3) == 2)       // BT.2020 non-constant luminance (Kr .2627, Kb .0593)
         return vec3(yb + 1.4746 * vb, yb - 0.164553 * ub - 0.571353 * vb, yb + 1.8814 * ub);
 #endif
     return vec3(yb + 1.5748 * vb,
@@ -182,8 +185,8 @@ vec3 SceneLinearToDisplayReferred(vec3 c) {
 // Media Player Pro grade, in the order an on-set chain applies it:
 // exposure (linear light) -> ASC CDL (on the encoded signal) -> 3D LUT.
 // Every stage is skipped at its identity, so the base player pays three branches.
-vec3 Grade(vec3 c) {
-    if (pc.exposure != 0.0) {
+vec3 GradeStages(vec3 c, bool withExposure) {
+    if (withExposure && pc.exposure != 0.0) {
         vec3 lin = DisplayReferredToSceneLinear(clamp(c, 0.0, 1.0)) * exp2(pc.exposure);
         c = SceneLinearToDisplayReferred(clamp(lin, 0.0, 1.0));
     }
@@ -199,6 +202,83 @@ vec3 Grade(vec3 c) {
         c = texture(lut3d, t * ((n - 1.0) / n) + 0.5 / n).rgb;
     }
     return c;
+}
+vec3 Grade(vec3 c) { return GradeStages(c, true); }
+
+// HDR sources on the SDR panel (#134). The CPU twin is src/color/ToneMap.h HdrToDisplay();
+// change one, change the other. Signal -> linear relative to reference white (203 nits) ->
+// exposure -> BT.2020 -> BT.709 -> BT.2390 roll-off on max(R,G,B) down to reference white
+// -> sRGB encode, so the grade, the LUT and the QC views see an SDR picture.
+const float kRefWhite = 203.0;
+const float kPqM1 = 2610.0 / 16384.0;
+const float kPqM2 = 2523.0 / 4096.0 * 128.0;
+const float kPqC1 = 3424.0 / 4096.0;
+const float kPqC2 = 2413.0 / 4096.0 * 32.0;
+const float kPqC3 = 2392.0 / 4096.0 * 32.0;
+
+int HdrTransfer() { return (pc.yuvMatrix >> 4) & 3; }
+
+float PqToNits(float e) {
+    float p = pow(clamp(e, 0.0, 1.0), 1.0 / kPqM2);
+    return 10000.0 * pow(max(p - kPqC1, 0.0) / (kPqC2 - kPqC3 * p), 1.0 / kPqM1);
+}
+float NitsToPq(float nits) {
+    float p = pow(clamp(nits / 10000.0, 0.0, 1.0), kPqM1);
+    return pow((kPqC1 + kPqC2 * p) / (1.0 + kPqC3 * p), kPqM2);
+}
+float HlgToScene(float e) {
+    e = clamp(e, 0.0, 1.0);
+    return e <= 0.5 ? e * e / 3.0 : (exp((e - 0.55991073) / 0.17883277) + 0.28466892) / 12.0;
+}
+float Bt2390Nits(float nits, float srcPeak, float dstPeak) {
+    if (srcPeak <= dstPeak) return min(nits, dstPeak);
+    float sMax = NitsToPq(srcPeak);
+    float e1 = NitsToPq(nits) / sMax;
+    float maxLum = NitsToPq(dstPeak) / sMax;
+    float ks = 1.5 * maxLum - 0.5;
+    float e2 = e1;
+    if (e1 >= 1.0) {
+        e2 = maxLum;
+    } else if (e1 > ks) {
+        float t = (e1 - ks) / (1.0 - ks), t2 = t * t, t3 = t2 * t;
+        e2 = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) + (-2.0 * t3 + 3.0 * t2) * maxLum;
+    }
+    return PqToNits(e2 * sMax);
+}
+vec3 HdrToDisplay(vec3 c, float exposure, bool lutShaper) {
+    const int tr = HdrTransfer();
+    vec3 l;
+    if (tr == 1) {  // HLG: inverse OETF, then the OOTF for a 1000-nit display (gamma 1.2)
+        vec3 s = vec3(HlgToScene(c.r), HlgToScene(c.g), HlgToScene(c.b));
+        float ys = dot(s, vec3(0.2627, 0.6780, 0.0593));
+        l = s * (1000.0 * pow(max(ys, 1e-6), 0.2) / kRefWhite);
+    } else {        // PQ, or scene-linear stored as PQ
+        l = vec3(PqToNits(c.r), PqToNits(c.g), PqToNits(c.b)) / kRefWhite;
+    }
+    float m = exp2(exposure);
+    l *= m;
+    if (((pc.yuvMatrix >> 7) & 1) != 0)
+        l = vec3(1.660491 * l.r - 0.587641 * l.g - 0.072850 * l.b,
+                 -0.124550 * l.r + 1.132900 * l.g - 0.008349 * l.b,
+                 -0.018151 * l.r - 0.100579 * l.g + 1.118730 * l.b);
+    l = max(l, vec3(0.0));
+    // An OCIO look on scene-linear EXR: the LUT gets the linear light as PQ code, unclipped
+    // (its bake decodes it first), instead of the SDR picture.
+    if (lutShaper && ((pc.yuvMatrix >> 8) & 1) != 0)
+        return vec3(NitsToPq(l.r * kRefWhite), NitsToPq(l.g * kRefWhite), NitsToPq(l.b * kRefWhite));
+    float mx = max(l.r, max(l.g, l.b));
+    if (((pc.yuvMatrix >> 6) & 1) != 0 && mx > 0.0) {
+        float src = (tr == 1 ? 1000.0 : float((pc.yuvMatrix >> 16) & 0xFFFF)) * m;
+        l *= (Bt2390Nits(mx * kRefWhite, src, kRefWhite) / kRefWhite) / mx;
+    }
+    return SceneLinearToDisplayReferred(clamp(l, 0.0, 1.0));
+}
+
+// The picture as decoded (the "before" side of the grade wipe): HDR made viewable, no grade.
+vec3 SourceView(vec3 s) { return HdrTransfer() == 0 ? s : HdrToDisplay(s, 0.0, false); }
+// This clip's grade: an HDR source takes exposure in linear light, before the roll-off.
+vec3 GradeSrc(vec3 s) {
+    return HdrTransfer() == 0 ? Grade(s) : GradeStages(HdrToDisplay(s, pc.exposure, true), false);
 }
 
 // False colour: exposure bands on the graded Rec.709 luma (% of full scale), the rest in
@@ -216,6 +296,7 @@ vec3 FalseColour(vec3 c) {
 }
 #else
 vec3 Grade(vec3 c) { return c; }
+vec3 GradeSrc(vec3 c) { return c; }
 #endif
 
 #ifdef MP_GRADE
@@ -296,7 +377,7 @@ void main() {
     }
     vec2 otherUv = vr ? VrFrameUV(tan0 + pc.otherDelta, true).xy : uv + pc.otherDelta;
 #endif
-    vec3 graded = Grade(SampleSource(uv));
+    vec3 graded = GradeSrc(SampleSource(uv));
 #ifdef MP_GRADE
     if (inPicture < 0.5) graded = vec3(0.0);
 #endif
@@ -309,8 +390,8 @@ void main() {
     // same in both eyes. 1: left of it the source as it arrives, right of it the grade.
     // 2: left of it the left eye, right of it the right eye (otherDelta reaches it).
     const bool pastWipe = wipe != 0 && vUV.x >= wipePos;
-    if (wipe == 1 && !pastWipe) c = SampleSource(uv);
-    if (wipe == 2 && pastWipe) c = Grade(SampleSource(otherUv));
+    if (wipe == 1 && !pastWipe) c = SourceView(SampleSource(uv));
+    if (wipe == 2 && pastWipe) c = GradeSrc(SampleSource(otherUv));
     // 3: right of the line the compare clip B, at the same point of the same eye, graded
     // the same way (both versions seen through one look). Without B bound, A stays.
     if (wipe == 3 && pastWipe && ((pc.viewFlags >> 14) & 1) != 0) c = Grade(SampleSourceB(uv));
@@ -319,10 +400,10 @@ void main() {
 
 #ifdef MP_GRADE
     if (pc.qcMode == 1) {          // eye difference: alignment / sync check
-        vec3 o = Grade(SampleSource(otherUv));
+        vec3 o = GradeSrc(SampleSource(otherUv));
         c = clamp(abs(c - o) * 4.0, 0.0, 1.0);
     } else if (pc.qcMode == 2) {   // anaglyph: red = this (left) eye, cyan = the other
-        vec3 o = Grade(SampleSource(otherUv));
+        vec3 o = GradeSrc(SampleSource(otherUv));
         float l = dot(c, vec3(0.299, 0.587, 0.114));
         float r = dot(o, vec3(0.299, 0.587, 0.114));
         c = vec3(l, r, r);

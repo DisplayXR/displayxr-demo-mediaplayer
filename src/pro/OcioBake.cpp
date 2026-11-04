@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pro/OcioBake.h"
 
+#include "color/ToneMap.h"  // PQ decode for scene-linear input (#134)
+
 #if defined(MEDIAPLAYER_WITH_OCIO)
 #include <OpenColorIO/OpenColorIO.h>
 namespace OCIO = OCIO_NAMESPACE;
@@ -76,8 +78,17 @@ bool Bake(const Request& req, color::CubeLut& out, std::string& err) {
                     out.rgb[i + 2] = (float)b / (n - 1);
                     i += 3;
                 }
-        OCIO::PackedImageDesc img(out.rgb.data(), (long)n * n * n, 1, 3);
+        std::vector<float> in;
+        float* src = out.rgb.data();
+        if (req.linearPqInput) {  // #134: the LUT is indexed by PQ code; OCIO wants linear
+            in = out.rgb;
+            for (float& v : in) v = color::PqToNits(v) / color::kRefWhiteNits;
+            src = in.data();
+            out.title += " [scene-linear]";
+        }
+        OCIO::PackedImageDesc img(src, (long)n * n * n, 1, 3);
         cpu->apply(img);
+        if (req.linearPqInput) out.rgb = std::move(in);
         return true;
     } catch (const OCIO::Exception& e) {
         err = std::string("OpenColorIO: ") + e.what();
