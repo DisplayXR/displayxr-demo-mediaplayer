@@ -3177,6 +3177,7 @@ android_main(struct android_app *app)
 				if (is_jpeg || is_png) {
 					if (!load_picked_image(app, pick, off, len)) {
 						LOGE("Failed to load picked image (fd=%d)", pick);
+						load_splash(app);  // the old media is gone: never leave nothing on screen
 					}
 					close(pick);  // image path stages a copy; the fd is done
 				} else {
@@ -3236,6 +3237,7 @@ android_main(struct android_app *app)
 						if (audio_fd >= 0) close(audio_fd);
 						if (probe_fd >= 0) close(probe_fd);
 						LOGE("Failed to open picked video (fd=%d)", pick);
+						load_splash(app);
 					}
 				}
 			}
