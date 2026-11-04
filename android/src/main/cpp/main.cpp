@@ -1583,8 +1583,8 @@ create_hud_swapchain()
 	// Same choice as the desktop XrSession::CreateHudSwapchain: RGBA channel order is
 	// load-bearing (ImGui's pipeline + DumpExternalImage assume R,G,B,A bytes), so
 	// R8G8B8A8_SRGB (43) -> R8G8B8A8_UNORM (37) -> formats[0]; =unorm swaps the first two.
-	// On an _SRGB HUD, ImGuiLayer draws into a UNORM staging image (blending stays in
-	// encoded space) and vkCmdCopyImage's the bytes across — hence TRANSFER_DST below.
+	// On an _SRGB HUD, ImGuiLayer draws through UNORM views (blending stays in encoded
+	// space), hence MUTABLE_FORMAT below. Its staging copy costs Adreno 9-12 ms a frame.
 	const bool legacy_unorm = swapchain_encoding() == mp::color::Encoding::Unorm;
 	const int64_t order[2] = {legacy_unorm ? mp::color::kR8G8B8A8_UNORM : mp::color::kR8G8B8A8_SRGB,
 	                          legacy_unorm ? mp::color::kR8G8B8A8_SRGB : mp::color::kR8G8B8A8_UNORM};
@@ -1606,7 +1606,7 @@ create_hud_swapchain()
 	XrSwapchainCreateInfo ci = {};
 	ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
 	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
-	                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	                XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
 	ci.format = fmt;
 	ci.sampleCount = 1;
 	ci.width = render_w;
@@ -1676,6 +1676,7 @@ hud_init()
 	// The touch UI was tuned on the 320 dpi NP02J through a 1920x1200 HUD stretched to the
 	// 2560x1600 panel (x1.33). dpi / 240 keeps that size there and follows density elsewhere.
 	if (g_density_dpi > 0) g_imgui.SetUiScale((float)g_density_dpi / 240.0f);
+	g_imgui.SetMutableHud(true);
 	if (!g_imgui.Init(nullptr, g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
 	                  g_vk_queue_family, g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images,
 	                  frames_in_flight())) {

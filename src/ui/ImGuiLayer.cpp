@@ -90,11 +90,13 @@ bool ImGuiLayer::CreateTargetObjects(VkFormat hudFormat, uint32_t hudWidth,
     hudHeight_ = hudHeight;
     hudImages_ = hudImages;
 
-    // --- #78: an _SRGB HUD swapchain gets an intermediate. See the staging* members in
-    //     the header for why ImGui must keep blending in the encoded (UNORM) space.
-    const bool stage = color::IsSrgb8((int64_t)hudFormat);
+    // --- #78: an _SRGB HUD swapchain is drawn in its UNORM sibling, through views of the
+    //     images when they are MUTABLE_FORMAT, else into an intermediate. See the staging*
+    //     members in the header for why ImGui must keep blending in the encoded space.
+    const bool srgb = color::IsSrgb8((int64_t)hudFormat);
+    const bool stage = srgb && !mutableHud_;
     const VkFormat drawFormat =
-        stage ? (VkFormat)color::UnormCounterpart((int64_t)hudFormat) : hudFormat;
+        srgb ? (VkFormat)color::UnormCounterpart((int64_t)hudFormat) : hudFormat;
 
     // --- Render pass over the draw target: clear to transparent. Direct to the HUD image
     //     it ends in COLOR_ATTACHMENT_OPTIMAL (what the runtime expects at swapchain
@@ -204,7 +206,7 @@ bool ImGuiLayer::CreateTargetObjects(VkFormat hudFormat, uint32_t hudWidth,
         VkImageViewCreateInfo iv{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         iv.image = hudImages[i];
         iv.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        iv.format = hudFormat;
+        iv.format = drawFormat;
         iv.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         if (vkCreateImageView(device_, &iv, nullptr, &imageViews_[i]) != VK_SUCCESS) {
             LOG_ERROR("ImGuiLayer: vkCreateImageView failed");
@@ -221,6 +223,10 @@ bool ImGuiLayer::CreateTargetObjects(VkFormat hudFormat, uint32_t hudWidth,
             LOG_ERROR("ImGuiLayer: vkCreateFramebuffer failed");
             return false;
         }
+    }
+    if (srgb) {
+        LOG_INFO("ImGuiLayer: HUD is sRGB (format %d), drawing through %d views (#78)",
+                 (int)hudFormat, (int)drawFormat);
     }
     return true;
 }
