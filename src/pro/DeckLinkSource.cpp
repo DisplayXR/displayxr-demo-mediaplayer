@@ -157,10 +157,13 @@ void DeckLinkSource::PrintDeviceList(FILE* out) {
     const std::vector<std::string> devs = Enumerate();
     if (devs.empty()) {
         std::fprintf(out, "No Blackmagic inputs: %s.\n", UnavailableReason().c_str());
-        return;
+    } else {
+        std::fprintf(out, "Blackmagic devices (use the number or part of the name):\n");
+        for (const std::string& d : devs) std::fprintf(out, "  %s\n", d.c_str());
     }
-    std::fprintf(out, "Blackmagic devices (use the number or part of the name):\n");
-    for (const std::string& d : devs) std::fprintf(out, "  %s\n", d.c_str());
+    // Also with no card: station acceptance E2 reads the driver version from this line.
+    const std::string v = DriverVersionText();
+    if (!v.empty()) std::fprintf(out, "Desktop Video %s\n", v.c_str());
 }
 
 #if defined(MEDIAPLAYER_WITH_DECKLINK)
@@ -878,6 +881,12 @@ DeckLinkSource::PairStats DeckLinkSource::GetPairStats() const {
     return pairStats_;
 }
 
+std::string DeckLinkSource::DriverVersionText() {
+    dl::ComScope com;
+    const int64_t v = DriverVersion();
+    return v > 0 ? VersionText(v) : std::string();
+}
+
 std::vector<std::string> DeckLinkSource::Enumerate() {
     dl::ComScope com;
     std::vector<std::string> names;
@@ -1043,6 +1052,7 @@ void DeckLinkSource::Worker() {
 bool DeckLinkSource::Available() { return false; }
 std::vector<std::string> DeckLinkSource::Enumerate() { return {}; }
 std::string DeckLinkSource::UnavailableReason() { return "this build has no DeckLink SDK"; }
+std::string DeckLinkSource::DriverVersionText() { return {}; }
 DeckLinkSource::PairStats DeckLinkSource::GetPairStats() const { return {}; }
 void DeckLinkSource::Worker() {}
 

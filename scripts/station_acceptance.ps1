@@ -159,12 +159,25 @@ if (Want "E2") {
         $info | Set-Content (Join-Path $Out "E2_info.txt") -Encoding utf8
         $rt = if ($info -match "git-tag:\s*'?v?([\d\.]+)") { $Matches[1] } else { "" }
         $lp = if ($info -match "DisplayXR Leia SR'\s+v?([\d\.]+)") { $Matches[1] } else { "" }
-        if (-not $rt) { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "FAIL" "could not read the runtime version (E2_info.txt)" }
-        elseif (-not (Version-AtLeast $rt 2 53)) { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "FAIL" "runtime $rt is older than 2.53" }
-        elseif ($lp -and -not (Version-AtLeast $lp 2 17)) { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "FAIL" "Leia plug-in $lp is older than 2.17" }
-        elseif (-not $lp) { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "INFO" "runtime $rt; no Leia plug-in registered (not a Leia display?)" }
-        else { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "PASS" "runtime $rt, Leia plug-in $lp" }
-    } else { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "SKIP" "no displayxr-cli" }
+        # Runtime 2.61: display calibration keys .cube files by XrDisplayStableKeyDXR (display_info v24).
+        # Desktop Video 16.0: the SDK the player is built against (third_party/decklink-sdk); older is refused.
+        $what = if ($DeckLink) { "Runtime 2.61+ / Leia plug-in 2.17+ / Desktop Video 16.0+" } else { "Runtime 2.61+ / Leia plug-in 2.17+" }
+        $dv = ""
+        if ($DeckLink) {
+            $dlList = & $Exe --decklink-list 2>&1 | Out-String
+            $dv = if ($dlList -match "Desktop Video (\d+\.\d+(\.\d+)?)") { $Matches[1] } else { "" }
+        }
+        $fails = @()
+        if (-not $rt) { $fails += "could not read the runtime version (E2_info.txt)" }
+        elseif (-not (Version-AtLeast $rt 2 61)) { $fails += "runtime $rt is older than 2.61" }
+        if ($lp -and -not (Version-AtLeast $lp 2 17)) { $fails += "Leia plug-in $lp is older than 2.17" }
+        if ($DeckLink -and -not $dv) { $fails += "could not read the Desktop Video version (is it installed? see D1)" }
+        elseif ($DeckLink -and -not (Version-AtLeast $dv 16 0)) { $fails += "Desktop Video $dv is older than 16.0" }
+        $have = @("runtime $rt"); if ($lp) { $have += "Leia plug-in $lp" }; if ($dv) { $have += "Desktop Video $dv" }
+        if ($fails) { Report "E2" $what "FAIL" ($fails -join "; ") }
+        elseif (-not $lp) { Report "E2" $what "INFO" (($have -join ", ") + "; no Leia plug-in registered (not a Leia display?)") }
+        else { Report "E2" $what "PASS" ($have -join ", ") }
+    } else { Report "E2" "Runtime 2.61+ / Leia plug-in 2.17+" "SKIP" "no displayxr-cli" }
 }
 if (Want "E3") {
     $gpus = (Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name) (driver $($_.DriverVersion))" }) -join "; "
@@ -293,9 +306,12 @@ if (-not $DeckLink) {
         $secs = [int]($SoakMinutes * 60 + 20)
         Write-Host "     D3 two-input soak: $SoakMinutes min, inputs $Left + $Right ($Connection)..." -ForegroundColor Gray
         $script:soakT0 = Get-Date
+        $script:soakLastRow = [datetime]::MinValue
         $r = Run-Player "D3_two_input" @("--decklink=$Left", "--decklink-right=$Right", "--decklink-input=$Connection") @{} -dumpFrame 600 -seconds $secs -until {
             param($s)
-            if ($s.rig -and $s.rig.decklink) {
+            # The status poll runs every 0.5 s; the CSV keeps one row every 2 s.
+            if ($s.rig -and $s.rig.decklink -and ((Get-Date) - $script:soakLastRow).TotalSeconds -ge 2) {
+                $script:soakLastRow = Get-Date
                 $d = $s.rig.decklink
                 "{0:N0},{1},{2},{3},{4},{5},{6},{7},{8}" -f ((Get-Date) - $script:soakT0).TotalSeconds, $d.signal_fps, $d.delivered_fps, $d.late_frames, $d.dropped, $d.pairs, $d.unpaired, $d.max_skew_ms, $s.timecode | Add-Content $csv
             }
