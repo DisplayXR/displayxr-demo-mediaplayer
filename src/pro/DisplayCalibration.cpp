@@ -100,4 +100,19 @@ bool Remove(const std::string& key, std::string& err) {
     return true;
 }
 
+bool IsKeptFile(const std::string& path, const std::string& key) {
+    if (path.empty()) return false;
+    const std::string kept = CalibrationPathFor(key);
+    if (kept.empty()) return false;
+    std::error_code ec;
+    const fs::path a = fs::u8path(path), b = fs::u8path(kept);
+    if (fs::equivalent(a, b, ec)) return true;   // both exist and are the same file
+    // The kept file may be gone already (deleted outside the player): compare the names.
+    ec.clear();
+    const fs::path na = fs::weakly_canonical(a, ec);
+    if (ec) return false;
+    const fs::path nb = fs::weakly_canonical(b, ec);
+    return !ec && na == nb;
+}
+
 }  // namespace mp::pro::cal
