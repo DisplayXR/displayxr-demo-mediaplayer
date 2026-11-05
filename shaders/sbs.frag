@@ -257,12 +257,12 @@ float Bt2390Nits(float nits, float srcPeak, float dstPeak) {
 vec3 HdrToDisplayTags(vec3 c, int tr, bool rollOff, bool bt2020, float peak, float exposure, bool shaper,
                       bool over) {
     vec3 l;
-    if (tr == 1) {  // HLG: inverse OETF, then the OOTF for a display of `peak` nits (#169;
-                    // BT.2100 system gamma 1.2 + 0.42 log10(Lw / 1000), 1.2 at 1000 nits)
+    if (tr == 1) {  // HLG: inverse OETF, then the OOTF for the nominal 1000-nit display
+                    // (system gamma 1.2). `peak` only sets the roll-off's source peak (#169:
+                    // reference white and the picture stay put; the highlights change)
         vec3 s = vec3(HlgToScene(c.r), HlgToScene(c.g), HlgToScene(c.b));
         float ys = dot(s, vec3(0.2627, 0.6780, 0.0593));
-        float gam = 1.2 + 0.42 * log(peak / 1000.0) / log(10.0);
-        l = s * (peak * pow(max(ys, 1e-6), gam - 1.0) / kRefWhite);
+        l = s * (1000.0 * pow(max(ys, 1e-6), 0.2) / kRefWhite);
     } else {        // PQ, or scene-linear stored as PQ
         l = vec3(PqToNits(c.r), PqToNits(c.g), PqToNits(c.b)) / kRefWhite;
     }
