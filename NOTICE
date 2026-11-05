@@ -17,3 +17,6 @@ Copyright (c) Blackmagic Design, under the licence in each file; see the README 
 The UI font, Inter (third_party/fonts/inter), is Copyright (c) 2016 The Inter
 Project Authors and licensed under the SIL Open Font License 1.1; see
 third_party/fonts/inter/LICENSE.txt.
+
+The Windows Media Player Pro build links OpenColorIO and its dependencies statically;
+their licences ship next to the program as OCIO-THIRD-PARTY-NOTICES.txt.

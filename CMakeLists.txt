@@ -583,7 +583,9 @@ endif()
 # DLLs (Imath, expat, zlib: <OpenRV>/_build/stage/app/bin). Off by default.
 # macOS: the Homebrew keg, -DMP_OCIO_ROOT="$(brew --prefix opencolorio)"
 # (scripts/build_macos.sh --ocio). The .app bundler collects the dylibs; no DLL dir.
-set(MP_OCIO_ROOT "" CACHE PATH "OpenColorIO 2.x install prefix (Pro, optional)")
+# Windows: scripts/build-ocio-win.ps1 builds a static one, so no DLLs ship. CI and the signing
+# build pass it through the MP_OCIO_ROOT environment variable.
+set(MP_OCIO_ROOT "$ENV{MP_OCIO_ROOT}" CACHE PATH "OpenColorIO 2.x install prefix (Pro, optional)")
 set(MP_OCIO_DLL_DIR "" CACHE PATH "Folder with OpenColorIO's dependency DLLs (Windows)")
 set(MP_HAVE_OCIO FALSE)
 set(MP_OCIO_DLLS "")
@@ -595,11 +597,28 @@ if(MP_OCIO_ROOT)
         string(REGEX REPLACE "/(opt|Cellar)/opencolorio.*$" "" _ocio_brew "${MP_OCIO_ROOT}")
         list(APPEND CMAKE_PREFIX_PATH "${_ocio_brew}")
     endif()
+    # scripts/build-ocio-win.ps1: a static vcpkg install holds the dependencies in the same prefix.
+    if(WIN32)
+        list(APPEND CMAKE_PREFIX_PATH "${MP_OCIO_ROOT}")
+    endif()
     find_package(OpenColorIO CONFIG PATHS "${MP_OCIO_ROOT}" NO_DEFAULT_PATH)
     if(OpenColorIO_FOUND)
         set(MP_HAVE_OCIO TRUE)
         if(WIN32)
             file(GLOB MP_OCIO_DLLS "${MP_OCIO_ROOT}/bin/OpenColorIO*.dll")
+            # A static vcpkg install: the licences of OpenColorIO and what it links, for the
+            # installer to carry, since their code is in the exe.
+            file(GLOB _ocio_licences "${MP_OCIO_ROOT}/share/*/copyright")
+            if(_ocio_licences)
+                set(_ocio_notice "${CMAKE_BINARY_DIR}/OCIO-THIRD-PARTY-NOTICES.txt")
+                file(WRITE "${_ocio_notice}" "OpenColorIO and the libraries it links, as built into Media Player Pro.\n")
+                foreach(_l ${_ocio_licences})
+                    get_filename_component(_d "${_l}" DIRECTORY)
+                    get_filename_component(_n "${_d}" NAME)
+                    file(READ "${_l}" _t)
+                    file(APPEND "${_ocio_notice}" "\n===== ${_n} =====\n\n${_t}\n")
+                endforeach()
+            endif()
             if(MP_OCIO_DLL_DIR)
                 file(GLOB _ocio_dep "${MP_OCIO_DLL_DIR}/Imath*.dll" "${MP_OCIO_DLL_DIR}/libexpat*.dll"
                                     "${MP_OCIO_DLL_DIR}/zlib*.dll")
@@ -608,7 +627,7 @@ if(MP_OCIO_ROOT)
         endif()
         message(STATUS "OpenColorIO (Pro): ON (${OpenColorIO_VERSION})")
     else()
-        message(WARNING "MP_OCIO_ROOT=${MP_OCIO_ROOT}: no OpenColorIO package found; OCIO off")
+        message(FATAL_ERROR "MP_OCIO_ROOT=${MP_OCIO_ROOT}: no OpenColorIO package found. Unset it for a build without OCIO.")
     endif()
 endif()
 
