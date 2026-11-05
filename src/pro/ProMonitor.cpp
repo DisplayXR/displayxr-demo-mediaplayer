@@ -297,7 +297,8 @@ void ProController::BuildHdrControls() {
         grade_.peakNits = (float)std::clamp(peak, 0, 10000);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("PQ / EXR: the source's brightest; 0 = from the stream's metadata (else 1000)\n"
-                          "HLG: the display peak HLG is rendered for (sets the system gamma); 0 = 1000");
+                          "HLG: where the highlight roll-off ends; the picture and reference white\n"
+                          "stay put; 0 = 1000");
     ImGui::SetNextItemWidth(itemW);
     static const char* kUntagged[] = {"SDR (as tagged)", "HLG", "PQ"};
     int forced = std::clamp(grade_.forceTransfer, 0, 2);

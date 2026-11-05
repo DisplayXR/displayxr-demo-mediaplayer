@@ -26,8 +26,9 @@ constexpr float kRefWhiteNits = 203.0f;  // BT.2408 HDR reference (graphics) whi
 constexpr float kPqMaxNits = 10000.0f;
 constexpr float kDefaultPeakNits = 1000.0f;  // when the stream carries no light-level metadata
 constexpr float kHlgDisplayNits = 1000.0f;   // the HLG OOTF's nominal display peak (gamma 1.2)
-// HLG is scene-referred: its "peak" is the display it is rendered for (the OOTF's Lw), not a
-// property of the stream. peakNits carries it for HLG (#169: it was fixed at 1000 nits).
+// HLG is scene-referred, so the picture is always the 1000-nit render (system gamma 1.2) and
+// peakNits only sets where the roll-off ends (#169, David: the peak changes the highlights,
+// not the whole picture; reference white stays at 203 nits).
 
 // Transfer of the decoded signal (FrameRing ColorTransfer, same values).
 enum class Transfer : int { SDR = 0, HLG = 1, PQ = 2, LinearPq = 3 };
@@ -120,7 +121,7 @@ struct HdrParams {
     bool bt2020 = false;       // source primaries are BT.2020 (converted to BT.709)
     bool rollOff = true;       // BT.2390 roll-off; false = clip at SDR white
     float peakNits = kDefaultPeakNits;  // the source's brightest (PQ / EXR), before exposure;
-                                        // for HLG the OOTF's display peak Lw (HlgPeak)
+                                        // for HLG the roll-off's source peak (HlgPeak)
     float exposure = 0.0f;     // stops, applied in linear light before the roll-off
     // An OpenColorIO look on scene-linear EXR: hand the LUT the linear light as PQ code of
     // (linear x 203 nits), unclipped, instead of the SDR picture; the bake decodes it
@@ -150,8 +151,8 @@ inline float EncodeLinearPq(const float* lut, float v) {
     return lut[i] + (lut[i + 1] - lut[i]) * (t - (float)i);
 }
 
-// The HLG OOTF's display peak Lw: peakNits, kept in the range the BT.2100 system-gamma
-// formula is specified for (and that the shader's peak field carries).
+// HLG's roll-off source peak: peakNits (0 = 1000), kept in the range the shader's peak
+// field carries.
 constexpr float kHlgMinNits = 100.0f, kHlgMaxNits = 10000.0f;
 inline float HlgPeak(const HdrParams& p) {
     return p.peakNits > 0.0f ? std::clamp(p.peakNits, kHlgMinNits, kHlgMaxNits) : kHlgDisplayNits;
@@ -167,7 +168,7 @@ inline void HdrToDisplay(const HdrParams& p, float c[3]) {
         float s[3];
         for (int i = 0; i < 3; ++i) s[i] = HlgToScene(c[i]);
         const float ys = 0.2627f * s[0] + 0.6780f * s[1] + 0.0593f * s[2];  // BT.2100 luma
-        const float lw = HlgPeak(p);
+        const float lw = kHlgDisplayNits;  // the picture: always the 1000-nit render
         const float g = HlgSystemGamma(lw);
         const float k = lw * std::pow(std::max(ys, 1e-6f), g - 1.0f) / kRefWhiteNits;
         for (int i = 0; i < 3; ++i) l[i] = s[i] * k;
@@ -226,7 +227,7 @@ public:
         for (int i = 0; i < 3; ++i) l[i] = Lerp(decode_, c[i]);
         if (p_.transfer == Transfer::HLG) {
             const float ys = 0.2627f * l[0] + 0.6780f * l[1] + 0.0593f * l[2];
-            const float lw = HlgPeak(p_);
+            const float lw = kHlgDisplayNits;
             const float g = HlgSystemGamma(lw);
             const float k = lw * std::pow(std::max(ys, 1e-6f), g - 1.0f) / kRefWhiteNits;
             for (float& v : l) v *= k;

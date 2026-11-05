@@ -246,7 +246,7 @@ static void TestPackCompare() {
     CHECK((a & b.yuvMatrix) == 0);
 }
 
-// #169: HLG renders for a chosen display peak (system gamma 1.2 + 0.42 log10(Lw/1000)).
+// #169: the HLG peak sets the roll-off only; the picture stays the 1000-nit render.
 // 0 and 1000 are the old fixed behaviour; another peak changes the picture.
 static void TestHlgPeak() {
     CHECK(Near(HlgSystemGamma(2000.0f), 1.2f + 0.42f * std::log10(2.0f), 1e-6f));
@@ -261,7 +261,25 @@ static void TestHlgPeak() {
         return c[0];
     };
     CHECK(Near(show(0.0f, 0.75f), show(1000.0f, 0.75f), 1e-6f));   // 0 = the nominal 1000
-    CHECK(!Near(show(2000.0f, 0.75f), show(1000.0f, 0.75f), 1e-3f));
+    // The peak changes the highlights only (David, #169): the picture is the 1000-nit render
+    // for every peak, so without the roll-off nothing moves and with it everything under the
+    // knee stays put. 75% HLG (reference white) is 229 at 1000 nits.
+    auto grey = [&](float peak, float sig, bool roll) {
+        HdrParams q = p;
+        q.peakNits = peak;
+        q.rollOff = roll;
+        float c[3] = {sig, sig, sig};
+        HdrToDisplay(q, c);
+        return c[0];
+    };
+    for (float pk : {400.0f, 2000.0f, 4000.0f}) {
+        for (float sig : {0.75f, 0.9f}) CHECK(Near(grey(pk, sig, false), grey(1000.0f, sig, false), 0.0f));
+        CHECK(Near(grey(pk, 0.5f, true), grey(1000.0f, 0.5f, true), 1.0f / 255.0f));  // under the knee
+    }
+    CHECK(Near(grey(1000.0f, 0.75f, true) * 255.0f, 229.0f, 1.0f));
+    // ... and the highlights follow the peak: a higher peak keeps more of them under white.
+    CHECK(grey(2000.0f, 0.9f, true) < grey(1000.0f, 0.9f, true) - 4.0f / 255.0f);
+    CHECK(grey(400.0f, 0.9f, true) > grey(1000.0f, 0.9f, true));
     CHECK(Near(HlgPeak(p), kHlgDisplayNits, 0.0f));
     p.peakNits = 50.0f;
     CHECK(Near(HlgPeak(p), kHlgMinNits, 0.0f));

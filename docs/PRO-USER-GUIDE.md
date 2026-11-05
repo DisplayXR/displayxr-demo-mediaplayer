@@ -144,8 +144,9 @@ e.g. `PQ -> SDR 1000 nits`.
   - **off**: clip everything above white, before the grade.
   - **raw**: no mapping at all. Use it with a show LUT that expects PQ or HLG input.
 - **Source peak (nits)**: the brightest the source gets, which sets where the roll-off ends.
-  0 takes it from the file (HDR10 metadata), else 1000. For HLG it is the display the
-  picture is rendered for (it sets HLG's system gamma: 1.2 at 1000 nits); 0 = 1000.
+  0 takes it from the file (HDR10 metadata), else 1000. For HLG (which has no metadata) it
+  only changes the highlights: the picture is always rendered as for a 1000-nit display, so
+  everything below reference white (75% HLG) looks the same at any peak; 0 = 1000.
 - The scopes, false colour and zebras measure the mapped picture.
 
 The CDL and the LUT apply after the mapping, to the SDR picture. One exception: with an
