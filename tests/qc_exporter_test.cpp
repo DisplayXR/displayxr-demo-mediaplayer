@@ -144,6 +144,26 @@ void TestUniqueDirs() {
     fs::remove_all(root);
 }
 
+// #169: two snapshots in the same second get -2, -3; a name with files on disk is taken.
+void TestUniqueSnapshotName() {
+    namespace fs = std::filesystem;
+    using mp::pro::qcfiles::PrefixInUse;
+    using mp::pro::qcfiles::UniqueName;
+    const fs::path root = fs::temp_directory_path() / "dxr_snap_unique_test";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const std::string base = (root / "pro_20261104_120000").u8string();
+    auto taken = [](const std::string& p) { return PrefixInUse(p); };
+    CHECK(UniqueName(base, taken) == base, "an unused name is kept");
+    { std::ofstream(base + "_note.json") << "{}"; }
+    CHECK(UniqueName(base, taken) == base + "-2", "a second in the same second is -2");
+    { std::ofstream(base + "-2_atlas_2_2x1.png") << "x"; }
+    CHECK(UniqueName(base, taken) == base + "-3", "then -3");
+    CHECK(!PrefixInUse((root / "pro_20261104_1200").u8string()), "a shorter stamp is not matched by a longer one");
+    CHECK(UniqueName("x", [](const std::string&) { return true; }).empty(), "all taken: empty");
+    fs::remove_all(root);
+}
+
 // #169: the capture is found by its prefix whatever suffix the runtime chose, and only once
 // it exists.
 void TestFindAtlasCapture() {
@@ -169,6 +189,7 @@ int main() {
     TestDestructorFinishesQueue();
     TestEmptyJob();
     TestUniqueDirs();
+    TestUniqueSnapshotName();
     TestFindAtlasCapture();
     if (g_failures) {
         std::fprintf(stderr, "qc_exporter_test: %d failure(s)\n", g_failures);

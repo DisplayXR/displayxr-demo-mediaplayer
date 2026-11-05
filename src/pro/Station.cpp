@@ -317,7 +317,18 @@ bool Station::TakeSnapshot(const std::string& note) {
     char stamp[32];
     const std::string clock = Clock(stamp, sizeof(stamp));
     if (!host_.capturePrefix || !host_.captureAtlas) return false;
-    const std::string prefix = host_.capturePrefix(std::string("pro_") + stamp);
+    // Two snapshots in the same second: the second is pro_<stamp>-2, not an overwrite (#169).
+    const std::string name = qcfiles::UniqueName(std::string("pro_") + stamp, [&](const std::string& n) {
+        const std::string p = host_.capturePrefix(n);
+        for (const Snapshot& o : snapshots_)
+            if (o.prefix == p) return true;
+        return qcfiles::PrefixInUse(p);
+    });
+    if (name.empty()) {
+        if (host_.toast) host_.toast("Snapshot: too many in one second");
+        return false;
+    }
+    const std::string prefix = host_.capturePrefix(name);
     if (!host_.captureAtlas(prefix)) {
         if (host_.toast) host_.toast("Snapshot: the runtime cannot capture (no atlas capture)");
         return false;
