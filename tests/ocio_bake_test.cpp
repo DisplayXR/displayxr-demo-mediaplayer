@@ -103,6 +103,46 @@ int main() {
     r.src = "No Such Space";
     CHECK(!mp::ocio::Bake(r, lut, err) && !err.empty(), "an unknown colour space is an error, not a crash");
 
+    // The Inspector's ACES picker: the built-in ACES studio config, its per-display views,
+    // and the default it starts on (ACEScct onto the Rec.1886 / Rec.709 display, that
+    // display's default view) baking to a neutral, rising tone curve.
+    const char* kStudio = "ocio://studio-config-latest";
+    mp::ocio::ConfigInfo aces;
+    CHECK(mp::ocio::Describe(kStudio, aces, err), err.c_str());
+    CHECK(aces.displayViews.size() == aces.displays.size() && aces.displayDefaultView.size() == aces.displays.size(),
+          "a view list and a default view per display");
+    int rec1886 = -1;
+    for (size_t i = 0; i < aces.displays.size(); ++i)
+        if (aces.displays[i].find("Rec.1886") != std::string::npos) rec1886 = (int)i;
+    CHECK(rec1886 >= 0, "the studio config has a Rec.1886 (Rec.709) display");
+    CHECK(std::find(aces.colorSpaces.begin(), aces.colorSpaces.end(), "ACEScct") != aces.colorSpaces.end(),
+          "the studio config has ACEScct");
+    if (rec1886 >= 0) {
+        std::printf("  ACES studio '%s': %zu spaces, display '%s', %zu views, default '%s'\n", aces.name.c_str(),
+                    aces.colorSpaces.size(), aces.displays[rec1886].c_str(), aces.displayViews[rec1886].size(),
+                    aces.displayDefaultView[rec1886].c_str());
+        CHECK(!aces.displayViews[rec1886].empty(), "the Rec.1886 display has views");
+        mp::ocio::Request a;
+        a.config = kStudio;
+        a.src = "ACEScct";
+        a.display = aces.displays[rec1886];
+        a.view = aces.displayDefaultView[rec1886];
+        a.size = 33;
+        CHECK(mp::ocio::Bake(a, lut, err), err.c_str());
+        float prev = -1.0f;
+        bool rising = true, neutral = true, inRange = true;
+        for (float code : {0.2f, 0.3f, 0.4135884f, 0.5f, 0.6f}) {  // 0.4136 = ACEScct 18% grey
+            const float in[3] = {code, code, code};
+            if (lut.Valid()) Sample(lut, in, out);
+            rising = rising && out[1] > prev;
+            neutral = neutral && std::fabs(out[0] - out[1]) < 0.01f && std::fabs(out[2] - out[1]) < 0.01f;
+            inRange = inRange && out[1] >= 0.0f && out[1] <= 1.0f;
+            prev = out[1];
+            if (code > 0.41f && code < 0.42f) std::printf("  ACES 18%% grey -> Rec.709 %.3f\n", out[1]);
+        }
+        CHECK(rising && neutral && inRange, "ACEScct greys map to rising, neutral Rec.709 code values");
+    }
+
     if (g_failures) {
         std::fprintf(stderr, "ocio_bake_test: %d failure(s)\n", g_failures);
         return 1;

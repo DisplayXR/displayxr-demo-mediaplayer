@@ -113,6 +113,13 @@ compare); with the clip wipe on, it swaps which clip is on which side.
   ASC CDL, or drop either file on the window. Each has an **On** box.
 - **Exposure** (Inspector > Colour): ±4 stops. Right-click to reset.
 - **ASC CDL values**: slope, offset, power and saturation, editable in the Inspector.
+- **OpenColorIO (ACES)** (Inspector > Colour): an OCIO transform as the look. Pick the
+  **Config** (the built-in **ACES studio** or **ACES CG** config, or a show's own `.ocio`
+  file), the **Input** colour space the picture arrives in (a camera log such as ARRI LogC4
+  or S-Log3, or ACEScct), the **Display** and the **View**, then **Apply look**. It starts on
+  ACEScct onto the Rec.1886 Rec.709 display, the target the display calibration corrects the
+  panel to. The transform takes the LUT's place (the Look line shows it); untick the LUT's
+  **On** box to remove it.
 - **`G`** bypasses the whole grade, to see the picture as it arrives.
 
 The grade is applied in this order: exposure, then the CDL, then the LUT.

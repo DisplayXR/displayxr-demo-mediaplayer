@@ -107,6 +107,12 @@ bool Describe(const std::string& config, ConfigInfo& out, std::string& err) {
         out.defaultView = cfg->getDefaultView(out.defaultDisplay.c_str());
         for (int i = 0; i < cfg->getNumViews(out.defaultDisplay.c_str()); ++i)
             out.views.push_back(cfg->getView(out.defaultDisplay.c_str(), i));
+        for (const std::string& d : out.displays) {
+            std::vector<std::string> v;
+            for (int i = 0; i < cfg->getNumViews(d.c_str()); ++i) v.push_back(cfg->getView(d.c_str(), i));
+            out.displayViews.push_back(std::move(v));
+            out.displayDefaultView.push_back(cfg->getDefaultView(d.c_str()));
+        }
         return true;
     } catch (const OCIO::Exception& e) {
         err = std::string("OpenColorIO: ") + e.what();

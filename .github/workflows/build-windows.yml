@@ -362,7 +362,7 @@ jobs:
           $plist = & 7z l "$($pro.FullName)" 2>&1 | Out-String
           if ($plist -match 'SimulatedReality') {
             Write-Host "::error::Pro installer bundles a SimulatedReality* DLL."; exit 1 }
-          foreach ($need in @("mediaplayer_pro_handle_vk_win.exe","mediaplayer_pro_handle_vk_win.displayxr.json","SDL3.dll","avcodec","avformat","avutil","swscale","swresample")) {
+          foreach ($need in @("mediaplayer_pro_handle_vk_win.exe","mediaplayer_pro_handle_vk_win.displayxr.json","SDL3.dll","avcodec","avformat","avutil","swscale","swresample","OCIO-THIRD-PARTY-NOTICES.txt")) {
             if ($plist -notmatch [regex]::Escape($need)) {
               Write-Host "::error::Pro installer payload missing $need"; exit 1 } }
           Write-Host "PASS: Pro installer payload OK."

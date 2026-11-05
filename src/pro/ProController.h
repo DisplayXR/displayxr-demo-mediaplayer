@@ -227,6 +227,16 @@ private:
     void BuildOverlays(const Status& st, float uiAlpha);
     void BuildOverlaySection();
     void BuildHdrControls();  // Inspector > Color: the HDR tone map (#134)
+    // Inspector > Color > OpenColorIO: pick a config (the built-in ACES ones or a show's
+    // .ocio), the input colour space, display and view, then bake it as the look (LoadOcio).
+    void BuildOcioControls();
+    void OpenOcioConfigDialog();
+    void DescribeOcioConfig();  // fills ocioInfo_ for ocioUiConfig_ and picks the defaults
+    std::string ocioUiConfig_ = "ocio://studio-config-latest";
+    std::string ocioInfoFor_;  // the config ocioInfo_ describes ("" = not described yet)
+    std::string ocioInfoError_;
+    ocio::ConfigInfo ocioInfo_;
+    int ocioSrc_ = 0, ocioDisplay_ = 0, ocioView_ = 0;
     void BuildMonitoringSection(const Status& st);
     void BuildScopesPanel(float alpha, float W, float H, float panelW);
     void BuildPixelProbe(const Status& st);
@@ -308,11 +318,13 @@ private:
     bool dialogIsCdl_ = false;
     bool dialogIsCompare_ = false;  // the "Load B..." dialog (the clip wipe's compare clip)
     bool dialogIsCal_ = false;      // the display calibration dialog (#133)
+    bool dialogIsOcio_ = false;     // an OpenColorIO config (.ocio) for the OCIO picker
     bool dialogReady_ = false;
     bool dialogOpen_ = false;
     bool pendingDialogIsCdl_ = false;
     bool pendingDialogIsCompare_ = false;
     bool pendingDialogIsCal_ = false;
+    bool pendingDialogIsOcio_ = false;
     void OpenCompareDialog();
     void OpenCalibrationDialog();
 
