@@ -381,6 +381,11 @@ small selector beside the toggle lists the runtime's converters by their own nam
 state; a pick applies to this session only and is never saved (the default stays in
 DisplayXR's settings / `displayxr-cli conv use`).
 
+**Media Player Pro** needs runtime **v2.61.0** or later: from 2.61 the runtime keys display
+calibration by the display's stable key, and older runtimes fall back to the device name, so a
+calibration can land on the wrong panel. The Pro Windows installer warns below 2.61 and lets you
+go on; the Pro `.deb` declares `Depends: displayxr-runtime (>= 2.61.0)` (#169).
+
 **Input** (top bar, runtimes with `XR_DXR_input_providers`): pick which of the runtime's
 input providers drives this app's controllers / hands / gamepad, by the providers' own names; the
 pick is a request for this run only unless you tick *Remember for this app*, which saves
