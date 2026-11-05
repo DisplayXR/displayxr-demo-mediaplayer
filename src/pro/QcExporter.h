@@ -76,6 +76,14 @@ bool CreateUniqueDir(const std::filesystem::path& parent, const std::string& bas
 // with `<prefix's name>_atlas` and ends in .png, or "" while there is none.
 std::string FindAtlasCapture(const std::string& prefix);
 
+// A snapshot's name (#169): `base` (pro_<YYYYMMDD_HHMMSS>), or `base`-2, -3, ... when
+// `taken` says a name is in use, so two snapshots in the same second keep both captures and
+// notes. "" if all of -2..-99 are taken too.
+std::string UniqueName(const std::string& base, const std::function<bool(const std::string&)>& taken);
+
+// True when a file in prefix's folder is named `<prefix's name>_...` (a note or a capture).
+bool PrefixInUse(const std::string& prefix);
+
 }  // namespace qcfiles
 
 }  // namespace mp::pro
