@@ -6,6 +6,7 @@
 #include "pro/ProController.h"
 
 #include "Log.h"
+#include "ui/UiScale.h"
 
 #include <SDL3/SDL.h>
 
@@ -18,6 +19,8 @@
 #include <cstdio>
 
 namespace mp::pro {
+
+using ui::Px;
 
 namespace {
 
@@ -193,11 +196,11 @@ void ProController::BuildOverlays(const Status& st, float uiAlpha) {
     // While the trunk's top bar is up the burn-ins sit under it (the panels' top), else at
     // the picture's corner as on a clean feed.
     if (uiAlpha > 0.01f && !(host_.isFullscreen && host_.isFullscreen())) {
-        b.topInset = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f + 8.0f - py * H;
+        b.topInset = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f + Px(8.0f) - py * H;
         // The side panels (BuildUI's panelW, 8 px from each window edge).
-        const float panelW = std::clamp(W * 0.24f, 280.0f, 440.0f);
-        b.leftInset = panelW + 16.0f - px * W;
-        b.rightInset = panelW + 16.0f - (W - (px + pw) * W);
+        const float panelW = std::clamp(W * 0.24f, Px(280.0f), Px(440.0f));
+        b.leftInset = panelW + Px(16.0f) - px * W;
+        b.rightInset = panelW + Px(16.0f) - (W - (px + pw) * W);
     }
     const double fps = host_.mediaFps ? host_.mediaFps() : 0.0;
     const double pos = host_.mediaPosition ? host_.mediaPosition() : -1.0;
@@ -241,15 +244,15 @@ void ProController::BuildPixelProbe(const Status& st) {
     char t[96];
     std::snprintf(t, sizeof(t), "R %3d  G %3d  B %3d   Y %.1f%%", p[0], p[1], p[2], Y);
     ImDrawList* dl = ImGui::GetForegroundDrawList();
-    const float arm = 10.0f;
-    dl->AddLine(ImVec2(at.x - arm, at.y), ImVec2(at.x + arm, at.y), IM_COL32(255, 255, 255, 230), 1.5f);
-    dl->AddLine(ImVec2(at.x, at.y - arm), ImVec2(at.x, at.y + arm), IM_COL32(255, 255, 255, 230), 1.5f);
+    const float arm = Px(10.0f);
+    dl->AddLine(ImVec2(at.x - arm, at.y), ImVec2(at.x + arm, at.y), IM_COL32(255, 255, 255, 230), Px(1.5f));
+    dl->AddLine(ImVec2(at.x, at.y - arm), ImVec2(at.x, at.y + arm), IM_COL32(255, 255, 255, 230), Px(1.5f));
     const ImVec2 ts = ImGui::CalcTextSize(t);
-    const ImVec2 o(at.x + 14.0f, at.y + 12.0f);
-    const float sw = ts.y + 4.0f;  // swatch
-    dl->AddRectFilled(o, ImVec2(o.x + sw + ts.x + 18.0f, o.y + ts.y + 8.0f), IM_COL32(10, 12, 16, 220), 3.0f);
-    dl->AddRectFilled(ImVec2(o.x + 4, o.y + 2), ImVec2(o.x + 4 + sw - 4, o.y + ts.y + 6), IM_COL32(p[0], p[1], p[2], 255));
-    dl->AddText(ImVec2(o.x + sw + 10.0f, o.y + 4.0f), IM_COL32(235, 238, 242, 255), t);
+    const ImVec2 o(at.x + Px(14.0f), at.y + Px(12.0f));
+    const float sw = ts.y + Px(4.0f);  // swatch
+    dl->AddRectFilled(o, ImVec2(o.x + sw + ts.x + Px(18.0f), o.y + ts.y + Px(8.0f)), IM_COL32(10, 12, 16, 220), Px(3.0f));
+    dl->AddRectFilled(ImVec2(o.x + Px(4), o.y + Px(2)), ImVec2(o.x + Px(4) + sw - Px(4), o.y + ts.y + Px(6)), IM_COL32(p[0], p[1], p[2], 255));
+    dl->AddText(ImVec2(o.x + sw + Px(10.0f), o.y + Px(4.0f)), IM_COL32(235, 238, 242, 255), t);
 #else
     (void)st;
 #endif
@@ -391,15 +394,15 @@ void ProController::BuildMonitoringSection(const Status& st) {
 void ProController::BuildScopesPanel(float alpha, float W, float H, float panelW) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     if (!scopesOn_ || alpha < 0.01f) return;
-    const float margin = 8.0f;
+    const float margin = Px(8.0f);
     float x = panelW + 2.0f * margin, w = W - 2.0f * x;
-    if (w < 420.0f) {  // narrow window: span it
+    if (w < Px(420.0f)) {  // narrow window: span it
         x = margin;
         w = W - 2.0f * margin;
     }
-    const float graphH = std::clamp(w * 0.26f, 120.0f, 240.0f);
+    const float graphH = std::clamp(w * 0.26f, Px(120.0f), Px(240.0f));
     const float h = graphH + ImGui::GetTextLineHeightWithSpacing() * 2.0f + ImGui::GetStyle().WindowPadding.y * 2.0f;
-    ImGui::SetNextWindowPos(ImVec2(x, H - h - 52.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(x, H - h - Px(52.0f)), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(FlatNow() ? 1.0f : 0.85f);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
@@ -419,9 +422,9 @@ void ProController::BuildScopesPanel(float alpha, float W, float H, float panelW
                                            scopeTexDirty_ ? vecRgba_.data() : nullptr);
                 if (waveTex && vecTex) scopeTexDirty_ = false;
             }
-            const float gap = 10.0f;
-            const float vecW = graphH, histW = std::max(120.0f, (w - vecW - 3 * gap) * 0.36f);
-            const float waveW = std::max(120.0f, w - vecW - histW - 2 * gap - ImGui::GetStyle().WindowPadding.x * 2);
+            const float gap = Px(10.0f);
+            const float vecW = graphH, histW = std::max(Px(120.0f), (w - vecW - 3 * gap) * 0.36f);
+            const float waveW = std::max(Px(120.0f), w - vecW - histW - 2 * gap - ImGui::GetStyle().WindowPadding.x * 2);
             ImDrawList* dl = ImGui::GetWindowDrawList();
             const ImU32 grid = IM_COL32(255, 255, 255, 40), label = IM_COL32(200, 205, 210, 170);
 
@@ -436,7 +439,7 @@ void ProController::BuildScopesPanel(float alpha, float W, float H, float panelW
                 dl->AddLine(ImVec2(w0.x, yy), ImVec2(w0.x + waveW, yy), grid);
                 char t[8];
                 std::snprintf(t, sizeof(t), "%d", pct);
-                dl->AddText(ImVec2(w0.x + 2, yy - (pct == 100 ? 0 : ImGui::GetTextLineHeight())), label, t);
+                dl->AddText(ImVec2(w0.x + Px(2), yy - (pct == 100 ? 0 : ImGui::GetTextLineHeight())), label, t);
             }
             ImGui::EndGroup();
             ImGui::SameLine(0, gap);
@@ -465,8 +468,8 @@ void ProController::BuildScopesPanel(float alpha, float W, float H, float panelW
                 const float Y = 0.2126f * t.r + 0.7152f * t.g + 0.0722f * t.b;
                 const float cb = (t.b - Y) / 1.8556f, cr = (t.r - Y) / 1.5748f;
                 const ImVec2 q(v0.x + (cb + 0.5f) * vs, v0.y + (0.5f - cr) * vs);
-                dl->AddRect(ImVec2(q.x - 4, q.y - 4), ImVec2(q.x + 4, q.y + 4), IM_COL32(255, 255, 255, 120));
-                dl->AddText(ImVec2(q.x + 5, q.y - 7), label, t.n);
+                dl->AddRect(ImVec2(q.x - Px(4), q.y - Px(4)), ImVec2(q.x + Px(4), q.y + Px(4)), IM_COL32(255, 255, 255, 120));
+                dl->AddText(ImVec2(q.x + Px(5), q.y - Px(7)), label, t.n);
             }
             ImGui::EndGroup();
             ImGui::SameLine(0, gap);
@@ -485,7 +488,7 @@ void ProController::BuildScopesPanel(float alpha, float W, float H, float panelW
                 for (int i = 0; i < scopes::kLevels; ++i) {
                     const float xx = h0.x + histW * i / (float)(scopes::kLevels - 1);
                     const float yy = h0.y + graphH * (1.0f - std::min(1.0f, hist[i] / (float)peak));
-                    if (i) dl->AddLine(prev, ImVec2(xx, yy), col, 1.2f);
+                    if (i) dl->AddLine(prev, ImVec2(xx, yy), col, Px(1.2f));
                     prev = ImVec2(xx, yy);
                 }
             };

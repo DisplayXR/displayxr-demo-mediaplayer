@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ui/TransportUI.h"
+#include "ui/UiScale.h"
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include <algorithm>
@@ -56,8 +57,9 @@ void ShowTransportToast(TransportState& s, std::string msg) {
 // rectangles without moving a single pixel.
 void ApplyMediaPlayerStyle(float k) {
     if (!(k > 0.0f)) k = 1.0f;
-    ImGui::StyleColorsDark();
     ImGuiStyle& s = ImGui::GetStyle();
+    s = ImGuiStyle();  // start from defaults so re-applying at a new UI scale never compounds
+    ImGui::StyleColorsDark();
 
     // ---- identical on every leg ----
     s.WindowRounding = 16.0f;
@@ -74,9 +76,6 @@ void ApplyMediaPlayerStyle(float k) {
     s.GrabMinSize = 18.0f * k;
     // Hit-only padding: enlarges the grab/press rectangles, draws nothing.
     s.TouchExtraPadding = (k > 1.0f) ? ImVec2(10.0f, 14.0f) : ImVec2(0.0f, 0.0f);
-    // Legible against the HUD canvas (the desktop's long-standing 1.9), nudged up
-    // slightly for arm's-length tablet viewing.
-    ImGui::GetIO().FontGlobalScale = 1.9f * (k > 1.0f ? 1.15f : 1.0f);
 
     const ImVec4 accent(0.20f, 0.65f, 1.00f, 1.00f);
     ImVec4* c = s.Colors;
@@ -91,6 +90,15 @@ void ApplyMediaPlayerStyle(float k) {
     c[ImGuiCol_SliderGrabActive] = ImVec4(0.40f, 0.78f, 1.00f, 1.00f);
     c[ImGuiCol_CheckMark] = accent;
     c[ImGuiCol_Text] = ImVec4(0.92f, 0.94f, 0.97f, 1.00f);
+
+    s.ScaleAllSizes(g_uiScale);
+}
+
+float UiFontPx(float k) {
+    // Touch is bigger for arm's-length tablet viewing: 30 is 40 px on the 320 dpi NP02J,
+    // 16 is 40 px at Windows' 250%. Rounded up to a whole pixel; the epsilon keeps float
+    // error (320 / 240 = 1.3333334f) from pushing a whole size to the next one.
+    return std::ceil((k > 1.0f ? 30.0f : 16.0f) * g_uiScale - 0.001f);
 }
 
 namespace {
@@ -200,7 +208,7 @@ bool IconButton(const char* id, Icon kind, float size, bool active = false,
 // Returns true on a value change; `outActive` reports the held state. Both have
 // exactly the semantics the caller's scrub machine expects from SliderFloat.
 bool ScrubBar(const char* id, float* v, float vmax, float width, bool* outActive) {
-    if (width < 8.0f) width = 8.0f;
+    if (width < Px(8.0f)) width = Px(8.0f);
     const float rowH = ImGui::GetFrameHeight();
     const ImVec2 p = ImGui::GetCursorScreenPos();
 
@@ -223,7 +231,7 @@ bool ScrubBar(const char* id, float* v, float vmax, float width, bool* outActive
     const float cy = p.y + rowH * 0.5f;
     // Track thickness scales with the row so the touch build stays proportionate,
     // but stays genuinely thin.
-    const float th = std::max(3.0f, rowH * 0.085f);
+    const float th = std::max(Px(3.0f), rowH * 0.085f);
     const float knobR = th * ((hovered || active) ? 2.2f : 1.7f);
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
@@ -473,7 +481,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     ImGui::SetNextItemWidth(std::min(ImGui::CalcTextSize(preview).x +
                                                          ImGui::GetFrameHeight() +
                                                          st.FramePadding.x * 2.0f,
-                                                     280.0f));
+                                                     Px(280.0f)));
                     if (ImGui::BeginCombo("##convert3d_provider", preview)) {
                         for (int i = 0; i < (int)s.convertProviders.size(); ++i) {
                             const ConvertProviderRow& row = s.convertProviders[i];
@@ -506,11 +514,11 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                         ImGui::PushID(f);
                         ImGui::AlignTextToFramePadding();
                         ImGui::TextUnformatted(fam.label.c_str());
-                        ImGui::SameLine(110.0f);
+                        ImGui::SameLine(Px(110.0f));
                         const bool valid =
                             fam.enabled && fam.current >= 0 && fam.current < (int)fam.rows.size();
                         ImGui::BeginDisabled(!fam.enabled);
-                        ImGui::SetNextItemWidth(260.0f);
+                        ImGui::SetNextItemWidth(Px(260.0f));
                         if (ImGui::BeginCombo("##family", valid ? fam.rows[fam.current].c_str()
                                                                 : "no provider")) {
                             for (int r = 0; r < (int)fam.rows.size(); ++r) {
@@ -610,10 +618,15 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 if (IconButton("##playpause", s.paused ? Icon::Play : Icon::Pause, iconSz, false,
                                s.hitTargetScale))
                     Fire(a.TogglePlayback);
+                // A touch leg's icon hit boxes are taller than a frame: drop the frame-high
+                // items (times, scrubber) to the middle of the row.
+                const float rowPad = iconSz * (std::max(1.0f, s.hitTargetScale) - 1.0f) * 0.5f;
                 ImGui::SameLine();
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
                 ImGui::AlignTextToFramePadding();
                 ImGui::Text("%s", cur);
                 ImGui::SameLine();
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
                 // Leave room on the right for the total-time label + mute + loop icons.
                 // Derived from the live style rather than a magic constant, so the
                 // touch build spaces correctly instead of crowding the total time.
@@ -648,6 +661,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 s.scrubActive = active;
                 s.lastScrubValue = s.scrubValue;
                 ImGui::SameLine();
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
                 ImGui::AlignTextToFramePadding();
                 ImGui::Text("%s", tot);
                 if (s.caps.mute) {

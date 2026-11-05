@@ -404,6 +404,13 @@ void TestFilenameUnchanged() {
     CHECK(MediaSource::IsSupported("a.MPO"), "supported: .mpo (case-insensitive)");
     CHECK(MediaSource::IsSupported("a.lif") && MediaSource::IsSupported("a.mkv"),
           "supported: existing set intact");
+    CHECK(MediaSource::IsSupported("a.webm") && MediaSource::IsSupported("a.3gp") &&
+              MediaSource::IsSupported("a.M4V") && MediaSource::IsSupported("a.gif") &&
+              MediaSource::IsSupported("a.bmp"),
+          "supported: webm, 3gp, m4v, gif, bmp");
+    CHECK(MediaSource::Identify("a.webm").kind == MediaKind::Video &&
+              MediaSource::Identify("a.gif").kind == MediaKind::Image,
+          "identify: webm is video, gif is an image");
     CHECK(!MediaSource::IsSupported("notes.txt"), "supported: rejects other types");
 }
 

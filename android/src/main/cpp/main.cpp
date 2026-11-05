@@ -67,8 +67,13 @@
 #include "ColorPolicy.h"  // swapchain encoding policy, shared with the desktop leg (#78)
 #include "ui/ImGuiLayer.h"
 #include "ui/TransportUI.h"
+#include "ui/UiScale.h"
+#include "browser/AndroidMediaProvider.h"
+#include "browser/MediaBrowser.h"
+#include "browser/SlideGesture.h"
+#include "neighbour_stills.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
-#include "LifLoader.h"  // SHARED desktop LIF parser (src/media/, referenced by CMake)
+#include "still_image.h"
 #include "MediaSource.h"   // SHARED layered stereo-layout resolver (#45)
 #include "StereoDetect.h"
 #include "video_stereo_probe_android.h"
@@ -162,8 +167,16 @@ std::vector<XrSwapchainImageVulkanKHR> g_hud_xr_images;
 std::vector<VkImage> g_hud_vk_images;
 uint32_t g_hud_w = 0, g_hud_h = 0;
 VkFormat g_hud_format = VK_FORMAT_UNDEFINED;
+int32_t g_density_dpi = 0;  // AConfiguration_getDensity, read in android_main
 bool g_hud_ready = false;
 mp::ImGuiLayer g_imgui;
+// The media browser (#160). Defined after g_imgui: its thumbnails use ImGui's descriptors.
+mp::browser::MediaBrowser g_browser;
+std::atomic<bool> g_browser_ready{false};  // read by nativeBack on the UI thread
+bool g_browsing = false;  // the browser is up; media loading clears it (leave_splash)
+// Back in the player, the Load button, a tap on the splash: show_browser() next loop.
+std::atomic<bool> g_browser_request{false};
+bool g_paused_for_background = false;  // APP_CMD_PAUSE paused the video; RESUME undoes it
 mp::ui::TransportState g_ui_state;
 mp::ui::TransportActions g_ui_actions;
 // Set once if the runtime rejects the window-space layer. Suppresses the layer AND
@@ -177,6 +190,27 @@ std::atomic<bool> g_open_picker_request{false};
 // A clean tap (down+up with no drag) that is still waiting to be adjudicated
 // against ImGui's WantCaptureMouse on the render thread.
 std::atomic<bool> g_pending_tap{false};
+// Swiping to the next or previous file (#160). Touches come from the UI thread through
+// this queue; the render thread owns the gesture and the neighbours' stills.
+struct TouchEvent {
+	int action;  // MotionEvent's: 0 down, 1 up, 2 move, the rest end the gesture
+	float x, y;  // HUD pixels
+	double t;    // seconds
+};
+std::mutex g_touch_mx;
+std::vector<TouchEvent> g_touches;
+mp::browser::SlideGesture g_slide;
+NeighbourStills g_stills;
+// The file a finished slide asks for (+1 next, -1 previous), opened at the loop's top.
+int g_slide_step = 0;
+// The image on screen (when it is one), for NeighbourStills to keep when it is swiped away.
+NeighbourStills::Adopted g_picture;
+// The file the slide asked for has arrived: once it is on screen the slide is over.
+bool g_slide_arrived = false;
+// Design units, through ui::Px(): 8 dp and 64 dp.
+constexpr float kDragSlop = 12.0f;
+constexpr float kSwipeMin = 96.0f;
+constexpr uint32_t kStillMaxSide = 8192;
 
 // Touch metric scale for the shared ImGui style. The ONE sanctioned divergence
 // from the desktop: it scales padding/grab sizes only — colours, rounding and every
@@ -270,10 +304,10 @@ std::atomic<bool> g_scene_loaded{false};
 // Media sources. The app starts on the DisplayXR idle screen (same lockup as
 // Windows: displayxr/idle.png over dark grey) — nothing auto-plays. Media is
 // opened via the SAF picker: tap the idle/image screen, or the transport bar's
-// Load button in video mode. Picked files are sniffed by content: JPEG/PNG go
-// through the SHARED desktop LifLoader (stereo LIF → composed full-SBS with
-// baked reconvergence; plain image / mono LIF → flat 2D), everything else is
-// AMediaCodec video.
+// Load button in video mode. Picked files are sniffed by content: JPEG/PNG/GIF/BMP
+// go through the SHARED desktop MpoLoader and LifLoader (stereo MPO or LIF →
+// composed full-SBS, a LIF with baked reconvergence; plain image / mono LIF →
+// flat 2D), everything else is AMediaCodec video.
 VideoDecoder g_video;
 // ── Right eye of a two-track stereo file ("LVF v2", #64) ────────────────────
 // A second decoder on the SAME file, opened on the `abr` track and put in SLAVE
@@ -379,12 +413,6 @@ const char *const kIdleArt = "idle.png";  // bundled asset (repo displayxr/)
 // Desktop App.cpp's idle backdrop grey (kIdleBg*).
 constexpr uint8_t kIdleBg[3] = {31, 31, 33};  // 0.12,0.12,0.13 * 255
 
-// Opening the SAF picker while the XR session runs leaves the runtime's weave
-// overlay on screen with the last frame — the picker opens UNDERNEATH it,
-// invisible (runtime-side bug, #523 family). Workaround: tear the whole XR
-// instance down right before the picker opens (the overlay drops with it) and
-// rebuild from scratch when the activity resumes.
-
 // A file the user picked via SAF: fd + byte range, published from the JNI
 // thread and serviced (decoder reopen) on the android_main thread.
 std::atomic<int> g_pick_fd{-1};
@@ -452,6 +480,7 @@ static void
 leave_splash()
 {
 	g_showing_splash.store(false, std::memory_order_relaxed);
+	g_browsing = false;
 	if (g_splash_mode_requested >= 0 && g_mode_before_splash >= 0 &&
 	    g_active_mode == g_splash_mode_requested) {
 		g_pending_mode_request = g_mode_before_splash;
@@ -1481,6 +1510,12 @@ active_tile_dims(uint32_t *render_w, uint32_t *render_h, uint32_t *cols, uint32_
 	*rows = r;
 }
 
+bool
+browser_showing()
+{
+	return g_browser_ready.load(std::memory_order_relaxed) && g_browsing;
+}
+
 // Create the SINGLE tiled-atlas swapchain, sized worst-case over all modes AND
 // both orientations (the swapchain is never recreated on rotation, so it must
 // hold either orientation's largest tile layout; each frame renders a
@@ -1541,14 +1576,30 @@ swapchain_encoding()
 	return e;
 }
 
-// Create (or recreate) the HUD swapchain at the current per-eye tile size, and
-// point ImGui at it. Mirrors XrSession::CreateHudSwapchain on the desktop leg.
+// The HUD's size: the window's own pixel size, so the UI draws 1:1 (ui/UiScale.h).
+// ANativeWindow_getWidth/Height report the window even under a buffer-size override
+// (see the TRAP note above). The per-eye tile is only the fallback.
+void
+hud_target_size(uint32_t *w, uint32_t *h)
+{
+	ANativeWindow *win = g_app_window.load(std::memory_order_acquire);
+	if (win != nullptr && ANativeWindow_getWidth(win) > 0 && ANativeWindow_getHeight(win) > 0) {
+		*w = (uint32_t)ANativeWindow_getWidth(win);
+		*h = (uint32_t)ANativeWindow_getHeight(win);
+		return;
+	}
+	uint32_t cols = 0, rows = 0;
+	active_tile_dims(w, h, &cols, &rows);
+}
+
+// Create (or recreate) the HUD swapchain at hud_target_size, and point ImGui at it.
+// Mirrors XrSession::CreateHudSwapchain on the desktop leg.
 // Non-fatal: a failure just means no chrome this session.
 bool
 create_hud_swapchain()
 {
-	uint32_t render_w = 0, render_h = 0, cols = 0, rows = 0;
-	active_tile_dims(&render_w, &render_h, &cols, &rows);
+	uint32_t render_w = 0, render_h = 0;
+	hud_target_size(&render_w, &render_h);
 	if (render_w == 0 || render_h == 0) {
 		return false;
 	}
@@ -1566,8 +1617,8 @@ create_hud_swapchain()
 	// Same choice as the desktop XrSession::CreateHudSwapchain: RGBA channel order is
 	// load-bearing (ImGui's pipeline + DumpExternalImage assume R,G,B,A bytes), so
 	// R8G8B8A8_SRGB (43) -> R8G8B8A8_UNORM (37) -> formats[0]; =unorm swaps the first two.
-	// On an _SRGB HUD, ImGuiLayer draws into a UNORM staging image (blending stays in
-	// encoded space) and vkCmdCopyImage's the bytes across — hence TRANSFER_DST below.
+	// On an _SRGB HUD, ImGuiLayer draws through UNORM views (blending stays in encoded
+	// space), hence MUTABLE_FORMAT below. Its staging copy costs Adreno 9-12 ms a frame.
 	const bool legacy_unorm = swapchain_encoding() == mp::color::Encoding::Unorm;
 	const int64_t order[2] = {legacy_unorm ? mp::color::kR8G8B8A8_UNORM : mp::color::kR8G8B8A8_SRGB,
 	                          legacy_unorm ? mp::color::kR8G8B8A8_SRGB : mp::color::kR8G8B8A8_UNORM};
@@ -1589,7 +1640,7 @@ create_hud_swapchain()
 	XrSwapchainCreateInfo ci = {};
 	ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
 	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
-	                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	                XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
 	ci.format = fmt;
 	ci.sampleCount = 1;
 	ci.width = render_w;
@@ -1634,6 +1685,19 @@ create_hud_swapchain()
 	return true;
 }
 
+void
+toggle_playback()
+{
+	g_video.togglePaused();
+	// The right eye must pause WITH the master. Left running it would fill its
+	// reader pool with frames the paused master will not reach for as long as the
+	// pause lasts, and on resume the pairing rule would hold the right eye frozen
+	// until the master caught up. Both start unpaused and are only ever toggled
+	// here, so they cannot drift out of phase.
+	if (g_stereo_dual) g_video_right.togglePaused();
+	g_audio.setPaused(g_video.paused());  // mirror play/pause to audio
+}
+
 // Bring up the shared ImGui chrome. `debug.dxr.mp.ws_ui=0` disables it (the same
 // kill-switch modelviewer ships), leaving a bare projection layer.
 bool
@@ -1647,14 +1711,6 @@ hud_init()
 	if (!create_hud_swapchain()) {
 		return false;
 	}
-	if (!g_imgui.Init(nullptr, g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
-	                  g_vk_queue_family, g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images,
-	                  frames_in_flight())) {
-		LOGW("ImGuiLayer init failed — no chrome this session");
-		xrDestroySwapchain(g_hud_swapchain);
-		g_hud_swapchain = XR_NULL_HANDLE;
-		return false;
-	}
 	// The ONE sanctioned divergence from the desktop: metrics scale for fingers.
 	// Colours, rounding and every icon are identical — see ApplyMediaPlayerStyle.
 	float ui_scale = kTouchUiScale;
@@ -1663,7 +1719,19 @@ hud_init()
 		const float v = (float)atof(sprop);
 		if (v > 0.5f && v < 4.0f) ui_scale = v;
 	}
-	mp::ui::ApplyMediaPlayerStyle(ui_scale);
+	g_imgui.SetMetricScale(ui_scale);  // before Init: the font is rasterized at its size
+	// The touch UI was tuned on the 320 dpi NP02J through a 1920x1200 HUD stretched to the
+	// 2560x1600 panel (x1.33). dpi / 240 keeps that size there and follows density elsewhere.
+	if (g_density_dpi > 0) g_imgui.SetUiScale((float)g_density_dpi / 240.0f);
+	g_imgui.SetMutableHud(true);
+	if (!g_imgui.Init(nullptr, g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
+	                  g_vk_queue_family, g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images,
+	                  frames_in_flight())) {
+		LOGW("ImGuiLayer init failed, no chrome this session");
+		xrDestroySwapchain(g_hud_swapchain);
+		g_hud_swapchain = XR_NULL_HANDLE;
+		return false;
+	}
 
 	// Android can't back these: slideshow and prev/next need to enumerate a folder,
 	// and SAF hands us a file descriptor, not a path. Hidden, not disabled — a
@@ -1678,17 +1746,11 @@ hud_init()
 	g_ui_state.caps.layout = false;
 	g_ui_state.hitTargetScale = 1.35f;
 
-	g_ui_actions.Open = [] { g_open_picker_request.store(true, std::memory_order_relaxed); };
-	g_ui_actions.TogglePlayback = [] {
-		g_video.togglePaused();
-		// The right eye must pause WITH the master. Left running it would fill its
-		// reader pool with frames the paused master will not reach for as long as the
-		// pause lasts, and on resume the pairing rule would hold the right eye frozen
-		// until the master caught up. Both start unpaused and are only ever toggled
-		// here, so they cannot drift out of phase.
-		if (g_stereo_dual) g_video_right.togglePaused();
-		g_audio.setPaused(g_video.paused());  // mirror play/pause to audio
+	g_ui_actions.Open = [] {
+		(g_browser_ready.load(std::memory_order_relaxed) ? g_browser_request : g_open_picker_request)
+		    .store(true, std::memory_order_relaxed);
 	};
+	g_ui_actions.TogglePlayback = toggle_playback;
 	// AMediaExtractor has no cheap keyframe-preview mode here, so `preview` is
 	// ignored; the shared machine's follow-up exact seek is idempotent.
 	// Both eyes seek together. Their IDRs sit at identical PTS, so SEEK_CLOSEST_SYNC
@@ -1940,36 +2002,145 @@ load_splash(struct android_app *app)
 	return ok;
 }
 
-// Bake the LIF's intended zero-disparity plane into the composed full-SBS
-// buffer: shift each eye's half horizontally by ±0.5*conv*W px (the desktop
-// applies the same 0.5-scaled per-eye shift at render time — App.cpp's
-// `conv = convergence_ + 0.5*mediaConvergence_`). Exposed strips are filled by
-// edge replication; a static image pays this once at load, so no shader or
-// per-frame work is needed.
+// Stop whatever plays, before the next media or the browser replaces it.
 void
-bake_lif_convergence(mp::DecodedImage &img, float conv)
+stop_media()
 {
-	const int W = img.width / 2, H = img.height;
-	const int s = (int)std::lround(0.5f * conv * (float)W);
-	if (s == 0) {
+	// ORDER MATTERS. The slave holds a pacingMaster_ pointer to g_video and
+	// its decode thread reads that decoder's published state while it waits
+	// its turn; stopping the master first leaves the slave keeping station
+	// against a decoder that will never advance again. Stop the follower,
+	// then the thing it follows.
+	LOGI("[LVF] teardown: stop_dual");
+	stop_dual();  // right-eye decoder + convergence curve of the OLD clip
+	LOGI("[LVF] teardown: g_video.stop");
+	g_video.stop();
+	LOGI("[LVF] teardown: g_audio.stop");
+	g_audio.stop();
+	// The old decoder's AImageReader is gone; drop the renderer's
+	// imports of its buffers (and the refs keeping them alive) before
+	// the new reader hands out a fresh pool. See resetVideoAhb().
+	LOGI("[LVF] teardown: resetVideoAhb");
+	g_sbs.resetVideoAhb();
+	LOGI("[LVF] teardown: complete");
+	g_scene_loaded.store(false, std::memory_order_relaxed);
+	// A seek the old clip's scrubber still waits on must not hold the next clip's knob
+	// (the desktop resets these on every open).
+	g_ui_state.scrubValue = 0.0f;
+	g_ui_state.scrubActive = false;
+	g_ui_state.scrubTarget = -1.0f;
+}
+
+// The browser sits over the idle screen, which borrows the flat mode while it shows.
+void
+show_browser(struct android_app *app)
+{
+	if (!g_showing_splash.load(std::memory_order_relaxed)) {
+		stop_media();
+		load_splash(app);
+	}
+	g_browsing = true;
+	g_browser.Refresh();
+	g_slide.Reset();
+	g_slide_step = 0;
+	g_slide_arrived = false;
+}
+
+// The current press began on the chrome (the seek bar), so its drag is the chrome's.
+static bool
+press_on_chrome()
+{
+	if (!g_imgui.Ready()) return false;
+	const ImGuiIO &io = ImGui::GetIO();
+	return io.MouseDown[0] && io.MouseDownOwned[0];
+}
+
+// Once a frame, before the atlas draw: hand the swipe its touches and neighbours, open the
+// file it asks for, and place the picture and the neighbour's page.
+static void
+run_slide()
+{
+	const double now = (double)now_ns() * 1e-9;
+	if (g_slide_arrived && g_scene_loaded.load(std::memory_order_relaxed)) {
+		g_slide.Reset();
+		g_slide_arrived = false;
+	}
+	static std::vector<TouchEvent> touches;  // static: both queues keep their capacity
+	touches.clear();
+	{
+		// A swipe made while one slides or opens waits its turn, and ends that slide early.
+		std::lock_guard<std::mutex> lk(g_touch_mx);
+		if (!g_slide.Busy())
+			touches.swap(g_touches);
+		else if (!g_touches.empty())
+			g_slide.Hurry();
+	}
+	const bool in_player = !g_showing_splash.load(std::memory_order_relaxed);
+	if (!g_slide.Waiting()) {  // the page shown while a file opens must stay
+		int64_t prev = -1, next = -1;  // left as -1 when there is none
+		const bool has_prev = in_player && g_browser.NextId(-1, prev);
+		const bool has_next = in_player && g_browser.NextId(1, next);
+		g_slide.SetNeighbours(has_prev, has_next);
+		g_stills.Want(prev, next);
+	}
+	g_slide.SetMetrics((float)g_hud_w, mp::ui::Px(kDragSlop), mp::ui::Px(kSwipeMin));
+	for (const TouchEvent &e : touches) {
+		if (!in_player) break;
+		switch (e.action) {
+		case 0: g_slide.Press(e.x, e.y); break;
+		case 1: g_slide.Release(e.t); break;
+		case 2: g_slide.Move(e.x, e.y); break;
+		default: g_slide.Cancel(e.t); break;  // a cancel, or a second finger
+		}
+	}
+	const int step = g_slide.Update(now);
+	if (step != 0) g_slide_step = step;
+	const int side = g_slide.Neighbour();
+	g_sbs.setSlide(g_slide.Offset());
+	g_stills.ShowPage(side, g_slide.Offset() + (float)side);
+}
+
+// The image now in the renderer is the picture: its layout and the player's state.
+static void
+show_image(const NeighbourStills::Adopted &a)
+{
+	apply_layout(a.info.layout, a.width, a.height);
+	g_picture = a;
+	g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox for media
+	g_is_video = false;
+	leave_splash();
+	g_scene_loaded.store(true, std::memory_order_relaxed);
+	LOGI("Loaded image: %s %dx%d layout=%s (%s)%s", a.name.c_str(), a.width, a.height,
+	     mp::LayoutName(a.info.layout), mp::SignalName(a.info.signal),
+	     a.convergenceBaked ? ", convergence baked" : "");
+}
+
+// The file a finished slide asks for. An image whose still is ready becomes the picture at
+// once, one whose still is on its way waits for it, and anything else is opened.
+static void
+open_slide_step()
+{
+	const int step = g_slide_step;
+	const NeighbourStills::Use use = g_stills.ForOpen(step);
+	if (use == NeighbourStills::Use::Wait) return;
+	g_slide_step = 0;
+	int64_t current = -1;  // the picture being swiped away, when it is an image
+	if (!g_is_video && !g_showing_splash.load(std::memory_order_relaxed)) g_browser.NextId(0, current);
+	NeighbourStills::Adopted a;
+	if (use == NeighbourStills::Use::Adopt && g_stills.Adopt(step, a, current, g_picture)) {
+		stop_media();  // whatever played: the still is the picture now
+		g_browser.StepTo(step);
+		{
+			std::lock_guard<std::mutex> lk(g_pick_name_mx);
+			g_pick_name = a.name;
+		}
+		show_image(a);
+		g_slide.Reset();
 		return;
 	}
-	std::vector<uint8_t> row((size_t)W * 4);
-	auto shift_half = [&](int x0, int dx) {
-		for (int y = 0; y < H; ++y) {
-			uint8_t *base = img.pixels.data() + ((size_t)y * img.width + x0) * 4;
-			for (int x = 0; x < W; ++x) {
-				int sx = x - dx;
-				if (sx < 0) sx = 0;
-				if (sx >= W) sx = W - 1;
-				std::memcpy(row.data() + (size_t)x * 4, base + (size_t)sx * 4, 4);
-			}
-			std::memcpy(base, row.data(), (size_t)W * 4);
-		}
-	};
-	shift_half(0, +s);  // left eye content moves right
-	shift_half(W, -s);  // right eye content moves left
-	LOGI("LIF reconvergence baked: conv=%+.4f -> ±%d px per eye", conv, s);
+	const bool opening = g_browser.OpenNext(step);
+	LOGI("swipe %s -> %s", step > 0 ? "next" : "previous", opening ? "opening" : "none");
+	if (!opening) g_slide.Reset();
 }
 
 // Run an on-disk image through the SHARED desktop LifLoader — stereo LIF
@@ -1979,42 +2150,14 @@ bake_lif_convergence(mp::DecodedImage &img, float conv)
 bool
 load_image_file(const std::string &path, const std::string &logical_name)
 {
-	mp::LifResult r = mp::LifLoader::Load(path);
-	if (!r.ok) {
-		LOGE("image failed to decode: %s", path.c_str());
+	mp::StillImage still;
+	if (!mp::StillImage::Decode(path, logical_name, still)) return false;
+	const mp::DecodedImage &img = still.image;
+	if (!g_sbs.uploadTexture(img.pixels.data(), (uint32_t)img.width, (uint32_t)img.height)) {
 		return false;
 	}
-	if (r.stereo && r.hasConvergence) {
-		bake_lif_convergence(r.image, r.convergence);
-	}
-	if (!g_sbs.uploadTexture(r.image.pixels.data(), (uint32_t)r.image.width,
-	                         (uint32_t)r.image.height)) {
-		return false;
-	}
-	// Layered resolution (desktop App.cpp parity): a composed LIF/MPO is
-	// container metadata; a plain JPEG/PNG falls through to the filename, then
-	// the content detector on the decoded pixels, then aspect.
-	mp::MediaInfo meta;
-	meta.kind = mp::MediaKind::Image;
-	meta.layout = r.layout;
-	mp::StereoLayout fromName;
-	mp::StereoDetectResult content{};
-	const bool nameDecided = mp::MediaSource::LayoutFromFilename(logical_name, fromName);
-	if (!r.stereo && !nameDecided) {
-		content = mp::StereoDetect::AnalyzeRGBA(r.image.pixels.data(), r.image.width, r.image.height,
-		                                        (ptrdiff_t)r.image.width * 4);
-	}
-	const mp::MediaInfo info = mp::MediaSource::Resolve(
-	    logical_name, mp::MediaKind::Image, r.image.width, r.image.height, nullptr,
-	    r.stereo ? &meta : nullptr, (!r.stereo && !nameDecided && content.decided) ? &content : nullptr);
-	apply_layout(info.layout, r.image.width, r.image.height);
-	g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox for media
-	g_is_video = false;
-	leave_splash();
-	g_scene_loaded.store(true, std::memory_order_relaxed);
-	LOGI("Loaded image: %s %dx%d layout=%s (%s)%s", logical_name.c_str(), r.image.width,
-	     r.image.height, mp::LayoutName(info.layout), mp::SignalName(info.signal),
-	     (r.stereo && r.hasConvergence) ? ", convergence baked" : "");
+	show_image(NeighbourStills::Adopted{still.info, img.width, img.height, logical_name,
+	                                    still.convergenceBaked});
 	return true;
 }
 
@@ -2023,30 +2166,7 @@ bool
 load_picked_image(struct android_app *app, int fd, long long off, long long len)
 {
 	std::string path = std::string(app->activity->internalDataPath) + "/picked_image";
-	FILE *out = std::fopen(path.c_str(), "wb");
-	if (out == nullptr) {
-		LOGE("cannot stage picked image to %s", path.c_str());
-		return false;
-	}
-	bool copy_ok = true;
-	uint8_t buf[64 * 1024];
-	long long pos = off;
-	long long remaining = len;
-	while (remaining > 0) {
-		const size_t want = remaining < (long long)sizeof(buf) ? (size_t)remaining : sizeof(buf);
-		const ssize_t got = pread(fd, buf, want, (off_t)pos);
-		if (got <= 0 || std::fwrite(buf, 1, (size_t)got, out) != (size_t)got) {
-			copy_ok = false;
-			break;
-		}
-		pos += got;
-		remaining -= got;
-	}
-	std::fclose(out);
-	if (!copy_ok) {
-		LOGE("failed to stage picked image (fd=%d len=%lld)", fd, len);
-		return false;
-	}
+	if (!mp::StillImage::Stage(fd, off, len, path)) return false;
 	std::string name;
 	{
 		std::lock_guard<std::mutex> lk(g_pick_name_mx);
@@ -2384,12 +2504,23 @@ render_frame()
 	auto record_hud = [&]() -> bool {
 		if (!chrome_available) return false;
 		fill_transport_state();
+		const bool browsing = browser_showing();
 		// Skip the whole HUD path when nothing is visible — steady playback must
 		// cost nothing. Same gate as the desktop.
-		const bool anything_visible = g_ui_state.fadeAlpha > 0.001f ||
+		const bool anything_visible = browsing || g_ui_state.fadeAlpha > 0.001f ||
 		                              g_ui_state.toastAlpha > 0.001f ||
 		                              g_ui_state.transitionAlpha > 0.001f;
 		if (!anything_visible) return false;
+		// Follow the window's pixel size (rotation, freeform resize) so the UI stays 1:1.
+		// Rare, so idle the device rather than track which frame still uses the old images.
+		uint32_t want_w = 0, want_h = 0;
+		hud_target_size(&want_w, &want_h);
+		if (want_w != g_hud_w || want_h != g_hud_h) {
+			vkDeviceWaitIdle(g_vk_device);
+			if (!create_hud_swapchain() ||
+			    !g_imgui.RecreateTarget(g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images))
+				return false;
+		}
 		XrSwapchainImageAcquireInfo hacq = {};
 		hacq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
 		uint32_t hud_idx = 0;
@@ -2400,7 +2531,13 @@ render_frame()
 		if (xrWaitSwapchainImage(g_hud_swapchain, &hwait) == XR_SUCCESS) {
 			// The HUD IS the tile, so the remap is the identity rect.
 			g_imgui.BeginFrame((float)g_hud_w, (float)g_hud_h, 0.0f, 0.0f, 1.0f, 1.0f);
-			mp::ui::BuildTransportUI(g_ui_state, g_ui_actions);
+			if (browsing) {
+				if (g_browser.Build() == mp::browser::MediaBrowser::Action::OtherFiles)
+					g_open_picker_request.store(true, std::memory_order_relaxed);
+				g_browser.RecordUploads(g_sbs.frameCmd());
+			} else {
+				mp::ui::BuildTransportUI(g_ui_state, g_ui_actions);
+			}
 			g_imgui.RenderToHud(hud_idx, g_sbs.frameCmd());
 			hud_active = true;
 		}
@@ -2411,7 +2548,7 @@ render_frame()
 	uint32_t submit_views = 0;  // views RENDERED (the active mode's, clamped)
 	uint32_t layer_views = 0;   // views the layer CARRIES: every located one (ADR-041)
 	bool rendered = false;
-	if (frame_state.shouldRender && g_scene_loaded.load(std::memory_order_relaxed) &&
+	if (frame_state.shouldRender && (g_scene_loaded.load(std::memory_order_relaxed) || g_slide.Waiting()) &&
 	    !g_pick_pending.load(std::memory_order_relaxed)) {
 		XrViewState view_state = {};
 		view_state.type = XR_TYPE_VIEW_STATE;
@@ -2504,6 +2641,7 @@ render_frame()
 			PROF_MARK(PROF_ACQUIRE);
 			if (res == XR_SUCCESS) {
 				const float aC = g_content_aspect.load(std::memory_order_relaxed);
+				run_slide();
 				g_sbs.drawAtlas(g_atlas.images[img_idx].image, g_atlas.width, g_atlas.height,
 				                render_w, render_h, cols, rows, submit_views, aC, g_image_mono,
 				                g_clear_rgb);
@@ -2594,13 +2732,18 @@ render_frame()
 		// a button still held from the trickled DOWN event) swallowed the gesture.
 		if (!chrome_available) {
 			if (!g_is_video) g_open_picker_request.store(true, std::memory_order_relaxed);
-		} else if (!has_media) {
-			g_open_picker_request.store(true, std::memory_order_relaxed);
+		} else if (!has_media && !browser_showing()) {
+			(g_browser_ready.load(std::memory_order_relaxed) ? g_browser_request : g_open_picker_request)
+			    .store(true, std::memory_order_relaxed);
 		}
 		LOGI("tap: has_media=%d chrome=%d imgui_capture=%d -> picker=%d", (int)has_media,
 		     (int)chrome_available, (int)g_imgui.WantCaptureMouse(),
 		     (int)g_open_picker_request.load(std::memory_order_relaxed));
 	}
+
+	// A press on the chrome is the chrome's. Checked after the HUD frame: ImGui has seen the
+	// press by now.
+	if (press_on_chrome()) g_slide.Cancel((double)now_ns() * 1e-9);
 
 	XrCompositionLayerProjection projection_layer = {};
 	projection_layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
@@ -2778,6 +2921,17 @@ bring_up(struct android_app *app)
 	if (ok) {
 		// Non-fatal: without it the app plays fine, just with no chrome.
 		hud_init();
+		if (g_hud_ready && !g_browser_ready.load(std::memory_order_relaxed)) {
+			g_browser_ready.store(
+			    g_browser.Initialize(&mp::browser::AndroidMediaProvider::Instance(), g_vk_phys_device,
+			                         g_vk_device, frames_in_flight(),
+			                         std::string(app->activity->internalDataPath) + "/stereo_verdicts.txt"),
+			    std::memory_order_relaxed);
+			if (g_browser_ready.load(std::memory_order_relaxed))
+				g_stills.Initialize(&mp::browser::AndroidMediaProvider::Instance(), &g_sbs,
+				                    std::string(app->activity->internalDataPath) + "/still_image",
+				                    g_hud_w < g_hud_h ? g_hud_w : g_hud_h, kStillMaxSide);
+		}
 	}
 	if (!ok) {
 		LOGI("Bring-up failed; see logs.");
@@ -2876,6 +3030,20 @@ handle_cmd(struct android_app *app, int32_t cmd)
 		 */
 		forget_hint_buffer_geometry();
 #endif
+		break;
+	case APP_CMD_PAUSE:
+		// Home or recents mid-video pauses it; the app icon (RESUME) plays on.
+		if (g_is_video && !g_video.paused()) {
+			toggle_playback();
+			g_paused_for_background = true;
+		}
+		LOGI("APP_CMD_PAUSE (paused the video: %d)", (int)g_paused_for_background);
+		if (g_browser_ready.load(std::memory_order_relaxed)) g_browser.Save();  // it may be killed now
+		break;
+	case APP_CMD_RESUME:
+		LOGI("APP_CMD_RESUME (resuming the video: %d)", (int)g_paused_for_background);
+		if (g_paused_for_background && g_is_video && g_video.paused()) toggle_playback();
+		g_paused_for_background = false;
 		break;
 	case APP_CMD_DESTROY:
 		LOGI("APP_CMD_DESTROY");
@@ -3023,6 +3191,11 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 	constexpr int kDown = 0, kUp = 1, kMove = 2;
 
 	g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);  // re-reveal the chrome
+	{
+		std::lock_guard<std::mutex> lk(g_touch_mx);
+		if (g_touches.size() >= 256) g_touches.erase(g_touches.begin());  // a long load: keep the latest
+		g_touches.push_back({(int)action, nx * (float)g_hud_w, ny * (float)g_hud_h, (double)now_ns() * 1e-9});
+	}
 
 	if (action == kDown) {
 		downX = nx;
@@ -3045,6 +3218,17 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 	}
 }
 
+// MainActivity.onBackPressed (UI thread). In the player, Back returns to the browser and
+// this returns true; anywhere else it returns false and Java sends the app home.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeBack(JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	if (!g_browser_ready.load(std::memory_order_relaxed) || g_showing_splash.load(std::memory_order_relaxed))
+		return JNI_FALSE;
+	g_browser_request.store(true, std::memory_order_relaxed);
+	return JNI_TRUE;
+}
+
 // Java polls this once per Choreographer frame; a true result means "launch
 // ACTION_OPEN_DOCUMENT" (only Java can). Consumed on read.
 extern "C" JNIEXPORT jboolean JNICALL
@@ -3064,6 +3248,7 @@ android_main(struct android_app *app)
 {
 	LOGI("mediaplayer_vk_android: android_main entered");
 	app->onAppCmd = handle_cmd;
+	g_density_dpi = AConfiguration_getDensity(app->config);
 	// Touch is NOT consumed via app->onInputEvent: on the legacy path the
 	// runtime's MonadoView overlay covers our window, so a NativeActivity never
 	// sees native input. Gestures arrive via MainActivity.dispatchTouchEvent
@@ -3104,7 +3289,7 @@ android_main(struct android_app *app)
 				return;
 			}
 			// Service a file the user picked (Load button → SAF). Sniff the
-			// content: JPEG/PNG (incl. LIF — a JPEG with a trailer) go through
+			// content: JPEG/PNG/GIF/BMP (incl. LIF and MPO, both JPEGs) go through
 			// the image path; everything else reopens the video decoder on
 			// this thread (the old decode thread is joined in stop()).
 			if (g_pending_mode_request >= 0 && g_session_running && g_pfnReqMode != nullptr) {
@@ -3113,8 +3298,14 @@ android_main(struct android_app *app)
 				const XrResult mr = g_pfnReqMode(g_session, (uint32_t)want);
 				LOGI("xrRequestDisplayRenderingModeDXR(%d) -> %d", want, (int)mr);
 			}
+			if (g_browser_request.exchange(false, std::memory_order_relaxed)) show_browser(app);
+			if (g_browser_ready.load(std::memory_order_relaxed)) {
+				g_stills.Update();
+				if (g_slide_step != 0) open_slide_step();
+			}
 			const int pick = g_pick_fd.exchange(-1, std::memory_order_acquire);
 			if (pick >= 0) {
+				if (g_slide.Waiting()) g_slide_arrived = true;
 				const long long off = g_pick_off.load(std::memory_order_relaxed);
 				const long long len = g_pick_len.load(std::memory_order_relaxed);
 				uint8_t magic[4] = {};
@@ -3122,28 +3313,14 @@ android_main(struct android_app *app)
 				const bool is_jpeg = have_magic && magic[0] == 0xFF && magic[1] == 0xD8;
 				const bool is_png = have_magic && magic[0] == 0x89 && magic[1] == 'P' &&
 				                    magic[2] == 'N' && magic[3] == 'G';
-				// ORDER MATTERS. The slave holds a pacingMaster_ pointer to g_video and
-				// its decode thread reads that decoder's published state while it waits
-				// its turn; stopping the master first leaves the slave keeping station
-				// against a decoder that will never advance again. Stop the follower,
-				// then the thing it follows.
-				LOGI("[LVF] teardown: stop_dual");
-				stop_dual();  // right-eye decoder + convergence curve of the OLD clip
-				LOGI("[LVF] teardown: g_video.stop");
-				g_video.stop();
-				LOGI("[LVF] teardown: g_audio.stop");
-				g_audio.stop();
-				// The old decoder's AImageReader is gone; drop the renderer's
-				// imports of its buffers (and the refs keeping them alive) before
-				// the new reader hands out a fresh pool. See resetVideoAhb().
-				LOGI("[LVF] teardown: resetVideoAhb");
-				g_sbs.resetVideoAhb();
-				LOGI("[LVF] teardown: complete");
-				g_scene_loaded.store(false, std::memory_order_relaxed);
+				const bool is_gif = have_magic && std::memcmp(magic, "GIF8", 4) == 0;
+				const bool is_bmp = have_magic && magic[0] == 'B' && magic[1] == 'M';
+				stop_media();
 				g_pick_pending.store(false, std::memory_order_relaxed);
-				if (is_jpeg || is_png) {
+				if (is_jpeg || is_png || is_gif || is_bmp) {
 					if (!load_picked_image(app, pick, off, len)) {
 						LOGE("Failed to load picked image (fd=%d)", pick);
+						load_splash(app);  // the old media is gone: never leave nothing on screen
 					}
 					close(pick);  // image path stages a copy; the fd is done
 				} else {
@@ -3203,6 +3380,7 @@ android_main(struct android_app *app)
 						if (audio_fd >= 0) close(audio_fd);
 						if (probe_fd >= 0) close(probe_fd);
 						LOGE("Failed to open picked video (fd=%d)", pick);
+						load_splash(app);
 					}
 				}
 			}

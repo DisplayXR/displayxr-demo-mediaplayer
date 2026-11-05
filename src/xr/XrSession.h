@@ -167,6 +167,9 @@ public:
     const std::vector<VkImage>& HudImages() const { return hudVkImages_; }
     bool AcquireHudImage(uint32_t& imageIndex);
     bool ReleaseHudImage();
+    // Replace the HUD swapchain with one of this size (the caller has idled the device).
+    // False leaves no HUD (HasHud() is false).
+    bool ResizeHud(uint32_t width, uint32_t height);
 
     // --- Open-file (XR_DXR_workspace_file_dialog) ---
     // Outcome of a RequestFilePicker call. Pending → a completion event will arrive

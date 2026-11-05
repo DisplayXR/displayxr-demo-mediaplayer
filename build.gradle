@@ -19,8 +19,10 @@ ext {
     cmake_version = '3.22.1'
     ndk_version = '26.3.11579264'
 
-    // Match displayxr-runtime: compile against 35, target 31, min 29.
+    // Match displayxr-runtime: compile against 35, min 29. Target 34, not the
+    // runtime's 31: the media browser needs READ_MEDIA_* (33+) and partial
+    // photo access (34) (#160).
     sharedCompileSdk = 35
-    sharedTargetSdk = 31
+    sharedTargetSdk = 34
     sharedMinSdk = 29
 }

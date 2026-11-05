@@ -13,6 +13,8 @@
 //      returns 1 when the Load button asks Java to open the SAF video picker.
 //   3. Wake the DisplayXR runtime out of Android's "stopped" state before
 //      xrCreateInstance and, if it can't be reached, prompt the user.
+//   4. Host MediaStoreProvider, the Java half of the media browser (#160).
+//   5. Back (the player returns to the browser) and full screen.
 //
 // Vendor-neutral + out-of-process (ADR-025): no CNSDK, no CAMERA — the OOP
 // runtime service owns eye tracking. Binds to whichever runtime flavor is
@@ -27,6 +29,7 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Point
 import android.hardware.display.DisplayManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -34,6 +37,9 @@ import android.util.Log
 import android.view.Choreographer
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.Toast
 
@@ -99,6 +105,9 @@ class MainActivity : NativeActivity() {
     // (it blanks the scene while a pick is pending to avoid a stale-frame flash).
     private external fun nativePickCancelled()
 
+    // Back. True when native took it (the player returns to the browser).
+    private external fun nativeBack(): Boolean
+
     // This window's live on-screen rect + the panel extent in the SAME rotation
     // (XR_DXR_android_surface_binding / ADR-036 D6). The runtime anchors the
     // weave's interlace phase and the per-window Kooima frustum to it.
@@ -152,6 +161,8 @@ class MainActivity : NativeActivity() {
     private var miniLayoutW = 0
     private var miniLayoutH = 0
 
+    private lateinit var mediaStore: MediaStoreProvider
+
     private val rectCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!rectPollRunning) return
@@ -161,6 +172,7 @@ class MainActivity : NativeActivity() {
             } catch (_: Throwable) {
                 // Native lib not bound yet; the next frame retries.
             }
+            mediaStore.poll()
             Choreographer.getInstance().postFrameCallback(this)
         }
     }
@@ -266,7 +278,8 @@ class MainActivity : NativeActivity() {
                 // as jpg/png. Native sniffs the picked fd's content and routes
                 // image vs video accordingly.
                 type = "*/*"
-                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("video/*", "image/*"))
+                // Android types an .mpo as application/octet-stream.
+                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("video/*", "image/*", "application/octet-stream"))
                 // Persistable so the relaunched process can reopen it at cold start.
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or
                     Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
@@ -398,6 +411,7 @@ class MainActivity : NativeActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        mediaStore = MediaStoreProvider(this) { fd, length, name -> nativeOpenVideoFd(fd, 0L, length, name) }
         pushRotation()
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
             .registerDisplayListener(displayListener, null)
@@ -419,14 +433,49 @@ class MainActivity : NativeActivity() {
         }, 2500)
     }
 
+    @Deprecated("NativeActivity has no OnBackPressedDispatcher")
+    override fun onBackPressed() {
+        val handled = try { nativeBack() } catch (_: Throwable) { false }
+        // Home, not finish(): the XR session and the browser's place survive a relaunch.
+        if (!handled) moveTaskToBack(true)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
+    }
+
+    // Full screen: the status and nav bars would cover the browser's top bar and the
+    // player's controls. A swipe from an edge shows them for a moment.
+    private fun hideSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.insetsController?.let {
+                it.hide(WindowInsets.Type.systemBars())
+                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        }
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         pushRotation()
     }
 
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == MediaStoreProvider.REQUEST_PERMISSION) mediaStore.onPermissionResult()
+    }
+
     override fun onResume() {
         super.onResume()
         pushRotation()
+        mediaStore.onResume()
         if (!rectPollRunning) {
             // Forget the last sample so the first frame after a resume always
             // re-pushes: the surface was destroyed and rebuilt underneath us and
@@ -445,6 +494,7 @@ class MainActivity : NativeActivity() {
     }
 
     override fun onDestroy() {
+        mediaStore.close()
         try {
             (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
                 .unregisterDisplayListener(displayListener)

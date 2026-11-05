@@ -163,6 +163,7 @@ FetchContent_Declare(imgui
     GIT_TAG v1.91.5
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(imgui)
+include(cmake/UiFont.cmake)
 
 # --- nlohmann/json (header-only) for parsing the LIF container's JSON metadata.
 #     Lightweight (no link step), so LIF support is on the default path. (HEIC needs no
@@ -320,7 +321,7 @@ function(mp_add_player tgt is_pro)
     endif()
 
     target_include_directories(${tgt} PRIVATE
-        ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)
+        ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends ${MP_UI_FONT_INCLUDE_DIR})
     # MEDIAPLAYER_IMGUI_SDL selects the SDL3 ImGui *platform* backend (input + dt) on
     # Windows / macOS. Desktop Linux has no SDL window: MEDIAPLAYER_IMGUI_DXRWIN feeds
     # ImGui from displayxr-common's window events instead. The Android leg defines
@@ -716,6 +717,43 @@ if(MP_BUILD_TESTS)
         src/media/StreamUrl.cpp)
     target_include_directories(stream_url_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME stream_url COMMAND stream_url_test)
+
+    # Media browser (#160): the library's supported set, sources, filter and sort. Pure.
+    add_executable(media_library_test
+        tests/media_library_test.cpp
+        src/browser/MediaLibrary.cpp
+        src/media/MediaSource.cpp
+        src/media/StereoDetect.cpp
+        src/Log.cpp)
+    target_include_directories(media_library_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME media_library COMMAND media_library_test)
+
+    # Media browser (#160): 3D badge evidence and the verdict cache. Pure, one worker thread.
+    add_executable(stereo_classifier_test
+        tests/stereo_classifier_test.cpp
+        src/browser/StereoClassifier.cpp
+        src/media/MediaSource.cpp
+        src/media/StereoDetect.cpp
+        src/Log.cpp)
+    target_include_directories(stereo_classifier_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    find_package(Threads REQUIRED)
+    target_link_libraries(stereo_classifier_test PRIVATE Threads::Threads)
+    add_test(NAME stereo_classifier COMMAND stereo_classifier_test)
+
+    # Media browser (#160): media id to thumbnail slot, least recently drawn reuse. Pure.
+    add_executable(thumbnail_cache_test tests/thumbnail_cache_test.cpp src/browser/ThumbnailCache.cpp)
+    target_include_directories(thumbnail_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME thumbnail_cache COMMAND thumbnail_cache_test)
+
+    # Media browser (#160): drag, fling and tap for touch scrolling. Pure.
+    add_executable(touch_scroller_test tests/touch_scroller_test.cpp src/browser/TouchScroller.cpp)
+    target_include_directories(touch_scroller_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME touch_scroller COMMAND touch_scroller_test)
+
+    # Media browser (#160): swiping to the next or previous file in the player. Pure.
+    add_executable(slide_gesture_test tests/slide_gesture_test.cpp src/browser/SlideGesture.cpp)
+    target_include_directories(slide_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME slide_gesture COMMAND slide_gesture_test)
 
     # "Convert to 3D" (XR_DXR_lift spec v4): the LiftClient state machine over a fake
     # entry-point table, plus the CPU frame preparation. No runtime, no loader, no GPU.

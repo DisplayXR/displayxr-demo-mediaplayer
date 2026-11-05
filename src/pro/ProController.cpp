@@ -3,6 +3,7 @@
 #include "pro/DisplayCalibration.h"
 
 #include "Log.h"
+#include "ui/UiScale.h"
 
 #include <SDL3/SDL.h>
 
@@ -18,6 +19,8 @@
 #include <filesystem>
 
 namespace mp::pro {
+
+using ui::Px;
 
 namespace {
 
@@ -937,7 +940,7 @@ void ProController::BuildDepthOverlay(const Status& st) {
     const ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
-    const float rad = std::max(3.0f, H * 0.006f);
+    const float rad = std::max(Px(3.0f), H * 0.006f);
     for (size_t i = 0; i < r.parallaxPct.size(); ++i) {
         // match centre in eye-UV -> zoomed window -> HUD pixels
         const float u = (r.matchX[i] - panX_) * zoom_, v = (r.matchY[i] - panY_) * zoom_;
@@ -948,7 +951,7 @@ void ProController::BuildDepthOverlay(const Status& st) {
         const ImVec4 col = t < 0 ? ImVec4(1.0f, 1.0f + 0.55f * t, 1.0f + 0.85f * t, 0.95f)    // white -> orange-red
                                  : ImVec4(1.0f - 0.75f * t, 1.0f - 0.45f * t, 1.0f, 0.95f);   // white -> blue
         dl->AddCircleFilled(c, rad, ImGui::GetColorU32(col));
-        if (p < b.nearPct || p > b.farPct) dl->AddCircle(c, rad * 1.9f, IM_COL32(255, 60, 50, 255), 0, 2.0f);
+        if (p < b.nearPct || p > b.farPct) dl->AddCircle(c, rad * 1.9f, IM_COL32(255, 60, 50, 255), 0, Px(2.0f));
     }
     // Edge violations: a red bar along the frame edge over the rows where something in
     // front of the screen is cut off by it (the band's matches past the edge limit).
@@ -968,19 +971,19 @@ void ProController::BuildDepthOverlay(const Status& st) {
         const float v0 = std::clamp((y0 - half - panY_) * zoom_, 0.f, 1.f);
         const float v1 = std::clamp((y1 + half - panY_) * zoom_, 0.f, 1.f);
         if (v1 <= v0) continue;
-        const float x = (px + u * pw) * W, bw = std::max(4.0f, W * 0.004f);
+        const float x = (px + u * pw) * W, bw = std::max(Px(4.0f), W * 0.004f);
         const float xa = side == 0 ? x : x - bw, xb = side == 0 ? x + bw : x;
         dl->AddRectFilled(ImVec2(xa, (py + v0 * ph) * H), ImVec2(xb, (py + v1 * ph) * H), IM_COL32(255, 60, 50, 235));
         char t[48];
         std::snprintf(t, sizeof(t), "EDGE %+.1f%%", es.parallaxPct);
         const ImVec2 ts = ImGui::CalcTextSize(t);
-        const float tx = side == 0 ? xb + 6.0f : xa - 6.0f - ts.x;
-        dl->AddText(ImVec2(tx, (py + v0 * ph) * H + 2.0f), IM_COL32(255, 90, 80, 255), t);
+        const float tx = side == 0 ? xb + Px(6.0f) : xa - Px(6.0f) - ts.x;
+        dl->AddText(ImVec2(tx, (py + v0 * ph) * H + Px(2.0f)), IM_COL32(255, 90, 80, 255), t);
     }
     char legend[96];
     std::snprintf(legend, sizeof(legend), "Depth overlay (D): near %+.1f%%  far %+.1f%%  budget %+.1f..%+.1f%%", r.nearPct,
                   r.farPct, b.nearPct, b.farPct);
-    dl->AddText(ImVec2(px * W + 8.0f, py * H + 8.0f), IM_COL32(255, 255, 255, 230), legend);
+    dl->AddText(ImVec2(px * W + Px(8.0f), py * H + Px(8.0f)), IM_COL32(255, 255, 255, 230), legend);
 #else
     (void)st;
 #endif
@@ -998,11 +1001,11 @@ void ProController::BuildWipeLine(const Status& st) {
     const float x = (px + wipePos_ * pw) * W, y0 = py * H, y1 = (py + ph) * H;
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     const float wgt = std::max(2.0f, ph * H / 360.0f);  // heavy enough not to stair-step through the lens
-    dl->AddLine(ImVec2(x, y0), ImVec2(x, y1), IM_COL32(0, 0, 0, 140), wgt + 2.0f);
+    dl->AddLine(ImVec2(x, y0), ImVec2(x, y1), IM_COL32(0, 0, 0, 140), wgt + Px(2.0f));
     dl->AddLine(ImVec2(x, y0), ImVec2(x, y1), IM_COL32(255, 255, 255, 230), wgt);
     const float my = (y0 + y1) * 0.5f;  // a grab handle
     dl->AddCircleFilled(ImVec2(x, my), wgt * 3.0f, IM_COL32(255, 255, 255, 230));
-    dl->AddCircle(ImVec2(x, my), wgt * 3.0f, IM_COL32(0, 0, 0, 160), 0, 1.5f);
+    dl->AddCircle(ImVec2(x, my), wgt * 3.0f, IM_COL32(0, 0, 0, 160), 0, Px(1.5f));
     std::string la = wipe_ == Wipe::Grade ? "source" : "left eye";
     std::string ra = wipe_ == Wipe::Grade ? "graded" : "right eye";
     if (wipe_ == Wipe::Clips) {
@@ -1013,15 +1016,15 @@ void ProController::BuildWipeLine(const Status& st) {
     const char* l = la.c_str();
     const char* r = ra.c_str();
     const ImVec2 ls = ImGui::CalcTextSize(l);
-    const float ty = my + wgt * 3.0f + 8.0f;  // under the handle, clear of the transport bar
+    const float ty = my + wgt * 3.0f + Px(8.0f);  // under the handle, clear of the transport bar
     const ImVec2 rs = ImGui::CalcTextSize(r);
-    const float pad = 4.0f;
-    dl->AddRectFilled(ImVec2(x - ls.x - 10.0f - pad, ty - pad), ImVec2(x - 10.0f + pad, ty + ls.y + pad),
-                      IM_COL32(0, 0, 0, 170), 3.0f);
-    dl->AddRectFilled(ImVec2(x + 10.0f - pad, ty - pad), ImVec2(x + 10.0f + rs.x + pad, ty + rs.y + pad),
-                      IM_COL32(0, 0, 0, 170), 3.0f);
-    dl->AddText(ImVec2(x - ls.x - 10.0f, ty), IM_COL32(255, 255, 255, 235), l);
-    dl->AddText(ImVec2(x + 10.0f, ty), IM_COL32(255, 255, 255, 235), r);
+    const float pad = Px(4.0f);
+    dl->AddRectFilled(ImVec2(x - ls.x - Px(10.0f) - pad, ty - pad), ImVec2(x - Px(10.0f) + pad, ty + ls.y + pad),
+                      IM_COL32(0, 0, 0, 170), Px(3.0f));
+    dl->AddRectFilled(ImVec2(x + Px(10.0f) - pad, ty - pad), ImVec2(x + Px(10.0f) + rs.x + pad, ty + rs.y + pad),
+                      IM_COL32(0, 0, 0, 170), Px(3.0f));
+    dl->AddText(ImVec2(x - ls.x - Px(10.0f), ty), IM_COL32(255, 255, 255, 235), l);
+    dl->AddText(ImVec2(x + Px(10.0f), ty), IM_COL32(255, 255, 255, 235), r);
 #else
     (void)st;
 #endif
@@ -1082,15 +1085,15 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
     }
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     const ImVec2 ts = ImGui::CalcTextSize(buf);
-    const float pad = 6.0f;
-    const float x = px * W + 8.0f, y = (py + ph) * H - ts.y - 2.0f * pad - 8.0f;
-    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + ts.x + 2.0f * pad, y + ts.y + 2.0f * pad), IM_COL32(10, 12, 16, 190), 4.0f);
+    const float pad = Px(6.0f);
+    const float x = px * W + Px(8.0f), y = (py + ph) * H - ts.y - 2.0f * pad - Px(8.0f);
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + ts.x + 2.0f * pad, y + ts.y + 2.0f * pad), IM_COL32(10, 12, 16, 190), Px(4.0f));
     float tx = x + pad;
     if (st.live && !fs) {
-        dl->AddCircleFilled(ImVec2(tx + 4.0f, y + pad + ts.y * 0.5f), 4.0f, IM_COL32(235, 60, 50, 255));
+        dl->AddCircleFilled(ImVec2(tx + Px(4.0f), y + pad + ts.y * 0.5f), Px(4.0f), IM_COL32(235, 60, 50, 255));
         tx += 0.0f;
     }
-    dl->AddText(ImVec2(tx + (st.live && !fs ? 12.0f : 0.0f), y + pad), IM_COL32(235, 238, 242, 255), buf);
+    dl->AddText(ImVec2(tx + (st.live && !fs ? Px(12.0f) : 0.0f), y + pad), IM_COL32(235, 238, 242, 255), buf);
 #else
     (void)st;
 #endif
@@ -1109,8 +1112,8 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     if (alpha < 0.01f) return;
     const ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
-    const float panelW = std::clamp(W * 0.24f, 280.0f, 440.0f);
-    const float top = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f + 8.0f;
+    const float panelW = std::clamp(W * 0.24f, Px(280.0f), Px(440.0f));
+    const float top = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f + Px(8.0f);
 
     // Two panels, as in the plan's mockup: the station on the left (inputs, source,
     // looks, snapshots), the picture controls on the right (view, stereo, color, rig check).
@@ -1121,14 +1124,14 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     auto placePanel = [&](float x) {
         ImGui::SetNextWindowPos(ImVec2(x, top), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(panelW, 0.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowSizeConstraints(ImVec2(panelW, 0.0f), ImVec2(panelW, H - top - 90.0f));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(panelW, 0.0f), ImVec2(panelW, H - top - Px(90.0f)));
         ImGui::SetNextWindowBgAlpha(FlatNow() ? 1.0f : 0.82f);  // a flat card hides the picture anyway
     };
     // A flat card is a rectangle of 2D (the Local2D rect): square corners, or the corners
     // would show black / the desktop instead of the picture.
     const bool flat = FlatNow();
     if (flat) ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    placePanel(8.0f);
+    placePanel(Px(8.0f));
     if (ImGui::Begin("Station", nullptr, flags)) {
         ImGui::Checkbox("Pin panels (Tab)", &inspectorPinned_);
         ImGui::SameLine();
@@ -1190,7 +1193,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     }
     ImGui::End();
 
-    placePanel(W - panelW - 8.0f);
+    placePanel(W - panelW - Px(8.0f));
     if (ImGui::Begin("Inspector", nullptr, flags)) {
         // --- View -----------------------------------------------------------
         if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {

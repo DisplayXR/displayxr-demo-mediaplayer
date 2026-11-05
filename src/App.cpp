@@ -252,17 +252,17 @@ XrSession::ViewRect App::TargetScaled(XrSession::ViewRect fit) {
 }
 
 bool App::Initialize(const char* mediaPath) {
-    // Default 1280x720; MEDIAPLAYER_WINDOW="WxH" or the uniform "WxH+X+Y" form
+    // Default 768x432 x display scale; MEDIAPLAYER_WINDOW="WxH" or the uniform "WxH+X+Y" form
     // overrides (X,Y absolute virtual-desktop px — pins the window there and skips
     // the panel auto-placement; "WxH" alone still auto-places, e.g. "720x1280" to
     // test portrait aspect handling without a rebuild).
-    int winW = 1280, winH = 720;
+    int winW = 768, winH = 432;
     int forceX = 0, forceY = 0;
-    bool forcePos = false;
+    bool forcePos = false, forceSize = false;
     if (const char* s = std::getenv("MEDIAPLAYER_WINDOW")) {
         int a = 0, b = 0, x = 0, y = 0;
         int n = std::sscanf(s, "%dx%d+%d+%d", &a, &b, &x, &y);
-        if (n >= 2 && a > 0 && b > 0) { winW = a; winH = b; }
+        if (n >= 2 && a > 0 && b > 0) { winW = a; winH = b; forceSize = true; }
         if (n >= 4) { forceX = x; forceY = y; forcePos = true; }
     }
     if (!window_.Create(MP_PRODUCT_NAME, winW, winH)) return false;
@@ -282,8 +282,21 @@ bool App::Initialize(const char* mediaPath) {
     // (0, 0) = primary/unknown (old runtimes too): keep SDL's default placement.
     // With a known panel pixel size, center the window on the panel (parity with
     // the other demos); otherwise fall back to the panel's top-left corner.
-    auto placeOnPanel = [this, winW, winH, forceX, forceY, forcePos](
-                            int32_t left, int32_t top, uint32_t panelW, uint32_t panelH) {
+    auto placeOnPanel = [this, winW, winH, forceX, forceY, forcePos, forceSize](
+                            int32_t left, int32_t top, uint32_t panelW, uint32_t panelH) mutable {
+        // The default size is for 100% scaling: scale it like the UI, for the display the
+        // window opens on. A MEDIAPLAYER_WINDOW size is taken as given.
+        bool resized = false;
+        if (!forceSize) {
+            const float sc = forcePos ? Window::ContentScaleAt(forceX, forceY)
+                                      : Window::ContentScaleAt(left, top);
+            if (sc != 1.0f) {
+                winW = (int)((float)winW * sc);
+                winH = (int)((float)winH * sc);
+                window_.SetSize(winW, winH);
+                resized = true;
+            }
+        }
         if (forcePos) {
             window_.SetPosition(forceX, forceY);
             LOG_INFO("MEDIAPLAYER_WINDOW override: placed window at absolute (%d, %d)",
@@ -297,6 +310,9 @@ bool App::Initialize(const char* mediaPath) {
             window_.SetPosition(x, y);
             LOG_INFO("Placed window on 3D panel at (%d, %d)%s", x, y,
                      (panelW > 0) ? " (centered)" : "");
+        } else if (resized) {
+            // SDL centred the window at its old size: centre it again at the new one.
+            window_.SetPosition(SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         }
         // Desktop Linux: the window is created HERE, now that the panel is known
         // (displayxr-common's window helper: after the system properties, before
@@ -448,6 +464,7 @@ bool App::Initialize(const char* mediaPath) {
     // Dear ImGui transport bar, rendered into the window-space HUD layer (M4). If it
     // can't init, RenderOneFrame falls back to the CPU-rasterized text HUD.
     if (xr_.HasHud()) {
+        imgui_.SetUiScale(window_.DisplayScale());  // before Init: the font is rasterized at it
         if (imgui_.Init((void*)window_.SdlWindow(), xr_.VkInstanceHandle(), xr_.PhysicalDevice(),
                         xr_.Device(), xr_.GraphicsQueue(), xr_.GraphicsQueueFamily(),
                         (VkFormat)xr_.HudFormat(), xr_.HudWidth(), xr_.HudHeight(),
@@ -1076,27 +1093,32 @@ void App::RenderOneFrame() {
     if (wantHud) {
         uint32_t cw = 0, ch = 0;
         window_.PixelSize(cw, ch);
+        // The HUD image is the window's pixel size, so the UI draws 1:1. It cannot be a
+        // bigger image drawn into in part: the runtime's Vulkan compositor ignores the
+        // layer's sub-image rect. A drag-resize rebuilds it at most 5x a second; in between,
+        // the last one is stretched over the window.
+        if (imguiReady && cw > 0 && ch > 0 && (cw != xr_.HudWidth() || ch != xr_.HudHeight()) &&
+            SteadySeconds() - lastHudResize_ >= 0.2) {
+            lastHudResize_ = SteadySeconds();
+            vkDeviceWaitIdle(xr_.Device());
+            if (xr_.ResizeHud(cw, ch))
+                imgui_.RecreateTarget((VkFormat)xr_.HudFormat(), xr_.HudWidth(), xr_.HudHeight(),
+                                      xr_.HudImages());
+        }
         const float hudAR = (float)xr_.HudWidth() / (float)xr_.HudHeight();
         const float winAR = (ch > 0) ? (float)cw / (float)ch : 1.0f;
 
+        if (imguiReady) imgui_.SetUiScale(window_.DisplayScale());
         uint32_t hudIdx = 0;
         if (xr_.AcquireHudImage(hudIdx)) {
             if (imguiReady) {
-                // Aspect-preserving HUD footprint (matches the Gauss demo's demo-gs#8 fix).
-                // The HUD swapchain is a fixed 16:9 image; the runtime stretches it per-axis to
-                // fill the layer rect. A full-window rect on a non-16:9 tile stretches the two
-                // axes unequally and distorts the buttons/glyphs. Pick a centered rect whose
-                // fractions match the HUD aspect so both axes scale by the same factor (uniform,
-                // no distortion). The SAME rect drives the cursor remap below, so hit-testing
-                // stays aligned with what's drawn.
-                float fracW = 1.0f, fracH = 1.0f;
-                if (winAR > hudAR) fracW = hudAR / winAR;   // wide tile: full height, inset width
-                else if (winAR > 0.0f) fracH = winAR / hudAR;  // tall tile: full width, inset height
+                // Laid out in window pixels, shown over the whole window. The SAME rect
+                // drives the cursor remap below.
                 hud.enabled = true;
-                hud.x = (1.0f - fracW) * 0.5f;  // centered horizontally
-                hud.y = 0.0f;                   // anchored to the top so the bar stays flush
-                hud.width = fracW;
-                hud.height = fracH;
+                hud.x = 0.0f;
+                hud.y = 0.0f;
+                hud.width = 1.0f;
+                hud.height = 1.0f;
                 hud.disparity = kHudDisparity;
 #if MEDIAPLAYER_PRO
                 proHud_[0] = hud.x;
@@ -1210,9 +1232,10 @@ void App::RenderOneFrame() {
 void App::BuildTransportUI() {
     uiState_.hasMedia = hasMedia_;
     uiState_.isVideo = isVideo_;
-    uiState_.mediaFilename =
-        currentMediaPath_.empty() ? std::string()
-                                  : std::filesystem::path(currentMediaPath_).filename().string();
+    // Windowed, the file name is in the title bar (UpdateFps); full screen has none.
+    uiState_.mediaFilename = (currentMediaPath_.empty() || !window_.IsFullscreen())
+                                 ? std::string()
+                                 : std::filesystem::path(currentMediaPath_).filename().string();
     uiState_.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
     uiState_.layoutName = convertBound_ ? kConvertedLayoutName
                           : VrActive()  ? std::string(vr::ProjectionName(vrProj_)) + " " + LayoutShortName()  // #155
@@ -1433,10 +1456,12 @@ void App::UpdateFps() {
         fpsWindowFrames_ = 0;
         fpsWindowStart_ = now;
 
-        char title[160];
-        std::snprintf(title, sizeof(title),
-                      MP_PRODUCT_NAME "  —  %.0f fps  —  %s", fps_,
-                      xr_.ActiveModeName());
+        const std::string file = (currentMediaPath_.empty() || isLive_ || isStream_)
+                                     ? std::string()
+                                     : std::filesystem::path(currentMediaPath_).filename().string();
+        char title[400];
+        std::snprintf(title, sizeof(title), "%s%s" MP_PRODUCT_NAME "  -  %.0f fps  -  %s",
+                      file.c_str(), file.empty() ? "" : "  -  ", fps_, xr_.ActiveModeName());
         window_.SetTitle(title);
         LOG_DEBUG("fps=%.1f mode=%s", fps_, xr_.ActiveModeName());
     }
@@ -4122,7 +4147,7 @@ void App::RequestOpenFile() {
 
     static const SDL_DialogFileFilter kFilters[] = {
         // Keep in sync with MediaSource::IsSupported — SDL wants its own filter string.
-        {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png;lif;mpo;heic;heif;hif"},
+        {"Stereo media", "mp4;mkv;mov;m4v;webm;3gp;jpg;jpeg;png;gif;bmp;lif;mpo;heic;heif;hif"},
         {"All files", "*"},
     };
     SDL_ShowOpenFileDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this,

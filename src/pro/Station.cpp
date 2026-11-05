@@ -6,6 +6,7 @@
 #include "pro/QcReport.h"
 #include "pro/Thumbnail.h"
 #include "stb_image_write.h"  // implementation compiled in src/rhi/VulkanRenderer.cpp
+#include "ui/UiScale.h"
 
 #include <nlohmann/json.hpp>
 #include <SDL3/SDL.h>
@@ -25,6 +26,8 @@
 #endif
 
 namespace mp::pro {
+
+using ui::Px;
 
 namespace {
 
@@ -857,7 +860,7 @@ void Station::BuildDeckLinkDialog() {
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.42f), ImGuiCond_Appearing,
                             ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(std::clamp(io.DisplaySize.x * 0.30f, 380.0f, 520.0f), 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(std::clamp(io.DisplaySize.x * 0.30f, Px(380.0f), Px(520.0f)), 0.0f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.95f);
     if (!ImGui::Begin("DeckLink input setup", &dlgOpen_, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
@@ -1078,9 +1081,9 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
     // Between the two panels (ProController's panel width), along the bottom.
-    const float panelW = std::clamp(W * 0.24f, 280.0f, 440.0f);
+    const float panelW = std::clamp(W * 0.24f, Px(280.0f), Px(440.0f));
     ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.86f), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
-    ImGui::SetNextWindowSize(ImVec2(std::max(200.0f, W - 2.0f * panelW - 48.0f), H * 0.15f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(std::max(Px(200.0f), W - 2.0f * panelW - Px(48.0f)), H * 0.15f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(flat ? 1.0f : 0.72f);
     if (flat) ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     const ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
@@ -1103,7 +1106,7 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
         const ImU32 dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
         // depth band (near..far) against the budget
         {
-            const float y0 = p0.y, y1 = p0.y + rowH - 4.0f;
+            const float y0 = p0.y, y1 = p0.y + rowH - Px(4.0f);
             dl->AddText(ImVec2(p0.x, y0 + rowH * 0.3f), dim, "Depth");
             dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), grid);
             float lo = std::min(b.nearPct, -0.5f) - 0.6f, hi = std::max(b.farPct, 0.5f) + 0.6f;
@@ -1114,7 +1117,7 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
                 }
             auto Y = [&](float pct) { return y1 - (pct - lo) / (hi - lo) * (y1 - y0); };
             for (float lim : {b.nearPct, b.farPct})
-                for (float x = x0; x < x1; x += 10.0f) dl->AddLine(ImVec2(x, Y(lim)), ImVec2(std::min(x + 5.0f, x1), Y(lim)), limit, 1.5f);
+                for (float x = x0; x < x1; x += Px(10.0f)) dl->AddLine(ImVec2(x, Y(lim)), ImVec2(std::min(x + Px(5.0f), x1), Y(lim)), limit, Px(1.5f));
             dl->AddLine(ImVec2(x0, Y(0.0f)), ImVec2(x1, Y(0.0f)), grid);
             for (size_t i = 1; i < hist.size(); ++i) {
                 const rig::Sample& a = hist[i - 1];
@@ -1123,13 +1126,13 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
                 dl->AddQuadFilled(ImVec2(X(a.t), Y(a.nearPct)), ImVec2(X(c.t), Y(c.nearPct)), ImVec2(X(c.t), Y(c.farPct)),
                                   ImVec2(X(a.t), Y(a.farPct)), band);
                 const bool over = c.nearPct < b.nearPct || c.farPct > b.farPct;
-                dl->AddLine(ImVec2(X(a.t), Y(a.nearPct)), ImVec2(X(c.t), Y(c.nearPct)), over ? limit : line, 2.0f);
-                dl->AddLine(ImVec2(X(a.t), Y(a.farPct)), ImVec2(X(c.t), Y(c.farPct)), line, 1.5f);
+                dl->AddLine(ImVec2(X(a.t), Y(a.nearPct)), ImVec2(X(c.t), Y(c.nearPct)), over ? limit : line, Px(2.0f));
+                dl->AddLine(ImVec2(X(a.t), Y(a.farPct)), ImVec2(X(c.t), Y(c.farPct)), line, Px(1.5f));
             }
         }
         // vertical error
         {
-            const float y0 = p0.y + rowH, y1 = p0.y + 2.0f * rowH - 4.0f;
+            const float y0 = p0.y + rowH, y1 = p0.y + 2.0f * rowH - Px(4.0f);
             dl->AddText(ImVec2(p0.x, y0 + rowH * 0.3f), dim, "Vertical");
             dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), grid);
             // Scale to the larger of twice the limit and the worst sample, so an error past
@@ -1139,13 +1142,13 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
                 if (s.ok) range = std::max(range, std::fabs(s.verticalPx) * 1.25f);
             auto Y = [&](float px) { return (y0 + y1) * 0.5f - std::clamp(px / range, -1.0f, 1.0f) * (y1 - y0) * 0.5f; };
             for (float lim : {b.maxVerticalPx, -b.maxVerticalPx})
-                for (float x = x0; x < x1; x += 10.0f) dl->AddLine(ImVec2(x, Y(lim)), ImVec2(std::min(x + 5.0f, x1), Y(lim)), limit, 1.0f);
+                for (float x = x0; x < x1; x += Px(10.0f)) dl->AddLine(ImVec2(x, Y(lim)), ImVec2(std::min(x + Px(5.0f), x1), Y(lim)), limit, Px(1.0f));
             for (size_t i = 1; i < hist.size(); ++i) {
                 const rig::Sample& a = hist[i - 1];
                 const rig::Sample& c = hist[i];
                 if (!a.ok || !c.ok || c.t - a.t > 2.0) continue;
                 dl->AddLine(ImVec2(X(a.t), Y(a.verticalPx)), ImVec2(X(c.t), Y(c.verticalPx)),
-                            std::fabs(c.verticalPx) > b.maxVerticalPx ? limit : ImGui::GetColorU32(kOk), 2.0f);
+                            std::fabs(c.verticalPx) > b.maxVerticalPx ? limit : ImGui::GetColorU32(kOk), Px(2.0f));
             }
         }
         const char* ticks[] = {"-60 s", "-45 s", "-30 s", "-15 s", "now"};
