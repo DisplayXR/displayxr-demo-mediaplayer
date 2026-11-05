@@ -251,6 +251,28 @@ private:
 	// clip would silence exactly the case that matters -- the FIRST play-through of
 	// the next one.
 	bool stereoBindLogged_ = false;
+
+	// #8: Adreno's import of a YV12 buffer (what the c2.android software decoders write)
+	// assumes a stride that is a multiple of 128 and ignores the buffer's own, so any
+	// other width comes out garbled. Such frames are copied into our own YV12 buffers of
+	// a 128-multiple width; ahbUScale_ crops the padding. Per eye, reused round the pool.
+	struct Yv12Copy {
+		struct AHardwareBuffer *ahb = nullptr;  // our AHardwareBuffer_allocate ref
+		bool free = true;                       // no submitted frame samples it any more
+	};
+	static constexpr int kYv12Copies = 6;
+	// The buffer to import for decoder frame `ahb` (itself, or a padded copy of it);
+	// `importW` gets its width.
+	struct AHardwareBuffer *strideSafe(struct AHardwareBuffer *ahb, int eye, uint32_t w,
+	                                   uint32_t h, uint32_t *importW);
+	void releaseYv12Copies();
+	Yv12Copy yv12Copies_[2][kYv12Copies];
+	struct AHardwareBuffer *yv12Src_[2] = {};  // the decoder frame last copied, per eye
+	int yv12Cur_[2] = {-1, -1};                // the copy holding it
+	uint32_t yv12W_ = 0, yv12H_ = 0;           // the copies' size
+	bool yv12Logged_ = false;                  // per stream
+	float ahbUScale_ = 1.0f;  // content width / imported width
+
 	VkImage dummyImage_ = VK_NULL_HANDLE;
 	VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
 	VkImageView dummyView_ = VK_NULL_HANDLE;

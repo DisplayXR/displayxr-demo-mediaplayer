@@ -884,11 +884,107 @@ SbsRenderer::destroyAhbImport(AhbImport &imp)
 	imp = AhbImport{};
 }
 
+struct AHardwareBuffer *
+SbsRenderer::strideSafe(struct AHardwareBuffer *ahb, int eye, uint32_t w, uint32_t h,
+                        uint32_t *importW)
+{
+	constexpr uint32_t kFormatYv12 = 0x32315659;  // HAL_PIXEL_FORMAT_YV12 (no NDK name in r26)
+	*importW = w;
+	AHardwareBuffer_Desc sd = {};
+	AHardwareBuffer_describe(ahb, &sd);
+	if (sd.format != kFormatYv12 || sd.stride % 128 == 0) return ahb;
+	const uint32_t bw = (w + 127) & ~127u;
+	if (ahb == yv12Src_[eye] && yv12Cur_[eye] >= 0 && yv12W_ == bw && yv12H_ == h) {
+		*importW = bw;
+		return yv12Copies_[eye][yv12Cur_[eye]].ahb;
+	}
+	if (yv12W_ != bw || yv12H_ != h) {
+		ring_.waitAll();
+		releaseYv12Copies();
+		yv12W_ = bw;
+		yv12H_ = h;
+	}
+	int k = -1;
+	for (int pass = 0; pass < 2 && k < 0; ++pass) {
+		if (pass == 1) ring_.waitAll();  // runs the deferred frees below
+		for (int i = 0; i < kYv12Copies && k < 0; ++i) {
+			if (yv12Copies_[eye][i].free) k = i;
+		}
+	}
+	if (k < 0) return ahb;
+	Yv12Copy &copy = yv12Copies_[eye][k];
+	if (copy.ahb == nullptr) {
+		AHardwareBuffer_Desc dd = {};
+		dd.width = bw;
+		dd.height = h;
+		dd.layers = 1;
+		dd.format = kFormatYv12;
+		dd.usage = AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+		if (AHardwareBuffer_allocate(&dd, &copy.ahb) != 0) {
+			copy.ahb = nullptr;
+			if (!yv12Logged_) LOGE("YV12 %ux%u allocate failed: showing the frame as decoded (#8)", bw, h);
+			yv12Logged_ = true;
+			return ahb;
+		}
+	}
+	AHardwareBuffer_Planes sp = {}, dp = {};
+	if (AHardwareBuffer_lockPlanes(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, &sp) != 0)
+		return ahb;
+	if (AHardwareBuffer_lockPlanes(copy.ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr,
+	                               &dp) != 0) {
+		AHardwareBuffer_unlock(ahb, nullptr);
+		return ahb;
+	}
+	for (uint32_t p = 0; p < 3; ++p) {
+		const uint32_t pw = p == 0 ? w : (w + 1) / 2;
+		const uint32_t ph = p == 0 ? h : (h + 1) / 2;
+		for (uint32_t y = 0; y < ph; ++y) {
+			const uint8_t *s = (const uint8_t *)sp.planes[p].data + (size_t)y * sp.planes[p].rowStride;
+			uint8_t *d = (uint8_t *)dp.planes[p].data + (size_t)y * dp.planes[p].rowStride;
+			std::memcpy(d, s, pw);
+			if (pw < dp.planes[p].rowStride) d[pw] = d[pw - 1];  // linear filtering reads it
+		}
+	}
+	AHardwareBuffer_unlock(copy.ahb, nullptr);
+	AHardwareBuffer_unlock(ahb, nullptr);
+	if (!yv12Logged_) {
+		yv12Logged_ = true;
+		LOGI("YV12 stride %u is not a multiple of 128: copying frames into %ux%u buffers (#8)",
+		     sd.stride, bw, h);
+	}
+	if (yv12Cur_[eye] >= 0) {
+		const int prev = yv12Cur_[eye];
+		ring_.deferDestroy([this, eye, prev]() { yv12Copies_[eye][prev].free = true; });
+	}
+	copy.free = false;
+	yv12Cur_[eye] = k;
+	yv12Src_[eye] = ahb;
+	*importW = bw;
+	return copy.ahb;
+}
+
+void
+SbsRenderer::releaseYv12Copies()
+{
+	for (auto &eye : yv12Copies_) {
+		for (Yv12Copy &copy : eye) {
+			if (copy.ahb) AHardwareBuffer_release(copy.ahb);
+			copy = Yv12Copy{};
+		}
+	}
+	yv12Src_[0] = yv12Src_[1] = nullptr;
+	yv12Cur_[0] = yv12Cur_[1] = -1;
+	yv12W_ = yv12H_ = 0;
+}
+
 bool
 SbsRenderer::setVideoAhb(struct AHardwareBuffer *ahb, uint32_t width, uint32_t height)
 {
-	const AhbImport *imp = importAhb(ahb, width, height);
+	uint32_t importW = width;
+	ahb = strideSafe(ahb, 0, width, height, &importW);
+	const AhbImport *imp = importAhb(ahb, importW, height);
 	if (imp == nullptr) return false;
+	ahbUScale_ = (float)width / (float)importW;
 	// Only RECORD the active view: drawAtlas() writes it into the descriptor set of
 	// the ring slot it records into. Writing a shared set here would rewrite it under
 	// a frame that is still queued (frames are in flight now, nothing waits idle).
@@ -934,7 +1030,9 @@ SbsRenderer::setVideoAhbStereo(struct AHardwareBuffer *ahbL, uint32_t wL, uint32
 		// sampling through it is undefined -- so refuse and stay flat-left.
 		return fail("eye sizes differ");
 	}
-	const AhbImport *impR = importAhb(ahbR, wR, hR);
+	uint32_t importWR = wR;
+	ahbR = strideSafe(ahbR, 1, wR, hR, &importWR);
+	const AhbImport *impR = importAhb(ahbR, importWR, hR);
 	if (impR == nullptr) return fail("right import");
 
 	// importAhb() REBUILDS the whole ycbcr chain if the right buffer carries a
@@ -951,7 +1049,7 @@ SbsRenderer::setVideoAhbStereo(struct AHardwareBuffer *ahbL, uint32_t wL, uint32
 		LOGI("[LVF] eye streams reported different external formats; rebinding the left "
 		     "against the rebuilt pipeline");
 		if (!setVideoAhb(ahbL, wL, hL)) return fail("left re-import after format rebuild");
-		impR = importAhb(ahbR, wR, hR);
+		impR = importAhb(ahbR, importWR, hR);
 		if (impR == nullptr || ahbActiveView_ == VK_NULL_HANDLE) {
 			return fail("external formats will not converge");
 		}
@@ -1182,9 +1280,10 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &dsv, 0, nullptr);
 		SbsPush push = {};
-		push.uvOffset[0] = offBase;
+		const float uScale = useAhb ? ahbUScale_ : 1.0f;
+		push.uvOffset[0] = offBase * uScale;
 		push.uvOffset[1] = 0.0f;
-		push.uvScale[0] = boxW;
+		push.uvScale[0] = boxW * uScale;
 		push.uvScale[1] = 1.0f;
 		push.mode = sourceMode_;
 		push.fullRange = sourceFullRange_;
@@ -1247,6 +1346,9 @@ SbsRenderer::resetVideoAhb()
 	convergence_ = 0.0f;
 	stereoBindLogged_ = false;  // per-STREAM, so the next clip reports its own outcome
 	ahbActiveW_ = ahbActiveH_ = 0;
+	releaseYv12Copies();  // after the imports, which hold their own refs
+	yv12Logged_ = false;
+	ahbUScale_ = 1.0f;
 	if (sourceMode_ == 3) sourceMode_ = 0;  // nothing bound until the next source
 	destroyAhbPipeline();
 }
@@ -1265,6 +1367,7 @@ SbsRenderer::cleanup()
 	ahbActiveImageR_ = VK_NULL_HANDLE;
 	ahbActiveViewR_ = VK_NULL_HANDLE;
 	ahbStereo_ = false;
+	releaseYv12Copies();
 	destroyAhbPipeline();
 	for (auto &kv : targets_) {
 		if (kv.second.fb) vkDestroyFramebuffer(device_, kv.second.fb, nullptr);
