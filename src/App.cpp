@@ -3331,7 +3331,8 @@ void App::SubmitConvertFrame(const FrameRing::Frame& f, double nowSec) {
     // An HDR frame (#169): the converter takes an SDR picture, and its RGBA result is drawn as
     // SDR, so tone-map here the way the shader shows the source (no grade, no exposure: the
     // grade runs on the result). Scene-linear EXR was handed over as raw PQ code (white ~148).
-    if (fmt != 3 && f.transfer != ColorTransfer::SDR) {
+    // An untagged frame the user marked HLG / PQ (#169) goes the same way, on BT.2020.
+    if (fmt != 3 && (f.transfer != ColorTransfer::SDR || renderer_.ForcesHdr(0))) {
         const bool hdr = f.transfer == ColorTransfer::HLG || f.transfer == ColorTransfer::PQ;
         const VulkanRenderer::HdrState h =
             renderer_.HdrFor((int)f.transfer, f.primaries2020 || (hdr && f.matrix == ColorMatrix::BT2020), f.peakNits);
@@ -3344,7 +3345,8 @@ void App::SubmitConvertFrame(const FrameRing::Frame& f, double nowSec) {
             const color::HdrDisplayTable table(p);
             if (!lift::ConvertHdrYuvToRgba(f.plane[0].data(), f.plane[1].data(),
                                            fmt == 0 ? f.plane[2].data() : nullptr, (uint32_t)f.width,
-                                           (uint32_t)f.height, fmt, f.fullRange, (int)f.matrix, table, convertInW_,
+                                           (uint32_t)f.height, fmt, f.fullRange,
+                                           renderer_.EffectiveMatrix((int)f.transfer, (int)f.matrix), table, convertInW_,
                                            convertInH_, convertIn_))
                 return;
             lift_.Submit(convertIn_.data(), convertInW_, convertInH_, convertInW_ * 4, f.serial, nowSec);

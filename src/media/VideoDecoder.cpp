@@ -783,7 +783,15 @@ void VideoDecoder::DecodeLoop() {
                      av_get_pix_fmt_name(hwFrames->sw_format));
             warnedZeroCopyFormat_ = true;
         }
-        if (interopActive_ && impl_->hwPixFmt != AV_PIX_FMT_NONE && f->format == impl_->hwPixFmt &&
+        // An HLG / PQ frame takes the CPU path too (#169): the convert pass hands over SDR RGBA,
+        // which carries no transfer, so Pro's tone map would be skipped (an 8-bit HDR stream
+        // showed as raw signal). The base player shows the same pixels either way.
+        const bool hdrFrame = TransferOf(f, impl_->codec) != ColorTransfer::SDR;
+        if (interopActive_ && hdrFrame && !warnedZeroCopyHdr_) {
+            LOG_INFO("VideoDecoder: HDR stream: zero-copy hands over SDR RGBA, using the CPU path");
+            warnedZeroCopyHdr_ = true;
+        }
+        if (interopActive_ && !hdrFrame && impl_->hwPixFmt != AV_PIX_FMT_NONE && f->format == impl_->hwPixFmt &&
             hwFrames && hwFrames->sw_format == AV_PIX_FMT_NV12 && impl_->d3dContext && impl_->d3dHwctx) {
             FrameRing::Frame& dst = ring_.WriteBuffer();
             // (Re)create this slot's shared RGBA texture on first use or a size change.

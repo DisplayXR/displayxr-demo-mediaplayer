@@ -18,6 +18,7 @@
 
 #include "ColorPolicy.h"  // swapchain encoding policy (#78)
 #include "color/CubeLut.h"  // PackRgba16f for the 3D LUT
+#include "color/ToneMap.h"  // HLG display-peak range (#169)
 #include "Log.h"
 #include "rhi/Shaders.h"
 
@@ -623,13 +624,23 @@ VulkanRenderer::HdrState VulkanRenderer::SourceHdr() const {
 VulkanRenderer::HdrState VulkanRenderer::HdrFor(int transfer, bool bt2020, float peakNits) const {
     HdrState h;
     h.transfer = (transfer >= 1 && transfer <= 3) ? transfer : 0;
+    if (ForcesHdr(h.transfer)) {  // #169: the user says this untagged source is HLG / PQ
+        h.transfer = grade_.forceTransfer;
+        h.forced = true;
+        bt2020 = true;
+    }
     if (h.transfer == 0) return h;
     h.raw = grade_.toneMap == 3;
     h.bt2020 = bt2020;
     h.rollOff = grade_.toneMap == 1 || (grade_.toneMap == 0 && (h.transfer == 1 || h.transfer == 2));
     h.peakNits = grade_.peakNits > 0.0f ? grade_.peakNits : peakNits > 0.0f ? peakNits : 1000.0f;
-    if (h.transfer == 1) h.peakNits = 1000.0f;  // HLG: the OOTF's nominal display peak
+    // HLG: the peak is the OOTF's display peak Lw (scene-referred, no stream peak applies):
+    // the chosen one, else the nominal 1000 nits (#169: it was fixed at 1000).
+    if (h.transfer == 1)
+        h.peakNits = grade_.peakNits > 0.0f ? std::clamp(grade_.peakNits, color::kHlgMinNits, color::kHlgMaxNits)
+                                            : color::kHlgDisplayNits;
     h.pqShaper = grade_.lutPqShaper && h.transfer == 3 && !h.raw;
+    h.overWhite = grade_.toneMap == 0 && h.transfer == 3 && !h.raw && !h.pqShaper;
     return h;
 }
 
@@ -945,16 +956,19 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
             pc.yuvMatrix = 0;  // RGBA sources ignore it
         } else {
             const HdrState h = SourceHdr();
-            pc.yuvMatrix = PackColourWord(sourceMatrix_, h.raw ? 0 : h.transfer, h.rollOff, h.bt2020, h.peakNits,
-                                          h.pqShaper && pc.lutOn > 0.5f);
+            pc.yuvMatrix = PackColourWord(EffectiveMatrix(sourceTransfer_, sourceMatrix_), h.raw ? 0 : h.transfer,
+                                          h.rollOff, h.bt2020, h.peakNits, h.pqShaper && pc.lutOn > 0.5f);
+            if (h.overWhite) pc.mode |= 1 << 2;  // #169: EXR above white into the grade (A)
         }
         pc.zebraLevel = grade_.zebraLevel;
         pc.viewFlags = (grade_.channel & 7) | ((grade_.wipeMode & 3) << 4);
         if (compareMode_ >= 0) {  // B's sampling: mode bits 8-9, full range 10, matrix 11-12, P016 13, bound 14
-            pc.viewFlags |= (compareMode_ << 8) | ((compareFullRange_ ? 1 : 0) << 10) | (compareMatrix_ << 11) |
+            const int bMatrix = compareMode_ == 0 ? compareMatrix_ : EffectiveMatrix(compareTransfer_, compareMatrix_);
+            pc.viewFlags |= (compareMode_ << 8) | ((compareFullRange_ ? 1 : 0) << 10) | (bMatrix << 11) |
                             ((compare16_ ? 1 : 0) << 13) | (1 << 14);
             // B's HDR tags (#169): an HDR B is tone-mapped by its own transfer and peak.
             const HdrState hb = compareMode_ == 0 ? HdrState{} : HdrFor(compareTransfer_, compareBt2020_, comparePeak_);
+            if (hb.overWhite) pc.mode |= 1 << 3;  // EXR above white into the grade (B)
             const CompareHdrBits bb = PackCompareHdr(hb.raw ? 0 : hb.transfer, hb.rollOff, hb.bt2020, hb.peakNits,
                                                      hb.pqShaper && pc.lutOn > 0.5f);
             pc.viewFlags |= (int32_t)bb.viewFlags;
