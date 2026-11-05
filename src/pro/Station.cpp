@@ -316,6 +316,22 @@ static nlohmann::json TargetJson(const target::Screen& t, float scale, const rig
     return j;
 }
 
+static nlohmann::json CalibrationJson(const qc::Calibration& c) {
+    nlohmann::json j;
+    j["state"] = c.state.empty() ? std::string("none") : c.state;
+    if (c.state == "on" || c.state == "bypassed") {
+        j["name"] = c.name;
+        j["fingerprint"] = c.fingerprint;
+        j["lut_size"] = c.lutSize;
+        j["file"] = c.file;
+        j["kept"] = c.kept;
+        if (!c.modified.empty()) j["modified"] = c.modified;
+    }
+    j["panel"] = c.panel;
+    j["panel_key_source"] = c.panelSource;
+    return j;
+}
+
 bool Station::TakeSnapshot(const std::string& note) {
     char stamp[32];
     const std::string clock = Clock(stamp, sizeof(stamp));
@@ -348,6 +364,7 @@ bool Station::TakeSnapshot(const std::string& note) {
     s.target = target_;
     s.pictureScale = pictureScale_;
     s.parallaxOffsetPct = parallaxOffsetPct_;
+    s.calibration = calibration_;
     {
         const std::vector<rig::Sample> h = rig_.History(1.0);
         s.eyeSync = h.empty() ? -1 : h.back().eyeOffsetFrames;
@@ -380,6 +397,7 @@ void Station::SaveNote(size_t i) {
     if (s.eyeSync >= 0) j["eye_sync_frames"] = s.eyeSync;
     if (s.rig.eyeSyncMeasuredFrames >= 0) j["eye_sync_measured_frames"] = s.rig.eyeSyncMeasuredFrames;
     if (s.target.On()) j["target"] = TargetJson(s.target, s.pictureScale, s.rig, s.parallaxOffsetPct);
+    j["calibration"] = CalibrationJson(s.calibration);
     const rig::Budget b = rig_.GetBudget();
     j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"edge_pct", b.edgePct}};
     std::ofstream(s.notePath) << j.dump(2) << "\n";
@@ -441,6 +459,7 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
     s.started = (sessionDate_.size() == 8 ? IsoDate(sessionDate_.c_str()) + " " : std::string()) + sessionClock_;
     s.exported = IsoDate(stamp) + " " + clock;
     s.tcFps = signalFps_;
+    s.calibration = calibration_;
     const rig::Budget b = rig_.GetBudget();
     s.budgetNearPct = b.nearPct;
     s.budgetFarPct = b.farPct;
@@ -502,6 +521,7 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
         q.clock = sn.clock;
         q.tcFps = sn.tcFps;
         q.eyeSyncFrames = sn.eyeSync;
+        q.calibration = sn.calibration;
         q.rig.measured = sn.rig.ok;
         q.rig.verticalPx = sn.rig.verticalPx;
         q.rig.rollDeg = sn.rig.rollDeg;

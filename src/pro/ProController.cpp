@@ -13,9 +13,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 
 namespace mp::pro {
@@ -43,6 +45,26 @@ bool IsCdlPath(const std::string& p) {
 }
 
 std::string BaseName(const std::string& p) { return std::filesystem::path(p).filename().string(); }
+
+// A file's last change as local "YYYY-MM-DD HH:MM:SS", "" when it cannot be read. C++17 has
+// no clock_cast: the file clock's offset from the system clock is taken now.
+std::string FileModifiedText(const std::string& path) {
+    std::error_code ec;
+    const auto ft = std::filesystem::last_write_time(std::filesystem::u8path(path), ec);
+    if (ec) return std::string();
+    const auto sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+    const std::time_t t = std::chrono::system_clock::to_time_t(sys);
+    std::tm tm{};
+#if defined(_WIN32)
+    if (localtime_s(&tm, &t) != 0) return std::string();
+#else
+    if (!localtime_r(&t, &tm)) return std::string();
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    return buf;
+}
 
 }  // namespace
 
@@ -581,6 +603,7 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
                 case SDLK_G:
                     if (mod & SDL_KMOD_SHIFT) {  // #133: the display calibration, not the show grade
                         calBypass_ = !calBypass_;
+                        PushCalibrationToStation();  // a snapshot right after records it
                         if (host_.toast)
                             host_.toast(!calLoaded_ ? "No display calibration for this panel"
                                         : calBypass_ ? "Calibration bypassed" : "Calibration on");
@@ -648,6 +671,7 @@ void ProController::ResolveCalibration() {
         dev = host_.displayDeviceName();
     calKey_ = cal::PanelKey(runtimeKey, dev);
     calKeyFromRuntime_ = !runtimeKey.empty();
+    ++calGen_;
     if (!calPath_.empty()) {  // MEDIAPLAYER_PRO_CAL: this run only
         LOG_INFO("Pro: display calibration from MEDIAPLAYER_PRO_CAL (panel %s)", calKey_.c_str());
         LoadCalibration(calPath_, /*install=*/false);
@@ -713,6 +737,11 @@ void ProController::TickCalibration() {
     calPath_ = r.source;
     calName_ = !r.lut.title.empty() ? r.lut.title : std::filesystem::u8path(r.source).filename().u8string();
     calLoaded_ = true;
+    calLutSize_ = r.lut.size;
+    calFingerprint_ = r.fingerprint;
+    calModified_ = FileModifiedText(calKept_ ? cal::CalibrationPathFor(calKey_) : r.source);
+    ++calGen_;
+    PushCalibrationToStation();
     LOG_INFO("Pro: display calibration %s (%d^3) for panel %s", calName_.c_str(), r.lut.size, calKey_.c_str());
     if (host_.toast) host_.toast("Calibration: " + calName_);
 }
@@ -745,6 +774,11 @@ bool ProController::ClearCalibration(bool uninstall) {
     calName_.clear();
     calPath_.clear();
     calError_.clear();
+    calFingerprint_.clear();
+    calModified_.clear();
+    calLutSize_ = 0;
+    ++calGen_;
+    PushCalibrationToStation();
     if (runOnly && uninstall) {
         std::error_code ec;
         const std::string kept = cal::CalibrationPathFor(calKey_);
@@ -758,6 +792,26 @@ bool ProController::ClearCalibration(bool uninstall) {
         host_.toast(deleteKept ? "Display calibration removed" : "Display calibration off");
     }
     return true;
+}
+
+void ProController::PushCalibrationToStation() {
+    if (calGen_ == calPushedGen_ && calBypass_ == calPushedBypass_) return;
+    calPushedGen_ = calGen_;
+    calPushedBypass_ = calBypass_;
+    qc::Calibration c;
+    c.state = !calLoaded_ ? "none" : calBypass_ ? "bypassed" : "on";
+    c.panel = calKey_;
+    c.panelSource = calKeyFromRuntime_ ? "runtime" : "device_name";
+    if (calLoaded_) {
+        c.name = calName_;
+        // kept: the panel's file (Install copied the source there); run-only: where it came from
+        c.file = calKept_ ? cal::CalibrationPathFor(calKey_) : calPath_;
+        c.kept = calKept_;
+        c.lutSize = calLutSize_;
+        c.modified = calModified_;
+        c.fingerprint = calFingerprint_;
+    }
+    station_.SetCalibration(c);
 }
 
 std::string ProController::CalibrationLabel() const {
@@ -816,6 +870,7 @@ void ProController::PushTargetToStation() {
 void ProController::Tick(const Status& st) {
     stereoSource_ = st.stereo;
     station_.SetSignalFps(st.live ? st.sourceFps : 0.0f);
+    PushCalibrationToStation();
     station_.Tick();
     TickResolve(st);
     if (++ticks_ == testCompareFrame_) pendingCompare_ = true;

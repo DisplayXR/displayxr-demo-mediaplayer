@@ -132,12 +132,87 @@ void CsvAndHtml() {
     CHECK(Has(he, "No rig check went over budget") && Has(he, "No snapshots"), "an empty session says so");
 }
 
+Calibration Cal(const char* state, const char* fp) {
+    Calibration c;
+    c.state = state;
+    c.panel = "ACR-0000-871E4C17";
+    c.panelSource = "runtime";
+    if (std::string(state) != "none") {
+        c.name = "Suite A D65 2.4";
+        c.file = "C:\\cal\\ACR-0000-871E4C17.cube";
+        c.kept = true;
+        c.lutSize = 33;
+        c.modified = "2026-11-05 09:12:00";
+        c.fingerprint = fp;
+    }
+    return c;
+}
+
+void CalibrationRecord() {
+    // the fingerprint: stable, 16 hex digits, and any value change moves it
+    const float a[3] = {0.f, 0.5f, 1.f}, b[3] = {0.f, 0.5f, 0.999f};
+    const std::string fa = LutFingerprint(a, 3);
+    CHECK(fa.size() == 16 && fa.find_first_not_of("0123456789abcdef") == std::string::npos, "fingerprint is 16 hex");
+    CHECK(fa == LutFingerprint(a, 3), "same LUT, same fingerprint");
+    CHECK(fa != LutFingerprint(b, 3), "one value changed, fingerprint changes");
+    CHECK(LutFingerprint(nullptr, 0) == "cbf29ce484222325", "empty = the FNV-1a 64 offset basis");
+
+    CHECK(CalibrationText(Calibration{}).empty(), "not recorded: no text");
+    CHECK(CalibrationText(Cal("none", "")) == "none", "none");
+    const std::string on = CalibrationText(Cal("on", "0123456789abcdef"));
+    CHECK(Has(on, "Suite A D65 2.4 (33^3, on), fingerprint 0123456789abcdef, panel ACR-0000-871E4C17"), "on: text");
+    CHECK(Has(on, "changed 2026-11-05 09:12:00"), "on: the file's date");
+    CHECK(Has(CalibrationText(Cal("bypassed", "x")), "bypassed: not in the picture"), "bypassed says so");
+    Calibration ro = Cal("on", "x");
+    ro.kept = false;
+    ro.panelSource = "device_name";
+    CHECK(Has(CalibrationText(ro), "this run only") && Has(CalibrationText(ro), "follows the port"), "run-only, device name");
+
+    Session s = Sample();
+    s.calibration = Cal("on", "0123456789abcdef");
+    s.snapshots[0].calibration = s.calibration;
+    Snapshot other = s.snapshots[0];
+    other.timecode = "01:00:06:00";
+    other.calibration = Cal("bypassed", "0123456789abcdef");
+    s.snapshots.push_back(other);
+    const std::string h = MakeHtml(s);
+    CHECK(Has(h, "Display calibration at export: Suite A D65 2.4 (33^3, on)"), "HTML: the session's calibration");
+    CHECK(Has(h, "<span>Calibration Suite A D65 2.4 (33^3, on), fingerprint"), "HTML: a snapshot's own, unflagged");
+    CHECK(Has(h, "<span class=bad>Suite A D65 2.4 (33^3, bypassed: not in the picture)") &&
+              Has(h, "(not the one at export)"),
+          "HTML: a snapshot with a different calibration is flagged");
+    const std::string c = MakeCsv(s);
+    CHECK(Has(c, ",image,calibration,calibration_name,calibration_fingerprint,calibration_panel\n"), "CSV header columns");
+    CHECK(Has(c, ",on,Suite A D65 2.4,0123456789abcdef,ACR-0000-871E4C17\n"), "CSV snapshot row");
+    CHECK(Has(c, ",bypassed,Suite A D65 2.4,"), "CSV second snapshot bypassed");
+    // every row has the header's column count
+    size_t cols = 0;
+    bool same = true;
+    size_t start = 0;
+    for (size_t nl; (nl = c.find('\n', start)) != std::string::npos; start = nl + 1) {
+        const std::string row = c.substr(start, nl - start);
+        size_t n = 1;
+        bool q = false;
+        for (char ch : row) {
+            if (ch == '"') q = !q;
+            else if (ch == ',' && !q) ++n;
+        }
+        if (!cols) cols = n;
+        else same = same && n == cols;
+    }
+    CHECK(cols == 21 && same, "CSV: every row has 21 columns");
+    // an older session (nothing recorded) prints no calibration lines
+    const std::string old = MakeHtml(Sample());
+    CHECK(!Has(old, "Display calibration") && !Has(old, "Calibration "), "HTML: no record, no line");
+}
+
 }  // namespace
 
 int main() {
     TimecodeMaths();
     Edl();
     CsvAndHtml();
+    CalibrationRecord();
     if (g_failures) {
         std::fprintf(stderr, "qc_report_test: %d failure(s)\n", g_failures);
         return 1;

@@ -288,6 +288,11 @@ private:
     bool calLoaded_ = false;       // a calibration LUT is on the GPU
     bool calKept_ = false;         // ...and it is the panel's kept file (not run-only, #169)
     bool calBypass_ = false;       // Shift+G / the Inspector / set_display_calibration
+    std::string calFingerprint_, calModified_;  // of the applied LUT, for snapshots + QC (#169)
+    int calLutSize_ = 0;
+    uint64_t calGen_ = 1, calPushedGen_ = 0;   // bumped on any calibration change; pushed to the station
+    bool calPushedBypass_ = false;
+    void PushCalibrationToStation();
     void ResolveCalibration();     // find this panel's key; auto-load its installed file
     void TickCalibration();        // apply a calibration the loader finished
     std::string CalibrationLabel() const;
