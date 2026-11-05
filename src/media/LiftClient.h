@@ -35,6 +35,8 @@
 #include <string>
 #include <vector>
 
+#include "color/ToneMap.h"
+
 namespace mp::lift {
 
 // The XR_DXR_lift entry points the client uses. XrSession fills it from
@@ -228,5 +230,14 @@ void ScaleRgba(const uint8_t* src, uint32_t w, uint32_t h, uint32_t pitch, uint3
 bool ConvertYuvToRgba(const uint8_t* p0, const uint8_t* p1, const uint8_t* p2, uint32_t w,
                       uint32_t h, int format, bool fullRange, uint32_t outW, uint32_t outH,
                       std::vector<uint8_t>& out);
+
+// The same for an HDR frame (Media Player Pro, #169): the samples read at full precision
+// (P016's 16 bits), converted by the frame's own matrix (0 BT.709, 1 BT.601, 2 BT.2020 NCL,
+// as the shader), then tone-mapped by `hdr` (color::HdrDisplayTable, the shader's maths) to
+// the SDR picture the converter expects. format 0..2 as above (RGBA is never HDR).
+bool ConvertHdrYuvToRgba(const uint8_t* p0, const uint8_t* p1, const uint8_t* p2, uint32_t w,
+                         uint32_t h, int format, bool fullRange, int matrix,
+                         const color::HdrDisplayTable& hdr, uint32_t outW, uint32_t outH,
+                         std::vector<uint8_t>& out);
 
 }  // namespace mp::lift

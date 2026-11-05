@@ -685,6 +685,29 @@ void TestFrameHelpers() {
 
 }  // namespace
 
+// #169: an HDR frame reaches the converter tone-mapped. Scene-linear white (an EXR stored as
+// PQ of 203 nits, P016 limited levels) used to arrive as its PQ code (~148/255).
+static void TestHdrFrame() {
+    const uint32_t w = 4, h = 4, cw = 2, ch = 2;
+    const float code = mp::color::NitsToPq(mp::color::kRefWhiteNits);
+    const uint16_t y16 = (uint16_t)((64.0f + code * 876.0f) * 64.0f + 0.5f), c16 = 512 * 64;
+    std::vector<uint8_t> y(w * h * 2), uv(cw * ch * 4);
+    for (size_t i = 0; i < w * h; ++i) { y[i * 2] = (uint8_t)(y16 & 0xFF); y[i * 2 + 1] = (uint8_t)(y16 >> 8); }
+    for (size_t i = 0; i < cw * ch * 2; ++i) { uv[i * 2] = (uint8_t)(c16 & 0xFF); uv[i * 2 + 1] = (uint8_t)(c16 >> 8); }
+    std::vector<uint8_t> sdr;
+    CHECK(ConvertYuvToRgba(y.data(), uv.data(), nullptr, w, h, 2, false, w, h, sdr), "plain convert");
+    CHECK(sdr[0] < 170, "the plain convert hands over the PQ code (the #169 bug)");
+    mp::color::HdrParams p;
+    p.transfer = mp::color::Transfer::LinearPq;
+    p.rollOff = false;
+    const mp::color::HdrDisplayTable t(p);
+    std::vector<uint8_t> out;
+    CHECK(ConvertHdrYuvToRgba(y.data(), uv.data(), nullptr, w, h, 2, false, 0, t, w, h, out), "hdr convert");
+    CHECK(out.size() == w * h * 4, "hdr convert size");
+    CHECK(out[0] >= 253 && out[1] >= 253 && out[2] >= 253 && out[3] == 255, "scene-linear white shows as white");
+    CHECK(!ConvertHdrYuvToRgba(y.data(), uv.data(), nullptr, w, h, 3, false, 0, t, w, h, out), "RGBA is never HDR");
+}
+
 int main() {
     TestHidden();
     TestDisabledReasons();
@@ -701,6 +724,7 @@ int main() {
     TestCandidates();
     TestReset();
     TestFrameHelpers();
+    TestHdrFrame();
     if (g_failures) {
         std::fprintf(stderr, "lift_client_test: %d failure(s)\n", g_failures);
         return EXIT_FAILURE;

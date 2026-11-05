@@ -245,8 +245,10 @@ float Bt2390Nits(float nits, float srcPeak, float dstPeak) {
     }
     return PqToNits(e2 * sMax);
 }
-vec3 HdrToDisplay(vec3 c, float exposure, bool lutShaper) {
-    const int tr = HdrTransfer();
+// tr: transfer; peak: the source's peak in nits (PQ / scene-linear); shaper: hand an OCIO
+// look the linear light as PQ code. A takes its tags from yuvMatrix, the compare clip B
+// from its own bits (HdrToDisplayB).
+vec3 HdrToDisplayTags(vec3 c, int tr, bool rollOff, bool bt2020, float peak, float exposure, bool shaper) {
     vec3 l;
     if (tr == 1) {  // HLG: inverse OETF, then the OOTF for a 1000-nit display (gamma 1.2)
         vec3 s = vec3(HlgToScene(c.r), HlgToScene(c.g), HlgToScene(c.b));
@@ -257,21 +259,34 @@ vec3 HdrToDisplay(vec3 c, float exposure, bool lutShaper) {
     }
     float m = exp2(exposure);
     l *= m;
-    if (((pc.yuvMatrix >> 7) & 1) != 0)
+    if (bt2020)
         l = vec3(1.660491 * l.r - 0.587641 * l.g - 0.072850 * l.b,
                  -0.124550 * l.r + 1.132900 * l.g - 0.008349 * l.b,
                  -0.018151 * l.r - 0.100579 * l.g + 1.118730 * l.b);
     l = max(l, vec3(0.0));
     // An OCIO look on scene-linear EXR: the LUT gets the linear light as PQ code, unclipped
     // (its bake decodes it first), instead of the SDR picture.
-    if (lutShaper && ((pc.yuvMatrix >> 8) & 1) != 0)
+    if (shaper)
         return vec3(NitsToPq(l.r * kRefWhite), NitsToPq(l.g * kRefWhite), NitsToPq(l.b * kRefWhite));
     float mx = max(l.r, max(l.g, l.b));
-    if (((pc.yuvMatrix >> 6) & 1) != 0 && mx > 0.0) {
-        float src = (tr == 1 ? 1000.0 : float((pc.yuvMatrix >> 16) & 0xFFFF)) * m;
+    if (rollOff && mx > 0.0) {
+        float src = (tr == 1 ? 1000.0 : peak) * m;
         l *= (Bt2390Nits(mx * kRefWhite, src, kRefWhite) / kRefWhite) / mx;
     }
     return SceneLinearToDisplayReferred(clamp(l, 0.0, 1.0));
+}
+vec3 HdrToDisplay(vec3 c, float exposure, bool lutShaper) {
+    return HdrToDisplayTags(c, HdrTransfer(), ((pc.yuvMatrix >> 6) & 1) != 0, ((pc.yuvMatrix >> 7) & 1) != 0,
+                            float((pc.yuvMatrix >> 16) & 0xFFFF), exposure,
+                            lutShaper && ((pc.yuvMatrix >> 8) & 1) != 0);
+}
+// The compare clip B's tags (#169, src/rhi/PushPack.h PackCompareHdr): viewFlags bits 6-7
+// transfer, bit 3 BT.2020; yuvMatrix bit 2 shaper, bit 9 roll-off, bits 10-15 log peak.
+int HdrTransferB() { return (pc.viewFlags >> 6) & 3; }
+vec3 HdrToDisplayB(vec3 c, float exposure, bool lutShaper) {
+    const float peak = 100.0 * pow(100.0, float((pc.yuvMatrix >> 10) & 63) / 63.0);
+    return HdrToDisplayTags(c, HdrTransferB(), ((pc.yuvMatrix >> 9) & 1) != 0, ((pc.viewFlags >> 3) & 1) != 0,
+                            peak, exposure, lutShaper && ((pc.yuvMatrix >> 2) & 1) != 0);
 }
 
 // The picture as decoded (the "before" side of the grade wipe): HDR made viewable, no grade.
@@ -279,6 +294,10 @@ vec3 SourceView(vec3 s) { return HdrTransfer() == 0 ? s : HdrToDisplay(s, 0.0, f
 // This clip's grade: an HDR source takes exposure in linear light, before the roll-off.
 vec3 GradeSrc(vec3 s) {
     return HdrTransfer() == 0 ? Grade(s) : GradeStages(HdrToDisplay(s, pc.exposure, true), false);
+}
+// B's grade: the same look, with B's own HDR decode (an EXR B was shown as raw PQ code).
+vec3 GradeSrcB(vec3 s) {
+    return HdrTransferB() == 0 ? Grade(s) : GradeStages(HdrToDisplayB(s, pc.exposure, true), false);
 }
 
 // False colour: exposure bands on the graded Rec.709 luma (% of full scale), the rest in
@@ -394,7 +413,7 @@ void main() {
     if (wipe == 2 && pastWipe) c = GradeSrc(SampleSource(otherUv));
     // 3: right of the line the compare clip B, at the same point of the same eye, graded
     // the same way (both versions seen through one look). Without B bound, A stays.
-    if (wipe == 3 && pastWipe && ((pc.viewFlags >> 14) & 1) != 0) c = Grade(SampleSourceB(uv));
+    if (wipe == 3 && pastWipe && ((pc.viewFlags >> 14) & 1) != 0) c = GradeSrcB(SampleSourceB(uv));
     graded = c;  // zebras judge the picture as shown on each side of the wipe
 #endif
 

@@ -616,17 +616,27 @@ void VulkanRenderer::SetSourceHdr(int transfer, bool bt2020, float peakNits) {
 }
 
 VulkanRenderer::HdrState VulkanRenderer::SourceHdr() const {
+    if (sourceMode_ == 0) return HdrState{};  // an RGBA source (a still, a converted picture) is SDR
+    return HdrFor(sourceTransfer_, sourceBt2020_, sourcePeak_);
+}
+
+VulkanRenderer::HdrState VulkanRenderer::HdrFor(int transfer, bool bt2020, float peakNits) const {
     HdrState h;
-    if (sourceMode_ == 0) return h;  // an RGBA source (a still, a converted picture) is SDR
-    h.transfer = sourceTransfer_;
+    h.transfer = (transfer >= 1 && transfer <= 3) ? transfer : 0;
     if (h.transfer == 0) return h;
     h.raw = grade_.toneMap == 3;
-    h.bt2020 = sourceBt2020_;
+    h.bt2020 = bt2020;
     h.rollOff = grade_.toneMap == 1 || (grade_.toneMap == 0 && (h.transfer == 1 || h.transfer == 2));
-    h.peakNits = grade_.peakNits > 0.0f ? grade_.peakNits : sourcePeak_ > 0.0f ? sourcePeak_ : 1000.0f;
+    h.peakNits = grade_.peakNits > 0.0f ? grade_.peakNits : peakNits > 0.0f ? peakNits : 1000.0f;
     if (h.transfer == 1) h.peakNits = 1000.0f;  // HLG: the OOTF's nominal display peak
     h.pqShaper = grade_.lutPqShaper && h.transfer == 3 && !h.raw;
     return h;
+}
+
+void VulkanRenderer::SetCompareHdr(int transfer, bool bt2020, float peakNits) {
+    compareTransfer_ = (transfer >= 1 && transfer <= 3) ? transfer : 0;
+    compareBt2020_ = bt2020;
+    comparePeak_ = peakNits > 0.0f ? peakNits : 0.0f;
 }
 
 bool VulkanRenderer::UploadCompareTexture(const uint8_t* rgba, uint32_t width, uint32_t height) {
@@ -640,6 +650,7 @@ bool VulkanRenderer::UploadCompareTexture(const uint8_t* rgba, uint32_t width, u
     compareFullRange_ = false;
     compare16_ = false;
     compareMatrix_ = 0;
+    SetCompareHdr(0, false, 0.0f);  // an RGBA B (a still) is SDR
     if (rec) LOG_INFO("VulkanRenderer: compare (B) RGBA %ux%u", width, height);
     return true;
 }
@@ -700,6 +711,7 @@ void VulkanRenderer::ClearCompare() {
         p = Plane{};
     }
     compareMode_ = -1;
+    SetCompareHdr(0, false, 0.0f);
 }
 
 bool VulkanRenderer::EnsureDummy() {
@@ -938,9 +950,16 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         }
         pc.zebraLevel = grade_.zebraLevel;
         pc.viewFlags = (grade_.channel & 7) | ((grade_.wipeMode & 3) << 4);
-        if (compareMode_ >= 0)  // B's sampling: mode bits 8-9, full range 10, matrix 11-12, P016 13, bound 14
+        if (compareMode_ >= 0) {  // B's sampling: mode bits 8-9, full range 10, matrix 11-12, P016 13, bound 14
             pc.viewFlags |= (compareMode_ << 8) | ((compareFullRange_ ? 1 : 0) << 10) | (compareMatrix_ << 11) |
                             ((compare16_ ? 1 : 0) << 13) | (1 << 14);
+            // B's HDR tags (#169): an HDR B is tone-mapped by its own transfer and peak.
+            const HdrState hb = compareMode_ == 0 ? HdrState{} : HdrFor(compareTransfer_, compareBt2020_, comparePeak_);
+            const CompareHdrBits bb = PackCompareHdr(hb.raw ? 0 : hb.transfer, hb.rollOff, hb.bt2020, hb.peakNits,
+                                                     hb.pqShaper && pc.lutOn > 0.5f);
+            pc.viewFlags |= (int32_t)bb.viewFlags;
+            pc.yuvMatrix |= (int32_t)bb.yuvMatrix;
+        }
         if (grade_.calOn && cal_.view) pc.viewFlags |= 1 << 15;  // display calibration (#133)
         pc.viewFlags |= (int32_t)uvs[v].vrHeading;  // bits 16-31 (vr::PackHeading)
         pc.wipeGamma = PackWipeGamma(grade_.wipePos, grade_.gamma);
