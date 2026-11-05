@@ -878,6 +878,11 @@ if(MP_BUILD_TESTS)
     target_include_directories(color_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME color COMMAND color_test)
 
+    # Output channel choice: media/AudioLayout.h (header-only).
+    add_executable(audio_layout_test tests/audio_layout_test.cpp)
+    target_include_directories(audio_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME audio_layout COMMAND audio_layout_test)
+
     # HDR on the SDR panel (#134): color/ToneMap.h (header-only) + the push-word packing.
     add_executable(tone_map_test tests/tone_map_test.cpp)
     target_include_directories(tone_map_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
