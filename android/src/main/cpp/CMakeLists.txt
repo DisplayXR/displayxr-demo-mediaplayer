@@ -154,11 +154,14 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/browser/Icons.cpp
     ${REPO_ROOT}/src/browser/MediaBrowser.cpp
     ${REPO_ROOT}/src/browser/MediaLibrary.cpp
+    ${REPO_ROOT}/src/browser/SlideGesture.cpp
     ${REPO_ROOT}/src/browser/StereoClassifier.cpp
     ${REPO_ROOT}/src/browser/ThumbnailAtlas.cpp
     ${REPO_ROOT}/src/browser/ThumbnailCache.cpp
     ${REPO_ROOT}/src/browser/TouchScroller.cpp
     browser/AndroidMediaProvider.cpp
+    neighbour_stills.cpp
+    still_image.cpp
     ${MP_IMGUI_SOURCES}
     ${SHADER_HEADERS})
 

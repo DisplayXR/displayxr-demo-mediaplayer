@@ -15,6 +15,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
@@ -83,6 +84,10 @@ class MediaStoreProvider(
     // Pairs of (id, 1 to check the file or 0), or null if unchanged.
     private external fun nativeTakeWantedThumbnails(edgeOut: IntArray): LongArray?
     private external fun nativeTakeOpenRequest(): Long
+    // The stills wanted, or null if unchanged; edgeOut receives the largest video frame's edge.
+    private external fun nativeTakeWantedStills(edgeOut: IntArray): LongArray?
+    // An image's file (or -1), which native closes, or a video's first frame (or null).
+    private external fun nativeStill(id: Long, fd: Int, width: Int, height: Int, rgba: ByteArray?, name: String)
 
     private val queryThread = Executors.newSingleThreadExecutor()
     private val thumbnailPool = Executors.newFixedThreadPool(THUMBNAIL_THREADS)
@@ -100,6 +105,11 @@ class MediaStoreProvider(
     private var workers = 0
     private val edgeOut = IntArray(1)
 
+    // Stills of the files either side of the one playing, for the swipe. Guarded by `lock`.
+    private val stillThread = Executors.newSingleThreadExecutor()
+    private var wantedStills = LongArray(0)
+    private val stillEdgeOut = IntArray(1)
+
     /** Once per Choreographer frame, on the UI thread. */
     fun poll() {
         if (nativeTakeAccessRequest()) requestAccess()
@@ -111,6 +121,11 @@ class MediaStoreProvider(
         }
         val open = nativeTakeOpenRequest()
         if (open >= 0) open(open)
+        nativeTakeWantedStills(stillEdgeOut)?.let { ids ->
+            val edge = stillEdgeOut[0]
+            synchronized(lock) { wantedStills = ids }
+            for (id in ids) stillThread.execute { makeStill(id, edge) }
+        }
     }
 
     fun onResume() {
@@ -126,6 +141,7 @@ class MediaStoreProvider(
     fun close() {
         queryThread.shutdownNow()
         thumbnailPool.shutdownNow()
+        stillThread.shutdownNow()
     }
 
     // ---------------------------------------------------------------- access
@@ -259,11 +275,7 @@ class MediaStoreProvider(
             }
             val row = rows[id]
             val bitmap = row?.let { thumbnail(it, edge) }
-            val rgba = bitmap?.let {
-                val pixels = ByteBuffer.allocate(it.width * it.height * 4)
-                it.copyPixelsToBuffer(pixels) // ARGB_8888 is laid out R, G, B, A in memory
-                pixels.array()
-            }
+            val rgba = bitmap?.let { rgbaOf(it) }
             synchronized(lock) {
                 inFlight -= id
                 made += id
@@ -273,6 +285,13 @@ class MediaStoreProvider(
                 if (check && row != null) detachedFd(row) else -1, row?.type == TYPE_VIDEO,
             )
         }
+    }
+
+    private fun rgbaOf(bitmap: Bitmap): ByteArray {
+        val argb = if (bitmap.config == Bitmap.Config.ARGB_8888) bitmap else bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        val pixels = ByteBuffer.allocate(argb.width * argb.height * 4)
+        argb.copyPixelsToBuffer(pixels) // ARGB_8888 is laid out R, G, B, A in memory
+        return pixels.array()
     }
 
     private fun detachedFd(row: Row): Int = try {
@@ -300,6 +319,46 @@ class MediaStoreProvider(
             )
         }
         return bitmap
+    }
+
+    // ---------------------------------------------------------------- stills
+
+    // An image goes to native as its file, to be decoded the way the player decodes it
+    // (a LIF in 3D). A video goes as its first frame, fitted to edge x edge.
+    private fun makeStill(id: Long, edge: Int) {
+        synchronized(lock) { if (id !in wantedStills) return } // dropped while queued
+        val row = rows[id] ?: return
+        if (row.type == TYPE_IMAGE) {
+            nativeStill(id, detachedFd(row), 0, 0, null, row.name)
+            return
+        }
+        val frame = firstFrame(row, edge)
+        nativeStill(id, -1, frame?.width ?: 0, frame?.height ?: 0, frame?.let { rgbaOf(it) }, row.name)
+    }
+
+    private fun firstFrame(row: Row, edge: Int): Bitmap? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            activity.contentResolver.openFileDescriptor(row.uri, "r")?.use { pfd ->
+                retriever.setDataSource(pfd.fileDescriptor)
+                val vw = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+                val vh = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+                // The scaled call scales up too: only use it to make a big frame smaller.
+                if (max(vw, vh) <= edge) {
+                    retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                } else {
+                    retriever.getScaledFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, edge, edge)
+                }
+            }
+        } catch (e: FileNotFoundException) {
+            Log.w(TAG, "no still for ${row.name}: $e")
+            null
+        } catch (e: RuntimeException) { // the retriever's failures
+            Log.w(TAG, "no still for ${row.name}: $e")
+            null
+        } finally {
+            retriever.release()
+        }
     }
 
     // ---------------------------------------------------------------- open

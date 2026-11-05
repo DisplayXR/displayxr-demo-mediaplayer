@@ -392,7 +392,10 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
 
     const int r = tap ? rowAt(sidebarPress_) : -1;
     if (r < 0) return Action::None;
-    if (r == files) return Action::OtherFiles;
+    if (r == files) {
+        openedId_ = -1;
+        return Action::OtherFiles;
+    }
     sourceKind_ = sources[r].kind;
     sidebar_ = false;
     dirty_ = true;
@@ -557,8 +560,35 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
 
     size_t picked = 0;
     if (!tap || !itemAt(gridPress_, picked)) return Action::None;
-    provider_->Open(items[shown_[picked]].id);
+    openedId_ = items[shown_[picked]].id;
+    provider_->Open(openedId_);
     return Action::Opened;
+}
+
+bool MediaBrowser::NextId(int step, int64_t& id) const {
+    if (openedId_ < 0 || sourceKind_ == SourceKind::Unsupported) return false;
+    const std::vector<MediaItem>& items = library_.Items();
+    for (size_t p = 0; p < shown_.size(); ++p) {
+        if (items[shown_[p]].id != openedId_) continue;
+        const long next = (long)p + step;
+        if (next < 0 || next >= (long)shown_.size()) return false;
+        id = items[shown_[(size_t)next]].id;
+        return true;
+    }
+    return false;
+}
+
+bool MediaBrowser::StepTo(int step) {
+    int64_t id = 0;
+    if (!NextId(step, id)) return false;
+    openedId_ = id;
+    return true;
+}
+
+bool MediaBrowser::OpenNext(int step) {
+    if (!provider_ || !StepTo(step)) return false;
+    provider_->Open(openedId_);
+    return true;
 }
 
 void MediaBrowser::UploadReady(const std::unordered_set<int64_t>& window) {

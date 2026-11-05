@@ -60,6 +60,14 @@ public:
     // Record this frame's thumbnail uploads into the frame command buffer, before
     // ImGuiLayer::RenderToHud.
     void RecordUploads(VkCommandBuffer cmd) { atlas_.RecordUploads(cmd); }
+    // Open the item `step` places after the one last opened, in grid order (-1: the one
+    // before). False at either end, under Unsupported, or after "Other files...".
+    bool OpenNext(int step);
+    // The item OpenNext(step) would open.
+    bool NextId(int step, int64_t& id) const;
+    // Make the item `step` places away the one last opened, without opening it: the player
+    // shows it already.
+    bool StepTo(int step);
 
 private:
     static constexpr uint32_t kTile = 512;  // thumbnail edge, px
@@ -91,6 +99,7 @@ private:
     bool dirty_ = true;            // shown_ needs a rebuild
     std::vector<size_t> shown_;    // indices into the library's items, in grid order
     std::vector<size_t> unknown_;  // under a depth filter: items with no verdict yet
+    int64_t openedId_ = -1;        // the item last opened from the grid, or -1
 
     std::unordered_set<int64_t> pending_;      // thumbnails taken from the provider, not yet uploaded
     std::deque<Thumbnail> ready_;              // classified, waiting for an upload

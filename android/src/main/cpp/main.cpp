@@ -67,11 +67,13 @@
 #include "ColorPolicy.h"  // swapchain encoding policy, shared with the desktop leg (#78)
 #include "ui/ImGuiLayer.h"
 #include "ui/TransportUI.h"
+#include "ui/UiScale.h"
 #include "browser/AndroidMediaProvider.h"
 #include "browser/MediaBrowser.h"
+#include "browser/SlideGesture.h"
+#include "neighbour_stills.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
-#include "LifLoader.h"  // SHARED desktop LIF parser (src/media/, referenced by CMake)
-#include "MpoLoader.h"
+#include "still_image.h"
 #include "MediaSource.h"   // SHARED layered stereo-layout resolver (#45)
 #include "StereoDetect.h"
 #include "video_stereo_probe_android.h"
@@ -188,6 +190,27 @@ std::atomic<bool> g_open_picker_request{false};
 // A clean tap (down+up with no drag) that is still waiting to be adjudicated
 // against ImGui's WantCaptureMouse on the render thread.
 std::atomic<bool> g_pending_tap{false};
+// Swiping to the next or previous file (#160). Touches come from the UI thread through
+// this queue; the render thread owns the gesture and the neighbours' stills.
+struct TouchEvent {
+	int action;  // MotionEvent's: 0 down, 1 up, 2 move, the rest end the gesture
+	float x, y;  // HUD pixels
+	double t;    // seconds
+};
+std::mutex g_touch_mx;
+std::vector<TouchEvent> g_touches;
+mp::browser::SlideGesture g_slide;
+NeighbourStills g_stills;
+// The file a finished slide asks for (+1 next, -1 previous), opened at the loop's top.
+int g_slide_step = 0;
+// The image on screen (when it is one), for NeighbourStills to keep when it is swiped away.
+NeighbourStills::Adopted g_picture;
+// The file the slide asked for has arrived: once it is on screen the slide is over.
+bool g_slide_arrived = false;
+// Design units, through ui::Px(): 8 dp and 64 dp.
+constexpr float kDragSlop = 12.0f;
+constexpr float kSwipeMin = 96.0f;
+constexpr uint32_t kStillMaxSide = 8192;
 
 // Touch metric scale for the shared ImGui style. The ONE sanctioned divergence
 // from the desktop: it scales padding/grab sizes only — colours, rounding and every
@@ -2001,6 +2024,11 @@ stop_media()
 	g_sbs.resetVideoAhb();
 	LOGI("[LVF] teardown: complete");
 	g_scene_loaded.store(false, std::memory_order_relaxed);
+	// A seek the old clip's scrubber still waits on must not hold the next clip's knob
+	// (the desktop resets these on every open).
+	g_ui_state.scrubValue = 0.0f;
+	g_ui_state.scrubActive = false;
+	g_ui_state.scrubTarget = -1.0f;
 }
 
 // The browser sits over the idle screen, which borrows the flat mode while it shows.
@@ -2013,38 +2041,106 @@ show_browser(struct android_app *app)
 	}
 	g_browsing = true;
 	g_browser.Refresh();
+	g_slide.Reset();
+	g_slide_step = 0;
+	g_slide_arrived = false;
 }
 
-// Bake the LIF's intended zero-disparity plane into the composed full-SBS
-// buffer: shift each eye's half horizontally by ±0.5*conv*W px (the desktop
-// applies the same 0.5-scaled per-eye shift at render time — App.cpp's
-// `conv = convergence_ + 0.5*mediaConvergence_`). Exposed strips are filled by
-// edge replication; a static image pays this once at load, so no shader or
-// per-frame work is needed.
-void
-bake_lif_convergence(mp::DecodedImage &img, float conv)
+// The current press began on the chrome (the seek bar), so its drag is the chrome's.
+static bool
+press_on_chrome()
 {
-	const int W = img.width / 2, H = img.height;
-	const int s = (int)std::lround(0.5f * conv * (float)W);
-	if (s == 0) {
+	if (!g_imgui.Ready()) return false;
+	const ImGuiIO &io = ImGui::GetIO();
+	return io.MouseDown[0] && io.MouseDownOwned[0];
+}
+
+// Once a frame, before the atlas draw: hand the swipe its touches and neighbours, open the
+// file it asks for, and place the picture and the neighbour's page.
+static void
+run_slide()
+{
+	const double now = (double)now_ns() * 1e-9;
+	if (g_slide_arrived && g_scene_loaded.load(std::memory_order_relaxed)) {
+		g_slide.Reset();
+		g_slide_arrived = false;
+	}
+	static std::vector<TouchEvent> touches;  // static: both queues keep their capacity
+	touches.clear();
+	{
+		// A swipe made while one slides or opens waits its turn, and ends that slide early.
+		std::lock_guard<std::mutex> lk(g_touch_mx);
+		if (!g_slide.Busy())
+			touches.swap(g_touches);
+		else if (!g_touches.empty())
+			g_slide.Hurry();
+	}
+	const bool in_player = !g_showing_splash.load(std::memory_order_relaxed);
+	if (!g_slide.Waiting()) {  // the page shown while a file opens must stay
+		int64_t prev = -1, next = -1;  // left as -1 when there is none
+		const bool has_prev = in_player && g_browser.NextId(-1, prev);
+		const bool has_next = in_player && g_browser.NextId(1, next);
+		g_slide.SetNeighbours(has_prev, has_next);
+		g_stills.Want(prev, next);
+	}
+	g_slide.SetMetrics((float)g_hud_w, mp::ui::Px(kDragSlop), mp::ui::Px(kSwipeMin));
+	for (const TouchEvent &e : touches) {
+		if (!in_player) break;
+		switch (e.action) {
+		case 0: g_slide.Press(e.x, e.y); break;
+		case 1: g_slide.Release(e.t); break;
+		case 2: g_slide.Move(e.x, e.y); break;
+		default: g_slide.Cancel(e.t); break;  // a cancel, or a second finger
+		}
+	}
+	const int step = g_slide.Update(now);
+	if (step != 0) g_slide_step = step;
+	const int side = g_slide.Neighbour();
+	g_sbs.setSlide(g_slide.Offset());
+	g_stills.ShowPage(side, g_slide.Offset() + (float)side);
+}
+
+// The image now in the renderer is the picture: its layout and the player's state.
+static void
+show_image(const NeighbourStills::Adopted &a)
+{
+	apply_layout(a.info.layout, a.width, a.height);
+	g_picture = a;
+	g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox for media
+	g_is_video = false;
+	leave_splash();
+	g_scene_loaded.store(true, std::memory_order_relaxed);
+	LOGI("Loaded image: %s %dx%d layout=%s (%s)%s", a.name.c_str(), a.width, a.height,
+	     mp::LayoutName(a.info.layout), mp::SignalName(a.info.signal),
+	     a.convergenceBaked ? ", convergence baked" : "");
+}
+
+// The file a finished slide asks for. An image whose still is ready becomes the picture at
+// once, one whose still is on its way waits for it, and anything else is opened.
+static void
+open_slide_step()
+{
+	const int step = g_slide_step;
+	const NeighbourStills::Use use = g_stills.ForOpen(step);
+	if (use == NeighbourStills::Use::Wait) return;
+	g_slide_step = 0;
+	int64_t current = -1;  // the picture being swiped away, when it is an image
+	if (!g_is_video && !g_showing_splash.load(std::memory_order_relaxed)) g_browser.NextId(0, current);
+	NeighbourStills::Adopted a;
+	if (use == NeighbourStills::Use::Adopt && g_stills.Adopt(step, a, current, g_picture)) {
+		stop_media();  // whatever played: the still is the picture now
+		g_browser.StepTo(step);
+		{
+			std::lock_guard<std::mutex> lk(g_pick_name_mx);
+			g_pick_name = a.name;
+		}
+		show_image(a);
+		g_slide.Reset();
 		return;
 	}
-	std::vector<uint8_t> row((size_t)W * 4);
-	auto shift_half = [&](int x0, int dx) {
-		for (int y = 0; y < H; ++y) {
-			uint8_t *base = img.pixels.data() + ((size_t)y * img.width + x0) * 4;
-			for (int x = 0; x < W; ++x) {
-				int sx = x - dx;
-				if (sx < 0) sx = 0;
-				if (sx >= W) sx = W - 1;
-				std::memcpy(row.data() + (size_t)x * 4, base + (size_t)sx * 4, 4);
-			}
-			std::memcpy(base, row.data(), (size_t)W * 4);
-		}
-	};
-	shift_half(0, +s);  // left eye content moves right
-	shift_half(W, -s);  // right eye content moves left
-	LOGI("LIF reconvergence baked: conv=%+.4f -> ±%d px per eye", conv, s);
+	const bool opening = g_browser.OpenNext(step);
+	LOGI("swipe %s -> %s", step > 0 ? "next" : "previous", opening ? "opening" : "none");
+	if (!opening) g_slide.Reset();
 }
 
 // Run an on-disk image through the SHARED desktop LifLoader — stereo LIF
@@ -2054,49 +2150,14 @@ bake_lif_convergence(mp::DecodedImage &img, float conv)
 bool
 load_image_file(const std::string &path, const std::string &logical_name)
 {
-	mp::LifResult r;
-	if (!mp::LifLoader::IsLif(path) && mp::MpoLoader::IsMpo(path)) {
-		mp::MpoResult mpo = mp::MpoLoader::Load(path);
-		r.image = std::move(mpo.image);
-		r.layout = mpo.layout;
-		r.ok = r.stereo = mpo.ok;
-	}
-	if (!r.ok) r = mp::LifLoader::Load(path);  // a LIF, a plain image, or an MPO that is not a pair
-	if (!r.ok) {
-		LOGE("image failed to decode: %s", path.c_str());
+	mp::StillImage still;
+	if (!mp::StillImage::Decode(path, logical_name, still)) return false;
+	const mp::DecodedImage &img = still.image;
+	if (!g_sbs.uploadTexture(img.pixels.data(), (uint32_t)img.width, (uint32_t)img.height)) {
 		return false;
 	}
-	if (r.stereo && r.hasConvergence) {
-		bake_lif_convergence(r.image, r.convergence);
-	}
-	if (!g_sbs.uploadTexture(r.image.pixels.data(), (uint32_t)r.image.width,
-	                         (uint32_t)r.image.height)) {
-		return false;
-	}
-	// Layered resolution (desktop App.cpp parity): a composed LIF/MPO is
-	// container metadata; a plain JPEG/PNG falls through to the filename, then
-	// the content detector on the decoded pixels, then aspect.
-	mp::MediaInfo meta;
-	meta.kind = mp::MediaKind::Image;
-	meta.layout = r.layout;
-	mp::StereoLayout fromName;
-	mp::StereoDetectResult content{};
-	const bool nameDecided = mp::MediaSource::LayoutFromFilename(logical_name, fromName);
-	if (!r.stereo && !nameDecided) {
-		content = mp::StereoDetect::AnalyzeRGBA(r.image.pixels.data(), r.image.width, r.image.height,
-		                                        (ptrdiff_t)r.image.width * 4);
-	}
-	const mp::MediaInfo info = mp::MediaSource::Resolve(
-	    logical_name, mp::MediaKind::Image, r.image.width, r.image.height, nullptr,
-	    r.stereo ? &meta : nullptr, (!r.stereo && !nameDecided && content.decided) ? &content : nullptr);
-	apply_layout(info.layout, r.image.width, r.image.height);
-	g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox for media
-	g_is_video = false;
-	leave_splash();
-	g_scene_loaded.store(true, std::memory_order_relaxed);
-	LOGI("Loaded image: %s %dx%d layout=%s (%s)%s", logical_name.c_str(), r.image.width,
-	     r.image.height, mp::LayoutName(info.layout), mp::SignalName(info.signal),
-	     (r.stereo && r.hasConvergence) ? ", convergence baked" : "");
+	show_image(NeighbourStills::Adopted{still.info, img.width, img.height, logical_name,
+	                                    still.convergenceBaked});
 	return true;
 }
 
@@ -2105,30 +2166,7 @@ bool
 load_picked_image(struct android_app *app, int fd, long long off, long long len)
 {
 	std::string path = std::string(app->activity->internalDataPath) + "/picked_image";
-	FILE *out = std::fopen(path.c_str(), "wb");
-	if (out == nullptr) {
-		LOGE("cannot stage picked image to %s", path.c_str());
-		return false;
-	}
-	bool copy_ok = true;
-	uint8_t buf[64 * 1024];
-	long long pos = off;
-	long long remaining = len;
-	while (remaining > 0) {
-		const size_t want = remaining < (long long)sizeof(buf) ? (size_t)remaining : sizeof(buf);
-		const ssize_t got = pread(fd, buf, want, (off_t)pos);
-		if (got <= 0 || std::fwrite(buf, 1, (size_t)got, out) != (size_t)got) {
-			copy_ok = false;
-			break;
-		}
-		pos += got;
-		remaining -= got;
-	}
-	std::fclose(out);
-	if (!copy_ok) {
-		LOGE("failed to stage picked image (fd=%d len=%lld)", fd, len);
-		return false;
-	}
+	if (!mp::StillImage::Stage(fd, off, len, path)) return false;
 	std::string name;
 	{
 		std::lock_guard<std::mutex> lk(g_pick_name_mx);
@@ -2510,7 +2548,7 @@ render_frame()
 	uint32_t submit_views = 0;  // views RENDERED (the active mode's, clamped)
 	uint32_t layer_views = 0;   // views the layer CARRIES: every located one (ADR-041)
 	bool rendered = false;
-	if (frame_state.shouldRender && g_scene_loaded.load(std::memory_order_relaxed) &&
+	if (frame_state.shouldRender && (g_scene_loaded.load(std::memory_order_relaxed) || g_slide.Waiting()) &&
 	    !g_pick_pending.load(std::memory_order_relaxed)) {
 		XrViewState view_state = {};
 		view_state.type = XR_TYPE_VIEW_STATE;
@@ -2603,6 +2641,7 @@ render_frame()
 			PROF_MARK(PROF_ACQUIRE);
 			if (res == XR_SUCCESS) {
 				const float aC = g_content_aspect.load(std::memory_order_relaxed);
+				run_slide();
 				g_sbs.drawAtlas(g_atlas.images[img_idx].image, g_atlas.width, g_atlas.height,
 				                render_w, render_h, cols, rows, submit_views, aC, g_image_mono,
 				                g_clear_rgb);
@@ -2701,6 +2740,10 @@ render_frame()
 		     (int)chrome_available, (int)g_imgui.WantCaptureMouse(),
 		     (int)g_open_picker_request.load(std::memory_order_relaxed));
 	}
+
+	// A press on the chrome is the chrome's. Checked after the HUD frame: ImGui has seen the
+	// press by now.
+	if (press_on_chrome()) g_slide.Cancel((double)now_ns() * 1e-9);
 
 	XrCompositionLayerProjection projection_layer = {};
 	projection_layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
@@ -2884,6 +2927,10 @@ bring_up(struct android_app *app)
 			                         g_vk_device, frames_in_flight(),
 			                         std::string(app->activity->internalDataPath) + "/stereo_verdicts.txt"),
 			    std::memory_order_relaxed);
+			if (g_browser_ready.load(std::memory_order_relaxed))
+				g_stills.Initialize(&mp::browser::AndroidMediaProvider::Instance(), &g_sbs,
+				                    std::string(app->activity->internalDataPath) + "/still_image",
+				                    g_hud_w < g_hud_h ? g_hud_w : g_hud_h, kStillMaxSide);
 		}
 	}
 	if (!ok) {
@@ -3144,6 +3191,11 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 	constexpr int kDown = 0, kUp = 1, kMove = 2;
 
 	g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);  // re-reveal the chrome
+	{
+		std::lock_guard<std::mutex> lk(g_touch_mx);
+		if (g_touches.size() >= 256) g_touches.erase(g_touches.begin());  // a long load: keep the latest
+		g_touches.push_back({(int)action, nx * (float)g_hud_w, ny * (float)g_hud_h, (double)now_ns() * 1e-9});
+	}
 
 	if (action == kDown) {
 		downX = nx;
@@ -3247,8 +3299,13 @@ android_main(struct android_app *app)
 				LOGI("xrRequestDisplayRenderingModeDXR(%d) -> %d", want, (int)mr);
 			}
 			if (g_browser_request.exchange(false, std::memory_order_relaxed)) show_browser(app);
+			if (g_browser_ready.load(std::memory_order_relaxed)) {
+				g_stills.Update();
+				if (g_slide_step != 0) open_slide_step();
+			}
 			const int pick = g_pick_fd.exchange(-1, std::memory_order_acquire);
 			if (pick >= 0) {
+				if (g_slide.Waiting()) g_slide_arrived = true;
 				const long long off = g_pick_off.load(std::memory_order_relaxed);
 				const long long len = g_pick_len.load(std::memory_order_relaxed);
 				uint8_t magic[4] = {};

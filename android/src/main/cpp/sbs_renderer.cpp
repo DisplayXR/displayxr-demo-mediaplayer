@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "fullscreen.vert.h"  // fullscreen_vert_data (SPIR-V)
@@ -219,10 +220,11 @@ SbsRenderer::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 
 	// One descriptor set per ring slot (see descSets_).
 	const uint32_t nSlots = ring_.framesInFlight();
-	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * nSlots};
+	// Twice over: the stills' sets (stillSets_) come from this pool too.
+	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 * nSlots};
 	VkDescriptorPoolCreateInfo dpci = {};
 	dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	dpci.maxSets = nSlots;
+	dpci.maxSets = 2 * nSlots;
 	dpci.poolSizeCount = 1;
 	dpci.pPoolSizes = &ps;
 	if (vkCreateDescriptorPool(device_, &dpci, nullptr, &descPool_) != VK_SUCCESS) {
@@ -236,7 +238,8 @@ SbsRenderer::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 	dsai.descriptorPool = descPool_;
 	dsai.descriptorSetCount = nSlots;
 	dsai.pSetLayouts = layouts;
-	if (vkAllocateDescriptorSets(device_, &dsai, descSets_) != VK_SUCCESS) {
+	if (vkAllocateDescriptorSets(device_, &dsai, descSets_) != VK_SUCCESS ||
+	    vkAllocateDescriptorSets(device_, &dsai, stillSets_) != VK_SUCCESS) {
 		LOGE("vkAllocateDescriptorSets failed");
 		return false;
 	}
@@ -274,9 +277,8 @@ SbsRenderer::destroyPlane(Plane &p)
 // (Re)create plane idx if the size/format changed. Allocates a device-local
 // sampled image + a persistently-mapped host-visible staging buffer.
 bool
-SbsRenderer::ensurePlane(int idx, uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel)
+SbsRenderer::ensurePlane(Plane &p, uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel)
 {
-	Plane &p = planes_[idx];
 	if (p.image != VK_NULL_HANDLE && p.w == w && p.h == h && p.fmt == fmt) {
 		return false;  // reused, no recreate
 	}
@@ -339,10 +341,9 @@ SbsRenderer::ensurePlane(int idx, uint32_t w, uint32_t h, VkFormat fmt, uint32_t
 // Append a plane copy (memcpy into staging + transition + buffer→image copy +
 // transition to SHADER_READ) to an already-recording command buffer.
 void
-SbsRenderer::recordPlaneCopy(VkCommandBuffer cmd, int idx, const uint8_t *src, uint32_t w,
+SbsRenderer::recordPlaneCopy(VkCommandBuffer cmd, Plane &p, const uint8_t *src, uint32_t w,
                              uint32_t h, uint32_t bytesPerTexel)
 {
-	Plane &p = planes_[idx];
 	std::memcpy(p.mapped, src, (size_t)w * h * bytesPerTexel);
 
 	VkImageMemoryBarrier toDst = {};
@@ -428,17 +429,22 @@ SbsRenderer::ensureDummy()
 void
 SbsRenderer::bindDescriptors(VkDescriptorSet set)
 {
+	// slot1: used by YUV (modes 1/2); slot2: used by I420 (mode 1) only.
+	bindViews(set, planes_[0].view ? planes_[0].view : dummyView_,
+	          (sourceMode_ != 0 && planes_[1].view) ? planes_[1].view : dummyView_,
+	          (sourceMode_ == 1 && planes_[2].view) ? planes_[2].view : dummyView_);
+}
+
+void
+SbsRenderer::bindViews(VkDescriptorSet set, VkImageView v0, VkImageView v1, VkImageView v2)
+{
+	const VkImageView views[3] = {v0, v1, v2};
 	VkDescriptorImageInfo info[3] = {};
+	VkWriteDescriptorSet w[3] = {};
 	for (uint32_t i = 0; i < 3; ++i) {
 		info[i].sampler = sampler_;
 		info[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-	}
-	info[0].imageView = planes_[0].view ? planes_[0].view : dummyView_;
-	// slot1: used by YUV (modes 1/2); slot2: used by I420 (mode 1) only.
-	info[1].imageView = (sourceMode_ != 0 && planes_[1].view) ? planes_[1].view : dummyView_;
-	info[2].imageView = (sourceMode_ == 1 && planes_[2].view) ? planes_[2].view : dummyView_;
-	VkWriteDescriptorSet w[3] = {};
-	for (uint32_t i = 0; i < 3; ++i) {
+		info[i].imageView = views[i];
 		w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 		w[i].dstSet = set;
 		w[i].dstBinding = i;
@@ -457,13 +463,33 @@ SbsRenderer::uploadTexture(const uint8_t *rgba, uint32_t width, uint32_t height)
 	// reused — then upload through the ring's sanctioned blocking submit. The
 	// descriptor sets pick the new view up on the next drawAtlas().
 	ring_.waitAll();
-	ensurePlane(0, width, height, VK_FORMAT_R8G8B8A8_UNORM, 4);
+	ensurePlane(planes_[0], width, height, VK_FORMAT_R8G8B8A8_UNORM, 4);
 	sourceMode_ = 0;
 	sourceFullRange_ = 1.0f;
 	ring_.submitImmediate(
-	    [&](VkCommandBuffer cmd) { recordPlaneCopy(cmd, 0, rgba, width, height, 4); });
+	    [&](VkCommandBuffer cmd) { recordPlaneCopy(cmd, planes_[0], rgba, width, height, 4); });
 	LOGI("uploadTexture %ux%u (RGBA)", width, height);
 	return true;
+}
+
+void
+SbsRenderer::uploadStill(int slot, const uint8_t *rgba, uint32_t width, uint32_t height)
+{
+	// As uploadTexture: a queued frame may still sample this slot.
+	ring_.waitAll();
+	ensurePlane(stills_[slot], width, height, VK_FORMAT_R8G8B8A8_UNORM, 4);
+	ring_.submitImmediate(
+	    [&](VkCommandBuffer cmd) { recordPlaneCopy(cmd, stills_[slot], rgba, width, height, 4); });
+}
+
+void
+SbsRenderer::adoptStill(int slot)
+{
+	// Queued frames may still sample either plane: the swap changes neither's pixels, and
+	// the next uploadStill into the slot drains them first.
+	std::swap(planes_[0], stills_[slot]);
+	sourceMode_ = 0;
+	sourceFullRange_ = 1.0f;
 }
 
 bool
@@ -477,24 +503,24 @@ SbsRenderer::uploadYUV(const uint8_t *y, const uint8_t *uv_or_u, const uint8_t *
 	ring_.waitAll();
 	const uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
 	bool recreated = false;
-	recreated |= ensurePlane(0, width, height, VK_FORMAT_R8_UNORM, 1);   // Y
+	recreated |= ensurePlane(planes_[0], width, height, VK_FORMAT_R8_UNORM, 1);   // Y
 	if (nv12) {
-		recreated |= ensurePlane(1, cw, ch, VK_FORMAT_R8G8_UNORM, 2);   // interleaved UV
+		recreated |= ensurePlane(planes_[1], cw, ch, VK_FORMAT_R8G8_UNORM, 2);   // interleaved UV
 	} else {
-		recreated |= ensurePlane(1, cw, ch, VK_FORMAT_R8_UNORM, 1);     // U
-		recreated |= ensurePlane(2, cw, ch, VK_FORMAT_R8_UNORM, 1);     // V
+		recreated |= ensurePlane(planes_[1], cw, ch, VK_FORMAT_R8_UNORM, 1);     // U
+		recreated |= ensurePlane(planes_[2], cw, ch, VK_FORMAT_R8_UNORM, 1);     // V
 	}
 	sourceMode_ = nv12 ? 2 : 1;
 	sourceFullRange_ = fullRange ? 1.0f : 0.0f;
 	(void)recreated;  // descriptor sets are rewritten per frame in drawAtlas()
 
 	ring_.submitImmediate([&](VkCommandBuffer cmd) {
-		recordPlaneCopy(cmd, 0, y, width, height, 1);
+		recordPlaneCopy(cmd, planes_[0], y, width, height, 1);
 		if (nv12) {
-			recordPlaneCopy(cmd, 1, uv_or_u, cw, ch, 2);
+			recordPlaneCopy(cmd, planes_[1], uv_or_u, cw, ch, 2);
 		} else {
-			recordPlaneCopy(cmd, 1, uv_or_u, cw, ch, 1);
-			recordPlaneCopy(cmd, 2, v, cw, ch, 1);
+			recordPlaneCopy(cmd, planes_[1], uv_or_u, cw, ch, 1);
+			recordPlaneCopy(cmd, planes_[2], v, cw, ch, 1);
 		}
 	});
 	return true;
@@ -1083,7 +1109,10 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	const bool useAhb = (sourceMode_ == 3 && ahbActiveView_ != VK_NULL_HANDLE &&
 	                     ahbActiveImage_ != VK_NULL_HANDLE && ahbPipeline_ != VK_NULL_HANDLE &&
 	                     ahbDescSets_[0] != VK_NULL_HANDLE);
-	if (!useAhb && planes_[0].view == VK_NULL_HANDLE) return;
+	const bool haveMain = useAhb || planes_[0].view != VK_NULL_HANDLE;
+	const bool haveStill =
+	    stillPage_ >= 0 && stillPage_ < kStills && stills_[stillPage_].view != VK_NULL_HANDLE;
+	if (!haveMain && !haveStill) return;
 	// Dual-source (LVF v2): each eye has its OWN imported image, so `mono` and the
 	// SBS column split do not apply -- every view samples its own image whole. Falls
 	// back to the single-source draw (left eye to both views: flat, but correct and
@@ -1192,6 +1221,7 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		ds = descSets_[slot];
 		bindDescriptors(ds);
 	}
+	if (haveStill) bindViews(stillSets_[slot], stills_[stillPage_].view, dummyView_, dummyView_);
 
 	// Zero-copy AHB: acquire the imported image from the FOREIGN queue (the video
 	// decoder/display engine wrote it) to our graphics family before sampling.
@@ -1238,26 +1268,35 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	rpbi.pClearValues = &clear;
 	vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
+	// One page of a tile: content of `aspect` fitted min-to-min (MatchMinRect: the
+	// content's shorter side == the tile's shorter side, centered; the longer axis crops
+	// (scissor) or letterboxes (cleared black); no stretch), moved `slide` tile widths and
+	// scissored to the tile. Nothing is drawn when the page is wholly off the tile.
+	auto page = [&](float tx, float ty, float aspect, float slide, VkPipeline p, VkPipelineLayout l,
+	                VkDescriptorSet set, const SbsPush &push) {
+		const float tileMin = renderW < renderH ? (float)renderW : (float)renderH;
+		const float cqW = aspect >= 1.0f ? tileMin * aspect : tileMin;
+		const float cqH = aspect >= 1.0f ? tileMin : tileMin / aspect;
+		const float shift = std::round(slide * (float)renderW);
+		const float x0 = shift > 0.0f ? tx + shift : tx;
+		const float x1 = shift < 0.0f ? tx + (float)renderW + shift : tx + (float)renderW;
+		if (x1 <= x0) return;
+		const VkViewport vp = {tx + ((float)renderW - cqW) * 0.5f + shift,
+		                       ty + ((float)renderH - cqH) * 0.5f, cqW, cqH, 0.0f, 1.0f};
+		const VkRect2D sc = {{(int32_t)x0, (int32_t)ty}, {(uint32_t)(x1 - x0), renderH}};
+		vkCmdSetViewport(cmd, 0, 1, &vp);
+		vkCmdSetScissor(cmd, 0, 1, &sc);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, l, 0, 1, &set, 0, nullptr);
+		vkCmdPushConstants(cmd, l, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+		vkCmdDraw(cmd, 3, 1, 0, 0);
+	};
+
 	for (uint32_t v = 0; v < viewCount; ++v) {
 		const uint32_t tile_x = v % c;
 		const uint32_t tile_y = v / c;
 		const float tx = (float)(tile_x * renderW);
 		const float ty = (float)(tile_y * renderH);
-
-		// Min-to-min (MatchMinRect) fit WITHIN the tile: content's shorter side
-		// == the tile's shorter side, centered; the longer axis crops (scissor)
-		// or letterboxes (cleared black). No stretch.
-		const float tileMin = renderW < renderH ? (float)renderW : (float)renderH;
-		float cqW, cqH;
-		if (contentAspect >= 1.0f) {
-			cqH = tileMin;
-			cqW = tileMin * contentAspect;
-		} else {
-			cqW = tileMin;
-			cqH = tileMin / contentAspect;
-		}
-		const float vx = tx + ((float)renderW - cqW) * 0.5f;
-		const float vy = ty + ((float)renderH - cqH) * 0.5f;
 
 		// UV: mono → whole image to every view; stereo SBS → this view's column
 		// slice (left half to view 0, right half to view 1 for a 2×1 layout).
@@ -1272,24 +1311,29 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		if (dual) offBase += rightEye ? convHalf : -convHalf;
 		VkDescriptorSet dsv = (dual && rightEye) ? dsR : ds;
 
-		// Content quad, scissor-clipped to the tile.
-		VkViewport vp = {vx, vy, cqW, cqH, 0.0f, 1.0f};
-		VkRect2D sc = {{(int32_t)tx, (int32_t)ty}, {renderW, renderH}};
-		vkCmdSetViewport(cmd, 0, 1, &vp);
-		vkCmdSetScissor(cmd, 0, 1, &sc);
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &dsv, 0, nullptr);
-		SbsPush push = {};
-		const float uScale = useAhb ? ahbUScale_ : 1.0f;
-		push.uvOffset[0] = offBase * uScale;
-		push.uvOffset[1] = 0.0f;
-		push.uvScale[0] = boxW * uScale;
-		push.uvScale[1] = 1.0f;
-		push.mode = sourceMode_;
-		push.fullRange = sourceFullRange_;
-		push.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
-		vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
-		vkCmdDraw(cmd, 3, 1, 0, 0);
+		if (haveMain) {
+			SbsPush push = {};
+			const float uScale = useAhb ? ahbUScale_ : 1.0f;
+			push.uvOffset[0] = offBase * uScale;
+			push.uvOffset[1] = 0.0f;
+			push.uvScale[0] = boxW * uScale;
+			push.uvScale[1] = 1.0f;
+			push.mode = sourceMode_;
+			push.fullRange = sourceFullRange_;
+			push.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
+			page(tx, ty, contentAspect, slide_, pipe, pl, dsv, push);
+		}
+		// The swipe's second page: a still, split like an RGBA image.
+		if (haveStill) {
+			SbsPush push = {};
+			push.uvOffset[0] = stillMono_ ? 0.0f : (float)tile_x / (float)c;
+			push.uvScale[0] = stillMono_ ? 1.0f : 1.0f / (float)c;
+			push.uvScale[1] = 1.0f;
+			push.mode = 0;
+			push.fullRange = 1.0f;
+			push.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
+			page(tx, ty, stillAspect_, stillOffset_, pipeline_, pipeLayout_, stillSets_[slot], push);
+		}
 	}
 
 	vkCmdEndRenderPass(cmd);
@@ -1375,6 +1419,7 @@ SbsRenderer::cleanup()
 	}
 	targets_.clear();
 	for (auto &p : planes_) destroyPlane(p);
+	for (auto &p : stills_) destroyPlane(p);
 	if (dummyView_) vkDestroyImageView(device_, dummyView_, nullptr);
 	if (dummyImage_) vkDestroyImage(device_, dummyImage_, nullptr);
 	if (dummyMemory_) vkFreeMemory(device_, dummyMemory_, nullptr);
@@ -1388,7 +1433,7 @@ SbsRenderer::cleanup()
 	dummyImage_ = VK_NULL_HANDLE;
 	dummyMemory_ = VK_NULL_HANDLE;
 	descPool_ = VK_NULL_HANDLE;
-	for (uint32_t i = 0; i < kMaxSlots; ++i) descSets_[i] = VK_NULL_HANDLE;
+	for (uint32_t i = 0; i < kMaxSlots; ++i) descSets_[i] = stillSets_[i] = VK_NULL_HANDLE;
 	sampler_ = VK_NULL_HANDLE;
 	pipeline_ = VK_NULL_HANDLE;
 	pipeLayout_ = VK_NULL_HANDLE;

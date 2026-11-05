@@ -11,8 +11,19 @@
 
 #include <deque>
 #include <mutex>
+#include <string>
 
 namespace mp::browser {
+
+// What a still of an item is made from: an image's file, to decode as the player does, or
+// a video's first frame.
+struct StillSource {
+    int64_t id = 0;
+    std::string name;
+    int fd = -1;  // an image: the open file, which the taker closes
+    uint32_t width = 0, height = 0;  // a video: its first frame, RGBA, or 0 x 0 if none
+    std::vector<uint8_t> rgba;
+};
 
 class AndroidMediaProvider : public MediaProvider {
 public:
@@ -31,6 +42,12 @@ public:
     bool TakeThumbnail(Thumbnail& out) override;
     void Open(int64_t id) override;
 
+    // The player's NeighbourStills (render thread). The stills wanted (the files either side
+    // of the one playing), each video frame to fit in maxEdge x maxEdge. Replaces the previous
+    // list. They arrive through TakeStill().
+    void WantStills(const std::vector<int64_t>& ids, uint32_t maxEdge);
+    bool TakeStill(StillSource& out);
+
     // The Java side, through the JNI calls (any thread).
     void SetAccess(MediaAccess access);
     void SetItems(std::vector<MediaItem> items);
@@ -39,6 +56,8 @@ public:
     bool TakeRefreshRequest();
     bool TakeWantedThumbnails(std::vector<ThumbnailRequest>& wanted, uint32_t& maxEdge);
     bool TakeOpenRequest(int64_t& id);
+    void AddStill(StillSource still);
+    bool TakeWantedStills(std::vector<int64_t>& ids, uint32_t& maxEdge);
 
 private:
     AndroidMediaProvider() = default;
@@ -55,6 +74,10 @@ private:
     std::deque<Thumbnail> thumbnails_;
     bool openRequested_ = false;
     int64_t openId_ = 0;
+    bool stillsChanged_ = false;
+    std::vector<int64_t> stillIds_;
+    uint32_t stillEdge_ = 0;
+    std::deque<StillSource> stills_;
 };
 
 } // namespace mp::browser

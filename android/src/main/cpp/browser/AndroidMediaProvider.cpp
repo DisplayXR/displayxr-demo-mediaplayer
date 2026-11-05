@@ -63,6 +63,21 @@ void AndroidMediaProvider::Open(int64_t id) {
     openId_ = id;
 }
 
+void AndroidMediaProvider::WantStills(const std::vector<int64_t>& ids, uint32_t maxEdge) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stillIds_ = ids;
+    stillEdge_ = maxEdge;
+    stillsChanged_ = true;
+}
+
+bool AndroidMediaProvider::TakeStill(StillSource& out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stills_.empty()) return false;
+    out = std::move(stills_.front());
+    stills_.pop_front();
+    return true;
+}
+
 void AndroidMediaProvider::SetAccess(MediaAccess access) {
     std::lock_guard<std::mutex> lock(mutex_);
     access_ = access;
@@ -106,6 +121,20 @@ bool AndroidMediaProvider::TakeOpenRequest(int64_t& id) {
     return true;
 }
 
+void AndroidMediaProvider::AddStill(StillSource still) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stills_.push_back(std::move(still));
+}
+
+bool AndroidMediaProvider::TakeWantedStills(std::vector<int64_t>& ids, uint32_t& maxEdge) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!stillsChanged_) return false;
+    stillsChanged_ = false;
+    ids = stillIds_;
+    maxEdge = stillEdge_;
+    return true;
+}
+
 } // namespace mp::browser
 
 // ─── JNI: MediaStoreProvider.kt ──────────────────────────────────────────
@@ -114,17 +143,20 @@ namespace {
 
 using mp::browser::AndroidMediaProvider;
 
+std::string String(JNIEnv* env, jstring s) {
+    std::string out;
+    const char* c = s ? env->GetStringUTFChars(s, nullptr) : nullptr;
+    if (c) {
+        out = c;
+        env->ReleaseStringUTFChars(s, c);
+    }
+    return out;
+}
+
 std::string StringAt(JNIEnv* env, jobjectArray array, jsize i) {
     jstring s = (jstring)env->GetObjectArrayElement(array, i);
-    std::string out;
-    if (s) {
-        const char* c = env->GetStringUTFChars(s, nullptr);
-        if (c) {
-            out = c;
-            env->ReleaseStringUTFChars(s, c);
-        }
-        env->DeleteLocalRef(s);  // a long list would overflow the local reference table
-    }
+    std::string out = String(env, s);
+    if (s) env->DeleteLocalRef(s);  // a long list would overflow the local reference table
     return out;
 }
 
@@ -250,4 +282,41 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeTakeOpenReq
 {
     int64_t id = 0;
     return AndroidMediaProvider::Instance().TakeOpenRequest(id) ? (jlong)id : -1;
+}
+
+// The new list of stills wanted, or null if it has not changed. edgeOut receives the
+// largest video frame's edge.
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeTakeWantedStills(
+    JNIEnv* env, jobject /*thiz*/, jintArray edgeOut)
+{
+    std::vector<int64_t> ids;
+    uint32_t maxEdge = 0;
+    if (!AndroidMediaProvider::Instance().TakeWantedStills(ids, maxEdge)) return nullptr;
+    const jint edge = (jint)maxEdge;
+    env->SetIntArrayRegion(edgeOut, 0, 1, &edge);
+    std::vector<jlong> out(ids.begin(), ids.end());
+    jlongArray array = env->NewLongArray((jsize)out.size());
+    env->SetLongArrayRegion(array, 0, (jsize)out.size(), out.data());
+    return array;
+}
+
+// A still's source: an image's open file (`fd`, which native closes), or a video's first
+// frame (`rgba`, width x height x 4 bytes). -1 and null (0 x 0) when there is none.
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeStill(
+    JNIEnv* env, jobject /*thiz*/, jlong id, jint fd, jint width, jint height, jbyteArray rgba,
+    jstring name)
+{
+    mp::browser::StillSource s;
+    s.id = id;
+    s.fd = fd;
+    if (rgba && width > 0 && height > 0) {
+        s.width = (uint32_t)width;
+        s.height = (uint32_t)height;
+        s.rgba.resize((size_t)width * height * 4);
+        env->GetByteArrayRegion(rgba, 0, (jsize)s.rgba.size(), (jbyte*)s.rgba.data());
+    }
+    s.name = String(env, name);
+    AndroidMediaProvider::Instance().AddStill(std::move(s));
 }

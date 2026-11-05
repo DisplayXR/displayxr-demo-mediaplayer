@@ -749,6 +749,11 @@ if(MP_BUILD_TESTS)
     target_include_directories(touch_scroller_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME touch_scroller COMMAND touch_scroller_test)
 
+    # Media browser (#160): swiping to the next or previous file in the player. Pure.
+    add_executable(slide_gesture_test tests/slide_gesture_test.cpp src/browser/SlideGesture.cpp)
+    target_include_directories(slide_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME slide_gesture COMMAND slide_gesture_test)
+
     # "Convert to 3D" (XR_DXR_lift spec v4): the LiftClient state machine over a fake
     # entry-point table, plus the CPU frame preparation. No runtime, no loader, no GPU.
     add_executable(lift_client_test

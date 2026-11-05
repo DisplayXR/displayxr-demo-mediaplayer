@@ -30,18 +30,24 @@ src/browser/                    namespace mp::browser, platform-neutral
   ThumbnailCache.{h,cpp}        media id -> atlas slot, least recently used reuse
   StereoClassifier.{h,cpp}      3D badge verdicts: background thread, cached on disk
   TouchScroller.{h,cpp}         drag, inertia, tap vs drag
+  SlideGesture.{h,cpp}          swiping to the next or previous file in the player
   MediaBrowser.{h,cpp}          the ImGui view: sidebar, top bar, grid, view options, empty states
   Icons.{h,cpp}                 hand-drawn icons
 
 android/src/main/cpp/browser/
-  AndroidMediaProvider.{h,cpp}  MediaProvider over JNI; its JNI exports live here
+  AndroidMediaProvider.{h,cpp}  MediaProvider over JNI, plus the swipe's stills; its JNI
+                                exports live here
+
+android/src/main/cpp/           the player side of the swipe
+  neighbour_stills.{h,cpp}      the files either side of the one playing, ready on the GPU
+  still_image.{h,cpp}           an image decoded as the player shows it, for opening and stills
 
 android/src/main/java/.../
-  MediaStoreProvider.kt         MediaStore query, permissions, thumbnails, opening a file
+  MediaStoreProvider.kt         MediaStore query, permissions, thumbnails, stills, opening a file
 
 tests/
   media_library_test.cpp, stereo_classifier_test.cpp, thumbnail_cache_test.cpp,
-  touch_scroller_test.cpp
+  touch_scroller_test.cpp, slide_gesture_test.cpp
 ```
 
 ## Rules
@@ -67,8 +73,10 @@ tests/
 - The render thread owns `MediaBrowser`, `MediaLibrary`, `ThumbnailCache` and
   `ThumbnailAtlas`, like the rest of the ImGui UI.
 - `StereoClassifier` is driven from the render thread and runs the content check on its
-  own worker thread.
-- `MediaStoreProvider` runs on the Android UI thread and a thumbnail executor.
+  own worker thread. `NeighbourStills` does the same for the stills: it stages and
+  decodes on a low-priority worker and uploads on the render thread.
+- `MediaStoreProvider` runs on the Android UI thread, a thumbnail executor and a still
+  executor.
 - Java to native: Java hands results (the item list, thumbnails, the permission state) to
   `AndroidMediaProvider` through JNI calls, which queue them under a mutex. The browser
   takes them once a frame.
@@ -94,6 +102,15 @@ LIF or two-track video, whose thumbnail is already one view.
 - The browser borrows the flat 2D mode and hands it back on play.
 - Back from the player stops playback and returns to the browser at the same source and
   scroll position. Back from the browser goes to the home screen.
+- Swiping left or right in the player opens the next or previous file in grid order
+  (the source, filter and sort the grid showed). The picture follows the finger with the
+  neighbour beside it. An image neighbour is decoded ahead, so it becomes the picture at
+  once and the one it replaces is kept for a swipe back. A video neighbour shows its
+  first frame while it opens. At either end the picture gives a little and slides back.
+  No swiping after "Other files..." or under Unsupported.
+- Swipe limits: one file each side is prepared; opening a video takes about 0.6 s; a
+  two-track video's first frame is flat; a file that fails to open leaves black until
+  Back; Back returns to the grid where it was, not to the file swiped to.
 - Home mid-video pauses it; the app icon resumes it.
 - Permission states the browser shows: not granted, partial access (with "select more"),
   denied, and empty source.
