@@ -330,14 +330,18 @@ a `target` block.
 
 Press **`N`**, or click **Snapshot** in the Station panel. It saves both eyes **as shown**
 (with the grade, view mode, wipe and channel you have on) as a PNG in
-**`Pictures\DisplayXR\`**, with a `_note.json` beside it holding the timecode, rig numbers
-and depth budget. Type a note next to the snapshot in the Station panel's Snapshots list.
+**`Pictures\DisplayXR\`**, with a `_note.json` beside it holding the timecode, rig numbers,
+depth budget and the display calibration in effect. Type a note next to the snapshot in the Station panel's Snapshots list.
 
 To take a frame from a movie: pause on it (`Space`, then `Left` / `Right` to the exact
 frame) and press `N`.
 
 A snapshot is the picture that goes to the 3D display (the two eye views side by side),
-not a photo of the panel.
+not a photo of the panel. It includes this panel's display calibration, if one is on, so
+the note records which one: its name, whether it was on or bypassed (`Shift+G`), whether it
+is the panel's saved calibration or for this run only, the panel, the file, when the file
+last changed, and a fingerprint of the LUT's values. Two snapshots with the same
+fingerprint went through the same calibration, even if the file was renamed.
 
 ### QC report
 
@@ -345,11 +349,14 @@ Click **Export QC report** (next to **Snapshot**) to hand the session on. It mak
 folder in `Pictures\DisplayXR\` (`qc_` and the date and time) with:
 
 - **report.html** - every rig alert of this session (timecode, how long, what), and every
-  snapshot with both eyes, its note and its rig numbers (over-budget numbers in red). One
+  snapshot with both eyes, its note, its rig numbers (over-budget numbers in red) and its
+  display calibration. The top of the report names the calibration on at export; a
+  snapshot taken under a different one (another LUT, or bypassed) is shown in red. One
   file: the pictures are inside it, so it can be emailed as is.
 - **markers.edl** - the same as timeline markers for DaVinci Resolve (*Timeline > Import >
   Timeline Markers from EDL*): alerts red, snapshots blue, at their source timecode.
 - **markers.csv** - every row with the rig numbers, for a spreadsheet or another editor.
+  Snapshot rows also carry the calibration's state, name, fingerprint and panel.
 
 Alerts and snapshots without a source timecode are in the report and the CSV but not in the
 EDL. The report is written in the background, so the live picture keeps playing; the

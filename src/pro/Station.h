@@ -15,6 +15,7 @@
 #include "media/StereoTypes.h"
 #include "pro/DeckLinkSource.h"
 #include "pro/QcExporter.h"
+#include "pro/QcReport.h"
 #include "pro/RigCheck.h"
 #include "pro/TargetScreen.h"
 #include "pro/TestSignalSource.h"
@@ -120,6 +121,9 @@ public:
         parallaxOffsetPct_ = parallaxOffsetPct;
         rig_.SetTargetParallaxOffset(parallaxOffsetPct);
     }
+    // The display calibration in effect (#133): each snapshot note and the QC report record
+    // it, since both show the picture with it baked in. ProController pushes it on change.
+    void SetCalibration(const qc::Calibration& c) { calibration_ = c; }
     int SignalFps() const { return signalFps_; }
     double DelayMs() const { return delayMs_; }
 
@@ -182,7 +186,9 @@ private:
         rig::Result rig;
         target::Screen target;  // #135: the target screen when it was taken
         float pictureScale = 1.0f, parallaxOffsetPct = 0.0f;  // and how the picture was shown
+        qc::Calibration calibration;  // the display calibration in the capture
     };
+    qc::Calibration calibration_;
     std::vector<Snapshot> snapshots_;
 };
 

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -160,6 +161,35 @@ int RowsWithoutTimecode(const Session& s) {
     return n;
 }
 
+std::string LutFingerprint(const float* values, size_t n) {
+    uint64_t h = 14695981039346656037ull;  // FNV-1a 64 offset basis
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(values);
+    for (size_t i = 0; i < n * sizeof(float); ++i) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    char hex[17];
+    std::snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
+    return hex;
+}
+
+std::string CalibrationText(const Calibration& c) {
+    if (c.state.empty()) return std::string();
+    if (c.state == "none") return "none";
+    std::string o = c.name.empty() ? std::string("(unnamed)") : c.name;
+    o += " (";
+    if (c.lutSize > 0) o += std::to_string(c.lutSize) + "^3, ";
+    o += c.state == "on" ? "on" : "bypassed: not in the picture";
+    if (!c.kept) o += ", this run only";
+    o += ")";
+    if (!c.fingerprint.empty()) o += ", fingerprint " + c.fingerprint;
+    if (!c.panel.empty())
+        o += ", panel " + c.panel + (c.panelSource == "device_name" ? " (device name, follows the port)" : "");
+    if (!c.file.empty()) o += ", file " + c.file;
+    if (!c.modified.empty()) o += ", changed " + c.modified;
+    return o;
+}
+
 std::string MakeEdl(const Session& s) {
     const std::vector<Marker> ms = Markers(s);
     const bool drop = !ms.empty() && ms.front().drop;
@@ -180,13 +210,14 @@ std::string MakeEdl(const Session& s) {
 std::string MakeCsv(const Session& s) {
     std::string o =
         "kind,timecode,end_timecode,duration_frames,tc_fps,clock,description,note,vertical_px,roll_deg,"
-        "near_pct,far_pct,delta_e,edge_left_pct,edge_right_pct,eye_sync_frames,image\n";
+        "near_pct,far_pct,delta_e,edge_left_pct,edge_right_pct,eye_sync_frames,image,"
+        "calibration,calibration_name,calibration_fingerprint,calibration_panel\n";
     Marker m;
     for (const Alert& a : s.alerts) {
         const bool ok = AlertMarker(a, s, m);
         o += "alert," + Csv(a.timecode) + "," + Csv(a.endTimecode) + "," + (ok ? std::to_string(m.frames) : "") + "," +
              (a.tcFps > 0 ? std::to_string(a.tcFps) : "") + "," + Csv(a.clock) + "," +
-             Csv(AlertText(a)) + ",,,,,,,,,,\n";
+             Csv(AlertText(a)) + ",,,,,,,,,,,,,,\n";
     }
     for (const Snapshot& sn : s.snapshots) {
         const Rig& r = sn.rig;
@@ -195,7 +226,9 @@ std::string MakeCsv(const Session& s) {
              Csv(sn.clock) + ",Snapshot," + Csv(sn.note) + "," + rig(r.verticalPx, 2) + "," + rig(r.rollDeg, 2) + "," +
              rig(r.nearPct, 2) + "," + rig(r.farPct, 2) + "," + rig(r.deltaE, 2) + "," +
              (r.edgeMeasured[0] ? Num(r.edgePct[0], 2) : "") + "," + (r.edgeMeasured[1] ? Num(r.edgePct[1], 2) : "") +
-             "," + (sn.eyeSyncFrames >= 0 ? std::to_string(sn.eyeSyncFrames) : "") + "," + Csv(sn.image) + "\n";
+             "," + (sn.eyeSyncFrames >= 0 ? std::to_string(sn.eyeSyncFrames) : "") + "," + Csv(sn.image) + "," +
+             Csv(sn.calibration.state) + "," + Csv(sn.calibration.name) + "," + Csv(sn.calibration.fingerprint) +
+             "," + Csv(sn.calibration.panel) + "\n";
     }
     return o;
 }
@@ -228,6 +261,9 @@ std::string MakeHtml(const Session& s) {
          ". Depth budget " + Num(s.budgetNearPct, 1) + "% to " + Num(s.budgetFarPct, 1) +
          "% of the eye width; vertical &le; " + Num(s.budgetVerticalPx, 1) + " px; colour &Delta;E &le; " +
          Num(s.budgetDeltaE, 1) + "; nothing nearer than " + Num(s.budgetEdgePct, 1) + "% at the frame edges.</p>\n";
+    if (!s.calibration.state.empty())
+        o += "<p>Display calibration at export: " + Html(CalibrationText(s.calibration)) +
+             ". Snapshots show the picture as graded <i>and</i> calibrated for this panel; each lists its own.</p>\n";
     const int untimed = RowsWithoutTimecode(s);
     if (untimed)
         o += "<p class=mute>" + std::to_string(untimed) +
@@ -276,6 +312,12 @@ std::string MakeHtml(const Session& s) {
             o += "</div>";
         } else {
             o += "<div class=kv mute>No rig measurement at this snapshot.</div>";
+        }
+        if (!sn.calibration.state.empty()) {
+            const bool differs = !s.calibration.state.empty() && sn.calibration != s.calibration;
+            o += "<div class=kv><span>Calibration " +
+                 over(differs, Html(CalibrationText(sn.calibration)) + (differs ? " (not the one at export)" : "")) +
+                 "</span></div>";
         }
         o += "<div class=\"kv mute\">" + Html(sn.image) + "</div></div>\n";
     }

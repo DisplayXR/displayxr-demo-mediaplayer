@@ -160,7 +160,9 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
                         {"name", calLoaded_ ? calName_ : std::string()},
                         {"on", calLoaded_ && !calBypass_}, {"bypass", calBypass_},
                         {"loading", calLoading_}, {"error", calError_},
-                        {"file", cal::CalibrationPathFor(calKey_)}};
+                        {"file", cal::CalibrationPathFor(calKey_)},
+                        {"fingerprint", calLoaded_ ? calFingerprint_ : std::string()},
+                        {"lut_size", calLoaded_ ? calLutSize_ : 0}};
         };
         auto HdrJson = [&]() {
             const VulkanRenderer::HdrState h = renderer_ ? renderer_->SourceHdr() : VulkanRenderer::HdrState{};
@@ -247,6 +249,7 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
                 if (calLoading_ != p) return err("calibration not loaded: " + calError_);
             }
             if (a.contains("bypass") && a["bypass"].is_boolean()) calBypass_ = a["bypass"].get<bool>();
+            PushCalibrationToStation();
             result = calibrationJson().dump();
             return true;
         }
