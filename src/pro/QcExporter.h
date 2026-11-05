@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -58,5 +59,23 @@ private:
     bool stop_ = false;
     std::thread worker_;  // last: starts after the members above exist
 };
+
+// File helpers for the report job (#169); filesystem only, so tests/qc_exporter_test.cpp
+// covers them.
+namespace qcfiles {
+
+// Creates a new folder `parent`/`base` and returns it in `out`. When that name is taken
+// (two exports in the same second), `base`-2, `base`-3, ... up to -99: an export never
+// writes into, or replaces, another one's folder. create_directory is the test-and-set, so
+// two exports racing for a name still get one each. False with `ec` set otherwise.
+bool CreateUniqueDir(const std::filesystem::path& parent, const std::string& base, std::filesystem::path& out,
+                     std::error_code& ec);
+
+// The runtime writes a snapshot's capture as `<prefix>_atlas<suffix>.png`, the suffix of its
+// choosing, some frames after the request: the file in prefix's folder whose name starts
+// with `<prefix's name>_atlas` and ends in .png, or "" while there is none.
+std::string FindAtlasCapture(const std::string& prefix);
+
+}  // namespace qcfiles
 
 }  // namespace mp::pro
