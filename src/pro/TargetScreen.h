@@ -13,7 +13,7 @@
 // The preview shows the picture on the panel at the ANGULAR size it has on the target:
 // scaled by k = (W_t / D_t) / (W_p / D_p) about its centre (W_p = the picture's width on
 // the panel, D_p = the viewer's distance). Every parallax then subtends the angle it
-// subtends on the target, so the depth reads as it will there (in front of / behind the
+// subtends on the target, framing and depth angles match (in front of / behind the
 // screen, by the same angles; zero parallax stays on the screen), at the cost of cropping
 // (k > 1) or a border (k < 1). Remapping depth without changing the picture's size needs
 // view synthesis, which is a later step.

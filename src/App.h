@@ -316,6 +316,8 @@ private:
     // centre so it subtends the angle it does on the target (pro/TargetScreen.h).
     float proTargetW_ = 0.0f, proTargetD_ = 0.0f;
     float proPictureScale_ = 1.0f;
+    bool proPreviewLimited_ = false;     // the target's scale does not fit a viewport: not previewed
+    float proParallaxOffsetPct_ = 0.0f;  // what convergence adds to the shown parallax, % of the picture
     XrSession::ViewRect TargetScaled(XrSession::ViewRect fit);
     // The viewer's distance from the panel as the runtime renders it this frame (follows
     // eye tracking; the nominal distance when nobody is tracked), smoothed over ~0.5 s.

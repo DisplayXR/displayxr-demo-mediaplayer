@@ -157,10 +157,13 @@ void DeckLinkSource::PrintDeviceList(FILE* out) {
     const std::vector<std::string> devs = Enumerate();
     if (devs.empty()) {
         std::fprintf(out, "No Blackmagic inputs: %s.\n", UnavailableReason().c_str());
-        return;
+    } else {
+        std::fprintf(out, "Blackmagic devices (use the number or part of the name):\n");
+        for (const std::string& d : devs) std::fprintf(out, "  %s\n", d.c_str());
     }
-    std::fprintf(out, "Blackmagic devices (use the number or part of the name):\n");
-    for (const std::string& d : devs) std::fprintf(out, "  %s\n", d.c_str());
+    // Also with no card: station acceptance E2 reads the driver version from this line.
+    const std::string v = DriverVersionText();
+    if (!v.empty()) std::fprintf(out, "Desktop Video %s\n", v.c_str());
 }
 
 #if defined(MEDIAPLAYER_WITH_DECKLINK)
@@ -379,8 +382,11 @@ bool CopyPixels(IDeckLinkVideoFrame* f, RawPixels& out) {
     return ok;
 }
 
+std::atomic<int> g_lastBitDepth{0};
+
 // One eye's copied pixels -> P016 at column x0 of dst (10-bit kept; 8-bit and RGB widened).
 void ConvertEye(const RawPixels& p, livepix::P016& dst, int x0) {
+    g_lastBitDepth.store(p.pf == bmdFormat10BitYUV ? 10 : 8, std::memory_order_relaxed);
     const int w = p.w & ~1, h = p.h & ~1;
     if (p.pf == bmdFormat10BitYUV)
         livepix::V210ToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
@@ -452,7 +458,7 @@ void ReadColour(IDeckLinkVideoFrame* f, bool& hasMatrix, ColorMatrix& matrix, Co
         SUCCEEDED(md->GetInt(bmdDeckLinkFrameMetadataHDRElectroOpticalTransferFunc, &v))) {
         transfer = v == 2 ? ColorTransfer::PQ : v == 3 ? ColorTransfer::HLG : ColorTransfer::SDR;  // CEA 861.3
         if (transfer != ColorTransfer::SDR && !warnedHdr) {
-            LOG_WARN("decklink: the signal is %s; it is shown as SDR (no tone mapping) - monitor through a LUT",
+            LOG_WARN("decklink: the signal is %s; it is tone-mapped to the SDR panel",
                      transfer == ColorTransfer::PQ ? "PQ" : "HLG");
             warnedHdr = true;
         }
@@ -787,6 +793,7 @@ public:
         if (!(events & (bmdVideoInputDisplayModeChanged | bmdVideoInputColorspaceChanged)) &&
             pf == pixelFormat_ && !flagsChanged)
             return S_OK;
+        if (events & bmdVideoInputDisplayModeChanged) dualRefused_ = false;  // support is per mode
         dl::String name = nullptr;
         mode->GetName(&name);
         BMDTimeValue dur = 0;
@@ -816,6 +823,7 @@ public:
             LOG_WARN("decklink: the signal is dual-stream 3D but this card cannot capture it in this "
                      "mode; showing one eye");
             flags_ &= ~(BMDVideoInputFlags)bmdVideoInputDualStream3D;
+            cap_->dual = false;  // (cap_->m is held) one eye is what will arrive: do not wait for a right one
             dualRefused_ = true;
             r = input_->EnableVideoInput(mode->GetDisplayMode(), pf, flags_);
         } else if (SUCCEEDED(r) && (flags_ & bmdVideoInputDualStream3D) && !cap_->dualActive) {
@@ -876,6 +884,14 @@ std::string DeckLinkSource::UnavailableReason() {
 DeckLinkSource::PairStats DeckLinkSource::GetPairStats() const {
     std::lock_guard<std::mutex> lk(pairMutex_);
     return pairStats_;
+}
+
+int DeckLinkSource::LastBitDepth() { return g_lastBitDepth.load(std::memory_order_relaxed); }
+
+std::string DeckLinkSource::DriverVersionText() {
+    dl::ComScope com;
+    const int64_t v = DriverVersion();
+    return v > 0 ? VersionText(v) : std::string();
 }
 
 std::vector<std::string> DeckLinkSource::Enumerate() {
@@ -1043,6 +1059,8 @@ void DeckLinkSource::Worker() {
 bool DeckLinkSource::Available() { return false; }
 std::vector<std::string> DeckLinkSource::Enumerate() { return {}; }
 std::string DeckLinkSource::UnavailableReason() { return "this build has no DeckLink SDK"; }
+int DeckLinkSource::LastBitDepth() { return 0; }
+std::string DeckLinkSource::DriverVersionText() { return {}; }
 DeckLinkSource::PairStats DeckLinkSource::GetPairStats() const { return {}; }
 void DeckLinkSource::Worker() {}
 

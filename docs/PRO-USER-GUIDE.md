@@ -117,6 +117,37 @@ compare); with the clip wipe on, it swaps which clip is on which side.
 
 The grade is applied in this order: exposure, then the CDL, then the LUT.
 
+### HDR sources
+
+HDR video (HLG or PQ, e.g. HDR10) and scene-linear EXR are shown on the panel as an SDR
+picture. The player recognises them from the file and the status bar says what it does,
+e.g. `PQ -> SDR 1000 nits`.
+
+- HDR levels are scaled so 203 nits (reference white) would be the panel's white, then the
+  highlights are rolled off smoothly (ITU-R BT.2390) so the brightest part of the shot just
+  reaches white instead of everything above white clipping. The roll-off starts below
+  reference white, so reference white itself lands a little under white: about code 229 of
+  255 for a 1000-nit source, 208 for 4000 nits. Shadows are kept as they are.
+- HLG and PQ with untagged primaries or matrix are taken as BT.2020. A file with no HDR tag
+  at all is shown as SDR; there is no control to force it yet.
+  BT.2020 colours are converted to the panel's BT.709.
+- **Exposure** acts on the HDR light before the roll-off: pull it down to see detail in
+  highlights.
+- **HDR tone map** (Inspector > Colour):
+  - **auto** (default): roll off HLG and PQ; clip EXR at white (EXR then looks as before,
+    and exposure brings back what is above white).
+  - **on**: always roll off, EXR included.
+  - **off**: clip everything above white.
+  - **raw**: no mapping at all. Use it with a show LUT that expects PQ or HLG input.
+- **Source peak (nits)**: the brightest the source gets, which sets where the roll-off ends.
+  0 takes it from the file (HDR10 metadata), else 1000. HLG always uses 1000.
+- The scopes, false colour and zebras measure the mapped picture.
+
+The CDL and the LUT apply after the mapping, to the SDR picture. One exception: with an
+**OpenColorIO** look on an EXR, the look gets the scene-linear values themselves, above 1.0
+included, so the OCIO view (e.g. ACES) does the tone mapping; the status bar then says
+`Linear -> OCIO look (unclipped)`. The compare clip B in the clip wipe is not mapped.
+
 ### Display calibration
 
 The grade is the show's look and follows the content. A **display calibration** corrects
@@ -133,7 +164,8 @@ itself whenever it runs on that panel.
   not touch it: bypassing the grade still shows the picture through the calibration.
 - **Remove** deletes this panel's calibration.
 
-It is applied after the grade and the QC views, and before the gamma trim. The LUT must
+It is the last step: after the grade, the QC views, the gamma trim and the channel views,
+so a gamma trim is a choice you see through the calibration. The LUT must
 cover 0..1 (the usual `DOMAIN` for a display calibration); one with another domain is
 refused with a message.
 
@@ -261,15 +293,18 @@ from 2.5 m), **Monitor** (27", 0.60 m from 0.65 m), **Tablet** (11", 0.25 m from
 or **Custom** (your width and distance). It is **Off** by default.
 
 - **Show at the target's size** (on when you pick a target) shows the picture on the 3D
-  panel at the size it appears from a seat in front of the target. The depth then looks
-  as it will there: things in front of or behind the screen by the same angles. The
+  panel at the size it appears from a seat in front of the target, at the current
+  convergence. The framing and every depth angle then match the target, and the screen
+  plane stays where it is. It is not the same experience: your eyes still focus and
+  converge at the panel, so a large screen's sense of depth and any divergence are not
+  felt here. Use the numbers below for those. The
   picture is cropped when the target fills more of the view than the panel does, and gets
   a black border when it fills less. The Inspector shows the scale (`Picture x1.45,
   cropped`). It uses the panel's size, how far you sit from it (followed by eye tracking,
   smoothed over about half a second; the runtime's nominal distance when nobody is
   tracked) and the player window's size: a smaller window shows less of the picture.
 - The rig check's near and far are also given **for the target**: millimetres on its
-  screen and arcminutes (′) at its viewing distance, and so do the depth alerts
+  screen and arcminutes (′) at its viewing distance, including the current convergence, and so do the depth alerts
   (`Foreground at -2.0% for 2 s [-203 mm, -58' on Cinema]`). When the background's parallax is
   wider than the eyes are apart, the eyes have to turn outwards (diverge); past 0.5° the
   rig check raises **Background diverges on the target screen**. The Inspector shows

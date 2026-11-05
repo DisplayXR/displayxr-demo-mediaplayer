@@ -76,8 +76,18 @@ bool Install(const std::string& cube, const std::string& key, std::string& err) 
     ec.clear();
     fs::create_directories(to.parent_path(), ec);
     if (ec) { err = "cannot create " + to.parent_path().u8string() + ": " + ec.message(); return false; }
-    fs::copy_file(src, to, fs::copy_options::overwrite_existing, ec);
-    if (ec) { err = "cannot copy to " + dst + ": " + ec.message(); return false; }
+    // Through a temporary: a full disk or a crash must not leave a truncated file where the
+    // previous calibration was.
+    fs::path tmp = to;
+    tmp += ".tmp";
+    std::error_code ignored;
+    fs::copy_file(src, tmp, fs::copy_options::overwrite_existing, ec);
+    if (!ec) fs::rename(tmp, to, ec);
+    if (ec) {
+        fs::remove(tmp, ignored);
+        err = "cannot copy to " + dst + ": " + ec.message();
+        return false;
+    }
     return true;
 }
 

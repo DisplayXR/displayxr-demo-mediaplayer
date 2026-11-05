@@ -27,6 +27,11 @@ param(
     [string]$Right = "1",        # ... and the right eye (two-input soak)
     [string]$Connection = "sdi", # sdi | hdmi
     [int]$SoakMinutes = 10,
+    # What the feeds must be for D2 / D3 to pass, so a lower format cannot pass as the real one.
+    # Change them when the rig really feeds something else.
+    [int]$ExpectEyeWidth = 3840,
+    [double]$ExpectFps = 60,     # within 0.1: 59.94 needs -ExpectFps 59.94
+    [int]$ExpectBits = 10,
     [string]$Only = ""           # run only the checks whose id matches (e.g. "R*")
 )
 
@@ -57,7 +62,8 @@ function Report([string]$id, [string]$what, [string]$verdict, [string]$detail) {
     $c = @{ PASS = "Green"; FAIL = "Red"; SKIP = "DarkYellow"; INFO = "Gray" }[$verdict]
     Write-Host ("{0,-4} {1,-5} {2}  {3}" -f $id, $verdict, $what, $detail) -ForegroundColor $c
 }
-function Want([string]$id) { return (-not $Only) -or ($id -like $Only) }
+# Either side may be the pattern: -Only "P*" wants P1, and -Only P1 wants the block guarded by "P*".
+function Want([string]$id) { return (-not $Only) -or ($id -like $Only) -or ($Only -like $id) }
 
 # A generated look: a CDL that warms and lifts, and a 2-point .cube that inverts.
 $cdl = Join-Path $Out "accept_warm.cc"
@@ -153,18 +159,31 @@ if (Want "E1") {
         else { Report "E1" "DisplayXR runtime selftest" "FAIL" "exit $LASTEXITCODE, see E1_selftest.txt" }
     } else { Report "E1" "DisplayXR runtime selftest" "FAIL" "displayxr-cli not found: is the runtime installed?" }
 }
-if (Want "E2") {
+if ((Want "E2") -or $DeckLink) {
     if (Test-Path $Cli) {
         $info = & $Cli info 2>&1 | Out-String
         $info | Set-Content (Join-Path $Out "E2_info.txt") -Encoding utf8
         $rt = if ($info -match "git-tag:\s*'?v?([\d\.]+)") { $Matches[1] } else { "" }
         $lp = if ($info -match "DisplayXR Leia SR'\s+v?([\d\.]+)") { $Matches[1] } else { "" }
-        if (-not $rt) { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "FAIL" "could not read the runtime version (E2_info.txt)" }
-        elseif (-not (Version-AtLeast $rt 2 53)) { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "FAIL" "runtime $rt is older than 2.53" }
-        elseif ($lp -and -not (Version-AtLeast $lp 2 17)) { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "FAIL" "Leia plug-in $lp is older than 2.17" }
-        elseif (-not $lp) { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "INFO" "runtime $rt; no Leia plug-in registered (not a Leia display?)" }
-        else { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "PASS" "runtime $rt, Leia plug-in $lp" }
-    } else { Report "E2" "Runtime 2.53+ / Leia plug-in 2.17+" "SKIP" "no displayxr-cli" }
+        # Runtime 2.61: display calibration keys .cube files by XrDisplayStableKeyDXR (display_info v24).
+        # Desktop Video 16.0: the SDK the player is built against (third_party/decklink-sdk); older is refused.
+        $what = if ($DeckLink) { "Runtime 2.61+ / Leia plug-in 2.17+ / Desktop Video 16.0+" } else { "Runtime 2.61+ / Leia plug-in 2.17+" }
+        $dv = ""
+        if ($DeckLink) {
+            $dlList = & $Exe --decklink-list 2>&1 | Out-String
+            $dv = if ($dlList -match "Desktop Video (\d+\.\d+(\.\d+)?)") { $Matches[1] } else { "" }
+        }
+        $fails = @()
+        if (-not $rt) { $fails += "could not read the runtime version (E2_info.txt)" }
+        elseif (-not (Version-AtLeast $rt 2 61)) { $fails += "runtime $rt is older than 2.61" }
+        if ($lp -and -not (Version-AtLeast $lp 2 17)) { $fails += "Leia plug-in $lp is older than 2.17" }
+        if ($DeckLink -and -not $dv) { $fails += "could not read the Desktop Video version (is it installed? see D1)" }
+        elseif ($DeckLink -and -not (Version-AtLeast $dv 16 0)) { $fails += "Desktop Video $dv is older than 16.0" }
+        $have = @("runtime $rt"); if ($lp) { $have += "Leia plug-in $lp" }; if ($dv) { $have += "Desktop Video $dv" }
+        if ($fails) { Report "E2" $what "FAIL" ($fails -join "; ") }
+        elseif (-not $lp) { Report "E2" $what "INFO" (($have -join ", ") + "; no Leia plug-in registered (not a Leia display?)") }
+        else { Report "E2" $what "PASS" ($have -join ", ") }
+    } else { Report "E2" "Runtime 2.61+ / Leia plug-in 2.17+" "SKIP" "no displayxr-cli" }
 }
 if (Want "E3") {
     $gpus = (Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name) (driver $($_.DriverVersion))" }) -join "; "
@@ -247,7 +266,7 @@ function Rig-Run([string]$id, [string]$what, [hashtable]$faults, [string[]]$extr
 # The test scene sits at about -2.0 % (foreground) / +1.2 % (background), so the other checks
 # use a -3,2 budget it fits inside, and R4 tightens it to make the depth alert fire.
 $roomy = "--depth-budget=-3,2"
-if (Want "R1") { Rig-Run "R1" "Rig: clean rig raises no alert" @{} @($roomy) { param($s) $s.rig -and @($s.rig.alerts).Count -eq 0 } 20 $false }
+if (Want "R1") { Rig-Run "R1" "Rig: clean rig raises no alert" @{} @($roomy) { param($s) $s.rig -and $s.rig.measured -and @($s.rig.alerts).Count -eq 0 } 20 $false }
 if (Want "R2") { Rig-Run "R2" "Rig: 4 px vertical error is flagged" @{ MEDIAPLAYER_TEST_VSHIFT = "4" } @($roomy) { param($s) @($s.rig.alerts | Where-Object { $_.what -match "ertical" }).Count -gt 0 } }
 if (Want "R3") { Rig-Run "R3" "Rig: colour mismatch is flagged" @{ MEDIAPLAYER_TEST_GAIN_R = "1.25" } @($roomy) { param($s) @($s.rig.alerts | Where-Object { $_.what -match "olou" }).Count -gt 0 } }
 if (Want "R4") { Rig-Run "R4" "Rig: depth over budget is flagged" @{} @("--depth-budget=-0.5,0.5") { param($s) @($s.rig.alerts | Where-Object { $_.what -match "ground at" }).Count -gt 0 } }
@@ -278,26 +297,39 @@ if (-not $DeckLink) {
         else { Report "D1" "DeckLink card + driver found" "FAIL" $list.Trim() }
     }
     function Live-Ok($s) { $s.rig -and $s.rig.decklink -and $s.rig.decklink.signal_fps -gt 0 -and $s.rig.decklink.delivered_fps -gt 0 }
+    # The format actually captured against what the feeds must be; "" when it matches.
+    function Format-Miss($d) {
+        $miss = @()
+        if ([int]$d.eye_width -lt $ExpectEyeWidth) { $miss += "eye width $($d.eye_width), expected $ExpectEyeWidth" }
+        if ([math]::Abs([double]$d.signal_fps - $ExpectFps) -gt 0.1) { $miss += "signal $($d.signal_fps) fps, expected $ExpectFps" }
+        if ([int]$d.bit_depth -lt $ExpectBits) { $miss += "$($d.bit_depth)-bit, expected $ExpectBits" }
+        return ($miss -join "; ")
+    }
     if (Want "D2") {
         $r = Run-Player "D2_one_input" @("--decklink=$Left", "--decklink-input=$Connection") @{} -dumpFrame 300 -seconds 25
         $d = if ($r.status -and $r.status.rig) { $r.status.rig.decklink } else { $null }
         if (-not $d) { Report "D2" "One input: live picture at full rate" "FAIL" "no capture stats (no signal on input $Left?)" }
         elseif ($d.signal_fps -le 0) { Report "D2" "One input: live picture at full rate" "FAIL" "no signal detected" }
+        elseif (Format-Miss $d) { Report "D2" "One input: live picture at full rate" "FAIL" (Format-Miss $d) }
         elseif ($d.delivered_fps -lt 0.98 * $d.signal_fps -or $d.late_frames -gt 0) { Report "D2" "One input: live picture at full rate" "FAIL" ("{0:N2} of {1:N2} fps, late {2}, dropped {3}" -f $d.delivered_fps, $d.signal_fps, $d.late_frames, $d.dropped) }
-        else { Report "D2" "One input: live picture at full rate" "PASS" ("{0:N2} fps, TC {1}" -f $d.delivered_fps, $r.status.timecode) }
+        else { Report "D2" "One input: live picture at full rate" "PASS" ("{0}x{1} {2}-bit, {3:N2} fps, TC {4}" -f $d.width, $d.height, $d.bit_depth, $d.delivered_fps, $r.status.timecode) }
     }
     if (Want "D3") {
         # #141 Done when: two 4K60 10-bit inputs hold 60 fps with no unpaired frames climbing over 10 minutes.
         $csv = Join-Path $Out "D3_soak.csv"
-        "elapsed_s,signal_fps,delivered_fps,late_frames,dropped,pairs,unpaired,max_skew_ms,timecode" | Set-Content $csv -Encoding ascii
+        "elapsed_s,signal_fps,delivered_fps,late_frames,dropped,published,pairs,unpaired,max_skew_ms,timecode,eye_width,bit_depth,pairing" | Set-Content $csv -Encoding ascii
+        $inv = [Globalization.CultureInfo]::InvariantCulture  # no thousands separators or decimal commas in the CSV
         $secs = [int]($SoakMinutes * 60 + 20)
         Write-Host "     D3 two-input soak: $SoakMinutes min, inputs $Left + $Right ($Connection)..." -ForegroundColor Gray
         $script:soakT0 = Get-Date
+        $script:soakLastRow = [datetime]::MinValue
         $r = Run-Player "D3_two_input" @("--decklink=$Left", "--decklink-right=$Right", "--decklink-input=$Connection") @{} -dumpFrame 600 -seconds $secs -until {
             param($s)
-            if ($s.rig -and $s.rig.decklink) {
+            # The status poll runs every 0.5 s; the CSV keeps one row every 2 s.
+            if ($s.rig -and $s.rig.decklink -and ((Get-Date) - $script:soakLastRow).TotalSeconds -ge 2) {
+                $script:soakLastRow = Get-Date
                 $d = $s.rig.decklink
-                "{0:N0},{1},{2},{3},{4},{5},{6},{7},{8}" -f ((Get-Date) - $script:soakT0).TotalSeconds, $d.signal_fps, $d.delivered_fps, $d.late_frames, $d.dropped, $d.pairs, $d.unpaired, $d.max_skew_ms, $s.timecode | Add-Content $csv
+                [string]::Format($inv, "{0:F0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12}", ((Get-Date) - $script:soakT0).TotalSeconds, $d.signal_fps, $d.delivered_fps, $d.late_frames, $d.dropped, $d.published, $d.pairs, $d.unpaired, $d.max_skew_ms, $s.timecode, $d.eye_width, $d.bit_depth, $d.pairing) | Add-Content $csv
             }
             return $false
         }
@@ -310,8 +342,15 @@ if (-not $DeckLink) {
             $unpairedGrowth = [long]$lastRow.unpaired - [long]$first.unpaired
             $late = [long]$lastRow.late_frames; $dropped = [long]$lastRow.dropped
             $skew = [double]$lastRow.max_skew_ms; $half = if ($fps -gt 0) { 500.0 / $fps } else { 0 }
-            $detail = "{0:N2} fps signal, min delivered {1:N2}, unpaired +{2}, late {3}, dropped {4}, max skew {5:N2} ms" -f $fps, $minFps, $unpairedGrowth, $late, $dropped, $skew
-            if ($fps -gt 0 -and $minFps -ge 0.98 * $fps -and $unpairedGrowth -le 0 -and $late -eq 0 -and $skew -lt $half) { Report "D3" "Two inputs: $SoakMinutes min soak" "PASS" $detail }
+            # Frames the card delivered that never reached the panel (the ring keeps the newest).
+            $droppedGrowth = [long]$lastRow.dropped - [long]$first.dropped
+            $publishedGrowth = [long]$lastRow.published - [long]$first.published
+            $dropShare = if ($publishedGrowth -gt 0) { $droppedGrowth / $publishedGrowth } else { 1 }
+            $miss = Format-Miss ([pscustomobject]@{ eye_width = $lastRow.eye_width; signal_fps = $lastRow.signal_fps; bit_depth = $lastRow.bit_depth })
+            $paired = $lastRow.pairing -in @("timecode", "hardware_clock")  # "newest" = not frame-accurate
+            $detail = "{0:N2} fps signal, {1}-wide {2}-bit eyes, paired by {3}, min delivered {4:N2}, unpaired +{5}, late {6}, dropped +{7} ({8:P1}), max skew {9:N2} ms" -f $fps, $lastRow.eye_width, $lastRow.bit_depth, $lastRow.pairing, $minFps, $unpairedGrowth, $late, $droppedGrowth, $dropShare, $skew
+            if ($miss) { $detail = "$miss; $detail" }
+            if (-not $miss -and $paired -and $fps -gt 0 -and $minFps -ge 0.98 * $fps -and $unpairedGrowth -le 0 -and $late -eq 0 -and $dropShare -le 0.02 -and $skew -lt $half) { Report "D3" "Two inputs: $SoakMinutes min soak" "PASS" $detail }
             else { Report "D3" "Two inputs: $SoakMinutes min soak" "FAIL" $detail }
         }
     }

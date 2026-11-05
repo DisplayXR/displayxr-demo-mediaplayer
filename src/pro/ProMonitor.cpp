@@ -65,6 +65,7 @@ const char* TransferName(ColorTransfer t) {
     switch (t) {
         case ColorTransfer::HLG: return "HLG";
         case ColorTransfer::PQ: return "PQ";
+        case ColorTransfer::LinearPq: return "Linear";
         default: return "SDR";
     }
 }
@@ -112,7 +113,15 @@ void ProController::OnStill(const uint8_t* rgba, int w, int h, StereoLayout layo
 
 scopes::Grade ProController::ScopeGrade() {
     scopes::Grade g;
+    if (renderer_) {  // the HDR mapping applies under bypass too (it is not the look)
+        const VulkanRenderer::HdrState h = renderer_->SourceHdr();
+        g.hdr.transfer = h.raw ? color::Transfer::SDR : (color::Transfer)h.transfer;
+        g.hdr.bt2020 = h.bt2020;
+        g.hdr.rollOff = h.rollOff;
+        g.hdr.peakNits = h.peakNits;
+    }
     if (bypass_) return g;
+    g.hdr.pqShaper = renderer_ && renderer_->SourceHdr().pqShaper && grade_.lutOn && lut_.Valid();
     g.exposure = grade_.exposure;
     g.cdlOn = grade_.cdlOn;
     for (int i = 0; i < 3; ++i) {
@@ -135,11 +144,11 @@ scopes::Grade ProController::ScopeGrade() {
 
 std::string ProController::ScopeKey() {
     const scopes::Grade g = ScopeGrade();
-    char key[256];
-    std::snprintf(key, sizeof(key), "%d|%.4f|%d|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f|%p|%d%d",
+    char key[320];
+    std::snprintf(key, sizeof(key), "%d|%.4f|%d|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f|%p|%d%d|%d%d%d%.0f",
                   (int)bypass_, g.exposure, (int)g.cdlOn, g.slope[0], g.slope[1], g.slope[2], g.offset[0], g.offset[1],
                   g.offset[2], g.power[0], g.power[1], g.power[2], g.saturation, (const void*)g.lut, (int)parade_,
-                  (int)scopesOn_);
+                  (int)scopesOn_, (int)g.hdr.transfer, (int)g.hdr.bt2020, (int)g.hdr.rollOff * 2 + (int)g.hdr.pqShaper, g.hdr.peakNits);
     return key;
 }
 
@@ -249,6 +258,51 @@ void ProController::BuildPixelProbe(const Status& st) {
 // ---------------------------------------------------------------------------
 // Inspector sections
 // ---------------------------------------------------------------------------
+
+std::string HdrSummary(const VulkanRenderer::HdrState& h) {
+    if (h.transfer == 0) return {};
+    char s[64];
+    if (h.raw)
+        std::snprintf(s, sizeof(s), "%s raw (not mapped)", HdrTransferName(h.transfer));
+    else if (h.pqShaper)
+        std::snprintf(s, sizeof(s), "%s -> OCIO look (unclipped)", HdrTransferName(h.transfer));
+    else if (h.rollOff)
+        std::snprintf(s, sizeof(s), "%s -> SDR %.0f nits", HdrTransferName(h.transfer), h.peakNits);
+    else
+        std::snprintf(s, sizeof(s), "%s, clipped at white", HdrTransferName(h.transfer));
+    return s;
+}
+
+// Inspector > Color: how an HDR source (HLG, PQ, scene-linear EXR) reaches the SDR panel.
+// Auto rolls off HLG / PQ highlights and clips EXR at white (today's EXR look; exposure
+// acts first, so pulling it down brings highlights back). The peak is the source's
+// brightest: from the stream's metadata, else 1000 nits, unless set here.
+void ProController::BuildHdrControls() {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    const VulkanRenderer::HdrState h = renderer_ ? renderer_->SourceHdr() : VulkanRenderer::HdrState{};
+    const float itemW = ImGui::GetContentRegionAvail().x * 0.42f;
+    ImGui::SetNextItemWidth(itemW);
+    if (ImGui::BeginCombo("HDR tone map", ToneMapName(grade_.toneMap))) {
+        for (int i = 0; i < 4; ++i)
+            if (ImGui::Selectable(ToneMapName(i), grade_.toneMap == i)) grade_.toneMap = i;
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("auto: roll off HLG / PQ highlights, clip EXR at white\n"
+                          "on: always roll off   off: clip at white\n"
+                          "raw: the signal as it is, for a show LUT that expects PQ / HLG input");
+    ImGui::SetNextItemWidth(itemW);
+    int peak = (int)(grade_.peakNits + 0.5f);
+    if (ImGui::InputInt("Source peak (nits)", &peak, 100, 1000))
+        grade_.peakNits = (float)std::clamp(peak, 0, 10000);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 = from the stream's metadata (else 1000)");
+    if (h.transfer == 0)
+        ImGui::TextDisabled("Source: SDR (no tone map)");
+    else
+        ImGui::TextDisabled("Source: %s%s  ->  %s", HdrTransferName(h.transfer), h.bt2020 ? " BT.2020" : "",
+                            HdrSummary(h).c_str());
+#endif
+}
 
 void ProController::BuildOverlaySection() {
 #if defined(MEDIAPLAYER_WITH_IMGUI)

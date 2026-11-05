@@ -11,6 +11,9 @@ under the Boost Software License 1.0 (BSL-1.0); see each file's
 SPDX-License-Identifier. Some carry Copyright Collabora, Ltd. (the XR_MNDX_*
 headers).
 
+third_party/decklink-sdk holds the include folders of the Blackmagic DeckLink SDK,
+Copyright (c) Blackmagic Design, under the licence in each file; see the README there.
+
 The UI font, Inter (third_party/fonts/inter), is Copyright (c) 2016 The Inter
 Project Authors and licensed under the SIL Open Font License 1.1; see
 third_party/fonts/inter/LICENSE.txt.

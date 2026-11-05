@@ -228,13 +228,20 @@ void App::UpdateViewerDistance(const XrView* views, uint32_t n, uint32_t canvasW
 
 XrSession::ViewRect App::TargetScaled(XrSession::ViewRect fit) {
     proPictureScale_ = 1.0f;
+    proPreviewLimited_ = false;
+    if (isLogo_) return fit;  // the idle logo is not the picture being judged
     const float panelW = xr_.DisplayWidthMeters();
     const float dist = proViewerDistM_ > 0.0f ? proViewerDistM_ : xr_.NominalViewerDistance();
     const uint32_t panelPx = xr_.DisplayPixelWidth();
     if (proTargetW_ <= 0.0f || proTargetD_ <= 0.0f || panelW <= 0.0f || dist <= 0.0f || !panelPx || !fit.w) return fit;
     const float picW = (float)fit.w * panelW / (float)panelPx;
     const float k = (proTargetW_ / proTargetD_) / (picW / dist);
-    if (!(k > 0.05f && k < 20.0f)) return fit;
+    // Outside what a viewport can hold: say so (the Inspector) rather than draw a wrong size.
+    constexpr float kMaxViewportPx = 16384.0f;
+    if (!(k > 0.05f && k < 20.0f) || (float)fit.w * k > kMaxViewportPx || (float)fit.h * k > kMaxViewportPx) {
+        proPreviewLimited_ = true;
+        return fit;
+    }
     proPictureScale_ = k;
     const float cx = (float)fit.x + 0.5f * (float)fit.w, cy = (float)fit.y + 0.5f * (float)fit.h;
     fit.w = (uint32_t)((float)fit.w * k + 0.5f);
@@ -799,6 +806,14 @@ void App::RenderOneFrame() {
                                     (uint32_t)vf->height,
                                     i420 ? 0 : vf->format == PixFormat::P016 ? 2 : 1, vf->fullRange,
                                     (int)vf->matrix);  // the frame's colour tag (BT.709 default)
+#if MEDIAPLAYER_PRO
+                // HDR (#134): the shader maps HLG / PQ / scene-linear EXR to the SDR panel. A
+                // live source tags HDR but not primaries; HDR on the BT.2020 matrix is BT.2020.
+                const bool hdr = vf->transfer == ColorTransfer::HLG || vf->transfer == ColorTransfer::PQ;
+                renderer_.SetSourceHdr((int)vf->transfer,
+                                       vf->primaries2020 || (hdr && vf->matrix == ColorMatrix::BT2020),
+                                       vf->peakNits);
+#endif
             }
         }
     }
@@ -917,7 +932,10 @@ void App::RenderOneFrame() {
             // per-eye shift) lands it at the author's intended plane; convergence_ trims.
             // Auto-convergence (#92) adds its own shift, which is a fraction of the EYE's
             // on-screen width (contentW), converted here to the tile fraction the others use.
-            const float convBase = convergence_ + 0.5f * mediaConvergence_;
+            // The first two are fractions of the tile, so Pro's target-screen preview scales
+            // them with the picture: parallax from convergence then keeps its share of the
+            // picture, as the picture's own parallax does.
+            const float convBase = (convergence_ + 0.5f * mediaConvergence_) * proPictureScale_;
             const float contentW = (float)viewFit.w * sx;
             int32_t cdx[XrSession::kMaxViews];
             for (uint32_t v = 0; v < frame.viewCount; ++v) {
@@ -964,6 +982,12 @@ void App::RenderOneFrame() {
                 proPicW_ = (float)viewFit.w * k;
                 proPicH_ = (float)viewFit.h * (canvasH ? (float)ph / (float)canvasH : 1.0f);
                 proTileContentW_ = (float)contentRects[0].w;
+                // Parallax is right x - left x and the shift is +left, -right: convergence
+                // moves the shown parallax by -2 x the shift, in % of the picture's width.
+                proParallaxOffsetPct_ =
+                    contentW > 0.0f && frame.viewCount > 0
+                        ? -200.0f * (convBase * (float)rects[0].w + autoConvergence_ * contentW) / contentW
+                        : 0.0f;
             }
 #endif
             // Build the draw list: each eye's content quad (scissor = its tile), then
@@ -4182,6 +4206,8 @@ void App::InitPro() {
         proTargetD_ = distanceM > 0.0f ? distanceM : 0.0f;
     };
     h.pictureScale = [this] { return proPictureScale_; };
+    h.previewLimited = [this] { return proPreviewLimited_; };
+    h.parallaxOffsetPct = [this] { return proParallaxOffsetPct_; };
     h.viewerDistance = [this] { return proViewerDistM_ > 0.0f ? proViewerDistM_ : xr_.NominalViewerDistance(); };
     h.panelGeometry = [this](float& widthM, float& viewerM) {
         widthM = xr_.DisplayWidthMeters();

@@ -24,9 +24,11 @@ enum class PixFormat { I420, NV12, RGBA, P016 };  // 3-plane, 2-plane, packed RG
 // MP_GRADE shader (`yuvMatrix`), so BT709 must stay 0: every producer that never sets it
 // gets today's BT.709 convert, bit for bit. BT2020 is the non-constant-luminance matrix.
 enum class ColorMatrix : int { BT709 = 0, BT601 = 1, BT2020 = 2 };
-// Transfer characteristic, carried as a TAG ONLY (for the UI): the renderer treats every
-// frame as SDR display-referred. HLG / PQ are not tone-mapped (docs/PRO.md).
-enum class ColorTransfer : int { SDR = 0, HLG = 1, PQ = 2 };
+// Transfer characteristic. The base player treats every frame as SDR display-referred;
+// Media Player Pro maps HLG / PQ (and scene-linear EXR, which the decoder stores as PQ of
+// linear x 203 nits so values above 1.0 survive) to the SDR panel (#134, color/ToneMap.h).
+// Values match color::Transfer.
+enum class ColorTransfer : int { SDR = 0, HLG = 1, PQ = 2, LinearPq = 3 };
 
 // The usual rule when a stream does not say: SD (576 lines and below) is BT.601, HD+ BT.709.
 inline ColorMatrix DefaultMatrixForHeight(int height) {
@@ -36,7 +38,10 @@ inline const char* ColorMatrixName(ColorMatrix m) {
     return m == ColorMatrix::BT601 ? "BT.601" : m == ColorMatrix::BT2020 ? "BT.2020" : "BT.709";
 }
 inline const char* ColorTransferName(ColorTransfer t) {
-    return t == ColorTransfer::HLG ? "HLG" : t == ColorTransfer::PQ ? "PQ" : "SDR";
+    return t == ColorTransfer::HLG        ? "HLG"
+           : t == ColorTransfer::PQ       ? "PQ"
+           : t == ColorTransfer::LinearPq ? "Linear"
+                                          : "SDR";
 }
 
 class FrameRing {
@@ -50,7 +55,9 @@ public:
         PixFormat format = PixFormat::I420;
         bool fullRange = false;       // JPEG/full vs MPEG/limited range
         ColorMatrix matrix = ColorMatrix::BT709;      // YUV matrix (ignored for RGBA)
-        ColorTransfer transfer = ColorTransfer::SDR;  // tag only - never tone-mapped
+        ColorTransfer transfer = ColorTransfer::SDR;  // Pro tone-maps HDR (#134)
+        bool primaries2020 = false;   // BT.2020 colour primaries (HDR video); else BT.709
+        float peakNits = 0.0f;        // the stream's brightest (MaxCLL / mastering), 0 = unknown
         int64_t serial = 0;           // monotonic; lets the consumer detect newness
         // Live sources: when the frame was captured (steady seconds, LiveProducer::
         // NowSeconds) and its source timecode ("HH:MM:SS:FF", empty when it has none).

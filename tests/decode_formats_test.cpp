@@ -176,15 +176,17 @@ int main() {
     CHECK(seq && std::fabs(dur - 5.0 / 24.0) < 0.02, "5 frames at 24 fps = one clip");
     CHECK(f.format == mp::PixFormat::P016 && f.width == W, "EXR -> P016 (16-bit) at full size");
     CHECK(f.matrix == mp::ColorMatrix::BT709 && !f.fullRange, "EXR encoded as BT.709 limited, and tagged so");
+    CHECK(f.transfer == mp::ColorTransfer::LinearPq && !f.primaries2020, "EXR tagged scene-linear (PQ store), BT.709");
     if (f.format == mp::PixFormat::P016 && f.plane[0].size() >= (size_t)W * H * 2 &&
         f.plane[1].size() >= (size_t)W * (H / 2) * 2) {
-        // linear 0.18 -> sRGB 0.46135 -> 10-bit limited Y = 64 + 0.46135*876 = 468.14, kept
-        // with its fraction at 16 bits (x64 = 29961); grey chroma is neutral 512 (32768).
+        // linear 0.18 -> PQ of 0.18 x 203 nits (#134: 1.0 = reference white, so values above
+        // 1.0 survive) = 0.41090 -> 10-bit limited Y = 64 + 0.41090*876 = 423.95, kept with
+        // its fraction at 16 bits; grey chroma is neutral 512 (32768).
         const uint16_t y = reinterpret_cast<const uint16_t*>(f.plane[0].data())[(size_t)(H / 2) * W + W / 2];
         const uint16_t* uv = reinterpret_cast<const uint16_t*>(f.plane[1].data()) + (size_t)(H / 4) * W + W / 2;
         std::printf("  EXR 18%% grey -> P016 Y %u (%.2f in 10-bit), Cb %.2f Cr %.2f\n", y, y / 64.0, uv[0] / 64.0,
                     uv[1] / 64.0);
-        CHECK(std::fabs(y / 64.0 - 468.14) < 0.25, "scene-linear 18% grey encoded for display at 16 bits (Y10 ~468.1)");
+        CHECK(std::fabs(y / 64.0 - 423.95) < 0.25, "scene-linear 18% grey stored as PQ at 16 bits (Y10 ~423.9)");
         CHECK(std::fabs(uv[0] / 64.0 - 512.0) < 0.25 && std::fabs(uv[1] / 64.0 - 512.0) < 0.25,
               "EXR grey chroma neutral");
     }

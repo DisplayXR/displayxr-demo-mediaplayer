@@ -92,6 +92,9 @@ void ProController::ApplyTestEnv() {
     if (const char* z = std::getenv("MEDIAPLAYER_PRO_ZOOM")) SetZoom((float)std::atof(z));
     if (const char* d = std::getenv("MEDIAPLAYER_PRO_DEPTH_OVERLAY")) depthOverlay_ = (*d && *d != '0');
     if (const char* e = std::getenv("MEDIAPLAYER_PRO_EXPOSURE")) grade_.exposure = std::clamp((float)std::atof(e), -4.0f, 4.0f);
+    // HDR tone map (#134): auto | on | off, and the source peak in nits (0 = the stream's).
+    if (const char* e = std::getenv("MEDIAPLAYER_PRO_TONEMAP")) grade_.toneMap = ToneMapFromName(e, grade_.toneMap);
+    if (const char* e = std::getenv("MEDIAPLAYER_PRO_PEAK_NITS")) grade_.peakNits = std::clamp((float)std::atof(e), 0.0f, 10000.0f);
     if (const char* b = std::getenv("MEDIAPLAYER_PRO_BYPASS")) bypass_ = (*b && *b != '0');
     // #133: MEDIAPLAYER_PRO_CAL_BYPASS=1 starts with the display calibration bypassed;
     // MEDIAPLAYER_PRO_CAL=<.cube> loads one for this run only (not installed).
@@ -225,9 +228,17 @@ bool ProController::LoadOcio(const ocio::Request& req, std::string* errOut) {
     }
     lutError_.clear();
     lutLoading_ = req.config.empty() ? "$OCIO" : req.config;
-    looks_.Submit([req](color::CubeLut& lut, std::string& err) { return ocio::Bake(req, lut, err); },
+    ocioReq_ = req;
+    ocio::Request bake = req;
+    bake.linearPqInput = SourceIsSceneLinear();  // #134: an EXR reaches the view unclipped
+    ocioBakePqInput_ = bake.linearPqInput;
+    looks_.Submit([bake](color::CubeLut& lut, std::string& err) { return ocio::Bake(bake, lut, err); },
                   lutLoading_, /*isOcio=*/true);
     return true;
+}
+
+bool ProController::SourceIsSceneLinear() const {
+    return renderer_ && renderer_->SourceHdr().transfer == (int)ColorTransfer::LinearPq;
 }
 
 void ProController::ToggleCompare() {
@@ -613,6 +624,8 @@ void ProController::TickLooks() {
     }
     lut_ = std::move(r.lut);
     lutPath_ = r.source;
+    lutIsOcio_ = r.isOcio;
+    lutPqShaper_ = r.isOcio && ocioBakePqInput_;
     lutName_ = r.isOcio || !lut_.title.empty() ? lut_.title : BaseName(r.source);
     grade_.lutOn = true;
     LOG_INFO("Pro: %s %s (%d^3) in %.1f ms off the render thread", r.isOcio ? "baked" : "loaded",
@@ -626,6 +639,8 @@ void ProController::TickLooks() {
 
 void ProController::ResolveCalibration() {
     calResolved_ = true;
+    calLoadId_ = 0;  // a load still running was for the previous panel
+    calLoading_.clear();
     std::string runtimeKey, dev;
     if (!(host_.panelIdentity && host_.panelIdentity(runtimeKey, dev)) && host_.displayDeviceName)
         dev = host_.displayDeviceName();
@@ -659,13 +674,14 @@ void ProController::LoadCalibration(const std::string& cube, bool install) {
     calError_.clear();
     calLoading_ = cube;
     calInstall_ = install;
-    calLoader_.Submit([cube](color::CubeLut& lut, std::string& err) { return color::LoadCube(cube, lut, err); },
-                      cube, /*isOcio=*/false);
+    calLoadId_ = calLoader_.Submit([cube](color::CubeLut& lut, std::string& err) { return color::LoadCube(cube, lut, err); },
+                                   cube, /*isOcio=*/false);
 }
 
 void ProController::TickCalibration() {
     LookLoader::Result r;
     if (!calLoader_.Take(r)) return;
+    if (r.id != calLoadId_) return;  // for a panel the window left, or since removed
     calLoading_.clear();
     auto fail = [&](const std::string& why) {
         calError_ = why;
@@ -697,6 +713,8 @@ void ProController::TickCalibration() {
 }
 
 void ProController::ClearCalibration(bool uninstall) {
+    calLoadId_ = 0;
+    calLoading_.clear();
     if (renderer_) renderer_->ClearCalibrationLut();
     calLoaded_ = false;
     calName_.clear();
@@ -752,6 +770,13 @@ void ProController::ApplyTarget() {
     b.targetWidthM = target_.widthM;
     b.targetDistanceM = target_.distanceM;
     station_.SetRigBudget(b);
+    PushTargetToStation();
+}
+
+void ProController::PushTargetToStation() {
+    station_.SetTarget(target_, host_.pictureScale ? host_.pictureScale() : 1.0f,
+                       host_.viewerDistance ? host_.viewerDistance() : 0.0f,
+                       host_.parallaxOffsetPct ? host_.parallaxOffsetPct() : 0.0f);
 }
 
 void ProController::Tick(const Status& st) {
@@ -826,12 +851,16 @@ void ProController::Tick(const Status& st) {
     }
     TickCalibration();
     if (targetDirty_) ApplyTarget();
-    station_.SetTarget(target_, host_.pictureScale ? host_.pictureScale() : 1.0f,
-                       host_.viewerDistance ? host_.viewerDistance() : 0.0f);
+    PushTargetToStation();
     if (!renderer_) return;
+    // #134: an OCIO look follows the source: re-bake when an EXR comes or goes.
+    if (lutIsOcio_ && lutLoading_.empty() && lutPqShaper_ != SourceIsSceneLinear()) LoadOcio(ocioReq_);
+    grade_.lutPqShaper = lutIsOcio_ && lutPqShaper_;
     GradeParams g = grade_;
     if (bypass_ || st.isLogo) {
         g = GradeParams{};
+        g.toneMap = grade_.toneMap;  // the HDR mapping is the display transform, not the look
+        g.peakNits = grade_.peakNits;
     }
     // The display calibration belongs to the panel, not the show: grade bypass keeps it.
     g.calOn = calLoaded_ && !calBypass_;
@@ -1003,6 +1032,10 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
                        : grade_.lutOn && !lutName_.empty() ? lutName_.c_str()
                        : grade_.cdlOn ? "CDL" : "no look");
         if (!bypass_ && std::fabs(grade_.exposure) > 0.005f) add(" %+.1f EV", grade_.exposure);
+        if (renderer_) {
+            const std::string hdr = HdrSummary(renderer_->SourceHdr());
+            if (!hdr.empty()) add("  |  %s", hdr.c_str());
+        }
         add("  |  %s", CalibrationLabel().c_str());
         if (target_.On()) {
             const float k = host_.pictureScale ? host_.pictureScale() : 1.0f;
@@ -1103,6 +1136,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                     lutName_.clear();
                     lutPath_.clear();
                     grade_.lutOn = false;
+                    lutIsOcio_ = lutPqShaper_ = false;  // nothing left to re-bake (#134)
                     if (renderer_) renderer_->ClearLut3D();
                 }
                 ImGui::TextDisabled("%s  (%d^3)", lutName_.c_str(), lut_.size);
@@ -1223,6 +1257,9 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
             ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
             ImGui::SliderFloat("Exposure", &grade_.exposure, -4.0f, 4.0f, "%+.2f EV");
             if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) grade_.exposure = 0.0f;
+            ImGui::EndDisabled();
+            BuildHdrControls();
+            ImGui::BeginDisabled(bypass_);
             ImGui::TextDisabled("Look: %s%s%s", grade_.lutOn && !lutName_.empty() ? lutName_.c_str() : "no LUT",
                                 grade_.cdlOn ? " + CDL " : "", grade_.cdlOn ? cdlName_.c_str() : "");
             ImGui::BeginDisabled(!grade_.cdlOn);
@@ -1285,13 +1322,19 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                 float pw = 0.0f, pd = 0.0f;
                 const bool geom = host_.panelGeometry && host_.panelGeometry(pw, pd);
                 if (!geom) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Panel size unknown: no preview");
+                else if (targetPreview_ && host_.previewLimited && host_.previewLimited())
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "This target is too large to preview");
                 else if (targetPreview_)
                     ImGui::TextDisabled("Picture x%.2f%s (panel %.2f m, you at %.2f m)", k,
                                         k > 1.005f ? ", cropped" : k < 0.995f ? ", bordered" : "", pw,
                                         host_.viewerDistance ? host_.viewerDistance() : pd);
                 const rig::Result r = station_.RigLast();
                 if (r.ok && st.stereo && st.hasPicture) {
-                    const target::Depth n = target::AtParallax(target_, r.nearPct), f = target::AtParallax(target_, r.farPct);
+                    // For the picture as shown, so the convergence is included.
+                    const float off = host_.parallaxOffsetPct ? host_.parallaxOffsetPct() : 0.0f;
+                    const target::Depth n = target::AtParallax(target_, r.nearPct + off),
+                                        f = target::AtParallax(target_, r.farPct + off);
+                    if (std::fabs(off) > 0.005f) ImGui::TextDisabled("Includes convergence: %+.2f%%", off);
                     ImGui::Text("Near %+.0f mm  %+.0f'   Far %+.0f mm  %+.0f'", n.mm, n.arcmin, f.mm, f.arcmin);
                     if (f.divergenceDeg > 0.0f)
                         ImGui::TextColored(f.divergenceDeg > target::kDivergenceCapDeg ? ImVec4(1.0f, 0.4f, 0.35f, 1.0f)

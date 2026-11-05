@@ -46,6 +46,21 @@ enum class Channel { RGB = 0, Red, Green, Blue, Alpha, Luma, Count };
 const char* ChannelName(Channel c);
 // before | after the grade; left eye | right eye; this clip | the compare clip B
 enum class Wipe { Off = 0, Grade, Eyes, Clips, Count };
+
+// HDR tone map (#134), GradeParams::toneMap: 0 auto, 1 on (roll off), 2 off (clip), 3 raw.
+inline const char* ToneMapName(int m) { return m == 1 ? "on" : m == 2 ? "off" : m == 3 ? "raw" : "auto"; }
+inline int ToneMapFromName(const std::string& s, int fallback) {
+    return s == "auto" || s == "0"  ? 0
+           : s == "on" || s == "1"  ? 1
+           : s == "off" || s == "2" ? 2
+           : s == "raw" || s == "3" ? 3
+                                    : fallback;
+}
+inline const char* HdrTransferName(int t) {
+    return t == 1 ? "HLG" : t == 2 ? "PQ" : t == 3 ? "Linear" : "SDR";
+}
+// "PQ -> SDR 1000 nits" / "Linear, clip" for the status bar; "" for SDR.
+std::string HdrSummary(const VulkanRenderer::HdrState& h);
 const char* WipeName(Wipe w);
 
 // Live player state the inspector shows, refreshed by App every frame.
@@ -104,6 +119,8 @@ struct Host {
     // width and nominal viewing distance (false when the runtime does not say).
     std::function<void(float widthM, float distanceM)> setTargetScreen;
     std::function<float()> pictureScale;
+    std::function<bool()> previewLimited;     // the target's scale is too large to preview
+    std::function<float()> parallaxOffsetPct;  // what convergence adds to the shown parallax, % of width
     std::function<float()> viewerDistance;  // m: the tracked viewer, else the nominal distance
     std::function<bool(float& widthM, float& viewerM)> panelGeometry;
     // An RGBA texture for ImGui::Image (scope pictures), per slot: upload `rgba` (nullptr =
@@ -201,6 +218,7 @@ private:
     void SetWipe(Wipe w, bool announce);
     void BuildOverlays(const Status& st, float uiAlpha);
     void BuildOverlaySection();
+    void BuildHdrControls();  // Inspector > Color: the HDR tone map (#134)
     void BuildMonitoringSection(const Status& st);
     void BuildScopesPanel(float alpha, float W, float H, float panelW);
     void BuildPixelProbe(const Status& st);
@@ -240,6 +258,13 @@ private:
     LookLoader looks_;             // parses / bakes LUTs off the render thread
     std::string lutLoading_;       // source of the look being built ('' = none)
     std::string lutError_;         // why the last look failed ('' = it did not)
+    // #134: an OCIO look on scene-linear EXR is baked for PQ-coded linear input. The request
+    // is kept so a change of source (EXR <-> other) re-bakes it the other way.
+    ocio::Request ocioReq_;
+    bool ocioBakePqInput_ = false;  // the bake in flight was for PQ-coded linear input
+    bool lutIsOcio_ = false;        // the LUT on the GPU is an OCIO bake ...
+    bool lutPqShaper_ = false;      // ... baked for PQ-coded linear input
+    bool SourceIsSceneLinear() const;
 
     // Display calibration (#133): per panel, after the grade and QC views. Not part of the
     // show grade, so G (bypass all) leaves it on; Shift+G bypasses it.
@@ -250,6 +275,7 @@ private:
     int calCheckTicks_ = 0;        // frames since the panel was last looked up
     std::string calPath_, calName_;
     std::string calLoading_, calError_;
+    uint64_t calLoadId_ = 0;       // the load still wanted; another finishing is dropped
     bool calInstall_ = false;      // the pending load is kept for this panel once it applies
     bool calLoaded_ = false;       // a calibration LUT is on the GPU
     bool calBypass_ = false;       // Shift+G / the Inspector / set_display_calibration
@@ -265,6 +291,7 @@ private:
     bool targetDirty_ = false;     // push target_ / targetPreview_ to the app + station
     float customTargetW_ = 3.0f, customTargetD_ = 4.0f;
     void ApplyTarget();
+    void PushTargetToStation();  // target_ and how the picture is shown, for its figures and alerts
 
     // File dialog result (SDL may call back on another thread).
     std::mutex dialogMutex_;
