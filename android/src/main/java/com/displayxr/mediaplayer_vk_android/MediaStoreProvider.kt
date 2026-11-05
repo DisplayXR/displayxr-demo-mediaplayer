@@ -23,7 +23,6 @@ import android.provider.Settings
 import android.util.Log
 import android.util.Size
 import java.io.FileNotFoundException
-import java.io.IOException
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import kotlin.math.max
@@ -296,18 +295,22 @@ class MediaStoreProvider(
 
     private fun detachedFd(row: Row): Int = try {
         activity.contentResolver.openFileDescriptor(row.uri, "r")?.detachFd() ?: -1
-    } catch (e: FileNotFoundException) {
+    } catch (e: Exception) { // FileNotFoundException, or SecurityException on a revoked grant
         -1
     }
 
     private fun thumbnail(row: Row, edge: Int): Bitmap? {
-        var bitmap = try {
+        // Runs on a pool thread: any exception here would kill the process, and a revoked
+        // partial-media grant (Android 14) surfaces as a SecurityException, not an IOException.
+        var bitmap: Bitmap = try {
             activity.contentResolver.loadThumbnail(row.uri, Size(edge, edge), null)
-        } catch (e: IOException) {
+        } catch (e: Exception) {
             Log.w(TAG, "no thumbnail for ${row.name}: $e")
             return null
         }
-        if (bitmap.config != Bitmap.Config.ARGB_8888) bitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        if (bitmap.config != Bitmap.Config.ARGB_8888) {
+            bitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false) ?: return null
+        }
         // loadThumbnail samples by powers of two, so it can return up to twice the size asked for.
         val scale = edge.toFloat() / max(bitmap.width, bitmap.height)
         if (scale < 1f) {
@@ -373,7 +376,7 @@ class MediaStoreProvider(
             val pfd = activity.contentResolver.openFileDescriptor(row.uri, "r") ?: return
             val length = pfd.statSize
             openFd(pfd.detachFd(), length, row.name)
-        } catch (e: FileNotFoundException) {
+        } catch (e: Exception) { // FileNotFoundException, or SecurityException on a revoked grant
             Log.w(TAG, "media browser: cannot open ${row.name}: $e")
         }
     }
