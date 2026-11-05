@@ -3,6 +3,8 @@
 
 #include <chrono>
 #include <exception>
+#include <string>
+#include <system_error>
 #include <utility>
 
 namespace mp::pro {
@@ -66,5 +68,60 @@ void QcExporter::Run() {
         }
     }
 }
+
+namespace qcfiles {
+
+bool CreateUniqueDir(const std::filesystem::path& parent, const std::string& base, std::filesystem::path& out,
+                     std::error_code& ec) {
+    ec.clear();
+    std::filesystem::create_directories(parent, ec);
+    if (ec) return false;
+    for (int k = 1; k <= 99; ++k) {
+        const std::filesystem::path d = parent / (k == 1 ? base : base + "-" + std::to_string(k));
+        ec.clear();
+        if (std::filesystem::create_directory(d, ec)) {  // false + no error: it exists, try the next
+            out = d;
+            return true;
+        }
+        // A FILE of that name: libstdc++ says false/no error, MSVC reports an error. Either
+        // way the name is taken; anything else (no permission, full disk) is a failure.
+        std::error_code ec2;
+        if (ec && !std::filesystem::exists(d, ec2)) return false;
+    }
+    ec = std::make_error_code(std::errc::file_exists);
+    return false;
+}
+
+std::string UniqueName(const std::string& base, const std::function<bool(const std::string&)>& taken) {
+    for (int k = 1; k <= 99; ++k) {
+        const std::string n = k == 1 ? base : base + "-" + std::to_string(k);
+        if (!taken(n)) return n;
+    }
+    return {};
+}
+
+bool PrefixInUse(const std::string& prefix) {
+    if (prefix.empty()) return false;
+    const std::filesystem::path pre = std::filesystem::u8path(prefix);
+    const std::string stem = pre.filename().u8string() + "_";
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator(pre.parent_path(), ec))
+        if (de.path().filename().u8string().rfind(stem, 0) == 0) return true;
+    return false;
+}
+
+std::string FindAtlasCapture(const std::string& prefix) {
+    if (prefix.empty()) return {};
+    const std::filesystem::path pre = std::filesystem::u8path(prefix);
+    const std::string stem = pre.filename().u8string() + "_atlas";
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator(pre.parent_path(), ec)) {
+        const std::string f = de.path().filename().u8string();
+        if (f.rfind(stem, 0) == 0 && de.path().extension() == ".png") return de.path().u8string();
+    }
+    return {};
+}
+
+}  // namespace qcfiles
 
 }  // namespace mp::pro

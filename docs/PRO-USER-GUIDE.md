@@ -129,24 +129,31 @@ e.g. `PQ -> SDR 1000 nits`.
   reference white, so reference white itself lands a little under white: about code 229 of
   255 for a 1000-nit source, 208 for 4000 nits. Shadows are kept as they are.
 - HLG and PQ with untagged primaries or matrix are taken as BT.2020. A file with no HDR tag
-  at all is shown as SDR; there is no control to force it yet.
+  at all is shown as SDR. If you know it is HDR, set **Untagged source** (Inspector > Colour)
+  to **HLG** or **PQ**: it is then decoded as BT.2100 (BT.2020 matrix and primaries) and the
+  status bar says `untagged, taken as PQ`. Tagged files are not affected.
   BT.2020 colours are converted to the panel's BT.709.
 - **Exposure** acts on the HDR light before the roll-off: pull it down to see detail in
   highlights.
 - **HDR tone map** (Inspector > Colour):
   - **auto** (default): roll off HLG and PQ; clip EXR at white (EXR then looks as before,
-    and exposure brings back what is above white).
+    and exposure brings back what is above white). The clip comes after the CDL and LUT, so
+    an EXR's values above white still go into the grade: a CDL slope of 0.5 brings them
+    back below white instead of turning them all into one flat grey.
   - **on**: always roll off, EXR included.
-  - **off**: clip everything above white.
+  - **off**: clip everything above white, before the grade.
   - **raw**: no mapping at all. Use it with a show LUT that expects PQ or HLG input.
 - **Source peak (nits)**: the brightest the source gets, which sets where the roll-off ends.
-  0 takes it from the file (HDR10 metadata), else 1000. HLG always uses 1000.
+  0 takes it from the file (HDR10 metadata), else 1000. For HLG (which has no metadata) it
+  only changes the highlights: the picture is always rendered as for a 1000-nit display, so
+  everything below reference white (75% HLG) looks the same at any peak; 0 = 1000.
 - The scopes, false colour and zebras measure the mapped picture.
 
 The CDL and the LUT apply after the mapping, to the SDR picture. One exception: with an
 **OpenColorIO** look on an EXR, the look gets the scene-linear values themselves, above 1.0
 included, so the OCIO view (e.g. ACES) does the tone mapping; the status bar then says
-`Linear -> OCIO look (unclipped)`. The compare clip B in the clip wipe is not mapped.
+`Linear -> OCIO look (unclipped)`. The compare clip B in the clip wipe is mapped the same
+way, from its own tags.
 
 ### Display calibration
 
@@ -162,7 +169,10 @@ itself whenever it runs on that panel.
   panel has none; the status line shows the same. Hover it for the panel's key and file.
 - **`Shift+G`** (or **Bypass calibration**) turns the calibration off and on. **`G`** does
   not touch it: bypassing the grade still shows the picture through the calibration.
-- **Remove** deletes this panel's calibration.
+- **Remove** deletes this panel's calibration. When the one showing is for this run only
+  (`MEDIAPLAYER_PRO_CAL`, or one that could not be kept), Remove only turns it off and the
+  panel's kept calibration stays. If the file cannot be deleted, Remove says so and the
+  calibration stays on.
 
 It is the last step: after the grade, the QC views, the gamma trim and the channel views,
 so a gamma trim is a choice you see through the calibration. The LUT must

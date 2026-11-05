@@ -26,6 +26,9 @@ constexpr float kRefWhiteNits = 203.0f;  // BT.2408 HDR reference (graphics) whi
 constexpr float kPqMaxNits = 10000.0f;
 constexpr float kDefaultPeakNits = 1000.0f;  // when the stream carries no light-level metadata
 constexpr float kHlgDisplayNits = 1000.0f;   // the HLG OOTF's nominal display peak (gamma 1.2)
+// HLG is scene-referred, so the picture is always the 1000-nit render (system gamma 1.2) and
+// peakNits only sets where the roll-off ends (#169, David: the peak changes the highlights,
+// not the whole picture; reference white stays at 203 nits).
 
 // Transfer of the decoded signal (FrameRing ColorTransfer, same values).
 enum class Transfer : int { SDR = 0, HLG = 1, PQ = 2, LinearPq = 3 };
@@ -75,6 +78,11 @@ inline float SrgbEncode(float l) {
     l = std::clamp(l, 0.0f, 1.0f);
     return l <= 0.0031308f ? 12.92f * l : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
 }
+// The same curve continued past 1.0 (values above SDR white, #169).
+inline float SrgbEncodeOver(float l) {
+    l = std::max(l, 0.0f);
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
+}
 inline float SrgbDecode(float e) {
     e = std::clamp(e, 0.0f, 1.0f);
     return e <= 0.04045f ? e / 12.92f : std::pow((e + 0.055f) / 1.055f, 2.4f);
@@ -112,12 +120,16 @@ struct HdrParams {
     Transfer transfer = Transfer::SDR;
     bool bt2020 = false;       // source primaries are BT.2020 (converted to BT.709)
     bool rollOff = true;       // BT.2390 roll-off; false = clip at SDR white
-    float peakNits = kDefaultPeakNits;  // the source's brightest (PQ / EXR), before exposure
+    float peakNits = kDefaultPeakNits;  // the source's brightest (PQ / EXR), before exposure;
+                                        // for HLG the roll-off's source peak (HlgPeak)
     float exposure = 0.0f;     // stops, applied in linear light before the roll-off
     // An OpenColorIO look on scene-linear EXR: hand the LUT the linear light as PQ code of
     // (linear x 203 nits), unclipped, instead of the SDR picture; the bake decodes it
     // (ocio::Request::linearPqInput), so the OCIO view sees values above 1.0.
     bool pqShaper = false;
+    // Scene-linear EXR without the roll-off (tone map auto, #169): keep values above SDR
+    // white, sRGB-encoded past 1.0, for the grade; the caller clips after the grade.
+    bool overWhite = false;
 };
 
 // Scene-linear EXR -> PQ code, the decoder's per-sample encode (#134). A lerped table over
@@ -139,6 +151,13 @@ inline float EncodeLinearPq(const float* lut, float v) {
     return lut[i] + (lut[i + 1] - lut[i]) * (t - (float)i);
 }
 
+// HLG's roll-off source peak: peakNits (0 = 1000), kept in the range the shader's peak
+// field carries.
+constexpr float kHlgMinNits = 100.0f, kHlgMaxNits = 10000.0f;
+inline float HlgPeak(const HdrParams& p) {
+    return p.peakNits > 0.0f ? std::clamp(p.peakNits, kHlgMinNits, kHlgMaxNits) : kHlgDisplayNits;
+}
+
 // True when the shader takes the HDR path for this frame (SDR never does: bit-identical).
 inline bool IsHdr(const HdrParams& p) { return p.transfer != Transfer::SDR; }
 
@@ -149,8 +168,9 @@ inline void HdrToDisplay(const HdrParams& p, float c[3]) {
         float s[3];
         for (int i = 0; i < 3; ++i) s[i] = HlgToScene(c[i]);
         const float ys = 0.2627f * s[0] + 0.6780f * s[1] + 0.0593f * s[2];  // BT.2100 luma
-        const float g = HlgSystemGamma(kHlgDisplayNits);
-        const float k = kHlgDisplayNits * std::pow(std::max(ys, 1e-6f), g - 1.0f) / kRefWhiteNits;
+        const float lw = kHlgDisplayNits;  // the picture: always the 1000-nit render
+        const float g = HlgSystemGamma(lw);
+        const float k = lw * std::pow(std::max(ys, 1e-6f), g - 1.0f) / kRefWhiteNits;
         for (int i = 0; i < 3; ++i) l[i] = s[i] * k;
     } else {  // PQ or LinearPq: the code is PQ either way
         for (int i = 0; i < 3; ++i) l[i] = PqToNits(c[i]) / kRefWhiteNits;
@@ -165,11 +185,90 @@ inline void HdrToDisplay(const HdrParams& p, float c[3]) {
     }
     const float mx = std::max(l[0], std::max(l[1], l[2]));
     if (p.rollOff && mx > 0.0f) {
-        const float src = (p.transfer == Transfer::HLG ? kHlgDisplayNits : p.peakNits) * m;
+        const float src = (p.transfer == Transfer::HLG ? HlgPeak(p) : p.peakNits) * m;
         const float out = Bt2390Nits(mx * kRefWhiteNits, src, kRefWhiteNits) / kRefWhiteNits;
         for (float& v : l) v *= out / mx;
     }
+    if (p.overWhite && !p.rollOff) {
+        for (int i = 0; i < 3; ++i) c[i] = SrgbEncodeOver(l[i]);
+        return;
+    }
     for (int i = 0; i < 3; ++i) c[i] = SrgbEncode(l[i]);
 }
+
+// HdrToDisplay() for a whole picture on the CPU ("Convert to 3D" hands the converter an
+// 8-bit SDR picture, so an HDR frame is tone-mapped first). The same maths with the pow-heavy
+// steps tabled: the signal decode, the roll-off gain over log2(max RGB) and the sRGB encode.
+// tests/tone_map_test.cpp bounds it against HdrToDisplay() (under half an 8-bit code).
+// pqShaper is ignored: the result is always the SDR picture.
+class HdrDisplayTable {
+public:
+    explicit HdrDisplayTable(const HdrParams& p) : p_(p) {
+        decode_.resize(kN + 1);
+        for (int i = 0; i <= kN; ++i) {
+            const float e = (float)i / kN;
+            decode_[(size_t)i] = p.transfer == Transfer::HLG ? HlgToScene(e) : PqToNits(e) / kRefWhiteNits;
+        }
+        gain_.assign(kG + 1, 1.0f);
+        const float m = std::exp2(p.exposure);
+        src_ = (p.transfer == Transfer::HLG ? HlgPeak(p) : p.peakNits) * m;
+        if (p.rollOff)
+            for (int i = 0; i <= kG; ++i) {
+                const float mx = std::exp2(kLogLo + (kLogHi - kLogLo) * (float)i / kG);
+                gain_[(size_t)i] = Bt2390Nits(mx * kRefWhiteNits, src_, kRefWhiteNits) / kRefWhiteNits / mx;
+            }
+        encode_.resize(kN + 1);
+        for (int i = 0; i <= kN; ++i) encode_[(size_t)i] = SrgbEncode(Unit((float)i / kN));
+    }
+
+    // One R'G'B' signal (0..1) -> display-referred sRGB-encoded R'G'B' (0..1).
+    void Apply(float c[3]) const {
+        float l[3];
+        for (int i = 0; i < 3; ++i) l[i] = Lerp(decode_, c[i]);
+        if (p_.transfer == Transfer::HLG) {
+            const float ys = 0.2627f * l[0] + 0.6780f * l[1] + 0.0593f * l[2];
+            const float lw = kHlgDisplayNits;
+            const float g = HlgSystemGamma(lw);
+            const float k = lw * std::pow(std::max(ys, 1e-6f), g - 1.0f) / kRefWhiteNits;
+            for (float& v : l) v *= k;
+        }
+        const float m = std::exp2(p_.exposure);
+        for (float& v : l) v *= m;
+        if (p_.bt2020) Bt2020To709(l);
+        for (float& v : l) v = std::max(v, 0.0f);
+        const float mx = std::max(l[0], std::max(l[1], l[2]));
+        if (p_.rollOff && mx > 0.0f) {
+            const float lg = std::log2(mx);
+            // Below the table the curve is the identity (far under the knee); above it, the
+            // source peak (and everything over it) lands on SDR white.
+            const float gain = lg <= kLogLo   ? 1.0f
+                               : lg >= kLogHi ? Bt2390Nits(mx * kRefWhiteNits, src_, kRefWhiteNits) / kRefWhiteNits / mx
+                                              : Lerp(gain_, (lg - kLogLo) / (kLogHi - kLogLo));
+            for (float& v : l) v *= gain;
+        }
+        for (int i = 0; i < 3; ++i) c[i] = Lerp8th(std::clamp(l[i], 0.0f, 1.0f));
+    }
+
+private:
+    static constexpr int kN = 4096;   // signal decode and sRGB encode, lerped
+    static constexpr int kG = 2048;   // roll-off gain over log2(max RGB)
+    static constexpr float kLogLo = -16.0f, kLogHi = 7.0f;  // up to ~128x reference white
+    // The sRGB encode's table is indexed by the 8th root of linear light, which straightens
+    // its steep toe (the 1/2.4 power) so a lerp holds near black.
+    static float Unit(float u) {
+        const float u2 = u * u, u4 = u2 * u2;
+        return u4 * u4;
+    }
+    static float Lerp(const std::vector<float>& t, float x) {
+        const float f = std::clamp(x, 0.0f, 1.0f) * (float)(t.size() - 1);
+        const int i = (std::min)((int)f, (int)t.size() - 2);
+        return t[(size_t)i] + (t[(size_t)i + 1] - t[(size_t)i]) * (f - (float)i);
+    }
+    float Lerp8th(float l) const { return Lerp(encode_, std::sqrt(std::sqrt(std::sqrt(l)))); }
+
+    HdrParams p_;
+    float src_ = 0.0f;
+    std::vector<float> decode_, gain_, encode_;
+};
 
 }  // namespace mp::color

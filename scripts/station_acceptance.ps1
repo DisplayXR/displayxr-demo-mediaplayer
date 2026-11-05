@@ -239,14 +239,21 @@ if ($base -and (Want "G2")) {
         else { Report "G2" "Grade: 3D LUT applies" "FAIL" "picture unchanged $(Fmt $m[0])" }
     } else { Report "G2" "Grade: 3D LUT applies" "FAIL" "no atlas dump" }
 }
+# P4 only checks that --10bit is taken: the runtime is new enough, the player renders with it,
+# and the runtime accepted the setting. The one log line there is, "DXR_ATLAS_FORMAT=rgb10a2:
+# <compositor> atlas format N", is printed when the runtime PARSES the setting, before any frame;
+# it says nothing about what the display processor weaves or the panel shows (#169). So P4 can
+# fail but never pass: the 10-bit panel path is judged by eye in M3 (a gradient, --8bit vs --10bit).
 if (Want "P4") {
+    $what = "--10bit accepted (panel path: manual M3)"
     $r = Run-Player "P4_10bit" @("--10bit", $Stereo) @{}
-    $deep = $r.log -and (Select-String -Path $r.log -Pattern "R10G10B10A2|rgb10a2" -Quiet)
+    $parsed = $r.log -and (Select-String -Path $r.log -Pattern "DXR_ATLAS_FORMAT=rgb10a2: \S+ atlas format" -Quiet)
+    $rejected = $r.log -and (Select-String -Path $r.log -Pattern "DXR_ATLAS_FORMAT='rgb10a2' not recognised" -SimpleMatch -Quiet)
     $warn = $r.stdout -match "needs DisplayXR runtime 2.53"
-    if ($warn) { Report "P4" "10-bit picture to the panel" "FAIL" "runtime too old for --10bit" }
-    elseif (-not $r.atlas -and -not (Get-ChildItem $Out -Filter "P4_10bit*woven*.png")) { Report "P4" "10-bit picture to the panel" "FAIL" "player did not render (P4_10bit_stdout.txt)" }
-    elseif ($deep) { Report "P4" "10-bit picture to the panel" "PASS" "runtime log shows the 10-bit atlas; confirm the picture by eye (manual M3)" }
-    else { Report "P4" "10-bit picture to the panel" "FAIL" "no 10-bit atlas in the runtime log (P4_10bit_runtime.log)" }
+    if ($warn) { Report "P4" $what "FAIL" "runtime too old for --10bit" }
+    elseif (-not $r.atlas -and -not (Get-ChildItem $Out -Filter "P4_10bit*woven*.png")) { Report "P4" $what "FAIL" "player did not render (P4_10bit_stdout.txt)" }
+    elseif ($rejected -or -not $parsed) { Report "P4" $what "FAIL" "the runtime did not take DXR_ATLAS_FORMAT=rgb10a2 (P4_10bit_runtime.log)" }
+    else { Report "P4" $what "INFO" "the runtime parsed the 10-bit atlas setting; this does not show the panel gets 10 bits - judge M3 by eye" }
 }
 
 # ---------------------------------------------------------------- R: rig checks on the built-in test rig

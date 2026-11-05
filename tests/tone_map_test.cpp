@@ -191,8 +191,135 @@ static void TestPack() {
     CHECK(((mp::PackColourWord(0, 3, false, false, 100.0f) >> 8) & 1) == 0);
 }
 
+// #169: the CPU table the "Convert to 3D" input uses matches HdrToDisplay() to well under
+// one 8-bit code, across transfers, peaks, roll-off on / off and BT.2020.
+static void TestHdrDisplayTable() {
+    struct Case { Transfer tr; bool roll; bool b2020; float peak; };
+    const Case cases[] = {{Transfer::PQ, true, true, 1000.0f},   {Transfer::PQ, true, false, 4000.0f},
+                          {Transfer::PQ, false, true, 1000.0f},  {Transfer::HLG, true, true, 1000.0f},
+                          {Transfer::LinearPq, false, false, 1000.0f}, {Transfer::LinearPq, true, false, 2000.0f}};
+    for (const Case& k : cases) {
+        HdrParams p;
+        p.transfer = k.tr;
+        p.rollOff = k.roll;
+        p.bt2020 = k.b2020;
+        p.peakNits = k.peak;
+        const HdrDisplayTable t(p);
+        float worst = 0.0f;
+        for (int r = 0; r <= 32; ++r)
+            for (int g = 0; g <= 32; ++g)
+                for (int b = 0; b <= 32; b += 4) {
+                    float a[3] = {r / 32.0f, g / 32.0f, b / 32.0f}, e[3] = {a[0], a[1], a[2]};
+                    HdrToDisplay(p, e);
+                    t.Apply(a);
+                    for (int i = 0; i < 3; ++i) worst = std::max(worst, std::fabs(a[i] - e[i]));
+                }
+        if (worst > 0.5f / 255.0f) std::fprintf(stderr, "table worst %.5f (tr %d)\n", worst, (int)k.tr);
+        CHECK(worst <= 0.5f / 255.0f);
+    }
+    // Scene-linear white (PQ of 203 nits) shows as white, not as its PQ code (~148/255).
+    HdrParams lin;
+    lin.transfer = Transfer::LinearPq;
+    lin.rollOff = false;
+    float w[3] = {NitsToPq(kRefWhiteNits), NitsToPq(kRefWhiteNits), NitsToPq(kRefWhiteNits)};
+    HdrDisplayTable(lin).Apply(w);
+    CHECK(w[0] > 0.995f && w[1] > 0.995f && w[2] > 0.995f);
+}
+
+// #169: the compare clip B's tags in the spare bits; SDR packs to nothing.
+static void TestPackCompare() {
+    const mp::CompareHdrBits none = mp::PackCompareHdr(0, true, true, 1000.0f, true);
+    CHECK(none.viewFlags == 0 && none.yuvMatrix == 0);
+    const mp::CompareHdrBits b = mp::PackCompareHdr(3, true, true, 1000.0f, true);
+    CHECK(((b.viewFlags >> 6) & 3) == 3);
+    CHECK(((b.viewFlags >> 3) & 1) == 1);
+    CHECK((b.viewFlags & ~((3u << 6) | (1u << 3))) == 0);  // only bits 3, 6, 7
+    CHECK(((b.yuvMatrix >> 2) & 1) == 1);
+    CHECK(((b.yuvMatrix >> 9) & 1) == 1);
+    CHECK((b.yuvMatrix & ~((1u << 2) | (1u << 9) | (63u << 10))) == 0);  // never A's bits
+    for (float pk : {100.0f, 203.0f, 1000.0f, 4000.0f, 10000.0f}) {
+        const float back = mp::UnpackComparePeak(mp::PackComparePeakCode(pk));
+        CHECK(std::fabs(back - pk) <= pk * 0.04f);
+    }
+    // B's bits never overlap A's colour word.
+    const uint32_t a = (uint32_t)mp::PackColourWord(2, 3, true, true, 10000.0f, true);
+    CHECK((a & b.yuvMatrix) == 0);
+}
+
+// #169: the HLG peak sets the roll-off only; the picture stays the 1000-nit render.
+// 0 and 1000 are the old fixed behaviour; another peak changes the picture.
+static void TestHlgPeak() {
+    CHECK(Near(HlgSystemGamma(2000.0f), 1.2f + 0.42f * std::log10(2.0f), 1e-6f));
+    HdrParams p;
+    p.transfer = Transfer::HLG;
+    p.rollOff = true;
+    auto show = [&](float peak, float sig) {
+        HdrParams q = p;
+        q.peakNits = peak;
+        float c[3] = {sig, sig * 0.8f, sig * 0.6f};
+        HdrToDisplay(q, c);
+        return c[0];
+    };
+    CHECK(Near(show(0.0f, 0.75f), show(1000.0f, 0.75f), 1e-6f));   // 0 = the nominal 1000
+    // The peak changes the highlights only (David, #169): the picture is the 1000-nit render
+    // for every peak, so without the roll-off nothing moves and with it everything under the
+    // knee stays put. 75% HLG (reference white) is 229 at 1000 nits.
+    auto grey = [&](float peak, float sig, bool roll) {
+        HdrParams q = p;
+        q.peakNits = peak;
+        q.rollOff = roll;
+        float c[3] = {sig, sig, sig};
+        HdrToDisplay(q, c);
+        return c[0];
+    };
+    for (float pk : {400.0f, 2000.0f, 4000.0f}) {
+        for (float sig : {0.75f, 0.9f}) CHECK(Near(grey(pk, sig, false), grey(1000.0f, sig, false), 0.0f));
+        CHECK(Near(grey(pk, 0.5f, true), grey(1000.0f, 0.5f, true), 1.0f / 255.0f));  // under the knee
+    }
+    CHECK(Near(grey(1000.0f, 0.75f, true) * 255.0f, 229.0f, 1.0f));
+    // ... and the highlights follow the peak: a higher peak keeps more of them under white.
+    CHECK(grey(2000.0f, 0.9f, true) < grey(1000.0f, 0.9f, true) - 4.0f / 255.0f);
+    CHECK(grey(400.0f, 0.9f, true) > grey(1000.0f, 0.9f, true));
+    CHECK(Near(HlgPeak(p), kHlgDisplayNits, 0.0f));
+    p.peakNits = 50.0f;
+    CHECK(Near(HlgPeak(p), kHlgMinNits, 0.0f));
+    // The table (Convert to 3D) follows the same peak.
+    p.peakNits = 2000.0f;
+    const HdrDisplayTable t(p);
+    float a[3] = {0.75f, 0.6f, 0.45f}, b[3] = {0.75f, 0.6f, 0.45f};
+    t.Apply(a);
+    HdrToDisplay(p, b);
+    CHECK(Near(a[0], b[0], 2.0f / 255.0f) && Near(a[2], b[2], 2.0f / 255.0f));
+}
+
+// #169: scene-linear EXR without the roll-off keeps values above white (encoded past 1.0)
+// when overWhite is set; without it, it clips at white as before.
+static void TestOverWhite() {
+    HdrParams p;
+    p.transfer = Transfer::LinearPq;
+    p.rollOff = false;
+    const float two = NitsToPq(2.0f * kRefWhiteNits);
+    float a[3] = {two, two, two};
+    HdrToDisplay(p, a);
+    CHECK(Near(a[0], 1.0f, 1e-4f));
+    p.overWhite = true;
+    float b[3] = {two, two, two};
+    HdrToDisplay(p, b);
+    CHECK(Near(b[0], SrgbEncodeOver(2.0f), 3e-3f) && b[0] > 1.3f);
+    const float half = NitsToPq(0.5f * kRefWhiteNits);
+    float c[3] = {half, half, half};
+    HdrToDisplay(p, c);
+    CHECK(Near(c[0], SrgbEncode(0.5f), 2e-3f));  // below white: unchanged
+    p.rollOff = true;  // the roll-off wins: no over-white output
+    float d[3] = {two, two, two};
+    HdrToDisplay(p, d);
+    CHECK(d[0] <= 1.0f);
+}
+
 int main() {
     TestPq();
+    TestHlgPeak();
+    TestOverWhite();
     TestHlg();
     TestBt2390();
     TestHdrToDisplay();
@@ -201,6 +328,8 @@ int main() {
     TestPqShaper();
     TestGamut();
     TestPack();
+    TestHdrDisplayTable();
+    TestPackCompare();
     if (g_fail) {
         std::fprintf(stderr, "tone_map_test: %d failure(s)\n", g_fail);
         return 1;

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <new>
 #include <thread>
 
 using mp::color::CubeLut;
@@ -73,6 +74,18 @@ void ErrorsComeBackAsResults() {
     CHECK(!r.ok && r.isOcio, "an empty LUT is rejected");
 }
 
+// #169: an allocation failing on the worker (a 256^3 LUT under memory pressure) is a failed
+// result, not std::terminate, and the loader keeps working afterwards.
+void OutOfMemoryIsAFailedResult() {
+    LookLoader l;
+    l.Submit([](CubeLut&, std::string&) -> bool { throw std::bad_alloc(); }, "huge.cube", false);
+    LookLoader::Result r;
+    CHECK(WaitTake(l, r), "a failed result arrives");
+    CHECK(!r.ok && !r.err.empty() && r.rgba16f.empty(), "out of memory is an error (got '%s')", r.err.c_str());
+    l.Submit([](CubeLut& lut, std::string&) { return Flat(lut, 0.5f); }, "next.cube", false);
+    CHECK(WaitTake(l, r) && r.ok, "the next load still works");
+}
+
 void LatestWins() {
     LookLoader l;
     std::atomic<bool> release{false};
@@ -112,6 +125,7 @@ void DestroysWhileBusy() {
 int main() {
     RunsOffThreadAndPacks();
     ErrorsComeBackAsResults();
+    OutOfMemoryIsAFailedResult();
     LatestWins();
     DestroysWhileBusy();
     if (g_failures != 0) {

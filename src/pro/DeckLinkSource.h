@@ -63,6 +63,10 @@ public:
     // The bit depth of the last frame captured (10, or 8 after a refused 10-bit or for RGB);
     // 0 before the first frame. The station's capture stats report it.
     static int LastBitDepth();
+    // Bit depth the capture loses to the pixel format the card took after a format change
+    // (e.g. "12-bit RGB signal captured as 10-bit RGB (r210): 2 bits of depth lost"); "" when
+    // none. The Station panel shows it and get_rig_status reports it (#169).
+    std::string FormatWarning() const;
 
     // Two-input stereo: how far apart the paired frames were on the card's hardware
     // reference clock, and how many frames never made it into a pair.
@@ -94,6 +98,9 @@ public:
 private:
     friend struct DeckLinkCapture;  // the SDK side (DeckLinkSource.cpp) publishes through us
     void Worker();
+    void SetFormatWarning(int eye, const std::string& text);
+    mutable std::mutex warnMutex_;
+    std::string formatWarning_[2];  // per input
     mutable std::mutex pairMutex_;
     PairStats pairStats_;
     DeckLinkConfig cfg_;

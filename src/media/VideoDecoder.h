@@ -168,6 +168,7 @@ private:
     bool haveInteropLUID_ = false;
     bool interopActive_ = false;    // decoding on the pinned adapter (zero-copy eligible)
     bool warnedZeroCopyFormat_ = false;  // logged once: a non-NV12 surface took the CPU path
+    bool warnedZeroCopyHdr_ = false;     // logged once: an HLG / PQ stream took the CPU path (#169)
 #endif
     std::thread thread_;
     std::atomic<bool> stop_{false};

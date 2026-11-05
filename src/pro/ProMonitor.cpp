@@ -91,6 +91,8 @@ void ProController::OnFrame(const FrameRing::Frame& f, StereoLayout layout) {
     // Render thread: a point-sampled copy of the eye only; the rest runs on the worker.
     scopes::ScopeWorker::Job job;
     if (!scopes::Gather(f, layout, kScopeW, job.mini, job.w, job.h)) return;
+    // An untagged source taken as HLG / PQ (#169) decodes on BT.2020, as the shader does.
+    if (renderer_) job.mini.matrix = (ColorMatrix)renderer_->EffectiveMatrix((int)f.transfer, (int)f.matrix);
     job.hasFrame = true;
     g_down.Add((NowSec() - now) * 1000.0);
     LogCost();
@@ -119,6 +121,7 @@ scopes::Grade ProController::ScopeGrade() {
         g.hdr.bt2020 = h.bt2020;
         g.hdr.rollOff = h.rollOff;
         g.hdr.peakNits = h.peakNits;
+        g.hdr.overWhite = h.overWhite;
     }
     if (bypass_) return g;
     g.hdr.pqShaper = renderer_ && renderer_->SourceHdr().pqShaper && grade_.lutOn && lut_.Valid();
@@ -295,9 +298,22 @@ void ProController::BuildHdrControls() {
     int peak = (int)(grade_.peakNits + 0.5f);
     if (ImGui::InputInt("Source peak (nits)", &peak, 100, 1000))
         grade_.peakNits = (float)std::clamp(peak, 0, 10000);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 = from the stream's metadata (else 1000)");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("PQ / EXR: the source's brightest; 0 = from the stream's metadata (else 1000)\n"
+                          "HLG: where the highlight roll-off ends; the picture and reference white\n"
+                          "stay put; 0 = 1000");
+    ImGui::SetNextItemWidth(itemW);
+    static const char* kUntagged[] = {"SDR (as tagged)", "HLG", "PQ"};
+    int forced = std::clamp(grade_.forceTransfer, 0, 2);
+    if (ImGui::Combo("Untagged source", &forced, kUntagged, 3)) grade_.forceTransfer = forced;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("A video with no HDR tag plays as SDR. Choose HLG or PQ when you know\n"
+                          "it is HDR (BT.2020 matrix and primaries). Tagged sources are unaffected.");
     if (h.transfer == 0)
         ImGui::TextDisabled("Source: SDR (no tone map)");
+    else if (h.forced)
+        ImGui::TextDisabled("Source: untagged, taken as %s BT.2020  ->  %s", HdrTransferName(h.transfer),
+                            HdrSummary(h).c_str());
     else
         ImGui::TextDisabled("Source: %s%s  ->  %s", HdrTransferName(h.transfer), h.bt2020 ? " BT.2020" : "",
                             HdrSummary(h).c_str());

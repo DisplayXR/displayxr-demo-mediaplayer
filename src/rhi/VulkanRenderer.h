@@ -75,9 +75,13 @@ struct GradeParams {
     // HDR sources (#134): 0 auto (roll off HLG / PQ highlights, clip scene-linear EXR at
     // white), 1 always roll off, 2 never (clip), 3 raw (the signal goes into the grade as
     // if it were SDR, for a show LUT that expects PQ / HLG). peakNits 0 = the stream's own.
+    // For HLG, peakNits is the display peak the OOTF renders for (default 1000).
     int toneMap = 0;
     float peakNits = 0.0f;
     bool lutPqShaper = false;    // the LUT is an OCIO bake expecting PQ-coded linear (EXR)
+    // An untagged YUV source (#169): 0 as tagged (SDR), 1 take it as BT.2100 HLG, 2 as PQ
+    // (BT.2020 matrix and primaries). A tagged HDR source and an RGBA one are unaffected.
+    int forceTransfer = 0;
 };
 
 
@@ -160,8 +164,21 @@ public:
         bool bt2020 = false;
         float peakNits = 0.0f;
         bool pqShaper = false;  // scene-linear into an OCIO look, unclipped (see GradeParams)
+        // Scene-linear EXR under tone map auto (#169): values above white go into the CDL
+        // and LUT unclipped (clipped after the grade), so highlights survive a grade.
+        bool overWhite = false;
+        bool forced = false;    // the transfer came from GradeParams::forceTransfer
     };
     HdrState SourceHdr() const;
+    // The same decision for any tags under the current grade (the compare clip B, the
+    // "Convert to 3D" input frame): transfer 0 SDR, 1 HLG, 2 PQ, 3 scene-linear as PQ.
+    // An untagged (SDR) transfer becomes GradeParams::forceTransfer when one is set.
+    HdrState HdrFor(int transfer, bool bt2020, float peakNits) const;
+    // The Y'CbCr matrix to decode with: BT.2020 (2) when HdrFor forces an untagged source.
+    int EffectiveMatrix(int transfer, int matrix) const { return ForcesHdr(transfer) ? 2 : matrix; }
+    bool ForcesHdr(int transfer) const {
+        return transfer == 0 && (grade_.forceTransfer == 1 || grade_.forceTransfer == 2);
+    }
 
     // Media Player Pro's clip-vs-clip wipe: a second source (B) at bindings 4..6, sampled by
     // the MP_GRADE shader right of the wipe line (GradeParams::wipeMode 3). Same formats and
@@ -171,6 +188,8 @@ public:
     bool UploadCompareYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2, uint32_t width,
                           uint32_t height, int format, bool fullRange, int matrix = 0);
     void ClearCompare();
+    // B's HDR tags (#169), as SetSourceHdr for A; an RGBA B upload resets them to SDR.
+    void SetCompareHdr(int transfer, bool bt2020, float peakNits);
     bool HasCompare() const { return compareMode_ >= 0; }
 
 #if defined(_WIN32)
@@ -273,6 +292,9 @@ private:
     int compareMode_ = -1;           // B: -1 none, else as sourceMode_
     bool compareFullRange_ = false, compare16_ = false;
     int compareMatrix_ = 0;
+    int compareTransfer_ = 0;        // B's HDR tags (#169), see SetCompareHdr
+    bool compareBt2020_ = false;
+    float comparePeak_ = 0.0f;
     float sourceFullRange_ = 0.0f;
     bool source16_ = false;          // P016: the MP_GRADE shader uses 10-bit limited levels
     int sourceMatrix_ = 0;           // YUV matrix pushed to the MP_GRADE shader (0 = BT.709)

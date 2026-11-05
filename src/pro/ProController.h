@@ -56,6 +56,11 @@ inline int ToneMapFromName(const std::string& s, int fallback) {
            : s == "raw" || s == "3" ? 3
                                     : fallback;
 }
+// An untagged source (#169), GradeParams::forceTransfer: 0 as tagged (SDR), 1 HLG, 2 PQ.
+inline const char* UntaggedName(int m) { return m == 1 ? "hlg" : m == 2 ? "pq" : "sdr"; }
+inline int UntaggedFromName(const std::string& s, int fallback) {
+    return s == "sdr" || s == "0" ? 0 : s == "hlg" || s == "1" ? 1 : s == "pq" || s == "2" ? 2 : fallback;
+}
 inline const char* HdrTransferName(int t) {
     return t == 1 ? "HLG" : t == 2 ? "PQ" : t == 3 ? "Linear" : "SDR";
 }
@@ -142,10 +147,13 @@ public:
     void LoadCdl(const std::string& path);
     // Per-panel display calibration (#133). Load `cube` as this panel's calibration and,
     // with `install`, keep it for this panel (copied to its file in the calibration folder,
-    // so it loads automatically from then on). ClearCalibration drops it (and with
-    // `uninstall`, deletes the panel's file).
+    // so it loads automatically from then on). ClearCalibration drops it and, with
+    // `uninstall`, deletes the panel's kept file - unless what is showing is a run-only
+    // calibration (MEDIAPLAYER_PRO_CAL, or one whose keep failed): then only that is dropped
+    // and the kept file stays (#169). False (with calError_ and a toast) when the delete
+    // failed; the calibration then stays applied, matching the file still on disk.
     void LoadCalibration(const std::string& cube, bool install);
-    void ClearCalibration(bool uninstall);
+    bool ClearCalibration(bool uninstall);
     // #135: judge (and preview) the depth for a target screen; an off Screen = this panel.
     void SetTarget(const target::Screen& t);
     // An OpenColorIO transform baked into the grade's 3D LUT (needs a build with MP_OCIO_ROOT).
@@ -278,6 +286,7 @@ private:
     uint64_t calLoadId_ = 0;       // the load still wanted; another finishing is dropped
     bool calInstall_ = false;      // the pending load is kept for this panel once it applies
     bool calLoaded_ = false;       // a calibration LUT is on the GPU
+    bool calKept_ = false;         // ...and it is the panel's kept file (not run-only, #169)
     bool calBypass_ = false;       // Shift+G / the Inspector / set_display_calibration
     void ResolveCalibration();     // find this panel's key; auto-load its installed file
     void TickCalibration();        // apply a calibration the loader finished

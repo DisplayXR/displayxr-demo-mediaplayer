@@ -36,7 +36,8 @@ layout(binding = 7) uniform sampler3D calLut;  // per-panel display calibration 
 layout(push_constant) uniform PushConstants {
     vec2 uvOffset;
     vec2 uvScale;
-    int mode;        // bits 0-1: 0 = RGBA, 1 = I420, 2 = NV12. MP_GRADE: bits 8+ = VR flags (#155)
+    int mode;        // bits 0-1: 0 = RGBA, 1 = I420, 2 = NV12. MP_GRADE: bits 2 / 3 = A / B is
+                     // scene-linear EXR kept above white into the grade (#169); bits 8+ = VR flags (#155)
     float fullRange; // 1 = full/JPEG range, 0 = limited/MPEG range
     float srgbTarget;// 1 = the colour attachment is an _SRGB view (encodes on store)
 #ifdef MP_GRADE
@@ -185,15 +186,18 @@ vec3 SceneLinearToDisplayReferred(vec3 c) {
 // Media Player Pro grade, in the order an on-set chain applies it:
 // exposure (linear light) -> ASC CDL (on the encoded signal) -> 3D LUT.
 // Every stage is skipped at its identity, so the base player pays three branches.
-vec3 GradeStages(vec3 c, bool withExposure) {
+// over: the input may sit above 1.0 (scene-linear EXR, #169); the CDL keeps it, the LUT's
+// domain decides what it sees, and the caller clips after the grade.
+vec3 GradeStages(vec3 c, bool withExposure, bool over) {
     if (withExposure && pc.exposure != 0.0) {
         vec3 lin = DisplayReferredToSceneLinear(clamp(c, 0.0, 1.0)) * exp2(pc.exposure);
         c = SceneLinearToDisplayReferred(clamp(lin, 0.0, 1.0));
     }
     if (pc.cdlOffset.a > 0.5) {
-        c = pow(clamp(c * pc.cdlSlope.rgb + pc.cdlOffset.rgb, 0.0, 1.0), pc.cdlPower.rgb);
+        const float hi = over ? 1e30 : 1.0;
+        c = pow(clamp(c * pc.cdlSlope.rgb + pc.cdlOffset.rgb, 0.0, hi), pc.cdlPower.rgb);
         float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
-        c = clamp(luma + pc.cdlSlope.a * (c - luma), 0.0, 1.0);
+        c = clamp(luma + pc.cdlSlope.a * (c - luma), 0.0, hi);
     }
     if (pc.lutOn > 0.5) {
         // Map the LUT domain onto texel centres: N samples span [0.5/N, 1 - 0.5/N].
@@ -203,7 +207,7 @@ vec3 GradeStages(vec3 c, bool withExposure) {
     }
     return c;
 }
-vec3 Grade(vec3 c) { return GradeStages(c, true); }
+vec3 Grade(vec3 c) { return GradeStages(c, true, false); }
 
 // HDR sources on the SDR panel (#134). The CPU twin is src/color/ToneMap.h HdrToDisplay();
 // change one, change the other. Signal -> linear relative to reference white (203 nits) ->
@@ -245,10 +249,17 @@ float Bt2390Nits(float nits, float srcPeak, float dstPeak) {
     }
     return PqToNits(e2 * sMax);
 }
-vec3 HdrToDisplay(vec3 c, float exposure, bool lutShaper) {
-    const int tr = HdrTransfer();
+// tr: transfer; peak: the source's peak in nits (PQ / scene-linear); shaper: hand an OCIO
+// look the linear light as PQ code. A takes its tags from yuvMatrix, the compare clip B
+// from its own bits (HdrToDisplayB).
+// over: scene-linear EXR without a roll-off keeps values above white (encoded past 1.0)
+// for the grade (#169); everything else is clipped to the SDR range here.
+vec3 HdrToDisplayTags(vec3 c, int tr, bool rollOff, bool bt2020, float peak, float exposure, bool shaper,
+                      bool over) {
     vec3 l;
-    if (tr == 1) {  // HLG: inverse OETF, then the OOTF for a 1000-nit display (gamma 1.2)
+    if (tr == 1) {  // HLG: inverse OETF, then the OOTF for the nominal 1000-nit display
+                    // (system gamma 1.2). `peak` only sets the roll-off's source peak (#169:
+                    // reference white and the picture stay put; the highlights change)
         vec3 s = vec3(HlgToScene(c.r), HlgToScene(c.g), HlgToScene(c.b));
         float ys = dot(s, vec3(0.2627, 0.6780, 0.0593));
         l = s * (1000.0 * pow(max(ys, 1e-6), 0.2) / kRefWhite);
@@ -257,28 +268,54 @@ vec3 HdrToDisplay(vec3 c, float exposure, bool lutShaper) {
     }
     float m = exp2(exposure);
     l *= m;
-    if (((pc.yuvMatrix >> 7) & 1) != 0)
+    if (bt2020)
         l = vec3(1.660491 * l.r - 0.587641 * l.g - 0.072850 * l.b,
                  -0.124550 * l.r + 1.132900 * l.g - 0.008349 * l.b,
                  -0.018151 * l.r - 0.100579 * l.g + 1.118730 * l.b);
     l = max(l, vec3(0.0));
     // An OCIO look on scene-linear EXR: the LUT gets the linear light as PQ code, unclipped
     // (its bake decodes it first), instead of the SDR picture.
-    if (lutShaper && ((pc.yuvMatrix >> 8) & 1) != 0)
+    if (shaper)
         return vec3(NitsToPq(l.r * kRefWhite), NitsToPq(l.g * kRefWhite), NitsToPq(l.b * kRefWhite));
     float mx = max(l.r, max(l.g, l.b));
-    if (((pc.yuvMatrix >> 6) & 1) != 0 && mx > 0.0) {
-        float src = (tr == 1 ? 1000.0 : float((pc.yuvMatrix >> 16) & 0xFFFF)) * m;
-        l *= (Bt2390Nits(mx * kRefWhite, src, kRefWhite) / kRefWhite) / mx;
+    if (rollOff && mx > 0.0) {
+        l *= (Bt2390Nits(mx * kRefWhite, peak * m, kRefWhite) / kRefWhite) / mx;
     }
+    if (over && !rollOff) return SceneLinearToDisplayReferred(l);
     return SceneLinearToDisplayReferred(clamp(l, 0.0, 1.0));
+}
+bool OverWhite() { return ((pc.mode >> 2) & 1) != 0; }
+bool OverWhiteB() { return ((pc.mode >> 3) & 1) != 0; }
+vec3 HdrToDisplay(vec3 c, float exposure, bool lutShaper, bool over) {
+    return HdrToDisplayTags(c, HdrTransfer(), ((pc.yuvMatrix >> 6) & 1) != 0, ((pc.yuvMatrix >> 7) & 1) != 0,
+                            float((pc.yuvMatrix >> 16) & 0xFFFF), exposure,
+                            lutShaper && ((pc.yuvMatrix >> 8) & 1) != 0, over);
+}
+// The compare clip B's tags (#169, src/rhi/PushPack.h PackCompareHdr): viewFlags bits 6-7
+// transfer, bit 3 BT.2020; yuvMatrix bit 2 shaper, bit 9 roll-off, bits 10-15 log peak.
+int HdrTransferB() { return (pc.viewFlags >> 6) & 3; }
+vec3 HdrToDisplayB(vec3 c, float exposure, bool lutShaper, bool over) {
+    const float peak = 100.0 * pow(100.0, float((pc.yuvMatrix >> 10) & 63) / 63.0);
+    return HdrToDisplayTags(c, HdrTransferB(), ((pc.yuvMatrix >> 9) & 1) != 0, ((pc.viewFlags >> 3) & 1) != 0,
+                            peak, exposure, lutShaper && ((pc.yuvMatrix >> 2) & 1) != 0, over);
 }
 
 // The picture as decoded (the "before" side of the grade wipe): HDR made viewable, no grade.
-vec3 SourceView(vec3 s) { return HdrTransfer() == 0 ? s : HdrToDisplay(s, 0.0, false); }
-// This clip's grade: an HDR source takes exposure in linear light, before the roll-off.
+vec3 SourceView(vec3 s) { return HdrTransfer() == 0 ? s : HdrToDisplay(s, 0.0, false, false); }
+// This clip's grade: an HDR source takes exposure in linear light, before the roll-off. An
+// EXR kept above white is clipped after the grade, not before it (#169).
 vec3 GradeSrc(vec3 s) {
-    return HdrTransfer() == 0 ? Grade(s) : GradeStages(HdrToDisplay(s, pc.exposure, true), false);
+    if (HdrTransfer() == 0) return Grade(s);
+    const bool over = OverWhite();
+    vec3 g = GradeStages(HdrToDisplay(s, pc.exposure, true, over), false, over);
+    return over ? clamp(g, 0.0, 1.0) : g;
+}
+// B's grade: the same look, with B's own HDR decode (an EXR B was shown as raw PQ code).
+vec3 GradeSrcB(vec3 s) {
+    if (HdrTransferB() == 0) return Grade(s);
+    const bool over = OverWhiteB();
+    vec3 g = GradeStages(HdrToDisplayB(s, pc.exposure, true, over), false, over);
+    return over ? clamp(g, 0.0, 1.0) : g;
 }
 
 // False colour: exposure bands on the graded Rec.709 luma (% of full scale), the rest in
@@ -394,7 +431,7 @@ void main() {
     if (wipe == 2 && pastWipe) c = GradeSrc(SampleSource(otherUv));
     // 3: right of the line the compare clip B, at the same point of the same eye, graded
     // the same way (both versions seen through one look). Without B bound, A stays.
-    if (wipe == 3 && pastWipe && ((pc.viewFlags >> 14) & 1) != 0) c = Grade(SampleSourceB(uv));
+    if (wipe == 3 && pastWipe && ((pc.viewFlags >> 14) & 1) != 0) c = GradeSrcB(SampleSourceB(uv));
     graded = c;  // zebras judge the picture as shown on each side of the wipe
 #endif
 
