@@ -15,8 +15,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include "imgui.h"
@@ -25,6 +27,10 @@
 namespace mp::pro {
 
 namespace {
+
+// How long after a snapshot the runtime is given to write its capture file: Tick() stops
+// looking for it then, and a QC export waits for it at most until then (#169).
+constexpr double kCaptureWaitS = 5.0;
 
 // "decklink:<dev>[+<right>][,sdi|hdmi][,dual|sbs|mono][,mode=Hp25]"
 bool ParseDeckLinkSpec(const std::string& args, DeckLinkConfig& c) {
@@ -212,22 +218,16 @@ void Station::Tick() {
     for (size_t i = 0; i < snapshots_.size(); ++i) {
         Snapshot& s = snapshots_[i];
         if (s.imageFound || s.prefix.empty()) continue;
-        if (LiveProducer::NowSeconds() - s.takenSec > 5.0) {
+        if (LiveProducer::NowSeconds() - s.takenSec > kCaptureWaitS) {
             s.imageFound = true;  // give up; the note keeps the guess
             continue;
         }
         if (testFrames_ % 15 != 0) continue;
-        const std::filesystem::path pre(s.prefix);
-        const std::string stem = pre.filename().string() + "_atlas";
-        std::error_code ec;
-        for (const auto& de : std::filesystem::directory_iterator(pre.parent_path(), ec)) {
-            const std::string f = de.path().filename().string();
-            if (f.rfind(stem, 0) == 0 && de.path().extension() == ".png") {
-                s.image = de.path().string();
-                s.imageFound = true;
-                SaveNote(i);
-                break;
-            }
+        const std::string found = qcfiles::FindAtlasCapture(s.prefix);
+        if (!found.empty()) {
+            s.image = found;
+            s.imageFound = true;
+            SaveNote(i);
         }
     }
     if (!pendingDeckLinkSpec_.empty()) {
@@ -468,7 +468,19 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
     }
     // in the order they started (the log has the closed ones first)
     std::stable_sort(s.alerts.begin(), s.alerts.end(), [](const qc::Alert& x, const qc::Alert& y) { return x.clock < y.clock; });
+    // #169: a snapshot still inside its capture window (the runtime writes the file some
+    // frames after the request, and Tick() only looks every 15 frames) may not be on disk
+    // yet, or only partly. The job waits for those, up to the same 5 s Tick() gives them.
+    struct Pending {
+        size_t index;
+        std::string prefix;
+        double deadline;  // LiveProducer::NowSeconds
+    };
+    std::vector<Pending> pending;
     for (const Snapshot& sn : snapshots_) {
+        if (!sn.prefix.empty() && LiveProducer::NowSeconds() - sn.takenSec <= kCaptureWaitS)
+            pending.push_back({s.snapshots.size(), sn.imageFound ? std::string() : sn.prefix,
+                               sn.takenSec + kCaptureWaitS});
         qc::Snapshot q;
         q.image = sn.image;  // its thumbnail is made on the exporter's thread
         q.note = sn.note;
@@ -488,11 +500,12 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
         }
         s.snapshots.push_back(q);
     }
-    const std::filesystem::path dir = std::filesystem::path(folder) / (std::string("qc_") + stamp);
+    // #169: qc_<stamp>, or qc_<stamp>-2, -3... when an export in the same second has it.
+    std::filesystem::path dir;
     std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        error = "cannot write " + dir.string();
+    if (!qcfiles::CreateUniqueDir(std::filesystem::u8path(folder), std::string("qc_") + stamp, dir, ec)) {
+        error = "cannot write " + (std::filesystem::u8path(folder) / (std::string("qc_") + stamp)).u8string() +
+                ": " + ec.message();
         return false;
     }
     dirOut = dir.string();
@@ -502,12 +515,25 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
     // of the session (no reference to the station).
     LOG_INFO("Station: QC report (%zu alerts, %zu snapshots) gathered in %.1f ms, writing -> %s",
              s.alerts.size(), s.snapshots.size(), (LiveProducer::NowSeconds() - t0) * 1000.0, dirOut.c_str());
-    qcExport_.Submit([s = std::move(s), dir]() mutable {
+    qcExport_.Submit([s = std::move(s), dir, pending = std::move(pending)]() mutable {
         QcExporter::Result r;
         r.dir = dir.string();
         r.alerts = s.alerts.size();
         r.snapshots = s.snapshots.size();
         for (qc::Snapshot& q : s.snapshots) q.thumbJpeg = ReportThumbnail(q.image, 1280);
+        // Snapshots the runtime may still be writing: wait for the file (an unfound one's
+        // name is only a guess) and retry the decode (a half-written PNG does not decode).
+        for (const Pending& p : pending) {
+            qc::Snapshot& q = s.snapshots[p.index];
+            while (q.thumbJpeg.empty() && LiveProducer::NowSeconds() < p.deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                if (!p.prefix.empty()) {
+                    const std::string found = qcfiles::FindAtlasCapture(p.prefix);
+                    if (!found.empty()) q.image = found;
+                }
+                q.thumbJpeg = ReportThumbnail(q.image, 1280);
+            }
+        }
         auto write = [&](const std::filesystem::path& path, const std::string& text) {
             std::ofstream f(path.string(), std::ios::binary);
             f << text;

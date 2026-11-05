@@ -10,6 +10,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -121,11 +123,53 @@ void TestEmptyJob() {
 
 }  // namespace
 
+// #169: two exports in the same second get their own folders, readable names kept.
+void TestUniqueDirs() {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "dxr_qc_unique_test";
+    fs::remove_all(root);
+    fs::path a, b, c;
+    std::error_code ec;
+    CHECK(mp::pro::qcfiles::CreateUniqueDir(root, "qc_20261104_120000", a, ec), "first: %s", ec.message().c_str());
+    CHECK(mp::pro::qcfiles::CreateUniqueDir(root, "qc_20261104_120000", b, ec), "second: %s", ec.message().c_str());
+    CHECK(mp::pro::qcfiles::CreateUniqueDir(root, "qc_20261104_120000", c, ec), "third: %s", ec.message().c_str());
+    CHECK(a.filename() == "qc_20261104_120000", "the first keeps the plain name (%s)", a.string().c_str());
+    CHECK(b.filename() == "qc_20261104_120000-2", "the second is -2 (%s)", b.string().c_str());
+    CHECK(c.filename() == "qc_20261104_120000-3", "the third is -3 (%s)", c.string().c_str());
+    CHECK(fs::is_directory(a) && fs::is_directory(b) && fs::is_directory(c), "all three exist");
+    // A file (not a folder) of that name is not reused either.
+    { std::ofstream(root / "qc_x") << "x"; }
+    fs::path d;
+    CHECK(mp::pro::qcfiles::CreateUniqueDir(root, "qc_x", d, ec) && d.filename() == "qc_x-2", "a file's name is skipped");
+    fs::remove_all(root);
+}
+
+// #169: the capture is found by its prefix whatever suffix the runtime chose, and only once
+// it exists.
+void TestFindAtlasCapture() {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "dxr_qc_find_test";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const std::string prefix = (root / "pro_20261104_120000").string();
+    CHECK(mp::pro::qcfiles::FindAtlasCapture(prefix).empty(), "nothing before the runtime writes it");
+    { std::ofstream(root / "pro_20261104_120000_note.json") << "{}"; }
+    { std::ofstream(root / "pro_20261104_120001_atlas_2_2x1.png") << "x"; }  // another snapshot
+    CHECK(mp::pro::qcfiles::FindAtlasCapture(prefix).empty(), "the note and another snapshot's capture do not count");
+    { std::ofstream(root / "pro_20261104_120000_atlas_2_2x1.png") << "x"; }
+    CHECK(fs::path(mp::pro::qcfiles::FindAtlasCapture(prefix)).filename() == "pro_20261104_120000_atlas_2_2x1.png",
+          "found with the runtime's suffix");
+    CHECK(mp::pro::qcfiles::FindAtlasCapture("").empty(), "no prefix, nothing");
+    fs::remove_all(root);
+}
+
 int main() {
     TestOffThreadAndBusy();
     TestEveryJobInOrder();
     TestDestructorFinishesQueue();
     TestEmptyJob();
+    TestUniqueDirs();
+    TestFindAtlasCapture();
     if (g_failures) {
         std::fprintf(stderr, "qc_exporter_test: %d failure(s)\n", g_failures);
         return 1;
