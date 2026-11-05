@@ -55,7 +55,9 @@ void AnalysisSize(double aspect, int analysisW, int& w, int& h) {
     h = std::max(10, (int)std::lround(w / std::max(0.1, aspect))) & ~1;
 }
 
-void Analyze(const std::vector<uint8_t>& rgba, int w, int h, const Grade& g, Result& out) {
+// `rgba` is 8- or 16-bit RGBA; `scale` maps a sample to 0..1.
+template <class T>
+void Analyze(const std::vector<T>& rgba, int w, int h, const Grade& g, Result& out, float scale) {
     out.w = w;
     out.h = h;
     out.graded.assign((size_t)w * h * 3, 0);
@@ -73,8 +75,8 @@ void Analyze(const std::vector<uint8_t>& rgba, int w, int h, const Grade& g, Res
     auto lvl = [](float v) { return std::clamp((int)std::lround(v * (kLevels - 1)), 0, kLevels - 1); };
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-            const uint8_t* p = &rgba[((size_t)y * w + x) * 4];
-            float c[3] = {p[0] / 255.0f, p[1] / 255.0f, p[2] / 255.0f};
+            const T* p = &rgba[((size_t)y * w + x) * 4];
+            float c[3] = {p[0] * scale, p[1] * scale, p[2] * scale};
             ApplyGrade(g, c);
             const float Y = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
             uint8_t* o = &out.graded[((size_t)y * w + x) * 3];
@@ -122,12 +124,19 @@ void ApplyGrade(const Grade& g, float c[3]) {
         const float m = std::exp2(g.exposure);
         for (int k = 0; k < 3; ++k) c[k] = LinearToSrgb(Clamp01(SrgbToLinear(Clamp01(c[k])) * m));
     }
+    // Scene-linear EXR kept above white (#169, the shader's GradeStages `over`): the CDL keeps
+    // values above 1.0, the LUT's domain decides what it sees, and the clip comes last.
+    const bool over = color::IsHdr(g.hdr) && g.hdr.overWhite && !g.hdr.rollOff;
+    const float hi = over ? 1e30f : 1.0f;
     if (g.cdlOn) {
-        for (int k = 0; k < 3; ++k) c[k] = std::pow(Clamp01(c[k] * g.slope[k] + g.offset[k]), g.power[k]);
+        for (int k = 0; k < 3; ++k)
+            c[k] = std::pow(std::clamp(c[k] * g.slope[k] + g.offset[k], 0.0f, hi), g.power[k]);
         const float luma = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
-        for (int k = 0; k < 3; ++k) c[k] = Clamp01(luma + g.saturation * (c[k] - luma));
+        for (int k = 0; k < 3; ++k) c[k] = std::clamp(luma + g.saturation * (c[k] - luma), 0.0f, hi);
     }
     if (g.lut && g.lut->Valid()) SampleLut(*g.lut, c);
+    if (over)
+        for (int k = 0; k < 3; ++k) c[k] = Clamp01(c[k]);
 }
 
 bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, std::vector<uint8_t>& rgba,
@@ -170,7 +179,17 @@ void Measure(const std::vector<uint8_t>& rgba, int w, int h, const Grade& g, Res
         out.ok = false;
         return;
     }
-    Analyze(rgba, w, h, g, out);
+    Analyze(rgba, w, h, g, out, 1.0f / 255.0f);
+    out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void Measure16(const std::vector<uint16_t>& rgba, int w, int h, const Grade& g, Result& out) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (w < 1 || h < 1 || rgba.size() < (size_t)w * h * 4) {
+        out.ok = false;
+        return;
+    }
+    Analyze(rgba, w, h, g, out, 1.0f / 65535.0f);
     out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
@@ -234,6 +253,9 @@ bool Gather(const FrameRing::Frame& f, StereoLayout layout, int analysisW, Frame
 bool DownsampleMini(const FrameRing::Frame& mini, int w, int h, std::vector<uint8_t>& rgba) {
     return MakeThumbnail(mini, StereoLayout::Mono, w, h, rgba);  // mini has the eye's display aspect
 }
+bool DownsampleMini16(const FrameRing::Frame& mini, int w, int h, std::vector<uint16_t>& rgba) {
+    return MakeThumbnail16(mini, StereoLayout::Mono, w, h, rgba);
+}
 
 // --- ScopeWorker ---------------------------------------------------------------
 
@@ -285,16 +307,27 @@ void ScopeWorker::Run() {
             image_ = std::move(job.image);
             imageW_ = job.w;
             imageH_ = job.h;
+            image16_.clear();
         } else if (job.hasFrame) {
-            if (DownsampleMini(job.mini, job.w, job.h, image_)) {
+            // A frame is analysed at 16 bits, so a 10-bit / HDR source is not quantised to
+            // 8 bits before the tone map (#169); a still stays the 8-bit picture it is.
+            if (DownsampleMini16(job.mini, job.w, job.h, image16_)) {
                 imageW_ = job.w;
                 imageH_ = job.h;
+                image_.clear();
             }
         }
         Result r;
         std::vector<uint8_t> wave, vec;
         bool ok = false;
-        if (!image_.empty() && imageW_ > 0) {
+        if (!image16_.empty() && imageW_ > 0) {
+            Measure16(image16_, imageW_, imageH_, job.grade, r);
+            if (r.ok && job.pictures) {
+                RenderWaveform(r, job.parade, job.pictureW, wave);
+                RenderVectorscope(r, vec);
+            }
+            ok = r.ok;
+        } else if (!image_.empty() && imageW_ > 0) {
             Measure(image_, imageW_, imageH_, job.grade, r);
             if (r.ok && job.pictures) {
                 RenderWaveform(r, job.parade, job.pictureW, wave);

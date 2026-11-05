@@ -75,9 +75,13 @@ struct GradeParams {
     // HDR sources (#134): 0 auto (roll off HLG / PQ highlights, clip scene-linear EXR at
     // white), 1 always roll off, 2 never (clip), 3 raw (the signal goes into the grade as
     // if it were SDR, for a show LUT that expects PQ / HLG). peakNits 0 = the stream's own.
+    // For HLG, peakNits is the display peak the OOTF renders for (default 1000).
     int toneMap = 0;
     float peakNits = 0.0f;
     bool lutPqShaper = false;    // the LUT is an OCIO bake expecting PQ-coded linear (EXR)
+    // An untagged YUV source (#169): 0 as tagged (SDR), 1 take it as BT.2100 HLG, 2 as PQ
+    // (BT.2020 matrix and primaries). A tagged HDR source and an RGBA one are unaffected.
+    int forceTransfer = 0;
 };
 
 
@@ -160,11 +164,21 @@ public:
         bool bt2020 = false;
         float peakNits = 0.0f;
         bool pqShaper = false;  // scene-linear into an OCIO look, unclipped (see GradeParams)
+        // Scene-linear EXR under tone map auto (#169): values above white go into the CDL
+        // and LUT unclipped (clipped after the grade), so highlights survive a grade.
+        bool overWhite = false;
+        bool forced = false;    // the transfer came from GradeParams::forceTransfer
     };
     HdrState SourceHdr() const;
     // The same decision for any tags under the current grade (the compare clip B, the
     // "Convert to 3D" input frame): transfer 0 SDR, 1 HLG, 2 PQ, 3 scene-linear as PQ.
+    // An untagged (SDR) transfer becomes GradeParams::forceTransfer when one is set.
     HdrState HdrFor(int transfer, bool bt2020, float peakNits) const;
+    // The Y'CbCr matrix to decode with: BT.2020 (2) when HdrFor forces an untagged source.
+    int EffectiveMatrix(int transfer, int matrix) const { return ForcesHdr(transfer) ? 2 : matrix; }
+    bool ForcesHdr(int transfer) const {
+        return transfer == 0 && (grade_.forceTransfer == 1 || grade_.forceTransfer == 2);
+    }
 
     // Media Player Pro's clip-vs-clip wipe: a second source (B) at bindings 4..6, sampled by
     // the MP_GRADE shader right of the wipe line (GradeParams::wipeMode 3). Same formats and

@@ -92,6 +92,8 @@ void ProController::ApplyTestEnv() {
     // HDR tone map (#134): auto | on | off, and the source peak in nits (0 = the stream's).
     if (const char* e = std::getenv("MEDIAPLAYER_PRO_TONEMAP")) grade_.toneMap = ToneMapFromName(e, grade_.toneMap);
     if (const char* e = std::getenv("MEDIAPLAYER_PRO_PEAK_NITS")) grade_.peakNits = std::clamp((float)std::atof(e), 0.0f, 10000.0f);
+    // #169: an untagged source taken as HLG or PQ (sdr | hlg | pq).
+    if (const char* e = std::getenv("MEDIAPLAYER_PRO_UNTAGGED")) grade_.forceTransfer = UntaggedFromName(e, grade_.forceTransfer);
     if (const char* b = std::getenv("MEDIAPLAYER_PRO_BYPASS")) bypass_ = (*b && *b != '0');
     // #133: MEDIAPLAYER_PRO_CAL_BYPASS=1 starts with the display calibration bypassed;
     // MEDIAPLAYER_PRO_CAL=<.cube> loads one for this run only (not installed).
@@ -858,6 +860,7 @@ void ProController::Tick(const Status& st) {
         g = GradeParams{};
         g.toneMap = grade_.toneMap;  // the HDR mapping is the display transform, not the look
         g.peakNits = grade_.peakNits;
+        g.forceTransfer = grade_.forceTransfer;  // what the source IS, not the look
     }
     // The display calibration belongs to the panel, not the show: grade bypass keeps it.
     g.calOn = calLoaded_ && !calBypass_;

@@ -25,13 +25,15 @@ void ProController::RegisterTools(const RegisterFn& reg) {
         "exposure in stops (-4..4, linear light) and bypass. HDR sources (HLG, PQ, scene-linear "
         "EXR): tone_map auto (roll off HLG / PQ, clip EXR at white) | on | off (clip) | raw (the "
         "signal unmapped, for a show LUT that expects PQ / HLG), peak_nits = the source's "
-        "brightest (0 = from the stream, else 1000). Arguments left out keep their "
+        "brightest (0 = from the stream, else 1000; for HLG the display peak it is rendered for), "
+        "untagged = how a source with no HDR tag is taken: sdr (default) | hlg | pq. Arguments left out keep their "
         "current value. Returns the grade. A LUT loads in the background: the reply carries "
         "lut_loading, and get_grade shows the LUT (or lut_error) once it applies.",
         "{\"type\":\"object\",\"properties\":{\"lut\":{\"type\":\"string\"},\"cdl\":{\"type\":\"string\"},"
         "\"exposure\":{\"type\":\"number\"},\"bypass\":{\"type\":\"boolean\"},"
         "\"tone_map\":{\"type\":\"string\",\"enum\":[\"auto\",\"on\",\"off\",\"raw\"]},"
-        "\"peak_nits\":{\"type\":\"number\"}}}");
+        "\"peak_nits\":{\"type\":\"number\"},"
+        "\"untagged\":{\"type\":\"string\",\"enum\":[\"sdr\",\"hlg\",\"pq\"]}}}");
     reg("set_target_screen",
         "Judge the depth for the screen the picture is made for (#135): target cinema, tv, monitor, "
         "tablet or off, or a custom width_m + distance_m. With a target, get_rig_status reports near / "
@@ -164,6 +166,7 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             const VulkanRenderer::HdrState h = renderer_ ? renderer_->SourceHdr() : VulkanRenderer::HdrState{};
             return json{{"transfer", HdrTransferName(h.transfer)}, {"raw", h.raw}, {"roll_off", h.rollOff},
                         {"bt2020", h.bt2020}, {"peak_nits", h.peakNits}, {"ocio_unclipped", h.pqShaper},
+                        {"forced", h.forced}, {"over_white", h.overWhite},
                         {"summary", HdrSummary(h)}};
         };
         auto gradeJson = [&]() {
@@ -176,6 +179,7 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
                         {"saturation", grade_.saturation}, {"exposure", grade_.exposure}, {"bypass", bypass_},
                         {"calibration", calibrationJson()},
                         {"tone_map", ToneMapName(grade_.toneMap)}, {"peak_nits", grade_.peakNits},
+                        {"untagged", UntaggedName(grade_.forceTransfer)},
                         {"hdr", HdrJson()}};
         };
         if (tool == "set_grade") {
@@ -198,6 +202,11 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             }
             float nits;
             if (Num(a, "peak_nits", nits)) grade_.peakNits = std::clamp(nits, 0.0f, 10000.0f);
+            if (Str(a, "untagged", p)) {
+                const int m = UntaggedFromName(p, -1);
+                if (m < 0) return err("untagged must be sdr, hlg or pq");
+                grade_.forceTransfer = m;
+            }
             result = gradeJson().dump();
             return true;
         }

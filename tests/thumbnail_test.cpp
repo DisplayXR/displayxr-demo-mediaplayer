@@ -62,6 +62,33 @@ bool Near(const uint8_t* p, int r, int g, int b, int tol = 6) {
 
 const uint8_t* Px(const std::vector<uint8_t>& t, int w, int x, int y) { return &t[((size_t)y * w + x) * 4]; }
 
+// #169: the frame's own matrix. BT.2020 limited-range red is (74, 97, 240); decoded as
+// BT.709 it picks up ~14 of green.
+void MatrixFollowsTheFrame() {
+    constexpr Yuv kRed2020{74, 97, 240};
+    FrameRing::Frame f = Nv12(64, 36, kRed2020, kRed2020);
+    std::vector<uint8_t> t;
+    f.matrix = ColorMatrix::BT2020;
+    CHECK(pro::MakeThumbnail(f, StereoLayout::Mono, 32, 18, t) && Near(Px(t, 32, 16, 9), 255, 0, 0, 3),
+          "BT.2020 red decodes as red");
+    f.matrix = ColorMatrix::BT709;
+    CHECK(pro::MakeThumbnail(f, StereoLayout::Mono, 32, 18, t) && Px(t, 32, 16, 9)[1] > 8,
+          "the same code as BT.709 is not pure red (the matrix is used)");
+}
+
+// #169: the 16-bit variant keeps a P016 frame's low byte (the scopes' HDR input).
+void SixteenBit() {
+    FrameRing::Frame f = Nv12(64, 36, kWhite, kWhite, true);
+    for (size_t i = 0; i + 1 < f.plane[0].size(); i += 2) f.plane[0][i] = 128;  // + half an 8-bit code
+    std::vector<uint16_t> t16;
+    std::vector<uint8_t> t8;
+    CHECK(pro::MakeThumbnail16(f, StereoLayout::Mono, 32, 18, t16) && pro::MakeThumbnail(f, StereoLayout::Mono, 32, 18, t8),
+          "16-bit and 8-bit thumbnails of P016");
+    const size_t i = ((size_t)9 * 32 + 16) * 4;
+    CHECK(t16[i + 3] == 65535, "16-bit alpha opaque");
+    CHECK(std::abs((int)t16[i] - (int)t8[i] * 257) <= 257, "16-bit agrees with 8-bit within one 8-bit code");
+}
+
 }  // namespace
 
 int main() {
@@ -116,6 +143,8 @@ int main() {
     shortBuf.plane[1].resize(10);
     CHECK(!pro::MakeThumbnail(shortBuf, StereoLayout::SbsFull, 32, 18, t), "a short buffer is refused, not read past");
 
+    MatrixFollowsTheFrame();
+    SixteenBit();
     if (g_failures) {
         std::fprintf(stderr, "thumbnail_test: %d failure(s)\n", g_failures);
         return 1;

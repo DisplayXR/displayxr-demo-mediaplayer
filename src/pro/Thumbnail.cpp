@@ -11,10 +11,24 @@ namespace {
 constexpr int kTaps = 3;  // samples per axis per output pixel (box filter)
 
 uint8_t Clamp8(float v) { return (uint8_t)std::clamp((int)std::lround(v), 0, 255); }
+uint16_t Clamp16(float v) { return (uint16_t)std::clamp((int)std::lround(v * 257.0f), 0, 65535); }
 
-}  // namespace
+// R'G'B' from range-expanded Y'CbCr (0..255 scale) with the frame's matrix, the same
+// coefficients as shaders/sbs.frag YuvToRgb (#169: this was BT.709 for every frame).
+struct Coeffs {
+    float rv, gu, gv, bu;
+};
+Coeffs CoeffsFor(ColorMatrix m) {
+    if (m == ColorMatrix::BT601) return {1.402f, 0.344136f, 0.714136f, 1.772f};
+    if (m == ColorMatrix::BT2020) return {1.4746f, 0.164553f, 0.571353f, 1.8814f};
+    return {1.5748f, 0.1873f, 0.4681f, 1.8556f};
+}
 
-bool MakeThumbnail(const FrameRing::Frame& f, StereoLayout layout, int outW, int outH, std::vector<uint8_t>& rgba) {
+// The box filter, writing each output pixel through `put(index, r, g, b)` (0..255 scale,
+// unrounded), so the 8-bit thumbnail and the 16-bit scope image share one path.
+template <class T, class Put>
+bool ThumbnailCore(const FrameRing::Frame& f, StereoLayout layout, int outW, int outH, std::vector<T>& rgba, T opaque,
+                   Put put) {
     if (f.gpu || f.width < 2 || f.height < 2 || outW < 1 || outH < 1 || f.plane[0].empty()) return false;
     const int w = f.width, h = f.height;
     const bool sbs = layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf;
@@ -53,8 +67,9 @@ bool MakeThumbnail(const FrameRing::Frame& f, StereoLayout layout, int outW, int
         }
     };
 
+    const Coeffs k = CoeffsFor(f.matrix);
     rgba.assign((size_t)outW * outH * 4, 0);
-    for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
+    for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = opaque;
     const double stepX = (double)eyeW / fitW, stepY = (double)h / fitH;
     for (int oy = 0; oy < fitH; ++oy) {
         for (int ox = 0; ox < fitW; ++ox) {
@@ -80,19 +95,34 @@ bool MakeThumbnail(const FrameRing::Frame& f, StereoLayout layout, int outW, int
                         cb = (cb - 128.0f) * (255.0f / 224.0f);
                         cr = (cr - 128.0f) * (255.0f / 224.0f);
                     }
-                    r += yv + 1.5748f * cr;
-                    g += yv - 0.1873f * cb - 0.4681f * cr;
-                    b += yv + 1.8556f * cb;
+                    r += yv + k.rv * cr;
+                    g += yv - k.gu * cb - k.gv * cr;
+                    b += yv + k.bu * cb;
                 }
             }
             constexpr float inv = 1.0f / (kTaps * kTaps);
-            uint8_t* o = &rgba[((size_t)(y0 + oy) * outW + (x0 + ox)) * 4];
-            o[0] = Clamp8(r * inv);
-            o[1] = Clamp8(g * inv);
-            o[2] = Clamp8(b * inv);
+            put(((size_t)(y0 + oy) * outW + (x0 + ox)) * 4, r * inv, g * inv, b * inv);
         }
     }
     return true;
+}
+
+}  // namespace
+
+bool MakeThumbnail(const FrameRing::Frame& f, StereoLayout layout, int outW, int outH, std::vector<uint8_t>& rgba) {
+    return ThumbnailCore(f, layout, outW, outH, rgba, (uint8_t)255, [&](size_t i, float r, float g, float b) {
+        rgba[i] = Clamp8(r);
+        rgba[i + 1] = Clamp8(g);
+        rgba[i + 2] = Clamp8(b);
+    });
+}
+
+bool MakeThumbnail16(const FrameRing::Frame& f, StereoLayout layout, int outW, int outH, std::vector<uint16_t>& rgba) {
+    return ThumbnailCore(f, layout, outW, outH, rgba, (uint16_t)65535, [&](size_t i, float r, float g, float b) {
+        rgba[i] = Clamp16(r);
+        rgba[i + 1] = Clamp16(g);
+        rgba[i + 2] = Clamp16(b);
+    });
 }
 
 }  // namespace mp::pro

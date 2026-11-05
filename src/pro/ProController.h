@@ -56,6 +56,11 @@ inline int ToneMapFromName(const std::string& s, int fallback) {
            : s == "raw" || s == "3" ? 3
                                     : fallback;
 }
+// An untagged source (#169), GradeParams::forceTransfer: 0 as tagged (SDR), 1 HLG, 2 PQ.
+inline const char* UntaggedName(int m) { return m == 1 ? "hlg" : m == 2 ? "pq" : "sdr"; }
+inline int UntaggedFromName(const std::string& s, int fallback) {
+    return s == "sdr" || s == "0" ? 0 : s == "hlg" || s == "1" ? 1 : s == "pq" || s == "2" ? 2 : fallback;
+}
 inline const char* HdrTransferName(int t) {
     return t == 1 ? "HLG" : t == 2 ? "PQ" : t == 3 ? "Linear" : "SDR";
 }

@@ -246,8 +246,62 @@ static void TestPackCompare() {
     CHECK((a & b.yuvMatrix) == 0);
 }
 
+// #169: HLG renders for a chosen display peak (system gamma 1.2 + 0.42 log10(Lw/1000)).
+// 0 and 1000 are the old fixed behaviour; another peak changes the picture.
+static void TestHlgPeak() {
+    CHECK(Near(HlgSystemGamma(2000.0f), 1.2f + 0.42f * std::log10(2.0f), 1e-6f));
+    HdrParams p;
+    p.transfer = Transfer::HLG;
+    p.rollOff = true;
+    auto show = [&](float peak, float sig) {
+        HdrParams q = p;
+        q.peakNits = peak;
+        float c[3] = {sig, sig * 0.8f, sig * 0.6f};
+        HdrToDisplay(q, c);
+        return c[0];
+    };
+    CHECK(Near(show(0.0f, 0.75f), show(1000.0f, 0.75f), 1e-6f));   // 0 = the nominal 1000
+    CHECK(!Near(show(2000.0f, 0.75f), show(1000.0f, 0.75f), 1e-3f));
+    CHECK(Near(HlgPeak(p), kHlgDisplayNits, 0.0f));
+    p.peakNits = 50.0f;
+    CHECK(Near(HlgPeak(p), kHlgMinNits, 0.0f));
+    // The table (Convert to 3D) follows the same peak.
+    p.peakNits = 2000.0f;
+    const HdrDisplayTable t(p);
+    float a[3] = {0.75f, 0.6f, 0.45f}, b[3] = {0.75f, 0.6f, 0.45f};
+    t.Apply(a);
+    HdrToDisplay(p, b);
+    CHECK(Near(a[0], b[0], 2.0f / 255.0f) && Near(a[2], b[2], 2.0f / 255.0f));
+}
+
+// #169: scene-linear EXR without the roll-off keeps values above white (encoded past 1.0)
+// when overWhite is set; without it, it clips at white as before.
+static void TestOverWhite() {
+    HdrParams p;
+    p.transfer = Transfer::LinearPq;
+    p.rollOff = false;
+    const float two = NitsToPq(2.0f * kRefWhiteNits);
+    float a[3] = {two, two, two};
+    HdrToDisplay(p, a);
+    CHECK(Near(a[0], 1.0f, 1e-4f));
+    p.overWhite = true;
+    float b[3] = {two, two, two};
+    HdrToDisplay(p, b);
+    CHECK(Near(b[0], SrgbEncodeOver(2.0f), 3e-3f) && b[0] > 1.3f);
+    const float half = NitsToPq(0.5f * kRefWhiteNits);
+    float c[3] = {half, half, half};
+    HdrToDisplay(p, c);
+    CHECK(Near(c[0], SrgbEncode(0.5f), 2e-3f));  // below white: unchanged
+    p.rollOff = true;  // the roll-off wins: no over-white output
+    float d[3] = {two, two, two};
+    HdrToDisplay(p, d);
+    CHECK(d[0] <= 1.0f);
+}
+
 int main() {
     TestPq();
+    TestHlgPeak();
+    TestOverWhite();
     TestHlg();
     TestBt2390();
     TestHdrToDisplay();

@@ -264,8 +264,33 @@ void GatherAndWorker() {
 
 }  // namespace
 
+// #169: with tone map auto an EXR's highlights go into the CDL unclipped. A slope of 0.5
+// used to give 0.5 for linear 1, 2 and 4 alike; now they stay apart (and clip only after).
+void OverWhiteGrade() {
+    scopes::Grade g;
+    g.hdr.transfer = color::Transfer::LinearPq;
+    g.hdr.rollOff = false;
+    g.cdlOn = true;
+    g.slope[0] = g.slope[1] = g.slope[2] = 0.5f;
+    auto grade = [&](float lin) {
+        const float s = color::NitsToPq(lin * color::kRefWhiteNits);
+        float c[3] = {s, s, s};
+        scopes::ApplyGrade(g, c);
+        return c[0];
+    };
+    CHECK(Near(grade(1.0f), 0.5f) && Near(grade(2.0f), 0.5f) && Near(grade(4.0f), 0.5f),
+          "clipped before the CDL without overWhite (the old look)");
+    g.hdr.overWhite = true;
+    const float a = grade(1.0f), b = grade(2.0f), c = grade(4.0f);
+    CHECK(Near(a, 0.5f, 2e-3f) && b > a + 0.1f && c > b + 0.1f && c <= 1.0f,
+          "overWhite: highlights survive the CDL, clipped after");
+    g.slope[0] = g.slope[1] = g.slope[2] = 1.0f;
+    CHECK(Near(grade(4.0f), 1.0f), "overWhite: an identity grade still clips at white");
+}
+
 int main() {
     GradeMaths();
+    OverWhiteGrade();
     HdrMaths();
     ScopesReadTheLeftEye();
     VectorscopeHue();
