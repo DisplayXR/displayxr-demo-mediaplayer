@@ -39,6 +39,7 @@ public:
         std::vector<uint16_t> rgba16f;  // lut packed for the GPU (ok only)
         std::string err;
         double ms = 0.0;                // worker time: parse / bake + pack
+        std::string fingerprint;        // qc::LutFingerprint of lut.rgb (ok only)
     };
 
     LookLoader();

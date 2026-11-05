@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pro/LookLoader.h"
 
+#include "pro/QcReport.h"
+
 #include <chrono>
 #include <exception>
 #include <utility>
@@ -74,7 +76,10 @@ void LookLoader::Run() {
                 r.ok = false;
                 r.err = "the look produced no LUT";
             }
-            if (r.ok) r.rgba16f = color::PackRgba16f(r.lut.rgb.data(), r.lut.rgb.size() / 3);
+            if (r.ok) {
+                r.rgba16f = color::PackRgba16f(r.lut.rgb.data(), r.lut.rgb.size() / 3);
+                r.fingerprint = qc::LutFingerprint(r.lut.rgb.data(), r.lut.rgb.size());
+            }
         } catch (const std::exception& e) {
             r.ok = false;
             r.lut = color::CubeLut{};
