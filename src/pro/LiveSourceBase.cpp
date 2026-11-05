@@ -156,9 +156,11 @@ void LiveSourceBase::CheckStall(double stallSec) {
         std::lock_guard<std::mutex> lk(statsMutex_);
         last = stats_.lastPublishSec > 0.0 ? stats_.lastPublishSec : openedAt_;
     }
-    const LiveState st = state_.load();
+    LiveState st = state_.load();
+    // compare-exchange: a source may go Failed on another thread (a DeckLink restart that
+    // failed, #169) between the load and the store, and Failed must not become Stalled.
     if ((st == LiveState::Streaming || st == LiveState::Opening) && last > 0.0 && NowSeconds() - last > stallSec)
-        state_ = LiveState::Stalled;
+        state_.compare_exchange_strong(st, LiveState::Stalled);
 }
 
 }  // namespace mp

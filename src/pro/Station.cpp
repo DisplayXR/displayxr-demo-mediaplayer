@@ -602,7 +602,10 @@ std::string Station::RigStatusJson() const {
         json dl = {{"delivered_fps", ls.deliveredFps}, {"signal_fps", ls.fps}, {"published", ls.published},
                    {"late_frames", ls.lateFrames}, {"dropped", ls.dropped},
                    {"width", ls.w}, {"height", ls.h}, {"bit_depth", DeckLinkSource::LastBitDepth()},
-                   {"eye_width", decklink_.IsPair() ? ls.w / 2 : ls.w}};  // a pair is shown side by side
+                   {"eye_width", decklink_.IsPair() ? ls.w / 2 : ls.w},  // a pair is shown side by side
+                   // failed = capture stopped (e.g. a format the card would not restart in, #169)
+                   {"state", LiveStateName(decklink_.GetState())}, {"error", decklink_.LastError()},
+                   {"format_warning", decklink_.FormatWarning()}};
         if (decklink_.IsPair()) {
             const DeckLinkSource::PairStats ps = decklink_.GetPairStats();
             dl["pairing"] = ps.timecode ? "timecode" : ps.hwClockPairing ? "hardware_clock" : "newest";
@@ -903,6 +906,9 @@ void Station::BuildSignalLines(bool live) {
         const int dark = decklink_.GetStats().noSignalEyes;
         if (dark & 1) ImGui::TextColored(kBad, decklink_.IsPair() ? "Left eye: NO SIGNAL" : "NO SIGNAL");
         if (dark & 2) ImGui::TextColored(kBad, "Right eye: NO SIGNAL");
+        if (decklink_.GetState() == LiveState::Failed) ImGui::TextColored(kBad, "%s", decklink_.LastError().c_str());
+        const std::string fw = decklink_.FormatWarning();  // depth lost to the format the card took (#169)
+        if (!fw.empty()) ImGui::TextColored(kWarn, "%s", fw.c_str());
         const uint64_t late = decklink_.GetStats().lateFrames;
         if (late) ImGui::TextColored(kWarn, "Capture late: %llu frames skipped (CPU too slow to convert)",
                                      (unsigned long long)late);
