@@ -4,6 +4,7 @@
 // NV12, placing an eye at its column of a side-by-side frame, repeating an eye, and
 // the --test-signal spec grammar. Pure: no SDK, no card, no GPU.
 
+#include "pro/DeckLinkFormat.h"
 #include "pro/LivePixels.h"
 #include "pro/TestSignalSource.h"
 
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using mp::livepix::Nv12;
@@ -274,6 +276,77 @@ void TestSignalSpec() {
     CHECK(!h.ParseSpec("image="), "photo rig: empty path refused");
 }
 
+// r210: one big-endian word per pixel, R G B at 10 bits (SMPTE levels).
+void PutR210(uint8_t* p, int r, int g, int b) {
+    const uint32_t v = ((uint32_t)r << 20) | ((uint32_t)g << 10) | (uint32_t)b;
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+void R210Levels() {
+    // 2x2 per eye; row 0 white | black, row 1 grey 502 (mid) | grey 502.
+    std::vector<uint8_t> src(2 * 8);
+    PutR210(&src[0], 940, 940, 940);
+    PutR210(&src[4], 64, 64, 64);
+    PutR210(&src[8], 502, 502, 502);
+    PutR210(&src[12], 503, 503, 503);  // an odd code: 10 bits survive, not 8
+    mp::livepix::P016 d;
+    d.Resize(4, 2);
+    d.y.assign(d.y.size(), 0);
+    d.uv.assign(d.uv.size(), 0);
+    mp::livepix::R210ToP016(src.data(), 8, 2, 2, d, 2, mp::ColorMatrix::BT709);  // the right eye
+    CHECK(d.y[2] == 235 * 256, "r210 white -> Y 235 << 8");
+    CHECK(d.y[3] == 16 * 256, "r210 black -> Y 16 << 8");
+    CHECK(d.y[6] == 502 * 64 && d.y[7] == 503 * 64, "r210 grey keeps all 10 bits");
+    CHECK(d.uv[2] == 32768 && d.uv[3] == 32768, "r210 grey: neutral chroma");
+    CHECK(d.y[0] == 0 && d.uv[0] == 0, "r210: left eye untouched");
+    CHECK(d.matrix == mp::ColorMatrix::BT709, "r210: tagged with the matrix it encoded with");
+}
+
+void R210RedHasCr() {
+    std::vector<uint8_t> src(2 * 8);
+    for (int i = 0; i < 4; ++i) PutR210(&src[4 * i], 940, 64, 64);
+    mp::livepix::P016 d;
+    d.Resize(2, 2);
+    mp::livepix::R210ToP016(src.data(), 8, 2, 2, d, 0, mp::ColorMatrix::BT709);
+    // BT.709: Y' = 64 + 0.2126 * 876 = 250.24 codes -> x64; Cr at the top of its range (240 << 8).
+    CHECK(std::abs((int)d.y[0] - 16015) <= 1, "r210 red luma (BT.709)");
+    CHECK(std::abs((int)d.uv[1] - 240 * 256) <= 1, "r210 red: Cr at 240 << 8");
+    CHECK(d.uv[0] < 32768, "r210 red: Cb below neutral");
+    mp::livepix::R210ToP016(src.data(), 8, 2, 2, d, 0, mp::ColorMatrix::BT601);
+    CHECK(std::abs((int)d.y[0] - (int)std::lround(64.0 * (64 + 0.299 * 876))) <= 1, "r210 red luma (BT.601)");
+    CHECK(d.matrix == mp::ColorMatrix::BT601, "r210: BT.601 tag");
+}
+
+void DeckLinkFormatChoice() {
+    using mp::dlfmt::Pix;
+    Pix c[4];
+    int n = mp::dlfmt::Candidates(/*rgb=*/true, 10, true, c);
+    CHECK(n == 4 && c[0] == Pix::Rgb10 && c[1] == Pix::Bgra8 && c[2] == Pix::Yuv10 && c[3] == Pix::Yuv8,
+          "10-bit RGB: r210, then BGRA, then YUV");
+    n = mp::dlfmt::Candidates(true, 12, true, c);
+    CHECK(n == 4 && c[0] == Pix::Rgb10, "12-bit RGB: r210 first (no 12-bit converter)");
+    n = mp::dlfmt::Candidates(true, 0, true, c);
+    CHECK(n == 4 && c[0] == Pix::Rgb10, "RGB of unknown depth: r210 first");
+    n = mp::dlfmt::Candidates(true, 8, false, c);
+    CHECK(n == 2 && c[0] == Pix::Bgra8 && c[1] == Pix::Yuv8, "8-bit RGB, 10-bit YUV refused: BGRA, 8-bit YUV");
+    n = mp::dlfmt::Candidates(false, 10, true, c);
+    CHECK(n == 2 && c[0] == Pix::Yuv10 && c[1] == Pix::Yuv8, "YUV: v210, then 8-bit");
+    n = mp::dlfmt::Candidates(false, 10, false, c);
+    CHECK(n == 1 && c[0] == Pix::Yuv8, "YUV after a refused v210: 8-bit only");
+
+    CHECK(mp::dlfmt::DepthLossText(true, 10, Pix::Rgb10).empty(), "10-bit RGB as r210: nothing lost");
+    CHECK(mp::dlfmt::DepthLossText(true, 0, Pix::Bgra8).empty(), "unknown depth: no claim");
+    CHECK(mp::dlfmt::DepthLossText(true, 8, Pix::Bgra8).empty(), "8-bit RGB as BGRA: nothing lost");
+    const std::string t = mp::dlfmt::DepthLossText(true, 12, Pix::Rgb10);
+    CHECK(t.find("12-bit RGB") != std::string::npos && t.find("2 bits") != std::string::npos,
+          "12-bit RGB as r210: 2 bits lost");
+    CHECK(!mp::dlfmt::DepthLossText(true, 10, Pix::Bgra8).empty(), "10-bit RGB as BGRA: warned");
+    CHECK(!mp::dlfmt::DepthLossText(false, 10, Pix::Yuv8).empty(), "10-bit YUV as 8-bit: warned");
+}
+
 }  // namespace
 
 int main() {
@@ -289,6 +362,9 @@ int main() {
     V210MatchesReference();
     UyvyPr108Vector();
     BgraMatrixTagRoundTrips();
+    R210Levels();
+    R210RedHasCr();
+    DeckLinkFormatChoice();
     if (g_failures) {
         std::fprintf(stderr, "live_pixels_test: %d failure(s)\n", g_failures);
         return 1;

@@ -157,6 +157,58 @@ void BgraToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, in
             dst.uv[(size_t)row * dst.width + x0 + x] = (uint16_t)(tmp.uv[(size_t)row * w + x] << 8);
 }
 
+void R210ToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0, ColorMatrix matrix) {
+    if (!src || w <= 0 || h <= 1 || x0 < 0 || x0 + w > dst.width || h > dst.height) return;
+    w &= ~1;
+    dst.matrix = matrix;  // the tag is the encode below
+    const float kr = matrix == ColorMatrix::BT601 ? 0.299f : matrix == ColorMatrix::BT2020 ? 0.2627f : 0.2126f;
+    const float kb = matrix == ColorMatrix::BT601 ? 0.114f : matrix == ColorMatrix::BT2020 ? 0.0593f : 0.0722f;
+    const float kg = 1.0f - kr - kb;
+    // Limited in, limited out: with the 10-bit code c, Y'16 = 64 * (kr R + kg G + kb B)
+    // exactly (64 -> 16 << 8, 940 -> 235 << 8); chroma (224 / 219 of the luma swing):
+    // C16 = 32768 + 57344 / (876 * 2 (1 - k)) * (component - Y'), in 10-bit codes.
+    const float sCb = 57344.0f / (876.0f * 2.0f * (1.0f - kb)), sCr = 57344.0f / (876.0f * 2.0f * (1.0f - kr));
+    auto px = [](const uint8_t* p, float& r, float& g, float& b) {
+        const uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+        r = (float)((v >> 20) & 0x3ff);
+        g = (float)((v >> 10) & 0x3ff);
+        b = (float)(v & 0x3ff);
+    };
+    auto clamp16 = [](float v) { return (uint16_t)std::clamp((int)(v + 0.5f), 0, 65535); };
+    for (int row = 0; row + 1 < h; row += 2) {
+        const uint8_t* a = src + (size_t)row * srcRowBytes;
+        const uint8_t* b = a + srcRowBytes;
+        uint16_t* ya = dst.y.data() + (size_t)row * dst.width + x0;
+        uint16_t* yb = ya + dst.width;
+        uint16_t* uvo = dst.uv.data() + (size_t)(row / 2) * dst.width + x0;
+        for (int x = 0; x < w; x += 2) {
+            float r[4], g[4], bl[4];
+            px(a + 4 * x, r[0], g[0], bl[0]);
+            px(a + 4 * x + 4, r[1], g[1], bl[1]);
+            px(b + 4 * x, r[2], g[2], bl[2]);
+            px(b + 4 * x + 4, r[3], g[3], bl[3]);
+            ya[x] = clamp16(64.0f * (kr * r[0] + kg * g[0] + kb * bl[0]));
+            ya[x + 1] = clamp16(64.0f * (kr * r[1] + kg * g[1] + kb * bl[1]));
+            yb[x] = clamp16(64.0f * (kr * r[2] + kg * g[2] + kb * bl[2]));
+            yb[x + 1] = clamp16(64.0f * (kr * r[3] + kg * g[3] + kb * bl[3]));
+            const float mr = 0.25f * (r[0] + r[1] + r[2] + r[3]), mg = 0.25f * (g[0] + g[1] + g[2] + g[3]),
+                        mb = 0.25f * (bl[0] + bl[1] + bl[2] + bl[3]);
+            const float my = kr * mr + kg * mg + kb * mb;
+            uvo[x] = clamp16(32768.0f + sCb * (mb - my));
+            uvo[x + 1] = clamp16(32768.0f + sCr * (mr - my));
+        }
+    }
+    if (h & 1) {  // an odd last row: its luma (no chroma row to pair with)
+        const uint8_t* a = src + (size_t)(h - 1) * srcRowBytes;
+        uint16_t* yo = dst.y.data() + (size_t)(h - 1) * dst.width + x0;
+        for (int x = 0; x < w; ++x) {
+            float r, g, bl;
+            px(a + 4 * x, r, g, bl);
+            yo[x] = clamp16(64.0f * (kr * r + kg * g + kb * bl));
+        }
+    }
+}
+
 void CopyEye(P016& dst, int x0, int x1, int w) {
     if (w <= 0 || x0 < 0 || x1 < 0 || x0 + w > dst.width || x1 + w > dst.width) return;
     for (int row = 0; row < dst.height; ++row)
