@@ -52,7 +52,7 @@ that feeds something else, say so: `-ExpectEyeWidth 1920 -ExpectFps 23.98 -Expec
 | P2 | QC view: left eye | both views show the left eye |
 | P3 | QC view: difference | (recorded) |
 | G1 / G2 | a CDL / a 3D LUT change the picture | the picture changes as expected |
-| P4 | `--10bit` | the runtime reports the 10-bit atlas |
+| P4 | `--10bit` is taken | (recorded) the runtime is new enough, the player renders and the runtime parsed the 10-bit atlas setting; fails if not. It never passes: the log line is printed when the setting is parsed, not by the panel path. **M3 is the 10-bit check.** |
 | R1 | clean test rig | no alert in 20 s |
 | R2 / R3 / R4 | 4 px vertical error / colour mismatch / depth over budget | each raises its alert |
 | R5 | right eye 2 frames late | eye sync reads 2 frames |
@@ -73,7 +73,7 @@ was seen.
 |---|---|
 | M1 | **3D looks right**: a real stereo clip in depth, the right way round (`X` swaps the eyes: the wrong way must look inside-out). Look away from the camera: the picture goes 2D cleanly, no ghosting. |
 | M2 | **Live picture from the card**: both eyes live, the timecode chip advancing one frame per frame at 24/25p **and at 48/50/60p**, drop-frame shown with `;`. |
-| M3 | **10-bit**: a smooth gradient (sky, vignette, a grey ramp) under a strong LUT, `--8bit` then `--10bit`: the 10-bit one shows less banding. |
+| M3 | **10-bit** (the only check of the 10-bit panel path; P4 only shows the setting was taken): a smooth gradient (sky, vignette, a grey ramp) under a strong LUT, `--8bit` then `--10bit`: the 10-bit one shows less banding. |
 | M4 | **Pull one cable** during the two-input run: that eye shows NO SIGNAL within 2 s (never a frozen eye next to a live one); plug it back: LIVE, without a restart. |
 | M5 | **Formats** the production will use (rate, 1080p / 2160p / DCI, 8 / 10 bit, PsF): each shows, colours right. Interlaced is warned about. |
 | M6 | **Resolve panel** in Resolve Studio (Workspace > Workflow Integrations > DisplayXR Station): snapshot and alert markers appear live; *Follow Resolve* tracks the playhead; *Go to station TC* jumps. Note whether the follow is offset by the clip's start timecode. |
