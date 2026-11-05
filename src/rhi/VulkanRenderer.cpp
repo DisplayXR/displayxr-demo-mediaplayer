@@ -1483,31 +1483,48 @@ bool VulkanRenderer::CreateLutImage(Lut3D& dst, uint32_t n, const uint16_t* rgba
         LOG_ERROR("LUT: memory alloc failed");
         return false;
     }
-    vkBindImageMemory(device_, l.image, l.memory, 0);
+    // #169: every step below is checked. A 256^3 LUT is 128 MiB of image plus 128 MiB of
+    // staging, so under memory pressure any of them can fail; on failure everything made here
+    // is released and `dst` (the LUT already on the GPU, or none) is left as it was.
+    VkBuffer sbuf = VK_NULL_HANDLE;
+    VkDeviceMemory smem = VK_NULL_HANDLE;
+    auto fail = [&](const char* what, VkResult r) {
+        if (sbuf) vkDestroyBuffer(device_, sbuf, nullptr);
+        if (smem) vkFreeMemory(device_, smem, nullptr);
+        vkDestroyImage(device_, l.image, nullptr);
+        vkFreeMemory(device_, l.memory, nullptr);
+        LOG_ERROR("LUT: %s failed for %u^3 (VkResult %d); the previous LUT is kept", what, n, (int)r);
+        return false;
+    };
+    VkResult vr = vkBindImageMemory(device_, l.image, l.memory, 0);
+    if (vr != VK_SUCCESS) return fail("vkBindImageMemory", vr);
 
     // Staging buffer, copied with a one-off blocking submit (LUT loads are user actions,
     // never per frame).
     const VkDeviceSize bytes = (VkDeviceSize)n * n * n * 4 * sizeof(uint16_t);
-    VkBuffer sbuf = VK_NULL_HANDLE;
-    VkDeviceMemory smem = VK_NULL_HANDLE;
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    vkCreateBuffer(device_, &bci, nullptr, &sbuf);
+    vr = vkCreateBuffer(device_, &bci, nullptr, &sbuf);
+    if (vr != VK_SUCCESS) { sbuf = VK_NULL_HANDLE; return fail("staging vkCreateBuffer", vr); }
     VkMemoryRequirements breq;
     vkGetBufferMemoryRequirements(device_, sbuf, &breq);
     VkMemoryAllocateInfo bai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     bai.allocationSize = breq.size;
     bai.memoryTypeIndex = FindMemoryType(
         breq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    vkAllocateMemory(device_, &bai, nullptr, &smem);
-    vkBindBufferMemory(device_, sbuf, smem, 0);
+    if (bai.memoryTypeIndex == UINT32_MAX) return fail("staging memory type", VK_ERROR_FEATURE_NOT_PRESENT);
+    vr = vkAllocateMemory(device_, &bai, nullptr, &smem);
+    if (vr != VK_SUCCESS) { smem = VK_NULL_HANDLE; return fail("staging vkAllocateMemory", vr); }
+    vr = vkBindBufferMemory(device_, sbuf, smem, 0);
+    if (vr != VK_SUCCESS) return fail("staging vkBindBufferMemory", vr);
     void* mapped = nullptr;
-    vkMapMemory(device_, smem, 0, bytes, 0, &mapped);
+    vr = vkMapMemory(device_, smem, 0, bytes, 0, &mapped);
+    if (vr != VK_SUCCESS || !mapped) return fail("staging vkMapMemory", vr);
     std::memcpy(mapped, rgba16f, (size_t)bytes);
     vkUnmapMemory(device_, smem);
 
-    ring_.submitImmediate([&](VkCommandBuffer cmd) {
+    vr = ring_.submitImmediate([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -1529,8 +1546,11 @@ bool VulkanRenderer::CreateLutImage(Lut3D& dst, uint32_t n, const uint16_t* rgba
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &b);
     });
+    if (vr != VK_SUCCESS) return fail("upload submit", vr);
     vkDestroyBuffer(device_, sbuf, nullptr);
     vkFreeMemory(device_, smem, nullptr);
+    sbuf = VK_NULL_HANDLE;
+    smem = VK_NULL_HANDLE;
 
     VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image = l.image;
