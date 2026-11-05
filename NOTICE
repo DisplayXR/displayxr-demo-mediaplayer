@@ -13,3 +13,6 @@ headers).
 
 third_party/decklink-sdk holds the include folders of the Blackmagic DeckLink SDK,
 Copyright (c) Blackmagic Design, under the licence in each file; see the README there.
+
+The Windows Media Player Pro build links OpenColorIO and its dependencies statically;
+their licences ship next to the program as OCIO-THIRD-PARTY-NOTICES.txt.
