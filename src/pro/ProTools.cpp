@@ -229,7 +229,8 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
         }
         if (tool == "set_display_calibration") {
             if (!calResolved_) ResolveCalibration();
-            if (a.contains("clear") && a["clear"].is_boolean() && a["clear"].get<bool>()) ClearCalibration(true);
+            if (a.contains("clear") && a["clear"].is_boolean() && a["clear"].get<bool>() && !ClearCalibration(true))
+                return err("calibration not removed: " + calError_);  // #169: a failed delete is a failure
             std::string p;
             if (Str(a, "cube", p)) {
                 const bool keep = !(a.contains("keep") && a["keep"].is_boolean() && !a["keep"].get<bool>());

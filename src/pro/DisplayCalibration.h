@@ -42,7 +42,14 @@ std::string CalibrationPathFor(const std::string& key);
 // Copy `cube` to CalibrationPathFor(key) so it loads on this panel from now on.
 bool Install(const std::string& cube, const std::string& key, std::string& err);
 
-// Delete the panel's installed calibration (no file = success).
+// Delete the panel's installed calibration (no file = success). A delete that fails
+// returns false with `err` set; the file is then still there and loads next run.
 bool Remove(const std::string& key, std::string& err);
+
+// Whether `path` is the panel's kept file (CalibrationPathFor(key)), i.e. not a run-only
+// calibration (MEDIAPLAYER_PRO_CAL, or one whose keep failed). Empty path = false. Used by
+// Remove in the Inspector (#169): removing a run-only calibration drops it for this run and
+// must not delete the file kept for the panel.
+bool IsKeptFile(const std::string& path, const std::string& key);
 
 }  // namespace mp::pro::cal

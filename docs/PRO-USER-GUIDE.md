@@ -162,7 +162,10 @@ itself whenever it runs on that panel.
   panel has none; the status line shows the same. Hover it for the panel's key and file.
 - **`Shift+G`** (or **Bypass calibration**) turns the calibration off and on. **`G`** does
   not touch it: bypassing the grade still shows the picture through the calibration.
-- **Remove** deletes this panel's calibration.
+- **Remove** deletes this panel's calibration. When the one showing is for this run only
+  (`MEDIAPLAYER_PRO_CAL`, or one that could not be kept), Remove only turns it off and the
+  panel's kept calibration stays. If the file cannot be deleted, Remove says so and the
+  calibration stays on.
 
 It is the last step: after the grade, the QC views, the gamma trim and the channel views,
 so a gamma trim is a choice you see through the calibration. The LUT must

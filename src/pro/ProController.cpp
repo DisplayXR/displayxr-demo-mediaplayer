@@ -692,9 +692,12 @@ void ProController::TickCalibration() {
             return fail("its DOMAIN is not 0..1 (a display calibration maps code values 0..1)");
     if (!renderer_ || !renderer_->UploadCalibrationLut(r.rgba16f.data(), (uint32_t)r.lut.size))
         return fail("upload failed");
+    // Whether what now shows is the panel's kept file (Remove deletes it) or run-only.
+    calKept_ = cal::IsKeptFile(r.source, calKey_);
     if (calInstall_) {
         std::string err;
-        if (!cal::Install(r.source, calKey_, err)) {
+        if (cal::Install(r.source, calKey_, err)) calKept_ = true;
+        if (!calKept_) {
             LOG_WARN("Pro: calibration applied for this run but not kept: %s", err.c_str());
             if (host_.toast) host_.toast("Calibration applied, not kept: " + err);
         } else {
@@ -709,18 +712,47 @@ void ProController::TickCalibration() {
     if (host_.toast) host_.toast("Calibration: " + calName_);
 }
 
-void ProController::ClearCalibration(bool uninstall) {
+bool ProController::ClearCalibration(bool uninstall) {
+    // #169: what is showing (or about to). A run-only calibration is not the panel's kept
+    // file, so removing it must not delete that file.
+    // A load in flight counts as kept when it will be kept (calInstall_) or is the kept
+    // file itself; with nothing showing, Remove means the kept file.
+    bool runOnly = false;
+    if (calLoaded_) runOnly = !calKept_;
+    else if (!calLoading_.empty()) runOnly = !calInstall_ && !cal::IsKeptFile(calLoading_, calKey_);
+    const bool deleteKept = uninstall && !runOnly;
+    if (deleteKept) {
+        // Delete first: if it fails, nothing changes (the file would load again next run,
+        // so dropping the LUT now would only hide that the remove did not happen).
+        std::string err;
+        if (!cal::Remove(calKey_, err)) {
+            calError_ = err;
+            LOG_WARN("Pro: display calibration not removed: %s", err.c_str());
+            if (host_.toast) host_.toast("Calibration not removed: " + err);
+            return false;
+        }
+    }
     calLoadId_ = 0;
     calLoading_.clear();
     if (renderer_) renderer_->ClearCalibrationLut();
     calLoaded_ = false;
+    calKept_ = false;
     calName_.clear();
     calPath_.clear();
-    if (uninstall) {
-        std::string err;
-        if (!cal::Remove(calKey_, err)) calError_ = err;
+    calError_.clear();
+    if (runOnly && uninstall) {
+        std::error_code ec;
+        const std::string kept = cal::CalibrationPathFor(calKey_);
+        const bool hasKept = !kept.empty() && std::filesystem::is_regular_file(std::filesystem::u8path(kept), ec);
+        LOG_INFO("Pro: run-only display calibration dropped; panel %s's kept file %s", calKey_.c_str(),
+                 hasKept ? "left in place" : "does not exist");
+        if (host_.toast)
+            host_.toast(hasKept ? "Run-only calibration dropped (this panel's kept calibration loads next run)"
+                                : "Run-only calibration dropped");
+    } else if (host_.toast) {
+        host_.toast(deleteKept ? "Display calibration removed" : "Display calibration off");
     }
-    if (host_.toast) host_.toast("Display calibration removed");
+    return true;
 }
 
 std::string ProController::CalibrationLabel() const {
@@ -839,6 +871,7 @@ void ProController::Tick(const Status& st) {
                 if (calLoaded_) {
                     if (renderer_) renderer_->ClearCalibrationLut();
                     calLoaded_ = false;
+                    calKept_ = false;
                     calName_.clear();
                     calPath_.clear();
                 }

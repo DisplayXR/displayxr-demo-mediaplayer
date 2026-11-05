@@ -60,6 +60,20 @@ int main() {
     CHECK(Remove("AUO-B194@HDMI-1", err));
     CHECK(!std::filesystem::exists(dir / "AUO-B194@HDMI-1.cube"));
     CHECK(Remove("AUO-B194@HDMI-1", err));  // nothing to remove is fine
+
+    // #169: which file is the panel's kept one (Remove deletes it) and which is run-only.
+    CHECK(Install(src.string(), "AUO-B194@HDMI-1", err));
+    CHECK(IsKeptFile((dir / "AUO-B194@HDMI-1.cube").string(), "AUO-B194@HDMI-1"));
+    CHECK(!IsKeptFile(src.string(), "AUO-B194@HDMI-1"));          // MEDIAPLAYER_PRO_CAL-style source
+    CHECK(!IsKeptFile((dir / "AUO-B194@HDMI-1.cube").string(), "other-panel"));
+    CHECK(!IsKeptFile("", "AUO-B194@HDMI-1"));
+    CHECK(Remove("AUO-B194@HDMI-1", err));
+    CHECK(IsKeptFile((dir / "AUO-B194@HDMI-1.cube").string(), "AUO-B194@HDMI-1"));  // by name once gone
+    // A delete that fails is reported as a failure (here: a non-empty folder where the file goes).
+    std::filesystem::create_directories(dir / "AUO-B194@HDMI-1.cube" / "x");
+    err.clear();
+    CHECK(!Remove("AUO-B194@HDMI-1", err));
+    CHECK(!err.empty());
     std::filesystem::remove_all(dir);
     std::filesystem::remove(src);
 
