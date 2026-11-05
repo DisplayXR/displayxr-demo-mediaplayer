@@ -86,6 +86,8 @@ SHELL_MANIFEST="mediaplayer_handle_vk_win.displayxr.json"
 SIDECAR_ICONS="icon.png icon_sbs.png"
 TAG_PREFIX="v"
 PRO_NOTE=""
+# The runtime package this one needs. The Media Player takes any runtime; Pro sets a floor.
+RUNTIME_DEPENDS="displayxr-runtime"
 
 PRO=0
 for a in "$@"; do [ "$a" = --pro ] && PRO=1; done
@@ -101,6 +103,12 @@ if [ "$PRO" = 1 ]; then
   SHELL_MANIFEST="mediaplayer_pro_handle_vk_win.displayxr.json"
   SIDECAR_ICONS="icon_pro.png icon_pro_sbs.png"
   TAG_PREFIX="pro-v"
+  # Runtime 2.61 keys display calibration by the display's stable key; an older runtime
+  # falls back to the device name, so a calibration can land on the wrong panel (#169).
+  # The runtime .deb is versioned X.Y.Z (X.Y.Z+<n>.g<sha> after a tag), which sorts
+  # above X.Y.Z, so a dev build of 2.61 satisfies it. apt refuses an older runtime with
+  # a "Depends: displayxr-runtime (>= 2.61.0) but ... is installed" message.
+  RUNTIME_DEPENDS="displayxr-runtime (>= 2.61.0)"
   PRO_NOTE="Live input: UVC cameras, the test signal, and Blackmagic DeckLink cards when Blackmagic Desktop Video is installed (not part of this package). No OpenColorIO in this build; .cube LUTs and ASC CDLs work."
 fi
 
@@ -308,7 +316,7 @@ LIB_DEPENDS="$(cd "$SHLIBS_TMP" && dpkg-shlibdeps -O --ignore-missing-info -l"$A
                | sed -n 's/^shlibs:Depends=//p')"
 rm -rf "$SHLIBS_TMP"
 [ -n "$LIB_DEPENDS" ] || { echo "error: dpkg-shlibdeps produced no Depends." >&2; exit 1; }
-DEPENDS="displayxr-runtime, $LIB_DEPENDS, $EXTRA_DEPENDS"
+DEPENDS="$RUNTIME_DEPENDS, $LIB_DEPENDS, $EXTRA_DEPENDS"
 echo "==> Depends: $DEPENDS"
 echo "==> Recommends: $EXTRA_RECOMMENDS"
 echo "==> glibc floor: $(objdump -T "${ELF_FILES[@]}" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
@@ -330,7 +338,7 @@ Description: $DISPLAY_NAME
  $DESCRIPTION
  .
  A DisplayXR demo OpenXR app for glasses-free 3D displays. Requires the
- DisplayXR runtime (Depends: displayxr-runtime); runs on whichever display
+ DisplayXR runtime (Depends: $RUNTIME_DEPENDS); runs on whichever display
  processor is active (sim-display fallback, or the Leia SR plug-in when
  installed). Launch from the menu or run '$PKG'.
 EOF
