@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Unit tests for the media browser's MediaLibrary (#160): what it counts as unsupported (the
-// player's supported set, with MPO and HEIC switched off as on Android), the sources it
+// player's supported set, with HEIC switched off as on Android), the sources it
 // builds (All media, Camera, Downloads, Pictures, Movies, Unsupported) and what Query()
 // returns for a source under the type filter and sort order. Pure logic: no Vulkan, no JNI.
 
 #include "browser/MediaLibrary.h"
-#include "media/MediaSource.h"
 
 #include <cstdio>
 #include <string>
 #include <vector>
 
-using mp::MediaSource;
 using mp::browser::MediaItem;
 using mp::browser::MediaLibrary;
 using mp::browser::MediaType;
@@ -58,7 +56,6 @@ const Source* Find(const MediaLibrary& library, SourceKind kind) {
 }
 
 void TestSupportedSet() {
-    MediaSource::SetMpoSupported(false);
     MediaLibrary library;
     library.SetItems({
         Item(1, "a.jpg", MediaType::Image, 1, ""),
@@ -71,19 +68,14 @@ void TestSupportedSet() {
     });
     const std::vector<Source>& s = library.Sources();
     CHECK(library.Items().size() == 7, "keeps every item");
-    CHECK(s[0].count == 3, "All media: jpg, mp4 and png");
-    CHECK(s[5].count == 4, "Unsupported: heic, mpo, webp, no extension");
+    CHECK(s[0].count == 4, "All media: jpg, mpo, mp4 and png");
+    CHECK(s[5].count == 3, "Unsupported: heic, webp, no extension");
     CHECK(library.Kind(1) == SourceKind::Unsupported && library.Kind(0) == SourceKind::Pictures, "Kind");
     CHECK(library.Find(2) && library.Find(2)->name == "b.HEIC", "finds an unsupported item by id");
     CHECK(!library.Find(99), "no unknown item");
-    CHECK((Ids(library, library.Query(s[0], ViewOptions{})) == std::vector<int64_t>{7, 4, 1}),
+    CHECK((Ids(library, library.Query(s[0], ViewOptions{})) == std::vector<int64_t>{7, 4, 3, 1}),
           "All media leaves out what the player cannot open");
-    CHECK((Ids(library, library.Query(s[5], ViewOptions{})) == std::vector<int64_t>{6, 5, 3, 2}), "Unsupported");
-
-    MediaSource::SetMpoSupported(true);
-    library.SetItems({Item(3, "c.mpo", MediaType::Image, 3, "")});
-    CHECK(library.Sources()[0].count == 1 && library.Sources()[5].count == 0, "mpo is supported when MPO is");
-    MediaSource::SetMpoSupported(false);
+    CHECK((Ids(library, library.Query(s[5], ViewOptions{})) == std::vector<int64_t>{6, 5, 2}), "Unsupported");
 }
 
 void TestSources() {
@@ -99,7 +91,7 @@ void TestSources() {
         Item(8, "m.mp4", MediaType::Video, 70, "Movies/clips/"),
         Item(9, "clip.mkv", MediaType::Video, 80, "TestMedia/"),
         Item(10, "root.jpg", MediaType::Image, 90, ""),
-        Item(11, "art.bmp", MediaType::Image, 100, "Pictures/"),
+        Item(11, "art.webp", MediaType::Image, 100, "Pictures/"),
         Item(12, "cam.heic", MediaType::Image, 110, "DCIM/Camera/"),
     });
     const std::vector<Source>& s = library.Sources();

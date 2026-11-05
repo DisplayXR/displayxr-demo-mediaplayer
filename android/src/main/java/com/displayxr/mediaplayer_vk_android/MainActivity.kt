@@ -278,7 +278,8 @@ class MainActivity : NativeActivity() {
                 // as jpg/png. Native sniffs the picked fd's content and routes
                 // image vs video accordingly.
                 type = "*/*"
-                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("video/*", "image/*"))
+                // Android types an .mpo as application/octet-stream.
+                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("video/*", "image/*", "application/octet-stream"))
                 // Persistable so the relaunched process can reopen it at cold start.
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or
                     Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)

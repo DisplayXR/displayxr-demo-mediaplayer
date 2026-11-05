@@ -141,6 +141,7 @@ add_library(mediaplayer_vk_android SHARED
     # `mett` convergence curve. Android-local because it is pure NDK AMediaExtractor.
     lvf_probe_android.cpp
     ${REPO_ROOT}/src/media/LifLoader.cpp
+    ${REPO_ROOT}/src/media/MpoLoader.cpp
     ${REPO_ROOT}/src/media/StereoCompose.cpp
     ${REPO_ROOT}/src/media/ImageDecoder.cpp
     # The player's Dear ImGui chrome, SHARED VERBATIM with the desktop legs. This is

@@ -4096,7 +4096,7 @@ void App::RequestOpenFile() {
 
     static const SDL_DialogFileFilter kFilters[] = {
         // Keep in sync with MediaSource::IsSupported — SDL wants its own filter string.
-        {"Stereo media", "mp4;mkv;mov;jpg;jpeg;png;lif;mpo;heic;heif;hif"},
+        {"Stereo media", "mp4;mkv;mov;m4v;webm;3gp;jpg;jpeg;png;gif;bmp;lif;mpo;heic;heif;hif"},
         {"All files", "*"},
     };
     SDL_ShowOpenFileDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this,

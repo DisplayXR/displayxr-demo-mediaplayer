@@ -71,6 +71,7 @@
 #include "browser/MediaBrowser.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
 #include "LifLoader.h"  // SHARED desktop LIF parser (src/media/, referenced by CMake)
+#include "MpoLoader.h"
 #include "MediaSource.h"   // SHARED layered stereo-layout resolver (#45)
 #include "StereoDetect.h"
 #include "video_stereo_probe_android.h"
@@ -280,10 +281,10 @@ std::atomic<bool> g_scene_loaded{false};
 // Media sources. The app starts on the DisplayXR idle screen (same lockup as
 // Windows: displayxr/idle.png over dark grey) — nothing auto-plays. Media is
 // opened via the SAF picker: tap the idle/image screen, or the transport bar's
-// Load button in video mode. Picked files are sniffed by content: JPEG/PNG go
-// through the SHARED desktop LifLoader (stereo LIF → composed full-SBS with
-// baked reconvergence; plain image / mono LIF → flat 2D), everything else is
-// AMediaCodec video.
+// Load button in video mode. Picked files are sniffed by content: JPEG/PNG/GIF/BMP
+// go through the SHARED desktop MpoLoader and LifLoader (stereo MPO or LIF →
+// composed full-SBS, a LIF with baked reconvergence; plain image / mono LIF →
+// flat 2D), everything else is AMediaCodec video.
 VideoDecoder g_video;
 // ── Right eye of a two-track stereo file ("LVF v2", #64) ────────────────────
 // A second decoder on the SAME file, opened on the `abr` track and put in SLAVE
@@ -2053,7 +2054,14 @@ bake_lif_convergence(mp::DecodedImage &img, float conv)
 bool
 load_image_file(const std::string &path, const std::string &logical_name)
 {
-	mp::LifResult r = mp::LifLoader::Load(path);
+	mp::LifResult r;
+	if (!mp::LifLoader::IsLif(path) && mp::MpoLoader::IsMpo(path)) {
+		mp::MpoResult mpo = mp::MpoLoader::Load(path);
+		r.image = std::move(mpo.image);
+		r.layout = mpo.layout;
+		r.ok = r.stereo = mpo.ok;
+	}
+	if (!r.ok) r = mp::LifLoader::Load(path);  // a LIF, a plain image, or an MPO that is not a pair
 	if (!r.ok) {
 		LOGE("image failed to decode: %s", path.c_str());
 		return false;
@@ -3189,7 +3197,6 @@ android_main(struct android_app *app)
 	LOGI("mediaplayer_vk_android: android_main entered");
 	app->onAppCmd = handle_cmd;
 	g_density_dpi = AConfiguration_getDensity(app->config);
-	mp::MediaSource::SetMpoSupported(false);
 	// Touch is NOT consumed via app->onInputEvent: on the legacy path the
 	// runtime's MonadoView overlay covers our window, so a NativeActivity never
 	// sees native input. Gestures arrive via MainActivity.dispatchTouchEvent
@@ -3230,7 +3237,7 @@ android_main(struct android_app *app)
 				return;
 			}
 			// Service a file the user picked (Load button → SAF). Sniff the
-			// content: JPEG/PNG (incl. LIF — a JPEG with a trailer) go through
+			// content: JPEG/PNG/GIF/BMP (incl. LIF and MPO, both JPEGs) go through
 			// the image path; everything else reopens the video decoder on
 			// this thread (the old decode thread is joined in stop()).
 			if (g_pending_mode_request >= 0 && g_session_running && g_pfnReqMode != nullptr) {
@@ -3249,9 +3256,11 @@ android_main(struct android_app *app)
 				const bool is_jpeg = have_magic && magic[0] == 0xFF && magic[1] == 0xD8;
 				const bool is_png = have_magic && magic[0] == 0x89 && magic[1] == 'P' &&
 				                    magic[2] == 'N' && magic[3] == 'G';
+				const bool is_gif = have_magic && std::memcmp(magic, "GIF8", 4) == 0;
+				const bool is_bmp = have_magic && magic[0] == 'B' && magic[1] == 'M';
 				stop_media();
 				g_pick_pending.store(false, std::memory_order_relaxed);
-				if (is_jpeg || is_png) {
+				if (is_jpeg || is_png || is_gif || is_bmp) {
 					if (!load_picked_image(app, pick, off, len)) {
 						LOGE("Failed to load picked image (fd=%d)", pick);
 						load_splash(app);  // the old media is gone: never leave nothing on screen

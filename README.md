@@ -350,9 +350,9 @@ Set `MEDIAPLAYER_LOG_DEBUG=1` for verbose logs.
 
 | Type | Formats | Notes |
 |---|---|---|
-| Images | SBS JPG/PNG, LIF, MPO, HEIC | layout from filename / container / content, else assumed stereo |
+| Images | SBS JPG/PNG/GIF/BMP, LIF, MPO, HEIC | layout from filename / container / content, else assumed stereo; a GIF shows its first frame |
 | Phone spatial capture | stereo HEIC photos, MV-HEVC video (`.mov` / `.mp4`), as written by Apple spatial capture and the Samsung Galaxy "3D Capture" mode | detected automatically, no conversion: both views are composed side by side (HUD: `MV-HEVC` / `stereo HEIC`). Eye order from the file: the HEIF `ster` group, the MV-HEVC eye tags, else base view = left. A HEIC with no stereo group shows its primary image flat. Desktop, FFmpeg 7.1+ (the shipped builds); MV-HEVC decodes in software. Not on Android yet |
-| Video | SBS H.264 / H.265 / AV1 (MP4/MKV/MOV) | hardware decode via FFmpeg, CPU fallback; `AVStereo3D` side data honoured incl. eye order |
+| Video | SBS H.264 / H.265 / AV1 / VP8 / VP9 / MPEG-4 (MP4/MKV/MOV/M4V/WEBM/3GP) | hardware decode via FFmpeg, CPU fallback; `AVStereo3D` side data honoured incl. eye order |
 | 2D (mono) stills, video, live | anything above that is mono, or pinned Mono with `L` | optional **Convert to 3D** (Shift+L / top-bar toggle / MCP `set_convert_3d`): the runtime's `XR_DXR_lift` `VIEWS_MONO` task returns a side-by-side pair that replaces the picture. Off on every load. Hidden when the runtime has no `XR_DXR_lift`; greyed with the reason when the task cannot serve this session |
 
 ## Runtime compatibility

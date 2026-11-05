@@ -13,7 +13,7 @@ Camera, Downloads, Pictures, Movies, Unsupported, "Other files..." for the syste
 a square-tile grid, 3D and duration badges, and view options (Both / 3D / 2D, All /
 Videos / Images, newest or oldest first).
 
-Out for now: a desktop browser; the VR badge; MPO, HEIC and MV-HEVC on Android. Files
+Out for now: a desktop browser; the VR badge; HEIC and MV-HEVC on Android. Files
 the player cannot open are listed under Unsupported with their format, so the formats
 left to do stay visible. MediaStore does not index MPO, JPS or JFIF as media, so the
 gallery cannot list them; "Other files..." reaches them.
@@ -49,8 +49,8 @@ tests/
 - Browser code lives in the folders above. `src/browser/` has no JNI, no MediaStore and
   no media paths: it reaches the device's media only through `MediaProvider`.
 - Existing classes get wiring only (Android `main.cpp`, `MainActivity.kt`, the build
-  lists). Extend one only when the capability belongs to it: the MPO switch in
-  `MediaSource` (like its HEIC switch) and an fd variant of the LIF check in `LifLoader`.
+  lists). Extend one only when the capability belongs to it, like the fd variant of the
+  LIF check in `LifLoader`.
 - Follow the repo's C++ habits (C++17). One class per header, no globals. PascalCase
   methods, trailing `_` on members, `k` constants, C-style casts.
 - A class that owns resources has a default constructor, `bool Initialize(...)` and
