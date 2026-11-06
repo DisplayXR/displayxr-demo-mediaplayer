@@ -203,6 +203,11 @@ public:
     void SetFlatPanelsAvailable(bool on) { flatAvailable_ = on; }
 
     // True while Pro wants the HUD kept alive (pinned inspector).
+    // Tab / "Show panels": the full UI (top bar, panels, transport) is up and stays up, no
+    // timers. Off, only the transient transport strip appears (App::TickUi).
+    bool PanelsPinned() const { return inspectorPinned_; }
+    void SetPanelsPinned(bool on) { inspectorPinned_ = on; }
+    bool ProbeOn() const { return probeOn_; }
     bool KeepHudAwake() const { return inspectorPinned_ || depthOverlay_ || OverlaysOn() || scopesOn_; }
 
     ViewMode Mode() const { return mode_; }
