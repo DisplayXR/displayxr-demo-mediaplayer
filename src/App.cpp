@@ -4153,6 +4153,9 @@ void App::TickUi() {
         (void)idle;
         const bool panels = pro_.PanelsPinned();
         if (panels && !proPanelsSeen_ && !showHud_) showHud_ = true;  // Tab leaves the clean feed
+        // Panels just hidden (Tab, the Panels button): the strip takes over, so the button
+        // under the pointer does not vanish with them.
+        const bool panelsWentOff = !panels && proPanelsSeen_ && showHud_;
         proPanelsSeen_ = panels;
         bool moved = false;
         if (window_.MouseInWindow()) {
@@ -4171,7 +4174,7 @@ void App::TickUi() {
         if (proHideStrip_) {
             proStrip_ = false;
         } else {
-            if (moved) {
+            if (moved || panelsWentOff) {
                 proStrip_ = true;
                 proStripSince_ = now;
             }
