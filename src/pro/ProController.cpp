@@ -278,6 +278,7 @@ void ProController::DialogCallback(void* userdata, const char* const* filelist, 
         self->dialogIsCdl_ = self->pendingDialogIsCdl_;
         self->dialogIsCompare_ = self->pendingDialogIsCompare_;
         self->dialogIsCal_ = self->pendingDialogIsCal_;
+        self->dialogIsOcio_ = self->pendingDialogIsOcio_;
         self->dialogReady_ = true;
     }
 }
@@ -290,6 +291,7 @@ void ProController::OpenLookDialog(bool cdl) {
         pendingDialogIsCdl_ = cdl;
         pendingDialogIsCompare_ = false;
         pendingDialogIsCal_ = false;
+        pendingDialogIsOcio_ = false;
     }
     static const SDL_DialogFileFilter kLutFilter[] = {{"3D LUT (.cube)", "cube"}};
     static const SDL_DialogFileFilter kCdlFilter[] = {{"ASC CDL (.cc, .ccc, .cdl)", "cc;ccc;cdl"}};
@@ -307,6 +309,7 @@ void ProController::OpenCompareDialog() {
         pendingDialogIsCdl_ = false;
         pendingDialogIsCompare_ = true;
         pendingDialogIsCal_ = false;
+        pendingDialogIsOcio_ = false;
     }
     const std::string cur = host_.currentMedia ? host_.currentMedia() : std::string();
     std::string dir = cur.empty() ? std::string() : std::filesystem::path(cur).parent_path().string();
@@ -773,11 +776,147 @@ void ProController::OpenCalibrationDialog() {
         pendingDialogIsCdl_ = false;
         pendingDialogIsCompare_ = false;
         pendingDialogIsCal_ = true;
+        pendingDialogIsOcio_ = false;
     }
     static const SDL_DialogFileFilter kFilter[] = {{"Display calibration 3D LUT (.cube)", "cube"}};
     std::string dir = calPath_.empty() ? std::string() : std::filesystem::u8path(calPath_).parent_path().u8string();
     SDL_ShowOpenFileDialog(&ProController::DialogCallback, this, window_, kFilter, 1,
                            dir.empty() ? nullptr : dir.c_str(), false);
+}
+
+void ProController::OpenOcioConfigDialog() {
+    {
+        std::lock_guard<std::mutex> lock(dialogMutex_);
+        if (dialogOpen_) return;
+        dialogOpen_ = true;
+        pendingDialogIsCdl_ = false;
+        pendingDialogIsCompare_ = false;
+        pendingDialogIsCal_ = false;
+        pendingDialogIsOcio_ = true;
+    }
+    static const SDL_DialogFileFilter kFilter[] = {{"OpenColorIO config (.ocio)", "ocio"}};
+    const bool file = !ocioUiConfig_.empty() && ocioUiConfig_.rfind("ocio://", 0) != 0;
+    std::string dir = file ? std::filesystem::u8path(ocioUiConfig_).parent_path().u8string() : std::string();
+    SDL_ShowOpenFileDialog(&ProController::DialogCallback, this, window_, kFilter, 1,
+                           dir.empty() ? nullptr : dir.c_str(), false);
+}
+
+namespace {
+int IndexOf(const std::vector<std::string>& v, const std::string& name) {
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i] == name) return (int)i;
+    return -1;
+}
+int FirstContaining(const std::vector<std::string>& v, const char* part) {
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].find(part) != std::string::npos) return (int)i;
+    return -1;
+}
+}  // namespace
+
+void ProController::DescribeOcioConfig() {
+    ocioInfoFor_ = ocioUiConfig_;
+    ocioInfoError_.clear();
+    ocioInfo_ = ocio::ConfigInfo{};
+    if (!ocio::Describe(ocioUiConfig_, ocioInfo_, ocioInfoError_)) return;
+    // Start from the look already on (a --ocio launch, the MCP tool) when it used this
+    // config; otherwise ACEScct in, onto the display the calibration targets (Rec.709 at
+    // gamma 2.4 = Rec.1886), with that display's default view.
+    const bool same = !ocioReq_.src.empty() && ocioReq_.config == ocioUiConfig_;
+    ocioSrc_ = same ? IndexOf(ocioInfo_.colorSpaces, ocioReq_.src) : -1;
+    if (ocioSrc_ < 0) ocioSrc_ = IndexOf(ocioInfo_.colorSpaces, "ACEScct");
+    if (ocioSrc_ < 0) ocioSrc_ = 0;
+    ocioDisplay_ = same && !ocioReq_.display.empty() ? IndexOf(ocioInfo_.displays, ocioReq_.display) : -1;
+    if (ocioDisplay_ < 0) ocioDisplay_ = FirstContaining(ocioInfo_.displays, "Rec.1886");
+    if (ocioDisplay_ < 0) ocioDisplay_ = IndexOf(ocioInfo_.displays, ocioInfo_.defaultDisplay);
+    if (ocioDisplay_ < 0) ocioDisplay_ = 0;
+    ocioView_ = -1;
+    if (ocioDisplay_ < (int)ocioInfo_.displayViews.size()) {
+        const auto& views = ocioInfo_.displayViews[ocioDisplay_];
+        if (same && !ocioReq_.view.empty()) ocioView_ = IndexOf(views, ocioReq_.view);
+        if (ocioView_ < 0) ocioView_ = IndexOf(views, ocioInfo_.displayDefaultView[ocioDisplay_]);
+    }
+    if (ocioView_ < 0) ocioView_ = 0;
+}
+
+void ProController::BuildOcioControls() {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    // A look set at launch (--ocio) or by the MCP tool: open on it, showing its settings.
+    if (ocioInfoFor_.empty() && !ocioReq_.config.empty()) ocioUiConfig_ = ocioReq_.config;
+    if (!ocioReq_.src.empty()) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+    if (!ImGui::TreeNode("OpenColorIO (ACES)")) return;
+    if (!ocio::Available()) {
+        ImGui::TextDisabled("This build has no OpenColorIO");
+        ImGui::TreePop();
+        return;
+    }
+    struct Builtin {
+        const char* label;
+        const char* uri;
+    };
+    static const Builtin kBuiltins[] = {
+        {"ACES studio (built-in)", "ocio://studio-config-latest"},
+        {"ACES CG (built-in)", "ocio://cg-config-latest"},
+    };
+    std::string cfgLabel = BaseName(ocioUiConfig_);
+    for (const Builtin& b : kBuiltins)
+        if (ocioUiConfig_ == b.uri) cfgLabel = b.label;
+    const float itemW = ImGui::GetContentRegionAvail().x * 0.62f;
+    ImGui::SetNextItemWidth(itemW);
+    if (ImGui::BeginCombo("Config", cfgLabel.c_str())) {
+        for (const Builtin& b : kBuiltins)
+            if (ImGui::Selectable(b.label, ocioUiConfig_ == b.uri)) ocioUiConfig_ = b.uri;
+        if (ImGui::Selectable("From file (.ocio)...")) OpenOcioConfigDialog();
+        ImGui::EndCombo();
+    }
+    if (ocioInfoFor_ != ocioUiConfig_) DescribeOcioConfig();
+    if (!ocioInfoError_.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f), "%s", ocioInfoError_.c_str());
+        ImGui::TreePop();
+        return;
+    }
+    auto combo = [&](const char* label, const std::vector<std::string>& items, int& sel) {
+        if (items.empty()) return false;
+        sel = std::clamp(sel, 0, (int)items.size() - 1);
+        bool changed = false;
+        ImGui::SetNextItemWidth(itemW);
+        if (ImGui::BeginCombo(label, items[sel].c_str(), ImGuiComboFlags_HeightLarge)) {
+            for (int i = 0; i < (int)items.size(); ++i)
+                if (ImGui::Selectable(items[i].c_str(), sel == i)) {
+                    changed = sel != i;
+                    sel = i;
+                }
+            ImGui::EndCombo();
+        }
+        return changed;
+    };
+    combo("Input", ocioInfo_.colorSpaces, ocioSrc_);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The colour space the picture arrives in (camera log, ACEScct, ...)");
+    if (combo("Display", ocioInfo_.displays, ocioDisplay_) && ocioDisplay_ < (int)ocioInfo_.displayViews.size()) {
+        ocioView_ = IndexOf(ocioInfo_.displayViews[ocioDisplay_], ocioInfo_.displayDefaultView[ocioDisplay_]);
+        if (ocioView_ < 0) ocioView_ = 0;
+    }
+    static const std::vector<std::string> kNone;
+    const auto& views =
+        ocioDisplay_ < (int)ocioInfo_.displayViews.size() ? ocioInfo_.displayViews[ocioDisplay_] : kNone;
+    combo("View", views, ocioView_);
+    const bool ready = !ocioInfo_.colorSpaces.empty() && !ocioInfo_.displays.empty() && !views.empty();
+    ImGui::BeginDisabled(!ready || !lutLoading_.empty());
+    if (ImGui::SmallButton("Apply look")) {
+        ocio::Request req;
+        req.config = ocioUiConfig_;
+        req.src = ocioInfo_.colorSpaces[ocioSrc_];
+        req.display = ocioInfo_.displays[ocioDisplay_];
+        req.view = views[ocioView_];
+        LoadOcio(req);
+    }
+    ImGui::EndDisabled();
+    if (lutIsOcio_ && grade_.lutOn) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("on (untick LUT to remove)");
+    }
+    ImGui::TreePop();
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -838,7 +977,7 @@ void ProController::Tick(const Status& st) {
     }
     rightOnlyView_ = mode_ == ViewMode::RightOnly;
     std::string path;
-    bool isCdl = false, isCompare = false, isCal = false;
+    bool isCdl = false, isCompare = false, isCal = false, isOcio = false;
     {
         std::lock_guard<std::mutex> lock(dialogMutex_);
         if (dialogReady_) {
@@ -846,12 +985,16 @@ void ProController::Tick(const Status& st) {
             isCdl = dialogIsCdl_;
             isCompare = dialogIsCompare_;
             isCal = dialogIsCal_;
+            isOcio = dialogIsOcio_;
             dialogReady_ = false;
         }
     }
     if (!path.empty()) {
         if (isCal) {
             LoadCalibration(path, /*install=*/true);
+        } else if (isOcio) {
+            ocioUiConfig_ = path;  // the picker describes it on its next frame
+            ocioInfoFor_.clear();
         } else if (isCompare) {
             compare_[1 - compareSide_] = path;  // the clip not showing becomes B
             SetWipe(Wipe::Clips, true);
@@ -1296,6 +1439,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
             ImGui::EndDisabled();
             BuildHdrControls();
             ImGui::BeginDisabled(bypass_);
+            BuildOcioControls();
             ImGui::TextDisabled("Look: %s%s%s", grade_.lutOn && !lutName_.empty() ? lutName_.c_str() : "no LUT",
                                 grade_.cdlOn ? " + CDL " : "", grade_.cdlOn ? cdlName_.c_str() : "");
             ImGui::BeginDisabled(!grade_.cdlOn);

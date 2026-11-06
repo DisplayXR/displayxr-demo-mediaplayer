@@ -216,6 +216,8 @@ Section "Media Player Pro" SecPro
     File "${BIN_DIR}\avutil-*.dll"
     File "${BIN_DIR}\swscale-*.dll"
     File "${BIN_DIR}\swresample-*.dll"
+    ; Licences of OpenColorIO and its dependencies, linked statically into the exe.
+    File /nonfatal "${BIN_DIR}\OCIO-THIRD-PARTY-NOTICES.txt"
 
     ; Bundled sample stereo image (auto-loaded by the Start Menu shortcut).
     File "${SOURCE_DIR}\assets\test_LR_2x1.png"
@@ -364,6 +366,7 @@ Section "Uninstall"
     ; Remove install dir contents.
     Delete "$INSTDIR\mediaplayer_pro_handle_vk_win.exe"
     Delete "$INSTDIR\*.dll"
+    Delete "$INSTDIR\OCIO-THIRD-PARTY-NOTICES.txt"
     Delete "$INSTDIR\test_LR_2x1.png"
     Delete "$INSTDIR\displayxr\icon.png"
     Delete "$INSTDIR\displayxr\icon_sbs.png"

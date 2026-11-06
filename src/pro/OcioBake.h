@@ -39,6 +39,9 @@ struct ConfigInfo {
     std::string name;
     std::vector<std::string> colorSpaces, displays, views;  // views of the default display
     std::string defaultDisplay, defaultView;
+    // Per display (same order as `displays`): its views and its default view.
+    std::vector<std::vector<std::string>> displayViews;
+    std::vector<std::string> displayDefaultView;
 };
 bool Describe(const std::string& config, ConfigInfo& out, std::string& err);
 
