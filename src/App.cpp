@@ -680,6 +680,23 @@ int App::Run() {
                            std::chrono::duration<double>(kIdleHideSeconds + 1.0));
         }
         if (activity) lastActivity_ = nowT;
+        {
+            const bool plainClick = window_.TakePlainClick();
+#if MEDIAPLAYER_PRO
+            // Pro: a click outside the UI dismisses it at once instead of waiting out the
+            // idle timer. Only while it is showing: a click with the UI hidden still wakes
+            // it (the activity above). ImGui's hover state is from the last frame, which is
+            // the frame the user clicked on; an open popup also counts as "wants the mouse",
+            // so the click that closes a dropdown leaves the UI up.
+            if (plainClick && uiState_.fadeAlpha > 0.0f && !imgui_.WantCaptureMouse()) {
+                lastActivity_ =
+                    nowT - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                               std::chrono::duration<double>(kIdleHideSeconds + 1.0));
+            }
+#else
+            (void)plainClick;
+#endif
+        }
         xr_.PollEvents();
         if (xr_.TakeModeChanged()) OnRenderingModeChanged();
 
