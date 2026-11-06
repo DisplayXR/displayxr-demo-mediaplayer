@@ -76,7 +76,7 @@ jobs:
   Build:
     name: Build macOS
     needs: DetectChanges
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45   # base + Pro (+ OpenColorIO) and two .pkgs
     env:
       GH_TOKEN: ${{ github.token }}
