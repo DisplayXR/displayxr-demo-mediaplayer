@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "imgui.h"
 #endif
@@ -425,7 +426,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
         ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
         const ImGuiWindowFlags topbar = pill & ~ImGuiWindowFlags_AlwaysAutoResize;
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);  // flat bar, flush to edges
-        if (ImGui::Begin("##wsui_top", nullptr, topbar)) {
+        if (!s.stripOnly && ImGui::Begin("##wsui_top", nullptr, topbar)) {
             ImGui::BeginDisabled(s.openFilePending);
             if (ImGui::Button("Open")) Fire(a.Open);
             ImGui::EndDisabled();
@@ -585,14 +586,24 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     Fire(a.ToggleSlideshow);
             }
         }
-        ImGui::End();
+        if (!s.stripOnly) ImGui::End();
         ImGui::PopStyleVar();
 
         // --- Bottom transport: play/pause + scrubber + loop (video only) ---
         if (s.isVideo && s.durationSeconds > 0.0) {
-            ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.955f), ImGuiCond_Always,
-                                    ImVec2(0.5f, 1.0f));
-            ImGui::SetNextWindowSize(ImVec2(W * 0.8f, 0.0f), ImGuiCond_Always);
+            // The strip sits flush on the bottom edge, full width and flat, so it covers as
+            // little of the picture as possible (usually only the letterbox).
+            if (s.stripOnly) {
+                ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+                ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                                    ImVec2(ImGui::GetStyle().WindowPadding.x, 4.0f));
+            } else {
+                ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.955f), ImGuiCond_Always,
+                                        ImVec2(0.5f, 1.0f));
+                ImGui::SetNextWindowSize(ImVec2(W * 0.8f, 0.0f), ImGuiCond_Always);
+            }
             const ImGuiWindowFlags bar = pill & ~ImGuiWindowFlags_AlwaysAutoResize;
             if (ImGui::Begin("##transport", nullptr, bar)) {
                 const float dur = (float)s.durationSeconds;
@@ -611,9 +622,14 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     const int t = (int)sec;
                     std::snprintf(out, n, "%d:%02d", t / 60, t % 60);
                 };
-                char cur[16], tot[16];
+                char cur[48], tot[16];
                 mmss(s.scrubValue, cur, sizeof(cur));
                 mmss(dur, tot, sizeof(tot));
+                if (s.frameRate > 0.0) {  // Pro: the frame number after the time
+                    const size_t n = std::strlen(cur);
+                    std::snprintf(cur + n, sizeof(cur) - n, "  f %lld",
+                                  (long long)std::llround(s.scrubValue * s.frameRate));
+                }
 
                 if (IconButton("##playpause", s.paused ? Icon::Play : Icon::Pause, iconSz, false,
                                s.hitTargetScale))
@@ -632,10 +648,13 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 // touch build spaces correctly instead of crowding the total time.
                 const ImGuiStyle& st = ImGui::GetStyle();
                 const int rightIcons = (s.caps.mute ? 1 : 0) + (s.caps.loop ? 1 : 0);
+                const float panelsW = s.panelsButton ? ImGui::CalcTextSize("Panels").x +
+                                                           st.FramePadding.x * 2.0f + st.ItemSpacing.x
+                                                     : 0.0f;
                 const float rightW = ImGui::CalcTextSize(tot).x +
                                      (float)rightIcons * (iconSz * s.hitTargetScale) +
                                      (float)(rightIcons + 2) * st.ItemSpacing.x +
-                                     st.WindowPadding.x;
+                                     st.WindowPadding.x + panelsW;
                 bool active = false;
                 const bool changed = ScrubBar("##scrub", &s.scrubValue, dur,
                                               ImGui::GetContentRegionAvail().x - rightW, &active);
@@ -675,8 +694,17 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     if (IconButton("##loop", Icon::Loop, iconSz, s.loop, s.hitTargetScale))
                         Fire(a.ToggleLoop);
                 }
+                if (s.panelsButton) {
+                    ImGui::SameLine();
+                    if (s.panelsOn)
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                    if (ImGui::Button("Panels")) Fire(a.TogglePanels);
+                    if (s.panelsOn) ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip(s.panelsOn ? "Hide panels (Tab)" : "Show panels (Tab)");
+                }
             }
             ImGui::End();
+            if (s.stripOnly) ImGui::PopStyleVar(2);
         }
         ImGui::PopStyleVar();
     }

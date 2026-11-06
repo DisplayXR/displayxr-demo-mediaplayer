@@ -1276,7 +1276,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     if (flat) ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     placePanel(Px(8.0f));
     if (ImGui::Begin("Station", nullptr, flags)) {
-        ImGui::Checkbox("Pin panels (Tab)", &inspectorPinned_);
+        ImGui::Checkbox("Show panels (Tab)", &inspectorPinned_);
         ImGui::SameLine();
         ImGui::TextDisabled("Shift+Tab: all UI");
         // --- Inputs (DeckLink / test rig / camera / stream) ----------------------

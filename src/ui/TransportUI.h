@@ -124,6 +124,16 @@ struct TransportState {
     // reporting >= 1 candidate). convertProviderCurrent = the row shown as current.
     std::vector<ConvertProviderRow> convertProviders;
     int convertProviderCurrent = -1;
+    // Strip-only chrome (Pro's inspection UI): only a slim full-width transport strip on
+    // the bottom edge, no top bar. DEFAULT FALSE: every other leg draws exactly as before.
+    bool stripOnly = false;
+    // Pro: a "Panels" button on the transport (fires TogglePanels; drawn highlighted while
+    // panelsOn). DEFAULT FALSE: not drawn.
+    bool panelsButton = false;
+    bool panelsOn = false;
+    // Frames per second of the open video, 0 = unknown / not shown. When > 0 the transport
+    // also shows the current frame number. DEFAULT 0: only Pro sets it.
+    double frameRate = 0.0;
     // Input popup - only read when caps.input.
     std::vector<InputFamilyRow> inputFamilies;
     bool inputRemember = false;  // "Remember for this app": the next pick persists (per-app pin)
@@ -165,6 +175,7 @@ struct TransportActions {
     std::function<void()> TogglePlayback;
     std::function<void()> ToggleMute;
     std::function<void()> ToggleLoop;
+    std::function<void()> TogglePanels;  // Pro, used only when panelsButton
 
     // Scrub machine. Seek(preview=true) is a cheap keyframe seek for a fast
     // sweep; preview=false is the exact frame. ScrubHeld fires once when the
