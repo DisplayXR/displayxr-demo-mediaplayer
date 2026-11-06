@@ -338,6 +338,7 @@ bool Window::PumpEvents() {
                     mouseActivity_ = true;
                     if (ev.button == 1 && !ev.window_drag && !(ev.mods & DxrModCtrl)) {
                         leftDown_ = true;  // VR viewer drag + double-click (#155)
+                        plainClick_ = true;
                         dragLastX_ = (float)ev.x;
                         dragLastY_ = (float)ev.y;
                         const int32_t ddx = ev.x - lastClickX_, ddy = ev.y - lastClickY_;

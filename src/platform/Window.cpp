@@ -171,6 +171,7 @@ bool Window::PumpEvents() {
         // them only while a VR projection is on screen and ImGui does not want the mouse.
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT) {
             leftDown_ = !(SDL_GetModState() & SDL_KMOD_CTRL);
+            if (leftDown_) plainClick_ = true;
             if (e.button.clicks == 2) doubleClick_ = true;
         }
         if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_LEFT) leftDown_ = false;
@@ -461,6 +462,12 @@ bool Window::TakeToggleMuteRequest() {
 bool Window::TakeMouseActivity() {
     bool v = mouseActivity_;
     mouseActivity_ = false;
+    return v;
+}
+
+bool Window::TakePlainClick() {
+    bool v = plainClick_;
+    plainClick_ = false;
     return v;
 }
 

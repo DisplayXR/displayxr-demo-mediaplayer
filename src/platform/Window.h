@@ -190,6 +190,9 @@ public:
     bool TakeMouseActivity();
     // True once when the cursor left the window (auto-hide should drop the UI).
     bool TakeMouseLeft();
+    // True once after a plain left click (no Ctrl, not a window drag) anywhere in the
+    // window. The app decides whether it landed outside the UI (Pro: hide the UI now).
+    bool TakePlainClick();
     // Is the cursor currently inside the window? (gates motion polling.)
     bool MouseInWindow() const { return mouseInWindow_; }
 
@@ -261,6 +264,7 @@ private:
     std::vector<std::string> dropBatch_;
     bool mouseActivity_ = false;
     bool mouseLeft_ = false;
+    bool plainClick_ = false;
     bool mouseInWindow_ = true;
     bool fullscreen_ = false;
     bool escapeQuits_ = true;
