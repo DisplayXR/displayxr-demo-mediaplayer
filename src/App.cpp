@@ -2557,15 +2557,24 @@ void App::VrRecenter(const char* why) {
 
 void App::VrHandleInput(bool& activity) {
     window_.SetArrowsPanView(VrActive());
-    if (window_.TakeCycleProjectionRequest()) {  // 'P'
+    // In Pro, P is the pixel probe and R the rig history strip, so neither may also change
+    // the VR view: P flipped a stereo picture to flat / VR180 mid-review. Pro still detects
+    // VR media on its own, sets the projection over MCP, and re-centres on a double-click.
+    const bool cycleProjection = window_.TakeCycleProjectionRequest();
+    bool recenter = window_.TakeRecenterRequest();
+#if MEDIAPLAYER_PRO
+    (void)cycleProjection;
+    recenter = false;
+#else
+    if (cycleProjection) {  // 'P'
         CycleVrProjection();
         activity = true;
     }
+#endif
     float dx = 0.f, dy = 0.f;
     const bool dragged = window_.TakeViewDrag(dx, dy);
     const float wheel = window_.TakeWheelSteps();
     const bool dbl = window_.TakeDoubleClick();
-    const bool recenter = window_.TakeRecenterRequest();
     int nx = 0, ny = 0;
     const bool nudged = window_.TakeViewNudge(nx, ny);
     if (!VrActive()) return;  // flat media: the gestures keep their usual meaning (or none)
