@@ -117,6 +117,9 @@ constexpr float kHudDisparity = 0.0f;
 
 // Auto-hide / slideshow timing.
 constexpr double kIdleHideSeconds = 5.0;    // fade the UI out after this much inactivity
+#if MEDIAPLAYER_PRO
+constexpr double kStripHideSeconds = 2.5;   // Pro: the mouse-move strip goes sooner
+#endif
 constexpr double kStillSeconds = 5.0;       // slideshow: seconds to hold a still image
 constexpr double kTransitionSeconds = 0.40; // slideshow: dip-to-black half-duration
 // Scrub speed (video-seconds moved per UI frame) above which we show keyframes instead
@@ -526,10 +529,8 @@ int App::Run() {
     xr_.Cursor().onDepthCursorShownChanged([this](bool shown) {
         // The runtime draws the cursor now: hide the OS pointer (and keep ImGui's SDL
         // backend from re-showing it every frame), or give it back.
-        imgui_.SetCursorLocked(shown);
-#if !defined(__APPLE__)
-        window_.SetOsCursorHidden(shown);
-#endif
+        depthCursorShown_ = shown;
+        ApplyCursorHidden();
         LOG_DEBUG("depth cursor: %s", shown ? "runtime draws (lifted over popped-out content; OS cursor hidden)"
                                            : "on the glass (OS cursor)");
     });
@@ -553,6 +554,16 @@ int App::Run() {
             showHud_ = !showHud_;
             LOG_INFO("HUD %s", showHud_ ? "on" : "off");
             activity = true;
+#if MEDIAPLAYER_PRO
+            // Pro's clean feed: entering it drops the panels, leaving it puts them back.
+            if (!showHud_) {
+                proPanelsBeforeClean_ = pro_.PanelsPinned();
+                pro_.SetPanelsPinned(false);
+            } else {
+                pro_.SetPanelsPinned(proPanelsBeforeClean_);
+            }
+            proPanelsSeen_ = pro_.PanelsPinned();
+#endif
         }
         // M4 transport / stereo controls.
         if (const int steps = window_.TakeConvergenceSteps(); steps != 0) {  // '-' / '='
@@ -613,7 +624,9 @@ int App::Run() {
             SetAutoConvPolicy(next);
             activity = true;
         }
+        bool ctrlClicked = false;
         if (float cx = 0.f, cy = 0.f; window_.TakeCtrlClick(cx, cy)) {  // Ctrl+click (#92)
+            ctrlClicked = true;
             // Window points -> canvas pixels -> the eye image under the cursor (the content
             // rect before the convergence shift, which is at most a few percent).
             uint32_t pw = 0, ph = 0, cw = 0, ch = 0;
@@ -674,6 +687,9 @@ int App::Run() {
             activity = true;
         }
         if (window_.TakeMouseLeft()) {
+#if MEDIAPLAYER_PRO
+            proHideStrip_ = true;
+#endif
             // Cursor left the window — drop the UI now (push idle past the hide threshold).
             lastActivity_ =
                 nowT - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -683,19 +699,15 @@ int App::Run() {
         {
             const bool plainClick = window_.TakePlainClick();
 #if MEDIAPLAYER_PRO
-            // Pro: a click outside the UI dismisses it at once instead of waiting out the
-            // idle timer. Only while it is showing: a click with the UI hidden still wakes
-            // it (the activity above). ImGui's hover state is from the last frame, which is
-            // the frame the user clicked on; an open popup also counts as "wants the mouse",
-            // so the click that closes a dropdown leaves the UI up.
-            if (plainClick && uiState_.fadeAlpha > 0.0f && !imgui_.WantCaptureMouse()) {
-                lastActivity_ =
-                    nowT - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                               std::chrono::duration<double>(kIdleHideSeconds + 1.0));
-            }
+            // Pro: a plain click on the picture drops the transport strip at once. ImGui's
+            // hover state is from the last frame, which is the frame the user clicked on;
+            // an open popup also counts as "wants the mouse", so the click that closes a
+            // dropdown is a click on the UI.
+            if (plainClick && !imgui_.WantCaptureMouse()) proHideStrip_ = true;
 #else
             (void)plainClick;
 #endif
+            (void)ctrlClicked;
         }
         xr_.PollEvents();
         if (xr_.TakeModeChanged()) OnRenderingModeChanged();
@@ -1403,6 +1415,9 @@ void App::BuildTransportUI() {
         SetInputProvider(fams[family], id, inputRemember_, "ui");
     };
     actions.SetInputRemember = [this](bool remember) { inputRemember_ = remember; };
+#if MEDIAPLAYER_PRO
+    actions.TogglePanels = [this] { pro_.SetPanelsPinned(!pro_.PanelsPinned()); };
+#endif
     actions.SelectConvertProvider = [this](int row) {
         const auto& cands = lift_.Candidates();
         if (row >= 0 && row < (int)cands.size()) SetConvertProvider(cands[row].id, "ui");
@@ -1410,12 +1425,32 @@ void App::BuildTransportUI() {
 
     ui::BuildTransportUI(uiState_, actions);
 #if MEDIAPLAYER_PRO
-    if (showHud_) pro_.BuildUI(ProStatus(), uiState_.fadeAlpha);
+    // The strip is the trunk's transport alone: Pro's panels stay down until the full UI.
+    if (showHud_) pro_.BuildUI(ProStatus(), uiState_.stripOnly ? 0.0f : uiState_.fadeAlpha);
 #endif
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     // A focused text field (the Stream URL popup) owns the keyboard: no hotkeys.
     window_.SetKeyboardCaptured(ImGui::GetIO().WantTextInput);
 #endif
+}
+
+void App::ApplyCursorHidden() {
+    bool idle = false;
+#if MEDIAPLAYER_PRO
+    idle = proCursorIdle_;
+#endif
+#if defined(__APPLE__)
+    // macOS: the depth cursor hides the pointer through the Cocoa adapter, not SDL; only
+    // the idle hide goes through SDL here.
+    const bool hide = idle;
+#else
+    const bool hide = depthCursorShown_ || idle;
+#endif
+    imgui_.SetCursorLocked(depthCursorShown_ || idle);
+    if (hide != cursorHiddenApplied_) {
+        cursorHiddenApplied_ = hide;
+        window_.SetOsCursorHidden(hide);
+    }
 }
 
 void App::UpdateDepthCursor() {
@@ -1456,7 +1491,11 @@ void App::UpdateDepthCursor() {
     float mx = 0.0f, my = 0.0f;
     window_.MousePosition(mx, my);
     XrVector2f uv{};
-    if (window_.MouseInWindow() && !imgui_.WantCaptureMouse() &&
+    bool pointerIdle = false;
+#if MEDIAPLAYER_PRO
+    pointerIdle = proCursorIdle_;  // the pointer is hidden with the UI: draw no cursor either
+#endif
+    if (!pointerIdle && window_.MouseInWindow() && !imgui_.WantCaptureMouse() &&
         dxr::cursorCanvasUV(mx, my, pw, ph, /*yUp=*/false, uv))
         cursor.setPointerUV(uv.x, uv.y);
     else
@@ -4104,7 +4143,72 @@ void App::TickUi() {
     // Auto-hide + toast fades are shared with Android — see ui/TransportUI.cpp. What
     // counts as "activity" is platform-specific and stays here (mouse motion above).
     const double idle = duration<double>(now - lastActivity_).count();
+#if MEDIAPLAYER_PRO
+    {
+        // Pro inspection UI (see App.h). Panels (Tab) = the full UI, held, no timers.
+        // Otherwise the strip: up on real pointer motion (> 8 px from rest), held while
+        // the pointer rests on it, down after kStripHideSeconds or on a click on the
+        // picture. Nothing else (keys, wheel, Ctrl+click) shows it. lastActivity_ is not
+        // used here, so keys cannot wake the UI.
+        (void)idle;
+        const bool panels = pro_.PanelsPinned();
+        if (panels && !proPanelsSeen_ && !showHud_) showHud_ = true;  // Tab leaves the clean feed
+        // Panels just hidden (Tab, the Panels button): the strip takes over, so the button
+        // under the pointer does not vanish with them.
+        const bool panelsWentOff = !panels && proPanelsSeen_ && showHud_;
+        proPanelsSeen_ = panels;
+        bool moved = false;
+        if (window_.MouseInWindow()) {
+            float mx = 0.0f, my = 0.0f;
+            window_.MousePosition(mx, my);
+            if (proRestX_ < 0.0f) {
+                proRestX_ = mx;
+                proRestY_ = my;
+            } else if (std::fabs(mx - proRestX_) + std::fabs(my - proRestY_) > 8.0f) {
+                proRestX_ = mx;
+                proRestY_ = my;
+                moved = true;
+            }
+        }
+        if (proStripSince_ == steady_clock::time_point{}) proStripSince_ = now;
+        if (proHideStrip_) {
+            proStrip_ = false;
+        } else {
+            if (moved || panelsWentOff) {
+                proStrip_ = true;
+                proStripSince_ = now;
+            }
+            if (proStrip_ && imgui_.WantCaptureMouse()) proStripSince_ = now;  // resting on it
+            if (dumpHudPath_ && !dumpedHud_) proStripSince_ = now;
+            if (proStrip_ && duration<double>(now - proStripSince_).count() >= kStripHideSeconds)
+                proStrip_ = false;
+        }
+        proHideStrip_ = false;
+        if (panels) proStrip_ = false;  // under the panels the strip is part of the full UI
+        const bool visible = showHud_ && (panels || proStrip_);
+        // While fading out, keep drawing what was showing (a strip must not flash the full
+        // UI on its way down).
+        if (visible) uiState_.stripOnly = !panels;
+        uiState_.frameRate = isVideo_ ? video_.FrameRate() : 0.0;
+        uiState_.panelsButton = true;
+        uiState_.panelsOn = panels;
+        if (!showHud_) {  // clean feed: no toasts either
+            uiState_.toastText.clear();
+            uiState_.toastAlpha = 0.0f;
+            uiState_.toastSecondsLeft = 0.0;
+        }
+        // The pointer goes with the UI (it is an overlay at screen depth too), except while
+        // the pixel probe needs it.
+        const bool cursorIdle = !visible && !pro_.ProbeOn();
+        if (cursorIdle != proCursorIdle_) {
+            proCursorIdle_ = cursorIdle;
+            ApplyCursorHidden();
+        }
+        ui::TickTransportUI(uiState_, dt, /*uiAwake=*/visible);
+    }
+#else
     ui::TickTransportUI(uiState_, dt, /*uiAwake=*/showHud_ && idle < kIdleHideSeconds);
+#endif
 
     // Dip-to-black transition machine, shared by the slideshow and manual ↑/↓ nav.
     // Slideshow auto-starts a transition when a still has shown long enough / a video

@@ -543,6 +543,26 @@ private:
     // per-eye content width in tile pixels: Pro's pointer->picture mapping and 1:1 zoom.
     float proPicX_ = 0.f, proPicY_ = 0.f, proPicW_ = 0.f, proPicH_ = 0.f;
     float proTileContentW_ = 0.f;
+    // Inspection UI (docs/PRO.md, "UI"). Tab / the strip's Panels button shows or hides
+    // the full UI, which then never times out. With the panels hidden, moving the mouse
+    // shows a transient transport strip (and the pointer) that fades after
+    // kStripHideSeconds, or at once on a click on the picture. Keys, the wheel and
+    // Ctrl+click never show or hide UI. Shift+Tab is the clean feed: nothing is drawn,
+    // not even the pointer. Decided in TickUi.
+    bool proStrip_ = true;          // the strip is up (starts up, then fades)
+    bool proHideStrip_ = false;     // main loop: a click on the picture / the pointer left
+    std::chrono::steady_clock::time_point proStripSince_{};
+    float proRestX_ = -1.0f, proRestY_ = -1.0f;  // pointer rest point for the 8 px wake
+    bool proPanelsBeforeClean_ = false;
+    bool proPanelsSeen_ = false;    // edge detector: Tab pressed while in the clean feed
+    bool proCursorIdle_ = false;    // pointer hidden with the strip
+#endif
+    // The OS pointer is hidden while the runtime draws the depth cursor, and (Pro) while
+    // the UI is idle; ApplyCursorHidden() combines the two.
+    bool depthCursorShown_ = false;
+    bool cursorHiddenApplied_ = false;
+    void ApplyCursorHidden();
+#if MEDIAPLAYER_PRO
     float proHud_[4] = {0.f, 0.f, 1.f, 1.f};  // HUD rect in window fractions (x, y, w, h)
 #endif
 
