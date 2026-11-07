@@ -237,8 +237,10 @@ bool ScrubBar(const char* id, float* v, float vmax, float width, bool* outActive
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
     // Unplayed track, then the played portion in the accent colour.
+    // FrameBg is tuned for widgets on a panel and all but vanishes on the dark strip: a
+    // translucent text tint reads on any background and stays clearly below the accent.
     dl->AddRectFilled(ImVec2(p.x, cy - th * 0.5f), ImVec2(p.x + width, cy + th * 0.5f),
-                      ImGui::GetColorU32(ImGuiCol_FrameBg), th * 0.5f);
+                      ImGui::GetColorU32(ImGuiCol_Text, (hovered || active) ? 0.38f : 0.26f), th * 0.5f);
     if (frac > 0.0f) {
         dl->AddRectFilled(ImVec2(p.x, cy - th * 0.5f), ImVec2(p.x + width * frac, cy + th * 0.5f),
                           ImGui::GetColorU32(ImGuiCol_SliderGrab), th * 0.5f);
@@ -410,6 +412,7 @@ void StreamPill(const TransportState& s, const TransportActions& a) {
 void BuildTransportUI(TransportState& s, const TransportActions& a) {
     ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    g_transportTop = 0.0f;
     const ImGuiWindowFlags pill = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
                                   ImGuiWindowFlags_NoBringToFrontOnFocus |
@@ -592,8 +595,12 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
         // --- Bottom transport: play/pause + scrubber + loop (video only) ---
         if (s.isVideo && s.durationSeconds > 0.0) {
             // The strip sits flush on the bottom edge, full width and flat, so it covers as
-            // little of the picture as possible (usually only the letterbox).
-            if (s.stripOnly) {
+            // little of the picture as possible (usually only the letterbox). Pro's full UI
+            // (side panels up) uses it too: the floating 80%-wide pill ran under the
+            // Station / Inspector panels, while the strip lands in the gap below them
+            // (the panels stop 90 px above the bottom edge, the scopes 52 px).
+            const bool strip = s.stripOnly || s.panelsOn;
+            if (strip) {
                 ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
                 ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
@@ -606,6 +613,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             }
             const ImGuiWindowFlags bar = pill & ~ImGuiWindowFlags_AlwaysAutoResize;
             if (ImGui::Begin("##transport", nullptr, bar)) {
+                if (s.fadeAlpha > 0.01f) g_transportTop = ImGui::GetWindowPos().y;
                 const float dur = (float)s.durationSeconds;
                 const float pos = (float)s.positionSeconds;
                 // Track playback into the knob, but not while dragging, and not while a
@@ -622,14 +630,13 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     const int t = (int)sec;
                     std::snprintf(out, n, "%d:%02d", t / 60, t % 60);
                 };
-                char cur[48], tot[16];
+                char cur[16], tot[16], frm[32] = "";
                 mmss(s.scrubValue, cur, sizeof(cur));
                 mmss(dur, tot, sizeof(tot));
-                if (s.frameRate > 0.0) {  // Pro: the frame number after the time
-                    const size_t n = std::strlen(cur);
-                    std::snprintf(cur + n, sizeof(cur) - n, "  f %lld",
+                const bool showFrame = s.frameRate > 0.0;  // Pro: the frame number after the time
+                if (showFrame)
+                    std::snprintf(frm, sizeof(frm), "f %lld",
                                   (long long)std::llround(s.scrubValue * s.frameRate));
-                }
 
                 if (IconButton("##playpause", s.paused ? Icon::Play : Icon::Pause, iconSz, false,
                                s.hitTargetScale))
@@ -639,9 +646,52 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 const float rowPad = iconSz * (std::max(1.0f, s.hitTargetScale) - 1.0f) * 0.5f;
                 ImGui::SameLine();
                 ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
+                // Time and frame number each sit in their OWN fixed slot, sized for the
+                // widest value this clip can produce (its duration / last frame, every
+                // digit as the font's widest digit). Drawn at natural width the label
+                // pushed the scrubber sideways as digits changed; drawn as one string,
+                // the time slid left whenever the frame number gained a digit. Now the
+                // time is right-aligned in its slot and the frame number left-aligned in
+                // its own, so neither moves the other and nothing moves the scrubber.
+                char wideDigit = '0';
+                float wideDigitW = 0.0f;
+                for (char d = '0'; d <= '9'; d++) {
+                    const char ds[2] = {d, '\0'};
+                    const float w = ImGui::CalcTextSize(ds).x;
+                    if (w > wideDigitW) {
+                        wideDigitW = w;
+                        wideDigit = d;
+                    }
+                }
+                auto slotW = [wideDigit](const char* sample) {
+                    char buf[48];
+                    std::snprintf(buf, sizeof(buf), "%s", sample);
+                    for (char* p = buf; *p; p++)
+                        if (*p >= '0' && *p <= '9') *p = wideDigit;
+                    return ImGui::CalcTextSize(buf).x;
+                };
+                const float timeSlotW = std::max(slotW(tot), ImGui::CalcTextSize(cur).x);
+                float frameSlotW = 0.0f;
+                if (showFrame) {
+                    char lastFrm[32];
+                    std::snprintf(lastFrm, sizeof(lastFrm), "f %lld",
+                                  (long long)std::llround((double)dur * s.frameRate));
+                    frameSlotW = std::max(slotW(lastFrm), ImGui::CalcTextSize(frm).x);
+                }
+                const float labelGap = ImGui::CalcTextSize("  ").x;
+                const float curX = ImGui::GetCursorPosX();
+                ImGui::SetCursorPosX(curX + timeSlotW - ImGui::CalcTextSize(cur).x);
                 ImGui::AlignTextToFramePadding();
                 ImGui::Text("%s", cur);
-                ImGui::SameLine();
+                float labelW = timeSlotW;
+                if (showFrame) {
+                    ImGui::SameLine(curX + timeSlotW + labelGap);
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("%s", frm);
+                    labelW += labelGap + frameSlotW;
+                }
+                ImGui::SameLine(curX + labelW + ImGui::GetStyle().ItemSpacing.x);
                 ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
                 // Leave room on the right for the total-time label + mute + loop icons.
                 // Derived from the live style rather than a magic constant, so the
@@ -704,7 +754,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 }
             }
             ImGui::End();
-            if (s.stripOnly) ImGui::PopStyleVar(2);
+            if (strip) ImGui::PopStyleVar(2);
         }
         ImGui::PopStyleVar();
     }

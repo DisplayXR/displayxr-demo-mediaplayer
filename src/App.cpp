@@ -560,9 +560,9 @@ int App::Run() {
                 proPanelsBeforeClean_ = pro_.PanelsPinned();
                 pro_.SetPanelsPinned(false);
             } else {
-                pro_.SetPanelsPinned(proPanelsBeforeClean_);
+                pro_.SetPanelsPinned(proPanelsBeforeClean_, /*quiet=*/true);
             }
-            proPanelsSeen_ = pro_.PanelsPinned();
+            proPanelsSeen_ = pro_.PanelsShown();
 #endif
         }
         // M4 transport / stereo controls.
@@ -4160,7 +4160,7 @@ void App::TickUi() {
         // picture. Nothing else (keys, wheel, Ctrl+click) shows it. lastActivity_ is not
         // used here, so keys cannot wake the UI.
         (void)idle;
-        const bool panels = pro_.PanelsPinned();
+        const bool panels = pro_.PanelsShown();
         if (panels && !proPanelsSeen_ && !showHud_) showHud_ = true;  // Tab leaves the clean feed
         // Panels just hidden (Tab, the Panels button): the strip takes over, so the button
         // under the pointer does not vanish with them.
@@ -4199,7 +4199,7 @@ void App::TickUi() {
         // UI on its way down).
         if (visible) uiState_.stripOnly = !panels;
         uiState_.frameRate = isVideo_ ? video_.FrameRate() : 0.0;
-        uiState_.panelsButton = true;
+        uiState_.panelsButton = pro_.PanelsFit();  // no Panels button where they cannot show
         uiState_.panelsOn = panels;
         if (!showHud_) {  // clean feed: no toasts either
             uiState_.toastText.clear();

@@ -13,4 +13,14 @@ inline float g_uiScale = 1.0f;
 
 inline float Px(float v) { return v * g_uiScale; }
 
+// Top edge (HUD pixels) of the bottom transport this frame, or 0 when none is showing.
+// Written by BuildTransportUI, which runs before Pro's UI, so the Pro status line can
+// sit above the strip instead of under it.
+inline float g_transportTop = 0.0f;
+
+// Top edge of everything docked on the bottom edge this frame — the transport and the Pro
+// status line sitting on it — or 0 when nothing is. Bottom-anchored panels (scopes, the
+// rig history) end above it rather than covering the status line.
+inline float g_bottomUiTop = 0.0f;
+
 }  // namespace mp::ui

@@ -594,7 +594,7 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
                     return true;
                 case SDLK_TAB:
                     if (mod & SDL_KMOD_SHIFT) return false;  // Shift+Tab is the trunk's HUD master
-                    inspectorPinned_ = !inspectorPinned_;
+                    SetPanelsPinned(!inspectorPinned_);
                     return true;
                 default: return station_.HandleKey((int)e.key.key);  // T R N J
             }
@@ -1185,6 +1185,7 @@ bool ProController::NearWipeLine(float x, float y) const {
 // or faded, only the timecode stays (the "SDI timecode overlay"); T hides it.
 void ProController::BuildStatusBar(const Status& st, float alpha) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
+    ui::g_bottomUiTop = ui::g_transportTop;
     if (st.isLogo || !host_.pictureInHud) return;
     float px, py, pw, ph;
     if (!host_.pictureInHud(px, py, pw, ph)) return;
@@ -1227,9 +1228,35 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
         if (st.stereo) add("  |  conv %+.2f%%", host_.getConvergence ? host_.getConvergence() * 100.0f : 0.0f);
     }
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
-    const ImVec2 ts = ImGui::CalcTextSize(buf);
     const float pad = Px(6.0f);
-    const float x = px * W + Px(8.0f), y = (py + ph) * H - ts.y - 2.0f * pad - Px(8.0f);
+    // Anchored to the picture's bottom-left corner — but only while that corner is on
+    // screen. Fit-height on a window narrower than the picture (or a zoom) puts it off
+    // the left/bottom edge, and the line went with it, its start cut off. Clamp to the
+    // window.
+    const float x = std::max(px * W, 0.0f) + Px(8.0f);
+    // A long line (file + format + look + calibration + rig numbers) ran off the right
+    // edge of a window: end it with an ellipsis at the edge instead.
+    const float maxTextW = W - x - Px(8.0f) - 2.0f * pad;
+    if (n > 0 && ImGui::CalcTextSize(buf).x > maxTextW) {
+        int lo = 0, hi = std::min(n, (int)sizeof(buf) - 4);
+        char tmp[sizeof(buf)];
+        while (lo < hi) {  // longest prefix that fits with the ellipsis
+            const int mid = (lo + hi + 1) / 2;
+            std::snprintf(tmp, sizeof(tmp), "%.*s...", mid, buf);
+            if (ImGui::CalcTextSize(tmp).x <= maxTextW) lo = mid;
+            else hi = mid - 1;
+        }
+        std::snprintf(tmp, sizeof(tmp), "%.*s...", lo, buf);
+        std::snprintf(buf, sizeof(buf), "%s", tmp);
+    }
+    const ImVec2 ts = ImGui::CalcTextSize(buf);
+    float y = std::min((py + ph) * H, H) - ts.y - 2.0f * pad - Px(8.0f);
+    // When the picture reaches the window's bottom edge (any windowed layout) the line
+    // would print straight over the transport strip: sit above it instead.
+    if (ui::g_transportTop > 0.0f) {
+        y = std::min(y, ui::g_transportTop - ts.y - 2.0f * pad - Px(6.0f));
+        ui::g_bottomUiTop = std::min(ui::g_bottomUiTop, y);
+    }
     dl->AddRectFilled(ImVec2(x, y), ImVec2(x + ts.x + 2.0f * pad, y + ts.y + 2.0f * pad), IM_COL32(10, 12, 16, 190), Px(4.0f));
     float tx = x + pad;
     if (st.live && !fs) {
@@ -1244,15 +1271,19 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
 
 void ProController::BuildUI(const Status& st, float uiAlpha) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
-    BuildOverlays(st, inspectorPinned_ ? 1.0f : uiAlpha);  // framing + burn-ins: not faded
+    {
+        const ImGuiIO& fio = ImGui::GetIO();
+        panelsFit_ = fio.DisplaySize.x >= Px(kPanelsMinW) && fio.DisplaySize.y >= Px(kPanelsMinH);
+    }
+    BuildOverlays(st, PanelsShown() ? 1.0f : uiAlpha);  // framing + burn-ins: not faded
     BuildDepthOverlay(st);  // on the picture; independent of the inspector fade
     BuildWipeLine(st);
     BuildPixelProbe(st);
     flatRects_.clear();
-    const float alpha = inspectorPinned_ ? 1.0f : uiAlpha;
+    const float alpha = PanelsShown() ? 1.0f : uiAlpha;
     BuildStatusBar(st, alpha);
     station_.BuildDeckLinkDialog();
-    if (alpha < 0.01f) return;
+    if (alpha < 0.01f || !panelsFit_) return;
     const ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
     const float panelW = std::clamp(W * 0.24f, Px(280.0f), Px(440.0f));
@@ -1277,7 +1308,9 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     placePanel(Px(8.0f));
     if (ImGui::Begin("Station", nullptr, flags)) {
         ImGui::Checkbox("Show panels (Tab)", &inspectorPinned_);
-        ImGui::SameLine();
+        // The hint shares the row only when it fits; a narrow panel clipped it mid-word.
+        const float hintW = ImGui::CalcTextSize("Shift+Tab: all UI").x + ImGui::GetStyle().ItemSpacing.x;
+        if (ImGui::GetContentRegionAvail().x - ImGui::GetItemRectSize().x >= hintW) ImGui::SameLine();
         ImGui::TextDisabled("Shift+Tab: all UI");
         // --- Inputs (DeckLink / test rig / camera / stream) ----------------------
         station_.BuildInputsSection(st.sourceLabel, st.live);
@@ -1355,14 +1388,22 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                 if (ImGui::RadioButton(label, mode_ == m)) SetMode(m, false);
                 ImGui::EndDisabled();
             }
+            // Buttons flow onto the next line rather than off the panel's right edge.
+            const float rowRight = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+            auto flow = [&](const char* nextLabel) {
+                const ImGuiStyle& st = ImGui::GetStyle();
+                const float w = ImGui::CalcTextSize(nextLabel).x + st.FramePadding.x * 2.0f;
+                if (ImGui::GetItemRectMax().x + st.ItemSpacing.x + w <= rowRight) ImGui::SameLine();
+            };
             ImGui::Text("Zoom %.0f%%", zoom_ * 100.0f);
-            ImGui::SameLine();
+            flow("Fit (H)");
             if (ImGui::SmallButton("Fit (H)")) SetZoom(1.0f);
-            ImGui::SameLine();
+            flow("1:1 (Z)");
             if (ImGui::SmallButton("1:1 (Z)")) SetZoom(host_.oneToOneZoom ? host_.oneToOneZoom() : 1.0f);
-            ImGui::SameLine();
             const bool fs = host_.isFullscreen && host_.isFullscreen();
-            if (ImGui::SmallButton(fs ? "Windowed (F11)" : "Full screen (F11)") && host_.toggleFullscreen)
+            const char* fsLabel = fs ? "Windowed (F11)" : "Full screen (F11)";
+            flow(fsLabel);
+            if (ImGui::SmallButton(fsLabel) && host_.toggleFullscreen)
                 host_.toggleFullscreen();
             ImGui::TextDisabled("Wheel zooms, middle-drag pans");
             const float itemW = ImGui::GetContentRegionAvail().x * 0.42f;

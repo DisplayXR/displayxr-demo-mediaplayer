@@ -799,7 +799,10 @@ void Station::BuildInputsSection(const std::string& liveName, bool live) {
     if (ImGui::SmallButton("DeckLink setup...")) OpenDeckLinkDialog();
     if (inputs_.empty()) {
         ImGui::TextDisabled("%s", live ? liveName.c_str() : "No inputs configured.");
-        ImGui::TextDisabled("--input=\"Rig=decklink:0+1,sdi\"  --test-signal");
+        // An example command line: wrap it rather than clip it at the panel edge.
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("--input=\"Rig=decklink:0+1,sdi\"  --test-signal");
+        ImGui::PopStyleColor();
         if (!DeckLinkSource::Available()) ImGui::TextDisabled("(this build has no DeckLink SDK)");
         return;
     }
@@ -1082,8 +1085,14 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
     // Between the two panels (ProController's panel width), along the bottom.
     const float panelW = std::clamp(W * 0.24f, Px(280.0f), Px(440.0f));
-    ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.86f), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
-    ImGui::SetNextWindowSize(ImVec2(std::max(Px(200.0f), W - 2.0f * panelW - Px(48.0f)), H * 0.15f), ImGuiCond_Always);
+    float bottom = H * 0.86f;
+    if (ui::g_bottomUiTop > 0.0f) bottom = std::min(bottom, ui::g_bottomUiTop - Px(8.0f));  // above strip + status
+    ImGui::SetNextWindowPos(ImVec2(W * 0.5f, bottom), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+    // Two graph rows of at least two text lines each plus the tick row: below that the row
+    // labels and tick labels print over each other (a small window's 15% is ~65 pt).
+    const float minH = ImGui::GetTextLineHeight() * 5.0f + ImGui::GetStyle().WindowPadding.y * 2.0f + Px(8.0f);
+    ImGui::SetNextWindowSize(ImVec2(std::max(Px(200.0f), W - 2.0f * panelW - Px(48.0f)), std::max(H * 0.15f, minH)),
+                             ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(flat ? 1.0f : 0.72f);
     if (flat) ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     const ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
@@ -1094,7 +1103,8 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         const ImVec2 avail = ImGui::GetContentRegionAvail();
-        const float labelW = avail.x * 0.14f;
+        // Never narrower than the longest row label, or "Vertical" runs into its graph.
+        const float labelW = std::max(avail.x * 0.14f, ImGui::CalcTextSize("Vertical").x + Px(12.0f));
         const float x0 = p0.x + labelW, x1 = p0.x + avail.x;
         const float rowH = (avail.y - ImGui::GetTextLineHeight()) * 0.5f;
         const double now = hist.back().t;
@@ -1152,7 +1162,10 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
             }
         }
         const char* ticks[] = {"-60 s", "-45 s", "-30 s", "-15 s", "now"};
+        // Keep only the ends when the quarter ticks would touch each other.
+        const bool allTicks = (x1 - x0) / 4.0f > ImGui::CalcTextSize("-60 s").x + Px(16.0f);
         for (int i = 0; i < 5; ++i) {
+            if (!allTicks && i != 0 && i != 4) continue;
             const float x = x0 + (x1 - x0) * (float)i / 4.0f;
             const ImVec2 ts = ImGui::CalcTextSize(ticks[i]);
             dl->AddText(ImVec2(std::min(x - ts.x * 0.5f, x1 - ts.x), p0.y + 2.0f * rowH), dim, ticks[i]);
