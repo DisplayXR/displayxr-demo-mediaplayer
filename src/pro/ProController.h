@@ -206,9 +206,21 @@ public:
     // Tab / "Show panels": the full UI (top bar, panels, transport) is up and stays up, no
     // timers. Off, only the transient transport strip appears (App::TickUi).
     bool PanelsPinned() const { return inspectorPinned_; }
-    void SetPanelsPinned(bool on) { inspectorPinned_ = on; }
+    // `quiet`: a restore (leaving the clean feed), not a user asking for the panels.
+    void SetPanelsPinned(bool on, bool quiet = false) {
+        inspectorPinned_ = on;
+        if (on && !quiet) WarnPanelsDontFit();
+    }
+    // The window is big enough for the full UI (panels, scopes, rig history). Below that
+    // the pin is remembered but nothing is drawn: two 280 pt panels plus a usable centre
+    // only crowd a small window. Full screen, or a bigger window, brings them back.
+    static constexpr float kPanelsMinW = 1000.0f;  // design units (pt at 100%)
+    static constexpr float kPanelsMinH = 600.0f;
+    bool PanelsFit() const { return panelsFit_; }
+    // What is on screen: pinned AND room for it. App's UI state follows this, not the pin.
+    bool PanelsShown() const { return inspectorPinned_ && panelsFit_; }
     bool ProbeOn() const { return probeOn_; }
-    bool KeepHudAwake() const { return inspectorPinned_ || depthOverlay_ || OverlaysOn() || scopesOn_; }
+    bool KeepHudAwake() const { return PanelsShown() || depthOverlay_ || OverlaysOn() || scopesOn_; }
 
     ViewMode Mode() const { return mode_; }
     // The monitoring station: inputs, timecode / delay, rig checks, snapshots (Station.h).
@@ -334,10 +346,14 @@ private:
     void OpenCalibrationDialog();
 
     bool inspectorPinned_ = false;  // Tab / the Pin box: panels stay up; unpinned they follow the UI fade
+    bool panelsFit_ = true;         // last frame's window had room for the panels (kPanelsMinW/H)
+    void WarnPanelsDontFit() {
+        if (!panelsFit_ && host_.toast) host_.toast("Window too small for the panels - F11 for full screen");
+    }
     std::vector<FlatRect> flatRects_;
     bool flatAvailable_ = false;    // the runtime takes Local2D layers (XR_DXR_local_3d_zone)
     bool flatPanels_ = true;        // MEDIAPLAYER_PRO_PANELS_3D=1 keeps pinned panels woven
-    bool FlatNow() const { return flatAvailable_ && flatPanels_ && inspectorPinned_; }
+    bool FlatNow() const { return flatAvailable_ && flatPanels_ && PanelsShown(); }
     void AddFlatRectOfCurrentWindow();
     Station station_;
     bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture

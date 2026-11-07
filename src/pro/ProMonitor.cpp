@@ -402,7 +402,9 @@ void ProController::BuildScopesPanel(float alpha, float W, float H, float panelW
     }
     const float graphH = std::clamp(w * 0.26f, Px(120.0f), Px(240.0f));
     const float h = graphH + ImGui::GetTextLineHeightWithSpacing() * 2.0f + ImGui::GetStyle().WindowPadding.y * 2.0f;
-    ImGui::SetNextWindowPos(ImVec2(x, H - h - Px(52.0f)), ImGuiCond_Always);
+    float y = H - h - Px(52.0f);
+    if (ui::g_bottomUiTop > 0.0f) y = std::min(y, ui::g_bottomUiTop - h - Px(8.0f));  // above strip + status
+    ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(FlatNow() ? 1.0f : 0.85f);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
