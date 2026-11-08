@@ -1826,8 +1826,8 @@ void VideoDecoder::SegmentedPlayback(::AVFrame* frame,
     constexpr double kJumpSec = 2.0;        // PTS this far off the clock: a discontinuity
 
     const double fps = frameRate_ > 0.0 ? frameRate_ : 30.0;
-    const size_t maxPackets = (size_t)std::max(120.0, fps * kQueueSec);
-    const size_t rebufferPackets = (size_t)std::max(1.0, fps * kRebufferSec);
+    const size_t maxPackets = (size_t)(std::max)(120.0, fps * kQueueSec);
+    const size_t rebufferPackets = (size_t)(std::max)(1.0, fps * kRebufferSec);
 
     std::mutex m;
     std::condition_variable cv;
