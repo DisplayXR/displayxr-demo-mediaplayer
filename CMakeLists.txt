@@ -63,7 +63,11 @@ endif()
 
 # --- FFmpeg (libav*) for video decode (M2/M3). Optional: if absent, the app builds
 #     without video support.
-#   * macOS / Linux: pkg-config (Homebrew / system).
+#   * Linux dev builds: pkg-config (system FFmpeg).
+#   * macOS (#201): scripts/build_macos.sh builds the slim FFmpeg
+#     (scripts/build_ffmpeg_macos.sh) and passes it as FFMPEG_ROOT; the .app bundler
+#     copies its dylibs into Contents/Resources/lib. Without FFMPEG_ROOT, pkg-config
+#     (Homebrew) still works for local dev (build_macos.sh --brew-ffmpeg).
 #   * Windows: no pkg-config in the usual MSVC toolchain, so fall back to a manual
 #     dev tree. Set -DFFMPEG_ROOT=<dir containing include/ + lib/>. For the shipped
 #     installer, CI builds a slim DECODE-ONLY FFmpeg via scripts/build-ffmpeg-slim.sh

@@ -69,7 +69,11 @@ the libheif option the PRD reserved was never needed and is not wired).
 CUDA/NVDEC may be used *transparently* when FFmpeg picks it — never a build dep.
 
 - SDL3 / Dear ImGui / stb → FetchContent (pinned).
-- FFmpeg → vcpkg on Windows, system/Homebrew elsewhere. hwaccel auto-selected per
+- FFmpeg → the repo's own slim, decode-only build on every desktop platform
+  (`scripts/build-ffmpeg-slim.sh` Windows, `build_ffmpeg_linux.sh` Linux,
+  `build_ffmpeg_macos.sh` macOS, #201), one shared component list in
+  `scripts/ffmpeg_components.sh`. Homebrew's FFmpeg is a `build_macos.sh --brew-ffmpeg`
+  local-dev escape hatch only, never in a `.pkg`. hwaccel auto-selected per
   OS (D3D11VA/NVDEC, VideoToolbox, VAAPI, MediaCodec) with CPU software fallback.
 
 ## Platforms & graphics binding

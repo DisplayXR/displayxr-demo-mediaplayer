@@ -77,7 +77,7 @@ jobs:
     name: Build macOS
     needs: DetectChanges
     runs-on: macos-15
-    timeout-minutes: 45   # base + Pro (+ OpenColorIO) and two .pkgs
+    timeout-minutes: 60   # slim FFmpeg on a cache miss, base + Pro (+ OpenColorIO) and two .pkgs
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -90,11 +90,26 @@ jobs:
       - name: Install dependencies
         if: needs.DetectChanges.outputs.docs_only != 'true'
         # OpenXR loader is built from source by scripts/build_macos.sh (no brew
-        # formula). FFmpeg via Homebrew (pkg-config). The app's dylib closure is
-        # bundled by a recursive otool/install_name_tool walk in create_app_bundle.sh.
+        # formula). FFmpeg is the repo's slim build (scripts/build_ffmpeg_macos.sh,
+        # #201; meson is for its static dav1d), NOT Homebrew's. The app's dylib closure
+        # is bundled by a recursive otool/install_name_tool walk in create_app_bundle.sh.
+        # sdl3 is explicit: it used to arrive as a dependency of Homebrew's ffmpeg, and
+        # CMake prefers an installed SDL3, so the shipped app has always carried
+        # Homebrew's SDL3. Without it CMake builds the pinned SDL3 instead (a different
+        # SDL3 in the .pkg, and the bundler does not resolve the build tree's @rpath).
         run: |
-          brew install cmake ninja ffmpeg pkg-config vulkan-headers vulkan-loader molten-vk opencolorio
+          brew install cmake ninja meson pkg-config sdl3 vulkan-headers vulkan-loader molten-vk opencolorio
           echo "VULKAN_SDK=$(brew --prefix)" >> "$GITHUB_ENV"
+
+      # The slim FFmpeg build_macos.sh builds (and then reuses: the script stamps its
+      # prefix). Keyed on the pin + build script + shared component list, like the
+      # Windows and Linux caches.
+      - name: Cache slim FFmpeg
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ffmpeg-slim-macos
+          key: ffmpeg-slim-macos15-arm64-${{ hashFiles('scripts/build_ffmpeg_macos.sh', 'scripts/ffmpeg_components.sh', 'scripts/ffmpeg-patches/*.patch') }}
 
       - name: Derive installer version
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -180,18 +195,39 @@ jobs:
 
       # MP_BUILD_TESTS defaults OFF, so nothing ran ctest before this — the unit tests
       # existed but never executed in CI. Re-configure the tree build_macos.sh already
-      # populated (incremental: no re-fetch of SDL3/imgui/OpenXR) and run them.
+      # populated (incremental: no re-fetch of SDL3/imgui/OpenXR; FFMPEG_ROOT stays the
+      # slim FFmpeg from its cache) and run them against what ships.
       # stereo_sweep needs the generated corpus and exits 0 with a notice without it, so
       # CI stays green without building gigabytes of fixtures.
+      # decode_formats is excluded here, as on Windows: it ENCODES its EXR / DPX / ProRes
+      # fixtures and the slim FFmpeg is decode-only. It runs in the next step instead.
       - name: Unit tests
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
           cmake -S . -B build -DMP_BUILD_TESTS=ON
+          grep -q '^FFMPEG_ROOT:.*ffmpeg-slim-macos' build/CMakeCache.txt || { echo "::error::tests are not built against the slim FFmpeg"; exit 1; }
           cmake --build build --target lif_roundtrip_test stereo_detect_test \
                                      mpo_parse_test camera_select_test auto_convergence_test stereo_packing_test eye_assign_test stream_url_test lift_client_test input_provider_client_test color_test \
-                                     stereo_sweep live_pixels_test timecode_pairer_test resolve_link_test thumbnail_test scopes_test overlays_test compare_clip_test look_loader_test rig_check_test                                      image_sequence_test decode_formats_test ocio_bake_test short_clip_test segmented_pacing_test qc_report_test spatial_media_test vr_view_test display_calibration_test target_screen_test qc_exporter_test tone_map_test media_library_test stereo_classifier_test thumbnail_cache_test touch_scroller_test slide_gesture_test audio_layout_test
-          ctest --test-dir build --output-on-failure
+                                     stereo_sweep live_pixels_test timecode_pairer_test resolve_link_test thumbnail_test scopes_test overlays_test compare_clip_test look_loader_test rig_check_test \
+                                     image_sequence_test ocio_bake_test short_clip_test segmented_pacing_test qc_report_test spatial_media_test vr_view_test display_calibration_test target_screen_test qc_exporter_test tone_map_test media_library_test stereo_classifier_test thumbnail_cache_test touch_scroller_test slide_gesture_test audio_layout_test
+          ctest --test-dir build --output-on-failure -E "^decode_formats$"
+
+      # decode_formats (Pro review formats through the real VideoDecoder), short_clip and
+      # segmented_pacing (both skip themselves on the slim build: no ProRes / mpeg2video
+      # encoder, no hls muxer) need FFmpeg's
+      # encoders to write their fixtures, so they build in their own tree against Homebrew's
+      # full FFmpeg, installed only now: after the shipped binaries are built and
+      # packaged, so it can never reach them. Nothing from this tree is packaged.
+      - name: Encoder-fixture tests (Homebrew FFmpeg, test only)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          brew install ffmpeg
+          cmake -S . -B build-decode-test -G Ninja -DCMAKE_BUILD_TYPE=Release -DMP_BUILD_TESTS=ON \
+              -DCMAKE_PREFIX_PATH="/tmp/openxr-install;$(brew --prefix)"
+          cmake --build build-decode-test --target decode_formats_test short_clip_test segmented_pacing_test
+          ctest --test-dir build-decode-test --output-on-failure -R "^(decode_formats|short_clip|segmented_pacing)$"
 
       - name: Assert .pkg payload (regression guard)
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -227,6 +263,13 @@ jobs:
           assert_present "$APP/Resources/displayxr/mediaplayer_handle_vk_macos\.displayxr\.json" "DisplayXR app manifest"
           assert_present "$APP/Resources/displayxr/icon\.png" "manifest 2D icon"
           assert_present "$APP/Resources/displayxr/icon_sbs\.png" "manifest 3D icon"
+          # #201: the slim FFmpeg, not Homebrew's (whose closure dragged in the GPL
+          # encoders and OpenSSL), and nothing else from it.
+          if grep -E "$APP/Resources/lib/lib(x264|x265|SvtAv1|vpx|mp3lame|opus|dav1d|ssl|crypto|mpg123)" "$EXPAND_DIR/files"; then
+            echo "::error::Homebrew FFmpeg dependencies in the payload (expected the slim FFmpeg)"; MISSING=1
+          fi
+          grep -q "$APP/Resources/lib/libavcodec\.62\.dylib" "$EXPAND_DIR/files" \
+            || { echo "::error::libavcodec.62.dylib (the pinned slim FFmpeg 8.x) missing"; MISSING=1; }
           if [ "$MISSING" -ne 0 ]; then echo "Payload listing:"; cat "$EXPAND_DIR/files"; exit 1; fi
           echo "PASS: .pkg payload contains app + MoltenVK/Vulkan/OpenXR + FFmpeg dylibs + DisplayXR manifest/icons."
           # Every Mach-O in the shipped payload loads only bundle-relative paths (v1.14.2
@@ -274,6 +317,13 @@ jobs:
           assert_present "$APP/Resources/displayxr/mediaplayer_pro_handle_vk_macos\.displayxr\.json" "DisplayXR app manifest"
           assert_present "$APP/Resources/displayxr/icon\.png" "manifest 2D icon"
           assert_present "$APP/Resources/displayxr/icon_sbs\.png" "manifest 3D icon"
+          # #201: the slim FFmpeg, not Homebrew's (whose closure dragged in the GPL
+          # encoders and OpenSSL), and nothing else from it.
+          if grep -E "$APP/Resources/lib/lib(x264|x265|SvtAv1|vpx|mp3lame|opus|dav1d|ssl|crypto|mpg123)" "$EXPAND_DIR/files"; then
+            echo "::error::Homebrew FFmpeg dependencies in the payload (expected the slim FFmpeg)"; MISSING=1
+          fi
+          grep -q "$APP/Resources/lib/libavcodec\.62\.dylib" "$EXPAND_DIR/files" \
+            || { echo "::error::libavcodec.62.dylib (the pinned slim FFmpeg 8.x) missing"; MISSING=1; }
           if grep -q 'Stereo Media Player\.app' "$EXPAND_DIR/files"; then
             echo "::error::Pro .pkg carries the Stereo Media Player app"; MISSING=1
           fi

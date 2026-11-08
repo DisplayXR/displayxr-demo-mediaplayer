@@ -33,6 +33,9 @@
 #     reason (distro libsrt / libmbedcrypto sonames and t64 package names differ
 #     across the three releases). libsrt is C++, so libavformat gains a
 #     libstdc++.so.6 DT_NEEDED, which is on the .deb's STABLE_SONAMES list.
+#   * AV1 software decode (#201): libdav1d, STATIC (distro libdav1d is .so.5 on
+#     22.04, .so.7 on 24.04 / 26.04). FFmpeg's native av1 decoder is hardware-only,
+#     so without it AV1 did not play on a GPU without AV1 decode.
 # --disable-autodetect keeps anything else on the build host from sneaking in.
 #
 # Build it on the OLDEST supported release (the .deb's glibc floor comes from
@@ -41,7 +44,7 @@
 #
 #   ./scripts/build_ffmpeg_linux.sh            # -> $FFMPEG_PREFIX (default /tmp/ffmpeg-slim-linux)
 #
-# Needs: build-essential, nasm, pkg-config, git, cmake, libva-dev, zlib1g-dev.
+# Needs: build-essential, nasm, pkg-config, git, cmake, meson, ninja-build, libva-dev, zlib1g-dev.
 set -euo pipefail
 
 # Keep FFMPEG_SHA equal to build-windows.yml's pin (FFmpeg 8.x).
@@ -53,10 +56,15 @@ NVSRC="/tmp/nv-codec-headers-$NVCODEC_TAG"
 LIBXML2_TAG="${LIBXML2_TAG:-v2.13.9}"
 MBEDTLS_TAG="${MBEDTLS_TAG:-v3.6.5}"
 SRT_TAG="${SRT_TAG:-v1.5.4}"
-NETDEPS="/tmp/ffmpeg-netdeps-linux-$LIBXML2_TAG-$MBEDTLS_TAG-$SRT_TAG"
+DAV1D_TAG="${DAV1D_TAG:-1.5.1}"
+NETDEPS="/tmp/ffmpeg-netdeps-linux-$LIBXML2_TAG-$MBEDTLS_TAG-$SRT_TAG-dav1d$DAV1D_TAG"
 
-SELF_HASH="$(sha256sum "$0" | cut -c1-16)"
-STAMP="$FFMPEG_SHA $NVCODEC_TAG $LIBXML2_TAG $MBEDTLS_TAG $SRT_TAG $SELF_HASH"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Demuxers / decoders / parsers / bsfs: the list every platform shares (#201).
+# shellcheck source=ffmpeg_components.sh
+. "$SCRIPT_DIR/ffmpeg_components.sh"
+SELF_HASH="$(cat "$0" "$SCRIPT_DIR/ffmpeg_components.sh" "$SCRIPT_DIR"/ffmpeg-patches/*.patch | sha256sum | cut -c1-16)"
+STAMP="$FFMPEG_SHA $NVCODEC_TAG $LIBXML2_TAG $MBEDTLS_TAG $SRT_TAG $DAV1D_TAG $SELF_HASH"
 if [ -f "$PREFIX/.stamp" ] && [ "$(cat "$PREFIX/.stamp")" = "$STAMP" ]; then
     echo "==> slim FFmpeg cached at $PREFIX ($STAMP)"
     exit 0
@@ -65,6 +73,7 @@ fi
 command -v nasm >/dev/null || { echo "error: nasm not found (needed for FFmpeg's x86 SIMD)." >&2; exit 1; }
 pkg-config --exists libva libva-drm || { echo "error: libva-dev not found (VAAPI hwaccel)." >&2; exit 1; }
 command -v cmake >/dev/null || { echo "error: cmake not found (builds the static libxml2)." >&2; exit 1; }
+{ command -v meson && command -v ninja; } >/dev/null || { echo "error: meson + ninja not found (build the static dav1d)." >&2; exit 1; }
 
 # --- nv-codec-headers (header-only, installs ffnvcodec.pc) -------------------
 if [ ! -f "$NVSRC/Makefile" ]; then
@@ -123,6 +132,17 @@ if [ ! -f "$NETDEPS/lib/libsrt.a" ]; then
     cmake --build "$SRTSRC/_build" -j"$(nproc)" >/dev/null
     cmake --install "$SRTSRC/_build" >/dev/null
 fi
+# --- dav1d, static + PIC (AV1 software decode, #201) ---------------------------
+if [ ! -f "$NETDEPS/lib/libdav1d.a" ]; then
+    DAVSRC="/tmp/dav1d-src-$DAV1D_TAG"
+    rm -rf "$DAVSRC"
+    git clone -q --depth 1 --branch "$DAV1D_TAG" https://code.videolan.org/videolan/dav1d.git "$DAVSRC"
+    meson setup "$DAVSRC/_build" "$DAVSRC" --buildtype=release --default-library=static \
+        --prefix="$NETDEPS" --libdir=lib -Db_staticpic=true \
+        -Denable_tools=false -Denable_tests=false -Denable_examples=false >/dev/null
+    ninja -C "$DAVSRC/_build" >/dev/null
+    ninja -C "$DAVSRC/_build" install >/dev/null
+fi
 # Static-only dir: drop any shared object an install step left, so -L resolves to .a.
 rm -f "$NETDEPS"/lib/*.so*
 
@@ -141,6 +161,13 @@ Version: ${SRT_TAG#v}
 Cflags: -I$NETDEPS/include
 Libs: -L$NETDEPS/lib -lsrt -lmbedcrypto -lstdc++ -lpthread -lm
 EOF
+cat > "$NETDEPS/pc/dav1d.pc" <<EOF
+Name: dav1d
+Description: dav1d (static, AV1 software decode)
+Version: $DAV1D_TAG
+Cflags: -I$NETDEPS/include
+Libs: -L$NETDEPS/lib -ldav1d -lpthread -lm
+EOF
 export PKG_CONFIG_PATH="$NETDEPS/pc:$PKG_CONFIG_PATH"
 
 # --- FFmpeg source at the pinned commit ---------------------------------------
@@ -152,6 +179,9 @@ if [ ! -f "$SRC/configure" ]; then
     git -C "$SRC" checkout -q FETCH_HEAD
 fi
 
+# Upstream fixes on top of the pin (scripts/ffmpeg-patches, see ffmpeg_components.sh).
+ff_apply_patches "$SRC"
+
 BUILD="$SRC/_build-slim-linux"
 rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
 "$SRC/configure" \
@@ -162,12 +192,12 @@ rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
   --disable-avdevice --disable-avfilter \
   --enable-network --disable-autodetect --disable-debug \
   --enable-swscale --enable-swresample \
-  --enable-zlib --enable-libxml2 --enable-libsrt \
+  --enable-zlib --enable-libxml2 --enable-libsrt --enable-libdav1d \
   --enable-protocol=file,pipe,tcp,udp,rtp,http,rtmp,hls,crypto,data,libsrt \
-  --enable-demuxer=mov,matroska,mpegts,avi,flv,live_flv,rtsp,rtp,sdp,hls,dash,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v,mxf,image_dpx_pipe,image_exr_pipe \
-  --enable-decoder=h264,hevc,av1,vp9,vp8,mpeg4,mpeg2video,mpeg1video,mjpeg,png,bmp,tiff,webp,gif,prores,dnxhd,exr,dpx,aac,aac_latm,mp3,ac3,eac3,flac,opus,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8 \
-  --enable-parser=h264,hevc,av1,vp9,vp8,mpeg4video,mpegvideo,aac,aac_latm,ac3,flac,opus,vorbis,mjpeg,png \
-  --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,av1_frame_split,vp9_superframe,vp9_superframe_split,aac_adtstoasc,extract_extradata,mpeg4_unpack_bframes,null \
+  --enable-demuxer="$FF_DEMUXERS" \
+  --enable-decoder="$FF_DECODERS" \
+  --enable-parser="$FF_PARSERS" \
+  --enable-bsf="$FF_BSFS" \
   --enable-vaapi \
   --enable-ffnvcodec --enable-cuda --enable-nvdec \
   --enable-hwaccel=h264_vaapi,hevc_vaapi,av1_vaapi,vp9_vaapi,vp8_vaapi,mpeg2_vaapi,mpeg4_vaapi,h264_nvdec,hevc_nvdec,av1_nvdec,vp9_nvdec,vp8_nvdec,mpeg2_nvdec,mpeg4_nvdec
@@ -178,7 +208,8 @@ for want in CONFIG_VAAPI CONFIG_NVDEC CONFIG_H264_VAAPI_HWACCEL CONFIG_HEVC_NVDE
             CONFIG_NETWORK CONFIG_RTSP_DEMUXER CONFIG_HLS_DEMUXER CONFIG_UDP_PROTOCOL CONFIG_HTTP_PROTOCOL \
             CONFIG_EXR_DECODER CONFIG_PNG_DECODER CONFIG_DPX_DECODER CONFIG_PRORES_DECODER CONFIG_DNXHD_DECODER \
             CONFIG_MXF_DEMUXER CONFIG_IMAGE_EXR_PIPE_DEMUXER CONFIG_IMAGE_DPX_PIPE_DEMUXER \
-            CONFIG_LIBXML2 CONFIG_DASH_DEMUXER CONFIG_LIBSRT CONFIG_LIBSRT_PROTOCOL; do
+            CONFIG_LIBXML2 CONFIG_DASH_DEMUXER CONFIG_LIBSRT CONFIG_LIBSRT_PROTOCOL \
+            CONFIG_LIBDAV1D_DECODER CONFIG_VC1_DECODER CONFIG_JPEG2000_DECODER CONFIG_MPJPEG_DEMUXER CONFIG_WEBVTT_DEMUXER; do
     # (component switches live in config_components.h on FFmpeg >= 6). grep the files
     # directly: `cat ... | grep -q` under pipefail fails when grep -q exits on an early
     # match and cat dies of SIGPIPE (CONFIG_LIBXML2 sits near the top of config.h).

@@ -10,9 +10,10 @@
 # stock full build — cutting the demo's installer from ~46 MB to ~12 MB.
 #
 # HW decode is kept via D3D11VA + DXVA2 (covers Intel/AMD/NVIDIA on Windows);
-# x86 SIMD stays on (nasm) so software fallback isn't crippled. AV1 software
-# fallback uses FFmpeg's native decoder (no libdav1d) — only slower on GPUs that
-# lack AV1 hardware decode.
+# x86 SIMD stays on (nasm) so software fallback isn't crippled. AV1 needs D3D11VA:
+# FFmpeg's native av1 decoder is hardware-only and this build has no libdav1d (the
+# macOS and Linux builds link it statically, #201), so AV1 does not play on a GPU
+# without AV1 decode.
 #
 # Network input (#93, the live stream-URL source): network + the protocols and
 # demuxers a live stream needs — RTSP (+ RTP/SDP depacketizers), RTMP(S), UDP/RTP
@@ -30,6 +31,9 @@
 set -euo pipefail
 
 SRC="${FFMPEG_SRC:?set FFMPEG_SRC to the FFmpeg source dir}"
+# Demuxers / decoders / parsers / bsfs: the list every platform shares (#201).
+# shellcheck source=ffmpeg_components.sh
+. "$(cd "$(dirname "$0")" && pwd)/ffmpeg_components.sh"
 PREFIX="${FFMPEG_PREFIX:?set FFMPEG_PREFIX to the install prefix}"
 
 # The MSVC link.exe/cl.exe must win over the shell's /usr/bin/link.exe (the classic
@@ -188,6 +192,9 @@ echo "netdeps=$NETDEPS_PREFIX (libxml2 $LIBXML2_TAG, mbedtls $MBEDTLS_TAG, srt $
 
 cd "$SRC"
 
+# Upstream fixes on top of the pin (scripts/ffmpeg-patches, see ffmpeg_components.sh).
+ff_apply_patches "$SRC"
+
 # configure (at the pinned commit and on master, 2026-09-30) hands compile-only
 # -D defines to the LINKER in test_ld, and since ~2024 it treats link.exe's
 # "LNK4044: unrecognized option" warning as a failed probe. The schannel probe
@@ -211,10 +218,10 @@ fi
   --enable-zlib --extra-cflags="-I$ZLIB_INC_W" --extra-ldflags="-LIBPATH:$ZLIB_LIB_W" \
   --pkg-config="$PKGCONF_SHIM" --enable-libxml2 --enable-libsrt \
   --enable-protocol=file,pipe,tcp,udp,rtp,http,https,tls,rtmp,rtmps,hls,crypto,data,libsrt \
-  --enable-demuxer=mov,matroska,mpegts,avi,flv,live_flv,rtsp,rtp,sdp,hls,dash,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v,mxf,image_dpx_pipe,image_exr_pipe \
-  --enable-decoder=h264,hevc,av1,vp9,vp8,mpeg4,mpeg2video,mpeg1video,mjpeg,png,bmp,tiff,webp,gif,prores,dnxhd,exr,dpx,aac,aac_latm,mp3,ac3,eac3,flac,opus,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8 \
-  --enable-parser=h264,hevc,av1,vp9,vp8,mpeg4video,mpegvideo,aac,aac_latm,ac3,flac,opus,vorbis,mjpeg,png \
-  --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,av1_frame_split,vp9_superframe,vp9_superframe_split,aac_adtstoasc,extract_extradata,mpeg4_unpack_bframes,null \
+  --enable-demuxer="$FF_DEMUXERS" \
+  --enable-decoder="$FF_DECODERS" \
+  --enable-parser="$FF_PARSERS" \
+  --enable-bsf="$FF_BSFS" \
   --enable-hwaccel=h264_d3d11va,h264_d3d11va2,h264_dxva2,hevc_d3d11va,hevc_d3d11va2,hevc_dxva2,av1_d3d11va,av1_d3d11va2,av1_dxva2,vp9_d3d11va,vp9_d3d11va2,vp9_dxva2 \
   --enable-d3d11va --enable-dxva2 \
   --enable-schannel
@@ -229,7 +236,8 @@ for want in CONFIG_NETWORK CONFIG_SCHANNEL CONFIG_TLS_PROTOCOL CONFIG_HTTPS_PROT
             CONFIG_ZLIB CONFIG_EXR_DECODER CONFIG_PNG_DECODER CONFIG_DPX_DECODER \
             CONFIG_PRORES_DECODER CONFIG_DNXHD_DECODER CONFIG_MXF_DEMUXER \
             CONFIG_IMAGE_EXR_PIPE_DEMUXER CONFIG_IMAGE_DPX_PIPE_DEMUXER \
-            CONFIG_LIBXML2 CONFIG_DASH_DEMUXER CONFIG_LIBSRT CONFIG_LIBSRT_PROTOCOL; do
+            CONFIG_LIBXML2 CONFIG_DASH_DEMUXER CONFIG_LIBSRT CONFIG_LIBSRT_PROTOCOL \
+            CONFIG_VC1_DECODER CONFIG_JPEG2000_DECODER CONFIG_MPJPEG_DEMUXER CONFIG_WEBVTT_DEMUXER; do
     # (component switches live in config_components.h on FFmpeg >= 6). grep the files
     # directly: `cat ... | grep -q` under pipefail fails when grep -q exits on an early
     # match and cat dies of SIGPIPE (CONFIG_LIBXML2 sits near the top of config.h).

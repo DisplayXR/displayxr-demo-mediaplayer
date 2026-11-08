@@ -6,6 +6,9 @@
 # macOS/Linux with "bad interpreter".
 *.sh text eol=lf
 
+# Upstream FFmpeg patches (scripts/ffmpeg-patches/): LF, as git apply expects.
+*.patch text eol=lf
+
 # Windows batch + NSIS scripts are CRLF.
 *.bat text eol=crlf
 *.nsi text eol=crlf
