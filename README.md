@@ -253,7 +253,7 @@ and **Stop live** in the same menu ends it. Audio in a stream is ignored for now
 | `udp://` / `rtp://` | MPEG-TS over UDP (unicast or multicast, `udp://@239.0.0.1:1234`). |
 | `http://` / `https://` | progressive MPEG-TS / FLV / fragmented MP4. |
 | `*.m3u8` | HLS, local or remote. Its latency is the playlist's (seconds), not the player's. |
-| `*.mpd` | MPEG-DASH, VOD or live (dynamic MPD), local or remote (#195). Like HLS, its latency is the manifest's. Of several video representations FFmpeg's best-stream pick takes the highest bitrate. Every desktop build (macOS since #201). |
+| `*.mpd` | MPEG-DASH, VOD or live (dynamic MPD), local or remote (#195). Like HLS, its latency is the manifest's, and the rendition adapts to the network (below). Every desktop build (macOS since #201). |
 | `srt://` | SRT (#198), caller by default: `srt://host:9000`. Options go in the query and are FFmpeg's libsrt ones: `mode=caller\|listener`, `streamid=…` (for example a media server's `read:<path>`), `passphrase=…` (AES; redacted in logs and `get_status`) and `latency=` in **microseconds** (`latency=200000` = 200 ms; libsrt's default is 120 ms). As a listener (`srt://0.0.0.0:9000?mode=listener`) the player waits up to 30 s for the sender. Every desktop build (macOS since #201). |
 
 **Latency.** Demuxing runs with `fflags=nobuffer`, a 0.5 s `max_delay`, a small probe
@@ -269,6 +269,19 @@ live stream plays smoothly instead of in segment-sized bursts. When the network 
 than the stream the picture waits ("stall", counted in the 5 s `Stream:` log line and in
 `get_status` `stream_stalls`), then resumes once a second of media is queued again. Push
 protocols (RTSP, SRT, UDP, RTMP) are still shown as soon as each frame decodes.
+
+**Adaptive bitrate (#205).** When an HLS master playlist or a DASH manifest offers several
+video renditions, the player starts on the best one within 3 Mbit/s, measures the
+download throughput and the media queued ahead of the picture, and moves up or down the
+ladder at segment boundaries without a gap or a repeated frame. The STREAM pill and the
+`Stream:` log line show the rendition (`720p auto`). Agents fix it with the MCP tool
+`set_stream_quality {quality: "auto" | <index> | "1080p"}` (index 0 = lowest bandwidth;
+`get_status` lists `stream_renditions` and reports `stream_rendition`,
+`stream_estimate_kbps`, `stream_buffer_s` and `stream_switches`);
+`MEDIAPLAYER_STREAM_QUALITY=<index>` does the same from the start. A change shows once the
+media already queued has played (up to 10 s). FFmpeg cannot abort a segment download, so
+a switch also waits for the old rendition's segment in flight; on a sudden collapse of the
+network the player drops it instead and skips that part of the segment.
 
 **Reconnect.** A stream that stops (the sender is killed or the network drops) is detected
 after 5 s without data (15 s for HLS and DASH). The pill turns amber (RECONNECTING) and the player
