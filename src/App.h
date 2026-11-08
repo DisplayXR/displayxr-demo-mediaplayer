@@ -187,6 +187,8 @@ private:
     void PollStream();
     void OpenUrlPrompt();                 // Ctrl+U / the combo row: the URL popup
     std::string StreamStatusText() const; // STREAM | FROZEN | CONNECTING | RECONNECTING | FAILED
+    // HLS / DASH rendition for the HUD / logs (#205): "720p auto", "1080p" (manual), "" (none).
+    std::string StreamQualityLabel(const VideoDecoder::StreamStats& ss) const;
 
     // Auto-convergence (#92). DEFAULT OFF: raw footage stays raw unless the operator turns
     // it on. SetAutoConv toggles; the policy cycles nearest -> sharp -> centre (Focus is

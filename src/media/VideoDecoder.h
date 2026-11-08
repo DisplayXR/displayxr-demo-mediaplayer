@@ -31,6 +31,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 struct AVFrame;  // FFmpeg (global scope)
 
@@ -59,6 +60,13 @@ public:
         uint64_t frames = 0;         // decoded + published this session
         uint64_t dropped = 0;        // published over a frame the renderer never took
         uint64_t stalls = 0;         // HLS / DASH: the picture waited on the network (#197)
+        // HLS / DASH adaptive bitrate (#205). rung indexes GetStreamRungs() (ascending
+        // bandwidth); -1 / 0 rungs for a push protocol.
+        int rung = -1;               // the rendition being shown
+        int rungs = 0;               // renditions this build can decode
+        int switches = 0;            // completed rendition switches this session
+        float estKbps = 0.0f;        // measured download throughput (EWMA)
+        float bufferSec = 0.0f;      // media queued ahead of the picture
         int reconnects = 0;          // times the stream came back after a loss
         double connectMs = 0.0;      // open -> first frame of the current connection
         std::string lastError;       // last connect / read failure ("" = none)
@@ -72,6 +80,18 @@ public:
     bool Seekable() const { return !live_; }
     StreamState GetStreamState() const { return streamState_.load(); }
     StreamStats GetStreamStats() const;
+    // HLS / DASH renditions (#205), ascending advertised bandwidth; empty before the
+    // stream opens and for push protocols.
+    struct StreamRung {
+        int width = 0, height = 0;
+        int64_t bandwidth = 0;       // advertised, bit/s
+        std::string codec;           // FFmpeg decoder name
+    };
+    std::vector<StreamRung> GetStreamRungs() const;
+    // Quality: -1 = automatic (adaptive bitrate, the default), else a fixed rung index.
+    // Takes effect at the next segment boundary; OpenLive() resets it to automatic.
+    void SetStreamQuality(int rung) { qualityRequest_.store(rung < 0 ? -1 : rung); }
+    int StreamQuality() const { return qualityRequest_.load(); }
 
     // Play/pause: when paused the decode thread holds the current frame and the
     // presentation clock is frozen, so resume continues seamlessly (no fast-forward).
@@ -147,11 +167,13 @@ private:
     // DecodeLoop's frame->ring copier (AVFrame* passed as void*, header stays libav-free);
     // `timeBase` is re-pointed at each connection's video stream.
     void LiveLoop(const std::function<double(void*)>& fill, double& timeBase);
-    // HLS / DASH (#197): demux ahead on a second thread, show each frame at its PTS.
-    // Returns when the connection ends (err set) or on Stop(). `publish` / `tick` are
-    // LiveLoop's ring + stats hooks, `winBytes` its bitrate window.
-    void SegmentedPlayback(::AVFrame* frame, const std::function<double(void*)>& fill,
-                           int64_t readTimeoutNs,
+    // HLS / DASH (#197): demux ahead on a second thread, show each frame at its PTS, and
+    // adapt the rendition to the measured throughput (#205). Returns when the connection
+    // ends (err set; false = a rendition switch failed) or on Stop(). `publish` / `tick`
+    // are LiveLoop's ring + stats hooks, `winBytes` its bitrate window, `timeBase` is
+    // re-pointed on a switch.
+    bool SegmentedPlayback(::AVFrame* frame, const std::function<double(void*)>& fill,
+                           double& timeBase, int64_t readTimeoutNs,
                            const std::function<void(::AVFrame*, double)>& publish,
                            const std::function<void()>& tick, std::atomic<uint64_t>& winBytes,
                            std::string& err);
@@ -197,6 +219,17 @@ private:
     std::atomic<StreamState> streamState_{StreamState::Idle};
     std::atomic<int64_t> ioDeadlineNs_{0};      // steady-clock ns; 0 = no deadline
     std::atomic<bool> segAbort_{false};         // ends SegmentedPlayback's demux thread
+    // Adaptive bitrate (#205). rungs_ is written on the decode thread at each connect and
+    // read under statsMutex_; abrEstimateBps_ carries the last estimate into a reconnect.
+    struct Rung {
+        int stream = -1;             // AVStream index in the current connection
+        StreamRung info;
+    };
+    std::vector<Rung> rungs_;
+    std::atomic<int> qualityRequest_{-1};
+    double abrEstimateBps_ = 0.0;
+    static constexpr double kAbrStartBps = 3.0e6;  // first open: highest rung within this
+    int StartRung(const std::vector<Rung>& ladder) const;
     mutable std::mutex statsMutex_;
     StreamStats stats_;
     double durationSec_ = 0.0;                  // set in Open()
