@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ui/TransportUI.h"
+#include "ui/UiScale.h"
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "imgui.h"
 #endif
@@ -56,8 +58,9 @@ void ShowTransportToast(TransportState& s, std::string msg) {
 // rectangles without moving a single pixel.
 void ApplyMediaPlayerStyle(float k) {
     if (!(k > 0.0f)) k = 1.0f;
-    ImGui::StyleColorsDark();
     ImGuiStyle& s = ImGui::GetStyle();
+    s = ImGuiStyle();  // start from defaults so re-applying at a new UI scale never compounds
+    ImGui::StyleColorsDark();
 
     // ---- identical on every leg ----
     s.WindowRounding = 16.0f;
@@ -74,9 +77,6 @@ void ApplyMediaPlayerStyle(float k) {
     s.GrabMinSize = 18.0f * k;
     // Hit-only padding: enlarges the grab/press rectangles, draws nothing.
     s.TouchExtraPadding = (k > 1.0f) ? ImVec2(10.0f, 14.0f) : ImVec2(0.0f, 0.0f);
-    // Legible against the HUD canvas (the desktop's long-standing 1.9), nudged up
-    // slightly for arm's-length tablet viewing.
-    ImGui::GetIO().FontGlobalScale = 1.9f * (k > 1.0f ? 1.15f : 1.0f);
 
     const ImVec4 accent(0.20f, 0.65f, 1.00f, 1.00f);
     ImVec4* c = s.Colors;
@@ -91,6 +91,15 @@ void ApplyMediaPlayerStyle(float k) {
     c[ImGuiCol_SliderGrabActive] = ImVec4(0.40f, 0.78f, 1.00f, 1.00f);
     c[ImGuiCol_CheckMark] = accent;
     c[ImGuiCol_Text] = ImVec4(0.92f, 0.94f, 0.97f, 1.00f);
+
+    s.ScaleAllSizes(g_uiScale);
+}
+
+float UiFontPx(float k) {
+    // Touch is bigger for arm's-length tablet viewing: 30 is 40 px on the 320 dpi NP02J,
+    // 16 is 40 px at Windows' 250%. Rounded up to a whole pixel; the epsilon keeps float
+    // error (320 / 240 = 1.3333334f) from pushing a whole size to the next one.
+    return std::ceil((k > 1.0f ? 30.0f : 16.0f) * g_uiScale - 0.001f);
 }
 
 namespace {
@@ -200,7 +209,7 @@ bool IconButton(const char* id, Icon kind, float size, bool active = false,
 // Returns true on a value change; `outActive` reports the held state. Both have
 // exactly the semantics the caller's scrub machine expects from SliderFloat.
 bool ScrubBar(const char* id, float* v, float vmax, float width, bool* outActive) {
-    if (width < 8.0f) width = 8.0f;
+    if (width < Px(8.0f)) width = Px(8.0f);
     const float rowH = ImGui::GetFrameHeight();
     const ImVec2 p = ImGui::GetCursorScreenPos();
 
@@ -223,13 +232,15 @@ bool ScrubBar(const char* id, float* v, float vmax, float width, bool* outActive
     const float cy = p.y + rowH * 0.5f;
     // Track thickness scales with the row so the touch build stays proportionate,
     // but stays genuinely thin.
-    const float th = std::max(3.0f, rowH * 0.085f);
+    const float th = std::max(Px(3.0f), rowH * 0.085f);
     const float knobR = th * ((hovered || active) ? 2.2f : 1.7f);
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
     // Unplayed track, then the played portion in the accent colour.
+    // FrameBg is tuned for widgets on a panel and all but vanishes on the dark strip: a
+    // translucent text tint reads on any background and stays clearly below the accent.
     dl->AddRectFilled(ImVec2(p.x, cy - th * 0.5f), ImVec2(p.x + width, cy + th * 0.5f),
-                      ImGui::GetColorU32(ImGuiCol_FrameBg), th * 0.5f);
+                      ImGui::GetColorU32(ImGuiCol_Text, (hovered || active) ? 0.38f : 0.26f), th * 0.5f);
     if (frac > 0.0f) {
         dl->AddRectFilled(ImVec2(p.x, cy - th * 0.5f), ImVec2(p.x + width * frac, cy + th * 0.5f),
                           ImGui::GetColorU32(ImGuiCol_SliderGrab), th * 0.5f);
@@ -300,7 +311,7 @@ void UrlPopup(TransportState& s, const TransportActions& a) {
     if (!ImGui::BeginPopupModal(kTitle, nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
         return;
-    ImGui::TextUnformatted("rtsp:// rtmp:// udp:// rtp:// http(s):// or .m3u8");
+    ImGui::TextUnformatted("rtsp:// rtmp:// srt:// udp:// rtp:// http(s):// .m3u8 or .mpd");
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 30.0f);
     bool connect = ImGui::InputText("##url", s.urlBuf, sizeof(s.urlBuf),
@@ -401,6 +412,7 @@ void StreamPill(const TransportState& s, const TransportActions& a) {
 void BuildTransportUI(TransportState& s, const TransportActions& a) {
     ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    g_transportTop = 0.0f;
     const ImGuiWindowFlags pill = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
                                   ImGuiWindowFlags_NoBringToFrontOnFocus |
@@ -417,7 +429,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
         ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
         const ImGuiWindowFlags topbar = pill & ~ImGuiWindowFlags_AlwaysAutoResize;
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);  // flat bar, flush to edges
-        if (ImGui::Begin("##wsui_top", nullptr, topbar)) {
+        if (!s.stripOnly && ImGui::Begin("##wsui_top", nullptr, topbar)) {
             ImGui::BeginDisabled(s.openFilePending);
             if (ImGui::Button("Open")) Fire(a.Open);
             ImGui::EndDisabled();
@@ -473,7 +485,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     ImGui::SetNextItemWidth(std::min(ImGui::CalcTextSize(preview).x +
                                                          ImGui::GetFrameHeight() +
                                                          st.FramePadding.x * 2.0f,
-                                                     280.0f));
+                                                     Px(280.0f)));
                     if (ImGui::BeginCombo("##convert3d_provider", preview)) {
                         for (int i = 0; i < (int)s.convertProviders.size(); ++i) {
                             const ConvertProviderRow& row = s.convertProviders[i];
@@ -506,11 +518,11 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                         ImGui::PushID(f);
                         ImGui::AlignTextToFramePadding();
                         ImGui::TextUnformatted(fam.label.c_str());
-                        ImGui::SameLine(110.0f);
+                        ImGui::SameLine(Px(110.0f));
                         const bool valid =
                             fam.enabled && fam.current >= 0 && fam.current < (int)fam.rows.size();
                         ImGui::BeginDisabled(!fam.enabled);
-                        ImGui::SetNextItemWidth(260.0f);
+                        ImGui::SetNextItemWidth(Px(260.0f));
                         if (ImGui::BeginCombo("##family", valid ? fam.rows[fam.current].c_str()
                                                                 : "no provider")) {
                             for (int r = 0; r < (int)fam.rows.size(); ++r) {
@@ -577,16 +589,31 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     Fire(a.ToggleSlideshow);
             }
         }
-        ImGui::End();
+        if (!s.stripOnly) ImGui::End();
         ImGui::PopStyleVar();
 
         // --- Bottom transport: play/pause + scrubber + loop (video only) ---
         if (s.isVideo && s.durationSeconds > 0.0) {
-            ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.955f), ImGuiCond_Always,
-                                    ImVec2(0.5f, 1.0f));
-            ImGui::SetNextWindowSize(ImVec2(W * 0.8f, 0.0f), ImGuiCond_Always);
+            // The strip sits flush on the bottom edge, full width and flat, so it covers as
+            // little of the picture as possible (usually only the letterbox). Pro's full UI
+            // (side panels up) uses it too: the floating 80%-wide pill ran under the
+            // Station / Inspector panels, while the strip lands in the gap below them
+            // (the panels stop 90 px above the bottom edge, the scopes 52 px).
+            const bool strip = s.stripOnly || s.panelsOn;
+            if (strip) {
+                ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+                ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                                    ImVec2(ImGui::GetStyle().WindowPadding.x, 4.0f));
+            } else {
+                ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.955f), ImGuiCond_Always,
+                                        ImVec2(0.5f, 1.0f));
+                ImGui::SetNextWindowSize(ImVec2(W * 0.8f, 0.0f), ImGuiCond_Always);
+            }
             const ImGuiWindowFlags bar = pill & ~ImGuiWindowFlags_AlwaysAutoResize;
             if (ImGui::Begin("##transport", nullptr, bar)) {
+                if (s.fadeAlpha > 0.01f) g_transportTop = ImGui::GetWindowPos().y;
                 const float dur = (float)s.durationSeconds;
                 const float pos = (float)s.positionSeconds;
                 // Track playback into the knob, but not while dragging, and not while a
@@ -603,26 +630,81 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     const int t = (int)sec;
                     std::snprintf(out, n, "%d:%02d", t / 60, t % 60);
                 };
-                char cur[16], tot[16];
+                char cur[16], tot[16], frm[32] = "";
                 mmss(s.scrubValue, cur, sizeof(cur));
                 mmss(dur, tot, sizeof(tot));
+                const bool showFrame = s.frameRate > 0.0;  // Pro: the frame number after the time
+                if (showFrame)
+                    std::snprintf(frm, sizeof(frm), "f %lld",
+                                  (long long)std::llround(s.scrubValue * s.frameRate));
 
                 if (IconButton("##playpause", s.paused ? Icon::Play : Icon::Pause, iconSz, false,
                                s.hitTargetScale))
                     Fire(a.TogglePlayback);
+                // A touch leg's icon hit boxes are taller than a frame: drop the frame-high
+                // items (times, scrubber) to the middle of the row.
+                const float rowPad = iconSz * (std::max(1.0f, s.hitTargetScale) - 1.0f) * 0.5f;
                 ImGui::SameLine();
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
+                // Time and frame number each sit in their OWN fixed slot, sized for the
+                // widest value this clip can produce (its duration / last frame, every
+                // digit as the font's widest digit). Drawn at natural width the label
+                // pushed the scrubber sideways as digits changed; drawn as one string,
+                // the time slid left whenever the frame number gained a digit. Now the
+                // time is right-aligned in its slot and the frame number left-aligned in
+                // its own, so neither moves the other and nothing moves the scrubber.
+                char wideDigit = '0';
+                float wideDigitW = 0.0f;
+                for (char d = '0'; d <= '9'; d++) {
+                    const char ds[2] = {d, '\0'};
+                    const float w = ImGui::CalcTextSize(ds).x;
+                    if (w > wideDigitW) {
+                        wideDigitW = w;
+                        wideDigit = d;
+                    }
+                }
+                auto slotW = [wideDigit](const char* sample) {
+                    char buf[48];
+                    std::snprintf(buf, sizeof(buf), "%s", sample);
+                    for (char* p = buf; *p; p++)
+                        if (*p >= '0' && *p <= '9') *p = wideDigit;
+                    return ImGui::CalcTextSize(buf).x;
+                };
+                const float timeSlotW = std::max(slotW(tot), ImGui::CalcTextSize(cur).x);
+                float frameSlotW = 0.0f;
+                if (showFrame) {
+                    char lastFrm[32];
+                    std::snprintf(lastFrm, sizeof(lastFrm), "f %lld",
+                                  (long long)std::llround((double)dur * s.frameRate));
+                    frameSlotW = std::max(slotW(lastFrm), ImGui::CalcTextSize(frm).x);
+                }
+                const float labelGap = ImGui::CalcTextSize("  ").x;
+                const float curX = ImGui::GetCursorPosX();
+                ImGui::SetCursorPosX(curX + timeSlotW - ImGui::CalcTextSize(cur).x);
                 ImGui::AlignTextToFramePadding();
                 ImGui::Text("%s", cur);
-                ImGui::SameLine();
+                float labelW = timeSlotW;
+                if (showFrame) {
+                    ImGui::SameLine(curX + timeSlotW + labelGap);
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("%s", frm);
+                    labelW += labelGap + frameSlotW;
+                }
+                ImGui::SameLine(curX + labelW + ImGui::GetStyle().ItemSpacing.x);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
                 // Leave room on the right for the total-time label + mute + loop icons.
                 // Derived from the live style rather than a magic constant, so the
                 // touch build spaces correctly instead of crowding the total time.
                 const ImGuiStyle& st = ImGui::GetStyle();
                 const int rightIcons = (s.caps.mute ? 1 : 0) + (s.caps.loop ? 1 : 0);
+                const float panelsW = s.panelsButton ? ImGui::CalcTextSize("Panels").x +
+                                                           st.FramePadding.x * 2.0f + st.ItemSpacing.x
+                                                     : 0.0f;
                 const float rightW = ImGui::CalcTextSize(tot).x +
                                      (float)rightIcons * (iconSz * s.hitTargetScale) +
                                      (float)(rightIcons + 2) * st.ItemSpacing.x +
-                                     st.WindowPadding.x;
+                                     st.WindowPadding.x + panelsW;
                 bool active = false;
                 const bool changed = ScrubBar("##scrub", &s.scrubValue, dur,
                                               ImGui::GetContentRegionAvail().x - rightW, &active);
@@ -648,6 +730,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 s.scrubActive = active;
                 s.lastScrubValue = s.scrubValue;
                 ImGui::SameLine();
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
                 ImGui::AlignTextToFramePadding();
                 ImGui::Text("%s", tot);
                 if (s.caps.mute) {
@@ -661,8 +744,17 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     if (IconButton("##loop", Icon::Loop, iconSz, s.loop, s.hitTargetScale))
                         Fire(a.ToggleLoop);
                 }
+                if (s.panelsButton) {
+                    ImGui::SameLine();
+                    if (s.panelsOn)
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                    if (ImGui::Button("Panels")) Fire(a.TogglePanels);
+                    if (s.panelsOn) ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip(s.panelsOn ? "Hide panels (Tab)" : "Show panels (Tab)");
+                }
             }
             ImGui::End();
+            if (strip) ImGui::PopStyleVar(2);
         }
         ImGui::PopStyleVar();
     }

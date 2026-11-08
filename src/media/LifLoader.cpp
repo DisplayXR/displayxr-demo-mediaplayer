@@ -177,6 +177,11 @@ bool LifLoader::IsLif(const std::string& path) {
     return (bool)f && tail[0] == 0x1E && tail[1] == 0x1A;
 }
 
+bool LifLoader::IsLif(const ReadAtFn& readAt, uint64_t fileSize) {
+    unsigned char tail[2] = {0, 0};
+    return fileSize >= 2 && readAt(fileSize - 2, tail, 2) && tail[0] == 0x1E && tail[1] == 0x1A;
+}
+
 LifResult LifLoader::Load(const std::string& path) {
     std::vector<uint8_t> buf;
     if (!ReadWholeFile(path, buf)) {

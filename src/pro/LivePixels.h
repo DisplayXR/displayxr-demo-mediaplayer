@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Pixel helpers for live capture sources: an SDI/HDMI card delivers 8-bit 4:2:2 YUV
-// (UYVY) or 8-bit RGB (BGRA); the renderer takes NV12. Each eye is converted straight
+// Pixel helpers for live capture sources: an SDI/HDMI card delivers 4:2:2 YUV (UYVY,
+// v210) or RGB (BGRA, r210); the renderer takes NV12 / P016. Each eye is converted straight
 // into its place in a side-by-side NV12 frame, so a two-input pair costs one pass and
 // no extra copy. Pure functions, unit-tested (tests/live_pixels_test.cpp).
 #pragma once
@@ -50,6 +50,11 @@ struct P016 {
 void V210ToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0);
 void UyvyToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0);
 void BgraToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0);
+// r210 (DeckLink bmdFormat10BitRGB, an RGB 4:4:4 signal at 10 bits): one big-endian 32-bit
+// word per pixel, 2 unused bits then R G B at 10 bits each, SMPTE levels (64-940). Encoded to
+// limited-range Y'CbCr with `matrix` (dst.matrix is set to it), so the 10 bits reach the
+// grade; 4:4:4 -> 4:2:0 averages each 2x2 block's RGB.
+void R210ToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0, ColorMatrix matrix);
 void CopyEye(P016& dst, int x0, int x1, int w);
 
 }  // namespace mp::livepix

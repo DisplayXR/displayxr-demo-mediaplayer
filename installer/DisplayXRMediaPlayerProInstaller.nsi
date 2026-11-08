@@ -9,7 +9,8 @@
 ;
 ; Build: makensis /DVERSION=0.1.0 /DBIN_DIR=<build-dir> /DSOURCE_DIR=<repo-root> /DOUTPUT_DIR=<output-dir> DisplayXRMediaPlayerProInstaller.nsi
 ;
-; Hard-prereqs the DisplayXR runtime (HKLM\Software\DisplayXR\Runtime\InstallPath).
+; Hard-prereqs the DisplayXR runtime (HKLM\Software\DisplayXR\Runtime\InstallPath) and
+; warns below MIN_RUNTIME_VERSION (HKLM ...\Runtime "Version").
 ; Installs the Pro exe + its runtime DLLs (SDL3 + FFmpeg) + a bundled sample
 ; stereo image to Program Files\DisplayXR\Apps\MediaPlayerPro\. Drops a
 ; registered-mode app manifest under %ProgramData%\DisplayXR\apps\ so the
@@ -91,6 +92,12 @@ ShowUninstDetails show
 !include "LogicLib.nsh"
 !include "WordFunc.nsh"
 
+; The runtime this release is checked against (#169): 2.61 keys display calibration
+; by the display's stable key. A warning, not a gate (see .onInit).
+!ifndef MIN_RUNTIME_VERSION
+    !define MIN_RUNTIME_VERSION "2.61.0"
+!endif
+
 ;--------------------------------
 ; Abort a pre-flight check without ever showing a modal in silent mode.
 ;
@@ -159,9 +166,30 @@ Function .onInit
     ${If} $0 == ""
         !insertmacro AbortWithReason 4 "DisplayXR runtime is not installed.$\r$\n$\r$\nInstall the DisplayXR runtime first, then re-run this installer.$\r$\n$\r$\nGet it from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
     ${EndIf}
-    ; Presence is the only hard gate. A minimum-version covenant can be added
-    ; here (VersionCompare against HKLM ...\Runtime "Version") once a verified
-    ; floor is established — see README "Runtime compatibility".
+    ; Presence is the only hard gate. The runtime version is a warning (#169):
+    ; ${MIN_RUNTIME_VERSION} keys display calibration by the display's stable key; an
+    ; older runtime falls back to the device name, so a calibration .cube can be
+    ; applied to the wrong panel. Interactive: warn, default to No, let the user go
+    ; on. Silent (the bundle, which installs the runtime first): go on, no modal.
+    SetRegView 64
+    ReadRegStr $1 HKLM "Software\DisplayXR\Runtime" "Version"
+    SetRegView 32
+    ; A dev runtime stamps "2.61.0-3-gabc123" or "2.61.0+3.gabc123": compare X.Y.Z.
+    ${WordFind} "$1" "-" "+1{" $2
+    ${WordFind} "$2" "+" "+1{" $2
+    StrCpy $3 "2"  ; no version value at all: treat as older
+    ${If} $2 != ""
+        ${VersionCompare} "$2" "${MIN_RUNTIME_VERSION}" $3  ; 2 = installed is older
+    ${EndIf}
+    ${If} $3 == "2"
+    ${AndIfNot} ${Silent}
+        ${If} $1 == ""
+            StrCpy $1 "unknown"
+        ${EndIf}
+        MessageBox MB_YESNO|MB_ICONEXCLAMATION|MB_DEFBUTTON2 "Media Player Pro needs DisplayXR runtime ${MIN_RUNTIME_VERSION} or newer; version $1 is installed.$\r$\n$\r$\nWith an older runtime, display calibration is keyed by the display's device name instead of its stable key, so a calibration can be applied to the wrong panel.$\r$\n$\r$\nUpdate the runtime from https://github.com/DisplayXR/displayxr-runtime/releases$\r$\n$\r$\nInstall anyway?" IDYES runtime_floor_ok
+        Abort
+    ${EndIf}
+    runtime_floor_ok:
 FunctionEnd
 
 ;--------------------------------
@@ -188,6 +216,8 @@ Section "Media Player Pro" SecPro
     File "${BIN_DIR}\avutil-*.dll"
     File "${BIN_DIR}\swscale-*.dll"
     File "${BIN_DIR}\swresample-*.dll"
+    ; Licences of OpenColorIO and its dependencies, linked statically into the exe.
+    File /nonfatal "${BIN_DIR}\OCIO-THIRD-PARTY-NOTICES.txt"
 
     ; Bundled sample stereo image (auto-loaded by the Start Menu shortcut).
     File "${SOURCE_DIR}\assets\test_LR_2x1.png"
@@ -288,6 +318,17 @@ Section "DaVinci Resolve panel" SecResolve
     SetOutPath "$INSTDIR"
 SectionEnd
 
+; The station acceptance kit (#142, docs/STATION-ACCEPTANCE.md): run on a new station with
+;   powershell -ExecutionPolicy Bypass -File "<install dir>\tools\acceptance\station_acceptance.ps1" -DeckLink
+; It finds the installed player through HKLM\Software\DisplayXR\Apps\MediaPlayerPro.
+Section "Station acceptance kit" SecAcceptance
+    SetShellVarContext all
+    SetOutPath "$INSTDIR\tools\acceptance"
+    File "${SOURCE_DIR}\scripts\station_acceptance.ps1"
+    File "${SOURCE_DIR}\docs\STATION-ACCEPTANCE.md"
+    SetOutPath "$INSTDIR"
+SectionEnd
+
 Section "Start Menu Shortcut" SecShortcut
     SetShellVarContext all
     CreateDirectory "$SMPROGRAMS\DisplayXR"
@@ -325,6 +366,7 @@ Section "Uninstall"
     ; Remove install dir contents.
     Delete "$INSTDIR\mediaplayer_pro_handle_vk_win.exe"
     Delete "$INSTDIR\*.dll"
+    Delete "$INSTDIR\OCIO-THIRD-PARTY-NOTICES.txt"
     Delete "$INSTDIR\test_LR_2x1.png"
     Delete "$INSTDIR\displayxr\icon.png"
     Delete "$INSTDIR\displayxr\icon_sbs.png"
@@ -336,6 +378,9 @@ Section "Uninstall"
     RMDir "$INSTDIR\displayxr"
     Delete "$INSTDIR\tools\resolve\DisplayXR_Station_Panel.py"
     RMDir "$INSTDIR\tools\resolve"
+    Delete "$INSTDIR\tools\acceptance\station_acceptance.ps1"
+    Delete "$INSTDIR\tools\acceptance\STATION-ACCEPTANCE.md"
+    RMDir "$INSTDIR\tools\acceptance"
     RMDir "$INSTDIR\tools"
     Delete "$APPDATA\Blackmagic Design\DaVinci Resolve\Support\Workflow Integration Plugins\DisplayXR_Station_Panel.py"
     Delete "$INSTDIR\Uninstall.exe"

@@ -50,6 +50,15 @@ public:
               VkDevice device, VkQueue queue, uint32_t queueFamily, VkFormat hudFormat,
               uint32_t hudWidth, uint32_t hudHeight, const std::vector<VkImage>& hudImages,
               uint32_t framesInFlight = 3);
+    // A touch leg's ui::ApplyMediaPlayerStyle metric scale. Set before Init, which applies
+    // the style and rasterizes the font at ui::UiFontPx(scale).
+    void SetMetricScale(float scale) { metricScale_ = scale; }
+    // Before Init: the HUD swapchain was created with XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT,
+    // so an _SRGB HUD can be drawn through a UNORM view of its images (no staging copy).
+    void SetMutableHud(bool on) { mutableHud_ = on; }
+    // HUD pixels per design unit (ui/UiScale.h). Before Init it only records the scale;
+    // after Init a change rebuilds the font and the style at the new scale.
+    void SetUiScale(float scale);
     void Shutdown();
     bool Ready() const { return ready_; }
 
@@ -132,6 +141,8 @@ private:
     void DestroyTargetObjects();
 
     bool ready_ = false;
+    float metricScale_ = 1.0f;
+    void AddUiFont();
     void* nativeWindow_ = nullptr;  // borrowed SDL_Window*; used to fetch the live HWND (Win32)
     // Cursor in window points from SDL motion events — a fallback source. On Windows the
     // primary source is the raw WM_MOUSEMOVE position captured by the window-proc subclass
@@ -181,6 +192,9 @@ private:
     // bytes untouched — the matched transfer for encoded content. (A blit would
     // convert and double-apply.) On the UNORM path these stay null and ImGui renders
     // directly into the swapchain image, byte for byte as before.
+    // A MUTABLE_FORMAT HUD skips the staging: a UNORM view of the swapchain image stores
+    // the same bytes. On Adreno the copy cost 9-12 ms of CPU a frame at 2560x1600.
+    bool mutableHud_ = false;
     VkImage stagingImage_ = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory_ = VK_NULL_HANDLE;
     VkImageView stagingView_ = VK_NULL_HANDLE;

@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -235,6 +236,27 @@ void TestTruncatedRegion() {
     CHECK(r.ok, "trunc: ok (fell back to base JPEG, no crash)");
 }
 
+// IsLif through a callback (the media browser's 3D badge, #160); here the bytes are in
+// memory.
+bool IsLifBytes(const std::vector<uint8_t>& bytes) {
+    return LifLoader::IsLif(
+        [&](uint64_t off, void* dst, size_t n) {
+            if (off + n > bytes.size()) return false;
+            std::memcpy(dst, bytes.data() + off, n);
+            return true;
+        },
+        bytes.size());
+}
+
+void TestIsLifReadAt() {
+    std::printf("[IsLif without a path]\n");
+    const auto red = MakeSolidJpeg(kW, kH, 220, 30, 30);
+    const std::string one = R"({"views":[{"image":{"blob_id":-1},"position":[0,0,0]}]})";
+    CHECK(IsLifBytes(BuildLif(red, {{8, JsonBytes(one)}})), "read-at: a LIF");
+    CHECK(!IsLifBytes(red), "read-at: a plain JPEG");
+    CHECK(!IsLifBytes({0x1A}), "read-at: shorter than the trailer");
+}
+
 } // namespace
 
 int main() {
@@ -245,6 +267,7 @@ int main() {
     TestMonoFallbackOneView();
     TestNonLifFallback();
     TestTruncatedRegion();
+    TestIsLifReadAt();
     if (g_failures == 0) {
         std::printf("ALL PASSED\n");
         return 0;

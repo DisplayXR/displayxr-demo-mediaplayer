@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "media/VideoDecoder.h"
 #include "media/ImageSequence.h"
+#include "media/StreamUrl.h"
 
 #include "Log.h"
+#include "color/ToneMap.h"  // scene-linear EXR -> PQ code (#134)
 
 #include <algorithm>
 #include <cctype>
@@ -33,6 +35,7 @@ extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>  // <d3d11.h> already included above (guarded)
 #endif
 #include <libavutil/imgutils.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
@@ -54,6 +57,8 @@ struct HwFormatHook {
 
 // The stream's Y'CbCr matrix / transfer (FrameRing tags). The frame's own fields win, the
 // codec context's are the fallback; an unspecified matrix follows the SD/HD rule.
+static ColorTransfer TransferOf(const AVFrame* f, const AVCodecContext* c);
+
 static ColorMatrix MatrixOf(const AVFrame* f, const AVCodecContext* c) {
     AVColorSpace cs = f ? f->colorspace : AVCOL_SPC_UNSPECIFIED;
     if (cs == AVCOL_SPC_UNSPECIFIED && c) cs = c->colorspace;
@@ -64,7 +69,10 @@ static ColorMatrix MatrixOf(const AVFrame* f, const AVCodecContext* c) {
     case AVCOL_SPC_FCC: return ColorMatrix::BT601;
     case AVCOL_SPC_BT2020_NCL:
     case AVCOL_SPC_BT2020_CL: return ColorMatrix::BT2020;  // CL is rare; NCL is the closest we draw
-    default: return DefaultMatrixForHeight(f ? f->height : (c ? c->height : 0));
+    default:
+        // HLG and PQ are BT.2020 by definition: an untagged matrix does not follow the SD/HD rule.
+        if (TransferOf(f, c) != ColorTransfer::SDR) return ColorMatrix::BT2020;
+        return DefaultMatrixForHeight(f ? f->height : (c ? c->height : 0));
     }
 }
 
@@ -74,6 +82,53 @@ static ColorTransfer TransferOf(const AVFrame* f, const AVCodecContext* c) {
     if (t == AVCOL_TRC_ARIB_STD_B67) return ColorTransfer::HLG;
     if (t == AVCOL_TRC_SMPTE2084) return ColorTransfer::PQ;
     return ColorTransfer::SDR;
+}
+
+static bool PrimariesAre2020(const AVFrame* f, const AVCodecContext* c) {
+    AVColorPrimaries p = f ? f->color_primaries : AVCOL_PRI_UNSPECIFIED;
+    if (p == AVCOL_PRI_UNSPECIFIED && c) p = c->color_primaries;
+    // Untagged primaries on HLG / PQ: BT.2020, as for the matrix.
+    return p == AVCOL_PRI_BT2020 || (p == AVCOL_PRI_UNSPECIFIED && TransferOf(f, c) != ColorTransfer::SDR);
+}
+
+// The brightest the stream says it gets (nits): MaxCLL, else the mastering display's peak.
+// Frames carry it on keyframes (HEVC SEI), the container on the stream, so the last value
+// seen is kept. 0 = never said. A value below HDR reference white is not a believable peak for
+// HDR video, and trusting it would clip everything above it: it counts as not said.
+constexpr float kMinBelievablePeakNits = 203.0f;
+static float PeakNitsOf(const AVFrame* f) {
+    if (!f) return 0.0f;
+    if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL)) {
+        const auto* cll = (const AVContentLightMetadata*)sd->data;
+        if ((float)cll->MaxCLL >= kMinBelievablePeakNits) return (float)cll->MaxCLL;
+    }
+    if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) {
+        const auto* md = (const AVMasteringDisplayMetadata*)sd->data;
+        if (md->has_luminance && md->max_luminance.den > 0 && av_q2d(md->max_luminance) >= kMinBelievablePeakNits)
+            return (float)av_q2d(md->max_luminance);
+    }
+    return 0.0f;
+}
+static float StreamPeakNits(const AVStream* st) {
+#if LIBAVCODEC_VERSION_MAJOR < 61  // coded_side_data is FFmpeg 6.1+ (Ubuntu 22.04 has 4.4)
+    (void)st;
+    return 0.0f;
+#else
+    if (!st || !st->codecpar) return 0.0f;
+    const AVCodecParameters* cp = st->codecpar;
+    if (const AVPacketSideData* sd =
+            av_packet_side_data_get(cp->coded_side_data, cp->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL)) {
+        const auto* cll = (const AVContentLightMetadata*)sd->data;
+        if ((float)cll->MaxCLL >= kMinBelievablePeakNits) return (float)cll->MaxCLL;
+    }
+    if (const AVPacketSideData* sd = av_packet_side_data_get(cp->coded_side_data, cp->nb_coded_side_data,
+                                                             AV_PKT_DATA_MASTERING_DISPLAY_METADATA)) {
+        const auto* md = (const AVMasteringDisplayMetadata*)sd->data;
+        if (md->has_luminance && md->max_luminance.den > 0 && av_q2d(md->max_luminance) >= kMinBelievablePeakNits)
+            return (float)av_q2d(md->max_luminance);
+    }
+    return 0.0f;
+#endif
 }
 
 struct VideoDecoder::Impl {
@@ -92,7 +147,8 @@ struct VideoDecoder::Impl {
     AVFrame* f32Frame = nullptr;
     AVFrame* f32Out = nullptr;
     int swsFW = 0, swsFH = 0, swsFFmt = -1;
-    std::vector<float> oetf;                    // linear [0,1] -> sRGB samples, lerped
+    std::vector<float> oetf;                    // scene linear -> PQ code samples, lerped (#134)
+    float peakNits = 0.0f;                      // last light-level metadata seen (#134)
     // MV-HEVC (#154): both views are decoded and glued into one full-SBS frame.
     bool mv = false;
     AVFrame* mvPending = nullptr;               // the first view of the current pair
@@ -447,16 +503,12 @@ AVFrame* VideoDecoder::FloatToP016(AVFrame* src) {
         sws_scale(im.swsF, src->data, src->linesize, 0, src->height, im.f32Frame->data, im.f32Frame->linesize);
         g = im.f32Frame;
     }
-    // linear -> sRGB OETF as a lerped table: 16385 samples keep the error under 0.1 of a
-    // 16-bit code (the toe is linear, so it is exact there).
-    constexpr int kOetfN = 16384;
-    if (im.oetf.empty()) {
-        im.oetf.resize(kOetfN + 1);
-        for (int i = 0; i <= kOetfN; ++i) {
-            const double l = (double)i / kOetfN;
-            im.oetf[(size_t)i] = (float)(l <= 0.0031308 ? 12.92 * l : 1.055 * std::pow(l, 1.0 / 2.4) - 0.055);
-        }
-    }
+    // Scene linear -> PQ code of (linear x 203 nits) (#134): 1.0 is HDR reference white and
+    // values up to ~49x it survive, where the sRGB encode this replaced clipped at 1.0. The
+    // shader decodes it back (ColorTransfer::LinearPq). A lerped table indexed by the eighth
+    // root of the value, which straightens PQ's steep toe (color::EncodeLinearPq).
+    constexpr int kOetfN = color::kLinearPqTableN;
+    if (im.oetf.empty()) color::BuildLinearPqTable(im.oetf);
     if (!im.f32Out || im.f32Out->width != w || im.f32Out->height != h) {
         if (!im.f32Out) im.f32Out = av_frame_alloc();
         av_frame_unref(im.f32Out);
@@ -466,14 +518,8 @@ AVFrame* VideoDecoder::FloatToP016(AVFrame* src) {
         if (av_frame_get_buffer(im.f32Out, 32) < 0) return nullptr;
     }
     const float* lut = im.oetf.data();
-    // Branch-free: clamp to [0,1] (values > 1.0 clip - an OCIO view is the tool for HDR EXR;
-    // fmin/fmax also send NaN to 0), then lerp the table.
-    const int oetfN = kOetfN;  // a copy: MSVC will not capture a constexpr implicitly
-    auto enc = [lut, oetfN](float v) -> float {
-        const float t = std::fmin(std::fmax(v, 0.0f), 1.0f) * (float)oetfN;
-        const int i = (std::min)((int)t, oetfN - 1);  // parenthesised: windows.h min()
-        return lut[i] + (lut[i + 1] - lut[i]) * (t - (float)i);
-    };
+    (void)kOetfN;
+    auto enc = [lut](float v) -> float { return color::EncodeLinearPq(lut, v); };
     // 10-bit limited levels at 16-bit precision, MSB-aligned like P010 - what the shader's
     // P016 branch reads ((v*65535/64 - 64)/876): Y 64..940, C 64..960 (x64), fraction kept.
     auto q16 = [](float v) -> uint16_t { return (uint16_t)std::fmin(std::fmax(v + 0.5f, 0.0f), 65535.0f); };
@@ -588,6 +634,7 @@ bool VideoDecoder::Open(const std::string& path) {
     // as a second coded layer of the same stream. Decode both views and compose them side
     // by side, so the clip reaches the player as an ordinary full-SBS frame.
     impl_->mv = spatial::ff::IsMvHevcStream(impl_->fmt->streams[impl_->videoStream]);
+    impl_->peakNits = StreamPeakNits(impl_->fmt->streams[impl_->videoStream]);  // #134
     multiview_ = impl_->mv;
     multiviewEyesFromMeta_ = false;
     if (!OpenVideoCodec(dec, path)) {
@@ -737,7 +784,15 @@ void VideoDecoder::DecodeLoop() {
                      av_get_pix_fmt_name(hwFrames->sw_format));
             warnedZeroCopyFormat_ = true;
         }
-        if (interopActive_ && impl_->hwPixFmt != AV_PIX_FMT_NONE && f->format == impl_->hwPixFmt &&
+        // An HLG / PQ frame takes the CPU path too (#169): the convert pass hands over SDR RGBA,
+        // which carries no transfer, so Pro's tone map would be skipped (an 8-bit HDR stream
+        // showed as raw signal). The base player shows the same pixels either way.
+        const bool hdrFrame = TransferOf(f, impl_->codec) != ColorTransfer::SDR;
+        if (interopActive_ && hdrFrame && !warnedZeroCopyHdr_) {
+            LOG_INFO("VideoDecoder: HDR stream: zero-copy hands over SDR RGBA, using the CPU path");
+            warnedZeroCopyHdr_ = true;
+        }
+        if (interopActive_ && !hdrFrame && impl_->hwPixFmt != AV_PIX_FMT_NONE && f->format == impl_->hwPixFmt &&
             hwFrames && hwFrames->sw_format == AV_PIX_FMT_NV12 && impl_->d3dContext && impl_->d3dHwctx) {
             FrameRing::Frame& dst = ring_.WriteBuffer();
             // (Re)create this slot's shared RGBA texture on first use or a size change.
@@ -868,6 +923,9 @@ void VideoDecoder::DecodeLoop() {
                 dst.gpu = true;
                 dst.matrix = MatrixOf(f, impl_->codec);  // (applied above; the tag is for the UI / tools)
                 dst.transfer = TransferOf(f, impl_->codec);
+                dst.primaries2020 = PrimariesAre2020(f, impl_->codec);
+                if (const float pk = PeakNitsOf(f)) impl_->peakNits = pk;
+                dst.peakNits = impl_->peakNits;
                 const int64_t ticks = (f->best_effort_timestamp != AV_NOPTS_VALUE)
                                           ? f->best_effort_timestamp
                                           : f->pts;
@@ -989,6 +1047,13 @@ void VideoDecoder::DecodeLoop() {
         else
             dst.matrix = outFmt == PixFormat::P016 ? ColorMatrix::BT709 : ColorMatrix::BT601;
         dst.transfer = TransferOf(src, impl_->codec);
+        dst.primaries2020 = PrimariesAre2020(src, impl_->codec);
+        if (const float pk = PeakNitsOf(f)) impl_->peakNits = pk;  // f: the hw copy drops side data
+        dst.peakNits = impl_->peakNits;
+        if (outFmt == PixFormat::P016 && desc && (desc->flags & AV_PIX_FMT_FLAG_FLOAT)) {
+            dst.transfer = ColorTransfer::LinearPq;  // FloatToP016 stored PQ of linear x 203 nits
+            dst.primaries2020 = false;               // OpenEXR's default (linear Rec.709 / sRGB)
+        }
         const int cw = (yuv->width + 1) / 2, ch = (yuv->height + 1) / 2;
         copyPlane(dst.plane[0], yuv->data[0], yuv->linesize[0], yuv->width, yuv->height);
         if (outFmt == PixFormat::P016) {
@@ -1334,12 +1399,19 @@ std::string LowerScheme(const std::string& url) {
     return s;
 }
 
-bool IsHls(const std::string& url) {
-    std::string path = url.substr(0, url.find_first_of("?#"));
-    if (path.size() < 5) return false;
-    std::string ext = path.substr(path.size() - 5);
-    for (char& c : ext) c = (char)std::tolower((unsigned char)c);
-    return ext == ".m3u8";
+// HLS playlist or DASH manifest (#195): a segmented source. It opens by fetching a
+// manifest and then segments (DASH: the init segment of every representation), so it
+// gets the longer connect / read budgets and no tiny probe.
+bool IsSegmented(const std::string& url) { return stream::IsManifestPath(url); }
+
+// srt://...?mode=listener (case-insensitive): the player listens, the sender calls.
+bool IsSrtListener(const std::string& url) {
+    const size_t q = url.find('?');
+    if (q == std::string::npos) return false;
+    std::string query = url.substr(q + 1);
+    for (char& c : query) c = (char)std::tolower((unsigned char)c);
+    const size_t m = ("&" + query).find("&mode=listener");
+    return m != std::string::npos;
 }
 
 constexpr int64_t kSec = 1000000000LL;
@@ -1408,7 +1480,17 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
     // Low-latency demux. Unknown keys are simply left unconsumed by protocols/demuxers
     // that don't have them, so one dictionary serves every scheme.
     const std::string scheme = LowerScheme(streamUrl_);
-    const bool hls = IsHls(streamUrl_);
+    const bool hls = IsSegmented(streamUrl_);
+    const bool srtListener = scheme == "srt" && IsSrtListener(streamUrl_);
+    if (stream::IsDashPath(streamUrl_) && !av_find_input_format("dash")) {
+        // An FFmpeg built without libxml2 has no dash demuxer and would only say
+        // "Invalid data found" after downloading the manifest.
+        avformat_free_context(impl_->fmt);
+        impl_->fmt = nullptr;
+        err = "this build's FFmpeg has no DASH demuxer (needs libxml2)";
+        fatal = true;
+        return false;
+    }
     AVDictionary* opts = nullptr;
     av_dict_set(&opts, "fflags", "nobuffer", 0);
     av_dict_set(&opts, "max_delay", "500000", 0);           // demuxer reorder window, us
@@ -1427,6 +1509,12 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
         av_dict_set(&opts, "buffer_size", "16777216", 0);    // 4K I-frames arrive in bursts
         av_dict_set(&opts, "overrun_nonfatal", "1", 0);
         av_dict_set(&opts, "fifo_size", "1000000", 0);
+    } else if (scheme == "srt") {
+        // libsrt (#198). Its own options come from the URL query (mode=, latency= in
+        // MICROseconds, streamid=, passphrase=) and win over these defaults. A caller
+        // gets a 5 s socket I/O timeout; a listener must not have one, since libsrt
+        // would then also cap how long it waits for the sender to call in.
+        if (!srtListener) av_dict_set(&opts, "timeout", "5000000", 0);
     } else if (scheme == "http" || scheme == "https" || scheme == "tcp") {
         av_dict_set(&opts, "timeout", "5000000", 0);
         if (scheme != "tcp") {
@@ -1441,7 +1529,11 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
 
     // Connect + probe must finish inside this budget (a dead server fails fast; Stop()
     // interrupts it at once through the callback).
-    ioDeadlineNs_.store(SteadyNowNs() + (hls ? 15 : 8) * kSec);
+    // DASH opens the init + first media segment of EVERY representation before it
+    // returns (a 3-rung UHD ladder is several MB), so it gets the longest budget.
+    // An SRT listener waits for its sender to call in, so it gets the same 30 s.
+    const int connectSec = (stream::IsDashPath(streamUrl_) || srtListener) ? 30 : hls ? 15 : 8;
+    ioDeadlineNs_.store(SteadyNowNs() + connectSec * kSec);
     int rc = avformat_open_input(&impl_->fmt, streamUrl_.c_str(), nullptr, &opts);
     av_dict_free(&opts);
     if (rc < 0) {
@@ -1465,6 +1557,39 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
     AVCodec* dec = nullptr;
 #endif
     impl_->videoStream = av_find_best_stream(impl_->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
+    if (hls) {
+        // A DASH / HLS source lists every representation as its own stream, and
+        // av_find_best_stream ranks them by the bitrate it ESTIMATED from the probed
+        // segment, which can be the lowest one (DASH-IF UHD MultiRate: 5.7 of 5.7 /
+        // 8.3 / 10.9 Mbit/s). Take the highest advertised bandwidth that this build
+        // can decode (no ABR: FFmpeg's demuxers never switch). Ties: more pixels.
+        int bestIdx = -1;
+        int64_t bestBw = -1, bestPx = -1;
+        for (unsigned i = 0; i < impl_->fmt->nb_streams; ++i) {
+            const AVStream* st = impl_->fmt->streams[i];
+            if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+            if (st->disposition & AV_DISPOSITION_ATTACHED_PIC) continue;
+            if (!avcodec_find_decoder(st->codecpar->codec_id)) continue;
+            const AVDictionaryEntry* e = av_dict_get(st->metadata, "variant_bitrate", nullptr, 0);
+            const int64_t bw = e ? std::strtoll(e->value, nullptr, 10) : st->codecpar->bit_rate;
+            const int64_t px = (int64_t)st->codecpar->width * st->codecpar->height;
+            if (bw > bestBw || (bw == bestBw && px > bestPx)) {
+                bestIdx = (int)i;
+                bestBw = bw;
+                bestPx = px;
+            }
+        }
+        if (bestIdx >= 0 && bestIdx != impl_->videoStream) {
+            impl_->videoStream = bestIdx;
+            dec = avcodec_find_decoder(impl_->fmt->streams[bestIdx]->codecpar->codec_id);
+        }
+        if (bestIdx >= 0) {
+            const AVCodecParameters* cp = impl_->fmt->streams[bestIdx]->codecpar;
+            LOG_INFO("VideoDecoder: segmented source, video representation %d of %u streams: "
+                     "%dx%d at %lld bit/s advertised",
+                     bestIdx, impl_->fmt->nb_streams, cp->width, cp->height, (long long)bestBw);
+        }
+    }
     if (impl_->videoStream < 0 || !dec) {
         err = (impl_->videoStream == AVERROR_DECODER_NOT_FOUND) ? "no decoder for the video codec"
                                                                  : "no video stream";
@@ -1490,7 +1615,7 @@ void VideoDecoder::LiveLoop(const std::function<double(void*)>& fill, double& ti
     using clock = std::chrono::steady_clock;
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
-    const bool hls = IsHls(streamUrl_);
+    const bool hls = IsSegmented(streamUrl_);
     const int64_t readTimeoutNs = (hls ? 15 : 5) * kSec;
 
     // Before the first successful stream a dead URL gives up after kMaxInitialFailures

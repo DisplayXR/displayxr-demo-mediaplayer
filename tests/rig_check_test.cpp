@@ -274,6 +274,38 @@ void EdgeAlert() {
     CHECK(!a.empty() && a[0].what.find("Left edge violation at -1.5%") == 0, "named by side, with the worst parallax");
 }
 
+// #135: the divergence alert and the target figures are for the picture as shown, so
+// convergence counts; the source's near / far alerts do not change with it.
+void DivergenceFollowsConvergence() {
+    rig::Budget b;
+    b.farPct = 5.0f;
+    b.divergeFarPct = 1.7f;
+    b.targetName = "Cinema";
+    b.targetWidthM = 10.0f;
+    b.targetDistanceM = 12.0f;
+    auto run = [&](float offsetPct) {
+        rig::RigMonitor m;
+        m.SetBudget(b);
+        m.SetTargetParallaxOffset(offsetPct);
+        for (int i = 0; i <= 10; ++i) {
+            rig::Sample s;
+            s.t = 3000.0 + i * 0.25;
+            s.ok = true;
+            s.farPct = 1.2f;
+            m.AddSample(s, "01:00:00:00");
+        }
+        return m.Alerts();
+    };
+    CHECK(run(0.0f).empty(), "+1.2% stays under the cinema's divergence limit");
+    CHECK(run(-1.0f).empty(), "convergence bringing the background forward does not alert");
+    const std::vector<rig::Alert> a = run(1.0f);
+    std::printf("  divergence alert: %s\n", a.empty() ? "(none)" : a.back().what.c_str());
+    CHECK(a.size() == 1, "convergence pushing it to +2.2% alerts");
+    CHECK(!a.empty() && a[0].what.find("Background diverges on the target screen at +2.2%") == 0, "quotes the parallax as shown");
+    // 220 mm on 10 m: 2 atan((0.220 - 0.065) / 24) = 0.74 deg, counted once, not twice.
+    CHECK(!a.empty() && a[0].what.find("[0.74 deg on Cinema]") != std::string::npos, "the angle includes the offset once");
+}
+
 void AlertClosesOnBlack() {
     rig::RigMonitor m;
     rig::Budget b;
@@ -525,6 +557,7 @@ int main() {
     TooFewMatches();
     EdgeViolations();
     EdgeAlert();
+    DivergenceFollowsConvergence();
     AlertClosesOnBlack();
     SyncConfirmVotes();
     EyeSyncMeasured();

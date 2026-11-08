@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pro/ProController.h"
+#include "pro/DisplayCalibration.h"
 
 #include "Log.h"
+#include "ui/UiScale.h"
 
 #include <SDL3/SDL.h>
 
@@ -17,6 +19,8 @@
 #include <filesystem>
 
 namespace mp::pro {
+
+using ui::Px;
 
 namespace {
 
@@ -88,7 +92,29 @@ void ProController::ApplyTestEnv() {
     if (const char* z = std::getenv("MEDIAPLAYER_PRO_ZOOM")) SetZoom((float)std::atof(z));
     if (const char* d = std::getenv("MEDIAPLAYER_PRO_DEPTH_OVERLAY")) depthOverlay_ = (*d && *d != '0');
     if (const char* e = std::getenv("MEDIAPLAYER_PRO_EXPOSURE")) grade_.exposure = std::clamp((float)std::atof(e), -4.0f, 4.0f);
+    // HDR tone map (#134): auto | on | off, and the source peak in nits (0 = the stream's).
+    if (const char* e = std::getenv("MEDIAPLAYER_PRO_TONEMAP")) grade_.toneMap = ToneMapFromName(e, grade_.toneMap);
+    if (const char* e = std::getenv("MEDIAPLAYER_PRO_PEAK_NITS")) grade_.peakNits = std::clamp((float)std::atof(e), 0.0f, 10000.0f);
+    // #169: an untagged source taken as HLG or PQ (sdr | hlg | pq).
+    if (const char* e = std::getenv("MEDIAPLAYER_PRO_UNTAGGED")) grade_.forceTransfer = UntaggedFromName(e, grade_.forceTransfer);
     if (const char* b = std::getenv("MEDIAPLAYER_PRO_BYPASS")) bypass_ = (*b && *b != '0');
+    // #133: MEDIAPLAYER_PRO_CAL_BYPASS=1 starts with the display calibration bypassed;
+    // MEDIAPLAYER_PRO_CAL=<.cube> loads one for this run only (not installed).
+    if (const char* b = std::getenv("MEDIAPLAYER_PRO_CAL_BYPASS")) calBypass_ = (*b && *b != '0');
+    if (const char* c = std::getenv("MEDIAPLAYER_PRO_CAL"); c && *c) calPath_ = c;
+    // #135: MEDIAPLAYER_PRO_TARGET=cinema|tv|monitor|tablet|<width_m>x<distance_m>;
+    // MEDIAPLAYER_PRO_TARGET_PREVIEW=0 keeps the picture at the panel's size.
+    if (const char* t = std::getenv("MEDIAPLAYER_PRO_TARGET"); t && *t) {
+        target::Screen s;
+        float w = 0.0f, d = 0.0f;
+        if (target::PresetByName(t, s)) SetTarget(s);
+        else if (std::sscanf(t, "%fx%f", &w, &d) == 2 && w > 0.0f && d > 0.0f) SetTarget({"Custom", w, d});
+        else LOG_WARN("Pro: MEDIAPLAYER_PRO_TARGET=%s: expected cinema|tv|monitor|tablet|<width_m>x<distance_m>", t);
+    }
+    if (const char* p = std::getenv("MEDIAPLAYER_PRO_TARGET_PREVIEW")) {
+        targetPreview_ = !(*p == '0');
+        targetDirty_ = true;
+    }
     if (const char* c = std::getenv("MEDIAPLAYER_PRO_COMPARE_FRAME")) testCompareFrame_ = std::atoi(c);
     if (const char* p = std::getenv("MEDIAPLAYER_PRO_PIN")) inspectorPinned_ = (*p && *p != '0');
     if (const char* f = std::getenv("MEDIAPLAYER_PRO_PANELS_3D")) flatPanels_ = !(*f && *f != '0');
@@ -204,9 +230,17 @@ bool ProController::LoadOcio(const ocio::Request& req, std::string* errOut) {
     }
     lutError_.clear();
     lutLoading_ = req.config.empty() ? "$OCIO" : req.config;
-    looks_.Submit([req](color::CubeLut& lut, std::string& err) { return ocio::Bake(req, lut, err); },
+    ocioReq_ = req;
+    ocio::Request bake = req;
+    bake.linearPqInput = SourceIsSceneLinear();  // #134: an EXR reaches the view unclipped
+    ocioBakePqInput_ = bake.linearPqInput;
+    looks_.Submit([bake](color::CubeLut& lut, std::string& err) { return ocio::Bake(bake, lut, err); },
                   lutLoading_, /*isOcio=*/true);
     return true;
+}
+
+bool ProController::SourceIsSceneLinear() const {
+    return renderer_ && renderer_->SourceHdr().transfer == (int)ColorTransfer::LinearPq;
 }
 
 void ProController::ToggleCompare() {
@@ -243,6 +277,8 @@ void ProController::DialogCallback(void* userdata, const char* const* filelist, 
         self->dialogPath_ = filelist[0];
         self->dialogIsCdl_ = self->pendingDialogIsCdl_;
         self->dialogIsCompare_ = self->pendingDialogIsCompare_;
+        self->dialogIsCal_ = self->pendingDialogIsCal_;
+        self->dialogIsOcio_ = self->pendingDialogIsOcio_;
         self->dialogReady_ = true;
     }
 }
@@ -254,6 +290,8 @@ void ProController::OpenLookDialog(bool cdl) {
         dialogOpen_ = true;
         pendingDialogIsCdl_ = cdl;
         pendingDialogIsCompare_ = false;
+        pendingDialogIsCal_ = false;
+        pendingDialogIsOcio_ = false;
     }
     static const SDL_DialogFileFilter kLutFilter[] = {{"3D LUT (.cube)", "cube"}};
     static const SDL_DialogFileFilter kCdlFilter[] = {{"ASC CDL (.cc, .ccc, .cdl)", "cc;ccc;cdl"}};
@@ -270,6 +308,8 @@ void ProController::OpenCompareDialog() {
         dialogOpen_ = true;
         pendingDialogIsCdl_ = false;
         pendingDialogIsCompare_ = true;
+        pendingDialogIsCal_ = false;
+        pendingDialogIsOcio_ = false;
     }
     const std::string cur = host_.currentMedia ? host_.currentMedia() : std::string();
     std::string dir = cur.empty() ? std::string() : std::filesystem::path(cur).parent_path().string();
@@ -542,12 +582,19 @@ bool ProController::HandleEvent(const void* ev, bool imguiWantsMouse, bool imgui
                     if (host_.toast) host_.toast(depthOverlay_ ? "Depth overlay on" : "Depth overlay off");
                     return true;
                 case SDLK_G:
+                    if (mod & SDL_KMOD_SHIFT) {  // #133: the display calibration, not the show grade
+                        calBypass_ = !calBypass_;
+                        if (host_.toast)
+                            host_.toast(!calLoaded_ ? "No display calibration for this panel"
+                                        : calBypass_ ? "Calibration bypassed" : "Calibration on");
+                        return true;
+                    }
                     bypass_ = !bypass_;
                     if (host_.toast) host_.toast(bypass_ ? "Grade bypassed" : "Grade on");
                     return true;
                 case SDLK_TAB:
                     if (mod & SDL_KMOD_SHIFT) return false;  // Shift+Tab is the trunk's HUD master
-                    inspectorPinned_ = !inspectorPinned_;
+                    SetPanelsPinned(!inspectorPinned_);
                     return true;
                 default: return station_.HandleKey((int)e.key.key);  // T R N J
             }
@@ -582,11 +629,327 @@ void ProController::TickLooks() {
     }
     lut_ = std::move(r.lut);
     lutPath_ = r.source;
+    lutIsOcio_ = r.isOcio;
+    lutPqShaper_ = r.isOcio && ocioBakePqInput_;
     lutName_ = r.isOcio || !lut_.title.empty() ? lut_.title : BaseName(r.source);
     grade_.lutOn = true;
     LOG_INFO("Pro: %s %s (%d^3) in %.1f ms off the render thread", r.isOcio ? "baked" : "loaded",
              lutName_.c_str(), lut_.size, r.ms);
     if (host_.toast) host_.toast(r.isOcio ? lutName_ : "LUT: " + lutName_);
+}
+
+// ---------------------------------------------------------------------------
+// Display calibration (#133)
+// ---------------------------------------------------------------------------
+
+void ProController::ResolveCalibration() {
+    calResolved_ = true;
+    calLoadId_ = 0;  // a load still running was for the previous panel
+    calLoading_.clear();
+    std::string runtimeKey, dev;
+    if (!(host_.panelIdentity && host_.panelIdentity(runtimeKey, dev)) && host_.displayDeviceName)
+        dev = host_.displayDeviceName();
+    calKey_ = cal::PanelKey(runtimeKey, dev);
+    calKeyFromRuntime_ = !runtimeKey.empty();
+    if (!calPath_.empty()) {  // MEDIAPLAYER_PRO_CAL: this run only
+        LOG_INFO("Pro: display calibration from MEDIAPLAYER_PRO_CAL (panel %s)", calKey_.c_str());
+        LoadCalibration(calPath_, /*install=*/false);
+        return;
+    }
+    const std::string file = cal::CalibrationPathFor(calKey_);
+    std::error_code ec;
+    if (!file.empty() && std::filesystem::is_regular_file(std::filesystem::u8path(file), ec)) {
+        LOG_INFO("Pro: display calibration for panel %s: %s", calKey_.c_str(), file.c_str());
+        LoadCalibration(file, /*install=*/false);
+    } else {
+        LOG_WARN("Pro: panel %s (%s, %s) has no display calibration (looked for %s)", calKey_.c_str(),
+                 dev.empty() ? "device name unknown" : dev.c_str(),
+                 calKeyFromRuntime_ ? "runtime key" : "no runtime key: device name", file.c_str());
+    }
+}
+
+void ProController::LoadCalibration(const std::string& cube, bool install) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(std::filesystem::u8path(cube), ec)) {
+        calError_ = "cannot open " + cube;
+        LOG_WARN("Pro: calibration %s rejected: %s", cube.c_str(), calError_.c_str());
+        if (host_.toast) host_.toast("Calibration not loaded: " + calError_);
+        return;
+    }
+    calError_.clear();
+    calLoading_ = cube;
+    calInstall_ = install;
+    calLoadId_ = calLoader_.Submit([cube](color::CubeLut& lut, std::string& err) { return color::LoadCube(cube, lut, err); },
+                                   cube, /*isOcio=*/false);
+}
+
+void ProController::TickCalibration() {
+    LookLoader::Result r;
+    if (!calLoader_.Take(r)) return;
+    if (r.id != calLoadId_) return;  // for a panel the window left, or since removed
+    calLoading_.clear();
+    auto fail = [&](const std::string& why) {
+        calError_ = why;
+        LOG_WARN("Pro: calibration %s rejected: %s", r.source.c_str(), why.c_str());
+        if (host_.toast) host_.toast("Calibration not loaded: " + why);
+    };
+    if (!r.ok) return fail(r.err);
+    // A display calibration maps display code values to display code values: 0..1 in.
+    for (int k = 0; k < 3; ++k)
+        if (std::fabs(r.lut.domainMin[k]) > 1e-4f || std::fabs(r.lut.domainMax[k] - 1.0f) > 1e-4f)
+            return fail("its DOMAIN is not 0..1 (a display calibration maps code values 0..1)");
+    if (!renderer_ || !renderer_->UploadCalibrationLut(r.rgba16f.data(), (uint32_t)r.lut.size))
+        return fail("upload failed");
+    // Whether what now shows is the panel's kept file (Remove deletes it) or run-only.
+    calKept_ = cal::IsKeptFile(r.source, calKey_);
+    if (calInstall_) {
+        std::string err;
+        if (cal::Install(r.source, calKey_, err)) calKept_ = true;
+        if (!calKept_) {
+            LOG_WARN("Pro: calibration applied for this run but not kept: %s", err.c_str());
+            if (host_.toast) host_.toast("Calibration applied, not kept: " + err);
+        } else {
+            LOG_INFO("Pro: calibration kept for panel %s: %s", calKey_.c_str(),
+                     cal::CalibrationPathFor(calKey_).c_str());
+        }
+    }
+    calPath_ = r.source;
+    calName_ = !r.lut.title.empty() ? r.lut.title : std::filesystem::u8path(r.source).filename().u8string();
+    calLoaded_ = true;
+    LOG_INFO("Pro: display calibration %s (%d^3) for panel %s", calName_.c_str(), r.lut.size, calKey_.c_str());
+    if (host_.toast) host_.toast("Calibration: " + calName_);
+}
+
+bool ProController::ClearCalibration(bool uninstall) {
+    // #169: what is showing (or about to). A run-only calibration is not the panel's kept
+    // file, so removing it must not delete that file.
+    // A load in flight counts as kept when it will be kept (calInstall_) or is the kept
+    // file itself; with nothing showing, Remove means the kept file.
+    bool runOnly = false;
+    if (calLoaded_) runOnly = !calKept_;
+    else if (!calLoading_.empty()) runOnly = !calInstall_ && !cal::IsKeptFile(calLoading_, calKey_);
+    const bool deleteKept = uninstall && !runOnly;
+    if (deleteKept) {
+        // Delete first: if it fails, nothing changes (the file would load again next run,
+        // so dropping the LUT now would only hide that the remove did not happen).
+        std::string err;
+        if (!cal::Remove(calKey_, err)) {
+            calError_ = err;
+            LOG_WARN("Pro: display calibration not removed: %s", err.c_str());
+            if (host_.toast) host_.toast("Calibration not removed: " + err);
+            return false;
+        }
+    }
+    calLoadId_ = 0;
+    calLoading_.clear();
+    if (renderer_) renderer_->ClearCalibrationLut();
+    calLoaded_ = false;
+    calKept_ = false;
+    calName_.clear();
+    calPath_.clear();
+    calError_.clear();
+    if (runOnly && uninstall) {
+        std::error_code ec;
+        const std::string kept = cal::CalibrationPathFor(calKey_);
+        const bool hasKept = !kept.empty() && std::filesystem::is_regular_file(std::filesystem::u8path(kept), ec);
+        LOG_INFO("Pro: run-only display calibration dropped; panel %s's kept file %s", calKey_.c_str(),
+                 hasKept ? "left in place" : "does not exist");
+        if (host_.toast)
+            host_.toast(hasKept ? "Run-only calibration dropped (this panel's kept calibration loads next run)"
+                                : "Run-only calibration dropped");
+    } else if (host_.toast) {
+        host_.toast(deleteKept ? "Display calibration removed" : "Display calibration off");
+    }
+    return true;
+}
+
+std::string ProController::CalibrationLabel() const {
+    if (!calLoaded_) return "display not calibrated";
+    return (calBypass_ ? "cal bypassed (" : "cal ") + calName_ + (calBypass_ ? ")" : "");
+}
+
+void ProController::OpenCalibrationDialog() {
+    {
+        std::lock_guard<std::mutex> lock(dialogMutex_);
+        if (dialogOpen_) return;
+        dialogOpen_ = true;
+        pendingDialogIsCdl_ = false;
+        pendingDialogIsCompare_ = false;
+        pendingDialogIsCal_ = true;
+        pendingDialogIsOcio_ = false;
+    }
+    static const SDL_DialogFileFilter kFilter[] = {{"Display calibration 3D LUT (.cube)", "cube"}};
+    std::string dir = calPath_.empty() ? std::string() : std::filesystem::u8path(calPath_).parent_path().u8string();
+    SDL_ShowOpenFileDialog(&ProController::DialogCallback, this, window_, kFilter, 1,
+                           dir.empty() ? nullptr : dir.c_str(), false);
+}
+
+void ProController::OpenOcioConfigDialog() {
+    {
+        std::lock_guard<std::mutex> lock(dialogMutex_);
+        if (dialogOpen_) return;
+        dialogOpen_ = true;
+        pendingDialogIsCdl_ = false;
+        pendingDialogIsCompare_ = false;
+        pendingDialogIsCal_ = false;
+        pendingDialogIsOcio_ = true;
+    }
+    static const SDL_DialogFileFilter kFilter[] = {{"OpenColorIO config (.ocio)", "ocio"}};
+    const bool file = !ocioUiConfig_.empty() && ocioUiConfig_.rfind("ocio://", 0) != 0;
+    std::string dir = file ? std::filesystem::u8path(ocioUiConfig_).parent_path().u8string() : std::string();
+    SDL_ShowOpenFileDialog(&ProController::DialogCallback, this, window_, kFilter, 1,
+                           dir.empty() ? nullptr : dir.c_str(), false);
+}
+
+namespace {
+int IndexOf(const std::vector<std::string>& v, const std::string& name) {
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i] == name) return (int)i;
+    return -1;
+}
+int FirstContaining(const std::vector<std::string>& v, const char* part) {
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].find(part) != std::string::npos) return (int)i;
+    return -1;
+}
+}  // namespace
+
+void ProController::DescribeOcioConfig() {
+    ocioInfoFor_ = ocioUiConfig_;
+    ocioInfoError_.clear();
+    ocioInfo_ = ocio::ConfigInfo{};
+    if (!ocio::Describe(ocioUiConfig_, ocioInfo_, ocioInfoError_)) return;
+    // Start from the look already on (a --ocio launch, the MCP tool) when it used this
+    // config; otherwise ACEScct in, onto the display the calibration targets (Rec.709 at
+    // gamma 2.4 = Rec.1886), with that display's default view.
+    const bool same = !ocioReq_.src.empty() && ocioReq_.config == ocioUiConfig_;
+    ocioSrc_ = same ? IndexOf(ocioInfo_.colorSpaces, ocioReq_.src) : -1;
+    if (ocioSrc_ < 0) ocioSrc_ = IndexOf(ocioInfo_.colorSpaces, "ACEScct");
+    if (ocioSrc_ < 0) ocioSrc_ = 0;
+    ocioDisplay_ = same && !ocioReq_.display.empty() ? IndexOf(ocioInfo_.displays, ocioReq_.display) : -1;
+    if (ocioDisplay_ < 0) ocioDisplay_ = FirstContaining(ocioInfo_.displays, "Rec.1886");
+    if (ocioDisplay_ < 0) ocioDisplay_ = IndexOf(ocioInfo_.displays, ocioInfo_.defaultDisplay);
+    if (ocioDisplay_ < 0) ocioDisplay_ = 0;
+    ocioView_ = -1;
+    if (ocioDisplay_ < (int)ocioInfo_.displayViews.size()) {
+        const auto& views = ocioInfo_.displayViews[ocioDisplay_];
+        if (same && !ocioReq_.view.empty()) ocioView_ = IndexOf(views, ocioReq_.view);
+        if (ocioView_ < 0) ocioView_ = IndexOf(views, ocioInfo_.displayDefaultView[ocioDisplay_]);
+    }
+    if (ocioView_ < 0) ocioView_ = 0;
+}
+
+void ProController::BuildOcioControls() {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    // A look set at launch (--ocio) or by the MCP tool: open on it, showing its settings.
+    if (ocioInfoFor_.empty() && !ocioReq_.config.empty()) ocioUiConfig_ = ocioReq_.config;
+    if (!ocioReq_.src.empty()) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+    if (!ImGui::TreeNode("OpenColorIO (ACES)")) return;
+    if (!ocio::Available()) {
+        ImGui::TextDisabled("This build has no OpenColorIO");
+        ImGui::TreePop();
+        return;
+    }
+    struct Builtin {
+        const char* label;
+        const char* uri;
+    };
+    static const Builtin kBuiltins[] = {
+        {"ACES studio (built-in)", "ocio://studio-config-latest"},
+        {"ACES CG (built-in)", "ocio://cg-config-latest"},
+    };
+    std::string cfgLabel = BaseName(ocioUiConfig_);
+    for (const Builtin& b : kBuiltins)
+        if (ocioUiConfig_ == b.uri) cfgLabel = b.label;
+    const float itemW = ImGui::GetContentRegionAvail().x * 0.62f;
+    ImGui::SetNextItemWidth(itemW);
+    if (ImGui::BeginCombo("Config", cfgLabel.c_str())) {
+        for (const Builtin& b : kBuiltins)
+            if (ImGui::Selectable(b.label, ocioUiConfig_ == b.uri)) ocioUiConfig_ = b.uri;
+        if (ImGui::Selectable("From file (.ocio)...")) OpenOcioConfigDialog();
+        ImGui::EndCombo();
+    }
+    if (ocioInfoFor_ != ocioUiConfig_) DescribeOcioConfig();
+    if (!ocioInfoError_.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f), "%s", ocioInfoError_.c_str());
+        ImGui::TreePop();
+        return;
+    }
+    auto combo = [&](const char* label, const std::vector<std::string>& items, int& sel) {
+        if (items.empty()) return false;
+        sel = std::clamp(sel, 0, (int)items.size() - 1);
+        bool changed = false;
+        ImGui::SetNextItemWidth(itemW);
+        if (ImGui::BeginCombo(label, items[sel].c_str(), ImGuiComboFlags_HeightLarge)) {
+            for (int i = 0; i < (int)items.size(); ++i)
+                if (ImGui::Selectable(items[i].c_str(), sel == i)) {
+                    changed = sel != i;
+                    sel = i;
+                }
+            ImGui::EndCombo();
+        }
+        return changed;
+    };
+    combo("Input", ocioInfo_.colorSpaces, ocioSrc_);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The colour space the picture arrives in (camera log, ACEScct, ...)");
+    if (combo("Display", ocioInfo_.displays, ocioDisplay_) && ocioDisplay_ < (int)ocioInfo_.displayViews.size()) {
+        ocioView_ = IndexOf(ocioInfo_.displayViews[ocioDisplay_], ocioInfo_.displayDefaultView[ocioDisplay_]);
+        if (ocioView_ < 0) ocioView_ = 0;
+    }
+    static const std::vector<std::string> kNone;
+    const auto& views =
+        ocioDisplay_ < (int)ocioInfo_.displayViews.size() ? ocioInfo_.displayViews[ocioDisplay_] : kNone;
+    combo("View", views, ocioView_);
+    const bool ready = !ocioInfo_.colorSpaces.empty() && !ocioInfo_.displays.empty() && !views.empty();
+    ImGui::BeginDisabled(!ready || !lutLoading_.empty());
+    if (ImGui::SmallButton("Apply look")) {
+        ocio::Request req;
+        req.config = ocioUiConfig_;
+        req.src = ocioInfo_.colorSpaces[ocioSrc_];
+        req.display = ocioInfo_.displays[ocioDisplay_];
+        req.view = views[ocioView_];
+        LoadOcio(req);
+    }
+    ImGui::EndDisabled();
+    if (lutIsOcio_ && grade_.lutOn) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("on (untick LUT to remove)");
+    }
+    ImGui::TreePop();
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Target screen (#135)
+// ---------------------------------------------------------------------------
+
+void ProController::SetTarget(const target::Screen& t) {
+    target_ = t.On() ? t : target::Screen{};
+    targetDirty_ = true;
+    if (target_.On())
+        LOG_INFO("Pro: target screen %s, %.2f m wide at %.2f m (diverges past %+.2f%%)", target_.name.c_str(),
+                 target_.widthM, target_.distanceM, target::DivergenceLimitPct(target_));
+    else
+        LOG_INFO("Pro: target screen off");
+}
+
+void ProController::ApplyTarget() {
+    targetDirty_ = false;
+    const bool preview = target_.On() && targetPreview_;
+    if (host_.setTargetScreen) host_.setTargetScreen(preview ? target_.widthM : 0.0f, preview ? target_.distanceM : 0.0f);
+    rig::Budget b = station_.RigBudget();
+    b.divergeFarPct = target_.On() ? target::DivergenceLimitPct(target_) : 0.0f;
+    b.targetName = target_.name;
+    b.targetWidthM = target_.widthM;
+    b.targetDistanceM = target_.distanceM;
+    station_.SetRigBudget(b);
+    PushTargetToStation();
+}
+
+void ProController::PushTargetToStation() {
+    station_.SetTarget(target_, host_.pictureScale ? host_.pictureScale() : 1.0f,
+                       host_.viewerDistance ? host_.viewerDistance() : 0.0f,
+                       host_.parallaxOffsetPct ? host_.parallaxOffsetPct() : 0.0f);
 }
 
 void ProController::Tick(const Status& st) {
@@ -614,18 +977,25 @@ void ProController::Tick(const Status& st) {
     }
     rightOnlyView_ = mode_ == ViewMode::RightOnly;
     std::string path;
-    bool isCdl = false, isCompare = false;
+    bool isCdl = false, isCompare = false, isCal = false, isOcio = false;
     {
         std::lock_guard<std::mutex> lock(dialogMutex_);
         if (dialogReady_) {
             path = dialogPath_;
             isCdl = dialogIsCdl_;
             isCompare = dialogIsCompare_;
+            isCal = dialogIsCal_;
+            isOcio = dialogIsOcio_;
             dialogReady_ = false;
         }
     }
     if (!path.empty()) {
-        if (isCompare) {
+        if (isCal) {
+            LoadCalibration(path, /*install=*/true);
+        } else if (isOcio) {
+            ocioUiConfig_ = path;  // the picker describes it on its next frame
+            ocioInfoFor_.clear();
+        } else if (isCompare) {
             compare_[1 - compareSide_] = path;  // the clip not showing becomes B
             SetWipe(Wipe::Clips, true);
         } else if (isCdl) {
@@ -636,11 +1006,43 @@ void ProController::Tick(const Status& st) {
     }
     TickCompareClip();
     TickLooks();
+    if (!calResolved_) ResolveCalibration();
+    // Follow the panel: the runtime's displays changed, or (checked once a second) the
+    // window now sits on another display. A run-only calibration (MEDIAPLAYER_PRO_CAL) stays.
+    if (calResolved_ && (++calCheckTicks_ >= 60 || (host_.displaysChanged && host_.displaysChanged()))) {
+        calCheckTicks_ = 0;
+        std::string runtimeKey, dev;
+        if (host_.panelIdentity && host_.panelIdentity(runtimeKey, dev)) {
+            const std::string key = cal::PanelKey(runtimeKey, dev);
+            if (key != calKey_ && std::getenv("MEDIAPLAYER_PRO_CAL") == nullptr) {
+                LOG_INFO("Pro: the window is now on panel %s (was %s)", key.c_str(), calKey_.c_str());
+                if (calLoaded_) {
+                    if (renderer_) renderer_->ClearCalibrationLut();
+                    calLoaded_ = false;
+                    calKept_ = false;
+                    calName_.clear();
+                    calPath_.clear();
+                }
+                ResolveCalibration();
+            }
+        }
+    }
+    TickCalibration();
+    if (targetDirty_) ApplyTarget();
+    PushTargetToStation();
     if (!renderer_) return;
+    // #134: an OCIO look follows the source: re-bake when an EXR comes or goes.
+    if (lutIsOcio_ && lutLoading_.empty() && lutPqShaper_ != SourceIsSceneLinear()) LoadOcio(ocioReq_);
+    grade_.lutPqShaper = lutIsOcio_ && lutPqShaper_;
     GradeParams g = grade_;
     if (bypass_ || st.isLogo) {
         g = GradeParams{};
+        g.toneMap = grade_.toneMap;  // the HDR mapping is the display transform, not the look
+        g.peakNits = grade_.peakNits;
+        g.forceTransfer = grade_.forceTransfer;  // what the source IS, not the look
     }
+    // The display calibration belongs to the panel, not the show: grade bypass keeps it.
+    g.calOn = calLoaded_ && !calBypass_;
     g.qcMode = st.isLogo                          ? 0
                : mode_ == ViewMode::Difference  ? 1
                : mode_ == ViewMode::Anaglyph    ? 2
@@ -681,7 +1083,7 @@ void ProController::BuildDepthOverlay(const Status& st) {
     const ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
-    const float rad = std::max(3.0f, H * 0.006f);
+    const float rad = std::max(Px(3.0f), H * 0.006f);
     for (size_t i = 0; i < r.parallaxPct.size(); ++i) {
         // match centre in eye-UV -> zoomed window -> HUD pixels
         const float u = (r.matchX[i] - panX_) * zoom_, v = (r.matchY[i] - panY_) * zoom_;
@@ -692,7 +1094,7 @@ void ProController::BuildDepthOverlay(const Status& st) {
         const ImVec4 col = t < 0 ? ImVec4(1.0f, 1.0f + 0.55f * t, 1.0f + 0.85f * t, 0.95f)    // white -> orange-red
                                  : ImVec4(1.0f - 0.75f * t, 1.0f - 0.45f * t, 1.0f, 0.95f);   // white -> blue
         dl->AddCircleFilled(c, rad, ImGui::GetColorU32(col));
-        if (p < b.nearPct || p > b.farPct) dl->AddCircle(c, rad * 1.9f, IM_COL32(255, 60, 50, 255), 0, 2.0f);
+        if (p < b.nearPct || p > b.farPct) dl->AddCircle(c, rad * 1.9f, IM_COL32(255, 60, 50, 255), 0, Px(2.0f));
     }
     // Edge violations: a red bar along the frame edge over the rows where something in
     // front of the screen is cut off by it (the band's matches past the edge limit).
@@ -712,19 +1114,19 @@ void ProController::BuildDepthOverlay(const Status& st) {
         const float v0 = std::clamp((y0 - half - panY_) * zoom_, 0.f, 1.f);
         const float v1 = std::clamp((y1 + half - panY_) * zoom_, 0.f, 1.f);
         if (v1 <= v0) continue;
-        const float x = (px + u * pw) * W, bw = std::max(4.0f, W * 0.004f);
+        const float x = (px + u * pw) * W, bw = std::max(Px(4.0f), W * 0.004f);
         const float xa = side == 0 ? x : x - bw, xb = side == 0 ? x + bw : x;
         dl->AddRectFilled(ImVec2(xa, (py + v0 * ph) * H), ImVec2(xb, (py + v1 * ph) * H), IM_COL32(255, 60, 50, 235));
         char t[48];
         std::snprintf(t, sizeof(t), "EDGE %+.1f%%", es.parallaxPct);
         const ImVec2 ts = ImGui::CalcTextSize(t);
-        const float tx = side == 0 ? xb + 6.0f : xa - 6.0f - ts.x;
-        dl->AddText(ImVec2(tx, (py + v0 * ph) * H + 2.0f), IM_COL32(255, 90, 80, 255), t);
+        const float tx = side == 0 ? xb + Px(6.0f) : xa - Px(6.0f) - ts.x;
+        dl->AddText(ImVec2(tx, (py + v0 * ph) * H + Px(2.0f)), IM_COL32(255, 90, 80, 255), t);
     }
     char legend[96];
     std::snprintf(legend, sizeof(legend), "Depth overlay (D): near %+.1f%%  far %+.1f%%  budget %+.1f..%+.1f%%", r.nearPct,
                   r.farPct, b.nearPct, b.farPct);
-    dl->AddText(ImVec2(px * W + 8.0f, py * H + 8.0f), IM_COL32(255, 255, 255, 230), legend);
+    dl->AddText(ImVec2(px * W + Px(8.0f), py * H + Px(8.0f)), IM_COL32(255, 255, 255, 230), legend);
 #else
     (void)st;
 #endif
@@ -742,11 +1144,11 @@ void ProController::BuildWipeLine(const Status& st) {
     const float x = (px + wipePos_ * pw) * W, y0 = py * H, y1 = (py + ph) * H;
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     const float wgt = std::max(2.0f, ph * H / 360.0f);  // heavy enough not to stair-step through the lens
-    dl->AddLine(ImVec2(x, y0), ImVec2(x, y1), IM_COL32(0, 0, 0, 140), wgt + 2.0f);
+    dl->AddLine(ImVec2(x, y0), ImVec2(x, y1), IM_COL32(0, 0, 0, 140), wgt + Px(2.0f));
     dl->AddLine(ImVec2(x, y0), ImVec2(x, y1), IM_COL32(255, 255, 255, 230), wgt);
     const float my = (y0 + y1) * 0.5f;  // a grab handle
     dl->AddCircleFilled(ImVec2(x, my), wgt * 3.0f, IM_COL32(255, 255, 255, 230));
-    dl->AddCircle(ImVec2(x, my), wgt * 3.0f, IM_COL32(0, 0, 0, 160), 0, 1.5f);
+    dl->AddCircle(ImVec2(x, my), wgt * 3.0f, IM_COL32(0, 0, 0, 160), 0, Px(1.5f));
     std::string la = wipe_ == Wipe::Grade ? "source" : "left eye";
     std::string ra = wipe_ == Wipe::Grade ? "graded" : "right eye";
     if (wipe_ == Wipe::Clips) {
@@ -757,15 +1159,15 @@ void ProController::BuildWipeLine(const Status& st) {
     const char* l = la.c_str();
     const char* r = ra.c_str();
     const ImVec2 ls = ImGui::CalcTextSize(l);
-    const float ty = my + wgt * 3.0f + 8.0f;  // under the handle, clear of the transport bar
+    const float ty = my + wgt * 3.0f + Px(8.0f);  // under the handle, clear of the transport bar
     const ImVec2 rs = ImGui::CalcTextSize(r);
-    const float pad = 4.0f;
-    dl->AddRectFilled(ImVec2(x - ls.x - 10.0f - pad, ty - pad), ImVec2(x - 10.0f + pad, ty + ls.y + pad),
-                      IM_COL32(0, 0, 0, 170), 3.0f);
-    dl->AddRectFilled(ImVec2(x + 10.0f - pad, ty - pad), ImVec2(x + 10.0f + rs.x + pad, ty + rs.y + pad),
-                      IM_COL32(0, 0, 0, 170), 3.0f);
-    dl->AddText(ImVec2(x - ls.x - 10.0f, ty), IM_COL32(255, 255, 255, 235), l);
-    dl->AddText(ImVec2(x + 10.0f, ty), IM_COL32(255, 255, 255, 235), r);
+    const float pad = Px(4.0f);
+    dl->AddRectFilled(ImVec2(x - ls.x - Px(10.0f) - pad, ty - pad), ImVec2(x - Px(10.0f) + pad, ty + ls.y + pad),
+                      IM_COL32(0, 0, 0, 170), Px(3.0f));
+    dl->AddRectFilled(ImVec2(x + Px(10.0f) - pad, ty - pad), ImVec2(x + Px(10.0f) + rs.x + pad, ty + rs.y + pad),
+                      IM_COL32(0, 0, 0, 170), Px(3.0f));
+    dl->AddText(ImVec2(x - ls.x - Px(10.0f), ty), IM_COL32(255, 255, 255, 235), l);
+    dl->AddText(ImVec2(x + Px(10.0f), ty), IM_COL32(255, 255, 255, 235), r);
 #else
     (void)st;
 #endif
@@ -783,6 +1185,7 @@ bool ProController::NearWipeLine(float x, float y) const {
 // or faded, only the timecode stays (the "SDI timecode overlay"); T hides it.
 void ProController::BuildStatusBar(const Status& st, float alpha) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
+    ui::g_bottomUiTop = ui::g_transportTop;
     if (st.isLogo || !host_.pictureInHud) return;
     float px, py, pw, ph;
     if (!host_.pictureInHud(px, py, pw, ph)) return;
@@ -809,22 +1212,58 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
                        : grade_.lutOn && !lutName_.empty() ? lutName_.c_str()
                        : grade_.cdlOn ? "CDL" : "no look");
         if (!bypass_ && std::fabs(grade_.exposure) > 0.005f) add(" %+.1f EV", grade_.exposure);
+        if (renderer_) {
+            const std::string hdr = HdrSummary(renderer_->SourceHdr());
+            if (!hdr.empty()) add("  |  %s", hdr.c_str());
+        }
+        add("  |  %s", CalibrationLabel().c_str());
+        if (target_.On()) {
+            const float k = host_.pictureScale ? host_.pictureScale() : 1.0f;
+            if (targetPreview_ && std::fabs(k - 1.0f) > 0.005f) add("  |  as on %s x%.2f", target_.name.c_str(), k);
+            else add("  |  for %s", target_.name.c_str());
+        }
         if (station_.ShowTimecode() && !tc.empty()) add("  |  TC %s", tc.c_str());
         const rig::Result r = station_.RigLast();
         if (st.stereo && st.hasPicture && r.ok) add("  |  near %+.1f%%  far %+.1f%%", r.nearPct, r.farPct);
         if (st.stereo) add("  |  conv %+.2f%%", host_.getConvergence ? host_.getConvergence() * 100.0f : 0.0f);
     }
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const float pad = Px(6.0f);
+    // Anchored to the picture's bottom-left corner — but only while that corner is on
+    // screen. Fit-height on a window narrower than the picture (or a zoom) puts it off
+    // the left/bottom edge, and the line went with it, its start cut off. Clamp to the
+    // window.
+    const float x = std::max(px * W, 0.0f) + Px(8.0f);
+    // A long line (file + format + look + calibration + rig numbers) ran off the right
+    // edge of a window: end it with an ellipsis at the edge instead.
+    const float maxTextW = W - x - Px(8.0f) - 2.0f * pad;
+    if (n > 0 && ImGui::CalcTextSize(buf).x > maxTextW) {
+        int lo = 0, hi = std::min(n, (int)sizeof(buf) - 4);
+        char tmp[sizeof(buf)];
+        while (lo < hi) {  // longest prefix that fits with the ellipsis
+            const int mid = (lo + hi + 1) / 2;
+            std::snprintf(tmp, sizeof(tmp), "%.*s...", mid, buf);
+            if (ImGui::CalcTextSize(tmp).x <= maxTextW) lo = mid;
+            else hi = mid - 1;
+        }
+        std::snprintf(tmp, sizeof(tmp), "%.*s...", lo, buf);
+        std::snprintf(buf, sizeof(buf), "%s", tmp);
+    }
     const ImVec2 ts = ImGui::CalcTextSize(buf);
-    const float pad = 6.0f;
-    const float x = px * W + 8.0f, y = (py + ph) * H - ts.y - 2.0f * pad - 8.0f;
-    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + ts.x + 2.0f * pad, y + ts.y + 2.0f * pad), IM_COL32(10, 12, 16, 190), 4.0f);
+    float y = std::min((py + ph) * H, H) - ts.y - 2.0f * pad - Px(8.0f);
+    // When the picture reaches the window's bottom edge (any windowed layout) the line
+    // would print straight over the transport strip: sit above it instead.
+    if (ui::g_transportTop > 0.0f) {
+        y = std::min(y, ui::g_transportTop - ts.y - 2.0f * pad - Px(6.0f));
+        ui::g_bottomUiTop = std::min(ui::g_bottomUiTop, y);
+    }
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + ts.x + 2.0f * pad, y + ts.y + 2.0f * pad), IM_COL32(10, 12, 16, 190), Px(4.0f));
     float tx = x + pad;
     if (st.live && !fs) {
-        dl->AddCircleFilled(ImVec2(tx + 4.0f, y + pad + ts.y * 0.5f), 4.0f, IM_COL32(235, 60, 50, 255));
+        dl->AddCircleFilled(ImVec2(tx + Px(4.0f), y + pad + ts.y * 0.5f), Px(4.0f), IM_COL32(235, 60, 50, 255));
         tx += 0.0f;
     }
-    dl->AddText(ImVec2(tx + (st.live && !fs ? 12.0f : 0.0f), y + pad), IM_COL32(235, 238, 242, 255), buf);
+    dl->AddText(ImVec2(tx + (st.live && !fs ? Px(12.0f) : 0.0f), y + pad), IM_COL32(235, 238, 242, 255), buf);
 #else
     (void)st;
 #endif
@@ -832,19 +1271,23 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
 
 void ProController::BuildUI(const Status& st, float uiAlpha) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
-    BuildOverlays(st, inspectorPinned_ ? 1.0f : uiAlpha);  // framing + burn-ins: not faded
+    {
+        const ImGuiIO& fio = ImGui::GetIO();
+        panelsFit_ = fio.DisplaySize.x >= Px(kPanelsMinW) && fio.DisplaySize.y >= Px(kPanelsMinH);
+    }
+    BuildOverlays(st, PanelsShown() ? 1.0f : uiAlpha);  // framing + burn-ins: not faded
     BuildDepthOverlay(st);  // on the picture; independent of the inspector fade
     BuildWipeLine(st);
     BuildPixelProbe(st);
     flatRects_.clear();
-    const float alpha = inspectorPinned_ ? 1.0f : uiAlpha;
+    const float alpha = PanelsShown() ? 1.0f : uiAlpha;
     BuildStatusBar(st, alpha);
     station_.BuildDeckLinkDialog();
-    if (alpha < 0.01f) return;
+    if (alpha < 0.01f || !panelsFit_) return;
     const ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
-    const float panelW = std::clamp(W * 0.24f, 280.0f, 440.0f);
-    const float top = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f + 8.0f;
+    const float panelW = std::clamp(W * 0.24f, Px(280.0f), Px(440.0f));
+    const float top = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f + Px(8.0f);
 
     // Two panels, as in the plan's mockup: the station on the left (inputs, source,
     // looks, snapshots), the picture controls on the right (view, stereo, color, rig check).
@@ -855,17 +1298,19 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     auto placePanel = [&](float x) {
         ImGui::SetNextWindowPos(ImVec2(x, top), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(panelW, 0.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowSizeConstraints(ImVec2(panelW, 0.0f), ImVec2(panelW, H - top - 90.0f));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(panelW, 0.0f), ImVec2(panelW, H - top - Px(90.0f)));
         ImGui::SetNextWindowBgAlpha(FlatNow() ? 1.0f : 0.82f);  // a flat card hides the picture anyway
     };
     // A flat card is a rectangle of 2D (the Local2D rect): square corners, or the corners
     // would show black / the desktop instead of the picture.
     const bool flat = FlatNow();
     if (flat) ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    placePanel(8.0f);
+    placePanel(Px(8.0f));
     if (ImGui::Begin("Station", nullptr, flags)) {
-        ImGui::Checkbox("Pin panels (Tab)", &inspectorPinned_);
-        ImGui::SameLine();
+        ImGui::Checkbox("Show panels (Tab)", &inspectorPinned_);
+        // The hint shares the row only when it fits; a narrow panel clipped it mid-word.
+        const float hintW = ImGui::CalcTextSize("Shift+Tab: all UI").x + ImGui::GetStyle().ItemSpacing.x;
+        if (ImGui::GetContentRegionAvail().x - ImGui::GetItemRectSize().x >= hintW) ImGui::SameLine();
         ImGui::TextDisabled("Shift+Tab: all UI");
         // --- Inputs (DeckLink / test rig / camera / stream) ----------------------
         station_.BuildInputsSection(st.sourceLabel, st.live);
@@ -903,6 +1348,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                     lutName_.clear();
                     lutPath_.clear();
                     grade_.lutOn = false;
+                    lutIsOcio_ = lutPqShaper_ = false;  // nothing left to re-bake (#134)
                     if (renderer_) renderer_->ClearLut3D();
                 }
                 ImGui::TextDisabled("%s  (%d^3)", lutName_.c_str(), lut_.size);
@@ -923,7 +1369,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     }
     ImGui::End();
 
-    placePanel(W - panelW - 8.0f);
+    placePanel(W - panelW - Px(8.0f));
     if (ImGui::Begin("Inspector", nullptr, flags)) {
         // --- View -----------------------------------------------------------
         if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -942,14 +1388,22 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
                 if (ImGui::RadioButton(label, mode_ == m)) SetMode(m, false);
                 ImGui::EndDisabled();
             }
+            // Buttons flow onto the next line rather than off the panel's right edge.
+            const float rowRight = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+            auto flow = [&](const char* nextLabel) {
+                const ImGuiStyle& st = ImGui::GetStyle();
+                const float w = ImGui::CalcTextSize(nextLabel).x + st.FramePadding.x * 2.0f;
+                if (ImGui::GetItemRectMax().x + st.ItemSpacing.x + w <= rowRight) ImGui::SameLine();
+            };
             ImGui::Text("Zoom %.0f%%", zoom_ * 100.0f);
-            ImGui::SameLine();
+            flow("Fit (H)");
             if (ImGui::SmallButton("Fit (H)")) SetZoom(1.0f);
-            ImGui::SameLine();
+            flow("1:1 (Z)");
             if (ImGui::SmallButton("1:1 (Z)")) SetZoom(host_.oneToOneZoom ? host_.oneToOneZoom() : 1.0f);
-            ImGui::SameLine();
             const bool fs = host_.isFullscreen && host_.isFullscreen();
-            if (ImGui::SmallButton(fs ? "Windowed (F11)" : "Full screen (F11)") && host_.toggleFullscreen)
+            const char* fsLabel = fs ? "Windowed (F11)" : "Full screen (F11)";
+            flow(fsLabel);
+            if (ImGui::SmallButton(fsLabel) && host_.toggleFullscreen)
                 host_.toggleFullscreen();
             ImGui::TextDisabled("Wheel zooms, middle-drag pans");
             const float itemW = ImGui::GetContentRegionAvail().x * 0.42f;
@@ -1002,10 +1456,31 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
         // --- Color ----------------------------------------------------------
         if (ImGui::CollapsingHeader("Color", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("Bypass all (G)", &bypass_);
+            // #133: the panel's display calibration, outside the show grade (G leaves it on).
+            if (!calLoaded_ && calLoading_.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Display: not calibrated");
+            } else {
+                ImGui::TextDisabled("Display: %s", calLoading_.empty() ? calName_.c_str() : "loading...");
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Panel %s\n%s", calKey_.c_str(),
+                                  calError_.empty() ? cal::CalibrationPathFor(calKey_).c_str() : calError_.c_str());
+            ImGui::BeginDisabled(!calLoaded_);
+            ImGui::Checkbox("Bypass calibration (Shift+G)", &calBypass_);
+            ImGui::EndDisabled();
+            if (ImGui::SmallButton("Calibrate panel...")) OpenCalibrationDialog();
+            if (calLoaded_) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Remove")) ClearCalibration(/*uninstall=*/true);
+            }
             ImGui::BeginDisabled(bypass_);
             ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
             ImGui::SliderFloat("Exposure", &grade_.exposure, -4.0f, 4.0f, "%+.2f EV");
             if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) grade_.exposure = 0.0f;
+            ImGui::EndDisabled();
+            BuildHdrControls();
+            ImGui::BeginDisabled(bypass_);
+            BuildOcioControls();
             ImGui::TextDisabled("Look: %s%s%s", grade_.lutOn && !lutName_.empty() ? lutName_.c_str() : "no LUT",
                                 grade_.cdlOn ? " + CDL " : "", grade_.cdlOn ? cdlName_.c_str() : "");
             ImGui::BeginDisabled(!grade_.cdlOn);
@@ -1035,6 +1510,69 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
 
         // --- Rig check (Phase 2) --------------------------------------------
         station_.BuildRigSection(st.stereo && st.hasPicture);  // measured (Phase 2)
+
+        // --- Target screen (#135): the depth as it plays on the screen it is made for ---
+        if (ImGui::CollapsingHeader("Target screen", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const std::vector<target::Screen>& pre = target::Presets();
+            int cur = 0;  // 0 off, 1..N presets, N+1 custom
+            if (target_.On()) {
+                cur = (int)pre.size() + 1;
+                for (size_t i = 0; i < pre.size(); ++i)
+                    if (pre[i].name == target_.name) cur = (int)i + 1;
+            }
+            std::vector<const char*> names = {"Off (this panel)"};
+            for (const target::Screen& p : pre) names.push_back(p.name.c_str());
+            names.push_back("Custom");
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
+            if (ImGui::Combo("Target", &cur, names.data(), (int)names.size())) {
+                if (cur == 0) SetTarget({});
+                else if (cur <= (int)pre.size()) SetTarget(pre[(size_t)cur - 1]);
+                else SetTarget({"Custom", customTargetW_, customTargetD_});
+            }
+            if (cur == (int)pre.size() + 1) {
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
+                bool ch = ImGui::DragFloat("Width (m)", &customTargetW_, 0.01f, 0.1f, 30.0f, "%.2f");
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
+                ch |= ImGui::DragFloat("Distance (m)", &customTargetD_, 0.01f, 0.2f, 40.0f, "%.2f");
+                if (ch) SetTarget({"Custom", std::max(0.1f, customTargetW_), std::max(0.2f, customTargetD_)});
+            }
+            if (target_.On()) {
+                ImGui::TextDisabled("%.2f m wide, seen from %.2f m", target_.widthM, target_.distanceM);
+                if (ImGui::Checkbox("Show at the target's size", &targetPreview_)) targetDirty_ = true;
+                const float k = host_.pictureScale ? host_.pictureScale() : 1.0f;
+                float pw = 0.0f, pd = 0.0f;
+                const bool geom = host_.panelGeometry && host_.panelGeometry(pw, pd);
+                if (!geom) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Panel size unknown: no preview");
+                else if (targetPreview_ && host_.previewLimited && host_.previewLimited())
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "This target is too large to preview");
+                else if (targetPreview_)
+                    ImGui::TextDisabled("Picture x%.2f%s (panel %.2f m, you at %.2f m)", k,
+                                        k > 1.005f ? ", cropped" : k < 0.995f ? ", bordered" : "", pw,
+                                        host_.viewerDistance ? host_.viewerDistance() : pd);
+                const rig::Result r = station_.RigLast();
+                if (r.ok && st.stereo && st.hasPicture) {
+                    // For the picture as shown, so the convergence is included.
+                    const float off = host_.parallaxOffsetPct ? host_.parallaxOffsetPct() : 0.0f;
+                    const target::Depth n = target::AtParallax(target_, r.nearPct + off),
+                                        f = target::AtParallax(target_, r.farPct + off);
+                    if (std::fabs(off) > 0.005f) ImGui::TextDisabled("Includes convergence: %+.2f%%", off);
+                    ImGui::Text("Near %+.0f mm  %+.0f'   Far %+.0f mm  %+.0f'", n.mm, n.arcmin, f.mm, f.arcmin);
+                    if (f.divergenceDeg > 0.0f)
+                        ImGui::TextColored(f.divergenceDeg > target::kDivergenceCapDeg ? ImVec4(1.0f, 0.4f, 0.35f, 1.0f)
+                                                                                      : ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                           "Background diverges %.2f deg", f.divergenceDeg);
+                }
+                ImGui::TextDisabled("Diverges past %+.1f%% (%.1f deg)", target::DivergenceLimitPct(target_),
+                                    target::kDivergenceCapDeg);
+            }
+            if (ImGui::SmallButton("Depth budget -1 / +2 %")) {
+                rig::Budget b = station_.RigBudget();
+                b.nearPct = -1.0f;
+                b.farPct = 2.0f;
+                station_.SetRigBudget(b);
+                if (host_.toast) host_.toast("Depth budget -1 / +2 %");
+            }
+        }
         if (FlatNow()) AddFlatRectOfCurrentWindow();
     }
     ImGui::End();

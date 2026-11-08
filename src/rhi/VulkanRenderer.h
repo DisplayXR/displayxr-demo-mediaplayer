@@ -43,6 +43,12 @@ struct ViewUV {
     // UV offset from this view's sample to the same scene point in the OTHER eye. Only
     // read by the Pro QC views (difference / anaglyph); 0 everywhere else.
     float otherDX = 0.0f, otherDY = 0.0f;
+    // VR180 / VR360 viewer (#155): when vrMode != 0 the offset/scale above are the eye's
+    // TANGENT window, not a source rect, and the shader samples through the sphere. Built
+    // by vr::PackModeFlags / vr::PackHeading (src/media/VrView.h). All 0 = a flat draw.
+    uint32_t vrMode = 0;     // OR-ed into the push block's `mode` (bits 8+)
+    float vrPitch = 0.0f;    // radians
+    uint32_t vrHeading = 0;  // OR-ed into viewFlags (bits 16-31)
 };
 
 // Media Player Pro grade, applied in the source shader to every DrawViews draw:
@@ -62,6 +68,20 @@ struct GradeParams {
     int wipeMode = 0;            // 0 off, 1 before | after the grade, 2 left eye | right eye
     float wipePos = 0.5f;        // the wipe line across the picture, 0..1
     float gamma = 1.0f;          // display gamma trim, applied after the grade and QC view
+    // Per-panel display calibration (#133), the last transform: after the grade, QC view,
+    // gamma trim and channel view. Ignored unless a calibration LUT was uploaded (HasCalibrationLut). Not part of
+    // the show grade: bypassing the grade keeps it.
+    bool calOn = false;
+    // HDR sources (#134): 0 auto (roll off HLG / PQ highlights, clip scene-linear EXR at
+    // white), 1 always roll off, 2 never (clip), 3 raw (the signal goes into the grade as
+    // if it were SDR, for a show LUT that expects PQ / HLG). peakNits 0 = the stream's own.
+    // For HLG, peakNits is the display peak the OOTF renders for (default 1000).
+    int toneMap = 0;
+    float peakNits = 0.0f;
+    bool lutPqShaper = false;    // the LUT is an OCIO bake expecting PQ-coded linear (EXR)
+    // An untagged YUV source (#169): 0 as tagged (SDR), 1 take it as BT.2100 HLG, 2 as PQ
+    // (BT.2020 matrix and primaries). A tagged HDR source and an RGBA one are unaffected.
+    int forceTransfer = 0;
 };
 
 
@@ -133,6 +153,32 @@ public:
     bool UploadYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2,
                    uint32_t width, uint32_t height, int format, bool fullRange, int matrix = 0);
     int SourceMatrix() const { return sourceMatrix_; }  // last YUV upload's matrix (UI)
+    // The HDR tags of the source just uploaded (#134): transfer 0 SDR, 1 HLG, 2 PQ, 3 scene-
+    // linear stored as PQ; BT.2020 primaries; the stream's peak in nits (0 = unknown).
+    void SetSourceHdr(int transfer, bool bt2020, float peakNits);
+    // What the shader does with them under the current grade (UI / status / notes).
+    struct HdrState {
+        int transfer = 0;      // the source's (0 SDR, 1 HLG, 2 PQ, 3 scene-linear as PQ)
+        bool raw = false;      // tone map "raw": the shader treats it as SDR
+        bool rollOff = false;
+        bool bt2020 = false;
+        float peakNits = 0.0f;
+        bool pqShaper = false;  // scene-linear into an OCIO look, unclipped (see GradeParams)
+        // Scene-linear EXR under tone map auto (#169): values above white go into the CDL
+        // and LUT unclipped (clipped after the grade), so highlights survive a grade.
+        bool overWhite = false;
+        bool forced = false;    // the transfer came from GradeParams::forceTransfer
+    };
+    HdrState SourceHdr() const;
+    // The same decision for any tags under the current grade (the compare clip B, the
+    // "Convert to 3D" input frame): transfer 0 SDR, 1 HLG, 2 PQ, 3 scene-linear as PQ.
+    // An untagged (SDR) transfer becomes GradeParams::forceTransfer when one is set.
+    HdrState HdrFor(int transfer, bool bt2020, float peakNits) const;
+    // The Y'CbCr matrix to decode with: BT.2020 (2) when HdrFor forces an untagged source.
+    int EffectiveMatrix(int transfer, int matrix) const { return ForcesHdr(transfer) ? 2 : matrix; }
+    bool ForcesHdr(int transfer) const {
+        return transfer == 0 && (grade_.forceTransfer == 1 || grade_.forceTransfer == 2);
+    }
 
     // Media Player Pro's clip-vs-clip wipe: a second source (B) at bindings 4..6, sampled by
     // the MP_GRADE shader right of the wipe line (GradeParams::wipeMode 3). Same formats and
@@ -142,6 +188,8 @@ public:
     bool UploadCompareYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2, uint32_t width,
                           uint32_t height, int format, bool fullRange, int matrix = 0);
     void ClearCompare();
+    // B's HDR tags (#169), as SetSourceHdr for A; an RGBA B upload resets them to SDR.
+    void SetCompareHdr(int transfer, bool bt2020, float peakNits);
     bool HasCompare() const { return compareMode_ >= 0; }
 
 #if defined(_WIN32)
@@ -186,6 +234,10 @@ public:
     bool UploadLut3DPacked(const uint16_t* rgba16f, uint32_t size, float domainMin, float domainMax);
     void ClearLut3D();
     bool HasLut3D() const { return lut_.view != VK_NULL_HANDLE; }
+    // The per-panel display calibration LUT (#133) at binding 7, domain 0..1.
+    bool UploadCalibrationLut(const uint16_t* rgba16f, uint32_t size);
+    void ClearCalibrationLut();
+    bool HasCalibrationLut() const { return cal_.view != VK_NULL_HANDLE; }
 
     // `rects` are the per-view content rects (the viewport — may be convergence-
     // shifted); `clipRects` are the per-view tile bounds the drawing is scissored to,
@@ -240,9 +292,15 @@ private:
     int compareMode_ = -1;           // B: -1 none, else as sourceMode_
     bool compareFullRange_ = false, compare16_ = false;
     int compareMatrix_ = 0;
+    int compareTransfer_ = 0;        // B's HDR tags (#169), see SetCompareHdr
+    bool compareBt2020_ = false;
+    float comparePeak_ = 0.0f;
     float sourceFullRange_ = 0.0f;
     bool source16_ = false;          // P016: the MP_GRADE shader uses 10-bit limited levels
     int sourceMatrix_ = 0;           // YUV matrix pushed to the MP_GRADE shader (0 = BT.709)
+    int sourceTransfer_ = 0;         // HDR tags (#134), see SetSourceHdr
+    bool sourceBt2020_ = false;
+    float sourcePeak_ = 0.0f;
 
 #if defined(_WIN32)
     // Zero-copy interop state (#28). imports_ caches one entry per shared handle. The producer
@@ -277,7 +335,7 @@ private:
         VkImageView view = VK_NULL_HANDLE;
         uint32_t size = 0;
         float domainMin = 0.f, domainMax = 1.f;
-    } lut_, lutDummy_;
+    } lut_, cal_, lutDummy_;  // cal_: the display calibration LUT at binding 7
     bool CreateLutImage(Lut3D& dst, uint32_t n, const uint16_t* rgba16f);
     void DestroyLut(Lut3D& l, bool deferred);
 

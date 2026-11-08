@@ -96,6 +96,46 @@ loads the first and makes the dropped set the list Up / Down and the slideshow w
 Dropping a **folder** opens its first asset and starts the slideshow, with the folder as
 that list — the same thing as passing the folder on the command line, plus playback.
 
+## VR180 / VR360 viewer (#155)
+
+VR180 and stereo VR360 files play as a **window into the scene**, steered with the mouse,
+instead of a flat, distorted packed frame. Each eye's half of the frame is projected onto the
+sphere and seen through a virtual camera window.
+
+- **Projections:** equirectangular half sphere (YouTube VR180) and full sphere (VR360), side by
+  side or top-bottom, and dual fisheye (raw VR180 camera files, equidistant, lens FOV 180 by
+  default), and 360 cubemaps: the 3x2 cubemap (FFmpeg v360 `c3x2`, Spherical Video V2 `cbmp`
+  layout 0, with its face padding) and the equi-angular cubemap (EAC, as YouTube streams 360
+  video; FFmpeg v360 `eac`), mono or stereo. Stereo cubemap / EAC uses the same cylindrical
+  window as stereo VR360 equirect. Mono 360 / 180 pans in 2D.
+- **Detection:** MP4 / MOV / MKV spherical metadata (`sv3d` / `proj` / `equi` or `cbmp`, with
+  `st3d` for the packing), then file-name tokens (`vr180`, `180`, `180x180`, `360`, `vr360`,
+  `fisheye`, `cubemap` / `c3x2`, `eac`, with
+  `3dh` / `sbs` / `lr` and `3dv` / `tb` for the packing; a bare `180` / `360` only counts on a
+  frame of the right shape; a cubemap / EAC eye is 3:2). EAC carries no metadata FFmpeg reads
+  (YouTube marks it with an sv3d mesh), so it comes from the name or the override. **P**
+  cycles the projection override (auto / flat / VR180 / VR360 / fisheye / cubemap / EAC); **L** still sets the packing. MCP: `set_layout {projection, fisheye_fov_deg}`.
+- **Controls:** drag pans and tilts, the wheel zooms, **double-click** or **R** re-centres,
+  the arrow keys pan in 5° steps (`[` / `]` step frames and PageUp / PageDown walk the folder
+  meanwhile). MCP `get_view` / `set_view {yaw_deg, pitch_deg, fov_deg, recenter}`.
+- **Life-size by default:** the window's field of view is the panel's real angular width at
+  the nominal viewing distance (`XR_DXR_display_info`). Zooming also scales the disparity;
+  auto-convergence (**A**) measures the rendered eye windows, so it keeps working.
+- **The stereo pair stays rectified.** The two source cameras sit on a fixed horizontal
+  baseline. Pitch is a real rotation about that baseline, so rows stay aligned. Yaw is **not**
+  a rotation, which would add vertical disparity off-centre and flatten depth by ~cos(yaw):
+  both eyes keep their image plane parallel to the baseline and the view pans as an
+  **off-axis (lens-shifted) window** across it, clamped to ±65° (`MEDIAPLAYER_VR_PAN_MAX`)
+  where its stretch becomes the trade. Stereo VR360 is omni-directional stereo; its window is
+  cylindrical (row = elevation), which keeps the rows aligned at every heading. Convergence
+  is a lens shift of the window too, so it never exposes a de-occlusion strip.
+  `tests/vr_view_test.cpp` measures the vertical disparity across the whole pan / pitch / zoom
+  range on synthetic scenes (≈0.003 px, against ~21 px for a naively rotated pair).
+- **Test media:** `tools/vr/make_vr_fixtures.py --assets DIR` renders synthetic VR180,
+  dual-fisheye and VR360 stills and clips (needs numpy + ffmpeg). Headless:
+  `MEDIAPLAYER_VR=equirect180|equirect360|fisheye|cubemap|eac|flat`, `MEDIAPLAYER_VR_VIEW=yaw,pitch[,fov]`.
+- Desktop only for now; Android touch control is a follow-up.
+
 ## Live camera (#90)
 
 A live **stereo camera** can stand in for a file: a side-by-side UVC webcam such as the
@@ -213,7 +253,8 @@ and **Stop live** in the same menu ends it. Audio in a stream is ignored for now
 | `udp://` / `rtp://` | MPEG-TS over UDP (unicast or multicast, `udp://@239.0.0.1:1234`). |
 | `http://` / `https://` | progressive MPEG-TS / FLV / fragmented MP4. |
 | `*.m3u8` | HLS, local or remote. Its latency is the playlist's (seconds), not the player's. |
-| `srt://` | **not supported** (needs libsrt); refused with a message. |
+| `*.mpd` | MPEG-DASH, VOD or live (dynamic MPD), local or remote (#195). Like HLS, its latency is the manifest's. Of several video representations FFmpeg's best-stream pick takes the highest bitrate. Every desktop build (macOS since #201). |
+| `srt://` | SRT (#198), caller by default: `srt://host:9000`. Options go in the query and are FFmpeg's libsrt ones: `mode=caller\|listener`, `streamid=…` (for example a media server's `read:<path>`), `passphrase=…` (AES; redacted in logs and `get_status`) and `latency=` in **microseconds** (`latency=200000` = 200 ms; libsrt's default is 120 ms). As a listener (`srt://0.0.0.0:9000?mode=listener`) the player waits up to 30 s for the sender. Every desktop build (macOS since #201). |
 
 **Latency.** Demuxing runs with `fflags=nobuffer`, a 0.5 s `max_delay`, a small probe
 (1 MB / 1.5 s, enough for a 4K SPS/PPS + IDR) and a low-delay decoder. The player adds
@@ -222,10 +263,10 @@ use a zerolatency tune and a short keyframe interval (`-g 30`). The first pictur
 the next keyframe.
 
 **Reconnect.** A stream that stops (the sender is killed or the network drops) is detected
-after 5 s without data (15 s for HLS). The pill turns amber (RECONNECTING) and the player
+after 5 s without data (15 s for HLS and DASH). The pill turns amber (RECONNECTING) and the player
 retries with a 1, 2, 4, 8 s backoff (capped) until the stream is back. The last picture
 stays up in the meantime. A URL that never connects gives up after three attempts
-(connect budget 8 s each) and returns to the idle screen with the error.
+(connect budget 8 s each; 15 s for HLS, 30 s for DASH, which fetches a first segment of every representation while opening) and returns to the idle screen with the error.
 
 While streaming, the top bar shows `STREAM host · fps · Mbit/s`: a blue dot while streaming,
 amber while connecting, reconnecting or frozen, grey once the stream has failed. The
@@ -235,7 +276,7 @@ SHIFT+TAB text HUD has the same line. Agents drive it with the MCP tool
 stops a stream too.
 
 **FFmpeg must have network input.** The installer's slim FFmpeg (`scripts/build-ffmpeg-slim.sh`,
-`scripts/build_ffmpeg_linux.sh`) enables it. An older slim tree used as a local
+`scripts/build_ffmpeg_linux.sh`, `scripts/build_ffmpeg_macos.sh`) enables it. An older slim tree used as a local
 `-DFFMPEG_ROOT` does not, and every URL then fails with "Protocol not found". For local
 work, point `FFMPEG_ROOT` at any full shared FFmpeg 8.x dev build instead; the gitignored
 `third_party/ffmpeg-win64-full/` is the conventional place for it.
@@ -245,7 +286,7 @@ Ubuntu 22.04, 24.04 and 26.04. Each Linux TLS backend adds a library whose packa
 differs across those releases (`libssl3` / `libssl3t64`), so the Linux build has no TLS:
 `https://`, `rtsps://`, `rtmps://` and HLS over https are **Windows and macOS only**. Plain
 `http`, `rtsp`, `rtmp`, `udp` and `rtp` work everywhere. Windows uses the system SChannel
-(no extra DLL). macOS uses Homebrew's full FFmpeg.
+(no extra DLL), macOS the system Secure Transport (no extra dylib).
 
 Test it with no infrastructure by serving a camera from a second `ffmpeg` on the same box:
 
@@ -315,9 +356,9 @@ Set `MEDIAPLAYER_LOG_DEBUG=1` for verbose logs.
 
 | Type | Formats | Notes |
 |---|---|---|
-| Images | SBS JPG/PNG, LIF, MPO, HEIC | layout from filename / container / content, else assumed stereo |
+| Images | SBS JPG/PNG/GIF/BMP, LIF, MPO, HEIC | layout from filename / container / content, else assumed stereo; a GIF shows its first frame |
 | Phone spatial capture | stereo HEIC photos, MV-HEVC video (`.mov` / `.mp4`), as written by Apple spatial capture and the Samsung Galaxy "3D Capture" mode | detected automatically, no conversion: both views are composed side by side (HUD: `MV-HEVC` / `stereo HEIC`). Eye order from the file: the HEIF `ster` group, the MV-HEVC eye tags, else base view = left. A HEIC with no stereo group shows its primary image flat. Desktop, FFmpeg 7.1+ (the shipped builds); MV-HEVC decodes in software. Not on Android yet |
-| Video | SBS H.264 / H.265 / AV1 (MP4/MKV/MOV) | hardware decode via FFmpeg, CPU fallback; `AVStereo3D` side data honoured incl. eye order |
+| Video | SBS H.264 / H.265 / AV1 / VP8 / VP9 / MPEG-4 (MP4/MKV/MOV/M4V/WEBM/3GP) | hardware decode via FFmpeg, CPU fallback; `AVStereo3D` side data honoured incl. eye order |
 | 2D (mono) stills, video, live | anything above that is mono, or pinned Mono with `L` | optional **Convert to 3D** (Shift+L / top-bar toggle / MCP `set_convert_3d`): the runtime's `XR_DXR_lift` `VIEWS_MONO` task returns a side-by-side pair that replaces the picture. Off on every load. Hidden when the runtime has no `XR_DXR_lift`; greyed with the reason when the task cannot serve this session |
 
 ## Runtime compatibility
@@ -345,6 +386,11 @@ headlessly. On a runtime with `XR_DXR_lift` **spec 5** (provider candidates, run
 small selector beside the toggle lists the runtime's converters by their own names and
 state; a pick applies to this session only and is never saved (the default stays in
 DisplayXR's settings / `displayxr-cli conv use`).
+
+**Media Player Pro** needs runtime **v2.61.0** or later: from 2.61 the runtime keys display
+calibration by the display's stable key, and older runtimes fall back to the device name, so a
+calibration can land on the wrong panel. The Pro Windows installer warns below 2.61 and lets you
+go on; the Pro `.deb` declares `Depends: displayxr-runtime (>= 2.61.0)` (#169).
 
 **Input** (top bar, runtimes with `XR_DXR_input_providers`): pick which of the runtime's
 input providers drives this app's controllers / hands / gamepad, by the providers' own names; the

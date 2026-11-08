@@ -33,6 +33,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <utility>
 #include <unordered_map>
 
 #include <vk_frame_ring.h>  // displayxr-common: dxr::VkFrameRing (INV-4.10)
@@ -100,6 +101,28 @@ struct SbsRenderer {
 	float convergence() const { return convergence_; }
 	bool stereoDual() const { return ahbStereo_; }
 
+	// The swipe slide: every tile's picture, crop included, moved by `s` tile widths
+	// (+ = right). Both eyes move together, so the depth is unchanged.
+	void setSlide(float s) { slide_ = s; }
+
+	// ── Stills: the swipe's second page (NeighbourStills) ─────────────────
+	// RGBA8 into still slot 0 or 1. A one-off: drains the frames in flight first.
+	void uploadStill(int slot, const uint8_t *rgba, uint32_t width, uint32_t height);
+	// The still in `slot` becomes the RGBA picture, as if uploadTexture had loaded it, with
+	// no copy. The slot is left the old picture's plane, for the next uploadStill.
+	void adoptStill(int slot);
+	// Swap the two still slots' contents (the picture swiped away moves to the other side).
+	void swapStills() { std::swap(stills_[0], stills_[1]); }
+	// Draw still `slot` (-1: none) as a second page `offset` tile widths across, fitted
+	// like the picture: `aspect` is one eye's, `mono` gives every view the whole still.
+	void setStillPage(int slot, float offset, float aspect, bool mono)
+	{
+		stillPage_ = slot;
+		stillOffset_ = offset;
+		stillAspect_ = aspect;
+		stillMono_ = mono;
+	}
+
 	// Drop every zero-copy resource belonging to the CURRENT stream: the cached
 	// per-AHB imports (and the AHardwareBuffer refs that keep the old reader's
 	// pool alive) and the ycbcr pipeline built from that stream's external
@@ -150,11 +173,12 @@ private:
 
 	const Target &targetFor(VkImage image, uint32_t w, uint32_t h);
 	uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
-	bool ensurePlane(int idx, uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel);
-	void recordPlaneCopy(VkCommandBuffer cmd, int idx, const uint8_t *src, uint32_t w,
+	bool ensurePlane(Plane &p, uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel);
+	void recordPlaneCopy(VkCommandBuffer cmd, Plane &p, const uint8_t *src, uint32_t w,
 	                     uint32_t h, uint32_t bytesPerTexel);
 	bool ensureDummy();
 	void bindDescriptors(VkDescriptorSet set);  // point the 3 sampler slots at planes_/dummy
+	void bindViews(VkDescriptorSet set, VkImageView v0, VkImageView v1, VkImageView v2);
 	void destroyPlane(Plane &p);
 
 	VkPhysicalDevice phys_ = VK_NULL_HANDLE;
@@ -180,6 +204,13 @@ private:
 	bool endFrameErrLogged_ = false;
 
 	Plane planes_[3];
+
+	static constexpr int kStills = 2;
+	Plane stills_[kStills];
+	VkDescriptorSet stillSets_[kMaxSlots] = {};  // per ring slot, like descSets_
+	int stillPage_ = -1;
+	float stillOffset_ = 0.0f, stillAspect_ = 1.0f;
+	bool stillMono_ = false;
 	int sourceMode_ = 0;          // 0 RGBA, 1 I420, 2 NV12, 3 AHB-ycbcr (pushed to the shader)
 	float sourceFullRange_ = 1.0f;
 
@@ -243,6 +274,7 @@ private:
 	VkImageView ahbActiveViewR_ = VK_NULL_HANDLE;
 	bool ahbStereo_ = false;
 	float convergence_ = 0.0f;   // fraction of view width; see drawAtlas()
+	float slide_ = 0.0f;         // tile widths; see setSlide()
 	float convSign_ = 1.0f;      // debug.dxr.mp.conv_sign: 1 = vendor convention (+ = nearer), -1 inverts
 	float convScale_ = 1.0f;     // debug.dxr.mp.conv_scale (0 = off, 1 = as authored)
 	bool convPropsRead_ = false;
@@ -251,6 +283,28 @@ private:
 	// clip would silence exactly the case that matters -- the FIRST play-through of
 	// the next one.
 	bool stereoBindLogged_ = false;
+
+	// #8: Adreno's import of a YV12 buffer (what the c2.android software decoders write)
+	// assumes a stride that is a multiple of 128 and ignores the buffer's own, so any
+	// other width comes out garbled. Such frames are copied into our own YV12 buffers of
+	// a 128-multiple width; ahbUScale_ crops the padding. Per eye, reused round the pool.
+	struct Yv12Copy {
+		struct AHardwareBuffer *ahb = nullptr;  // our AHardwareBuffer_allocate ref
+		bool free = true;                       // no submitted frame samples it any more
+	};
+	static constexpr int kYv12Copies = 6;
+	// The buffer to import for decoder frame `ahb` (itself, or a padded copy of it);
+	// `importW` gets its width.
+	struct AHardwareBuffer *strideSafe(struct AHardwareBuffer *ahb, int eye, uint32_t w,
+	                                   uint32_t h, uint32_t *importW);
+	void releaseYv12Copies();
+	Yv12Copy yv12Copies_[2][kYv12Copies];
+	struct AHardwareBuffer *yv12Src_[2] = {};  // the decoder frame last copied, per eye
+	int yv12Cur_[2] = {-1, -1};                // the copy holding it
+	uint32_t yv12W_ = 0, yv12H_ = 0;           // the copies' size
+	bool yv12Logged_ = false;                  // per stream
+	float ahbUScale_ = 1.0f;  // content width / imported width
+
 	VkImage dummyImage_ = VK_NULL_HANDLE;
 	VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
 	VkImageView dummyView_ = VK_NULL_HANDLE;

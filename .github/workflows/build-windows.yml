@@ -126,7 +126,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.FFMPEG_PREFIX }}
-          key: ffmpeg-slim-${{ env.FFMPEG_SHA }}-${{ hashFiles('scripts/build-ffmpeg-slim.sh') }}
+          key: ffmpeg-slim-${{ env.FFMPEG_SHA }}-${{ hashFiles('scripts/build-ffmpeg-slim.sh', 'scripts/ffmpeg_components.sh', 'scripts/ffmpeg-patches/*.patch') }}
 
       # NASM - prefer the copy already on the runner image.
       #
@@ -263,18 +263,35 @@ jobs:
           path: ${{ runner.temp }}/ffmpeg-config.log
           if-no-files-found: ignore
 
+      # OpenColorIO for Pro, static (no DLLs to ship), keyed by the script that pins its version.
+      - name: Restore OpenColorIO
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ocio/installed-*
+          key: ocio-static-${{ hashFiles('scripts/build-ocio-win.ps1') }}
+
+      - name: Build OpenColorIO
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $prefix = (& powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-ocio-win.ps1 -Root "$env:RUNNER_TEMP\ocio" | Select-Object -Last 1)
+          if ($LASTEXITCODE) { throw "OpenColorIO build failed" }
+          "MP_OCIO_ROOT=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Configure + build
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DFFMPEG_ROOT="$env:FFMPEG_ROOT" -DMP_BUILD_TESTS=ON
+          if (-not (Select-String -Path build\CMakeCache.txt -Pattern '^OpenColorIO_DIR:.*opencolorio' -Quiet)) { throw "Pro was configured without OpenColorIO" }
           cmake --build build
 
       # The unit tests are built above (MP_BUILD_TESTS=ON) next to the staged FFmpeg /
       # SDL3 DLLs in build/. decode_formats is excluded: it ENCODES EXR / DPX / ProRes
       # fixtures, and this job's slim FFmpeg is decode-only (scripts/build-ffmpeg-slim.sh),
       # so it can only fail here; macOS CI runs it against Homebrew's full FFmpeg.
-      # short_clip and ocio_bake skip themselves (no ProRes encoder / no OCIO).
+      # short_clip skips itself (no ProRes encoder).
       - name: Unit tests
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
@@ -345,7 +362,7 @@ jobs:
           $plist = & 7z l "$($pro.FullName)" 2>&1 | Out-String
           if ($plist -match 'SimulatedReality') {
             Write-Host "::error::Pro installer bundles a SimulatedReality* DLL."; exit 1 }
-          foreach ($need in @("mediaplayer_pro_handle_vk_win.exe","mediaplayer_pro_handle_vk_win.displayxr.json","SDL3.dll","avcodec","avformat","avutil","swscale","swresample")) {
+          foreach ($need in @("mediaplayer_pro_handle_vk_win.exe","mediaplayer_pro_handle_vk_win.displayxr.json","SDL3.dll","avcodec","avformat","avutil","swscale","swresample","OCIO-THIRD-PARTY-NOTICES.txt")) {
             if ($plist -notmatch [regex]::Escape($need)) {
               Write-Host "::error::Pro installer payload missing $need"; exit 1 } }
           Write-Host "PASS: Pro installer payload OK."

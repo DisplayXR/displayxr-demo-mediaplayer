@@ -6,6 +6,9 @@
 # macOS/Linux with "bad interpreter".
 *.sh text eol=lf
 
+# Upstream FFmpeg patches (scripts/ffmpeg-patches/): LF, as git apply expects.
+*.patch text eol=lf
+
 # Windows batch + NSIS scripts are CRLF.
 *.bat text eol=crlf
 *.nsi text eol=crlf
@@ -16,3 +19,8 @@
 *.mp4 binary
 *.pkg binary
 *.exe binary
+*.ttf binary
+
+# Blackmagic DeckLink SDK headers, vendored verbatim (third_party/decklink-sdk/README.md):
+# keep the SDK's own bytes and line endings.
+third_party/decklink-sdk/*/include/** -text

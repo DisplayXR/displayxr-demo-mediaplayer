@@ -29,6 +29,11 @@ bundle or `versions.json`). `mp_add_player()` in `CMakeLists.txt` builds both;
 - `shaders/sbs.frag` is shared with Android: Pro shader features stay behind
   `#ifdef MP_GRADE` (desktop compiles with `-DMP_GRADE`, Android without).
 
+## Media browser (read `docs/BROWSER.md`)
+
+The in-app gallery (#160), Android first. Read `docs/BROWSER.md` before touching
+`src/browser/`, `android/src/main/cpp/browser/` or `MediaStoreProvider.kt`.
+
 ## THE GOLDEN RULE — extension-wire-protocol only
 
 This app is coupled to the runtime **only by the OpenXR extension wire protocol**,
@@ -64,7 +69,11 @@ the libheif option the PRD reserved was never needed and is not wired).
 CUDA/NVDEC may be used *transparently* when FFmpeg picks it — never a build dep.
 
 - SDL3 / Dear ImGui / stb → FetchContent (pinned).
-- FFmpeg → vcpkg on Windows, system/Homebrew elsewhere. hwaccel auto-selected per
+- FFmpeg → the repo's own slim, decode-only build on every desktop platform
+  (`scripts/build-ffmpeg-slim.sh` Windows, `build_ffmpeg_linux.sh` Linux,
+  `build_ffmpeg_macos.sh` macOS, #201), one shared component list in
+  `scripts/ffmpeg_components.sh`. Homebrew's FFmpeg is a `build_macos.sh --brew-ffmpeg`
+  local-dev escape hatch only, never in a `.pkg`. hwaccel auto-selected per
   OS (D3D11VA/NVDEC, VideoToolbox, VAAPI, MediaCodec) with CPU software fallback.
 
 ## Platforms & graphics binding

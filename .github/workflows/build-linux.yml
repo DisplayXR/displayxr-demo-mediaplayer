@@ -21,7 +21,11 @@ name: Build Linux
 # lane, so a .deb that installs but cannot run on a supported release blocks
 # the merge, not just the release (runtime #1656 / #1684).
 #
-# Build-green scope: compile mediaplayer_handle_vk_linux. CI has no
+# Media Player Pro (#139) is built in both lanes (MP_BUILD_PRO=ON) and packaged as
+# its own displayxr-mediaplayer-pro .deb from the same portable build; a pro-v* tag
+# attaches it to the "Media Player Pro X.Y.Z" release the Windows / macOS jobs make.
+#
+# Build-green scope: compile mediaplayer_handle_vk_linux (+ Pro). CI has no
 # display/GPU, so the app is never run here; on-screen validation is
 # a separate pass gated on the runtime's Linux Phase 1b + hardware.
 
@@ -37,6 +41,7 @@ on:
     # (the Linux meta-bundle fetches it — runtime #781 Phase 3).
     tags:
       - 'v*'
+      - 'pro-v*'   # Media Player Pro releases: attach the Pro .deb (#139)
 
 # The Deb job attaches release assets on tags.
 permissions:
@@ -131,7 +136,7 @@ jobs:
 
       - name: Build (build-green; app is not run — no display on CI)
         if: needs.DetectChanges.outputs.docs_only != 'true'
-        run: ./scripts/build_linux.sh
+        run: MP_BUILD_PRO=ON ./scripts/build_linux.sh
 
       # Guard against a hollow green: FFmpeg must have resolved via pkg-config
       # so the media/VAAPI path actually compiled.
@@ -189,7 +194,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential ninja-build pkg-config python3 file binutils \
             libvulkan-dev glslang-tools \
-            nasm libva-dev zlib1g-dev \
+            nasm meson libva-dev zlib1g-dev \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxfixes-dev \
             libwayland-dev wayland-protocols libxkbcommon-dev libdbus-1-dev libegl-dev libgl-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev libdbus-1-dev libudev-dev \
@@ -204,7 +209,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.FFMPEG_PREFIX }}
-          key: ffmpeg-slim-linux-2204-${{ hashFiles('scripts/build_ffmpeg_linux.sh') }}
+          key: ffmpeg-slim-linux-2204-${{ hashFiles('scripts/build_ffmpeg_linux.sh', 'scripts/ffmpeg_components.sh', 'scripts/ffmpeg-patches/*.patch') }}
 
       - name: Build + package the demo .deb
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -212,6 +217,7 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           cmake --version | head -1
           ./scripts/package_deb_linux.sh
+          ./scripts/package_deb_linux.sh --pro --no-build   # Media Player Pro, same build (#139)
           ls -lh dist/*.deb
 
       - name: Upload .deb artifact
@@ -219,15 +225,43 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: displayxr-mediaplayer-deb
-          path: dist/*.deb
+          path: dist/displayxr-mediaplayer_*_amd64.deb
+          if-no-files-found: error
+
+      - name: Upload Pro .deb artifact
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: displayxr-mediaplayer-pro-deb
+          path: dist/displayxr-mediaplayer-pro_*_amd64.deb
           if-no-files-found: error
 
       - name: Attach .deb to the GitHub Release (tags only)
         if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.deb
+          files: dist/displayxr-mediaplayer_*_amd64.deb
           fail_on_unmatched_files: true
+
+      # Pro: its own pro-v* release, never "latest". Same name / draft / prerelease /
+      # make_latest as build-windows.yml's and build-macos.yml's pro-v* steps, so
+      # whichever job finishes first creates the release and the others add their
+      # asset (only build-windows.yml writes the release notes).
+      - name: Pro version (pro-vX.Y.Z -> X.Y.Z)
+        id: proversion
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/pro-v')
+        run: echo "version=${GITHUB_REF_NAME#pro-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Attach Pro .deb to the GitHub Release (pro-v* tags)
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/pro-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/displayxr-mediaplayer-pro_*_amd64.deb
+          fail_on_unmatched_files: true
+          name: Media Player Pro ${{ steps.proversion.outputs.version }}
+          draft: false
+          prerelease: false
+          make_latest: false
 
   # Install the .deb from the Deb job into a PRISTINE container of every
   # supported release, with the latest released runtime .deb (Depends:
@@ -256,6 +290,12 @@ jobs:
           name: displayxr-mediaplayer-deb
           path: dist
 
+      - uses: actions/download-artifact@v4
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          name: displayxr-mediaplayer-pro-deb
+          path: dist
+
       - name: Fetch the latest released runtime .deb
         if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
@@ -270,6 +310,15 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.lts }}" \
             ./scripts/verify_deb_install_linux.sh dist/displayxr-mediaplayer_*_amd64.deb runtime-deb/*.deb
+
+      # Media Player Pro (#139), with the Media Player in the same fresh container:
+      # proves the two packages install side by side.
+      - name: apt install + ldd Media Player Pro in clean ubuntu:${{ matrix.lts }}
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.lts }}" \
+            ./scripts/verify_deb_install_linux.sh dist/displayxr-mediaplayer-pro_*_amd64.deb \
+              dist/displayxr-mediaplayer_*_amd64.deb runtime-deb/*.deb
 
   # Single stable required context for the whole Linux packaging lane —
   # "Linux Packaging" (mirrors displayxr-runtime's, PR #1684).

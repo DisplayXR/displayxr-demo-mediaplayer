@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <thread>
 
 namespace mp::lift {
 
@@ -658,6 +659,97 @@ bool ConvertYuvToRgba(const uint8_t* p0, const uint8_t* p1, const uint8_t* p2, u
             d[2] = Clamp8((c + kBu * u + 512) >> 10);
             d[3] = 255;
         }
+    }
+    return true;
+}
+
+bool ConvertHdrYuvToRgba(const uint8_t* p0, const uint8_t* p1, const uint8_t* p2, uint32_t w,
+                         uint32_t h, int format, bool fullRange, int matrix,
+                         const color::HdrDisplayTable& hdr, uint32_t outW, uint32_t outH,
+                         std::vector<uint8_t>& out) {
+    if (!p0 || !p1 || w == 0 || h == 0 || outW == 0 || outH == 0) return false;
+    if (format < 0 || format > 2 || (format == 0 && !p2)) return false;
+    out.resize((size_t)outW * outH * 4);
+    const uint32_t cw = (w + 1) / 2;
+    const bool p16 = format == 2;
+    // Normalised Y' (0..1) and Cb / Cr (-0.5..0.5), the shader's SampleSource levels.
+    auto norm = [&](float y, float u, float v, float& yb, float& ub, float& vb) {
+        if (p16 && !fullRange) {  // 10-bit limited levels at 16-bit precision (y = code / 64)
+            yb = (y - 64.0f) / 876.0f;
+            ub = (u - 512.0f) / 896.0f;
+            vb = (v - 512.0f) / 896.0f;
+        } else if (fullRange) {
+            const float s = p16 ? 65535.0f : 255.0f;
+            yb = y / s;
+            ub = u / s - 0.5f;
+            vb = v / s - 0.5f;
+        } else {
+            yb = (y - 16.0f) / 219.0f;
+            ub = (u - 128.0f) / 224.0f;
+            vb = (v - 128.0f) / 224.0f;
+        }
+    };
+    auto rows = [&](uint32_t y0, uint32_t y1) {
+        for (uint32_t oy = y0; oy < y1; ++oy) {
+            const uint32_t sy = (uint32_t)(((uint64_t)oy * 2 + 1) * h / (outH * 2ull));
+            const uint32_t cy = sy / 2;
+            uint8_t* d = &out[(size_t)oy * outW * 4];
+            for (uint32_t ox = 0; ox < outW; ++ox, d += 4) {
+                const uint32_t sx = (uint32_t)(((uint64_t)ox * 2 + 1) * w / (outW * 2ull));
+                const uint32_t cx = sx / 2;
+                float Y, U, V;
+                if (p16) {
+                    auto rd = [](const uint8_t* q) { return (float)(q[0] | (q[1] << 8)); };
+                    const float k = fullRange ? 1.0f : 1.0f / 64.0f;
+                    Y = rd(p0 + ((size_t)sy * w + sx) * 2) * k;
+                    U = rd(p1 + ((size_t)cy * cw + cx) * 4) * k;
+                    V = rd(p1 + ((size_t)cy * cw + cx) * 4 + 2) * k;
+                } else if (format == 1) {
+                    Y = p0[(size_t)sy * w + sx];
+                    U = p1[((size_t)cy * cw + cx) * 2 + 0];
+                    V = p1[((size_t)cy * cw + cx) * 2 + 1];
+                } else {
+                    Y = p0[(size_t)sy * w + sx];
+                    U = p1[(size_t)cy * cw + cx];
+                    V = p2[(size_t)cy * cw + cx];
+                }
+                float yb, ub, vb;
+                norm(Y, U, V, yb, ub, vb);
+                float c[3];
+                if (matrix == 1) {
+                    c[0] = yb + 1.402f * vb;
+                    c[1] = yb - 0.344136f * ub - 0.714136f * vb;
+                    c[2] = yb + 1.772f * ub;
+                } else if (matrix == 2) {
+                    c[0] = yb + 1.4746f * vb;
+                    c[1] = yb - 0.164553f * ub - 0.571353f * vb;
+                    c[2] = yb + 1.8814f * ub;
+                } else {
+                    c[0] = yb + 1.5748f * vb;
+                    c[1] = yb - 0.1873f * ub - 0.4681f * vb;
+                    c[2] = yb + 1.8556f * ub;
+                }
+                for (float& e : c) e = std::clamp(e, 0.0f, 1.0f);
+                hdr.Apply(c);
+                for (int i = 0; i < 3; ++i) d[i] = (uint8_t)std::clamp((int)(c[i] * 255.0f + 0.5f), 0, 255);
+                d[3] = 255;
+            }
+        }
+    };
+    // Row bands across the cores: this runs on the render thread when a frame is submitted.
+    const uint32_t hw = (std::max)(1u, std::thread::hardware_concurrency());
+    const uint32_t jobs = (std::min)({hw, 8u, (std::max)(1u, outH / 64)});
+    if (jobs <= 1) {
+        rows(0, outH);
+    } else {
+        std::vector<std::thread> pool;
+        const uint32_t per = (outH + jobs - 1) / jobs;
+        for (uint32_t j = 1; j < jobs; ++j) {
+            const uint32_t b = j * per, e = (std::min)(outH, b + per);
+            if (b < e) pool.emplace_back(rows, b, e);
+        }
+        rows(0, (std::min)(outH, per));
+        for (std::thread& t : pool) t.join();
     }
     return true;
 }

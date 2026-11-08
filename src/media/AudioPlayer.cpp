@@ -2,8 +2,10 @@
 #include "media/AudioPlayer.h"
 
 #include "Log.h"
+#include "media/AudioLayout.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
@@ -14,6 +16,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 }
 #endif
@@ -49,10 +52,12 @@ bool AudioPlayer::Open(const std::string& path) {
     impl_ = std::make_unique<Impl>();
 
     if (avformat_open_input(&impl_->fmt, path.c_str(), nullptr, nullptr) < 0) {
+        LOG_WARN("AudioPlayer: cannot open '%s' for audio - silent", path.c_str());
         impl_.reset();
         return false;
     }
     if (avformat_find_stream_info(impl_->fmt, nullptr) < 0) {
+        LOG_WARN("AudioPlayer: no stream info in '%s' - silent", path.c_str());
         impl_.reset();
         return false;
     }
@@ -63,6 +68,7 @@ bool AudioPlayer::Open(const std::string& path) {
 #endif
     impl_->audioStream = av_find_best_stream(impl_->fmt, AVMEDIA_TYPE_AUDIO, -1, -1, &dec, 0);
     if (impl_->audioStream < 0 || !dec) {  // no audio stream — silent playback
+        LOG_INFO("AudioPlayer: no playable audio track in '%s' - silent", path.c_str());
         impl_.reset();
         return false;
     }
@@ -71,21 +77,41 @@ bool AudioPlayer::Open(const std::string& path) {
     avcodec_parameters_to_context(impl_->codec, st->codecpar);
     impl_->codec->thread_count = 0;
     if (avcodec_open2(impl_->codec, dec, nullptr) < 0) {
+        LOG_WARN("AudioPlayer: cannot open the '%s' decoder - silent", dec->name);
         impl_.reset();
         return false;
     }
     impl_->timeBase = av_q2d(st->time_base);
     impl_->outRate = impl_->codec->sample_rate > 0 ? impl_->codec->sample_rate : 48000;
-    impl_->outChannels = 2;
 
-    // Resample to interleaved float stereo at the source rate (SDL converts to the
-    // device rate). Guard an unset input layout (older streams).
+    // The device decides stereo or 5.1, so SDL has to be up before the resampler.
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        LOG_WARN("AudioPlayer: SDL audio init failed: %s", SDL_GetError());
+        impl_.reset();
+        return false;
+    }
+    SDL_AudioSpec deviceSpec;
+    SDL_zero(deviceSpec);
+    int deviceChannels = 0;  // not queryable -> stereo
+    if (SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &deviceSpec, nullptr)) {
+        deviceChannels = deviceSpec.channels;
+    }
+    deviceChannels = DeviceChannelsWithOverride(deviceChannels, std::getenv("MEDIAPLAYER_AUDIO_CHANNELS"));
+
+    // Resample to interleaved float at the source rate (SDL converts to the device rate).
+    // 5.1 uses the BACK layout because that is SDL's 6-channel order (FL FR FC LFE BL BR).
+    // Guard an unset input layout (older streams).
 #if LIBAVCODEC_VERSION_MAJOR >= 60
     if (impl_->codec->ch_layout.nb_channels <= 0) {
         av_channel_layout_default(&impl_->codec->ch_layout, 2);
     }
+    impl_->outChannels = ChooseOutChannels(impl_->codec->ch_layout.nb_channels, deviceChannels);
     AVChannelLayout outLayout;
-    av_channel_layout_default(&outLayout, impl_->outChannels);
+    if (impl_->outChannels == 6) {
+        av_channel_layout_from_mask(&outLayout, AV_CH_LAYOUT_5POINT1_BACK);
+    } else {
+        av_channel_layout_default(&outLayout, impl_->outChannels);
+    }
     int rc = swr_alloc_set_opts2(&impl_->swr, &outLayout, AV_SAMPLE_FMT_FLT, impl_->outRate,
                                  &impl_->codec->ch_layout, impl_->codec->sample_fmt,
                                  impl_->codec->sample_rate, 0, nullptr);
@@ -98,24 +124,24 @@ bool AudioPlayer::Open(const std::string& path) {
     if (impl_->codec->channel_layout == 0) {
         impl_->codec->channel_layout = av_get_default_channel_layout(impl_->codec->channels);
     }
+    impl_->outChannels = ChooseOutChannels(impl_->codec->channels, deviceChannels);
     impl_->swr = swr_alloc_set_opts(nullptr,
-                                    av_get_default_channel_layout(impl_->outChannels),
+                                    impl_->outChannels == 6 ? AV_CH_LAYOUT_5POINT1_BACK
+                                                            : av_get_default_channel_layout(impl_->outChannels),
                                     AV_SAMPLE_FMT_FLT, impl_->outRate,
                                     impl_->codec->channel_layout, impl_->codec->sample_fmt,
                                     impl_->codec->sample_rate, 0, nullptr);
     const int rc = impl_->swr ? 0 : -1;
 #endif
+    // Float output is not protected from overs by default: a loud 5.1 mix folded to stereo
+    // reaches about 2.4x full scale. Scale the matrix so it cannot exceed 1.0.
+    if (impl_->swr) av_opt_set_double(impl_->swr, "rematrix_maxval", 1.0, 0);
     if (rc < 0 || swr_init(impl_->swr) < 0) {
         LOG_WARN("AudioPlayer: swr init failed — silent");
         impl_.reset();
         return false;
     }
 
-    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-        LOG_WARN("AudioPlayer: SDL audio init failed: %s", SDL_GetError());
-        impl_.reset();
-        return false;
-    }
     SDL_AudioSpec spec;
     SDL_zero(spec);
     spec.format = SDL_AUDIO_F32;
@@ -140,9 +166,9 @@ bool AudioPlayer::Open(const std::string& path) {
 #else
     const int nch = impl_->codec->channels;
 #endif
-    LOG_INFO("AudioPlayer: '%s' %s %dch %dHz", dec->name,
-             av_get_sample_fmt_name(impl_->codec->sample_fmt), nch,
-             impl_->codec->sample_rate);
+    LOG_INFO("AudioPlayer: '%s' %s %dch %dHz -> %dch out (device %dch)", dec->name,
+             av_get_sample_fmt_name(impl_->codec->sample_fmt), nch, impl_->codec->sample_rate,
+             impl_->outChannels, deviceChannels);
     thread_ = std::thread(&AudioPlayer::DecodeLoop, this);
     return true;
 }

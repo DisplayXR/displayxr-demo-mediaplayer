@@ -18,6 +18,7 @@
 
 #include "ColorPolicy.h"  // swapchain encoding policy (#78)
 #include "color/CubeLut.h"  // PackRgba16f for the 3D LUT
+#include "color/ToneMap.h"  // HLG display-peak range (#169)
 #include "Log.h"
 #include "rhi/Shaders.h"
 
@@ -43,14 +44,14 @@ VkShaderModule MakeShaderModule(VkDevice device, const uint32_t* spv, size_t byt
 namespace mp {
 
 namespace {
-constexpr uint32_t kBindings = 7;  // 3 source planes, the grade LUT, 3 compare planes
+constexpr uint32_t kBindings = 8;  // 3 source planes, the grade LUT, 3 compare planes, the calibration LUT
 
 // Fragment push constants - must match `PushConstants` in shaders/sbs.frag (std430
 // push-constant offsets: vec2 at 8, vec4 at 16).
 struct DrawPush {
     float off[2];        //  0
     float scale[2];      //  8
-    int32_t mode;        // 16
+    int32_t mode;        // 16  bits 0-1 source format; bits 8+ VR flags (#155, vr::PackModeFlags)
     float fullRange;     // 20
     float srgbTarget;    // 24
     int32_t qcMode;      // 28
@@ -59,11 +60,11 @@ struct DrawPush {
     float lutOn;         // 44
     float cdlSlope[4];   // 48  .a = saturation
     float cdlOffset[4];  // 64  .a = CDL on
-    float cdlPower[4];   // 80
+    float cdlPower[4];   // 80  .a = VR window pitch, radians (#155)
     float lutDomain[4];  // 96  x = min, y = 1/(max-min), z = N
     int32_t yuvMatrix;   // 112 0 = BT.709 (default), 1 = BT.601, 2 = BT.2020 NCL
     float zebraLevel;    // 116 > 0: zebra stripes at or above this graded luma
-    int32_t viewFlags;   // 120 channel (bits 0-2) + wipe mode (bits 4-5)
+    int32_t viewFlags;   // 120 channel (bits 0-2) + wipe mode (bits 4-5); bits 16-31 VR heading (#155)
     uint32_t wipeGamma;  // 124 PackWipeGamma(): wipe position + display gamma
 };
 static_assert(sizeof(DrawPush) == 128, "DrawPush must match the shader's PushConstants");
@@ -609,6 +610,46 @@ bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, con
     return true;
 }
 
+void VulkanRenderer::SetSourceHdr(int transfer, bool bt2020, float peakNits) {
+    sourceTransfer_ = (transfer >= 1 && transfer <= 3) ? transfer : 0;
+    sourceBt2020_ = bt2020;
+    sourcePeak_ = peakNits > 0.0f ? peakNits : 0.0f;
+}
+
+VulkanRenderer::HdrState VulkanRenderer::SourceHdr() const {
+    if (sourceMode_ == 0) return HdrState{};  // an RGBA source (a still, a converted picture) is SDR
+    return HdrFor(sourceTransfer_, sourceBt2020_, sourcePeak_);
+}
+
+VulkanRenderer::HdrState VulkanRenderer::HdrFor(int transfer, bool bt2020, float peakNits) const {
+    HdrState h;
+    h.transfer = (transfer >= 1 && transfer <= 3) ? transfer : 0;
+    if (ForcesHdr(h.transfer)) {  // #169: the user says this untagged source is HLG / PQ
+        h.transfer = grade_.forceTransfer;
+        h.forced = true;
+        bt2020 = true;
+    }
+    if (h.transfer == 0) return h;
+    h.raw = grade_.toneMap == 3;
+    h.bt2020 = bt2020;
+    h.rollOff = grade_.toneMap == 1 || (grade_.toneMap == 0 && (h.transfer == 1 || h.transfer == 2));
+    h.peakNits = grade_.peakNits > 0.0f ? grade_.peakNits : peakNits > 0.0f ? peakNits : 1000.0f;
+    // HLG: the peak is the OOTF's display peak Lw (scene-referred, no stream peak applies):
+    // the chosen one, else the nominal 1000 nits (#169: it was fixed at 1000).
+    if (h.transfer == 1)
+        h.peakNits = grade_.peakNits > 0.0f ? std::clamp(grade_.peakNits, color::kHlgMinNits, color::kHlgMaxNits)
+                                            : color::kHlgDisplayNits;
+    h.pqShaper = grade_.lutPqShaper && h.transfer == 3 && !h.raw;
+    h.overWhite = grade_.toneMap == 0 && h.transfer == 3 && !h.raw && !h.pqShaper;
+    return h;
+}
+
+void VulkanRenderer::SetCompareHdr(int transfer, bool bt2020, float peakNits) {
+    compareTransfer_ = (transfer >= 1 && transfer <= 3) ? transfer : 0;
+    compareBt2020_ = bt2020;
+    comparePeak_ = peakNits > 0.0f ? peakNits : 0.0f;
+}
+
 bool VulkanRenderer::UploadCompareTexture(const uint8_t* rgba, uint32_t width, uint32_t height) {
     if (!rgba || width == 0 || height == 0) return false;
     if (!EnsureDummy()) return false;
@@ -620,6 +661,7 @@ bool VulkanRenderer::UploadCompareTexture(const uint8_t* rgba, uint32_t width, u
     compareFullRange_ = false;
     compare16_ = false;
     compareMatrix_ = 0;
+    SetCompareHdr(0, false, 0.0f);  // an RGBA B (a still) is SDR
     if (rec) LOG_INFO("VulkanRenderer: compare (B) RGBA %ux%u", width, height);
     return true;
 }
@@ -680,6 +722,7 @@ void VulkanRenderer::ClearCompare() {
         p = Plane{};
     }
     compareMode_ = -1;
+    SetCompareHdr(0, false, 0.0f);
 }
 
 bool VulkanRenderer::EnsureDummy() {
@@ -762,8 +805,9 @@ void VulkanRenderer::BindDescriptors(VkDescriptorSet set) {
     VkWriteDescriptorSet writes[kBindings] = {};
     for (uint32_t i = 0; i < kBindings; ++i) {
         dii[i].sampler = sampler_;
-        if (i == 3) {   // the Pro grade LUT, or its 1x1x1 dummy
-            dii[i].imageView = lut_.view ? lut_.view : lutDummy_.view;
+        if (i == 3 || i == 7) {   // the Pro grade LUT / display calibration, or the 1x1x1 dummy
+            const Lut3D& l = i == 3 ? lut_ : cal_;
+            dii[i].imageView = l.view ? l.view : lutDummy_.view;
             dii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         } else if (i >= 4) {
             dii[i].imageView = bViews[i - 4] ? bViews[i - 4] : dummyView_;
@@ -888,7 +932,7 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         pc.off[1] = uvs[v].offY;
         pc.scale[0] = uvs[v].scaleX;
         pc.scale[1] = uvs[v].scaleY;
-        pc.mode = sourceMode_;
+        pc.mode = sourceMode_ | (int32_t)uvs[v].vrMode;  // vrMode = 0 unless a VR draw (#155)
         pc.fullRange = sourceFullRange_;
         pc.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
         pc.qcMode = grade_.qcMode;
@@ -903,16 +947,35 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
         }
         pc.cdlSlope[3] = grade_.saturation;
         pc.cdlOffset[3] = grade_.cdlOn ? 1.0f : 0.0f;
+        pc.cdlPower[3] = uvs[v].vrPitch;  // the CDL power is RGB only
         pc.lutDomain[0] = lut_.domainMin;
         pc.lutDomain[1] = 1.0f / std::max(1e-6f, lut_.domainMax - lut_.domainMin);
         pc.lutDomain[2] = (float)std::max(1u, lut_.size);
         pc.lutDomain[3] = source16_ ? 1.0f : 0.0f;  // MP_GRADE: 10-bit levels for P016
-        pc.yuvMatrix = sourceMode_ == 0 ? 0 : sourceMatrix_;  // RGBA sources ignore it
+        if (sourceMode_ == 0) {
+            pc.yuvMatrix = 0;  // RGBA sources ignore it
+        } else {
+            const HdrState h = SourceHdr();
+            pc.yuvMatrix = PackColourWord(EffectiveMatrix(sourceTransfer_, sourceMatrix_), h.raw ? 0 : h.transfer,
+                                          h.rollOff, h.bt2020, h.peakNits, h.pqShaper && pc.lutOn > 0.5f);
+            if (h.overWhite) pc.mode |= 1 << 2;  // #169: EXR above white into the grade (A)
+        }
         pc.zebraLevel = grade_.zebraLevel;
         pc.viewFlags = (grade_.channel & 7) | ((grade_.wipeMode & 3) << 4);
-        if (compareMode_ >= 0)  // B's sampling: mode bits 8-9, full range 10, matrix 11-12, P016 13, bound 14
-            pc.viewFlags |= (compareMode_ << 8) | ((compareFullRange_ ? 1 : 0) << 10) | (compareMatrix_ << 11) |
+        if (compareMode_ >= 0) {  // B's sampling: mode bits 8-9, full range 10, matrix 11-12, P016 13, bound 14
+            const int bMatrix = compareMode_ == 0 ? compareMatrix_ : EffectiveMatrix(compareTransfer_, compareMatrix_);
+            pc.viewFlags |= (compareMode_ << 8) | ((compareFullRange_ ? 1 : 0) << 10) | (bMatrix << 11) |
                             ((compare16_ ? 1 : 0) << 13) | (1 << 14);
+            // B's HDR tags (#169): an HDR B is tone-mapped by its own transfer and peak.
+            const HdrState hb = compareMode_ == 0 ? HdrState{} : HdrFor(compareTransfer_, compareBt2020_, comparePeak_);
+            if (hb.overWhite) pc.mode |= 1 << 3;  // EXR above white into the grade (B)
+            const CompareHdrBits bb = PackCompareHdr(hb.raw ? 0 : hb.transfer, hb.rollOff, hb.bt2020, hb.peakNits,
+                                                     hb.pqShaper && pc.lutOn > 0.5f);
+            pc.viewFlags |= (int32_t)bb.viewFlags;
+            pc.yuvMatrix |= (int32_t)bb.yuvMatrix;
+        }
+        if (grade_.calOn && cal_.view) pc.viewFlags |= 1 << 15;  // display calibration (#133)
+        pc.viewFlags |= (int32_t)uvs[v].vrHeading;  // bits 16-31 (vr::PackHeading)
         pc.wipeGamma = PackWipeGamma(grade_.wipePos, grade_.gamma);
         vkCmdPushConstants(cmd, activeLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
@@ -1371,6 +1434,7 @@ void VulkanRenderer::Shutdown() {
     DestroyTexture();
     ClearCompare();
     DestroyLut(lut_, false);
+    DestroyLut(cal_, false);
     DestroyLut(lutDummy_, false);
     ring_.destroy();  // waits its fences, runs the deferred releases, frees cmds/fences
     if (sampler_) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
@@ -1419,31 +1483,48 @@ bool VulkanRenderer::CreateLutImage(Lut3D& dst, uint32_t n, const uint16_t* rgba
         LOG_ERROR("LUT: memory alloc failed");
         return false;
     }
-    vkBindImageMemory(device_, l.image, l.memory, 0);
+    // #169: every step below is checked. A 256^3 LUT is 128 MiB of image plus 128 MiB of
+    // staging, so under memory pressure any of them can fail; on failure everything made here
+    // is released and `dst` (the LUT already on the GPU, or none) is left as it was.
+    VkBuffer sbuf = VK_NULL_HANDLE;
+    VkDeviceMemory smem = VK_NULL_HANDLE;
+    auto fail = [&](const char* what, VkResult r) {
+        if (sbuf) vkDestroyBuffer(device_, sbuf, nullptr);
+        if (smem) vkFreeMemory(device_, smem, nullptr);
+        vkDestroyImage(device_, l.image, nullptr);
+        vkFreeMemory(device_, l.memory, nullptr);
+        LOG_ERROR("LUT: %s failed for %u^3 (VkResult %d); the previous LUT is kept", what, n, (int)r);
+        return false;
+    };
+    VkResult vr = vkBindImageMemory(device_, l.image, l.memory, 0);
+    if (vr != VK_SUCCESS) return fail("vkBindImageMemory", vr);
 
     // Staging buffer, copied with a one-off blocking submit (LUT loads are user actions,
     // never per frame).
     const VkDeviceSize bytes = (VkDeviceSize)n * n * n * 4 * sizeof(uint16_t);
-    VkBuffer sbuf = VK_NULL_HANDLE;
-    VkDeviceMemory smem = VK_NULL_HANDLE;
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    vkCreateBuffer(device_, &bci, nullptr, &sbuf);
+    vr = vkCreateBuffer(device_, &bci, nullptr, &sbuf);
+    if (vr != VK_SUCCESS) { sbuf = VK_NULL_HANDLE; return fail("staging vkCreateBuffer", vr); }
     VkMemoryRequirements breq;
     vkGetBufferMemoryRequirements(device_, sbuf, &breq);
     VkMemoryAllocateInfo bai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     bai.allocationSize = breq.size;
     bai.memoryTypeIndex = FindMemoryType(
         breq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    vkAllocateMemory(device_, &bai, nullptr, &smem);
-    vkBindBufferMemory(device_, sbuf, smem, 0);
+    if (bai.memoryTypeIndex == UINT32_MAX) return fail("staging memory type", VK_ERROR_FEATURE_NOT_PRESENT);
+    vr = vkAllocateMemory(device_, &bai, nullptr, &smem);
+    if (vr != VK_SUCCESS) { smem = VK_NULL_HANDLE; return fail("staging vkAllocateMemory", vr); }
+    vr = vkBindBufferMemory(device_, sbuf, smem, 0);
+    if (vr != VK_SUCCESS) return fail("staging vkBindBufferMemory", vr);
     void* mapped = nullptr;
-    vkMapMemory(device_, smem, 0, bytes, 0, &mapped);
+    vr = vkMapMemory(device_, smem, 0, bytes, 0, &mapped);
+    if (vr != VK_SUCCESS || !mapped) return fail("staging vkMapMemory", vr);
     std::memcpy(mapped, rgba16f, (size_t)bytes);
     vkUnmapMemory(device_, smem);
 
-    ring_.submitImmediate([&](VkCommandBuffer cmd) {
+    vr = ring_.submitImmediate([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -1465,8 +1546,11 @@ bool VulkanRenderer::CreateLutImage(Lut3D& dst, uint32_t n, const uint16_t* rgba
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &b);
     });
+    if (vr != VK_SUCCESS) return fail("upload submit", vr);
     vkDestroyBuffer(device_, sbuf, nullptr);
     vkFreeMemory(device_, smem, nullptr);
+    sbuf = VK_NULL_HANDLE;
+    smem = VK_NULL_HANDLE;
 
     VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image = l.image;
@@ -1519,5 +1603,14 @@ bool VulkanRenderer::UploadLut3DPacked(const uint16_t* rgba16f, uint32_t size, f
 }
 
 void VulkanRenderer::ClearLut3D() { DestroyLut(lut_, /*deferred=*/true); }
+
+bool VulkanRenderer::UploadCalibrationLut(const uint16_t* rgba16f, uint32_t size) {
+    if (!rgba16f || size < 2 || size > 256 || device_ == VK_NULL_HANDLE) return false;
+    if (!CreateLutImage(cal_, size, rgba16f)) return false;
+    LOG_INFO("Calibration LUT: uploaded %u^3", size);
+    return true;
+}
+
+void VulkanRenderer::ClearCalibrationLut() { DestroyLut(cal_, /*deferred=*/true); }
 
 } // namespace mp

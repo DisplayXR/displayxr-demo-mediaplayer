@@ -27,6 +27,9 @@ struct Request {
     std::string dst;      // ... or a plain target colour space instead
     std::string looks;    // optional OCIO looks, e.g. "+ShowLook"
     int size = 65;        // grid points per axis
+    // The grid's input is PQ code of (scene linear x 203 nits): decode it before the
+    // transform, so a scene-linear EXR reaches the OCIO view with values above 1.0 (#134).
+    bool linearPqInput = false;
 };
 
 // Bake `req` into `out` (red fastest, domain 0..1). False with `err` set on any OCIO error.
@@ -36,6 +39,9 @@ struct ConfigInfo {
     std::string name;
     std::vector<std::string> colorSpaces, displays, views;  // views of the default display
     std::string defaultDisplay, defaultView;
+    // Per display (same order as `displays`): its views and its default view.
+    std::vector<std::vector<std::string>> displayViews;
+    std::vector<std::string> displayDefaultView;
 };
 bool Describe(const std::string& config, ConfigInfo& out, std::string& err);
 

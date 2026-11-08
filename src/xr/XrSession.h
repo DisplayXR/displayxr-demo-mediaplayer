@@ -126,9 +126,37 @@ public:
     // True when the session was created with transparent-background compositing
     // (MEDIAPLAYER_TRANSPARENT=1) — the renderer should clear letterbox to alpha 0.
     bool TransparentBackground() const { return transparentBg_; }
+    // The OS name of the 3D panel's monitor (XrDisplayDesktopInfoDXR::deviceName, display_info
+    // v18: \.\DISPLAY1 on Windows, the display UUID on macOS, the RandR output on Linux).
+    // Empty on an older runtime. Pro keys its per-panel calibration on it (#133).
+    const std::string& DisplayDeviceName() const { return displayDeviceName_; }
+    // One connected display (xrEnumerateDisplaysDXR, display_info v20+): its OS device
+    // name, its desktop rect (the space the OS places windows in) and the runtime's stable
+    // per-display key (XrDisplayStableKeyDXR, v24; "" on an older runtime). Pro keys its
+    // per-panel calibration on it (#133).
+    struct DisplayEntry {
+        std::string key, deviceName;
+        int32_t x = 0, y = 0;
+        uint32_t w = 0, h = 0;
+        bool systemDefault = false;
+    };
+    // False when the runtime does not enumerate displays.
+    bool EnumerateDisplays(std::vector<DisplayEntry>& out) const;
+    // True once after XrEventDataDisplaysChangedDXR (a monitor added, removed, or rearranged).
+    bool TakeDisplaysChanged() {
+        const bool c = displaysChanged_;
+        displaysChanged_ = false;
+        return c;
+    }
 
     // Window-space HUD swapchain (created in Initialize if the runtime supports it).
     bool HasHud() const { return hasHud_; }
+    // The panel's physical size and the nominal viewing distance (XR_DXR_display_info; 0 =
+    // unknown). The VR viewer's life-size field of view (#155) and Pro's target-screen
+    // preview (#135) come from these.
+    float DisplayWidthMeters() const { return displayWidthM_; }
+    uint32_t DisplayPixelWidth() const { return displayPixelWidth_; }
+    float NominalViewerDistance() const { return nominalViewerZ_; }
     // Ask for XR_DXR_local_3d_zone (call before Init). Only Media Player Pro does: it
     // shows its panels as flat 2D (HudSubmit::flat). HasLocal2D() after Init.
     void RequestLocal2D(bool on) { wantLocal2D_ = on; }
@@ -139,6 +167,9 @@ public:
     const std::vector<VkImage>& HudImages() const { return hudVkImages_; }
     bool AcquireHudImage(uint32_t& imageIndex);
     bool ReleaseHudImage();
+    // Replace the HUD swapchain with one of this size (the caller has idled the device).
+    // False leaves no HUD (HasHud() is false).
+    bool ResizeHud(uint32_t width, uint32_t height);
 
     // --- Open-file (XR_DXR_workspace_file_dialog) ---
     // Outcome of a RequestFilePicker call. Pending → a completion event will arrive
@@ -415,10 +446,15 @@ private:
     bool transparentBg_ = false;   // MEDIAPLAYER_TRANSPARENT — letterbox composes through
     uint32_t displayPixelWidth_ = 0;
     uint32_t displayPixelHeight_ = 0;
+    float displayWidthM_ = 0.0f;   // displaySizeMeters.width
+    float nominalViewerZ_ = 0.0f;  // nominalViewerPositionInDisplaySpace.z
     // 3D panel top-left in virtual-desktop pixels (XrDisplayDesktopPositionDXR,
     // display_info v16). (0, 0) = primary/unknown — the safe default.
     int32_t displayDesktopLeft_ = 0;
     int32_t displayDesktopTop_ = 0;
+    std::string displayDeviceName_;
+    bool displaysChanged_ = false;
+    PFN_xrEnumerateDisplaysDXR pfnEnumerateDisplays_ = nullptr;
 
     // Session state machine.
     XrSessionState sessionState_ = XR_SESSION_STATE_UNKNOWN;

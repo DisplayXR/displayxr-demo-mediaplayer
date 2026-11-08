@@ -63,7 +63,11 @@ endif()
 
 # --- FFmpeg (libav*) for video decode (M2/M3). Optional: if absent, the app builds
 #     without video support.
-#   * macOS / Linux: pkg-config (Homebrew / system).
+#   * Linux dev builds: pkg-config (system FFmpeg).
+#   * macOS (#201): scripts/build_macos.sh builds the slim FFmpeg
+#     (scripts/build_ffmpeg_macos.sh) and passes it as FFMPEG_ROOT; the .app bundler
+#     copies its dylibs into Contents/Resources/lib. Without FFMPEG_ROOT, pkg-config
+#     (Homebrew) still works for local dev (build_macos.sh --brew-ffmpeg).
 #   * Windows: no pkg-config in the usual MSVC toolchain, so fall back to a manual
 #     dev tree. Set -DFFMPEG_ROOT=<dir containing include/ + lib/>. For the shipped
 #     installer, CI builds a slim DECODE-ONLY FFmpeg via scripts/build-ffmpeg-slim.sh
@@ -163,6 +167,7 @@ FetchContent_Declare(imgui
     GIT_TAG v1.91.5
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(imgui)
+include(cmake/UiFont.cmake)
 
 # --- nlohmann/json (header-only) for parsing the LIF container's JSON metadata.
 #     Lightweight (no link step), so LIF support is on the default path. (HEIC needs no
@@ -265,6 +270,7 @@ option(MP_LINUX_PORTABLE "Linux: RUNPATH=\$ORIGIN + stage bundled libs next to t
 
 function(mp_add_player tgt is_pro)
     add_executable(${tgt}
+        $<$<CXX_COMPILER_ID:MSVC>:windows/utf8.manifest>  # narrow strings are UTF-8 (paths)
         src/main.cpp
         src/color/CubeLut.cpp    # Pro looks; compiled into both so the trunk stays one source list
         src/color/Cdl.cpp
@@ -290,6 +296,7 @@ function(mp_add_player tgt is_pro)
         src/media/ImageSequence.cpp  # EXR / DPX / TIFF frames as one clip (Pro formats only)
         src/media/AutoConvergence.cpp  # live auto-convergence (#92): disparity.js port
         src/media/StreamUrl.cpp      # stream-URL classifier (#93)
+        src/media/VrView.cpp         # VR180 / VR360 viewer (#155): rectified window geometry, pure
         src/media/LiftClient.cpp     # "Convert to 3D": XR_DXR_lift VIEWS_MONO stream (CPU in / out)
         src/media/InputProviderClient.cpp  # XR_DXR_input_providers: the Input popup
         src/ui/Hud.cpp
@@ -318,7 +325,7 @@ function(mp_add_player tgt is_pro)
     endif()
 
     target_include_directories(${tgt} PRIVATE
-        ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends)
+        ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends ${MP_UI_FONT_INCLUDE_DIR})
     # MEDIAPLAYER_IMGUI_SDL selects the SDL3 ImGui *platform* backend (input + dt) on
     # Windows / macOS. Desktop Linux has no SDL window: MEDIAPLAYER_IMGUI_DXRWIN feeds
     # ImGui from displayxr-common's window events instead. The Android leg defines
@@ -459,6 +466,8 @@ function(mp_add_player tgt is_pro)
             src/pro/ProController.cpp
             src/pro/ProTools.cpp         # agent tools: grade, view, station
             src/pro/LookLoader.cpp       # LUT parse / OCIO bake off the render thread
+            src/pro/DisplayCalibration.cpp  # per-panel display calibration (#133)
+            src/pro/TargetScreen.cpp     # target-screen depth model (#135)
             src/pro/LivePixels.cpp       # UYVY / v210 / BGRA -> NV12 / P016 for capture cards
             src/pro/LiveSourceBase.cpp   # shared ring + stats of the Pro live sources
             src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)
@@ -467,6 +476,7 @@ function(mp_add_player tgt is_pro)
             src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
             src/pro/Station.cpp          # inputs, timecode / delay, rig UI, snapshots
             src/pro/QcReport.cpp         # the session's QC report: HTML + marker EDL / CSV
+            src/pro/QcExporter.cpp       # writes QC reports off the render thread
             src/pro/ResolveLink.cpp      # the live Resolve panel: file protocol + follow
             src/pro/ProResolve.cpp       # the live Resolve panel: station side
             src/pro/Thumbnail.cpp        # input-list thumbnails (left eye, CPU)
@@ -500,16 +510,22 @@ function(mp_add_player tgt is_pro)
     message(STATUS "Configured target: ${tgt}")
 endfunction()
 
-# Blackmagic DeckLink input (Pro, docs/PRO.md). The Desktop Video SDK is a registration
-# download and is never committed: point MP_DECKLINK_SDK_DIR (or the env var of the same
-# name) at the SDK zip or its extracted folder. Windows generates the COM header from the
+# Blackmagic DeckLink input (Pro, docs/PRO.md). The SDK's include folders are vendored in
+# third_party/decklink-sdk (their licence permits it; the rest of the SDK stays out, see the
+# README there) and are the default. MP_DECKLINK_SDK_DIR (or the env var of the same name)
+# overrides with another SDK zip or extracted folder; -DMP_DECKLINK_SDK_DIR=OFF builds
+# without DeckLink. Windows generates the COM header from the
 # SDK's IDL with midl at configure time (as Open RV does); macOS and Linux use the ready
 # headers in Mac/include and Linux/include plus the SDK's DeckLinkAPIDispatch.cpp, which
 # loads the installed DeckLinkAPI framework / libDeckLinkAPI.so at run time. Without the
 # SDK, Pro builds and its DeckLink input reports "no DeckLink support". The SDK's own
 # include folder stays on the include path everywhere for DeckLinkAPIVersion.h, which
 # DeckLinkSource.cpp uses to pick the 14.3+ frame-buffer API.
-set(MP_DECKLINK_SDK_DIR "$ENV{MP_DECKLINK_SDK_DIR}" CACHE PATH "Blackmagic DeckLink SDK zip or folder (Pro)")
+set(_dl_default "$ENV{MP_DECKLINK_SDK_DIR}")
+if(NOT _dl_default AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/decklink-sdk")
+    set(_dl_default "${CMAKE_CURRENT_SOURCE_DIR}/third_party/decklink-sdk")
+endif()
+set(MP_DECKLINK_SDK_DIR "${_dl_default}" CACHE PATH "Blackmagic DeckLink SDK zip or folder (Pro); OFF = no DeckLink")
 set(MP_DECKLINK_INCLUDE "")
 set(MP_DECKLINK_SDK_INCLUDE "")
 if(MP_DECKLINK_SDK_DIR)
@@ -534,7 +550,7 @@ if(MP_DECKLINK_SDK_DIR)
     file(GLOB_RECURSE _dl_found "${_dl_root}/*/${_dl_plat}/include/${_dl_probe}" "${_dl_root}/${_dl_plat}/include/${_dl_probe}")
     list(LENGTH _dl_found _dl_n)
     if(_dl_n EQUAL 0)
-        message(FATAL_ERROR "MP_DECKLINK_SDK_DIR=${MP_DECKLINK_SDK_DIR}: no ${_dl_plat}/include/${_dl_probe} in it. Point it at the Blackmagic DeckLink SDK (folder or .zip), or leave it unset for a build without DeckLink.")
+        message(FATAL_ERROR "MP_DECKLINK_SDK_DIR=${MP_DECKLINK_SDK_DIR}: no ${_dl_plat}/include/${_dl_probe} in it. Point it at the Blackmagic DeckLink SDK (folder or .zip), or set it to OFF for a build without DeckLink.")
     endif()
     list(GET _dl_found 0 _dl_found)
     get_filename_component(_dl_inc "${_dl_found}" DIRECTORY)
@@ -563,7 +579,7 @@ if(MP_DECKLINK_SDK_DIR)
         message(STATUS "DeckLink input (Pro): ON (SDK ${_dl_ver}, ${_dl_inc})")
     endif()
 else()
-    message(STATUS "DeckLink input (Pro): OFF (set MP_DECKLINK_SDK_DIR to the Desktop Video SDK)")
+    message(STATUS "DeckLink input (Pro): OFF (MP_DECKLINK_SDK_DIR=${MP_DECKLINK_SDK_DIR})")
 endif()
 
 # OpenColorIO (Pro, optional): an OCIO 2.x install prefix (e.g. Open RV's build,
@@ -571,7 +587,9 @@ endif()
 # DLLs (Imath, expat, zlib: <OpenRV>/_build/stage/app/bin). Off by default.
 # macOS: the Homebrew keg, -DMP_OCIO_ROOT="$(brew --prefix opencolorio)"
 # (scripts/build_macos.sh --ocio). The .app bundler collects the dylibs; no DLL dir.
-set(MP_OCIO_ROOT "" CACHE PATH "OpenColorIO 2.x install prefix (Pro, optional)")
+# Windows: scripts/build-ocio-win.ps1 builds a static one, so no DLLs ship. CI and the signing
+# build pass it through the MP_OCIO_ROOT environment variable.
+set(MP_OCIO_ROOT "$ENV{MP_OCIO_ROOT}" CACHE PATH "OpenColorIO 2.x install prefix (Pro, optional)")
 set(MP_OCIO_DLL_DIR "" CACHE PATH "Folder with OpenColorIO's dependency DLLs (Windows)")
 set(MP_HAVE_OCIO FALSE)
 set(MP_OCIO_DLLS "")
@@ -583,11 +601,28 @@ if(MP_OCIO_ROOT)
         string(REGEX REPLACE "/(opt|Cellar)/opencolorio.*$" "" _ocio_brew "${MP_OCIO_ROOT}")
         list(APPEND CMAKE_PREFIX_PATH "${_ocio_brew}")
     endif()
+    # scripts/build-ocio-win.ps1: a static vcpkg install holds the dependencies in the same prefix.
+    if(WIN32)
+        list(APPEND CMAKE_PREFIX_PATH "${MP_OCIO_ROOT}")
+    endif()
     find_package(OpenColorIO CONFIG PATHS "${MP_OCIO_ROOT}" NO_DEFAULT_PATH)
     if(OpenColorIO_FOUND)
         set(MP_HAVE_OCIO TRUE)
         if(WIN32)
             file(GLOB MP_OCIO_DLLS "${MP_OCIO_ROOT}/bin/OpenColorIO*.dll")
+            # A static vcpkg install: the licences of OpenColorIO and what it links, for the
+            # installer to carry, since their code is in the exe.
+            file(GLOB _ocio_licences "${MP_OCIO_ROOT}/share/*/copyright")
+            if(_ocio_licences)
+                set(_ocio_notice "${CMAKE_BINARY_DIR}/OCIO-THIRD-PARTY-NOTICES.txt")
+                file(WRITE "${_ocio_notice}" "OpenColorIO and the libraries it links, as built into Media Player Pro.\n")
+                foreach(_l ${_ocio_licences})
+                    get_filename_component(_d "${_l}" DIRECTORY)
+                    get_filename_component(_n "${_d}" NAME)
+                    file(READ "${_l}" _t)
+                    file(APPEND "${_ocio_notice}" "\n===== ${_n} =====\n\n${_t}\n")
+                endforeach()
+            endif()
             if(MP_OCIO_DLL_DIR)
                 file(GLOB _ocio_dep "${MP_OCIO_DLL_DIR}/Imath*.dll" "${MP_OCIO_DLL_DIR}/libexpat*.dll"
                                     "${MP_OCIO_DLL_DIR}/zlib*.dll")
@@ -596,7 +631,7 @@ if(MP_OCIO_ROOT)
         endif()
         message(STATUS "OpenColorIO (Pro): ON (${OpenColorIO_VERSION})")
     else()
-        message(WARNING "MP_OCIO_ROOT=${MP_OCIO_ROOT}: no OpenColorIO package found; OCIO off")
+        message(FATAL_ERROR "MP_OCIO_ROOT=${MP_OCIO_ROOT}: no OpenColorIO package found. Unset it for a build without OCIO.")
     endif()
 endif()
 
@@ -667,6 +702,26 @@ if(MP_BUILD_TESTS)
     target_include_directories(camera_select_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME camera_select COMMAND camera_select_test)
 
+    # VR180 / VR360 viewer (#155): the stereo pair stays rectified (vertical disparity ~0)
+    # across the whole pan / pitch range on synthetic scenes, plus clamps and detection.
+    # With FFmpeg it also reads the committed sv3d / st3d fixtures (tools/vr/make_vr_fixtures.py).
+    if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
+        add_executable(vr_view_test tests/vr_view_test.cpp src/media/VrView.cpp
+            src/media/VideoStereoProbe.cpp src/media/StereoDetect.cpp src/media/MediaSource.cpp
+            src/media/SpatialMedia.cpp src/Log.cpp)
+        target_compile_definitions(vr_view_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1
+            MP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+        if(TARGET PkgConfig::FFMPEG)
+            target_link_libraries(vr_view_test PRIVATE PkgConfig::FFMPEG)
+        else()
+            target_link_libraries(vr_view_test PRIVATE mp_ffmpeg)
+        endif()
+    else()
+        add_executable(vr_view_test tests/vr_view_test.cpp src/media/VrView.cpp)
+    endif()
+    target_include_directories(vr_view_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME vr_view COMMAND vr_view_test)
+
     # Auto-convergence (#92): synthetic SBS pairs with known disparity. Pure, no SDL.
     add_executable(auto_convergence_test
         tests/auto_convergence_test.cpp
@@ -685,6 +740,43 @@ if(MP_BUILD_TESTS)
         src/media/StreamUrl.cpp)
     target_include_directories(stream_url_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME stream_url COMMAND stream_url_test)
+
+    # Media browser (#160): the library's supported set, sources, filter and sort. Pure.
+    add_executable(media_library_test
+        tests/media_library_test.cpp
+        src/browser/MediaLibrary.cpp
+        src/media/MediaSource.cpp
+        src/media/StereoDetect.cpp
+        src/Log.cpp)
+    target_include_directories(media_library_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME media_library COMMAND media_library_test)
+
+    # Media browser (#160): 3D badge evidence and the verdict cache. Pure, one worker thread.
+    add_executable(stereo_classifier_test
+        tests/stereo_classifier_test.cpp
+        src/browser/StereoClassifier.cpp
+        src/media/MediaSource.cpp
+        src/media/StereoDetect.cpp
+        src/Log.cpp)
+    target_include_directories(stereo_classifier_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    find_package(Threads REQUIRED)
+    target_link_libraries(stereo_classifier_test PRIVATE Threads::Threads)
+    add_test(NAME stereo_classifier COMMAND stereo_classifier_test)
+
+    # Media browser (#160): media id to thumbnail slot, least recently drawn reuse. Pure.
+    add_executable(thumbnail_cache_test tests/thumbnail_cache_test.cpp src/browser/ThumbnailCache.cpp)
+    target_include_directories(thumbnail_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME thumbnail_cache COMMAND thumbnail_cache_test)
+
+    # Media browser (#160): drag, fling and tap for touch scrolling. Pure.
+    add_executable(touch_scroller_test tests/touch_scroller_test.cpp src/browser/TouchScroller.cpp)
+    target_include_directories(touch_scroller_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME touch_scroller COMMAND touch_scroller_test)
+
+    # Media browser (#160): swiping to the next or previous file in the player. Pure.
+    add_executable(slide_gesture_test tests/slide_gesture_test.cpp src/browser/SlideGesture.cpp)
+    target_include_directories(slide_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME slide_gesture COMMAND slide_gesture_test)
 
     # "Convert to 3D" (XR_DXR_lift spec v4): the LiftClient state machine over a fake
     # entry-point table, plus the CPU frame preparation. No runtime, no loader, no GPU.
@@ -717,6 +809,15 @@ if(MP_BUILD_TESTS)
     add_executable(qc_report_test tests/qc_report_test.cpp src/pro/QcReport.cpp)
     target_include_directories(qc_report_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME qc_report COMMAND qc_report_test)
+    add_executable(display_calibration_test tests/display_calibration_test.cpp src/pro/DisplayCalibration.cpp)
+    target_include_directories(display_calibration_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(display_calibration_test PRIVATE shell32 ole32 advapi32)
+    endif()
+    add_test(NAME display_calibration COMMAND display_calibration_test)
+    add_executable(target_screen_test tests/target_screen_test.cpp src/pro/TargetScreen.cpp)
+    target_include_directories(target_screen_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME target_screen COMMAND target_screen_test)
     add_executable(timecode_pairer_test tests/timecode_pairer_test.cpp src/pro/TimecodePairer.cpp)
     target_include_directories(timecode_pairer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME timecode_pairer COMMAND timecode_pairer_test)
@@ -736,10 +837,13 @@ if(MP_BUILD_TESTS)
     add_executable(look_loader_test tests/look_loader_test.cpp src/pro/LookLoader.cpp src/color/CubeLut.cpp)
     target_include_directories(look_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME look_loader COMMAND look_loader_test)
+    add_executable(qc_exporter_test tests/qc_exporter_test.cpp src/pro/QcExporter.cpp)
+    target_include_directories(qc_exporter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME qc_exporter COMMAND qc_exporter_test)
     add_executable(overlays_test tests/overlays_test.cpp src/pro/Overlays.cpp)
     target_include_directories(overlays_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME overlays COMMAND overlays_test)
-    add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/LivePixels.cpp
+    add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/TargetScreen.cpp src/pro/LivePixels.cpp
         src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
     target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
@@ -751,7 +855,7 @@ if(MP_BUILD_TESTS)
     add_test(NAME image_sequence COMMAND image_sequence_test)
     if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
         add_executable(decode_formats_test tests/decode_formats_test.cpp src/media/VideoDecoder.cpp
-            src/media/ImageSequence.cpp src/Log.cpp)
+            src/media/StreamUrl.cpp src/media/ImageSequence.cpp src/Log.cpp)
         target_include_directories(decode_formats_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_compile_definitions(decode_formats_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
         if(TARGET PkgConfig::FFMPEG)
@@ -779,7 +883,7 @@ if(MP_BUILD_TESTS)
     # The decoder drains at EOF (short clips, last frames): writes a 5-frame ProRes clip.
     if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
         add_executable(short_clip_test tests/short_clip_test.cpp src/media/VideoDecoder.cpp
-            src/media/ImageSequence.cpp src/Log.cpp)
+            src/media/StreamUrl.cpp src/media/ImageSequence.cpp src/Log.cpp)
         target_include_directories(short_clip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_compile_definitions(short_clip_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
         if(TARGET PkgConfig::FFMPEG)
@@ -800,7 +904,7 @@ if(MP_BUILD_TESTS)
         add_executable(spatial_media_test tests/spatial_media_test.cpp src/media/SpatialMedia.cpp
             src/media/HeifLoader.cpp src/media/StereoCompose.cpp src/media/ImageDecoder.cpp
             src/media/VideoDecoder.cpp src/media/VideoStereoProbe.cpp src/media/StereoDetect.cpp
-            src/media/MediaSource.cpp src/media/ImageSequence.cpp src/Log.cpp)
+            src/media/MediaSource.cpp src/media/ImageSequence.cpp src/media/StreamUrl.cpp src/Log.cpp)
         target_include_directories(spatial_media_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
         target_compile_definitions(spatial_media_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1
@@ -834,6 +938,16 @@ if(MP_BUILD_TESTS)
         src/color/Cdl.cpp)
     target_include_directories(color_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME color COMMAND color_test)
+
+    # Output channel choice: media/AudioLayout.h (header-only).
+    add_executable(audio_layout_test tests/audio_layout_test.cpp)
+    target_include_directories(audio_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME audio_layout COMMAND audio_layout_test)
+
+    # HDR on the SDR panel (#134): color/ToneMap.h (header-only) + the push-word packing.
+    add_executable(tone_map_test tests/tone_map_test.cpp)
+    target_include_directories(tone_map_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME tone_map COMMAND tone_map_test)
 
     add_executable(mpo_parse_test
         tests/mpo_parse_test.cpp

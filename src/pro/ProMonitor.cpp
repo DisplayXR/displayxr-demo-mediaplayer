@@ -6,6 +6,7 @@
 #include "pro/ProController.h"
 
 #include "Log.h"
+#include "ui/UiScale.h"
 
 #include <SDL3/SDL.h>
 
@@ -18,6 +19,8 @@
 #include <cstdio>
 
 namespace mp::pro {
+
+using ui::Px;
 
 namespace {
 
@@ -62,6 +65,7 @@ const char* TransferName(ColorTransfer t) {
     switch (t) {
         case ColorTransfer::HLG: return "HLG";
         case ColorTransfer::PQ: return "PQ";
+        case ColorTransfer::LinearPq: return "Linear";
         default: return "SDR";
     }
 }
@@ -87,6 +91,8 @@ void ProController::OnFrame(const FrameRing::Frame& f, StereoLayout layout) {
     // Render thread: a point-sampled copy of the eye only; the rest runs on the worker.
     scopes::ScopeWorker::Job job;
     if (!scopes::Gather(f, layout, kScopeW, job.mini, job.w, job.h)) return;
+    // An untagged source taken as HLG / PQ (#169) decodes on BT.2020, as the shader does.
+    if (renderer_) job.mini.matrix = (ColorMatrix)renderer_->EffectiveMatrix((int)f.transfer, (int)f.matrix);
     job.hasFrame = true;
     g_down.Add((NowSec() - now) * 1000.0);
     LogCost();
@@ -109,7 +115,16 @@ void ProController::OnStill(const uint8_t* rgba, int w, int h, StereoLayout layo
 
 scopes::Grade ProController::ScopeGrade() {
     scopes::Grade g;
+    if (renderer_) {  // the HDR mapping applies under bypass too (it is not the look)
+        const VulkanRenderer::HdrState h = renderer_->SourceHdr();
+        g.hdr.transfer = h.raw ? color::Transfer::SDR : (color::Transfer)h.transfer;
+        g.hdr.bt2020 = h.bt2020;
+        g.hdr.rollOff = h.rollOff;
+        g.hdr.peakNits = h.peakNits;
+        g.hdr.overWhite = h.overWhite;
+    }
     if (bypass_) return g;
+    g.hdr.pqShaper = renderer_ && renderer_->SourceHdr().pqShaper && grade_.lutOn && lut_.Valid();
     g.exposure = grade_.exposure;
     g.cdlOn = grade_.cdlOn;
     for (int i = 0; i < 3; ++i) {
@@ -132,11 +147,11 @@ scopes::Grade ProController::ScopeGrade() {
 
 std::string ProController::ScopeKey() {
     const scopes::Grade g = ScopeGrade();
-    char key[256];
-    std::snprintf(key, sizeof(key), "%d|%.4f|%d|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f|%p|%d%d",
+    char key[320];
+    std::snprintf(key, sizeof(key), "%d|%.4f|%d|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f %.4f %.4f|%.4f|%p|%d%d|%d%d%d%.0f",
                   (int)bypass_, g.exposure, (int)g.cdlOn, g.slope[0], g.slope[1], g.slope[2], g.offset[0], g.offset[1],
                   g.offset[2], g.power[0], g.power[1], g.power[2], g.saturation, (const void*)g.lut, (int)parade_,
-                  (int)scopesOn_);
+                  (int)scopesOn_, (int)g.hdr.transfer, (int)g.hdr.bt2020, (int)g.hdr.rollOff * 2 + (int)g.hdr.pqShaper, g.hdr.peakNits);
     return key;
 }
 
@@ -181,11 +196,11 @@ void ProController::BuildOverlays(const Status& st, float uiAlpha) {
     // While the trunk's top bar is up the burn-ins sit under it (the panels' top), else at
     // the picture's corner as on a clean feed.
     if (uiAlpha > 0.01f && !(host_.isFullscreen && host_.isFullscreen())) {
-        b.topInset = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f + 8.0f - py * H;
+        b.topInset = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f + Px(8.0f) - py * H;
         // The side panels (BuildUI's panelW, 8 px from each window edge).
-        const float panelW = std::clamp(W * 0.24f, 280.0f, 440.0f);
-        b.leftInset = panelW + 16.0f - px * W;
-        b.rightInset = panelW + 16.0f - (W - (px + pw) * W);
+        const float panelW = std::clamp(W * 0.24f, Px(280.0f), Px(440.0f));
+        b.leftInset = panelW + Px(16.0f) - px * W;
+        b.rightInset = panelW + Px(16.0f) - (W - (px + pw) * W);
     }
     const double fps = host_.mediaFps ? host_.mediaFps() : 0.0;
     const double pos = host_.mediaPosition ? host_.mediaPosition() : -1.0;
@@ -229,15 +244,15 @@ void ProController::BuildPixelProbe(const Status& st) {
     char t[96];
     std::snprintf(t, sizeof(t), "R %3d  G %3d  B %3d   Y %.1f%%", p[0], p[1], p[2], Y);
     ImDrawList* dl = ImGui::GetForegroundDrawList();
-    const float arm = 10.0f;
-    dl->AddLine(ImVec2(at.x - arm, at.y), ImVec2(at.x + arm, at.y), IM_COL32(255, 255, 255, 230), 1.5f);
-    dl->AddLine(ImVec2(at.x, at.y - arm), ImVec2(at.x, at.y + arm), IM_COL32(255, 255, 255, 230), 1.5f);
+    const float arm = Px(10.0f);
+    dl->AddLine(ImVec2(at.x - arm, at.y), ImVec2(at.x + arm, at.y), IM_COL32(255, 255, 255, 230), Px(1.5f));
+    dl->AddLine(ImVec2(at.x, at.y - arm), ImVec2(at.x, at.y + arm), IM_COL32(255, 255, 255, 230), Px(1.5f));
     const ImVec2 ts = ImGui::CalcTextSize(t);
-    const ImVec2 o(at.x + 14.0f, at.y + 12.0f);
-    const float sw = ts.y + 4.0f;  // swatch
-    dl->AddRectFilled(o, ImVec2(o.x + sw + ts.x + 18.0f, o.y + ts.y + 8.0f), IM_COL32(10, 12, 16, 220), 3.0f);
-    dl->AddRectFilled(ImVec2(o.x + 4, o.y + 2), ImVec2(o.x + 4 + sw - 4, o.y + ts.y + 6), IM_COL32(p[0], p[1], p[2], 255));
-    dl->AddText(ImVec2(o.x + sw + 10.0f, o.y + 4.0f), IM_COL32(235, 238, 242, 255), t);
+    const ImVec2 o(at.x + Px(14.0f), at.y + Px(12.0f));
+    const float sw = ts.y + Px(4.0f);  // swatch
+    dl->AddRectFilled(o, ImVec2(o.x + sw + ts.x + Px(18.0f), o.y + ts.y + Px(8.0f)), IM_COL32(10, 12, 16, 220), Px(3.0f));
+    dl->AddRectFilled(ImVec2(o.x + Px(4), o.y + Px(2)), ImVec2(o.x + Px(4) + sw - Px(4), o.y + ts.y + Px(6)), IM_COL32(p[0], p[1], p[2], 255));
+    dl->AddText(ImVec2(o.x + sw + Px(10.0f), o.y + Px(4.0f)), IM_COL32(235, 238, 242, 255), t);
 #else
     (void)st;
 #endif
@@ -246,6 +261,64 @@ void ProController::BuildPixelProbe(const Status& st) {
 // ---------------------------------------------------------------------------
 // Inspector sections
 // ---------------------------------------------------------------------------
+
+std::string HdrSummary(const VulkanRenderer::HdrState& h) {
+    if (h.transfer == 0) return {};
+    char s[64];
+    if (h.raw)
+        std::snprintf(s, sizeof(s), "%s raw (not mapped)", HdrTransferName(h.transfer));
+    else if (h.pqShaper)
+        std::snprintf(s, sizeof(s), "%s -> OCIO look (unclipped)", HdrTransferName(h.transfer));
+    else if (h.rollOff)
+        std::snprintf(s, sizeof(s), "%s -> SDR %.0f nits", HdrTransferName(h.transfer), h.peakNits);
+    else
+        std::snprintf(s, sizeof(s), "%s, clipped at white", HdrTransferName(h.transfer));
+    return s;
+}
+
+// Inspector > Color: how an HDR source (HLG, PQ, scene-linear EXR) reaches the SDR panel.
+// Auto rolls off HLG / PQ highlights and clips EXR at white (today's EXR look; exposure
+// acts first, so pulling it down brings highlights back). The peak is the source's
+// brightest: from the stream's metadata, else 1000 nits, unless set here.
+void ProController::BuildHdrControls() {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    const VulkanRenderer::HdrState h = renderer_ ? renderer_->SourceHdr() : VulkanRenderer::HdrState{};
+    const float itemW = ImGui::GetContentRegionAvail().x * 0.42f;
+    ImGui::SetNextItemWidth(itemW);
+    if (ImGui::BeginCombo("HDR tone map", ToneMapName(grade_.toneMap))) {
+        for (int i = 0; i < 4; ++i)
+            if (ImGui::Selectable(ToneMapName(i), grade_.toneMap == i)) grade_.toneMap = i;
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("auto: roll off HLG / PQ highlights, clip EXR at white\n"
+                          "on: always roll off   off: clip at white\n"
+                          "raw: the signal as it is, for a show LUT that expects PQ / HLG input");
+    ImGui::SetNextItemWidth(itemW);
+    int peak = (int)(grade_.peakNits + 0.5f);
+    if (ImGui::InputInt("Source peak (nits)", &peak, 100, 1000))
+        grade_.peakNits = (float)std::clamp(peak, 0, 10000);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("PQ / EXR: the source's brightest; 0 = from the stream's metadata (else 1000)\n"
+                          "HLG: where the highlight roll-off ends; the picture and reference white\n"
+                          "stay put; 0 = 1000");
+    ImGui::SetNextItemWidth(itemW);
+    static const char* kUntagged[] = {"SDR (as tagged)", "HLG", "PQ"};
+    int forced = std::clamp(grade_.forceTransfer, 0, 2);
+    if (ImGui::Combo("Untagged source", &forced, kUntagged, 3)) grade_.forceTransfer = forced;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("A video with no HDR tag plays as SDR. Choose HLG or PQ when you know\n"
+                          "it is HDR (BT.2020 matrix and primaries). Tagged sources are unaffected.");
+    if (h.transfer == 0)
+        ImGui::TextDisabled("Source: SDR (no tone map)");
+    else if (h.forced)
+        ImGui::TextDisabled("Source: untagged, taken as %s BT.2020  ->  %s", HdrTransferName(h.transfer),
+                            HdrSummary(h).c_str());
+    else
+        ImGui::TextDisabled("Source: %s%s  ->  %s", HdrTransferName(h.transfer), h.bt2020 ? " BT.2020" : "",
+                            HdrSummary(h).c_str());
+#endif
+}
 
 void ProController::BuildOverlaySection() {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
@@ -321,15 +394,17 @@ void ProController::BuildMonitoringSection(const Status& st) {
 void ProController::BuildScopesPanel(float alpha, float W, float H, float panelW) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     if (!scopesOn_ || alpha < 0.01f) return;
-    const float margin = 8.0f;
+    const float margin = Px(8.0f);
     float x = panelW + 2.0f * margin, w = W - 2.0f * x;
-    if (w < 420.0f) {  // narrow window: span it
+    if (w < Px(420.0f)) {  // narrow window: span it
         x = margin;
         w = W - 2.0f * margin;
     }
-    const float graphH = std::clamp(w * 0.26f, 120.0f, 240.0f);
+    const float graphH = std::clamp(w * 0.26f, Px(120.0f), Px(240.0f));
     const float h = graphH + ImGui::GetTextLineHeightWithSpacing() * 2.0f + ImGui::GetStyle().WindowPadding.y * 2.0f;
-    ImGui::SetNextWindowPos(ImVec2(x, H - h - 52.0f), ImGuiCond_Always);
+    float y = H - h - Px(52.0f);
+    if (ui::g_bottomUiTop > 0.0f) y = std::min(y, ui::g_bottomUiTop - h - Px(8.0f));  // above strip + status
+    ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(FlatNow() ? 1.0f : 0.85f);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
@@ -349,9 +424,9 @@ void ProController::BuildScopesPanel(float alpha, float W, float H, float panelW
                                            scopeTexDirty_ ? vecRgba_.data() : nullptr);
                 if (waveTex && vecTex) scopeTexDirty_ = false;
             }
-            const float gap = 10.0f;
-            const float vecW = graphH, histW = std::max(120.0f, (w - vecW - 3 * gap) * 0.36f);
-            const float waveW = std::max(120.0f, w - vecW - histW - 2 * gap - ImGui::GetStyle().WindowPadding.x * 2);
+            const float gap = Px(10.0f);
+            const float vecW = graphH, histW = std::max(Px(120.0f), (w - vecW - 3 * gap) * 0.36f);
+            const float waveW = std::max(Px(120.0f), w - vecW - histW - 2 * gap - ImGui::GetStyle().WindowPadding.x * 2);
             ImDrawList* dl = ImGui::GetWindowDrawList();
             const ImU32 grid = IM_COL32(255, 255, 255, 40), label = IM_COL32(200, 205, 210, 170);
 
@@ -366,7 +441,7 @@ void ProController::BuildScopesPanel(float alpha, float W, float H, float panelW
                 dl->AddLine(ImVec2(w0.x, yy), ImVec2(w0.x + waveW, yy), grid);
                 char t[8];
                 std::snprintf(t, sizeof(t), "%d", pct);
-                dl->AddText(ImVec2(w0.x + 2, yy - (pct == 100 ? 0 : ImGui::GetTextLineHeight())), label, t);
+                dl->AddText(ImVec2(w0.x + Px(2), yy - (pct == 100 ? 0 : ImGui::GetTextLineHeight())), label, t);
             }
             ImGui::EndGroup();
             ImGui::SameLine(0, gap);
@@ -395,8 +470,8 @@ void ProController::BuildScopesPanel(float alpha, float W, float H, float panelW
                 const float Y = 0.2126f * t.r + 0.7152f * t.g + 0.0722f * t.b;
                 const float cb = (t.b - Y) / 1.8556f, cr = (t.r - Y) / 1.5748f;
                 const ImVec2 q(v0.x + (cb + 0.5f) * vs, v0.y + (0.5f - cr) * vs);
-                dl->AddRect(ImVec2(q.x - 4, q.y - 4), ImVec2(q.x + 4, q.y + 4), IM_COL32(255, 255, 255, 120));
-                dl->AddText(ImVec2(q.x + 5, q.y - 7), label, t.n);
+                dl->AddRect(ImVec2(q.x - Px(4), q.y - Px(4)), ImVec2(q.x + Px(4), q.y + Px(4)), IM_COL32(255, 255, 255, 120));
+                dl->AddText(ImVec2(q.x + Px(5), q.y - Px(7)), label, t.n);
             }
             ImGui::EndGroup();
             ImGui::SameLine(0, gap);
@@ -415,7 +490,7 @@ void ProController::BuildScopesPanel(float alpha, float W, float H, float panelW
                 for (int i = 0; i < scopes::kLevels; ++i) {
                     const float xx = h0.x + histW * i / (float)(scopes::kLevels - 1);
                     const float yy = h0.y + graphH * (1.0f - std::min(1.0f, hist[i] / (float)peak));
-                    if (i) dl->AddLine(prev, ImVec2(xx, yy), col, 1.2f);
+                    if (i) dl->AddLine(prev, ImVec2(xx, yy), col, Px(1.2f));
                     prev = ImVec2(xx, yy);
                 }
             };

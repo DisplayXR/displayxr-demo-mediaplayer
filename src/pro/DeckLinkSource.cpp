@@ -2,6 +2,7 @@
 #include "pro/DeckLinkSource.h"
 
 #include "Log.h"
+#include "pro/DeckLinkFormat.h"
 #include "pro/TimecodePairer.h"
 
 #include <algorithm>
@@ -98,6 +99,11 @@ bool DeckLinkSource::Open(const DeckLinkConfig& cfg) {
     name_ = "DeckLink " + cfg.device;
     if (cfg.stereo == DeckLinkConfig::Stereo::Pair) name_ += " + " + cfg.rightDevice;
     ResetStats(0, 0.0);
+    {
+        std::lock_guard<std::mutex> lk(warnMutex_);
+        formatWarning_[0].clear();
+        formatWarning_[1].clear();
+    }
     if (!Available()) {
         Fail(LiveState::Failed, "this build has no Blackmagic DeckLink support");
         return false;
@@ -157,10 +163,13 @@ void DeckLinkSource::PrintDeviceList(FILE* out) {
     const std::vector<std::string> devs = Enumerate();
     if (devs.empty()) {
         std::fprintf(out, "No Blackmagic inputs: %s.\n", UnavailableReason().c_str());
-        return;
+    } else {
+        std::fprintf(out, "Blackmagic devices (use the number or part of the name):\n");
+        for (const std::string& d : devs) std::fprintf(out, "  %s\n", d.c_str());
     }
-    std::fprintf(out, "Blackmagic devices (use the number or part of the name):\n");
-    for (const std::string& d : devs) std::fprintf(out, "  %s\n", d.c_str());
+    // Also with no card: station acceptance E2 reads the driver version from this line.
+    const std::string v = DriverVersionText();
+    if (!v.empty()) std::fprintf(out, "Desktop Video %s\n", v.c_str());
 }
 
 #if defined(MEDIAPLAYER_WITH_DECKLINK)
@@ -234,7 +243,10 @@ std::string Take(String s) {
     std::free((void*)s);  // the SDK strdup()s what it returns
     return out;
 }
-bool IsIUnknown(REFIID a) { return std::memcmp(&a, &IID_IUnknown, sizeof(REFIID)) == 0; }
+bool IsIUnknown(REFIID a) {
+    const REFIID u = IID_IUnknown;  // a compound literal in LinuxCOM.h: no address to take
+    return std::memcmp(&a, &u, sizeof(u)) == 0;
+}
 #endif
 using Bool = bool;
 struct ComScope {};
@@ -376,11 +388,39 @@ bool CopyPixels(IDeckLinkVideoFrame* f, RawPixels& out) {
     return ok;
 }
 
-// One eye's copied pixels -> P016 at column x0 of dst (10-bit kept; 8-bit and RGB widened).
-void ConvertEye(const RawPixels& p, livepix::P016& dst, int x0) {
+std::atomic<int> g_lastBitDepth{0};
+
+BMDPixelFormat ToBmd(dlfmt::Pix p) {
+    switch (p) {
+        case dlfmt::Pix::Yuv10: return bmdFormat10BitYUV;
+        case dlfmt::Pix::Yuv8: return bmdFormat8BitYUV;
+        case dlfmt::Pix::Rgb10: return bmdFormat10BitRGB;
+        case dlfmt::Pix::Bgra8: return bmdFormat8BitBGRA;
+    }
+    return bmdFormat8BitYUV;
+}
+
+// The signal's bit depth as the card detected it; 0 when it does not say.
+int SignalBits(BMDDetectedVideoInputFormatFlags d) {
+    if (d & bmdDetectedVideoInput12BitDepth) return 12;
+    if (d & bmdDetectedVideoInput10BitDepth) return 10;
+    if (d & bmdDetectedVideoInput8BitDepth) return 8;
+    return 0;
+}
+
+// One eye's copied pixels -> P016 at column x0 of dst (10-bit kept; 8-bit widened).
+// hasMatrix / matrix: the signal's colorimetry, if the card reported it. An r210 (RGB)
+// frame is encoded with it, so the tag the caller sets afterwards is the one the pixels
+// were encoded with.
+void ConvertEye(const RawPixels& p, livepix::P016& dst, int x0, bool hasMatrix, ColorMatrix matrix) {
+    const bool deep = p.pf == bmdFormat10BitYUV || p.pf == bmdFormat10BitRGB;
+    g_lastBitDepth.store(deep ? 10 : 8, std::memory_order_relaxed);
     const int w = p.w & ~1, h = p.h & ~1;
     if (p.pf == bmdFormat10BitYUV)
         livepix::V210ToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
+    else if (p.pf == bmdFormat10BitRGB)
+        livepix::R210ToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0,
+                            hasMatrix ? matrix : DefaultMatrixForHeight(h));
     else if (p.pf == bmdFormat8BitBGRA)
         livepix::BgraToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
     else
@@ -449,7 +489,7 @@ void ReadColour(IDeckLinkVideoFrame* f, bool& hasMatrix, ColorMatrix& matrix, Co
         SUCCEEDED(md->GetInt(bmdDeckLinkFrameMetadataHDRElectroOpticalTransferFunc, &v))) {
         transfer = v == 2 ? ColorTransfer::PQ : v == 3 ? ColorTransfer::HLG : ColorTransfer::SDR;  // CEA 861.3
         if (transfer != ColorTransfer::SDR && !warnedHdr) {
-            LOG_WARN("decklink: the signal is %s; it is shown as SDR (no tone mapping) - monitor through a LUT",
+            LOG_WARN("decklink: the signal is %s; it is tone-mapped to the SDR panel",
                      transfer == ColorTransfer::PQ ? "PQ" : "HLG");
             warnedHdr = true;
         }
@@ -532,6 +572,20 @@ struct DeckLinkCapture {
         if (on) LOG_WARN("decklink: input %d has no signal", eye);
         else LOG_INFO("decklink: input %d signal back", eye);
         src->SetNoSignal(eye, on);
+    }
+
+    // A restart after a format change that cannot enable the input in any format (#169):
+    // the input is left stopped and the source goes Failed, so the status bar reads ERROR
+    // and the toast / get_rig_status give the reason, instead of a live cable reading as a
+    // stall. A later restart that works brings it back. m held.
+    void RestartFailed(const std::string& why) {
+        if (alive) src->Fail(LiveState::Failed, why);
+    }
+    void RestartOk() {
+        if (alive && src->GetState() == LiveState::Failed) src->SetState(LiveState::Opening);
+    }
+    void FormatWarning(int eye, const std::string& text) {
+        if (alive) src->SetFormatWarning(eye, text);
     }
 
     // ---- the hand-off (#141). The card's callback must return within a frame or the
@@ -654,8 +708,8 @@ struct DeckLinkCapture {
             // one input: only this lane touches `out`; the lock keeps Stop() simple
             std::lock_guard<std::mutex> lk(m);
             out.Resize(r.dual ? 2 * w : w, h);
-            ConvertEye(r.px, out, 0);
-            if (r.dual) ConvertEye(r.right, out, w);
+            ConvertEye(r.px, out, 0, r.hasMatrix, r.matrix);
+            if (r.dual) ConvertEye(r.right, out, w, r.hasMatrix, r.matrix);
             if (r.hasMatrix) out.matrix = r.matrix;
             out.transfer = r.transfer;
             if (alive) src->Publish(out, /*fullRange=*/false, r.now, r.tc[0] ? r.tc : nullptr, r.dual ? 0 : -1);
@@ -671,7 +725,7 @@ struct DeckLinkCapture {
         }
         EyeFrame& ef = hist[eye][slot];
         ef.px.Resize(w, h);
-        ConvertEye(r.px, ef.px, 0);
+        ConvertEye(r.px, ef.px, 0, r.hasMatrix, r.matrix);
         if (r.hasMatrix) ef.px.matrix = r.matrix;
         ef.px.transfer = r.transfer;
         ef.arrived = r.now;
@@ -738,8 +792,9 @@ class Callback : public IDeckLinkInputCallback {
 public:
     Callback(std::shared_ptr<DeckLinkCapture> cap, int eye, IDeckLinkInput* input, BMDVideoInputFlags flags,
              bool autoDual, BMDPixelFormat yuvFormat)
-        : cap_(std::move(cap)), eye_(eye), input_(input), flags_(flags), pixelFormat_(yuvFormat),
-          yuvFormat_(yuvFormat), autoDual_(autoDual) {
+        : cap_(std::move(cap)), eye_(eye), input_(input), flags_(flags), requested_(yuvFormat),
+          yuv10Ok_(yuvFormat == bmdFormat10BitYUV), autoDual_(autoDual),
+          explicitDual_(!autoDual && (flags & bmdVideoInputDualStream3D) != 0) {
         input_->AddRef();  // our own reference: a late callback never uses a released input
     }
     ~Callback() { input_->Release(); }
@@ -764,7 +819,13 @@ public:
     HRESULT STDMETHODCALLTYPE VideoInputFormatChanged(BMDVideoInputFormatChangedEvents events,
                                                       IDeckLinkDisplayMode* mode,
                                                       BMDDetectedVideoInputFormatFlags detected) override {
-        const BMDPixelFormat pf = (detected & bmdDetectedVideoInputRGB444) ? bmdFormat8BitBGRA : yuvFormat_;
+        // The formats to ask for, best first: RGB 4:4:4 at its own depth (r210 for 10 and
+        // 12 bit), then 8-bit RGB, then YUV, which the card converts to (#169).
+        const bool rgb = (detected & bmdDetectedVideoInputRGB444) != 0;
+        const int signalBits = SignalBits(detected);
+        dlfmt::Pix cand[4];
+        const int nCand = dlfmt::Candidates(rgb, signalBits, yuv10Ok_, cand);
+        const BMDPixelFormat pf = ToBmd(cand[0]);
         if (!cap_->alive) return S_OK;
         bool flagsChanged = false;
         if ((detected & bmdDetectedVideoInputDualStream3D) && autoDual_ && !cap_->dualActive && !dualRefused_) {
@@ -782,10 +843,17 @@ public:
             LOG_INFO("decklink: the signal is 2D again; left dual-stream 3D capture");
         }
         if (!(events & (bmdVideoInputDisplayModeChanged | bmdVideoInputColorspaceChanged)) &&
-            pf == pixelFormat_ && !flagsChanged)
+            pf == requested_ && !flagsChanged)
             return S_OK;
+        if (events & bmdVideoInputDisplayModeChanged) {
+            dualRefused_ = false;  // support is per mode
+            // --decklink-stereo=dual asked for dual-stream: a refusal in the old mode does
+            // not carry over to this one, so ask again.
+            if (explicitDual_) flags_ |= bmdVideoInputDualStream3D;
+        }
         dl::String name = nullptr;
         mode->GetName(&name);
+        const std::string modeName = dl::Take(name);
         BMDTimeValue dur = 0;
         BMDTimeScale scale = 0;
         if (SUCCEEDED(mode->GetFrameRate(&dur, &scale)) && dur) {
@@ -793,39 +861,71 @@ public:
             cap_->SetFps((double)scale / (double)dur);
         }
         const BMDFieldDominance fd = mode->GetFieldDominance();
-        LOG_INFO("decklink: input %d signal is now %s, %s, %s%s", eye_, dl::Take(name).c_str(),
-                 (detected & bmdDetectedVideoInputRGB444) ? "RGB 4:4:4" : "YUV 4:2:2", FieldText(fd),
+        LOG_INFO("decklink: input %d signal is now %s, %s, %d-bit, %s%s", eye_, modeName.c_str(),
+                 rgb ? "RGB 4:4:4" : "YUV 4:2:2", signalBits, FieldText(fd),
                  (detected & bmdDetectedVideoInputDualStream3D) ? ", dual-stream 3D" : "");
         if ((fd == bmdLowerFieldFirst || fd == bmdUpperFieldFirst) && !warnedInterlaced_) {
             LOG_WARN("decklink: input %d is interlaced: fields are shown combed and the rig checks are "
                      "unreliable; feed PsF or progressive", eye_);
             warnedInterlaced_ = true;
         }
-        pixelFormat_ = pf;
+        requested_ = pf;
         // Restart under the capture lock, and only while capture is still on: the worker
         // clears `alive` (taking the same lock) before it stops and disables the input.
         std::lock_guard<std::mutex> restartLock(cap_->m);
         if (!cap_->alive) return S_OK;
         cap_->ResetPairing();  // frames from the old format must not pair with the new
         input_->PauseStreams();
-        HRESULT r = input_->EnableVideoInput(mode->GetDisplayMode(), pf, flags_);
-        if (FAILED(r) && (flags_ & bmdVideoInputDualStream3D) && !cap_->dualActive) {
-            LOG_WARN("decklink: the signal is dual-stream 3D but this card cannot capture it in this "
-                     "mode; showing one eye");
-            flags_ &= ~(BMDVideoInputFlags)bmdVideoInputDualStream3D;
+        // Each format in turn until the card takes one (a refusal is per format and mode;
+        // yuv10Ok_ stays as it is: the next mode may take 10-bit again).
+        dlfmt::Pix got = cand[0];
+        auto enable = [&]() {
+            HRESULT hr = E_FAIL;
+            for (int i = 0; i < nCand && FAILED(hr); ++i) {
+                hr = input_->EnableVideoInput(mode->GetDisplayMode(), ToBmd(cand[i]), flags_);
+                if (SUCCEEDED(hr)) got = cand[i];
+            }
+            return hr;
+        };
+        HRESULT r = enable();
+        const BMDVideoInputFlags kDual = bmdVideoInputDualStream3D;
+        if (FAILED(r) && (flags_ & kDual)) {
+            // Dual-stream support is per mode: refused here whether capture was switching into
+            // it or was already in it before this format change (#169). Fall back to one input.
+            LOG_WARN("decklink: input %d: this card cannot capture dual-stream 3D in %s; showing one eye", eye_,
+                     modeName.c_str());
+            flags_ &= ~kDual;
+            cap_->dual = false;  // (cap_->m is held) one eye is what will arrive: do not wait for a right one
+            if (cap_->dualActive) cap_->SetDualActive(false);
+            cap_->NoSignal(1, false);  // no right eye is expected now, so it is not "dark"
             dualRefused_ = true;
-            r = input_->EnableVideoInput(mode->GetDisplayMode(), pf, flags_);
-        } else if (SUCCEEDED(r) && (flags_ & bmdVideoInputDualStream3D) && !cap_->dualActive) {
-            LOG_INFO("decklink: switched to dual-stream 3D capture");
+            r = enable();
+        } else if (SUCCEEDED(r) && (flags_ & kDual)) {
+            if (!cap_->dual) LOG_INFO("decklink: switched to dual-stream 3D capture");
             cap_->dual = true;  // (cap_->m is held: restartLock)
-            cap_->SetDualActive(true);
+            if (autoDual_) cap_->SetDualActive(true);
         }
-        if (FAILED(r) && pf == bmdFormat10BitYUV) {  // refused 10-bit in this format: 8-bit
-            pixelFormat_ = bmdFormat8BitYUV;  // (yuvFormat_ stays 10-bit: the next format may take it)
-            r = input_->EnableVideoInput(mode->GetDisplayMode(), bmdFormat8BitYUV, flags_);
-            if (SUCCEEDED(r)) LOG_INFO("decklink: input %d: 10-bit refused in this format, using 8-bit", eye_);
+        if (FAILED(r)) {
+            // Starting the streams now would deliver nothing: a live cable would read as a
+            // stall (NO SIGNAL) with the reason only in the log. Leave the input stopped and
+            // fail the source, so the reason reaches the status bar, a toast and get_rig_status.
+            const std::string why = "DeckLink input " + std::to_string(eye_) + " cannot capture the new format (" +
+                                    modeName + (rgb ? ", RGB 4:4:4" : ", YUV 4:2:2") +
+                                    "); capture stopped - re-select the input or change the source format";
+            LOG_WARN("decklink: %s", why.c_str());
+            cap_->RestartFailed(why);
+            input_->FlushStreams();
+            return S_OK;
         }
-        if (FAILED(r)) LOG_WARN("decklink: input %d cannot restart in the new format", eye_);
+        if (got != cand[0])
+            LOG_INFO("decklink: input %d: %s refused in this format, using %s", eye_, dlfmt::Name(cand[0]),
+                     dlfmt::Name(got));
+        // Depth lost to the format the card took (12-bit RGB as r210, 10-bit as 8-bit): once
+        // per format change, in the log and on the Station panel (cleared when nothing is lost).
+        const std::string loss = dlfmt::DepthLossText(rgb, signalBits, got);
+        if (!loss.empty()) LOG_WARN("decklink: input %d: %s", eye_, loss.c_str());
+        cap_->FormatWarning(eye_, loss);
+        cap_->RestartOk();
         input_->FlushStreams();
         input_->StartStreams();
         return S_OK;
@@ -849,9 +949,10 @@ private:
     int eye_;
     IDeckLinkInput* input_;
     BMDVideoInputFlags flags_;
-    BMDPixelFormat pixelFormat_;
-    BMDPixelFormat yuvFormat_;  // 10-bit; 8-bit when the card refused 10-bit at open
+    BMDPixelFormat requested_;  // the best format for the current signal (what a change compares with)
+    bool yuv10Ok_;              // false when the card refused 10-bit YUV at open
     bool autoDual_;
+    bool explicitDual_;         // --decklink-stereo=dual: ask for dual-stream again in each new mode
     bool dualRefused_ = false;
     bool warnedInterlaced_ = false;
 };
@@ -873,6 +974,30 @@ std::string DeckLinkSource::UnavailableReason() {
 DeckLinkSource::PairStats DeckLinkSource::GetPairStats() const {
     std::lock_guard<std::mutex> lk(pairMutex_);
     return pairStats_;
+}
+
+int DeckLinkSource::LastBitDepth() { return g_lastBitDepth.load(std::memory_order_relaxed); }
+
+#endif  // MEDIAPLAYER_WITH_DECKLINK
+
+void DeckLinkSource::SetFormatWarning(int eye, const std::string& text) {
+    std::lock_guard<std::mutex> lk(warnMutex_);
+    formatWarning_[eye & 1] = text;
+}
+
+std::string DeckLinkSource::FormatWarning() const {
+    std::lock_guard<std::mutex> lk(warnMutex_);
+    if (formatWarning_[0].empty()) return formatWarning_[1];
+    if (formatWarning_[1].empty() || formatWarning_[1] == formatWarning_[0]) return formatWarning_[0];
+    return formatWarning_[0] + "; " + formatWarning_[1];
+}
+
+#if defined(MEDIAPLAYER_WITH_DECKLINK)
+
+std::string DeckLinkSource::DriverVersionText() {
+    dl::ComScope com;
+    const int64_t v = DriverVersion();
+    return v > 0 ? VersionText(v) : std::string();
 }
 
 std::vector<std::string> DeckLinkSource::Enumerate() {
@@ -1040,6 +1165,8 @@ void DeckLinkSource::Worker() {
 bool DeckLinkSource::Available() { return false; }
 std::vector<std::string> DeckLinkSource::Enumerate() { return {}; }
 std::string DeckLinkSource::UnavailableReason() { return "this build has no DeckLink SDK"; }
+int DeckLinkSource::LastBitDepth() { return 0; }
+std::string DeckLinkSource::DriverVersionText() { return {}; }
 DeckLinkSource::PairStats DeckLinkSource::GetPairStats() const { return {}; }
 void DeckLinkSource::Worker() {}
 

@@ -10,6 +10,7 @@
 #pragma once
 
 #include "color/CubeLut.h"
+#include "color/ToneMap.h"
 #include "media/FrameRing.h"
 #include "media/StereoTypes.h"
 
@@ -29,9 +30,13 @@ struct Grade {
     float slope[3] = {1.f, 1.f, 1.f}, offset[3] = {0.f, 0.f, 0.f}, power[3] = {1.f, 1.f, 1.f};
     float saturation = 1.0f;
     const color::CubeLut* lut = nullptr;  // used when non-null and Valid()
+    // The source's HDR mapping (#134), as the shader gets it. SDR (the default) skips it;
+    // otherwise it runs first and takes the exposure (hdr.exposure is ignored).
+    color::HdrParams hdr;
 };
 
-// One display-referred R'G'B' (0..1) through the grade, exactly as Grade() in sbs.frag.
+// One R'G'B' signal (0..1) through the HDR mapping and the grade, exactly as GradeSrc() in
+// sbs.frag.
 void ApplyGrade(const Grade& g, float rgb[3]);
 
 constexpr int kLevels = 256;   // waveform / histogram vertical resolution
@@ -59,6 +64,8 @@ bool DownsampleRgba(const uint8_t* src, int srcW, int srcH, StereoLayout layout,
                     std::vector<uint8_t>& rgba, int& w, int& h);
 // Grade the analysis image and fill the scopes.
 void Measure(const std::vector<uint8_t>& rgba, int w, int h, const Grade& g, Result& out);
+// The same from 16-bit RGBA (a gathered video frame, #169).
+void Measure16(const std::vector<uint16_t>& rgba, int w, int h, const Grade& g, Result& out);
 
 // Render-thread half: point-sample the frame's left eye into `mini`, a frame of the same
 // pixel format kGatherScale x the analysis size (`w` x `h`, from `analysisW` and the
@@ -67,6 +74,7 @@ void Measure(const std::vector<uint8_t>& rgba, int w, int h, const Grade& g, Res
 constexpr int kGatherScale = 1;
 bool Gather(const FrameRing::Frame& f, StereoLayout layout, int analysisW, FrameRing::Frame& mini, int& w, int& h);
 bool DownsampleMini(const FrameRing::Frame& mini, int w, int h, std::vector<uint8_t>& rgba);
+bool DownsampleMini16(const FrameRing::Frame& mini, int w, int h, std::vector<uint16_t>& rgba);
 
 // Scope pictures (RGBA, alpha 255): the waveform as `outW` x kLevels (luma, or the RGB
 // parade side by side), the vectorscope as kVecSize x kVecSize. Log-scaled phosphor look.
@@ -108,7 +116,8 @@ private:
     Result result_;
     std::vector<uint8_t> wave_, vec_;
     double lastMs_ = 0.0;
-    std::vector<uint8_t> image_;          // worker-owned: the last analysis image
+    std::vector<uint8_t> image_;          // worker-owned: the last analysis image (a still)
+    std::vector<uint16_t> image16_;       // or the last frame's, at 16 bits
     int imageW_ = 0, imageH_ = 0;
     std::thread thread_;
 };

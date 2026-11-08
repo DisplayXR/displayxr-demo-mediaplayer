@@ -21,7 +21,7 @@
 # Does NOT run the app: CI has no display or GPU (on-screen checks are manual).
 set -euo pipefail
 
-[ "$#" -ge 1 ] || { echo "usage: $0 <mediaplayer.deb> [displayxr-runtime.deb]" >&2; exit 2; }
+[ "$#" -ge 1 ] || { echo "usage: $0 <mediaplayer[-pro].deb> [more .debs, e.g. displayxr-runtime.deb]" >&2; exit 2; }
 [ "$(id -u)" = 0 ] || { echo "error: run as root in a throwaway container." >&2; exit 2; }
 
 DEBS=()
@@ -35,10 +35,15 @@ apt-get update -qq
 # name or an unsatisfiable version (libc6 (>= 2.38) on 22.04, ...) fails here.
 apt-get install -y -qq --no-install-recommends "${DEBS[@]}"
 
-APPDIR=/usr/lib/displayxr-demos/mediaplayer
-BIN="$APPDIR/mediaplayer_handle_vk_linux"
+# The package under test is the FIRST .deb: the Media Player, or Media Player Pro
+# (#139; pass the Media Player .deb after it to prove the two install side by side).
+PKG="$(dpkg-deb -f "${DEBS[0]}" Package)"
+case "$PKG" in
+  displayxr-mediaplayer) APPDIR=/usr/lib/displayxr-demos/mediaplayer; BIN="$APPDIR/mediaplayer_handle_vk_linux" ;;
+  displayxr-mediaplayer-pro) APPDIR=/usr/lib/displayxr-demos/mediaplayer-pro; BIN="$APPDIR/mediaplayer_pro_handle_vk_linux" ;;
+  *) echo "error: unknown package $PKG in ${DEBS[0]}" >&2; exit 2 ;;
+esac
 [ -x "$BIN" ] || { echo "error: $BIN not installed." >&2; exit 1; }
-PKG=displayxr-mediaplayer
 dpkg-query -W -f='==> installed ${Package} ${Version}\nDepends: ${Depends}\n' "$PKG"
 
 fail=0
@@ -65,7 +70,7 @@ done
 
 # Every Recommends / Suggests alternative must name a real package here.
 for field in Recommends Suggests; do
-  for pkg in $(dpkg-query -W -f="\${$field}" displayxr-mediaplayer | tr ',|' '\n\n' | sed 's/(.*)//; s/ //g' | sed '/^$/d'); do
+  for pkg in $(dpkg-query -W -f="\${$field}" "$PKG" | tr ',|' '\n\n' | sed 's/(.*)//; s/ //g' | sed '/^$/d'); do
     if apt-cache show "$pkg" >/dev/null 2>&1; then
       echo "    $field $pkg: available"
     else

@@ -124,12 +124,14 @@ MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int ima
     MediaInfo info;
 
     if (EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png") ||
+        EndsWith(lower, ".gif") || EndsWith(lower, ".bmp") ||
         EndsWith(lower, ".mpo") || EndsWith(lower, ".lif") || (heifSupported_ && IsHeifExt(lower))) {
         // .lif and .mpo are JPEG containers; their loaders compose the pair to SBS and
         // report the authoritative layout, so the layout decided below is unused for
         // those paths.
         info.kind = MediaKind::Image;
     } else if (EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov") ||
+               EndsWith(lower, ".m4v") || EndsWith(lower, ".webm") || EndsWith(lower, ".3gp") ||
                (proFormats_ && IsProReviewExt(lower))) {
         info.kind = MediaKind::Video;  // (Pro: MXF, and EXR / DPX / TIFF played as a sequence)
     }
@@ -212,9 +214,11 @@ MediaInfo MediaSource::Resolve(const std::string& path, MediaKind kind,
 bool MediaSource::IsSupported(const std::string& path) {
     const std::string lower = Lower(path);
     return EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".png") ||
+           EndsWith(lower, ".gif") || EndsWith(lower, ".bmp") ||
            EndsWith(lower, ".lif") || EndsWith(lower, ".mpo") ||
            (heifSupported_ && IsHeifExt(lower)) ||
            EndsWith(lower, ".mp4") || EndsWith(lower, ".mkv") || EndsWith(lower, ".mov") ||
+           EndsWith(lower, ".m4v") || EndsWith(lower, ".webm") || EndsWith(lower, ".3gp") ||
            (proFormats_ && IsProReviewExt(lower));
 }
 

@@ -21,6 +21,7 @@
 #include "color/CubeLut.h"
 #include "pro/CompareClip.h"
 #include "pro/LookLoader.h"
+#include "pro/TargetScreen.h"
 #include "pro/OcioBake.h"
 #include "pro/Overlays.h"
 #include "pro/ResolveLink.h"
@@ -45,6 +46,26 @@ enum class Channel { RGB = 0, Red, Green, Blue, Alpha, Luma, Count };
 const char* ChannelName(Channel c);
 // before | after the grade; left eye | right eye; this clip | the compare clip B
 enum class Wipe { Off = 0, Grade, Eyes, Clips, Count };
+
+// HDR tone map (#134), GradeParams::toneMap: 0 auto, 1 on (roll off), 2 off (clip), 3 raw.
+inline const char* ToneMapName(int m) { return m == 1 ? "on" : m == 2 ? "off" : m == 3 ? "raw" : "auto"; }
+inline int ToneMapFromName(const std::string& s, int fallback) {
+    return s == "auto" || s == "0"  ? 0
+           : s == "on" || s == "1"  ? 1
+           : s == "off" || s == "2" ? 2
+           : s == "raw" || s == "3" ? 3
+                                    : fallback;
+}
+// An untagged source (#169), GradeParams::forceTransfer: 0 as tagged (SDR), 1 HLG, 2 PQ.
+inline const char* UntaggedName(int m) { return m == 1 ? "hlg" : m == 2 ? "pq" : "sdr"; }
+inline int UntaggedFromName(const std::string& s, int fallback) {
+    return s == "sdr" || s == "0" ? 0 : s == "hlg" || s == "1" ? 1 : s == "pq" || s == "2" ? 2 : fallback;
+}
+inline const char* HdrTransferName(int t) {
+    return t == 1 ? "HLG" : t == 2 ? "PQ" : t == 3 ? "Linear" : "SDR";
+}
+// "PQ -> SDR 1000 nits" / "Linear, clip" for the status bar; "" for SDR.
+std::string HdrSummary(const VulkanRenderer::HdrState& h);
 const char* WipeName(Wipe w);
 
 // Live player state the inspector shows, refreshed by App every frame.
@@ -93,6 +114,20 @@ struct Host {
     std::function<void()> toggleFullscreen;
     std::function<void(float)> setDesqueeze;  // anamorphic: stretch the picture's width
     std::function<double()> mediaFps;         // the open video's frame rate, 0 when not a video
+    std::function<std::string()> displayDeviceName;  // the 3D panel's OS monitor name (#133)
+    // #133: the display the player's window is on: the runtime's stable key ("" on a
+    // runtime before display_info v24) and its OS device name. False when unknown.
+    std::function<bool(std::string& key, std::string& deviceName)> panelIdentity;
+    std::function<bool()> displaysChanged;  // true once after the runtime's displays-changed event
+    // #135 target-screen preview: show the picture at the angular size it has on a screen
+    // widthM wide seen from distanceM (0, 0 = off); the scale it is shown at; the panel's
+    // width and nominal viewing distance (false when the runtime does not say).
+    std::function<void(float widthM, float distanceM)> setTargetScreen;
+    std::function<float()> pictureScale;
+    std::function<bool()> previewLimited;     // the target's scale is too large to preview
+    std::function<float()> parallaxOffsetPct;  // what convergence adds to the shown parallax, % of width
+    std::function<float()> viewerDistance;  // m: the tracked viewer, else the nominal distance
+    std::function<bool(float& widthM, float& viewerM)> panelGeometry;
     // An RGBA texture for ImGui::Image (scope pictures), per slot: upload `rgba` (nullptr =
     // no change) and return its ImTextureID, nullptr when there is none.
     std::function<void*(int slot, int w, int h, const uint8_t* rgba)> userTexture;
@@ -110,6 +145,17 @@ public:
     // (and an OCIO bake) loads asynchronously: it applies a few frames later, in Tick().
     void LoadLut(const std::string& path);
     void LoadCdl(const std::string& path);
+    // Per-panel display calibration (#133). Load `cube` as this panel's calibration and,
+    // with `install`, keep it for this panel (copied to its file in the calibration folder,
+    // so it loads automatically from then on). ClearCalibration drops it and, with
+    // `uninstall`, deletes the panel's kept file - unless what is showing is a run-only
+    // calibration (MEDIAPLAYER_PRO_CAL, or one whose keep failed): then only that is dropped
+    // and the kept file stays (#169). False (with calError_ and a toast) when the delete
+    // failed; the calibration then stays applied, matching the file still on disk.
+    void LoadCalibration(const std::string& cube, bool install);
+    bool ClearCalibration(bool uninstall);
+    // #135: judge (and preview) the depth for a target screen; an off Screen = this panel.
+    void SetTarget(const target::Screen& t);
     // An OpenColorIO transform baked into the grade's 3D LUT (needs a build with MP_OCIO_ROOT).
     // True = queued; config / colour-space errors surface later as lutError_.
     bool LoadOcio(const ocio::Request& req, std::string* err = nullptr);
@@ -157,7 +203,24 @@ public:
     void SetFlatPanelsAvailable(bool on) { flatAvailable_ = on; }
 
     // True while Pro wants the HUD kept alive (pinned inspector).
-    bool KeepHudAwake() const { return inspectorPinned_ || depthOverlay_ || OverlaysOn() || scopesOn_; }
+    // Tab / "Show panels": the full UI (top bar, panels, transport) is up and stays up, no
+    // timers. Off, only the transient transport strip appears (App::TickUi).
+    bool PanelsPinned() const { return inspectorPinned_; }
+    // `quiet`: a restore (leaving the clean feed), not a user asking for the panels.
+    void SetPanelsPinned(bool on, bool quiet = false) {
+        inspectorPinned_ = on;
+        if (on && !quiet) WarnPanelsDontFit();
+    }
+    // The window is big enough for the full UI (panels, scopes, rig history). Below that
+    // the pin is remembered but nothing is drawn: two 280 pt panels plus a usable centre
+    // only crowd a small window. Full screen, or a bigger window, brings them back.
+    static constexpr float kPanelsMinW = 1000.0f;  // design units (pt at 100%)
+    static constexpr float kPanelsMinH = 600.0f;
+    bool PanelsFit() const { return panelsFit_; }
+    // What is on screen: pinned AND room for it. App's UI state follows this, not the pin.
+    bool PanelsShown() const { return inspectorPinned_ && panelsFit_; }
+    bool ProbeOn() const { return probeOn_; }
+    bool KeepHudAwake() const { return PanelsShown() || depthOverlay_ || OverlaysOn() || scopesOn_; }
 
     ViewMode Mode() const { return mode_; }
     // The monitoring station: inputs, timecode / delay, rig checks, snapshots (Station.h).
@@ -180,6 +243,17 @@ private:
     void SetWipe(Wipe w, bool announce);
     void BuildOverlays(const Status& st, float uiAlpha);
     void BuildOverlaySection();
+    void BuildHdrControls();  // Inspector > Color: the HDR tone map (#134)
+    // Inspector > Color > OpenColorIO: pick a config (the built-in ACES ones or a show's
+    // .ocio), the input colour space, display and view, then bake it as the look (LoadOcio).
+    void BuildOcioControls();
+    void OpenOcioConfigDialog();
+    void DescribeOcioConfig();  // fills ocioInfo_ for ocioUiConfig_ and picks the defaults
+    std::string ocioUiConfig_ = "ocio://studio-config-latest";
+    std::string ocioInfoFor_;  // the config ocioInfo_ describes ("" = not described yet)
+    std::string ocioInfoError_;
+    ocio::ConfigInfo ocioInfo_;
+    int ocioSrc_ = 0, ocioDisplay_ = 0, ocioView_ = 0;
     void BuildMonitoringSection(const Status& st);
     void BuildScopesPanel(float alpha, float W, float H, float panelW);
     void BuildPixelProbe(const Status& st);
@@ -219,23 +293,67 @@ private:
     LookLoader looks_;             // parses / bakes LUTs off the render thread
     std::string lutLoading_;       // source of the look being built ('' = none)
     std::string lutError_;         // why the last look failed ('' = it did not)
+    // #134: an OCIO look on scene-linear EXR is baked for PQ-coded linear input. The request
+    // is kept so a change of source (EXR <-> other) re-bakes it the other way.
+    ocio::Request ocioReq_;
+    bool ocioBakePqInput_ = false;  // the bake in flight was for PQ-coded linear input
+    bool lutIsOcio_ = false;        // the LUT on the GPU is an OCIO bake ...
+    bool lutPqShaper_ = false;      // ... baked for PQ-coded linear input
+    bool SourceIsSceneLinear() const;
+
+    // Display calibration (#133): per panel, after the grade and QC views. Not part of the
+    // show grade, so G (bypass all) leaves it on; Shift+G bypasses it.
+    LookLoader calLoader_;         // its own loader: a look load must not supersede it
+    bool calResolved_ = false;     // the panel key was looked up (first Tick)
+    std::string calKey_;           // this panel's key (pro/DisplayCalibration.h)
+    bool calKeyFromRuntime_ = false;  // the runtime's stable key (display_info v24), not the device name
+    int calCheckTicks_ = 0;        // frames since the panel was last looked up
+    std::string calPath_, calName_;
+    std::string calLoading_, calError_;
+    uint64_t calLoadId_ = 0;       // the load still wanted; another finishing is dropped
+    bool calInstall_ = false;      // the pending load is kept for this panel once it applies
+    bool calLoaded_ = false;       // a calibration LUT is on the GPU
+    bool calKept_ = false;         // ...and it is the panel's kept file (not run-only, #169)
+    bool calBypass_ = false;       // Shift+G / the Inspector / set_display_calibration
+    void ResolveCalibration();     // find this panel's key; auto-load its installed file
+    void TickCalibration();        // apply a calibration the loader finished
+    std::string CalibrationLabel() const;
+
+    // Target screen (#135): off by default. With one set, the rig check reports depth in
+    // its terms and alerts on background divergence; with the preview on (the default once
+    // a target is chosen), the picture is shown at the angular size it has there.
+    target::Screen target_;
+    bool targetPreview_ = true;
+    bool targetDirty_ = false;     // push target_ / targetPreview_ to the app + station
+    float customTargetW_ = 3.0f, customTargetD_ = 4.0f;
+    void ApplyTarget();
+    void PushTargetToStation();  // target_ and how the picture is shown, for its figures and alerts
 
     // File dialog result (SDL may call back on another thread).
     std::mutex dialogMutex_;
     std::string dialogPath_;
     bool dialogIsCdl_ = false;
     bool dialogIsCompare_ = false;  // the "Load B..." dialog (the clip wipe's compare clip)
+    bool dialogIsCal_ = false;      // the display calibration dialog (#133)
+    bool dialogIsOcio_ = false;     // an OpenColorIO config (.ocio) for the OCIO picker
     bool dialogReady_ = false;
     bool dialogOpen_ = false;
     bool pendingDialogIsCdl_ = false;
     bool pendingDialogIsCompare_ = false;
+    bool pendingDialogIsCal_ = false;
+    bool pendingDialogIsOcio_ = false;
     void OpenCompareDialog();
+    void OpenCalibrationDialog();
 
     bool inspectorPinned_ = false;  // Tab / the Pin box: panels stay up; unpinned they follow the UI fade
+    bool panelsFit_ = true;         // last frame's window had room for the panels (kPanelsMinW/H)
+    void WarnPanelsDontFit() {
+        if (!panelsFit_ && host_.toast) host_.toast("Window too small for the panels - F11 for full screen");
+    }
     std::vector<FlatRect> flatRects_;
     bool flatAvailable_ = false;    // the runtime takes Local2D layers (XR_DXR_local_3d_zone)
     bool flatPanels_ = true;        // MEDIAPLAYER_PRO_PANELS_3D=1 keeps pinned panels woven
-    bool FlatNow() const { return flatAvailable_ && flatPanels_ && inspectorPinned_; }
+    bool FlatNow() const { return flatAvailable_ && flatPanels_ && PanelsShown(); }
     void AddFlatRectOfCurrentWindow();
     Station station_;
     bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture

@@ -14,7 +14,9 @@
 #include "media/LiveProducer.h"
 #include "media/StereoTypes.h"
 #include "pro/DeckLinkSource.h"
+#include "pro/QcExporter.h"
 #include "pro/RigCheck.h"
+#include "pro/TargetScreen.h"
 #include "pro/TestSignalSource.h"
 
 #include <functional>
@@ -72,7 +74,10 @@ public:
     bool TakeSnapshot(const std::string& note);
     // The session's QC report (#137): report.html + markers.edl + markers.csv in a new
     // Pictures/DisplayXR/qc_<stamp>/ folder. `untimed` = rows with no timecode (not in the EDL).
+    // The session is gathered here; thumbnails and files are written on the QC exporter's
+    // thread, report.html last. True = queued, `dir` = where it goes; Tick() reports the end.
     bool ExportQcReport(std::string& dir, std::string& error, int* untimed = nullptr);
+    bool QcExportBusy() const { return qcExport_.Busy(); }
     // The rig checks as JSON (get_rig_status; also in the Resolve panel's status file).
     std::string RigStatusJson() const;
     // Where snapshots, notes, alerts and the Resolve link files live (Pictures/DisplayXR).
@@ -101,6 +106,20 @@ public:
     // The live signal's frame rate (rounded), written with every timecode (notes, alerts,
     // the Resolve link) so a 50p timecode can be placed on a 25p timeline. 0 = unknown.
     void SetSignalFps(float fps) { signalFps_ = fps > 1.0f ? (int)(fps + 0.5f) : 0; }
+    void SetRigBudget(const rig::Budget& b) { rig_.SetBudget(b); }
+    // #135: the target screen the depth is judged for (off = this panel only), and the
+    // preview scale the picture is shown at. get_rig_status and snapshot notes report the
+    // depth in its terms too.
+    // parallaxOffsetPct: what convergence adds to the shown parallax, in % of the width; the
+    // target-screen figures and the divergence alert include it.
+    void SetTarget(const target::Screen& t, float pictureScale, float viewerDistanceM = 0.0f,
+                   float parallaxOffsetPct = 0.0f) {
+        target_ = t;
+        pictureScale_ = pictureScale;
+        viewerDistanceM_ = viewerDistanceM;
+        parallaxOffsetPct_ = parallaxOffsetPct;
+        rig_.SetTargetParallaxOffset(parallaxOffsetPct);
+    }
     int SignalFps() const { return signalFps_; }
     double DelayMs() const { return delayMs_; }
 
@@ -110,6 +129,7 @@ private:
     // The newest pixel-measured eye sync of the last 2 s (-1 none); lateEye +1 right, -1 left.
     int MeasuredEyeSync(int* lateEye) const;
     void SaveNote(size_t i);
+    void TickQcExport();  // finished QC reports: log + toast
 
     StationHost host_;
     StationOptions opt_;
@@ -140,9 +160,14 @@ private:
     bool OpenDeckLinkSpec(const std::string& spec);
     int testFrames_ = 0, testSnapshotFrame_ = -1, testQcExportFrame_ = -1;
     std::string timecode_;
+    target::Screen target_;
+    float pictureScale_ = 1.0f;
+    float viewerDistanceM_ = 0.0f;
+    float parallaxOffsetPct_ = 0.0f;
     int signalFps_ = 0;
     double delayMs_ = 0.0;
     double alertsLoggedUntil_ = 0.0;
+    QcExporter qcExport_;  // QC report thumbnails + file writes, off the render thread
     uintmax_t alertsOffset_ = 0;              // station_alerts.jsonl size when the session began
     std::string sessionClock_, sessionDate_;  // HH:MM:SS / YYYYMMDD the session began
     bool shutDown_ = false;  // App::Shutdown() and ~Station() both call Shutdown(): flush once
@@ -155,6 +180,8 @@ private:
         int eyeSync = -1;          // frames between the paired inputs (-1 unknown)
         char note[160] = {0};
         rig::Result rig;
+        target::Screen target;  // #135: the target screen when it was taken
+        float pictureScale = 1.0f, parallaxOffsetPct = 0.0f;  // and how the picture was shown
     };
     std::vector<Snapshot> snapshots_;
 };

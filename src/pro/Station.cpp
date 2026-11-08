@@ -6,6 +6,7 @@
 #include "pro/QcReport.h"
 #include "pro/Thumbnail.h"
 #include "stb_image_write.h"  // implementation compiled in src/rhi/VulkanRenderer.cpp
+#include "ui/UiScale.h"
 
 #include <nlohmann/json.hpp>
 #include <SDL3/SDL.h>
@@ -15,8 +16,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include "imgui.h"
@@ -24,7 +27,13 @@
 
 namespace mp::pro {
 
+using ui::Px;
+
 namespace {
+
+// How long after a snapshot the runtime is given to write its capture file: Tick() stops
+// looking for it then, and a QC export waits for it at most until then (#169).
+constexpr double kCaptureWaitS = 5.0;
 
 // "decklink:<dev>[+<right>][,sdi|hdmi][,dual|sbs|mono][,mode=Hp25]"
 bool ParseDeckLinkSpec(const std::string& args, DeckLinkConfig& c) {
@@ -202,6 +211,7 @@ void Station::Tick() {
         std::string dir, e;
         if (!ExportQcReport(dir, e)) LOG_WARN("Station: QC report failed: %s", e.c_str());
     }
+    TickQcExport();
     if (pendingSnapshot_) {
         pendingSnapshot_ = false;
         TakeSnapshot(pendingSnapshotNote_);
@@ -211,22 +221,16 @@ void Station::Tick() {
     for (size_t i = 0; i < snapshots_.size(); ++i) {
         Snapshot& s = snapshots_[i];
         if (s.imageFound || s.prefix.empty()) continue;
-        if (LiveProducer::NowSeconds() - s.takenSec > 5.0) {
+        if (LiveProducer::NowSeconds() - s.takenSec > kCaptureWaitS) {
             s.imageFound = true;  // give up; the note keeps the guess
             continue;
         }
         if (testFrames_ % 15 != 0) continue;
-        const std::filesystem::path pre(s.prefix);
-        const std::string stem = pre.filename().string() + "_atlas";
-        std::error_code ec;
-        for (const auto& de : std::filesystem::directory_iterator(pre.parent_path(), ec)) {
-            const std::string f = de.path().filename().string();
-            if (f.rfind(stem, 0) == 0 && de.path().extension() == ".png") {
-                s.image = de.path().string();
-                s.imageFound = true;
-                SaveNote(i);
-                break;
-            }
+        const std::string found = qcfiles::FindAtlasCapture(s.prefix);
+        if (!found.empty()) {
+            s.image = found;
+            s.imageFound = true;
+            SaveNote(i);
         }
     }
     if (!pendingDeckLinkSpec_.empty()) {
@@ -293,11 +297,41 @@ int Station::MeasuredEyeSync(int* lateEye) const {
     return -1;
 }
 
+// #135: near / far in the target screen's terms: physical parallax, angular disparity at
+// the viewing distance, and how far the eyes diverge on the background. For the picture as
+// shown: the measured parallax plus what convergence adds (parallaxOffsetPct).
+static nlohmann::json TargetJson(const target::Screen& t, float scale, const rig::Result& r, float parallaxOffsetPct) {
+    nlohmann::json j = {{"name", t.name}, {"width_m", t.widthM}, {"distance_m", t.distanceM},
+                        {"picture_scale", scale}, {"divergence_limit_pct", target::DivergenceLimitPct(t)},
+                        {"parallax_offset_pct", parallaxOffsetPct}};
+    if (r.ok) {
+        const target::Depth n = target::AtParallax(t, r.nearPct + parallaxOffsetPct),
+                            f = target::AtParallax(t, r.farPct + parallaxOffsetPct);
+        j["near_mm"] = n.mm;
+        j["near_arcmin"] = n.arcmin;
+        j["far_mm"] = f.mm;
+        j["far_arcmin"] = f.arcmin;
+        j["divergence_deg"] = f.divergenceDeg;
+    }
+    return j;
+}
+
 bool Station::TakeSnapshot(const std::string& note) {
     char stamp[32];
     const std::string clock = Clock(stamp, sizeof(stamp));
     if (!host_.capturePrefix || !host_.captureAtlas) return false;
-    const std::string prefix = host_.capturePrefix(std::string("pro_") + stamp);
+    // Two snapshots in the same second: the second is pro_<stamp>-2, not an overwrite (#169).
+    const std::string name = qcfiles::UniqueName(std::string("pro_") + stamp, [&](const std::string& n) {
+        const std::string p = host_.capturePrefix(n);
+        for (const Snapshot& o : snapshots_)
+            if (o.prefix == p) return true;
+        return qcfiles::PrefixInUse(p);
+    });
+    if (name.empty()) {
+        if (host_.toast) host_.toast("Snapshot: too many in one second");
+        return false;
+    }
+    const std::string prefix = host_.capturePrefix(name);
     if (!host_.captureAtlas(prefix)) {
         if (host_.toast) host_.toast("Snapshot: the runtime cannot capture (no atlas capture)");
         return false;
@@ -311,6 +345,9 @@ bool Station::TakeSnapshot(const std::string& note) {
     s.tcFps = signalFps_;
     s.clock = clock;
     s.rig = rig_.Last();
+    s.target = target_;
+    s.pictureScale = pictureScale_;
+    s.parallaxOffsetPct = parallaxOffsetPct_;
     {
         const std::vector<rig::Sample> h = rig_.History(1.0);
         s.eyeSync = h.empty() ? -1 : h.back().eyeOffsetFrames;
@@ -342,6 +379,7 @@ void Station::SaveNote(size_t i) {
     }
     if (s.eyeSync >= 0) j["eye_sync_frames"] = s.eyeSync;
     if (s.rig.eyeSyncMeasuredFrames >= 0) j["eye_sync_measured_frames"] = s.rig.eyeSyncMeasuredFrames;
+    if (s.target.On()) j["target"] = TargetJson(s.target, s.pictureScale, s.rig, s.parallaxOffsetPct);
     const rig::Budget b = rig_.GetBudget();
     j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"edge_pct", b.edgePct}};
     std::ofstream(s.notePath) << j.dump(2) << "\n";
@@ -388,6 +426,7 @@ std::string IsoDate(const char* stamp) {  // "YYYYMMDD..." -> "YYYY-MM-DD"
 }  // namespace
 
 bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untimed) {
+    const double t0 = LiveProducer::NowSeconds();
     LogNewAlerts();  // closed episodes reach the log first
     const std::string folder = Folder();
     if (folder.empty()) {
@@ -443,10 +482,21 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
     }
     // in the order they started (the log has the closed ones first)
     std::stable_sort(s.alerts.begin(), s.alerts.end(), [](const qc::Alert& x, const qc::Alert& y) { return x.clock < y.clock; });
+    // #169: a snapshot still inside its capture window (the runtime writes the file some
+    // frames after the request, and Tick() only looks every 15 frames) may not be on disk
+    // yet, or only partly. The job waits for those, up to the same 5 s Tick() gives them.
+    struct Pending {
+        size_t index;
+        std::string prefix;
+        double deadline;  // LiveProducer::NowSeconds
+    };
+    std::vector<Pending> pending;
     for (const Snapshot& sn : snapshots_) {
+        if (!sn.prefix.empty() && LiveProducer::NowSeconds() - sn.takenSec <= kCaptureWaitS)
+            pending.push_back({s.snapshots.size(), sn.imageFound ? std::string() : sn.prefix,
+                               sn.takenSec + kCaptureWaitS});
         qc::Snapshot q;
-        q.image = sn.image;
-        q.thumbJpeg = ReportThumbnail(sn.image, 1280);
+        q.image = sn.image;  // its thumbnail is made on the exporter's thread
         q.note = sn.note;
         q.timecode = sn.timecode;
         q.clock = sn.clock;
@@ -464,24 +514,72 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
         }
         s.snapshots.push_back(q);
     }
-    const std::filesystem::path dir = std::filesystem::path(folder) / (std::string("qc_") + stamp);
+    // #169: qc_<stamp>, or qc_<stamp>-2, -3... when an export in the same second has it.
+    std::filesystem::path dir;
     std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    auto write = [&](const char* name, const std::string& text) {
-        std::ofstream f((dir / name).string(), std::ios::binary);
-        f << text;
-        return (bool)f;
-    };
-    if (ec || !write("report.html", qc::MakeHtml(s)) || !write("markers.edl", qc::MakeEdl(s)) ||
-        !write("markers.csv", qc::MakeCsv(s))) {
-        error = "cannot write " + dir.string();
+    if (!qcfiles::CreateUniqueDir(std::filesystem::u8path(folder), std::string("qc_") + stamp, dir, ec)) {
+        error = "cannot write " + (std::filesystem::u8path(folder) / (std::string("qc_") + stamp)).u8string() +
+                ": " + ec.message();
         return false;
     }
     dirOut = dir.string();
     if (untimed) *untimed = qc::RowsWithoutTimecode(s);
-    LOG_INFO("Station: QC report (%zu alerts, %zu snapshots) -> %s", s.alerts.size(), s.snapshots.size(),
-             dirOut.c_str());
+    // Decoding each snapshot's full SBS capture for its thumbnail took a second or more with
+    // a few 8K snapshots, so the rest runs on the exporter's thread. The job owns its copy
+    // of the session (no reference to the station).
+    LOG_INFO("Station: QC report (%zu alerts, %zu snapshots) gathered in %.1f ms, writing -> %s",
+             s.alerts.size(), s.snapshots.size(), (LiveProducer::NowSeconds() - t0) * 1000.0, dirOut.c_str());
+    qcExport_.Submit([s = std::move(s), dir, pending = std::move(pending)]() mutable {
+        QcExporter::Result r;
+        r.dir = dir.string();
+        r.alerts = s.alerts.size();
+        r.snapshots = s.snapshots.size();
+        for (qc::Snapshot& q : s.snapshots) q.thumbJpeg = ReportThumbnail(q.image, 1280);
+        // Snapshots the runtime may still be writing: wait for the file (an unfound one's
+        // name is only a guess) and retry the decode (a half-written PNG does not decode).
+        for (const Pending& p : pending) {
+            qc::Snapshot& q = s.snapshots[p.index];
+            while (q.thumbJpeg.empty() && LiveProducer::NowSeconds() < p.deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                if (!p.prefix.empty()) {
+                    const std::string found = qcfiles::FindAtlasCapture(p.prefix);
+                    if (!found.empty()) q.image = found;
+                }
+                q.thumbJpeg = ReportThumbnail(q.image, 1280);
+            }
+        }
+        auto write = [&](const std::filesystem::path& path, const std::string& text) {
+            std::ofstream f(path.string(), std::ios::binary);
+            f << text;
+            f.close();  // a full disk only shows here, when the buffer is written
+            return !f.fail();
+        };
+        // report.html last, through a rename: once it exists the report is complete.
+        const std::filesystem::path html = dir / "report.html", part = dir / "report.html.part";
+        std::error_code rec;
+        if (!write(dir / "markers.edl", qc::MakeEdl(s)) || !write(dir / "markers.csv", qc::MakeCsv(s)) ||
+            !write(part, qc::MakeHtml(s)) || (std::filesystem::rename(part, html, rec), rec)) {
+            r.err = "cannot write " + dir.string();
+            return r;
+        }
+        r.ok = true;
+        return r;
+    });
     return true;
+}
+
+void Station::TickQcExport() {
+    QcExporter::Result r;
+    while (qcExport_.Take(r)) {
+        if (r.ok) {
+            LOG_INFO("Station: QC report written in %.0f ms (%zu alerts, %zu snapshots) -> %s", r.ms, r.alerts,
+                     r.snapshots, r.dir.c_str());
+            if (host_.toast) host_.toast("QC report: " + r.dir);
+        } else {
+            LOG_WARN("Station: QC report failed: %s", r.err.c_str());
+            if (host_.toast) host_.toast("QC report failed: " + r.err);
+        }
+    }
 }
 
 void Station::LogNewAlerts() {
@@ -528,21 +626,29 @@ std::string Station::RigStatusJson() const {
     out["eye_sync_measured_frames"] = MeasuredEyeSync(&late);  // from the pixels, -1 = not measured
     out["eye_sync_late_eye"] = late > 0 ? "right" : late < 0 ? "left" : "none";
     out["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
-                     {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}};
+                     {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}, {"divergence_far_pct", b.divergeFarPct}};
     json alerts = json::array();
     for (const rig::Alert& al : rig_.Alerts())
         alerts.push_back({{"what", al.what}, {"timecode", al.timecode}, {"time", al.wallClock}, {"open", al.end < 0}});
     out["alerts"] = alerts;
     out["timecode"] = timecode_;
     out["tc_fps"] = signalFps_;
+    out["target"] = target_.On() ? TargetJson(target_, pictureScale_, r, parallaxOffsetPct_) : nlohmann::json(nullptr);
+    if (target_.On() && viewerDistanceM_ > 0.0f) out["target"]["viewer_distance_m"] = viewerDistanceM_;
     out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
     if (decklink_.GetState() != LiveState::Closed) {
         // capture health (#141): the "Done when" of a two-input 4K60 run reads these
         const LiveStats ls = decklink_.GetStats();
         json dl = {{"delivered_fps", ls.deliveredFps}, {"signal_fps", ls.fps}, {"published", ls.published},
-                   {"late_frames", ls.lateFrames}, {"dropped", ls.dropped}};
+                   {"late_frames", ls.lateFrames}, {"dropped", ls.dropped},
+                   {"width", ls.w}, {"height", ls.h}, {"bit_depth", DeckLinkSource::LastBitDepth()},
+                   {"eye_width", decklink_.IsPair() ? ls.w / 2 : ls.w},  // a pair is shown side by side
+                   // failed = capture stopped (e.g. a format the card would not restart in, #169)
+                   {"state", LiveStateName(decklink_.GetState())}, {"error", decklink_.LastError()},
+                   {"format_warning", decklink_.FormatWarning()}};
         if (decklink_.IsPair()) {
             const DeckLinkSource::PairStats ps = decklink_.GetPairStats();
+            dl["pairing"] = ps.timecode ? "timecode" : ps.hwClockPairing ? "hardware_clock" : "newest";
             dl["pairs"] = ps.pairs;
             dl["unpaired"] = ps.unpaired;
             dl["max_skew_ms"] = ps.maxAbsSkewMs;
@@ -629,7 +735,8 @@ bool Station::DispatchTool(const std::string& tool, const std::string& argsJson,
                       {"report", (d / "report.html").string()},
                       {"markers_edl", (d / "markers.edl").string()},
                       {"markers_csv", (d / "markers.csv").string()},
-                      {"rows_without_timecode", untimed}}.dump();
+                      {"rows_without_timecode", untimed},
+                      {"writing", true}}.dump();
         return true;
     }
     if (tool == "list_inputs") {
@@ -692,7 +799,10 @@ void Station::BuildInputsSection(const std::string& liveName, bool live) {
     if (ImGui::SmallButton("DeckLink setup...")) OpenDeckLinkDialog();
     if (inputs_.empty()) {
         ImGui::TextDisabled("%s", live ? liveName.c_str() : "No inputs configured.");
-        ImGui::TextDisabled("--input=\"Rig=decklink:0+1,sdi\"  --test-signal");
+        // An example command line: wrap it rather than clip it at the panel edge.
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("--input=\"Rig=decklink:0+1,sdi\"  --test-signal");
+        ImGui::PopStyleColor();
         if (!DeckLinkSource::Available()) ImGui::TextDisabled("(this build has no DeckLink SDK)");
         return;
     }
@@ -753,7 +863,7 @@ void Station::BuildDeckLinkDialog() {
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.42f), ImGuiCond_Appearing,
                             ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(std::clamp(io.DisplaySize.x * 0.30f, 380.0f, 520.0f), 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(std::clamp(io.DisplaySize.x * 0.30f, Px(380.0f), Px(520.0f)), 0.0f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.95f);
     if (!ImGui::Begin("DeckLink input setup", &dlgOpen_, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
@@ -839,6 +949,9 @@ void Station::BuildSignalLines(bool live) {
         const int dark = decklink_.GetStats().noSignalEyes;
         if (dark & 1) ImGui::TextColored(kBad, decklink_.IsPair() ? "Left eye: NO SIGNAL" : "NO SIGNAL");
         if (dark & 2) ImGui::TextColored(kBad, "Right eye: NO SIGNAL");
+        if (decklink_.GetState() == LiveState::Failed) ImGui::TextColored(kBad, "%s", decklink_.LastError().c_str());
+        const std::string fw = decklink_.FormatWarning();  // depth lost to the format the card took (#169)
+        if (!fw.empty()) ImGui::TextColored(kWarn, "%s", fw.c_str());
         const uint64_t late = decklink_.GetStats().lateFrames;
         if (late) ImGui::TextColored(kWarn, "Capture late: %llu frames skipped (CPU too slow to convert)",
                                      (unsigned long long)late);
@@ -944,13 +1057,10 @@ void Station::BuildSnapshotsSection() {
     if (!ImGui::CollapsingHeader(head, ImGuiTreeNodeFlags_DefaultOpen)) return;
     if (ImGui::Button("Snapshot")) TakeSnapshot("");
     ImGui::SameLine();
-    if (ImGui::Button("Export QC report")) {
+    if (ImGui::Button(QcExportBusy() ? "Writing QC report...###qc" : "Export QC report###qc")) {
         std::string dir, e;
-        if (ExportQcReport(dir, e)) {
-            if (host_.toast) host_.toast("QC report: " + dir);
-        } else if (host_.toast) {
-            host_.toast("QC report failed: " + e);
-        }
+        if (!ExportQcReport(dir, e) && host_.toast) host_.toast("QC report failed: " + e);
+        // success is toasted by TickQcExport once the files are written
     }
     for (size_t k = snapshots_.size(); k-- > 0;) {
         Snapshot& s = snapshots_[k];
@@ -974,9 +1084,15 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
     // Between the two panels (ProController's panel width), along the bottom.
-    const float panelW = std::clamp(W * 0.24f, 280.0f, 440.0f);
-    ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.86f), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
-    ImGui::SetNextWindowSize(ImVec2(std::max(200.0f, W - 2.0f * panelW - 48.0f), H * 0.15f), ImGuiCond_Always);
+    const float panelW = std::clamp(W * 0.24f, Px(280.0f), Px(440.0f));
+    float bottom = H * 0.86f;
+    if (ui::g_bottomUiTop > 0.0f) bottom = std::min(bottom, ui::g_bottomUiTop - Px(8.0f));  // above strip + status
+    ImGui::SetNextWindowPos(ImVec2(W * 0.5f, bottom), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+    // Two graph rows of at least two text lines each plus the tick row: below that the row
+    // labels and tick labels print over each other (a small window's 15% is ~65 pt).
+    const float minH = ImGui::GetTextLineHeight() * 5.0f + ImGui::GetStyle().WindowPadding.y * 2.0f + Px(8.0f);
+    ImGui::SetNextWindowSize(ImVec2(std::max(Px(200.0f), W - 2.0f * panelW - Px(48.0f)), std::max(H * 0.15f, minH)),
+                             ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(flat ? 1.0f : 0.72f);
     if (flat) ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     const ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
@@ -987,7 +1103,8 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         const ImVec2 avail = ImGui::GetContentRegionAvail();
-        const float labelW = avail.x * 0.14f;
+        // Never narrower than the longest row label, or "Vertical" runs into its graph.
+        const float labelW = std::max(avail.x * 0.14f, ImGui::CalcTextSize("Vertical").x + Px(12.0f));
         const float x0 = p0.x + labelW, x1 = p0.x + avail.x;
         const float rowH = (avail.y - ImGui::GetTextLineHeight()) * 0.5f;
         const double now = hist.back().t;
@@ -999,7 +1116,7 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
         const ImU32 dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
         // depth band (near..far) against the budget
         {
-            const float y0 = p0.y, y1 = p0.y + rowH - 4.0f;
+            const float y0 = p0.y, y1 = p0.y + rowH - Px(4.0f);
             dl->AddText(ImVec2(p0.x, y0 + rowH * 0.3f), dim, "Depth");
             dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), grid);
             float lo = std::min(b.nearPct, -0.5f) - 0.6f, hi = std::max(b.farPct, 0.5f) + 0.6f;
@@ -1010,7 +1127,7 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
                 }
             auto Y = [&](float pct) { return y1 - (pct - lo) / (hi - lo) * (y1 - y0); };
             for (float lim : {b.nearPct, b.farPct})
-                for (float x = x0; x < x1; x += 10.0f) dl->AddLine(ImVec2(x, Y(lim)), ImVec2(std::min(x + 5.0f, x1), Y(lim)), limit, 1.5f);
+                for (float x = x0; x < x1; x += Px(10.0f)) dl->AddLine(ImVec2(x, Y(lim)), ImVec2(std::min(x + Px(5.0f), x1), Y(lim)), limit, Px(1.5f));
             dl->AddLine(ImVec2(x0, Y(0.0f)), ImVec2(x1, Y(0.0f)), grid);
             for (size_t i = 1; i < hist.size(); ++i) {
                 const rig::Sample& a = hist[i - 1];
@@ -1019,13 +1136,13 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
                 dl->AddQuadFilled(ImVec2(X(a.t), Y(a.nearPct)), ImVec2(X(c.t), Y(c.nearPct)), ImVec2(X(c.t), Y(c.farPct)),
                                   ImVec2(X(a.t), Y(a.farPct)), band);
                 const bool over = c.nearPct < b.nearPct || c.farPct > b.farPct;
-                dl->AddLine(ImVec2(X(a.t), Y(a.nearPct)), ImVec2(X(c.t), Y(c.nearPct)), over ? limit : line, 2.0f);
-                dl->AddLine(ImVec2(X(a.t), Y(a.farPct)), ImVec2(X(c.t), Y(c.farPct)), line, 1.5f);
+                dl->AddLine(ImVec2(X(a.t), Y(a.nearPct)), ImVec2(X(c.t), Y(c.nearPct)), over ? limit : line, Px(2.0f));
+                dl->AddLine(ImVec2(X(a.t), Y(a.farPct)), ImVec2(X(c.t), Y(c.farPct)), line, Px(1.5f));
             }
         }
         // vertical error
         {
-            const float y0 = p0.y + rowH, y1 = p0.y + 2.0f * rowH - 4.0f;
+            const float y0 = p0.y + rowH, y1 = p0.y + 2.0f * rowH - Px(4.0f);
             dl->AddText(ImVec2(p0.x, y0 + rowH * 0.3f), dim, "Vertical");
             dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), grid);
             // Scale to the larger of twice the limit and the worst sample, so an error past
@@ -1035,17 +1152,20 @@ bool Station::BuildHistoryStrip(float alpha, bool stereo, bool flat, float* rx, 
                 if (s.ok) range = std::max(range, std::fabs(s.verticalPx) * 1.25f);
             auto Y = [&](float px) { return (y0 + y1) * 0.5f - std::clamp(px / range, -1.0f, 1.0f) * (y1 - y0) * 0.5f; };
             for (float lim : {b.maxVerticalPx, -b.maxVerticalPx})
-                for (float x = x0; x < x1; x += 10.0f) dl->AddLine(ImVec2(x, Y(lim)), ImVec2(std::min(x + 5.0f, x1), Y(lim)), limit, 1.0f);
+                for (float x = x0; x < x1; x += Px(10.0f)) dl->AddLine(ImVec2(x, Y(lim)), ImVec2(std::min(x + Px(5.0f), x1), Y(lim)), limit, Px(1.0f));
             for (size_t i = 1; i < hist.size(); ++i) {
                 const rig::Sample& a = hist[i - 1];
                 const rig::Sample& c = hist[i];
                 if (!a.ok || !c.ok || c.t - a.t > 2.0) continue;
                 dl->AddLine(ImVec2(X(a.t), Y(a.verticalPx)), ImVec2(X(c.t), Y(c.verticalPx)),
-                            std::fabs(c.verticalPx) > b.maxVerticalPx ? limit : ImGui::GetColorU32(kOk), 2.0f);
+                            std::fabs(c.verticalPx) > b.maxVerticalPx ? limit : ImGui::GetColorU32(kOk), Px(2.0f));
             }
         }
         const char* ticks[] = {"-60 s", "-45 s", "-30 s", "-15 s", "now"};
+        // Keep only the ends when the quarter ticks would touch each other.
+        const bool allTicks = (x1 - x0) / 4.0f > ImGui::CalcTextSize("-60 s").x + Px(16.0f);
         for (int i = 0; i < 5; ++i) {
+            if (!allTicks && i != 0 && i != 4) continue;
             const float x = x0 + (x1 - x0) * (float)i / 4.0f;
             const ImVec2 ts = ImGui::CalcTextSize(ticks[i]);
             dl->AddText(ImVec2(std::min(x - ts.x * 0.5f, x1 - ts.x), p0.y + 2.0f * rowH), dim, ticks[i]);

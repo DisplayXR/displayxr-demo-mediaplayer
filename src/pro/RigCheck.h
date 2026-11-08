@@ -166,6 +166,13 @@ struct Budget {
     float maxVerticalPx = 1.0f;
     float maxDeltaE = 2.0f;
     float edgePct = -0.3f;  // nearest parallax allowed at the left / right frame edge
+    // #135: > 0 = the far parallax at which the TARGET screen's background diverges past
+    // the cap (target::DivergenceLimitPct); 0 = no target screen, no divergence alert.
+    float divergeFarPct = 0.0f;
+    // #135: the target screen the alerts also quote their depth for ("[-201 mm, -58' on
+    // Cinema]"); width 0 = none.
+    std::string targetName;
+    float targetWidthM = 0.0f, targetDistanceM = 0.0f;
 };
 
 struct Sample {
@@ -204,6 +211,9 @@ public:
     void AddSample(const Sample& s, const std::string& timecode);
     void SetBudget(const Budget& b);
     Budget GetBudget() const;
+    // What convergence adds to the shown parallax (% of width). The measurements stay the
+    // source's; the target-screen figures and the divergence alert are for the picture as shown.
+    void SetTargetParallaxOffset(float pct);
     void Reset();
     // Snapshot for the UI / tools.
     Result Last() const;
@@ -241,9 +251,10 @@ private:
     uint64_t syncGen_ = 0;
     StereoLayout pendingLayout_ = StereoLayout::SbsFull;
     bool pendingSwap_ = false;
+    float targetParallaxOffsetPct_ = 0.0f;
     uint64_t generation_ = 0;  // bumped by Reset: a measurement started before it is dropped
-    // open alert runs: near, far, vertical, colour, left edge, right edge
-    static constexpr int kRuns = 6;
+    // open alert runs: near, far, vertical, colour, left edge, right edge, divergence (#135)
+    static constexpr int kRuns = 7;
     struct Run {
         double since = -1;
         float worst = 0;

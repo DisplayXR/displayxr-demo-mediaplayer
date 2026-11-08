@@ -124,6 +124,16 @@ struct TransportState {
     // reporting >= 1 candidate). convertProviderCurrent = the row shown as current.
     std::vector<ConvertProviderRow> convertProviders;
     int convertProviderCurrent = -1;
+    // Strip-only chrome (Pro's inspection UI): only a slim full-width transport strip on
+    // the bottom edge, no top bar. DEFAULT FALSE: every other leg draws exactly as before.
+    bool stripOnly = false;
+    // Pro: a "Panels" button on the transport (fires TogglePanels; drawn highlighted while
+    // panelsOn). DEFAULT FALSE: not drawn.
+    bool panelsButton = false;
+    bool panelsOn = false;
+    // Frames per second of the open video, 0 = unknown / not shown. When > 0 the transport
+    // also shows the current frame number. DEFAULT 0: only Pro sets it.
+    double frameRate = 0.0;
     // Input popup - only read when caps.input.
     std::vector<InputFamilyRow> inputFamilies;
     bool inputRemember = false;  // "Remember for this app": the next pick persists (per-app pin)
@@ -165,6 +175,7 @@ struct TransportActions {
     std::function<void()> TogglePlayback;
     std::function<void()> ToggleMute;
     std::function<void()> ToggleLoop;
+    std::function<void()> TogglePanels;  // Pro, used only when panelsButton
 
     // Scrub machine. Seek(preview=true) is a cheap keyframe seek for a fast
     // sweep; preview=false is the exact frame. ScrubHeld fires once when the
@@ -195,10 +206,14 @@ struct TransportActions {
 };
 
 // The player's "dark glass" look. `metricScale` is the ONE sanctioned divergence
-// between legs: 1.0 on desktop, ~1.6 on touch. It scales PADDING AND GRAB SIZES ONLY —
-// every colour, rounding radius and icon is identical on both, so the design is one
-// design. Never branch on it anywhere else.
+// between legs: 1.0 on desktop, ~1.6 on touch. It scales PADDING, GRAB SIZES AND THE
+// FONT SIZE (UiFontPx) ONLY: every colour, rounding radius and icon is identical on
+// both, so the design is one design. Never branch on it anywhere else.
 void ApplyMediaPlayerStyle(float metricScale = 1.0f);
+
+// The UI font size in HUD pixels for the same metricScale (desktop or touch), times the
+// UI scale (UiScale.h), rounded up. ImGuiLayer rasterizes the font at exactly this size.
+float UiFontPx(float metricScale = 1.0f);
 
 // Advance the purely-visual timers: the auto-hide fade and the toast fade.
 // `uiAwake` is the caller's "should the chrome be visible" verdict (master
