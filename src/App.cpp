@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1365,6 +1366,7 @@ void App::BuildTransportUI() {
         const VideoDecoder::StreamStats ss = video_.GetStreamStats();
         uiState_.streamFps = ss.fpsIn;
         uiState_.streamKbps = ss.kbps;
+        uiState_.streamQuality = StreamQualityLabel(ss);
         uiState_.mediaFilename.clear();
     }
 
@@ -2270,6 +2272,8 @@ bool App::LoadUrl(const std::string& url) {
         return false;
     }
     isStream_ = true;
+    // Test / headless: a fixed HLS / DASH rendition index from the start (#205).
+    if (const char* q = std::getenv("MEDIAPLAYER_STREAM_QUALITY")) video_.SetStreamQuality(std::atoi(q));
     autoConvWorker_.RequestReset();  // a new stream is a new scene
     streamPaused_ = false;
     streamUrl_ = url;
@@ -2329,6 +2333,25 @@ std::string App::StreamStatusText() const {
     return "FAILED";
 }
 
+namespace {
+// get_status / set_stream_quality: the HLS / DASH ladder, ascending bandwidth (#205).
+nlohmann::json RenditionsJson(const std::vector<VideoDecoder::StreamRung>& rungs) {
+    nlohmann::json a = nlohmann::json::array();
+    for (const VideoDecoder::StreamRung& r : rungs)
+        a.push_back({{"width", r.width}, {"height", r.height}, {"bandwidth", r.bandwidth}, {"codec", r.codec}});
+    return a;
+}
+}  // namespace
+
+std::string App::StreamQualityLabel(const VideoDecoder::StreamStats& ss) const {
+    if (ss.rungs < 2 || ss.rung < 0) return std::string();
+    const std::vector<VideoDecoder::StreamRung> rungs = video_.GetStreamRungs();
+    if (ss.rung >= (int)rungs.size()) return std::string();
+    std::string label = std::to_string(rungs[ss.rung].height) + "p";
+    if (video_.StreamQuality() < 0) label += " auto";
+    return label;
+}
+
 void App::PollStream() {
     if (!isStream_) return;
     using S = VideoDecoder::StreamState;
@@ -2368,10 +2391,13 @@ void App::PollStream() {
             if (streamLogAt_ > 0.0) {
                 const VideoDecoder::StreamStats ss = video_.GetStreamStats();
                 LOG_INFO("Stream: %s %dx%d in %.1f fps %.0f kbit/s, panel %.0f fps, frames=%llu "
-                         "dropped=%llu stalls=%llu reconnects=%d, %s",
+                         "dropped=%llu stalls=%llu reconnects=%d, rendition %d/%d (%s) switches=%d "
+                         "estimate %.0f kbit/s buffer %.1f s, %s",
                          host.c_str(), ss.width, ss.height, ss.fpsIn, ss.kbps, fps_,
                          (unsigned long long)ss.frames, (unsigned long long)ss.dropped,
-                         (unsigned long long)ss.stalls, ss.reconnects, LayoutLabel().c_str());
+                         (unsigned long long)ss.stalls, ss.reconnects, ss.rung, ss.rungs,
+                         video_.StreamQuality() < 0 ? "auto" : "manual", ss.switches, ss.estKbps,
+                         ss.bufferSec, LayoutLabel().c_str());
             }
             streamLogAt_ = now + 5.0;
         }
@@ -3626,6 +3652,17 @@ void App::SetupAgentTools() {
         "udp://127.0.0.1:5004.\"}},\"required\":[\"url\"]}");
 
     xr_.RegisterMcpTool(
+        "set_stream_quality",
+        "HLS / DASH streams only: pick the rendition (quality). 'auto' (the default for every "
+        "new URL) adapts to the measured network throughput; a rendition index (0 = lowest "
+        "bandwidth, see get_status stream_renditions) or a height such as '1080p' fixes it. "
+        "The change takes effect at the next segment boundary, without a gap in the picture. "
+        "Returns the setting and the rendition list.",
+        "{\"type\":\"object\",\"properties\":{\"quality\":{\"oneOf\":[{\"type\":\"string\"},"
+        "{\"type\":\"integer\",\"minimum\":0}],\"description\":\"'auto', a rendition index, "
+        "or a height like '720p'.\"}},\"required\":[\"quality\"]}");
+
+    xr_.RegisterMcpTool(
         "set_convert_3d",
         "Convert to 3D: have the runtime's 2D->3D conversion turn the current MONO picture "
         "(a 2D still, a mono video or live source, or anything pinned mono with set_layout) "
@@ -3998,6 +4035,14 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
             out["stream_frames"] = ss.frames;
             out["stream_dropped"] = ss.dropped;
             out["stream_stalls"] = ss.stalls;  // HLS / DASH: waits on the network (#197)
+            // HLS / DASH adaptive bitrate (#205).
+            out["stream_quality"] = video_.StreamQuality() < 0 ? nlohmann::json("auto")
+                                                               : nlohmann::json(video_.StreamQuality());
+            out["stream_rendition"] = ss.rung;
+            out["stream_renditions"] = RenditionsJson(video_.GetStreamRungs());
+            out["stream_switches"] = ss.switches;
+            out["stream_estimate_kbps"] = ss.estKbps;
+            out["stream_buffer_s"] = ss.bufferSec;
             out["stream_connect_ms"] = ss.connectMs;
             out["stream_codec"] = ss.codec;
             out["stream_backend"] = ss.backend;
@@ -4102,6 +4147,46 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         }
         out["camera"] = camera_.DeviceName();
         out["camera_state"] = CameraSource::StateName(camera_.GetState());
+        return out.dump();
+    }
+    if (tool == "set_stream_quality") {
+        if (!isStream_) {
+            success = false;
+            return "{\"error\":\"no stream is open\"}";
+        }
+        if (!args.contains("quality")) {
+            success = false;
+            return "{\"error\":\"missing required arg 'quality' ('auto', a rendition index or e.g. '720p')\"}";
+        }
+        const std::vector<VideoDecoder::StreamRung> rungs = video_.GetStreamRungs();
+        int q = -2;
+        const nlohmann::json& a = args["quality"];
+        if (a.is_number_integer()) {
+            q = a.get<int>();
+        } else if (a.is_string()) {
+            const std::string v = a.get<std::string>();
+            if (v == "auto") {
+                q = -1;
+            } else if (!v.empty() && (v.back() == 'p' || v.back() == 'P')) {
+                // "720p": the highest-bandwidth rendition of that height
+                const int h = std::atoi(v.c_str());
+                for (size_t i = 0; i < rungs.size(); ++i)
+                    if (rungs[i].height == h) q = (int)i;
+            } else if (!v.empty() && std::isdigit((unsigned char)v[0])) {
+                q = std::atoi(v.c_str());
+            }
+        }
+        if (q < -1 || q >= (int)rungs.size()) {
+            success = false;
+            out["error"] = rungs.empty() ? std::string("this stream has no renditions to choose from")
+                                         : std::string("no such rendition");
+            out["stream_renditions"] = RenditionsJson(video_.GetStreamRungs());
+            return out.dump();
+        }
+        video_.SetStreamQuality(q);
+        LOG_INFO("Stream: quality %s", q < 0 ? "auto" : StreamQualityLabel(video_.GetStreamStats()).c_str());
+        out["stream_quality"] = q < 0 ? nlohmann::json("auto") : nlohmann::json(q);
+        out["stream_renditions"] = RenditionsJson(video_.GetStreamRungs());
         return out.dump();
     }
     if (tool == "open_url") {

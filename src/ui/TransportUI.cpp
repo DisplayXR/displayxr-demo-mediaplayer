@@ -394,9 +394,10 @@ void LivePill(const TransportState& s, const TransportActions& a) {
 void StreamPill(const TransportState& s, const TransportActions& a) {
     char text[192];
     if (s.streamStatus == "STREAM" || s.streamStatus == "FROZEN") {
-        std::snprintf(text, sizeof(text), "%s  %s  \xC2\xB7  %.0f fps  \xC2\xB7  %.1f Mbit/s",
+        std::snprintf(text, sizeof(text), "%s  %s  \xC2\xB7  %.0f fps  \xC2\xB7  %.1f Mbit/s%s%s",
                       s.streamStatus.c_str(), s.streamHost.c_str(), s.streamFps,
-                      s.streamKbps / 1000.0f);
+                      s.streamKbps / 1000.0f, s.streamQuality.empty() ? "" : "  \xC2\xB7  ",
+                      s.streamQuality.c_str());
     } else {
         std::snprintf(text, sizeof(text), "%s  %s", s.streamStatus.c_str(), s.streamHost.c_str());
     }

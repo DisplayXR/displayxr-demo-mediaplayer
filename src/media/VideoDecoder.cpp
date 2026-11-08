@@ -193,6 +193,7 @@ struct VideoDecoder::Impl {
     HwFormatHook hook;                          // ctx->opaque for the get_format callback
     int videoStream = -1;
     SegmentIoHook segIo;                        // DASH live segment retry (#197)
+    AVCodecParameters* switchPar = nullptr;     // ABR (#205): the new rendition's parameters
     int swsW = 0, swsH = 0, swsFmt = -1;        // cached sws source params (fallback)
     // Pro float (EXR) path: -> GBRPF32 (when needed), then sRGB-encoded BT.709 P016.
     SwsContext* swsF = nullptr;
@@ -250,6 +251,7 @@ struct VideoDecoder::Impl {
         if (swFrame) av_frame_free(&swFrame);
         if (convFrame) av_frame_free(&convFrame);
         if (codec) avcodec_free_context(&codec);
+        if (switchPar) avcodec_parameters_free(&switchPar);
         if (hwDevice) av_buffer_unref(&hwDevice);
         if (fmt) avformat_close_input(&fmt);
     }
@@ -736,11 +738,14 @@ bool VideoDecoder::Open(const std::string& path) {
 bool VideoDecoder::OpenVideoCodec(const void* decoder, const std::string& label) {
     const AVCodec* dec = static_cast<const AVCodec*>(decoder);
     AVStream* st = impl_->fmt->streams[impl_->videoStream];
+    // ABR (#205) reopens on a snapshot of the new rendition's parameters (the demuxer runs
+    // on another thread). Never set for files: always st->codecpar there.
+    const AVCodecParameters* par = impl_->switchPar ? impl_->switchPar : st->codecpar;
 
     // Build the codec context; try hardware decode, fall back to software if either
     // the device won't init or the hw-configured decoder won't open.
     impl_->codec = avcodec_alloc_context3(dec);
-    avcodec_parameters_to_context(impl_->codec, st->codecpar);
+    avcodec_parameters_to_context(impl_->codec, par);
     // MV-HEVC (#154) decodes in software: FFmpeg's hwaccels decode the base layer only, so a
     // hardware context would silently drop the second eye. Phone stereo is 1080p-class per
     // eye, which multithreaded software HEVC handles in real time.
@@ -778,7 +783,7 @@ bool VideoDecoder::OpenVideoCodec(const void* decoder, const std::string& label)
         interopActive_ = false;  // no hw device -> no zero-copy
 #endif
         impl_->codec = avcodec_alloc_context3(dec);
-        avcodec_parameters_to_context(impl_->codec, st->codecpar);
+        avcodec_parameters_to_context(impl_->codec, par);
         impl_->codec->thread_count = 0;
         if (live_) impl_->codec->flags |= AV_CODEC_FLAG_LOW_DELAY;
         rc = avcodec_open2(impl_->codec, dec, nullptr);
@@ -1498,6 +1503,12 @@ bool VideoDecoder::OpenLive(const std::string& url) {
     std::call_once(netInit, [] { avformat_network_init(); });
     live_ = true;
     streamUrl_ = url;
+    qualityRequest_.store(-1);  // a new URL starts on automatic quality (#205)
+    abrEstimateBps_ = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(statsMutex_);
+        rungs_.clear();
+    }
     {
         std::lock_guard<std::mutex> lk(statsMutex_);
         stats_ = StreamStats{};
@@ -1585,6 +1596,11 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
         }
     }
 
+    // hls: no parallel prefetch of the next segment. ABR (#205) switches renditions with
+    // AVStream::discard, and a playlist dropped mid-stream keeps its open connections; on
+    // re-enable it first plays out what they hold, two segments with the prefetch on.
+    if (stream::IsHlsPath(streamUrl_)) av_dict_set(&opts, "http_multiple", "0", 0);
+
     // Connect + probe must finish inside this budget (a dead server fails fast; Stop()
     // interrupts it at once through the callback).
     // DASH opens the init + first media segment of EVERY representation before it
@@ -1616,36 +1632,69 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
 #endif
     impl_->videoStream = av_find_best_stream(impl_->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
     if (hls) {
-        // A DASH / HLS source lists every representation as its own stream, and
+        // A DASH / HLS source lists every representation as its own stream (#196), and
         // av_find_best_stream ranks them by the bitrate it ESTIMATED from the probed
-        // segment, which can be the lowest one (DASH-IF UHD MultiRate: 5.7 of 5.7 /
-        // 8.3 / 10.9 Mbit/s). Take the highest advertised bandwidth that this build
-        // can decode (no ABR: FFmpeg's demuxers never switch). Ties: more pixels.
-        int bestIdx = -1;
-        int64_t bestBw = -1, bestPx = -1;
+        // segment, so the ladder is built from the ADVERTISED bandwidths instead. The
+        // first rung is picked here; SegmentedPlayback adapts from there (#205).
+        std::vector<Rung> ladder;
         for (unsigned i = 0; i < impl_->fmt->nb_streams; ++i) {
             const AVStream* st = impl_->fmt->streams[i];
             if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) continue;
             if (st->disposition & AV_DISPOSITION_ATTACHED_PIC) continue;
-            if (!avcodec_find_decoder(st->codecpar->codec_id)) continue;
-            const AVDictionaryEntry* e = av_dict_get(st->metadata, "variant_bitrate", nullptr, 0);
-            const int64_t bw = e ? std::strtoll(e->value, nullptr, 10) : st->codecpar->bit_rate;
-            const int64_t px = (int64_t)st->codecpar->width * st->codecpar->height;
-            if (bw > bestBw || (bw == bestBw && px > bestPx)) {
-                bestIdx = (int)i;
-                bestBw = bw;
-                bestPx = px;
+            const AVCodec* d = avcodec_find_decoder(st->codecpar->codec_id);
+            if (!d) continue;
+            // The advertised bandwidth: hls tags each variant's PROGRAM with it, and a stream
+            // shared by several variants (one per audio group) is in each of them: take the
+            // lowest, the rendition with its cheapest audio. The stream-level tag (dash; hls
+            // when the stream is in one variant) is the fallback, then the probed bit rate.
+            int64_t progBw = -1;
+            for (unsigned pi = 0; pi < impl_->fmt->nb_programs; ++pi) {
+                const AVProgram* pg = impl_->fmt->programs[pi];
+                const AVDictionaryEntry* pe = av_dict_get(pg->metadata, "variant_bitrate", nullptr, 0);
+                if (!pe) continue;
+                for (unsigned k = 0; k < pg->nb_stream_indexes; ++k) {
+                    if (pg->stream_index[k] != i) continue;
+                    const int64_t v = std::strtoll(pe->value, nullptr, 10);
+                    if (v > 0 && (progBw < 0 || v < progBw)) progBw = v;
+                }
             }
+            const AVDictionaryEntry* e = av_dict_get(st->metadata, "variant_bitrate", nullptr, 0);
+            const int64_t streamBw = e ? std::strtoll(e->value, nullptr, 10) : 0;
+            Rung r;
+            r.stream = (int)i;
+            r.info.width = st->codecpar->width;
+            r.info.height = st->codecpar->height;
+            r.info.bandwidth = progBw > 0 ? progBw : streamBw > 0 ? streamBw : st->codecpar->bit_rate;
+            r.info.codec = d->name;
+            // The same rendition listed twice (an HLS variant per audio group): keep one.
+            bool dup = false;
+            for (const Rung& o : ladder)
+                dup |= o.info.width == r.info.width && o.info.height == r.info.height &&
+                       o.info.bandwidth == r.info.bandwidth && o.info.codec == r.info.codec;
+            if (!dup) ladder.push_back(r);
         }
-        if (bestIdx >= 0 && bestIdx != impl_->videoStream) {
-            impl_->videoStream = bestIdx;
-            dec = avcodec_find_decoder(impl_->fmt->streams[bestIdx]->codecpar->codec_id);
-        }
-        if (bestIdx >= 0) {
-            const AVCodecParameters* cp = impl_->fmt->streams[bestIdx]->codecpar;
-            LOG_INFO("VideoDecoder: segmented source, video representation %d of %u streams: "
-                     "%dx%d at %lld bit/s advertised",
-                     bestIdx, impl_->fmt->nb_streams, cp->width, cp->height, (long long)bestBw);
+        std::stable_sort(ladder.begin(), ladder.end(), [](const Rung& x, const Rung& y) {
+            if (x.info.bandwidth != y.info.bandwidth) return x.info.bandwidth < y.info.bandwidth;
+            return (int64_t)x.info.width * x.info.height < (int64_t)y.info.width * y.info.height;
+        });
+        if (!ladder.empty()) {
+            const int start = StartRung(ladder);
+            impl_->videoStream = ladder[start].stream;
+            dec = avcodec_find_decoder(impl_->fmt->streams[impl_->videoStream]->codecpar->codec_id);
+            std::string list;
+            for (size_t i = 0; i < ladder.size(); ++i) {
+                char b[96];
+                std::snprintf(b, sizeof(b), "%s%dx%d %.2f Mbit/s %s", i ? ", " : "", ladder[i].info.width,
+                              ladder[i].info.height, ladder[i].info.bandwidth / 1e6, ladder[i].info.codec.c_str());
+                list += b;
+            }
+            LOG_INFO("VideoDecoder: segmented source, %zu rendition(s) [%s]; starting at %d (%dx%d, %s)",
+                     ladder.size(), list.c_str(), start, ladder[start].info.width, ladder[start].info.height,
+                     qualityRequest_.load() >= 0 ? "manual" : "auto");
+            std::lock_guard<std::mutex> lk(statsMutex_);
+            rungs_ = std::move(ladder);
+            stats_.rung = start;
+            stats_.rungs = (int)rungs_.size();
         }
     }
     if (impl_->videoStream < 0 || !dec) {
@@ -1742,7 +1791,7 @@ void VideoDecoder::LiveLoop(const std::function<double(void*)>& fill, double& ti
                 }
             };
             if (hls) {
-                SegmentedPlayback(frame, fill, readTimeoutNs, publish, updateWindow, winBytes, err);
+                SegmentedPlayback(frame, fill, timeBase, readTimeoutNs, publish, updateWindow, winBytes, err);
             } else {
                 // Push protocols (RTSP / SRT / UDP / RTMP): frames arrive at the source
                 // rate, so each one is shown as soon as it decodes (lowest latency).
@@ -1812,8 +1861,51 @@ void VideoDecoder::LiveLoop(const std::function<double(void*)>& fill, double& ti
 // more than kLateSec after its time (the queue ran dry: the network is slower than the
 // stream) is shown at once and counted in stats_.stalls; playback then resumes only once
 // kRebufferSec of media is queued again, so one slow segment is one pause, not a stutter.
-void VideoDecoder::SegmentedPlayback(::AVFrame* frame,
-                                     const std::function<double(void*)>& fill,
+//
+// Adaptive bitrate (#205). The ladder (rungs_, ascending advertised bandwidth) is built
+// by OpenLiveInput. The DEMUX thread measures throughput (packet bytes over the time spent
+// inside av_read_frame, i.e. fetching) and the buffer (media queued ahead of the picture)
+// and picks the rung. A switch ENABLES the new representation (AVStream::discard), which
+// FFmpeg's hls / dash demuxers then fetch from the segment the stream is on, and keeps the
+// old one until it reaches the new one's first keyframe past the demux position (a segment
+// boundary): make before break, because both demuxers stop a disabled stream at once. The
+// demux side passes on the new rung only from that keyframe, then drops the old one. THIS
+// thread decodes the old rung up to the keyframe, drains its decoder, reopens it on the new
+// stream's parameters and goes on with the new packets. Timestamps of a ladder are aligned,
+// so the presentation clock runs on: no gap, no repeat, no re-anchor.
+// Limits (FFmpeg's demuxers): the old segment in flight must finish downloading, and hls
+// reaches the new rung's keyframe by downloading the start of its current segment, both
+// inside av_read_frame. On a sudden collapse the old rung is abandoned early (a short
+// content skip) rather than waited for.
+namespace {
+double PacketSec(const AVPacket* p, double tb) {
+    const int64_t t = p->pts != AV_NOPTS_VALUE ? p->pts : p->dts;
+    return t != AV_NOPTS_VALUE ? (double)t * tb : -1.0;
+}
+}  // namespace
+
+int VideoDecoder::StartRung(const std::vector<Rung>& ladder) const {
+    const int n = (int)ladder.size();
+    const int req = qualityRequest_.load();
+    if (req >= 0) return (std::min)(req, n - 1);
+    // A reconnect keeps what the last connection measured; a first open starts on the
+    // highest rung within kAbrStartBps (most ladders: 720p-class), then adapts.
+    const double est = abrEstimateBps_ > 0.0 ? abrEstimateBps_ * 0.7 : kAbrStartBps;
+    int pick = 0;
+    for (int i = 0; i < n; ++i)
+        if ((double)ladder[i].info.bandwidth <= est) pick = i;
+    return pick;
+}
+
+std::vector<VideoDecoder::StreamRung> VideoDecoder::GetStreamRungs() const {
+    std::lock_guard<std::mutex> lk(statsMutex_);
+    std::vector<StreamRung> out;
+    for (const Rung& r : rungs_) out.push_back(r.info);
+    return out;
+}
+
+bool VideoDecoder::SegmentedPlayback(::AVFrame* frame,
+                                     const std::function<double(void*)>& fill, double& timeBase,
                                      int64_t readTimeoutNs,
                                      const std::function<void(::AVFrame*, double)>& publish,
                                      const std::function<void()>& tick,
@@ -1824,10 +1916,39 @@ void VideoDecoder::SegmentedPlayback(::AVFrame* frame,
     constexpr double kRebufferSec = 1.0;    // queued media needed to resume after a stall
     constexpr double kLateSec = 0.25;       // later than this: a stall, re-anchor
     constexpr double kJumpSec = 2.0;        // PTS this far off the clock: a discontinuity
+    // ABR (#205). Throughput is an EWMA over download time, a fast and a slow one, and the
+    // lower of the two is used (quick to fall, slow to rise).
+    constexpr double kFastHalfLife = 2.0, kSlowHalfLife = 8.0;  // seconds of download time
+    constexpr double kUpSafety = 0.75;      // step up to a rung needing <= 75% of the estimate
+    constexpr double kDownSafety = 0.9;     // the current rung needs > 90%: consider stepping down
+    constexpr double kPickSafety = 0.7;     // a step down lands on a rung <= 70% of the estimate
+    constexpr double kUpBufferSec = 3.0;    // step up only with this much queued
+    constexpr double kLowBufferSec = 5.0;   // below this the buffer is draining: step down
+    constexpr double kPanicBufferSec = 1.5; // below this (or a stall): step down hard
+    constexpr double kHoldSec = 4.0;        // between two automatic decisions
+    constexpr double kLiveWaitSec = 0.5;    // live: one read longer than this is a playlist wait
+    constexpr double kSwitchSettleSec = 1.0;  // new rung queued this far past its keyframe: old is done
 
     const double fps = frameRate_ > 0.0 ? frameRate_ : 30.0;
-    const size_t maxPackets = (size_t)(std::max)(120.0, fps * kQueueSec);
+    const size_t maxPackets = (size_t)(std::max)(240.0, fps * kQueueSec * 2.0);
     const size_t rebufferPackets = (size_t)(std::max)(1.0, fps * kRebufferSec);
+
+    std::vector<Rung> ladder;
+    {
+        std::lock_guard<std::mutex> lk(statsMutex_);
+        ladder = rungs_;
+    }
+    const unsigned nStreams = impl_->fmt->nb_streams;
+    std::vector<double> tbOf(nStreams);
+    for (unsigned i = 0; i < nStreams; ++i) tbOf[i] = av_q2d(impl_->fmt->streams[i]->time_base);
+    auto rungOf = [&](int stream) {
+        for (size_t i = 0; i < ladder.size(); ++i)
+            if (ladder[i].stream == stream) return (int)i;
+        return -1;
+    };
+    // A live playlist (no duration): the demuxer also WAITS inside av_read_frame for the
+    // next segment, and that time is not download time.
+    const bool liveSource = impl_->fmt->duration == AV_NOPTS_VALUE || impl_->fmt->duration <= 0;
 
     std::mutex m;
     std::condition_variable cv;
@@ -1835,22 +1956,68 @@ void VideoDecoder::SegmentedPlayback(::AVFrame* frame,
     int64_t qBytes = 0;
     bool demuxDone = false;   // EOF / error / abort: no more packets will come
     std::string demuxErr;
+    // Shared under m: the stream the decoder is on, the one the demux side wants, and the
+    // new stream's parameters (copied on the demux thread, which owns the demuxer).
+    int decodeStream = impl_->videoStream;
+    int targetStream = impl_->videoStream;
+    double targetSince = -1.0;    // the demux position (s) when the target was set
+    double switchAt = -1.0;       // the new rung's first keyframe (s), found by the demux side
+    AVCodecParameters* targetPar = nullptr;
+    double presentedSec = -1.0;   // PTS of the last frame shown (buffer = queued - shown)
+    double lastQueuedSec = -1.0;  // furthest PTS queued
     segAbort_.store(false);
 
     std::thread demux([&] {
+        std::vector<char> enabled(nStreams, 0);
+        enabled[impl_->videoStream] = 1;
+        double fastBps = 0.0, slowBps = 0.0, fastW = 0.0, slowW = 0.0, sampleSec = 0.0;
+        uint64_t sampleBytes = 0;
+        double firstQueuedSec = -1.0;
+        auto holdUntil = clock::now();
+        int lastManual = qualityRequest_.load();
+        uint64_t stallsAtDecision = 0;
+        double lastEst = 0.0;
+        auto nextDebug = clock::now();
+        bool oldCut = false;          // the old rung reached switchAt: stop fetching it
+        auto switchStarted = clock::now();
         for (;;) {
+            int dS, tS;
+            double since;
             {
                 std::unique_lock<std::mutex> lk(m);
+                // At most kQueueSec of media ahead of the picture (and a packet / byte cap
+                // for streams whose timestamps say nothing useful).
                 cv.wait(lk, [&] {
+                    const bool timeOk = q.empty() || presentedSec < 0.0 || lastQueuedSec - presentedSec < kQueueSec;
                     return stop_.load() || segAbort_.load() ||
-                           (q.size() < maxPackets && qBytes < kQueueBytes);
+                           (q.size() < maxPackets && qBytes < kQueueBytes && timeOk);
                 });
                 if (stop_.load() || segAbort_.load()) break;
+                dS = decodeStream;
+                tS = targetStream;
+                since = targetSince;
+                if (dS == tS) {
+                    switchAt = -1.0;
+                    oldCut = false;
+                }
+            }
+            // Make before break: the rung being shown stays enabled until it has delivered
+            // everything before the new rung's first keyframe, because both demuxers stop a
+            // disabled stream at once (hls at its next buffer refill, dash right away) and
+            // the new one only becomes decodable at a keyframe, a segment boundary.
+            for (const Rung& r : ladder) {
+                const char want = ((r.stream == dS && !oldCut) || r.stream == tS) ? 1 : 0;
+                if (want != enabled[r.stream]) {
+                    impl_->fmt->streams[r.stream]->discard = want ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+                    enabled[r.stream] = want;
+                }
             }
             AVPacket* p = av_packet_alloc();
+            const auto r0 = clock::now();
             ioDeadlineNs_.store(SteadyNowNs() + readTimeoutNs);
             const int r = av_read_frame(impl_->fmt, p);
             ioDeadlineNs_.store(0);
+            const double readSec = std::chrono::duration<double>(clock::now() - r0).count();
             if (r < 0) {
                 av_packet_free(&p);
                 std::lock_guard<std::mutex> lk(m);
@@ -1861,15 +2028,161 @@ void VideoDecoder::SegmentedPlayback(::AVFrame* frame,
                 break;
             }
             winBytes += (uint64_t)p->size;
-            if (p->stream_index != impl_->videoStream) {
+
+            // Throughput sample: bytes over fetch time, folded in every >= 256 KB and
+            // >= 50 ms of fetching (packets the demuxer already held take no time and
+            // would read as an absurd rate on their own).
+            sampleBytes += (uint64_t)p->size;
+            if (!(liveSource && readSec > kLiveWaitSec)) sampleSec += readSec;
+            if (sampleBytes >= (256u << 10) && sampleSec >= 0.05) {
+                const double bps = sampleBytes * 8.0 / sampleSec;
+                const double af = std::pow(0.5, sampleSec / kFastHalfLife);
+                const double as = std::pow(0.5, sampleSec / kSlowHalfLife);
+                fastBps = af * fastBps + (1.0 - af) * bps;
+                slowBps = as * slowBps + (1.0 - as) * bps;
+                fastW = af * fastW + (1.0 - af);   // zero-bias correction weights
+                slowW = as * slowW + (1.0 - as);
+                sampleBytes = 0;
+                sampleSec = 0.0;
+            }
+            const double est = (fastW > 0.0 && slowW > 0.0) ? (std::min)(fastBps / fastW, slowBps / slowW) : 0.0;
+            if (est > 0.0) lastEst = est;
+
+            const int si = p->stream_index;
+            const double ps = PacketSec(p, tbOf[si]);
+            bool drop = si != dS && si != tS;
+            if (!drop && si == tS && si != dS) {
+                // The new rung starts at a keyframe past the demux position when it was
+                // chosen, which is still ahead of the picture. What comes before it is
+                // dropped here: a re-enabled hls playlist first hands back what it had
+                // buffered when it was dropped and then catches up mid-segment, and a dash
+                // representation restarts at the start of the current segment.
+                double at;
+                {
+                    std::lock_guard<std::mutex> lk(m);
+                    at = switchAt;
+                }
+                if (at < 0.0) {
+                    if ((p->flags & AV_PKT_FLAG_KEY) && ps > since + 1e-3) {
+                        LOG_DEBUG("VideoDecoder: ABR rendition %d keyframe at %.3f s (target set at %.3f s): "
+                                  "switching there", rungOf(si), ps, since);
+                        std::lock_guard<std::mutex> lk(m);
+                        switchAt = ps;
+                        // Snapshot its parameters now, between two reads, while nothing
+                        // else touches the demuxer.
+                        if (targetPar) avcodec_parameters_free(&targetPar);
+                        targetPar = avcodec_parameters_alloc();
+                        if (targetPar) avcodec_parameters_copy(targetPar, impl_->fmt->streams[si]->codecpar);
+                    } else {
+                        drop = true;
+                    }
+                }
+            } else if (!drop && si == dS && dS != tS) {
+                std::lock_guard<std::mutex> lk(m);
+                // The old rung got to the new one's keyframe: this packet still goes to the
+                // decode side (it marks the boundary there), then the old rung is dropped.
+                if (switchAt >= 0.0 && ps >= switchAt - 1e-3) oldCut = true;
+            }
+            if (drop) {
                 av_packet_free(&p);
                 continue;
             }
-            std::lock_guard<std::mutex> lk(m);
-            qBytes += p->size;
-            q.push_back(p);
-            cv.notify_all();
+            int newTarget = -1;
+            double bufferSec = 0.0;
+            {
+                std::lock_guard<std::mutex> lk(m);
+                if (ps >= 0.0) {
+                    lastQueuedSec = (std::max)(lastQueuedSec, ps);
+                    if (firstQueuedSec < 0.0) firstQueuedSec = ps;
+                }
+                qBytes += p->size;
+                q.push_back(p);
+                cv.notify_all();
+                const double base = presentedSec >= 0.0 ? presentedSec : firstQueuedSec;
+                bufferSec = (lastQueuedSec >= 0.0 && base >= 0.0) ? (std::min)((std::max)(lastQueuedSec - base, 0.0), 60.0) : 0.0;
+            }
+            if (ladder.size() < 2) continue;
+
+            // ---- ABR decision -------------------------------------------------------
+            const int cur = rungOf(tS);
+            const int manual = qualityRequest_.load();
+            const auto now = clock::now();
+            uint64_t stallsNow;
+            {
+                std::lock_guard<std::mutex> lk(statsMutex_);
+                stats_.estKbps = (float)(est / 1000.0);
+                stats_.bufferSec = (float)bufferSec;
+                stallsNow = stats_.stalls;
+            }
+            if (now >= nextDebug) {
+                nextDebug = now + std::chrono::seconds(1);
+                LOG_DEBUG("VideoDecoder: ABR rung %d (decoding stream %d, target %d) estimate %.2f Mbit/s "
+                          "buffer %.1f s stalls %llu live %d",
+                          cur, dS, tS, est / 1e6, bufferSec, (unsigned long long)stallsNow, (int)liveSource);
+            }
+            if (dS != tS && oldCut) {
+                // The old rung is already cut at the new one's keyframe: the switch is
+                // committed and completes on the decode side within a frame or two. A new
+                // choice waits for it (going back would need the old rung re-fetched).
+            } else if (manual >= 0) {
+                newTarget = (std::min)(manual, (int)ladder.size() - 1);
+            } else if (lastManual >= 0) {
+                holdUntil = now;  // back to auto: decide from the next sample on
+            } else if (est > 0.0 && now >= holdUntil) {
+                const bool stalled = stallsNow > stallsAtDecision;
+                const bool panic = (bufferSec < kPanicBufferSec && !liveSource) || stalled;
+                // While a switch is under way only a step further DOWN may replace it (the
+                // network collapsed before the new rung took over).
+                const bool inFlight = dS != tS;
+                auto highestWithin = [&](double bps) {
+                    int pick = 0;
+                    for (int i = 0; i < (int)ladder.size(); ++i)
+                        if ((double)ladder[i].info.bandwidth <= bps) pick = i;
+                    return pick;
+                };
+                const double curBw = (double)ladder[cur].info.bandwidth;
+                int want = cur;
+                if (inFlight && !panic) {
+                    want = cur;
+                } else if (panic) {
+                    want = (std::min)(cur, highestWithin(est * 0.5));
+                    if (want == cur && cur > 0 && curBw > est) want = cur - 1;
+                } else if (bufferSec < kLowBufferSec && curBw > kDownSafety * est) {
+                    want = (std::min)(cur, highestWithin(est * kPickSafety));
+                } else if (bufferSec >= kUpBufferSec) {
+                    want = (std::max)(cur, highestWithin(est * kUpSafety));
+                }
+                if (inFlight && want > cur) want = cur;
+                newTarget = want;
+                stallsAtDecision = stallsNow;
+                // Abandon: the picture is starving while the old (higher) rung still has
+                // to finish its segment before the switch (FFmpeg cannot abort a segment
+                // download). Drop it now; the new rung takes over at its keyframe and the
+                // part of the segment in between is skipped rather than waited for.
+                if (inFlight && panic && !oldCut && rungOf(dS) > cur && now - switchStarted > std::chrono::milliseconds(1500)) {
+                    LOG_INFO("VideoDecoder: ABR dropping rendition %d before its segment ends (buffer %.1f s, "
+                             "estimate %.2f Mbit/s)", rungOf(dS), bufferSec, est / 1e6);
+                    oldCut = true;
+                }
+            }
+            if (!(dS != tS && oldCut)) lastManual = manual;
+            if (newTarget >= 0 && newTarget != cur) {
+                LOG_INFO("VideoDecoder: ABR %s %d -> %d (%dx%d, %.2f Mbit/s): estimate %.2f Mbit/s, buffer %.1f s, "
+                         "demux at %.3f s",
+                         manual >= 0 ? "manual" : "switch", cur, newTarget, ladder[newTarget].info.width,
+                         ladder[newTarget].info.height, ladder[newTarget].info.bandwidth / 1e6, est / 1e6, bufferSec,
+                         lastQueuedSec);
+                std::lock_guard<std::mutex> lk(m);
+                targetStream = ladder[newTarget].stream;
+                targetSince = lastQueuedSec;
+                switchAt = -1.0;
+                if (!(dS != tS && oldCut)) oldCut = false;  // a cut old rung stays cut
+                switchStarted = now;
+                if (targetPar) avcodec_parameters_free(&targetPar);
+                holdUntil = now + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(kHoldSec));
+            }
         }
+        if (lastEst > 0.0) abrEstimateBps_ = lastEst;  // a reconnect starts from it
         std::lock_guard<std::mutex> lk(m);
         demuxDone = true;
         cv.notify_all();
@@ -1880,6 +2193,7 @@ void VideoDecoder::SegmentedPlayback(::AVFrame* frame,
     double anchorPts = 0.0, prevPts = -1.0;
     bool rebuffering = false;   // after a stall: wait for kRebufferSec of media
     bool drained = false;       // sent the decoder its flush packet after the last packet
+    bool failed = false;        // a switch could not open the new decoder
     uint64_t stalls = 0, discontinuities = 0;
 
     // Sleep until `due` in short steps (Stop() cuts it short).
@@ -1917,8 +2231,89 @@ void VideoDecoder::SegmentedPlayback(::AVFrame* frame,
                                            std::chrono::duration<double>(pts - anchorPts)));
             }
             prevPts = pts;
+            std::lock_guard<std::mutex> lk(m);
+            presentedSec = pts;
+            cv.notify_all();  // the demux side may be waiting for the picture to move on
         }
         return !stop_.load();
+    };
+    // Decode one packet (nullptr = drain) and show its frames; frames at or past `stopAt`
+    // (seconds, <0 = none) belong to the next rung and are skipped.
+    auto decodePacket = [&](AVPacket* p, double stopAt) {
+        const int sent = avcodec_send_packet(impl_->codec, p);
+        if (sent != 0 && p) return;
+        while (!stop_.load() && ReceiveFrame(frame) == 0) {
+            const double pts = fill(frame);
+            if (pts <= -2.0) continue;  // hw download failed: dropped
+            if (stopAt >= 0.0 && pts >= stopAt - 1e-3) continue;
+            if (!present(pts)) break;
+            publish(frame, pts);
+            tick();
+        }
+    };
+
+    // Switch state (#205). The demux side passes on the new rung only from its keyframe at
+    // `switchAt`; its packets wait in `side` until the old rung has been decoded up to
+    // there (an old packet at or past switchAt marks it), then the decoder switches.
+    int cand = -1;
+    bool oldReached = false;
+    std::deque<AVPacket*> side;
+    auto clearSide = [&] {
+        for (AVPacket* x : side) av_packet_free(&x);
+        side.clear();
+    };
+    auto doSwitch = [&]() -> bool {
+        const auto s0 = clock::now();
+        const int from = rungOf(impl_->videoStream), to = rungOf(cand);
+        AVCodecParameters* par = nullptr;
+        double at;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            par = targetPar;
+            targetPar = nullptr;
+            at = switchAt;
+        }
+        decodePacket(nullptr, at);  // the old rung's last frames, up to the boundary
+        avcodec_free_context(&impl_->codec);
+        av_buffer_unref(&impl_->hwDevice);
+        impl_->hwPixFmt = AV_PIX_FMT_NONE;
+        hardware_ = false;
+        hwName_ = "software";
+        MvReset();
+        impl_->videoStream = cand;
+        timeBase = tbOf[cand];
+        if (impl_->switchPar) avcodec_parameters_free(&impl_->switchPar);
+        impl_->switchPar = par;  // OpenVideoCodec uses it instead of the live codecpar
+        const AVCodec* d = avcodec_find_decoder(par ? par->codec_id : impl_->fmt->streams[cand]->codecpar->codec_id);
+        if (!d || !OpenVideoCodec(d, streamUrl_)) {
+            err = "cannot open the decoder for the new rendition";
+            return false;
+        }
+        codecName_ = d->name;
+        const double ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
+        LOG_INFO("VideoDecoder: ABR switched rendition %d -> %d at %.3f s (%dx%d %s/%s, decoder reopened in %.0f ms)",
+                 from, to, at, par ? par->width : 0, par ? par->height : 0, codecName_, hwName_, ms);
+        {
+            std::lock_guard<std::mutex> lk(statsMutex_);
+            stats_.rung = to;
+            stats_.codec = codecName_;
+            stats_.backend = hwName_;
+            ++stats_.switches;
+        }
+        {
+            std::lock_guard<std::mutex> lk(m);
+            decodeStream = cand;
+            cv.notify_all();
+        }
+        cand = -1;
+        oldReached = false;
+        while (!side.empty() && !stop_.load()) {
+            AVPacket* x = side.front();
+            side.pop_front();
+            decodePacket(x, -1.0);
+            av_packet_free(&x);
+        }
+        return true;
     };
 
     while (!stop_.load()) {
@@ -1953,18 +2348,55 @@ void VideoDecoder::SegmentedPlayback(::AVFrame* frame,
                 continue;
             }
         }
-        // p == nullptr here means: the demuxer is done, flush the decoder's last frames.
-        const int sent = avcodec_send_packet(impl_->codec, p);
-        if (!p) drained = true;
-        if (p) av_packet_free(&p);
-        if (sent == 0 || !p) {
-            while (!stop_.load() && ReceiveFrame(frame) == 0) {
-                const double pts = fill(frame);
-                if (pts <= -2.0) continue;  // hw download failed: dropped
-                if (!present(pts)) break;
-                publish(frame, pts);
+        if (!p) {  // the demuxer is done: flush the decoder's last frames
+            drained = true;
+            decodePacket(nullptr, -1.0);
+            tick();
+            continue;
+        }
+        const int si = p->stream_index;
+        int want;
+        double at;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            want = targetStream;
+            at = switchAt;
+        }
+        const double ps = PacketSec(p, tbOf[si]);
+        if (si == impl_->videoStream) {
+            if (want != si && at >= 0.0 && ps >= at - 1e-3) {
+                // The old rung reached the boundary: from here on the new one is shown.
+                av_packet_free(&p);
+                oldReached = true;
+                if (cand >= 0 && !side.empty() && !doSwitch()) { failed = true; break; }
                 tick();
+                continue;
             }
+            decodePacket(p, -1.0);
+            av_packet_free(&p);
+        } else if (si == want) {
+            if (si != cand) {  // a (new) rung to switch to; its first packet is the keyframe
+                clearSide();
+                cand = si;
+                oldReached = false;
+            }
+            side.push_back(p);
+            // Switch once the old rung is decoded up to the boundary. The demuxers hand
+            // packets over in timestamp order, so if the old rung was cut short (dropped
+            // early, or it ended) nothing of it can still come once the new one is this
+            // far past its keyframe.
+            const double span = (at >= 0.0 && ps >= 0.0) ? ps - at : 0.0;
+            if ((oldReached || span > kSwitchSettleSec || side.size() > maxPackets / 2) && !doSwitch()) {
+                failed = true;
+                break;
+            }
+        } else {
+            // A rung the demux side has already moved away from.
+            if (si == cand) {
+                clearSide();
+                cand = -1;
+            }
+            av_packet_free(&p);
         }
         tick();
     }
@@ -1976,12 +2408,15 @@ void VideoDecoder::SegmentedPlayback(::AVFrame* frame,
     }
     demux.join();  // av_read_frame is interrupted by segAbort_ (InterruptCallback)
     segAbort_.store(false);
+    clearSide();
     for (AVPacket* left : q) av_packet_free(&left);
     q.clear();
+    if (targetPar) avcodec_parameters_free(&targetPar);
     if (stalls || discontinuities)
         LOG_INFO("VideoDecoder: segmented source: %llu stall(s), %llu PTS discontinuit%s",
                  (unsigned long long)stalls, (unsigned long long)discontinuities,
                  discontinuities == 1 ? "y" : "ies");
+    return !failed;
 }
 
 #else  // !MEDIAPLAYER_WITH_FFMPEG
@@ -2003,9 +2438,13 @@ bool VideoDecoder::OpenLive(const std::string&) {
 const char* VideoDecoder::StreamStateName(StreamState) { return "idle"; }
 VideoDecoder::StreamStats VideoDecoder::GetStreamStats() const { return StreamStats{}; }
 void VideoDecoder::LiveLoop(const std::function<double(void*)>&, double&) {}
-void VideoDecoder::SegmentedPlayback(::AVFrame*, const std::function<double(void*)>&, int64_t,
+bool VideoDecoder::SegmentedPlayback(::AVFrame*, const std::function<double(void*)>&, double&, int64_t,
                                      const std::function<void(::AVFrame*, double)>&,
-                                     const std::function<void()>&, std::atomic<uint64_t>&, std::string&) {}
+                                     const std::function<void()>&, std::atomic<uint64_t>&, std::string&) {
+    return false;
+}
+int VideoDecoder::StartRung(const std::vector<Rung>&) const { return 0; }
+std::vector<VideoDecoder::StreamRung> VideoDecoder::GetStreamRungs() const { return {}; }
 bool VideoDecoder::OpenLiveInput(std::string&, bool&) { return false; }
 bool VideoDecoder::OpenVideoCodec(const void*, const std::string&) { return false; }
 int VideoDecoder::InterruptCallback(void*) { return 0; }

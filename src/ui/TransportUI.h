@@ -110,6 +110,7 @@ struct TransportState {
     std::string streamHost;    // "host:port" (no credentials)
     float streamFps = 0.0f;    // frames decoded per second
     float streamKbps = 0.0f;   // demuxed bitrate
+    std::string streamQuality; // HLS / DASH rendition, e.g. "720p auto" (#205); "" = none
     std::string urlSeed;       // last URL (or MEDIAPLAYER_URL): prefills the popup
     bool urlPopupRequest = false;  // owner (Ctrl+U) or the combo row asks to open it
     // "Convert to 3D" - only read when caps.convert. A temporary state (the conversion task
