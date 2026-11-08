@@ -6,8 +6,8 @@
 //
 // The rule: a URL is `<scheme>://...` where the scheme is at least TWO characters
 // (so a Windows drive letter "C:\x" / "C://x" is never a scheme). Live schemes are
-// the ones the bundled FFmpeg can open as a stream; `srt://` is recognised but
-// rejected (it needs libsrt, which is not bundled). `file://` and anything without
+// the ones the bundled FFmpeg can open as a stream, `srt://` included (libsrt, #198).
+// `file://` and anything without
 // a scheme is a file — except a path ending in `.m3u8` (an HLS playlist) or `.mpd` (a
 // DASH manifest, #195), which is played as a live stream even from disk.
 #pragma once
@@ -44,8 +44,9 @@ bool IsNetworkUrl(const std::string& s);
 // a bare .m3u8 / .mpd path; "" when nothing sensible can be extracted.
 std::string UrlHost(const std::string& url);
 
-// The URL with any password replaced by "***" ("rtsp://user:***@cam/..."), for logs,
-// toasts and get_status. A URL without credentials is returned unchanged.
+// The URL with any password replaced by "***" ("rtsp://user:***@cam/...", and a
+// secret query value such as SRT's "?passphrase=***"), for logs, toasts and
+// get_status. A URL without credentials is returned unchanged.
 std::string RedactUrl(const std::string& url);
 
 }  // namespace mp::stream

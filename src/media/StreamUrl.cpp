@@ -61,7 +61,7 @@ UrlVerdict ClassifyUrl(const std::string& s) {
     }
     v.scheme = scheme;
     static const char* const kLive[] = {"rtsp", "rtsps", "rtmp", "rtmps", "udp", "rtp",
-                                        "http", "https", "tcp",  "hls"};
+                                        "http", "https", "tcp",  "hls",   "srt"};
     for (const char* k : kLive) {
         if (scheme == k) {
             v.cls = UrlClass::Live;
@@ -69,10 +69,7 @@ UrlVerdict ClassifyUrl(const std::string& s) {
         }
     }
     v.cls = UrlClass::Unsupported;
-    if (scheme == "srt")
-        v.reason = "SRT streams are not supported (needs libsrt) - use RTSP, RTMP, UDP or HTTP";
-    else
-        v.reason = "Unsupported stream scheme '" + scheme + "://'";
+    v.reason = "Unsupported stream scheme '" + scheme + "://'";
     return v;
 }
 
@@ -93,7 +90,10 @@ std::string UrlHost(const std::string& url) {
     return auth;
 }
 
-std::string RedactUrl(const std::string& url) {
+namespace {
+
+// userinfo password -> "***" ("rtsp://user:***@cam/...").
+std::string RedactUserinfo(const std::string& url) {
     size_t b = 0;
     const std::string auth = Authority(url, &b);
     const size_t at = auth.rfind('@');
@@ -102,5 +102,36 @@ std::string RedactUrl(const std::string& url) {
     if (colon == std::string::npos || colon > at) return url;  // user only, no password
     return url.substr(0, b + colon + 1) + "***" + url.substr(b + at);
 }
+
+// Secret-bearing query parameters -> "***": SRT's AES passphrase
+// ("srt://h:9000?passphrase=...", #198) and the common password-style keys.
+std::string RedactQuery(const std::string& url) {
+    const size_t q = url.find('?');
+    if (q == std::string::npos) return url;
+    const size_t end = url.find('#', q);
+    const size_t stop = end == std::string::npos ? url.size() : end;
+    static const char* const kSecret[] = {"passphrase", "password", "passwd", "pass"};
+    std::string out = url.substr(0, q + 1);
+    size_t i = q + 1;
+    while (i <= stop) {
+        size_t amp = url.find('&', i);
+        if (amp == std::string::npos || amp > stop) amp = stop;
+        const std::string kv = url.substr(i, amp - i);
+        const size_t eq = kv.find('=');
+        bool secret = false;
+        if (eq != std::string::npos && eq + 1 < kv.size()) {
+            const std::string key = Lower(kv.substr(0, eq));
+            for (const char* k : kSecret) secret = secret || key == k;
+        }
+        out += secret ? kv.substr(0, eq + 1) + "***" : kv;
+        if (amp < stop) out += '&';
+        i = amp + 1;
+    }
+    return out + url.substr(stop);
+}
+
+}  // namespace
+
+std::string RedactUrl(const std::string& url) { return RedactQuery(RedactUserinfo(url)); }
 
 }  // namespace mp::stream

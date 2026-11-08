@@ -249,7 +249,7 @@ and **Stop live** in the same menu ends it. Audio in a stream is ignored for now
 | `http://` / `https://` | progressive MPEG-TS / FLV / fragmented MP4. |
 | `*.m3u8` | HLS, local or remote. Its latency is the playlist's (seconds), not the player's. |
 | `*.mpd` | MPEG-DASH, VOD or live (dynamic MPD), local or remote (#195). Like HLS, its latency is the manifest's. Of several video representations FFmpeg's best-stream pick takes the highest bitrate. Windows and Linux builds; the macOS build's Homebrew FFmpeg has no DASH demuxer and says so. |
-| `srt://` | **not supported** (needs libsrt); refused with a message. |
+| `srt://` | SRT (#198), caller by default: `srt://host:9000`. Options go in the query and are FFmpeg's libsrt ones: `mode=caller\|listener`, `streamid=…` (for example a media server's `read:<path>`), `passphrase=…` (AES; redacted in logs and `get_status`) and `latency=` in **microseconds** (`latency=200000` = 200 ms; libsrt's default is 120 ms). As a listener (`srt://0.0.0.0:9000?mode=listener`) the player waits up to 30 s for the sender. Windows and Linux builds; the macOS build's Homebrew FFmpeg has no libsrt and answers "Protocol not found". |
 
 **Latency.** Demuxing runs with `fflags=nobuffer`, a 0.5 s `max_delay`, a small probe
 (1 MB / 1.5 s, enough for a 4K SPS/PPS + IDR) and a low-delay decoder. The player adds

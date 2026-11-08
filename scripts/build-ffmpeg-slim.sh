@@ -18,8 +18,8 @@
 # demuxers a live stream needs — RTSP (+ RTP/SDP depacketizers), RTMP(S), UDP/RTP
 # MPEG-TS, HTTP(S) progressive, HLS and DASH (#195). TLS (https://, rtmps://, HLS /
 # DASH over https) uses SChannel: a Windows system API (secur32/ncrypt/crypt32), so
-# no new DLL ships. DASH needs libxml2, built here statically like zlib (below).
-# SRT is deliberately absent (it would need libsrt).
+# no new DLL ships. DASH needs libxml2 and SRT (#198) needs libsrt + a crypto
+# library (mbedTLS); all three are built here statically like zlib (below).
 #
 # Requirements: run under a POSIX shell (MSYS2 / Git bash) with MSVC `cl`, `nmake`,
 # `cmake` (the VS developer environment has both) and `nasm` on PATH and GNU `make`
@@ -80,14 +80,16 @@ echo "zlib=$ZLIB_PREFIX ($ZLIB_TAG)"
 # is UTF-8; libxml2 keeps its built-in UTF-8/16 + Latin-1 decoders), no zlib/lzma, no
 # HTTP/FTP, no programs/tests/python. Pinned; the cache key hashes this script.
 #
-# FFmpeg's configure finds libxml2 through pkg-config. The MSYS2 on the CI images and
+# FFmpeg's configure finds libxml2 and libsrt through pkg-config. The MSYS2 on the CI images and
 # the signing box need not have one, and a host pkg-config could leak a foreign .pc in,
 # so configure gets --pkg-config=<shim>: it answers ONLY for the .pc files written
 # here (Cflags / Libs verbatim, which msvc's flag filter maps: -L -> -libpath:, -lx ->
 # x.lib) and fails every other query.
 LIBXML2_TAG=v2.13.9
+MBEDTLS_TAG=v3.6.5
+SRT_TAG=v1.5.4
 command -v cmake >/dev/null || { echo "ERROR: cmake not on PATH (it ships with the VS developer environment)" >&2; exit 1; }
-NETDEPS_PREFIX="$(cd "$SRC/.." && pwd)/netdeps-msvc-$LIBXML2_TAG"
+NETDEPS_PREFIX="$(cd "$SRC/.." && pwd)/netdeps-msvc-$LIBXML2_TAG-$MBEDTLS_TAG-$SRT_TAG"
 NETDEPS_W="$(cygpath -m "$NETDEPS_PREFIX" 2>/dev/null || echo "$NETDEPS_PREFIX")"
 # cmake_msvc <src-dir> <build-dir> [-D...]: static Release build + install into NETDEPS.
 cmake_msvc() {
@@ -102,7 +104,7 @@ cmake_msvc() {
 }
 if [ ! -f "$NETDEPS_PREFIX/lib/xml2.lib" ]; then
     LIBXML2_SRC="$(cd "$SRC/.." && pwd)/libxml2-src"
-    rm -rf "$LIBXML2_SRC" "$NETDEPS_PREFIX"
+    rm -rf "$LIBXML2_SRC"
     git clone --depth 1 --branch "$LIBXML2_TAG" https://github.com/GNOME/libxml2.git "$LIBXML2_SRC"
     cmake_msvc "$LIBXML2_SRC" "$LIBXML2_SRC/_build" \
         -DLIBXML2_WITH_ICONV=OFF -DLIBXML2_WITH_ZLIB=OFF -DLIBXML2_WITH_LZMA=OFF \
@@ -114,12 +116,45 @@ if [ ! -f "$NETDEPS_PREFIX/lib/xml2.lib" ]; then
     [ -n "$xmllib" ] || { echo "ERROR: libxml2 build produced no .lib" >&2; exit 1; }
     cp "$xmllib" "$NETDEPS_PREFIX/lib/xml2.lib"
 fi
+# libsrt (#198), static, with mbedTLS for its AES encryption (passphrase streams).
+# Why mbedTLS: SRT needs a crypto library for encryption, and the alternatives are
+# OpenSSL (heavy, and a second TLS stack next to SChannel) or encryption off (no
+# passphrase streams, the common case for contribution feeds). mbedTLS builds cleanly
+# with MSVC through CMake, and SRT only links its libmbedcrypto (AES, SHA-1 PBKDF2,
+# CTR-DRBG). SRT on MSVC uses C++11 threads (ENABLE_STDCXX_SYNC), so no pthreads-w32.
+# Its C++ runtime is static (/MT) like the rest: avformat stays a self-contained DLL.
+if [ ! -f "$NETDEPS_PREFIX/lib/mbedcrypto.lib" ]; then
+    MBEDTLS_SRC="$(cd "$SRC/.." && pwd)/mbedtls-src"
+    rm -rf "$MBEDTLS_SRC"
+    git clone --depth 1 --branch "$MBEDTLS_TAG" --recurse-submodules --shallow-submodules \
+        https://github.com/Mbed-TLS/mbedtls.git "$MBEDTLS_SRC"
+    cmake_msvc "$MBEDTLS_SRC" "$MBEDTLS_SRC/_build" \
+        -DENABLE_PROGRAMS=OFF -DENABLE_TESTING=OFF -DMBEDTLS_FATAL_WARNINGS=OFF
+fi
+if [ ! -f "$NETDEPS_PREFIX/lib/srt.lib" ]; then
+    SRT_SRC="$(cd "$SRC/.." && pwd)/srt-src"
+    rm -rf "$SRT_SRC"
+    git clone --depth 1 --branch "$SRT_TAG" https://github.com/Haivision/srt.git "$SRT_SRC"
+    # SSL_* given directly: SRT's FindMbedTLS would otherwise go looking on its own.
+    cmake_msvc "$SRT_SRC" "$SRT_SRC/_build" \
+        -DENABLE_SHARED=OFF -DENABLE_STATIC=ON -DENABLE_APPS=OFF -DENABLE_ENCRYPTION=ON \
+        -DUSE_ENCLIB=mbedtls -DSSL_INCLUDE_DIRS="$NETDEPS_W/include" \
+        -DSSL_LIBRARY_DIRS="$NETDEPS_W/lib" -DSSL_LIBRARIES=mbedcrypto
+    # SRT names its static MSVC library srt_static.lib; configure maps -lsrt to srt.lib.
+    [ -f "$NETDEPS_PREFIX/lib/srt_static.lib" ] || { echo "ERROR: libsrt build produced no srt_static.lib" >&2; exit 1; }
+    cp "$NETDEPS_PREFIX/lib/srt_static.lib" "$NETDEPS_PREFIX/lib/srt.lib"
+fi
 mkdir -p "$NETDEPS_PREFIX/pc"
 # LIBXML_STATIC: without it the headers declare every symbol __declspec(dllimport).
 cat > "$NETDEPS_PREFIX/pc/libxml-2.0.pc" <<EOF
 Version: ${LIBXML2_TAG#v}
 Cflags: -I$NETDEPS_W/include -I$NETDEPS_W/include/libxml2 -DLIBXML_STATIC
 Libs: -L$NETDEPS_W/lib -lxml2 -lws2_32 -lbcrypt
+EOF
+cat > "$NETDEPS_PREFIX/pc/srt.pc" <<EOF
+Version: ${SRT_TAG#v}
+Cflags: -I$NETDEPS_W/include
+Libs: -L$NETDEPS_W/lib -lsrt -lmbedcrypto -lws2_32 -lbcrypt
 EOF
 PKGCONF_SHIM="$NETDEPS_PREFIX/pc/pkg-config-shim.sh"
 cat > "$PKGCONF_SHIM" <<'EOF'
@@ -149,7 +184,7 @@ case "$mode" in
 esac
 EOF
 chmod +x "$PKGCONF_SHIM"
-echo "netdeps=$NETDEPS_PREFIX (libxml2 $LIBXML2_TAG)"
+echo "netdeps=$NETDEPS_PREFIX (libxml2 $LIBXML2_TAG, mbedtls $MBEDTLS_TAG, srt $SRT_TAG)"
 
 cd "$SRC"
 
@@ -174,8 +209,8 @@ fi
   --enable-network --disable-autodetect --disable-debug \
   --enable-swscale --enable-swresample \
   --enable-zlib --extra-cflags="-I$ZLIB_INC_W" --extra-ldflags="-LIBPATH:$ZLIB_LIB_W" \
-  --pkg-config="$PKGCONF_SHIM" --enable-libxml2 \
-  --enable-protocol=file,pipe,tcp,udp,rtp,http,https,tls,rtmp,rtmps,hls,crypto,data \
+  --pkg-config="$PKGCONF_SHIM" --enable-libxml2 --enable-libsrt \
+  --enable-protocol=file,pipe,tcp,udp,rtp,http,https,tls,rtmp,rtmps,hls,crypto,data,libsrt \
   --enable-demuxer=mov,matroska,mpegts,avi,flv,live_flv,rtsp,rtp,sdp,hls,dash,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v,mxf,image_dpx_pipe,image_exr_pipe \
   --enable-decoder=h264,hevc,av1,vp9,vp8,mpeg4,mpeg2video,mpeg1video,mjpeg,png,bmp,tiff,webp,gif,prores,dnxhd,exr,dpx,aac,aac_latm,mp3,ac3,eac3,flac,opus,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8 \
   --enable-parser=h264,hevc,av1,vp9,vp8,mpeg4video,mpegvideo,aac,aac_latm,ac3,flac,opus,vorbis,mjpeg,png \
@@ -186,7 +221,7 @@ fi
 
 # configure silently drops a feature whose dependency is missing (schannel is an
 # explicit enable under --disable-autodetect and soft-disables when its headers or
-# libs are absent; exr and png need zlib; dash needs libxml2; a misspelt --enable-demuxer name matches
+# libs are absent; exr and png need zlib; dash needs libxml2; srt needs libsrt; a misspelt --enable-demuxer name matches
 # nothing and says nothing): fail instead of shipping a player whose https:// is dead
 # or whose EXR / DPX review formats (Media Player Pro) do not open.
 for want in CONFIG_NETWORK CONFIG_SCHANNEL CONFIG_TLS_PROTOCOL CONFIG_HTTPS_PROTOCOL \
@@ -194,7 +229,7 @@ for want in CONFIG_NETWORK CONFIG_SCHANNEL CONFIG_TLS_PROTOCOL CONFIG_HTTPS_PROT
             CONFIG_ZLIB CONFIG_EXR_DECODER CONFIG_PNG_DECODER CONFIG_DPX_DECODER \
             CONFIG_PRORES_DECODER CONFIG_DNXHD_DECODER CONFIG_MXF_DEMUXER \
             CONFIG_IMAGE_EXR_PIPE_DEMUXER CONFIG_IMAGE_DPX_PIPE_DEMUXER \
-            CONFIG_LIBXML2 CONFIG_DASH_DEMUXER; do
+            CONFIG_LIBXML2 CONFIG_DASH_DEMUXER CONFIG_LIBSRT CONFIG_LIBSRT_PROTOCOL; do
     # (component switches live in config_components.h on FFmpeg >= 6). grep the files
     # directly: `cat ... | grep -q` under pipefail fails when grep -q exits on an early
     # match and cat dies of SIGPIPE (CONFIG_LIBXML2 sits near the top of config.h).

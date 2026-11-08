@@ -29,6 +29,10 @@
 #   * DASH (#195): libxml2, built here and linked STATICALLY into libavformat.
 #     A shared libxml2 would break the same rule: 26.04's libxml2 2.14 moved to
 #     soname libxml2.so.16 (package libxml2-16) while 22.04/24.04 have .so.2.
+#   * SRT (#198): libsrt + mbedTLS (its AES crypto), both STATIC for the same
+#     reason (distro libsrt / libmbedcrypto sonames and t64 package names differ
+#     across the three releases). libsrt is C++, so libavformat gains a
+#     libstdc++.so.6 DT_NEEDED, which is on the .deb's STABLE_SONAMES list.
 # --disable-autodetect keeps anything else on the build host from sneaking in.
 #
 # Build it on the OLDEST supported release (the .deb's glibc floor comes from
@@ -47,10 +51,12 @@ PREFIX="${FFMPEG_PREFIX:-/tmp/ffmpeg-slim-linux}"
 SRC="${FFMPEG_SRC:-/tmp/ffmpeg-src-${FFMPEG_SHA:0:8}}"
 NVSRC="/tmp/nv-codec-headers-$NVCODEC_TAG"
 LIBXML2_TAG="${LIBXML2_TAG:-v2.13.9}"
-NETDEPS="/tmp/ffmpeg-netdeps-linux-$LIBXML2_TAG"
+MBEDTLS_TAG="${MBEDTLS_TAG:-v3.6.5}"
+SRT_TAG="${SRT_TAG:-v1.5.4}"
+NETDEPS="/tmp/ffmpeg-netdeps-linux-$LIBXML2_TAG-$MBEDTLS_TAG-$SRT_TAG"
 
 SELF_HASH="$(sha256sum "$0" | cut -c1-16)"
-STAMP="$FFMPEG_SHA $NVCODEC_TAG $LIBXML2_TAG $SELF_HASH"
+STAMP="$FFMPEG_SHA $NVCODEC_TAG $LIBXML2_TAG $MBEDTLS_TAG $SRT_TAG $SELF_HASH"
 if [ -f "$PREFIX/.stamp" ] && [ "$(cat "$PREFIX/.stamp")" = "$STAMP" ]; then
     echo "==> slim FFmpeg cached at $PREFIX ($STAMP)"
     exit 0
@@ -79,7 +85,7 @@ export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PAT
 # where the linker never uses it.)
 if [ ! -f "$NETDEPS/lib/libxml2.a" ]; then
     XMLSRC="/tmp/libxml2-src-$LIBXML2_TAG"
-    rm -rf "$XMLSRC" "$NETDEPS"
+    rm -rf "$XMLSRC"
     git clone -q --depth 1 --branch "$LIBXML2_TAG" https://github.com/GNOME/libxml2.git "$XMLSRC"
     cmake -S "$XMLSRC" -B "$XMLSRC/_build" -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$NETDEPS" -DCMAKE_INSTALL_LIBDIR=lib \
@@ -90,6 +96,36 @@ if [ ! -f "$NETDEPS/lib/libxml2.a" ]; then
     cmake --build "$XMLSRC/_build" -j"$(nproc)" >/dev/null
     cmake --install "$XMLSRC/_build" >/dev/null
 fi
+# --- mbedTLS + libsrt, static + PIC (srt://, #198) ------------------------------
+# SRT links only libmbedcrypto (AES, PBKDF2, CTR-DRBG) for passphrase streams.
+if [ ! -f "$NETDEPS/lib/libmbedcrypto.a" ]; then
+    MBSRC="/tmp/mbedtls-src-$MBEDTLS_TAG"
+    rm -rf "$MBSRC"
+    git clone -q --depth 1 --branch "$MBEDTLS_TAG" --recurse-submodules --shallow-submodules \
+        https://github.com/Mbed-TLS/mbedtls.git "$MBSRC"
+    cmake -S "$MBSRC" -B "$MBSRC/_build" -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="$NETDEPS" -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DUSE_SHARED_MBEDTLS_LIBRARY=OFF \
+        -DENABLE_PROGRAMS=OFF -DENABLE_TESTING=OFF -DMBEDTLS_FATAL_WARNINGS=OFF >/dev/null
+    cmake --build "$MBSRC/_build" -j"$(nproc)" >/dev/null
+    cmake --install "$MBSRC/_build" >/dev/null
+fi
+if [ ! -f "$NETDEPS/lib/libsrt.a" ]; then
+    SRTSRC="/tmp/srt-src-$SRT_TAG"
+    rm -rf "$SRTSRC"
+    git clone -q --depth 1 --branch "$SRT_TAG" https://github.com/Haivision/srt.git "$SRTSRC"
+    cmake -S "$SRTSRC" -B "$SRTSRC/_build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DCMAKE_INSTALL_PREFIX="$NETDEPS" -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DENABLE_SHARED=OFF -DENABLE_STATIC=ON \
+        -DENABLE_APPS=OFF -DENABLE_ENCRYPTION=ON -DUSE_ENCLIB=mbedtls \
+        -DSSL_INCLUDE_DIRS="$NETDEPS/include" -DSSL_LIBRARY_DIRS="$NETDEPS/lib" \
+        -DSSL_LIBRARIES=mbedcrypto >/dev/null
+    cmake --build "$SRTSRC/_build" -j"$(nproc)" >/dev/null
+    cmake --install "$SRTSRC/_build" >/dev/null
+fi
+# Static-only dir: drop any shared object an install step left, so -L resolves to .a.
+rm -f "$NETDEPS"/lib/*.so*
+
 mkdir -p "$NETDEPS/pc"
 cat > "$NETDEPS/pc/libxml-2.0.pc" <<EOF
 Name: libXML
@@ -97,6 +133,13 @@ Description: libxml2 (static, for the dash demuxer)
 Version: ${LIBXML2_TAG#v}
 Cflags: -I$NETDEPS/include -I$NETDEPS/include/libxml2
 Libs: -L$NETDEPS/lib -lxml2 -lm
+EOF
+cat > "$NETDEPS/pc/srt.pc" <<EOF
+Name: srt
+Description: libsrt (static, mbedTLS crypto)
+Version: ${SRT_TAG#v}
+Cflags: -I$NETDEPS/include
+Libs: -L$NETDEPS/lib -lsrt -lmbedcrypto -lstdc++ -lpthread -lm
 EOF
 export PKG_CONFIG_PATH="$NETDEPS/pc:$PKG_CONFIG_PATH"
 
@@ -119,8 +162,8 @@ rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
   --disable-avdevice --disable-avfilter \
   --enable-network --disable-autodetect --disable-debug \
   --enable-swscale --enable-swresample \
-  --enable-zlib --enable-libxml2 \
-  --enable-protocol=file,pipe,tcp,udp,rtp,http,rtmp,hls,crypto,data \
+  --enable-zlib --enable-libxml2 --enable-libsrt \
+  --enable-protocol=file,pipe,tcp,udp,rtp,http,rtmp,hls,crypto,data,libsrt \
   --enable-demuxer=mov,matroska,mpegts,avi,flv,live_flv,rtsp,rtp,sdp,hls,dash,wav,flac,ogg,mp3,aac,ac3,eac3,mjpeg,image2,image2pipe,h264,hevc,av1,m4v,mxf,image_dpx_pipe,image_exr_pipe \
   --enable-decoder=h264,hevc,av1,vp9,vp8,mpeg4,mpeg2video,mpeg1video,mjpeg,png,bmp,tiff,webp,gif,prores,dnxhd,exr,dpx,aac,aac_latm,mp3,ac3,eac3,flac,opus,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8 \
   --enable-parser=h264,hevc,av1,vp9,vp8,mpeg4video,mpegvideo,aac,aac_latm,ac3,flac,opus,vorbis,mjpeg,png \
@@ -135,7 +178,7 @@ for want in CONFIG_VAAPI CONFIG_NVDEC CONFIG_H264_VAAPI_HWACCEL CONFIG_HEVC_NVDE
             CONFIG_NETWORK CONFIG_RTSP_DEMUXER CONFIG_HLS_DEMUXER CONFIG_UDP_PROTOCOL CONFIG_HTTP_PROTOCOL \
             CONFIG_EXR_DECODER CONFIG_PNG_DECODER CONFIG_DPX_DECODER CONFIG_PRORES_DECODER CONFIG_DNXHD_DECODER \
             CONFIG_MXF_DEMUXER CONFIG_IMAGE_EXR_PIPE_DEMUXER CONFIG_IMAGE_DPX_PIPE_DEMUXER \
-            CONFIG_LIBXML2 CONFIG_DASH_DEMUXER; do
+            CONFIG_LIBXML2 CONFIG_DASH_DEMUXER CONFIG_LIBSRT CONFIG_LIBSRT_PROTOCOL; do
     # (component switches live in config_components.h on FFmpeg >= 6). grep the files
     # directly: `cat ... | grep -q` under pipefail fails when grep -q exits on an early
     # match and cat dies of SIGPIPE (CONFIG_LIBXML2 sits near the top of config.h).
