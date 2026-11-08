@@ -253,7 +253,8 @@ and **Stop live** in the same menu ends it. Audio in a stream is ignored for now
 | `udp://` / `rtp://` | MPEG-TS over UDP (unicast or multicast, `udp://@239.0.0.1:1234`). |
 | `http://` / `https://` | progressive MPEG-TS / FLV / fragmented MP4. |
 | `*.m3u8` | HLS, local or remote. Its latency is the playlist's (seconds), not the player's. |
-| `srt://` | **not supported** (needs libsrt); refused with a message. |
+| `*.mpd` | MPEG-DASH, VOD or live (dynamic MPD), local or remote (#195). Like HLS, its latency is the manifest's. Of several video representations FFmpeg's best-stream pick takes the highest bitrate. Windows and Linux builds; the macOS build's Homebrew FFmpeg has no DASH demuxer and says so. |
+| `srt://` | SRT (#198), caller by default: `srt://host:9000`. Options go in the query and are FFmpeg's libsrt ones: `mode=caller\|listener`, `streamid=…` (for example a media server's `read:<path>`), `passphrase=…` (AES; redacted in logs and `get_status`) and `latency=` in **microseconds** (`latency=200000` = 200 ms; libsrt's default is 120 ms). As a listener (`srt://0.0.0.0:9000?mode=listener`) the player waits up to 30 s for the sender. Windows and Linux builds; the macOS build's Homebrew FFmpeg has no libsrt and answers "Protocol not found". |
 
 **Latency.** Demuxing runs with `fflags=nobuffer`, a 0.5 s `max_delay`, a small probe
 (1 MB / 1.5 s, enough for a 4K SPS/PPS + IDR) and a low-delay decoder. The player adds
@@ -262,10 +263,10 @@ use a zerolatency tune and a short keyframe interval (`-g 30`). The first pictur
 the next keyframe.
 
 **Reconnect.** A stream that stops (the sender is killed or the network drops) is detected
-after 5 s without data (15 s for HLS). The pill turns amber (RECONNECTING) and the player
+after 5 s without data (15 s for HLS and DASH). The pill turns amber (RECONNECTING) and the player
 retries with a 1, 2, 4, 8 s backoff (capped) until the stream is back. The last picture
 stays up in the meantime. A URL that never connects gives up after three attempts
-(connect budget 8 s each) and returns to the idle screen with the error.
+(connect budget 8 s each; 15 s for HLS, 30 s for DASH, which fetches a first segment of every representation while opening) and returns to the idle screen with the error.
 
 While streaming, the top bar shows `STREAM host · fps · Mbit/s`: a blue dot while streaming,
 amber while connecting, reconnecting or frozen, grey once the stream has failed. The

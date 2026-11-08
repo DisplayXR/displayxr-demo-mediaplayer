@@ -2,7 +2,7 @@
 //
 // Unit tests for the stream-URL classifier (#93): which strings open as a live
 // network stream, which are plain files (Windows drive letters, file://, relative
-// paths), which network schemes are rejected (srt://), plus the host / redaction
+// paths), which network schemes are rejected (ftp://), plus the host / redaction
 // helpers the HUD and get_status use. Pure string work: no FFmpeg, no network.
 
 #include "media/StreamUrl.h"
@@ -61,14 +61,41 @@ void TestHls() {
     ExpectClass("C:\\streams\\m3u8.mp4", UrlClass::File);
 }
 
+void TestDash() {
+    ExpectClass("https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd", UrlClass::Live);
+    ExpectClass("https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.MPD?x=1#t", UrlClass::Live);
+    ExpectClass("http://127.0.0.1:8080/live/manifest.mpd", UrlClass::Live);
+    // A local DASH manifest is played as a live stream too (segments may be remote).
+    ExpectClass("C:\\streams\\live.mpd", UrlClass::Live);
+    ExpectClass("/home/me/dash/Manifest.mpd", UrlClass::Live);
+    ExpectClass("file:///C:/streams/live.mpd", UrlClass::Live);
+    CHECK(IsNetworkUrl("/home/me/dash/Manifest.mpd"), "local .mpd routes to the stream loader");
+    CHECK(UrlHost("/home/me/dash/Manifest.mpd") == "Manifest.mpd", "bare .mpd host is its name");
+    ExpectClass("C:\\streams\\mpd.mp4", UrlClass::File);
+    ExpectClass("/home/me/clip.mpd.mp4", UrlClass::File);
+    CHECK(mp::stream::IsDashPath("x/a.MPD?q"), "IsDashPath ignores case + query");
+    CHECK(!mp::stream::IsDashPath("x/a.m3u8"), "an HLS path is not DASH");
+    CHECK(mp::stream::IsManifestPath("x/a.m3u8") && mp::stream::IsManifestPath("x/a.mpd"),
+          "both are manifests");
+}
+
+void TestSrt() {
+    for (const char* u : {"srt://127.0.0.1:9000", "srt://127.0.0.1:9000?mode=caller",
+                          "srt://:9001?mode=listener", "SRT://HOST:1/",
+                          "srt://127.0.0.1:8890?streamid=read:test&latency=200000"}) {
+        ExpectClass(u, UrlClass::Live);
+        CHECK(IsNetworkUrl(u), u);
+    }
+    CHECK(ClassifyUrl("srt://h:1").scheme == "srt", "srt scheme");
+    CHECK(UrlHost("srt://127.0.0.1:8890?streamid=read:test") == "127.0.0.1:8890",
+          "srt host strips the query");
+}
+
 void TestRejected() {
-    const auto v = ClassifyUrl("srt://127.0.0.1:9000?mode=caller");
-    CHECK(v.cls == UrlClass::Unsupported, "srt is rejected");
-    CHECK(v.reason.find("SRT") != std::string::npos, "srt reason names SRT");
-    CHECK(IsNetworkUrl("srt://x:1"), "srt is still a network URL (routed, then rejected)");
     const auto f = ClassifyUrl("ftp://example.com/a.ts");
     CHECK(f.cls == UrlClass::Unsupported, "ftp is rejected");
     CHECK(!f.reason.empty(), "ftp reason is set");
+    CHECK(IsNetworkUrl("ftp://x/a"), "ftp is still a network URL (routed, then rejected)");
 }
 
 void TestFiles() {
@@ -94,6 +121,16 @@ void TestHostAndRedact() {
     CHECK(RedactUrl("rtsp://admin@cam/live") == "rtsp://admin@cam/live", "user-only unchanged");
     CHECK(RedactUrl("udp://127.0.0.1:5004") == "udp://127.0.0.1:5004", "no credentials unchanged");
     CHECK(RedactUrl("http://h:80/a@b") == "http://h:80/a@b", "'@' in the path is not userinfo");
+    CHECK(RedactUrl("srt://h:9000?mode=caller&passphrase=s3cr3t-key&latency=200000") ==
+              "srt://h:9000?mode=caller&passphrase=***&latency=200000",
+          "srt passphrase redacted, other params kept");
+    CHECK(RedactUrl("srt://h:9000?PASSPHRASE=abc#x") == "srt://h:9000?PASSPHRASE=***#x",
+          "case-insensitive key, fragment kept");
+    CHECK(RedactUrl("srt://h:9000?passphrase=") == "srt://h:9000?passphrase=", "empty value");
+    CHECK(RedactUrl("rtsp://u:p@cam/x?pass=1&a=2") == "rtsp://u:***@cam/x?pass=***&a=2",
+          "userinfo and query both");
+    CHECK(RedactUrl("srt://h:1?streamid=read:test") == "srt://h:1?streamid=read:test",
+          "non-secret query unchanged");
 }
 
 }  // namespace
@@ -101,6 +138,8 @@ void TestHostAndRedact() {
 int main() {
     TestLiveSchemes();
     TestHls();
+    TestDash();
+    TestSrt();
     TestRejected();
     TestFiles();
     TestHostAndRedact();

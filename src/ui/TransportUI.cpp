@@ -311,7 +311,7 @@ void UrlPopup(TransportState& s, const TransportActions& a) {
     if (!ImGui::BeginPopupModal(kTitle, nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
         return;
-    ImGui::TextUnformatted("rtsp:// rtmp:// udp:// rtp:// http(s):// or .m3u8");
+    ImGui::TextUnformatted("rtsp:// rtmp:// srt:// udp:// rtp:// http(s):// .m3u8 or .mpd");
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 30.0f);
     bool connect = ImGui::InputText("##url", s.urlBuf, sizeof(s.urlBuf),
