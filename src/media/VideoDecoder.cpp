@@ -13,6 +13,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -131,6 +133,55 @@ static float StreamPeakNits(const AVStream* st) {
 #endif
 }
 
+// DASH live (#197): FFmpeg's dash demuxer computes the newest segment of a $Number$
+// template from the wall clock and asks for it as soon as it is reached, often a
+// segment before the server has it (HTTP 425 Too Early / 404). On that failure it does
+// not wait: it moves to the NEXT number and asks again at once, so a reader that keeps
+// up with the live edge runs ahead of the stream, skips segments and, after a few
+// failures in a row, ends it. This io_open wrapper (installed for DASH sources only)
+// retries such a segment for a while instead, so the demuxer waits at the live edge.
+namespace {
+using IoOpenFn = int (*)(AVFormatContext*, AVIOContext**, const char*, int, AVDictionary**);
+struct SegmentIoHook {
+    IoOpenFn def = nullptr;     // FFmpeg's own io_open
+    std::string manifest;       // never retried: a bad manifest URL fails at once
+};
+constexpr int kSegmentRetryMs = 8000;   // a few segment durations at most
+
+int SegmentIoOpen(AVFormatContext* s, AVIOContext** pb, const char* url, int flags,
+                  AVDictionary** opts) {
+    auto* hook = static_cast<SegmentIoHook*>(s->opaque);
+    const bool retryable = !(flags & AVIO_FLAG_WRITE) && url && hook->manifest != url;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(kSegmentRetryMs);
+    int waited = 0;
+    for (;;) {
+        AVDictionary* tmp = nullptr;
+        if (opts && *opts) av_dict_copy(&tmp, *opts, 0);
+        const int r = hook->def(s, pb, url, flags, &tmp);
+        const bool early = r == AVERROR_HTTP_NOT_FOUND || r == AVERROR_HTTP_OTHER_4XX;
+        if (r >= 0 || !retryable || !early || std::chrono::steady_clock::now() >= until) {
+            if (opts) {
+                av_dict_free(opts);
+                *opts = tmp;   // what the open left unconsumed, as io_open's contract says
+            } else {
+                av_dict_free(&tmp);
+            }
+            if (r >= 0 && waited)
+                LOG_DEBUG("VideoDecoder: DASH segment available after %d ms: %s", waited, url);
+            return r;
+        }
+        av_dict_free(&tmp);
+        // Not there yet: wait in short steps (Stop() / the read deadline cut it short).
+        for (int i = 0; i < 10; ++i) {
+            if (s->interrupt_callback.callback && s->interrupt_callback.callback(s->interrupt_callback.opaque))
+                return AVERROR_EXIT;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            waited += 25;
+        }
+    }
+}
+}  // namespace
+
 struct VideoDecoder::Impl {
     AVFormatContext* fmt = nullptr;
     AVCodecContext* codec = nullptr;
@@ -141,6 +192,7 @@ struct VideoDecoder::Impl {
     enum AVPixelFormat hwPixFmt = AV_PIX_FMT_NONE;  // the decoder's GPU surface format
     HwFormatHook hook;                          // ctx->opaque for the get_format callback
     int videoStream = -1;
+    SegmentIoHook segIo;                        // DASH live segment retry (#197)
     int swsW = 0, swsH = 0, swsFmt = -1;        // cached sws source params (fallback)
     // Pro float (EXR) path: -> GBRPF32 (when needed), then sRGB-encoded BT.709 P016.
     SwsContext* swsF = nullptr;
@@ -1430,7 +1482,7 @@ const char* VideoDecoder::StreamStateName(StreamState s) {
 
 int VideoDecoder::InterruptCallback(void* self) {
     auto* d = static_cast<VideoDecoder*>(self);
-    if (d->stop_.load()) return 1;
+    if (d->stop_.load() || d->segAbort_.load()) return 1;
     const int64_t dl = d->ioDeadlineNs_.load();
     return (dl != 0 && SteadyNowNs() > dl) ? 1 : 0;
 }
@@ -1476,6 +1528,12 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
     impl_->fmt = avformat_alloc_context();
     impl_->fmt->interrupt_callback.callback = &VideoDecoder::InterruptCallback;
     impl_->fmt->interrupt_callback.opaque = this;
+    if (stream::IsDashPath(streamUrl_)) {
+        impl_->segIo.def = impl_->fmt->io_open;
+        impl_->segIo.manifest = streamUrl_;
+        impl_->fmt->opaque = &impl_->segIo;
+        impl_->fmt->io_open = &SegmentIoOpen;
+    }
 
     // Low-latency demux. Unknown keys are simply left unconsumed by protocols/demuxers
     // that don't have them, so one dictionary serves every scheme.
@@ -1647,57 +1705,69 @@ void VideoDecoder::LiveLoop(const std::function<double(void*)>& fill, double& ti
             }
             bool gotFrame = false;
             auto winStart = clock::now();
-            uint64_t winFrames = 0, winBytes = 0;
-            for (;;) {
-                if (stop_.load()) break;
-                ioDeadlineNs_.store(SteadyNowNs() + readTimeoutNs);
-                const int r = av_read_frame(impl_->fmt, pkt);
-                if (r < 0) {
-                    if (stop_.load()) break;
-                    err = (r == AVERROR_EOF) ? "stream ended"
-                          : (r == AVERROR_EXIT) ? "no data for 5 s"
-                                                : AvErrorText(r);
-                    break;
+            uint64_t winFrames = 0;
+            std::atomic<uint64_t> winBytes{0};
+            // One decoded frame -> the ring + the session stats. `pts` < 0 = unknown.
+            auto publish = [&](AVFrame* f, double pts) {
+                if (pts >= 0.0) positionSec_.store(pts);
+                const bool overwrote = ring_.Publish();
+                ++winFrames;
+                std::lock_guard<std::mutex> lk(statsMutex_);
+                ++stats_.frames;
+                if (overwrote) ++stats_.dropped;
+                stats_.width = f->width;
+                stats_.height = f->height;
+                stats_.backend = hwName_;  // PickHwFormat may fall back per frame
+                if (!gotFrame) {
+                    gotFrame = true;
+                    stats_.connectMs =
+                        std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+                    stats_.lastError.clear();
+                    if (everStreamed) ++stats_.reconnects;
+                    everStreamed = true;
+                    backoffSec = 1;
+                    width_ = f->width;
+                    height_ = f->height;
+                    streamState_.store(StreamState::Streaming);
                 }
-                winBytes += (uint64_t)pkt->size;
-                if (pkt->stream_index == impl_->videoStream &&
-                    avcodec_send_packet(impl_->codec, pkt) == 0) {
-                    while (!stop_.load() && ReceiveFrame(frame) == 0) {
-                        const double pts = fill(frame);
-                        if (pts <= -2.0) continue;  // hw download failed: dropped
-                        if (pts >= 0.0) positionSec_.store(pts);
-                        const bool overwrote = ring_.Publish();
-                        ++winFrames;
-                        std::lock_guard<std::mutex> lk(statsMutex_);
-                        ++stats_.frames;
-                        if (overwrote) ++stats_.dropped;
-                        stats_.width = frame->width;
-                        stats_.height = frame->height;
-                        stats_.backend = hwName_;  // PickHwFormat may fall back per frame
-                        if (!gotFrame) {
-                            gotFrame = true;
-                            stats_.connectMs =
-                                std::chrono::duration<double, std::milli>(clock::now() - t0)
-                                    .count();
-                            stats_.lastError.clear();
-                            if (everStreamed) ++stats_.reconnects;
-                            everStreamed = true;
-                            backoffSec = 1;
-                            width_ = frame->width;
-                            height_ = frame->height;
-                            streamState_.store(StreamState::Streaming);
-                        }
-                    }
-                }
-                av_packet_unref(pkt);
-                const double winSec =
-                    std::chrono::duration<double>(clock::now() - winStart).count();
+            };
+            auto updateWindow = [&] {
+                const double winSec = std::chrono::duration<double>(clock::now() - winStart).count();
                 if (winSec >= 1.0) {
                     std::lock_guard<std::mutex> lk(statsMutex_);
                     stats_.fpsIn = (float)(winFrames / winSec);
-                    stats_.kbps = (float)(winBytes * 8.0 / 1000.0 / winSec);
+                    stats_.kbps = (float)(winBytes.exchange(0) * 8.0 / 1000.0 / winSec);
                     winStart = clock::now();
-                    winFrames = winBytes = 0;
+                    winFrames = 0;
+                }
+            };
+            if (hls) {
+                SegmentedPlayback(frame, fill, readTimeoutNs, publish, updateWindow, winBytes, err);
+            } else {
+                // Push protocols (RTSP / SRT / UDP / RTMP): frames arrive at the source
+                // rate, so each one is shown as soon as it decodes (lowest latency).
+                for (;;) {
+                    if (stop_.load()) break;
+                    ioDeadlineNs_.store(SteadyNowNs() + readTimeoutNs);
+                    const int r = av_read_frame(impl_->fmt, pkt);
+                    if (r < 0) {
+                        if (stop_.load()) break;
+                        err = (r == AVERROR_EOF) ? "stream ended"
+                              : (r == AVERROR_EXIT) ? "no data for 5 s"
+                                                    : AvErrorText(r);
+                        break;
+                    }
+                    winBytes += (uint64_t)pkt->size;
+                    if (pkt->stream_index == impl_->videoStream &&
+                        avcodec_send_packet(impl_->codec, pkt) == 0) {
+                        while (!stop_.load() && ReceiveFrame(frame) == 0) {
+                            const double pts = fill(frame);
+                            if (pts <= -2.0) continue;  // hw download failed: dropped
+                            publish(frame, pts);
+                        }
+                    }
+                    av_packet_unref(pkt);
+                    updateWindow();
                 }
             }
             ioDeadlineNs_.store(0);
@@ -1729,6 +1799,191 @@ void VideoDecoder::LiveLoop(const std::function<double(void*)>& fill, double& ti
     av_packet_free(&pkt);
 }
 
+// Segmented sources (#197). HLS / DASH hand over a whole segment (2-6 s of media) per
+// download, and the decoder turns it into frames far faster than real time. Shown as
+// they decode, a VOD played several times too fast and a live stream arrived in bursts
+// with a frozen picture between them, the ring overwriting most frames either way.
+//
+// So the demuxer runs on its own thread, ahead of the picture, into a bounded packet
+// queue (compressed data: a few MB; it keeps fetching segments while the picture waits),
+// and this thread decodes and shows each frame when a wall clock anchored on the first
+// frame reaches its PTS, as file playback does without audio. The clock re-anchors on a
+// timestamp discontinuity (a jump either way) and after a stall: a frame that arrives
+// more than kLateSec after its time (the queue ran dry: the network is slower than the
+// stream) is shown at once and counted in stats_.stalls; playback then resumes only once
+// kRebufferSec of media is queued again, so one slow segment is one pause, not a stutter.
+void VideoDecoder::SegmentedPlayback(::AVFrame* frame,
+                                     const std::function<double(void*)>& fill,
+                                     int64_t readTimeoutNs,
+                                     const std::function<void(::AVFrame*, double)>& publish,
+                                     const std::function<void()>& tick,
+                                     std::atomic<uint64_t>& winBytes, std::string& err) {
+    using clock = std::chrono::steady_clock;
+    constexpr double kQueueSec = 10.0;      // demux at most this far ahead of the picture
+    constexpr int64_t kQueueBytes = 96LL << 20;
+    constexpr double kRebufferSec = 1.0;    // queued media needed to resume after a stall
+    constexpr double kLateSec = 0.25;       // later than this: a stall, re-anchor
+    constexpr double kJumpSec = 2.0;        // PTS this far off the clock: a discontinuity
+
+    const double fps = frameRate_ > 0.0 ? frameRate_ : 30.0;
+    const size_t maxPackets = (size_t)std::max(120.0, fps * kQueueSec);
+    const size_t rebufferPackets = (size_t)std::max(1.0, fps * kRebufferSec);
+
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<AVPacket*> q;
+    int64_t qBytes = 0;
+    bool demuxDone = false;   // EOF / error / abort: no more packets will come
+    std::string demuxErr;
+    segAbort_.store(false);
+
+    std::thread demux([&] {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] {
+                    return stop_.load() || segAbort_.load() ||
+                           (q.size() < maxPackets && qBytes < kQueueBytes);
+                });
+                if (stop_.load() || segAbort_.load()) break;
+            }
+            AVPacket* p = av_packet_alloc();
+            ioDeadlineNs_.store(SteadyNowNs() + readTimeoutNs);
+            const int r = av_read_frame(impl_->fmt, p);
+            ioDeadlineNs_.store(0);
+            if (r < 0) {
+                av_packet_free(&p);
+                std::lock_guard<std::mutex> lk(m);
+                if (!stop_.load() && !segAbort_.load())
+                    demuxErr = (r == AVERROR_EOF) ? "stream ended"
+                               : (r == AVERROR_EXIT) ? "no data for 15 s"
+                                                     : AvErrorText(r);
+                break;
+            }
+            winBytes += (uint64_t)p->size;
+            if (p->stream_index != impl_->videoStream) {
+                av_packet_free(&p);
+                continue;
+            }
+            std::lock_guard<std::mutex> lk(m);
+            qBytes += p->size;
+            q.push_back(p);
+            cv.notify_all();
+        }
+        std::lock_guard<std::mutex> lk(m);
+        demuxDone = true;
+        cv.notify_all();
+    });
+
+    bool anchored = false;
+    clock::time_point anchorWall;
+    double anchorPts = 0.0, prevPts = -1.0;
+    bool rebuffering = false;   // after a stall: wait for kRebufferSec of media
+    bool drained = false;       // sent the decoder its flush packet after the last packet
+    uint64_t stalls = 0, discontinuities = 0;
+
+    // Sleep until `due` in short steps (Stop() cuts it short).
+    auto waitUntil = [&](clock::time_point due) {
+        while (!stop_.load()) {
+            const auto left = due - clock::now();
+            if (left <= clock::duration::zero()) return;
+            std::this_thread::sleep_for(std::min<clock::duration>(left, std::chrono::milliseconds(10)));
+        }
+    };
+    // Show a decoded frame at its PTS on the anchored wall clock.
+    auto present = [&](double pts) {
+        if (pts >= 0.0) {
+            const auto now = clock::now();
+            if (anchored) {
+                const double ahead = (pts - anchorPts) - std::chrono::duration<double>(now - anchorWall).count();
+                if (pts < prevPts - 0.5 || ahead > kJumpSec) {
+                    anchored = false;  // timestamps jumped (segment discontinuity, wrap)
+                    ++discontinuities;
+                    LOG_INFO("VideoDecoder: segmented source: PTS jump %.3f -> %.3f s, clock re-anchored",
+                             prevPts, pts);
+                } else if (-ahead > kLateSec) {
+                    anchored = false;  // the network fell behind: show now, count the stall
+                    ++stalls;
+                    std::lock_guard<std::mutex> lk(statsMutex_);
+                    stats_.stalls = stalls;
+                }
+            }
+            if (!anchored) {
+                anchored = true;
+                anchorWall = now;
+                anchorPts = pts;
+            } else {
+                waitUntil(anchorWall + std::chrono::duration_cast<clock::duration>(
+                                           std::chrono::duration<double>(pts - anchorPts)));
+            }
+            prevPts = pts;
+        }
+        return !stop_.load();
+    };
+
+    while (!stop_.load()) {
+        AVPacket* p = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(m);
+            if (q.empty() && !demuxDone && anchored) rebuffering = true;  // ran dry
+            cv.wait_for(lk, std::chrono::milliseconds(50), [&] {
+                if (stop_.load() || demuxDone) return true;
+                return rebuffering ? q.size() >= rebufferPackets : !q.empty();
+            });
+            if (stop_.load()) break;
+            if (rebuffering && !demuxDone && q.size() < rebufferPackets) {
+                lk.unlock();
+                tick();
+                continue;
+            }
+            rebuffering = false;
+            if (!q.empty()) {
+                p = q.front();
+                q.pop_front();
+                qBytes -= p->size;
+                cv.notify_all();
+            } else if (demuxDone) {
+                if (drained) {
+                    err = demuxErr.empty() ? std::string("stream ended") : demuxErr;
+                    break;
+                }
+            } else {
+                lk.unlock();
+                tick();
+                continue;
+            }
+        }
+        // p == nullptr here means: the demuxer is done, flush the decoder's last frames.
+        const int sent = avcodec_send_packet(impl_->codec, p);
+        if (!p) drained = true;
+        if (p) av_packet_free(&p);
+        if (sent == 0 || !p) {
+            while (!stop_.load() && ReceiveFrame(frame) == 0) {
+                const double pts = fill(frame);
+                if (pts <= -2.0) continue;  // hw download failed: dropped
+                if (!present(pts)) break;
+                publish(frame, pts);
+                tick();
+            }
+        }
+        tick();
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(m);
+        segAbort_.store(true);
+        cv.notify_all();
+    }
+    demux.join();  // av_read_frame is interrupted by segAbort_ (InterruptCallback)
+    segAbort_.store(false);
+    for (AVPacket* left : q) av_packet_free(&left);
+    q.clear();
+    if (stalls || discontinuities)
+        LOG_INFO("VideoDecoder: segmented source: %llu stall(s), %llu PTS discontinuit%s",
+                 (unsigned long long)stalls, (unsigned long long)discontinuities,
+                 discontinuities == 1 ? "y" : "ies");
+}
+
 #else  // !MEDIAPLAYER_WITH_FFMPEG
 
 struct VideoDecoder::Impl {};
@@ -1748,6 +2003,9 @@ bool VideoDecoder::OpenLive(const std::string&) {
 const char* VideoDecoder::StreamStateName(StreamState) { return "idle"; }
 VideoDecoder::StreamStats VideoDecoder::GetStreamStats() const { return StreamStats{}; }
 void VideoDecoder::LiveLoop(const std::function<double(void*)>&, double&) {}
+void VideoDecoder::SegmentedPlayback(::AVFrame*, const std::function<double(void*)>&, int64_t,
+                                     const std::function<void(::AVFrame*, double)>&,
+                                     const std::function<void()>&, std::atomic<uint64_t>&, std::string&) {}
 bool VideoDecoder::OpenLiveInput(std::string&, bool&) { return false; }
 bool VideoDecoder::OpenVideoCodec(const void*, const std::string&) { return false; }
 int VideoDecoder::InterruptCallback(void*) { return 0; }

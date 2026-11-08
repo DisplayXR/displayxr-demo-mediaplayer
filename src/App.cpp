@@ -2364,10 +2364,10 @@ void App::PollStream() {
             if (streamLogAt_ > 0.0) {
                 const VideoDecoder::StreamStats ss = video_.GetStreamStats();
                 LOG_INFO("Stream: %s %dx%d in %.1f fps %.0f kbit/s, panel %.0f fps, frames=%llu "
-                         "dropped=%llu reconnects=%d, %s",
+                         "dropped=%llu stalls=%llu reconnects=%d, %s",
                          host.c_str(), ss.width, ss.height, ss.fpsIn, ss.kbps, fps_,
                          (unsigned long long)ss.frames, (unsigned long long)ss.dropped,
-                         ss.reconnects, LayoutLabel().c_str());
+                         (unsigned long long)ss.stalls, ss.reconnects, LayoutLabel().c_str());
             }
             streamLogAt_ = now + 5.0;
         }
@@ -3987,6 +3987,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
             out["stream_height"] = ss.height;
             out["stream_frames"] = ss.frames;
             out["stream_dropped"] = ss.dropped;
+            out["stream_stalls"] = ss.stalls;  // HLS / DASH: waits on the network (#197)
             out["stream_connect_ms"] = ss.connectMs;
             out["stream_codec"] = ss.codec;
             out["stream_backend"] = ss.backend;
