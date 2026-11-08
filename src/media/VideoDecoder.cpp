@@ -1404,6 +1404,16 @@ std::string LowerScheme(const std::string& url) {
 // gets the longer connect / read budgets and no tiny probe.
 bool IsSegmented(const std::string& url) { return stream::IsManifestPath(url); }
 
+// srt://...?mode=listener (case-insensitive): the player listens, the sender calls.
+bool IsSrtListener(const std::string& url) {
+    const size_t q = url.find('?');
+    if (q == std::string::npos) return false;
+    std::string query = url.substr(q + 1);
+    for (char& c : query) c = (char)std::tolower((unsigned char)c);
+    const size_t m = ("&" + query).find("&mode=listener");
+    return m != std::string::npos;
+}
+
 constexpr int64_t kSec = 1000000000LL;
 }  // namespace
 
@@ -1471,6 +1481,7 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
     // that don't have them, so one dictionary serves every scheme.
     const std::string scheme = LowerScheme(streamUrl_);
     const bool hls = IsSegmented(streamUrl_);
+    const bool srtListener = scheme == "srt" && IsSrtListener(streamUrl_);
     if (stream::IsDashPath(streamUrl_) && !av_find_input_format("dash")) {
         // An FFmpeg built without libxml2 has no dash demuxer and would only say
         // "Invalid data found" after downloading the manifest.
@@ -1498,6 +1509,12 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
         av_dict_set(&opts, "buffer_size", "16777216", 0);    // 4K I-frames arrive in bursts
         av_dict_set(&opts, "overrun_nonfatal", "1", 0);
         av_dict_set(&opts, "fifo_size", "1000000", 0);
+    } else if (scheme == "srt") {
+        // libsrt (#198). Its own options come from the URL query (mode=, latency= in
+        // MICROseconds, streamid=, passphrase=) and win over these defaults. A caller
+        // gets a 5 s socket I/O timeout; a listener must not have one, since libsrt
+        // would then also cap how long it waits for the sender to call in.
+        if (!srtListener) av_dict_set(&opts, "timeout", "5000000", 0);
     } else if (scheme == "http" || scheme == "https" || scheme == "tcp") {
         av_dict_set(&opts, "timeout", "5000000", 0);
         if (scheme != "tcp") {
@@ -1514,7 +1531,8 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
     // interrupts it at once through the callback).
     // DASH opens the init + first media segment of EVERY representation before it
     // returns (a 3-rung UHD ladder is several MB), so it gets the longest budget.
-    const int connectSec = stream::IsDashPath(streamUrl_) ? 30 : hls ? 15 : 8;
+    // An SRT listener waits for its sender to call in, so it gets the same 30 s.
+    const int connectSec = (stream::IsDashPath(streamUrl_) || srtListener) ? 30 : hls ? 15 : 8;
     ioDeadlineNs_.store(SteadyNowNs() + connectSec * kSec);
     int rc = avformat_open_input(&impl_->fmt, streamUrl_.c_str(), nullptr, &opts);
     av_dict_free(&opts);
