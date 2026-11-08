@@ -38,3 +38,33 @@ pcm_s16be,pcm_s24be,pcm_s32be,pcm_f32be,pcm_f64be,pcm_alaw,pcm_mulaw,adpcm_g722,
 FF_PARSERS=h264,hevc,av1,vp9,vp8,mpeg4video,mpegvideo,h263,vc1,vvc,apv,prores_raw,dnxhd,jpeg2000,mjpeg,png,aac,aac_latm,mpegaudio,ac3,dca,mlp,flac,opus,vorbis,amr,dolby_e
 
 FF_BSFS=h264_mp4toannexb,hevc_mp4toannexb,av1_frame_split,vp9_superframe,vp9_superframe_split,aac_adtstoasc,extract_extradata,mpeg4_unpack_bframes,null
+
+# Upstream FFmpeg fixes on top of the pinned FFMPEG_SHA: scripts/ffmpeg-patches/*.patch,
+# verbatim upstream commits that landed after the pin, applied in name order (a patch
+# already applied is skipped, so a reused source tree is fine). Drop each one when the
+# pin moves past it. Every CI cache key hashes the folder.
+#   0001 54f0296dfe avformat/hls: deduplicate playlists shared by multiple variants.
+#        A master that pairs every video variant with several audio groups (Apple's
+#        fMP4 reference stream: 8 video playlists x 3 audio groups) opened each video
+#        playlist 3 times: 28 streams instead of 12 and a 13-20 s open, at or past the
+#        player's 15 s HLS connect budget (#201).
+#   0002 055cc2024d avformat/hls: fix variant_bitrate on streams shared by multiple
+#        variants. Follow-up to 0001: a shared stream's variant_bitrate would be the
+#        last variant's, and the player picks the HLS representation by that tag.
+FF_PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ffmpeg-patches"
+ff_apply_patches() {   # <ffmpeg-src-dir>
+    local p
+    for p in "$FF_PATCH_DIR"/*.patch; do
+        [ -e "$p" ] || continue
+        if (cd "$1" && git apply --reverse --check "$p" 2>/dev/null); then
+            echo "ffmpeg patch already applied: $(basename "$p")"
+        else
+            # A CRLF checkout (git core.autocrlf on a Windows box) would not match the
+            # LF patch: give the files it touches LF endings first (MSVC takes either).
+            (cd "$1" && sed -n 's|^diff --git a/\([^ ]*\) .*|\1|p' "$p" | while IFS= read -r f; do
+                [ -f "$f" ] && perl -pi -e 's/\r$//' "$f"; done)
+            (cd "$1" && git apply "$p") || { echo "error: ffmpeg patch does not apply: $(basename "$p")" >&2; return 1; }
+            echo "ffmpeg patch applied: $(basename "$p")"
+        fi
+    done
+}

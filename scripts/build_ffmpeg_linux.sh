@@ -63,7 +63,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Demuxers / decoders / parsers / bsfs: the list every platform shares (#201).
 # shellcheck source=ffmpeg_components.sh
 . "$SCRIPT_DIR/ffmpeg_components.sh"
-SELF_HASH="$(cat "$0" "$SCRIPT_DIR/ffmpeg_components.sh" | sha256sum | cut -c1-16)"
+SELF_HASH="$(cat "$0" "$SCRIPT_DIR/ffmpeg_components.sh" "$SCRIPT_DIR"/ffmpeg-patches/*.patch | sha256sum | cut -c1-16)"
 STAMP="$FFMPEG_SHA $NVCODEC_TAG $LIBXML2_TAG $MBEDTLS_TAG $SRT_TAG $DAV1D_TAG $SELF_HASH"
 if [ -f "$PREFIX/.stamp" ] && [ "$(cat "$PREFIX/.stamp")" = "$STAMP" ]; then
     echo "==> slim FFmpeg cached at $PREFIX ($STAMP)"
@@ -178,6 +178,9 @@ if [ ! -f "$SRC/configure" ]; then
     git -C "$SRC" fetch -q --depth 1 origin "$FFMPEG_SHA"
     git -C "$SRC" checkout -q FETCH_HEAD
 fi
+
+# Upstream fixes on top of the pin (scripts/ffmpeg-patches, see ffmpeg_components.sh).
+ff_apply_patches "$SRC"
 
 BUILD="$SRC/_build-slim-linux"
 rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"

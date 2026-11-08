@@ -192,6 +192,9 @@ echo "netdeps=$NETDEPS_PREFIX (libxml2 $LIBXML2_TAG, mbedtls $MBEDTLS_TAG, srt $
 
 cd "$SRC"
 
+# Upstream fixes on top of the pin (scripts/ffmpeg-patches, see ffmpeg_components.sh).
+ff_apply_patches "$SRC"
+
 # configure (at the pinned commit and on master, 2026-09-30) hands compile-only
 # -D defines to the LINKER in test_ld, and since ~2024 it treats link.exe's
 # "LNK4044: unrecognized option" warning as a failed probe. The schannel probe

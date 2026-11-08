@@ -209,7 +209,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.FFMPEG_PREFIX }}
-          key: ffmpeg-slim-linux-2204-${{ hashFiles('scripts/build_ffmpeg_linux.sh', 'scripts/ffmpeg_components.sh') }}
+          key: ffmpeg-slim-linux-2204-${{ hashFiles('scripts/build_ffmpeg_linux.sh', 'scripts/ffmpeg_components.sh', 'scripts/ffmpeg-patches/*.patch') }}
 
       - name: Build + package the demo .deb
         if: needs.DetectChanges.outputs.docs_only != 'true'

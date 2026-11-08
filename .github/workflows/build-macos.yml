@@ -105,7 +105,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/ffmpeg-slim-macos
-          key: ffmpeg-slim-macos15-arm64-${{ hashFiles('scripts/build_ffmpeg_macos.sh', 'scripts/ffmpeg_components.sh') }}
+          key: ffmpeg-slim-macos15-arm64-${{ hashFiles('scripts/build_ffmpeg_macos.sh', 'scripts/ffmpeg_components.sh', 'scripts/ffmpeg-patches/*.patch') }}
 
       - name: Derive installer version
         if: needs.DetectChanges.outputs.docs_only != 'true'

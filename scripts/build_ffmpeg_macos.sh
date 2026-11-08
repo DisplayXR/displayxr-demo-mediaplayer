@@ -55,7 +55,7 @@ NCPU="$(sysctl -n hw.ncpu)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=ffmpeg_components.sh
 . "$SCRIPT_DIR/ffmpeg_components.sh"
-SELF_HASH="$(cat "$0" "$SCRIPT_DIR/ffmpeg_components.sh" | shasum -a 256 | cut -c1-16)"
+SELF_HASH="$(cat "$0" "$SCRIPT_DIR/ffmpeg_components.sh" "$SCRIPT_DIR"/ffmpeg-patches/*.patch | shasum -a 256 | cut -c1-16)"
 STAMP="$FFMPEG_SHA $LIBXML2_TAG $MBEDTLS_TAG $SRT_TAG $DAV1D_TAG $ARCH $MACOSX_DEPLOYMENT_TARGET $SELF_HASH"
 if [ -f "$PREFIX/.stamp" ] && [ "$(cat "$PREFIX/.stamp")" = "$STAMP" ]; then
     echo "==> slim FFmpeg cached at $PREFIX ($STAMP)"
@@ -161,6 +161,9 @@ if [ ! -f "$SRC/configure" ]; then
 fi
 
 # Demuxers / decoders / parsers / bsfs: the list every platform shares.
+# Upstream fixes on top of the pin (scripts/ffmpeg-patches, see ffmpeg_components.sh).
+ff_apply_patches "$SRC"
+
 BUILD="$SRC/_build-slim-macos"
 rm -rf "$BUILD" "$PREFIX"; mkdir -p "$BUILD"; cd "$BUILD"
 "$SRC/configure" \
