@@ -104,12 +104,17 @@ sphere and seen through a virtual camera window.
 
 - **Projections:** equirectangular half sphere (YouTube VR180) and full sphere (VR360), side by
   side or top-bottom, and dual fisheye (raw VR180 camera files, equidistant, lens FOV 180 by
-  default). Mono 360 / 180 pans in 2D.
-- **Detection:** MP4 / MOV spherical metadata (`sv3d` / `proj` / `equi`, with `st3d` for the
-  packing), then file-name tokens (`vr180`, `180`, `180x180`, `360`, `vr360`, `fisheye`, with
+  default), and 360 cubemaps: the 3x2 cubemap (FFmpeg v360 `c3x2`, Spherical Video V2 `cbmp`
+  layout 0, with its face padding) and the equi-angular cubemap (EAC, as YouTube streams 360
+  video; FFmpeg v360 `eac`), mono or stereo. Stereo cubemap / EAC uses the same cylindrical
+  window as stereo VR360 equirect. Mono 360 / 180 pans in 2D.
+- **Detection:** MP4 / MOV / MKV spherical metadata (`sv3d` / `proj` / `equi` or `cbmp`, with
+  `st3d` for the packing), then file-name tokens (`vr180`, `180`, `180x180`, `360`, `vr360`,
+  `fisheye`, `cubemap` / `c3x2`, `eac`, with
   `3dh` / `sbs` / `lr` and `3dv` / `tb` for the packing; a bare `180` / `360` only counts on a
-  frame of the right shape). **P** cycles the projection override (auto / flat / VR180 /
-  VR360 / fisheye); **L** still sets the packing. MCP: `set_layout {projection, fisheye_fov_deg}`.
+  frame of the right shape; a cubemap / EAC eye is 3:2). EAC carries no metadata FFmpeg reads
+  (YouTube marks it with an sv3d mesh), so it comes from the name or the override. **P**
+  cycles the projection override (auto / flat / VR180 / VR360 / fisheye / cubemap / EAC); **L** still sets the packing. MCP: `set_layout {projection, fisheye_fov_deg}`.
 - **Controls:** drag pans and tilts, the wheel zooms, **double-click** or **R** re-centres,
   the arrow keys pan in 5° steps (`[` / `]` step frames and PageUp / PageDown walk the folder
   meanwhile). MCP `get_view` / `set_view {yaw_deg, pitch_deg, fov_deg, recenter}`.
@@ -128,7 +133,7 @@ sphere and seen through a virtual camera window.
   range on synthetic scenes (≈0.003 px, against ~21 px for a naively rotated pair).
 - **Test media:** `tools/vr/make_vr_fixtures.py --assets DIR` renders synthetic VR180,
   dual-fisheye and VR360 stills and clips (needs numpy + ffmpeg). Headless:
-  `MEDIAPLAYER_VR=equirect180|equirect360|fisheye|flat`, `MEDIAPLAYER_VR_VIEW=yaw,pitch[,fov]`.
+  `MEDIAPLAYER_VR=equirect180|equirect360|fisheye|cubemap|eac|flat`, `MEDIAPLAYER_VR_VIEW=yaw,pitch[,fov]`.
 - Desktop only for now; Android touch control is a follow-up.
 
 ## Live camera (#90)

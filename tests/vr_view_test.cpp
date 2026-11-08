@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 using namespace mp;
@@ -401,9 +402,15 @@ void Clamps() {
 
 void Packing() {
     const uint32_t f = PackModeFlags(Projection::Fisheye, Model::Plane, StereoLayout::SbsHalf, true, 190.f);
-    CHECK(((f >> 8) & 3) == 3 && ((f >> 10) & 3) == 0 && ((f >> 12) & 3) == 1 && ((f >> 14) & 1) == 1 &&
-              ((f >> 16) & 511) == 190 && (f & 3) == 0,
+    CHECK(((f >> 8) & 7) == 3 && ((f >> 11) & 3) == 0 && ((f >> 13) & 3) == 1 && ((f >> 15) & 1) == 1 &&
+              ((f >> 16) & 511) == 190 && (f >> 25) == 0 && (f & 0xFF) == 0,
           "mode flags round trip (0x%08x)", f);
+    const uint32_t c = PackModeFlags(Projection::Eac, Model::Cylinder, StereoLayout::TbFull, false, 180.f, 100);
+    CHECK(((c >> 8) & 7) == 5 && ((c >> 11) & 3) == 1 && ((c >> 13) & 3) == 2 && ((c >> 15) & 1) == 0 &&
+              (c >> 25) == 100,
+          "cube mode flags: 3-bit projection, padding in bits 25-31 (0x%08x)", c);
+    CHECK((PackModeFlags(Projection::Cubemap, Model::Free, StereoLayout::Mono, false, 180.f, 999) >> 25) == 127,
+          "padding saturates at 127");
     CHECK(PackModeFlags(Projection::None, Model::Plane, StereoLayout::SbsFull, true, 180.f) == 0,
           "flat = no flags (the base player is unchanged)");
     const uint32_t h = PackHeading(Rad(-90.f));
@@ -433,8 +440,275 @@ void Detection() {
     CHECK(FromSpherical(0, 360.f) == Projection::Equirect360, "a full equirect");
     CHECK(FromSpherical(2, 0.f) == Projection::Equirect180, "half equirect");
     CHECK(FromSpherical(3, 0.f) == Projection::Fisheye, "fisheye");
-    CHECK(FromSpherical(9, 0.f) == Projection::None, "cubemap etc. unsupported");
+    CHECK(FromSpherical(4, 0.f) == Projection::Cubemap, "cubemap");
+    CHECK(FromSpherical(9, 0.f) == Projection::None, "rectilinear etc. unsupported");
     CHECK(ParseProjectionId("equirect360", p) && p == Projection::Equirect360 && !ParseProjectionId("cube", p), "ids");
+    // Cubemap / EAC: ids, names, hints, aspects.
+    for (Projection q : {Projection::None, Projection::Equirect180, Projection::Equirect360, Projection::Fisheye,
+                         Projection::Cubemap, Projection::Eac}) {
+        Projection back = Projection::Equirect180;
+        CHECK(ParseProjectionId(ProjectionId(q), back) && back == q, "id round trip %s", ProjectionId(q));
+    }
+    CHECK(ParseProjectionId("c3x2", p) && p == Projection::Cubemap, "c3x2 alias");
+    CHECK(std::string(ProjectionName(Projection::Cubemap)) == "360 cubemap" &&
+              std::string(ProjectionName(Projection::Eac)) == "360 EAC",
+          "HUD names");
+    CHECK(ProjectionFromFilename("city_cubemap.mp4", p, pk) && p == Projection::Cubemap && pk == -1, "_cubemap");
+    CHECK(ProjectionFromFilename("city_360_c3x2_TB.mp4", p, pk) && p == Projection::Cubemap && pk == 2, "_c3x2 TB");
+    CHECK(ProjectionFromFilename("yt_360_eac.webm", p, pk) && p == Projection::Eac && pk == -1, "_eac beats _360");
+    CHECK(ProjectionFromFilename("stage_eac_sbs.mp4", p, pk) && p == Projection::Eac && pk == 1, "_eac SBS");
+    CHECK(!ProjectionFromFilename("seac.mp4", p, pk), "eac only as a whole token");
+    for (Projection q : {Projection::Cubemap, Projection::Eac}) {
+        CHECK(PackingFromAspect(q, 1.5f) == StereoLayout::Mono, "cube 3:2 = mono");
+        CHECK(PackingFromAspect(q, 0.75f) == StereoLayout::TbFull, "cube 3:4 = TB");
+        CHECK(PackingFromAspect(q, 3.0f) == StereoLayout::SbsFull, "cube 3:1 = SBS");
+        CHECK(AspectPlausible(q, 1.5f) && AspectPlausible(q, 0.75f) && AspectPlausible(q, 3.0f) &&
+                  AspectPlausible(q, 3840.f / 2560.f) && !AspectPlausible(q, 2.0f),
+              "cube aspect plausibility");
+    }
+    CHECK(AspectPlausible(Projection::Eac, 1920.f / 1080.f) && !AspectPlausible(Projection::Cubemap, 1920.f / 1080.f),
+          "YouTube's 16:9 EAC frames are plausible EAC, not cubemap");
+    CHECK(PackingFromAspect(Projection::Eac, 1920.f / 1080.f) == StereoLayout::Mono, "16:9 EAC without st3d = mono");
+}
+
+// --- cubemap / EAC ----------------------------------------------------------------------
+//
+// The reference is FFmpeg's v360 filter, transcribed independently of VrView.h: its
+// pixel -> direction maps (cube3x2_to_xyz with the default face order "rludfb" and no
+// rotation; eac_to_xyz), in v360's y-DOWN frame, turned into this file's y-up frame.
+
+// v360 cube_to_xyz for direction `dir` (0 right, 1 left, 2 up, 3 down, 4 front, 5 back),
+// face coords (uf, vf) in [-1, 1]; returns y-up.
+void V360CubeToDir(int dir, float uf, float vf, float d[3]) {
+    float x = 0, y = 0, z = 0;  // v360: y down
+    switch (dir) {
+        case 0: x = 1.f; y = vf; z = -uf; break;
+        case 1: x = -1.f; y = vf; z = uf; break;
+        case 2: x = uf; y = -1.f; z = vf; break;
+        case 3: x = uf; y = 1.f; z = -vf; break;
+        case 4: x = uf; y = vf; z = 1.f; break;
+        default: x = -uf; y = vf; z = -1.f; break;
+    }
+    const float n = std::sqrt(x * x + y * y + z * z);
+    d[0] = x / n;
+    d[1] = -y / n;
+    d[2] = z / n;
+}
+
+// c3x2 pixel (i, j) of a W x H eye -> direction. padPx = padding on each face edge.
+void V360C3x2PixelDir(int i, int j, int W, int H, float padPx, float d[3]) {
+    const float ew = W / 3.f, eh = H / 2.f;
+    const int uFace = (int)std::floor(i / ew), vFace = (int)std::floor(j / eh);
+    const int uShift = (int)std::ceil(ew * uFace), vShift = (int)std::ceil(eh * vFace);
+    const int ewi = (int)std::ceil(ew * (uFace + 1)) - uShift, ehi = (int)std::ceil(eh * (vFace + 1)) - vShift;
+    const float sw = 1.f - 2.f * padPx / ew, sh = 1.f - 2.f * padPx / eh;
+    const float uf = ((2.f * (i - uShift) + 1.f) / ewi - 1.f) / sw;
+    const float vf = ((2.f * (j - vShift) + 1.f) / ehi - 1.f) / sh;
+    V360CubeToDir(uFace + 3 * vFace, uf, vf, d);
+}
+
+// v360 eac_to_xyz, verbatim but for the y flip. False on the 2-pixel margin (extrapolated).
+bool V360EacPixelDir(int i, int j, int W, int H, float d[3]) {
+    const float uPad = 2.f / W, vPad = 2.f / H;
+    float uf = (i + 0.5f) / W, vf = (j + 0.5f) / H;
+    uf = 3.f * (uf - uPad) / (1.f - 2.f * uPad);
+    int uFace;
+    bool margin = false;
+    if (uf < 0.f) { uFace = 0; uf -= 0.5f; margin = true; }
+    else if (uf >= 3.f) { uFace = 2; uf -= 2.5f; margin = true; }
+    else { uFace = (int)std::floor(uf); uf = std::fmod(uf, 1.f) - 0.5f; }
+    const int vFace = (int)std::floor(vf * 2.f);
+    vf = (vf - vPad - 0.5f * vFace) / (0.5f - 2.f * vPad) - 0.5f;
+    if (uf < -0.5f || uf >= 0.5f || vf < -0.5f || vf >= 0.5f) margin = true;
+    uf = (uf >= -0.5f && uf < 0.5f) ? std::tan(0.5f * kPi * uf) : 2.f * uf;
+    vf = (vf >= -0.5f && vf < 0.5f) ? std::tan(0.5f * kPi * vf) : 2.f * vf;
+    float x, y, z;
+    switch (uFace + 3 * vFace) {
+        case 0: x = -1.f; y = vf; z = uf; break;   // TOP_LEFT: left
+        case 1: x = uf; y = vf; z = 1.f; break;    // TOP_MIDDLE: front
+        case 2: x = 1.f; y = vf; z = -uf; break;   // TOP_RIGHT: right
+        case 3: x = -vf; y = 1.f; z = -uf; break;  // BOTTOM_LEFT: down
+        case 4: x = -vf; y = -uf; z = -1.f; break; // BOTTOM_MIDDLE: back
+        default: x = -vf; y = -1.f; z = uf; break; // BOTTOM_RIGHT: up
+    }
+    const float n = std::sqrt(x * x + y * y + z * z);
+    d[0] = x / n;
+    d[1] = -y / n;
+    d[2] = z / n;
+    return !margin;
+}
+
+void CubeFaceCentres() {
+    // Directions of the six faces, in VrView's y-up frame, and the cell each lands in.
+    const float dirs[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    const char* names[6] = {"right", "left", "up", "down", "front", "back"};
+    const int c3x2Cell[6] = {0, 1, 2, 3, 4, 5};  // right left up / down front back
+    const int eacCell[6] = {2, 0, 5, 3, 1, 4};   // left front right / down back up
+    for (int k = 0; k < 6; ++k) {
+        for (Projection p : {Projection::Cubemap, Projection::Eac}) {
+            const int cell = p == Projection::Eac ? eacCell[k] : c3x2Cell[k];
+            float u, v;
+            CHECK(DirToLocalUV(p, 0.f, 1.5f, dirs[k], u, v), "cube always has a picture");
+            const float eu = ((cell % 3) + 0.5f) / 3.f, ev = ((cell / 3) + 0.5f) / 2.f;
+            CHECK(std::fabs(u - eu) < 1e-6f && std::fabs(v - ev) < 1e-6f, "%s %s centre: (%.4f, %.4f) want (%.4f, %.4f)",
+                  ProjectionId(p), names[k], u, v, eu, ev);
+        }
+    }
+    // Orientation on the front face (no rotation in either layout): up is up, right is right.
+    float u0, v0, u1, v1;
+    const float upish[3] = {0.f, 0.3f, 1.f}, rightish[3] = {0.3f, 0.f, 1.f};
+    DirToLocalUV(Projection::Cubemap, 0.f, 1.5f, upish, u0, v0);
+    DirToLocalUV(Projection::Cubemap, 0.f, 1.5f, rightish, u1, v1);
+    CHECK(v0 < 0.75f && std::fabs(u0 - 0.5f) < 1e-6f && u1 > 0.5f && std::fabs(v1 - 0.75f) < 1e-6f,
+          "front face: up is up, right is right");
+    // Corners and edges: a cube corner lands on its face's corner (within the half-texel
+    // inset), an edge direction on the face boundary.
+    const float corner[3] = {1.f, 1.f, 1.f};  // right / up / front meet: the up face wins the tie
+    float u, v;
+    DirToLocalUV(Projection::Cubemap, 0.f, 1.5f, corner, u, v, 1536.f, 1024.f);
+    // up face (cell 2): a = x / y = 1 (right edge), b = z / y = 1 (bottom edge)
+    CHECK(std::fabs(u - (1.f - 0.5f / 1536.f)) < 1e-5f && std::fabs(v - (0.5f - 0.5f / 1024.f)) < 1e-5f,
+          "cubemap corner (1,1,1) -> up face's bottom-right texel (%.5f, %.5f)", u, v);
+    const float edge[3] = {1.f, 0.f, 1.f};  // front / right edge: the right face wins the tie
+    DirToLocalUV(Projection::Cubemap, 0.f, 1.5f, edge, u, v, 1536.f, 1024.f);
+    CHECK(std::fabs(u - 0.5f / 1536.f) < 1e-5f && std::fabs(v - 0.25f) < 1e-5f,
+          "cubemap front/right edge -> the right face's left column (%.5f, %.5f)", u, v);
+    DirToLocalUV(Projection::Eac, 0.f, 1.5f, edge, u, v, 1536.f, 1024.f);
+    // EAC: right is cell 2 (top right); its left edge is the cell boundary at 2/3 (+ the margin share).
+    const float eacEdge = 2.f / 1536.f + 2.f * (1.f - 4.f / 1536.f) / 3.f;
+    CHECK(std::fabs(u - (eacEdge + 0.5f / 1536.f)) < 1e-5f && std::fabs(v - 0.25f) < 1e-5f,
+          "eac front/right edge -> the right face's left column (%.5f, %.5f)", u, v);
+
+    // EAC vs cubemap off-centre: 30 degrees right of the front centre. The cubemap places it
+    // by tan (a / 2 of the face from the centre), EAC by angle (30/90 of the face).
+    const float d30[3] = {std::sin(Rad(30.f)), 0.f, std::cos(Rad(30.f))};
+    float uc, ue;
+    DirToLocalUV(Projection::Cubemap, 0.f, 1.5f, d30, uc, v);
+    DirToLocalUV(Projection::Eac, 0.f, 1.5f, d30, ue, v);
+    const float fc = (uc * 3.f - 1.f) - 0.5f, fe = (ue * 3.f - 1.f) - 0.5f;  // offset from the face centre, in faces
+    CHECK(std::fabs(fc - 0.5f * std::tan(Rad(30.f))) < 1e-5f, "cubemap: tan spacing (%.5f)", fc);
+    CHECK(std::fabs(fe - 30.f / 90.f) < 1e-5f, "eac: equal-angle spacing (%.5f)", fe);
+    CHECK(fe > fc, "EAC pushes an off-centre direction further out than the cubemap");
+
+    // Stereo cubemap / EAC is the same ODS cylinder as stereo VR360; mono is free.
+    for (Projection p : {Projection::Cubemap, Projection::Eac}) {
+        CHECK(ModelFor(p, true) == Model::Cylinder && ModelFor(p, false) == Model::Free, "%s model", ProjectionId(p));
+        ViewState vs{190.f, 0.f, 0.f};
+        Clamp(vs, p, true, 40.f, kAspect, Limits{});
+        CHECK(std::fabs(vs.yawDeg + 170.f) < 1e-3f, "%s heading wraps", ProjectionId(p));
+    }
+}
+
+// Every pixel of a v360-made eye maps back to itself: v360's pixel -> direction, then
+// VrView's direction -> uv lands on that pixel's centre.
+void CubeRoundTripsV360() {
+    // EAC faces a whole number of pixels: (W - 4) / 3 and H / 2 - 4 (v360's 2-px margins).
+    const int W = 1536, H = 1024, WE = 1540, HE = 1032;
+    float worstC = 0.f, worstE = 0.f, worstP = 0.f;
+    int nE = 0;
+    for (int j = 0; j < H; j += 3)
+        for (int i = 0; i < W; i += 3) {
+            float d[3], u, v;
+            V360C3x2PixelDir(i, j, W, H, 0.f, d);
+            DirToLocalUV(Projection::Cubemap, 0.f, 1.5f, d, u, v, (float)W, (float)H);
+            worstC = std::max(worstC, std::max(std::fabs(u * W - 0.5f - i), std::fabs(v * H - 0.5f - j)));
+            V360C3x2PixelDir(i, j, W, H, 8.f, d);  // 8 px of padding on each face edge
+            const int fi = i % (W / 3), fj = j % (H / 2);
+            if (fi >= 8 && fi < W / 3 - 8 && fj >= 8 && fj < H / 2 - 8) {  // the face proper
+                DirToLocalUV(Projection::Cubemap, 0.f, 1.5f, d, u, v, (float)W, (float)H, 8.f);
+                worstP = std::max(worstP, std::max(std::fabs(u * W - 0.5f - i), std::fabs(v * H - 0.5f - j)));
+            }
+        }
+    for (int j = 0; j < HE; j += 3)
+        for (int i = 0; i < WE; i += 3) {
+            float d[3], u, v;
+            if (V360EacPixelDir(i, j, WE, HE, d)) {
+                DirToLocalUV(Projection::Eac, 0.f, 1.5f, d, u, v, (float)WE, (float)HE);
+                worstE = std::max(worstE, std::max(std::fabs(u * WE - 0.5f - i), std::fabs(v * HE - 0.5f - j)));
+                ++nE;
+            }
+        }
+    std::printf("  cubemap / EAC vs FFmpeg v360: c3x2 %.4f px, c3x2 padded %.4f px, eac %.4f px (%d px)\n", worstC,
+                worstP, worstE, nE);
+    CHECK(worstC < 0.02f, "c3x2 round trip %.4f px", worstC);
+    CHECK(worstP < 0.02f, "c3x2 padded round trip %.4f px", worstP);
+    CHECK(nE > 150000 && worstE < 0.02f, "eac round trip %.4f px over %d px", worstE, nE);
+}
+
+// Pixels end to end: a smooth luma pattern over the sphere, written into a cubemap / EAC
+// frame through v360's maps, rendered through windows by RenderEyeGray (the shader's CPU
+// twin) must equal the pattern evaluated on each window ray - at every heading including
+// straight up / down, so no face seam or misplaced face can hide. Stereo TB checks each
+// eye reads its own half.
+float Pattern(const float d[3], int eye) {
+    const float lon = std::atan2(d[0], d[2]), lat = std::asin(std::max(-1.f, std::min(1.f, d[1])));
+    const float g = 128.f + 70.f * std::cos(lat) * std::sin(3.f * lon) + 45.f * std::sin(2.f * lat) + 8.f * d[0];
+    return eye == 0 ? g : 255.f - g;
+}
+
+void CubeRendersPattern() {
+    struct Case {
+        Projection p;
+        StereoLayout l;
+        bool youtube;  // YouTube's stereo EAC: side by side, each eye's grid turned 90 deg CCW
+        const char* name;
+    } cases[] = {{Projection::Cubemap, StereoLayout::Mono, false, "cubemap mono"},
+                 {Projection::Cubemap, StereoLayout::TbFull, false, "cubemap TB"},
+                 {Projection::Eac, StereoLayout::Mono, false, "eac mono"},
+                 {Projection::Eac, StereoLayout::TbFull, false, "eac TB"},
+                 {Projection::Eac, StereoLayout::SbsFull, true, "eac SBS (YouTube, portrait eyes)"}};
+    for (const Case& c : cases) {
+        const Projection p = c.p;
+        const StereoLayout l = c.l;
+        {
+            // per eye: the upright grid is GW x GH; a YouTube eye is that turned (GH x GW)
+            const int GW = 1152, GH = 768;
+            const int W = c.youtube ? GH : GW, H = c.youtube ? GW : GH;
+            const int eyes = l == StereoLayout::Mono ? 1 : 2;
+            const bool sbs = l == StereoLayout::SbsFull;
+            const int FW = sbs ? W * eyes : W, FH = sbs ? H : H * eyes;
+            std::vector<uint8_t> src((size_t)FW * FH);
+            for (int e = 0; e < eyes; ++e)
+                for (int j = 0; j < H; ++j)
+                    for (int i = 0; i < W; ++i) {
+                        float d[3];
+                        // turned 90 deg CCW: eye pixel (i, j) is upright-grid pixel (GW-1-j, i)
+                        const int gi = c.youtube ? GW - 1 - j : i, gj = c.youtube ? i : j;
+                        if (p == Projection::Cubemap) V360C3x2PixelDir(gi, gj, GW, GH, 0.f, d);
+                        else V360EacPixelDir(gi, gj, GW, GH, d);
+                        const size_t at = sbs ? (size_t)j * FW + e * W + i : (size_t)(e * H + j) * FW + i;
+                        src[at] = (uint8_t)std::lround(Pattern(d, e));
+                    }
+            const int DW = 200, DH = 150;
+            std::vector<uint8_t> dst((size_t)DW * DH);
+            float worst = 0.f, sum = 0.f;
+            int n = 0;
+            const float views[][2] = {{0, 0}, {45, 0}, {90, 20}, {135, -30}, {180, 0}, {-100, 40},
+                                      {-45, -45}, {30, 90}, {0, -90}, {-120, 89}};
+            for (const auto& yp : views) {
+                for (int e = 0; e < eyes; ++e) {
+                    EyeWindow w = ComputeWindow(p, false, ViewState{yp[0], 0.f, 90.f}, 90.f, (float)DW / DH, 0.f);
+                    w.pitchRad = Rad(yp[1]);  // Free model, the pitch set past the UI clamp (the poles)
+                    RenderEyeGray(src.data(), FW, FH, FW, EyeRectFor(l, e == 1), p, 0.f, w, dst.data(), DW, DH, DW);
+                    for (int y = 0; y < DH; ++y)
+                        for (int x = 0; x < DW; ++x) {
+                            float d[3];
+                            RayDir(w, w.x0 + (x + 0.5f) / DW * w.sx, w.y0 + (y + 0.5f) / DH * w.sy, d);
+                            const float n2 = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                            d[0] /= n2; d[1] /= n2; d[2] /= n2;
+                            const float err = std::fabs((float)dst[(size_t)y * DW + x] - Pattern(d, e));
+                            worst = std::max(worst, err);
+                            sum += err;
+                            ++n;
+                        }
+                }
+            }
+            std::printf("  %-32s rendered vs the pattern on the rays: mean %.3f, max %.2f (of 255)\n", c.name,
+                        sum / n, worst);
+            CHECK(sum / n < 0.8f && worst < 6.f, "%s: rendered pattern off (mean %.3f max %.2f)", c.name, sum / n,
+                  worst);
+        }
+    }
 }
 
 #if defined(MEDIAPLAYER_WITH_FFMPEG)
@@ -446,16 +720,21 @@ void ContainerMetadata() {
         Projection proj;
         StereoLayout layout;
     } cases[] = {{"vr180_sbs_sv3d.mov", Projection::Equirect180, StereoLayout::SbsFull},
-                 {"vr360_tb_sv3d.mov", Projection::Equirect360, StereoLayout::TbFull}};
+                 {"vr360_tb_sv3d.mov", Projection::Equirect360, StereoLayout::TbFull},
+                 {"cube360_mono_sv3d.mov", Projection::Cubemap, StereoLayout::Mono}};
     for (const Case& c : cases) {
         const std::string path = std::string(MP_FIXTURE_DIR) + "/" + c.file;
         int kind = -1;
         float cov = 0.f;
-        const bool have = VideoStereoProbe::ReadSpherical(path, kind, cov);
+        int pad = -1;
+        const bool have = VideoStereoProbe::ReadSpherical(path, kind, cov, &pad);
         CHECK(have && FromSpherical(kind, cov) == c.proj, "%s: spherical kind %d cover %.1f", c.file, kind, cov);
+        CHECK(pad == (c.proj == Projection::Cubemap ? 2 : 0), "%s: cubemap padding %d", c.file, pad);
         const VideoStereoProbe::Result r = VideoStereoProbe::Run(path, false);
         CHECK(r.ok && r.haveSpherical && FromSpherical(r.sphericalKind, r.sphericalCoverageDeg) == c.proj,
               "%s: the probe's spherical verdict", c.file);
+        CHECK(r.sphericalPadding == pad, "%s: the probe's padding", c.file);
+        // st3d mono reads as "explicitly 2D" (metaLayout Mono).
         CHECK(r.haveMeta && r.metaLayout == c.layout, "%s: st3d -> packing (%d)", c.file, (int)r.metaLayout);
         std::printf("  %s: %s, %s\n", c.file, ProjectionName(FromSpherical(kind, cov)), have ? "sv3d read" : "-");
     }
@@ -475,6 +754,9 @@ int main() {
     Clamps();
     Packing();
     Detection();
+    CubeFaceCentres();
+    CubeRoundTripsV360();
+    CubeRendersPattern();
 #if defined(MEDIAPLAYER_WITH_FFMPEG)
     ContainerMetadata();
 #endif

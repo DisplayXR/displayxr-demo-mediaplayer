@@ -10,6 +10,8 @@ projections the player reads:
   vr180 dual fisheye, side by side (a raw VR180 camera; 190 degree equidistant circles)
   vr360 equirect, top-bottom       (omni-directional stereo, as stitched 360 rigs deliver;
                                     sv3d full equirect + st3d top-bottom)
+  360 cubemap, mono                (3x2 faces, FFmpeg v360 `c3x2`; sv3d `cbmp` layout 0 with
+                                    2 px of face padding + st3d mono)
 
 The ruled dome is the eyeball check: at every pan the latitude lines must sit on the same
 row in both eyes, and the balls must float in front of the dome.
@@ -139,6 +141,35 @@ def render_ods360(w, t=0.0):
     return np.concatenate(eyes, 0)  # TB: left on top
 
 
+CUBE_PAD = 2  # pixels on each face edge (sv3d cbmp padding)
+
+
+def cube_dirs(w, pad):
+    """Directions of a 3x2 cubemap eye w x (2w/3): FFmpeg v360 `c3x2` (top row right, left,
+    up; bottom row down, front, back; no rotation), `pad` pixels of margin on each face edge."""
+    h = w * 2 // 3
+    f = w // 3
+    i = np.arange(w)
+    j = np.arange(h)
+    ii, jj = np.meshgrid(i, j)
+    face = (ii // f) + 3 * (jj // f)
+    s = 1.0 - 2.0 * pad / f
+    a = ((2.0 * (ii % f) + 1.0) / f - 1.0) / s
+    b = ((2.0 * (jj % f) + 1.0) / f - 1.0) / s
+    one = np.ones_like(a)
+    # v360 cube_to_xyz (y down), then y flipped to y up
+    x = np.select([face == 0, face == 1, face == 2, face == 3, face == 4], [one, -one, a, a, a], -a)
+    y = np.select([face == 0, face == 1, face == 2, face == 3, face == 4], [b, b, -one, one, b], b)
+    z = np.select([face == 0, face == 1, face == 2, face == 3, face == 4], [-a, a, b, -b, one], -one)
+    d = np.stack([x, -y, z], -1).reshape(-1, 3)
+    return d / np.linalg.norm(d, axis=1, keepdims=True), h
+
+
+def render_cube360(w, t=0.0):
+    d, h = cube_dirs(w, CUBE_PAD)
+    return shade(np.zeros(3), d, t).reshape(h, w, 3)
+
+
 # ---- Spherical Video V2 boxes ------------------------------------------------------
 
 def box(typ, payload):
@@ -149,15 +180,19 @@ def fullbox(typ, payload, version=0, flags=0):
     return box(typ, struct.pack('>I', (version << 24) | flags) + payload)
 
 
-def spherical_boxes(stereo_mode, bounds):
+def spherical_boxes(stereo_mode, bounds, cubemap_padding=None):
     """stereo_mode: 0 mono, 1 top-bottom, 2 left-right. bounds: (top, bottom, left, right)
-    as fractions of the full 360 x 180 frame cropped away."""
+    as fractions of the full 360 x 180 frame cropped away. cubemap_padding: write a `cbmp`
+    (layout 0, that padding) instead of `equi`."""
     st3d = fullbox(b'st3d', struct.pack('>B', stereo_mode))
     svhd = fullbox(b'svhd', b'displayxr-demo-mediaplayer tools/vr\x00')
     prhd = fullbox(b'prhd', struct.pack('>iii', 0, 0, 0))
-    fx = [min(0xFFFFFFFF, int(round(b * 4294967296.0))) for b in bounds]
-    equi = fullbox(b'equi', struct.pack('>IIII', *fx))
-    sv3d = box(b'sv3d', svhd + box(b'proj', prhd + equi))
+    if cubemap_padding is not None:
+        proj = fullbox(b'cbmp', struct.pack('>II', 0, cubemap_padding))
+    else:
+        fx = [min(0xFFFFFFFF, int(round(b * 4294967296.0))) for b in bounds]
+        proj = fullbox(b'equi', struct.pack('>IIII', *fx))
+    sv3d = box(b'sv3d', svhd + box(b'proj', prhd + proj))
     return st3d + sv3d
 
 
@@ -222,7 +257,8 @@ def ffmpeg_encode(frames, path, fps=24):
 
 
 def make(kind, eye_w, path, frames=1):
-    render = {'vr180': render_equirect180, 'fisheye': render_fisheye, 'vr360': render_ods360}[kind]
+    render = {'vr180': render_equirect180, 'fisheye': render_fisheye, 'vr360': render_ods360,
+              'cube360': render_cube360}[kind]
     imgs = [render(eye_w, 2 * np.pi * i / max(1, frames)) for i in range(frames)]
     ffmpeg_encode(imgs, path)
     if path.endswith(('.mp4', '.mov')):
@@ -230,6 +266,8 @@ def make(kind, eye_w, path, frames=1):
             inject(path, spherical_boxes(2, (0.0, 0.0, 0.25, 0.25)))
         elif kind == 'vr360':
             inject(path, spherical_boxes(1, (0.0, 0.0, 0.0, 0.0)))
+        elif kind == 'cube360':
+            inject(path, spherical_boxes(0, (0.0, 0.0, 0.0, 0.0), cubemap_padding=CUBE_PAD))
         # fisheye: Spherical Video V2 has no fisheye box; the player reads the name.
     print(f'  {path}  ({os.path.getsize(path)} bytes)')
 
@@ -247,6 +285,7 @@ def main():
         print('fixtures ->', out)
         make('vr180', 64, os.path.join(out, 'vr180_sbs_sv3d.mov'), frames=24)
         make('vr360', 64, os.path.join(out, 'vr360_tb_sv3d.mov'), frames=24)
+        make('cube360', 96, os.path.join(out, 'cube360_mono_sv3d.mov'), frames=24)
     if a.assets:
         os.makedirs(a.assets, exist_ok=True)
         print('assets ->', a.assets)
@@ -256,6 +295,7 @@ def main():
         make('fisheye', 1440, os.path.join(a.assets, 'synth_dualfisheye_LR.mp4'), frames=48)
         make('vr360', 2048, os.path.join(a.assets, 'synth_vr360_TB.png'))
         make('vr360', 2048, os.path.join(a.assets, 'synth_vr360_sv3d.mp4'), frames=48)
+        make('cube360', 1536, os.path.join(a.assets, 'synth_cube360_sv3d.mp4'), frames=48)
     return 0
 
 

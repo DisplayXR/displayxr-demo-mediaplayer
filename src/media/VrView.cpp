@@ -12,6 +12,8 @@ const char* ProjectionName(Projection p) {
         case Projection::Equirect180: return "VR180";
         case Projection::Equirect360: return "VR360";
         case Projection::Fisheye: return "VR180 fisheye";
+        case Projection::Cubemap: return "360 cubemap";
+        case Projection::Eac: return "360 EAC";
         default: return "flat";
     }
 }
@@ -21,6 +23,8 @@ const char* ProjectionId(Projection p) {
         case Projection::Equirect180: return "equirect180";
         case Projection::Equirect360: return "equirect360";
         case Projection::Fisheye: return "fisheye";
+        case Projection::Cubemap: return "cubemap";
+        case Projection::Eac: return "eac";
         default: return "flat";
     }
 }
@@ -30,6 +34,8 @@ bool ParseProjectionId(const std::string& s, Projection& out) {
     else if (s == "equirect180" || s == "vr180") out = Projection::Equirect180;
     else if (s == "equirect360" || s == "vr360") out = Projection::Equirect360;
     else if (s == "fisheye" || s == "fisheye180") out = Projection::Fisheye;
+    else if (s == "cubemap" || s == "c3x2") out = Projection::Cubemap;
+    else if (s == "eac") out = Projection::Eac;
     else return false;
     return true;
 }
@@ -41,6 +47,13 @@ float WrapDeg(float d) {
     return d - 180.0f;
 }
 float ClampF(float x, float lo, float hi) { return x < lo ? lo : x > hi ? hi : x; }
+// Each eye's own aspect: 2:1 for a 360 equirect, 3:2 for a 3x2 cubemap / EAC, 1:1 for a
+// half sphere / fisheye circle.
+float EyeAspect(Projection p) {
+    if (p == Projection::Equirect360) return 2.0f;
+    if (IsCube(p)) return 1.5f;
+    return 1.0f;
+}
 }  // namespace
 
 void Clamp(ViewState& v, Projection p, bool stereo, float hfovDeg, float aspect, const Limits& lim) {
@@ -53,7 +66,7 @@ void Clamp(ViewState& v, Projection p, bool stereo, float hfovDeg, float aspect,
     const float hh = hw / (aspect > 0.f ? aspect : 1.f);
     const float halfV = Deg(std::atan(hh));
     const Model m = ModelFor(p, stereo);
-    const bool wraps = p == Projection::Equirect360;
+    const bool wraps = IsFullSphere(p);
 
     // Pitch: never past the configured limit, and the window's top / bottom edge stays
     // short of the pole (where the rotation would fold the picture over).
@@ -112,6 +125,7 @@ Projection FromSpherical(int kind, float horizCoverageDeg) {
             return horizCoverageDeg >= 270.0f ? Projection::Equirect360 : Projection::Equirect180;
         case 2: return Projection::Equirect180;
         case 3: return Projection::Fisheye;
+        case 4: return Projection::Cubemap;
         default: return Projection::None;
     }
 }
@@ -124,7 +138,7 @@ bool ProjectionFromFilename(const std::string& path, Projection& out, int& packi
     if (dot != std::string::npos) base = base.substr(0, dot);
     std::transform(base.begin(), base.end(), base.begin(), [](unsigned char c) { return (char)std::tolower(c); });
 
-    bool is180 = false, is360 = false, fish = false, equi = false;
+    bool is180 = false, is360 = false, fish = false, equi = false, cube = false, eac = false;
     packingHint = -1;
     std::string tok;
     for (size_t i = 0; i <= base.size(); ++i) {
@@ -138,6 +152,8 @@ bool ProjectionFromFilename(const std::string& path, Projection& out, int& packi
             else if (tok == "vr360" || tok == "360" || tok == "360x180") is360 = true;
             else if (tok == "fisheye" || tok == "fisheye180" || tok == "dualfisheye") fish = true;
             else if (tok == "equirect" || tok == "erp" || tok == "equirectangular") equi = true;
+            else if (tok == "cubemap" || tok == "c3x2" || tok == "cbmp") cube = true;
+            else if (tok == "eac") eac = true;
             else if (tok == "3dh" || tok == "sbs" || tok == "lr" || tok == "rl") packingHint = 1;
             else if (tok == "3dv" || tok == "tb" || tok == "ou" || tok == "bt") packingHint = 2;
             else if (tok == "mono" || tok == "2d") packingHint = 0;
@@ -145,6 +161,8 @@ bool ProjectionFromFilename(const std::string& path, Projection& out, int& packi
         tok.clear();
     }
     if (fish) out = Projection::Fisheye;
+    else if (eac) out = Projection::Eac;
+    else if (cube) out = Projection::Cubemap;
     else if (is360) out = Projection::Equirect360;
     else if (is180) out = Projection::Equirect180;
     else if (equi) out = Projection::Equirect360;  // a bare "equirect" is the full sphere
@@ -154,8 +172,7 @@ bool ProjectionFromFilename(const std::string& path, Projection& out, int& packi
 
 StereoLayout PackingFromAspect(Projection p, float a) {
     if (p == Projection::None || !(a > 0.0f)) return StereoLayout::Mono;
-    // Each eye's own aspect: 2:1 for a full sphere, 1:1 for a half sphere / fisheye circle.
-    const float eye = p == Projection::Equirect360 ? 2.0f : 1.0f;
+    const float eye = EyeAspect(p);
     // Pick the packing whose frame aspect is nearest in log terms: SBS 2x, mono 1x, TB 0.5x.
     const float r = std::log(a / eye);
     if (r > std::log(1.41421356f)) return StereoLayout::SbsFull;
@@ -165,14 +182,17 @@ StereoLayout PackingFromAspect(Projection p, float a) {
 
 bool AspectPlausible(Projection p, float a) {
     if (p == Projection::None || !(a > 0.0f)) return false;
-    const float eye = p == Projection::Equirect360 ? 2.0f : 1.0f;
+    const float eye = EyeAspect(p);
     for (float k : {0.5f, 1.0f, 2.0f})
         if (std::fabs(std::log(a / (eye * k))) < std::log(1.15f)) return true;
+    // YouTube EAC: 16:9 frames, mono or side by side (each eye then a portrait 8:9).
+    if (p == Projection::Eac && std::fabs(std::log(a / (16.0f / 9.0f))) < std::log(1.05f)) return true;
     return false;
 }
 
 void RenderEyeGray(const uint8_t* src, int srcW, int srcH, int srcStride, packing::EyeRect rect, Projection p,
-                   float fisheyeFovDeg, const EyeWindow& w, uint8_t* dst, int dstW, int dstH, int dstStride) {
+                   float fisheyeFovDeg, const EyeWindow& w, uint8_t* dst, int dstW, int dstH, int dstStride,
+                   int cubePadPx) {
     if (!src || !dst || srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
     const float eyePxW = rect.w * (float)srcW, eyePxH = rect.h * (float)srcH;
     const float eyeAspect = eyePxH > 0.f ? eyePxW / eyePxH : 1.f;
@@ -182,7 +202,7 @@ void RenderEyeGray(const uint8_t* src, int srcW, int srcH, int srcStride, packin
         for (int x = 0; x < dstW; ++x) {
             const float s = ((float)x + 0.5f) / (float)dstW;
             float u = 0.f, v = 0.f;
-            if (!SampleUV(w, p, fisheyeFovDeg, eyeAspect, s, t, u, v)) {
+            if (!SampleUV(w, p, fisheyeFovDeg, eyeAspect, s, t, u, v, eyePxW, eyePxH, (float)cubePadPx)) {
                 row[x] = 0;
                 continue;
             }

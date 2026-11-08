@@ -339,22 +339,89 @@ vec3 GradeSrc(vec3 c) { return c; }
 #ifdef MP_GRADE
 // ---- VR180 / VR360 viewer (#155) -------------------------------------------------------
 const float kPi = 3.14159265358979;
-int VrProj() { return (pc.mode >> 8) & 3; }  // 0 none, 1 equirect 180, 2 equirect 360, 3 fisheye
+// mode bits 8-10 projection: 0 none, 1 equirect 180, 2 equirect 360, 3 fisheye, 4 cubemap
+// (3x2), 5 EAC; 11-12 model; 13-14 packing; 15 second eye; 16-24 fisheye FOV; 25-31 cube
+// padding (vr::PackModeFlags)
+int VrProj() { return (pc.mode >> 8) & 7; }
 
 // This draw's (or the other eye's) rect in the frame: SBS / TB halves or the whole frame.
 vec4 VrEyeRect(bool otherEye) {
-    int pk = (pc.mode >> 12) & 3;
-    bool second = (((pc.mode >> 14) & 1) != 0) != otherEye;
+    int pk = (pc.mode >> 13) & 3;
+    bool second = (((pc.mode >> 15) & 1) != 0) != otherEye;
     float k = second ? 0.5 : 0.0;
     if (pk == 1) return vec4(k, 0.0, 0.5, 1.0);
     if (pk == 2) return vec4(0.0, k, 1.0, 0.5);
     return vec4(0.0, 0.0, 1.0, 1.0);
 }
 
+// Cubemap / EAC: a direction -> 3x2 grid uv, clamped half a texel inside its face's cell.
+// vr::CubeFace + vr::CubeGridUV in src/media/VrView.h, line for line (faces: 0 right,
+// 1 left, 2 up, 3 down, 4 front, 5 back).
+vec2 VrCubeGridUV(int proj, vec3 d, vec2 eyePx) {
+    vec3 ad = abs(d);
+    int dir;
+    float a, b;
+    if (ad.y >= ad.x && ad.y >= ad.z && ad.y > 0.0) {
+        if (d.y > 0.0) { a = d.x / ad.y; b = d.z / ad.y; dir = 2; }
+        else { a = d.x / ad.y; b = -d.z / ad.y; dir = 3; }
+    } else if (ad.x >= ad.z && ad.x > 0.0) {
+        if (d.x > 0.0) { a = -d.z / ad.x; b = -d.y / ad.x; dir = 0; }
+        else { a = d.z / ad.x; b = -d.y / ad.x; dir = 1; }
+    } else {
+        float zz = ad.z > 0.0 ? ad.z : 1.0;
+        if (d.z >= 0.0) { a = d.x / zz; b = -d.y / zz; dir = 4; }
+        else { a = -d.x / zz; b = -d.y / zz; dir = 5; }
+    }
+    bool eac = proj == 5;
+    // EAC: cells {right 2, left 0, up 5, down 3, front 1, back 4}; rotations up 3, down 3, back 1.
+    int rot = !eac ? 0 : (dir == 2 || dir == 3) ? 3 : dir == 5 ? 1 : 0;
+    if (rot == 1) { float t = a; a = -b; b = t; }
+    else if (rot == 2) { a = -a; b = -b; }
+    else if (rot == 3) { float t = a; a = b; b = -t; }
+    int cell = !eac ? dir : dir == 0 ? 2 : dir == 1 ? 0 : dir == 2 ? 5 : dir == 3 ? 3 : dir == 4 ? 1 : 4;
+    float col = float(cell % 3), row = float(cell / 3);
+    float u, v, cu0, cu1, cv0, cv1;
+    if (eac) {
+        float pu = eyePx.x > 0.0 ? 2.0 / eyePx.x : 0.0;  // vr::kEacMarginPx
+        float pv = eyePx.y > 0.0 ? 2.0 / eyePx.y : 0.0;
+        float fu = (2.0 / kPi) * atan(a) + 0.5, fv = (2.0 / kPi) * atan(b) + 0.5;
+        float fw = (1.0 - 2.0 * pu) / 3.0;
+        u = pu + (col + fu) * fw;
+        v = 0.5 * row + pv + fv * (0.5 - 2.0 * pv);
+        cu0 = col == 0.0 ? 0.0 : pu + col * fw;
+        cu1 = col == 2.0 ? 1.0 : pu + (col + 1.0) * fw;
+        cv0 = 0.5 * row;
+        cv1 = 0.5 * row + 0.5;
+    } else {
+        float padPx = float((uint(pc.mode) >> 25) & 127u);
+        float sx = eyePx.x > 0.0 ? 1.0 - 2.0 * padPx * 3.0 / eyePx.x : 1.0;
+        float sy = eyePx.y > 0.0 ? 1.0 - 2.0 * padPx * 2.0 / eyePx.y : 1.0;
+        u = (col + 0.5 * (a * sx + 1.0)) / 3.0;
+        v = (row + 0.5 * (b * sy + 1.0)) / 2.0;
+        cu0 = col / 3.0;
+        cu1 = (col + 1.0) / 3.0;
+        cv0 = row / 2.0;
+        cv1 = (row + 1.0) / 2.0;
+    }
+    float hu = eyePx.x > 0.0 ? 0.5 / eyePx.x : 0.0, hv = eyePx.y > 0.0 ? 0.5 / eyePx.y : 0.0;
+    return vec2(clamp(u, cu0 + hu, cu1 - hu), clamp(v, cv0 + hv, cv1 - hv));
+}
+
+// vr::CubeLocalUV: a portrait EAC eye is YouTube's stereo layout (the grid turned 90
+// degrees counter-clockwise).
+vec2 VrCubeUV(int proj, vec3 d, vec2 eyePx) {
+    float aspect = eyePx.y > 0.0 ? eyePx.x / eyePx.y : 1.0;
+    if (proj == 5 && aspect < 1.0) {
+        vec2 g = VrCubeGridUV(proj, d, eyePx.yx);
+        return vec2(g.y, 1.0 - g.x);
+    }
+    return VrCubeGridUV(proj, d, eyePx);
+}
+
 // Tangent coordinates -> eye-local source uv (.xy) and 1 inside the picture / 0 outside
 // (.z). vr::SampleUV in src/media/VrView.h, line for line.
 vec3 VrLocalUV(vec2 t, vec2 eyePx) {
-    int model = (pc.mode >> 10) & 3;
+    int model = (pc.mode >> 11) & 3;
     float heading = float(uint(pc.viewFlags) >> 16) / 65536.0 * 2.0 * kPi;
     vec3 d;
     if (model == 1) {              // cylinder (stereo ODS 360): row = tan(elevation)
@@ -368,6 +435,7 @@ vec3 VrLocalUV(vec2 t, vec2 eyePx) {
         d = vec3(c.x * ch + c.z * sh, c.y, -c.x * sh + c.z * ch);
     }
     int proj = VrProj();
+    if (proj == 4 || proj == 5) return vec3(VrCubeUV(proj, d, eyePx), 1.0);
     if (proj == 3) {               // equidistant fisheye, image circle inscribed in the eye
         float len = length(d);
         float th = acos(clamp(len > 0.0 ? d.z / len : 1.0, -1.0, 1.0));
