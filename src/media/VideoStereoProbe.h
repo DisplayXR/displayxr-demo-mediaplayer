@@ -56,10 +56,11 @@ struct VideoStereoProbe {
 
         // VR180 / VR360 (#155): the container's spherical projection (MP4 sv3d / proj, MKV
         // Projection, Apple APMP), reduced for vr::FromSpherical: kind 0 equirect, 1 bounded
-        // equirect (VR180), 2 half equirect, 3 fisheye; -1 none / unsupported.
+        // equirect (VR180), 2 half equirect, 3 fisheye, 4 cubemap (3x2); -1 none / unsupported.
         bool haveSpherical = false;
         int sphericalKind = -1;
         float sphericalCoverageDeg = 0.0f;  // horizontal coverage of an equirect
+        int sphericalPadding = 0;           // cubemap: padding pixels on each face edge
 
         StereoDetectResult content;  // voted; decided=false if not run or inconclusive
         int framesExamined = 0;
@@ -73,7 +74,7 @@ struct VideoStereoProbe {
 
     // Only the spherical metadata (no decode): what Run() fills into haveSpherical & co,
     // for the loads that skip Run() (a pinned layout). Returns haveSpherical.
-    static bool ReadSpherical(const std::string& path, int& kind, float& coverageDeg);
+    static bool ReadSpherical(const std::string& path, int& kind, float& coverageDeg, int* padding = nullptr);
 };
 
 } // namespace mp

@@ -993,7 +993,8 @@ void App::RenderOneFrame() {
                     ViewUV u{w.x0, w.y0, w.sx, w.sy};
                     // The other eye's window differs only by the opposite shift (Pro QC views).
                     u.otherDX = 2.0f * shift * w.sx;
-                    u.vrMode = vr::PackModeFlags(vrProj_, model, layout_, stereo && !isLeftView[v], vrFisheyeFovDeg_);
+                    u.vrMode = vr::PackModeFlags(vrProj_, model, layout_, stereo && !isLeftView[v], vrFisheyeFovDeg_,
+                                                 vrCubePadPx_);
                     u.vrPitch = w.pitchRad;
                     u.vrHeading = vr::PackHeading(w.headingRad);
                     uvs[v] = u;
@@ -1574,7 +1575,7 @@ void App::ReadStereoEnv() {
         LOG_INFO("Stereo layout forced: %s", layoutForced_ ? l : "auto");
     }
     // VR viewer (#155): MEDIAPLAYER_VR pins a projection for headless runs (flat |
-    // equirect180 | equirect360 | fisheye); MEDIAPLAYER_VR_VIEW = "yaw,pitch[,fov]" in degrees
+    // equirect180 | equirect360 | fisheye | cubemap | eac); MEDIAPLAYER_VR_VIEW = "yaw,pitch[,fov]" in degrees
     // opens every file at that view; the clamps and the fisheye lens FOV are tunable.
     if (const char* v = std::getenv("MEDIAPLAYER_VR")) {
         vrForced_ = vr::ParseProjectionId(v, vrForcedValue_);
@@ -1588,8 +1589,9 @@ void App::ReadStereoEnv() {
 bool App::LoadMedia(const std::string& path) {
     loadSphKind_ = -1;
     loadSphCoverage_ = 0.0f;
+    loadSphPadding_ = 0;
     if (!LoadMediaFile(path)) return false;
-    ResolveVr(path, loadSphKind_, loadSphCoverage_, mediaW_, mediaH_);  // #155, every kind of file
+    ResolveVr(path, loadSphKind_, loadSphCoverage_, mediaW_, mediaH_, loadSphPadding_);  // #155, every kind of file
     if (const char* v = std::getenv("MEDIAPLAYER_VR_VIEW")) {
         float y = 0.f, p = 0.f, f = 0.f;
         if (std::sscanf(v, "%f,%f,%f", &y, &p, &f) >= 2) {
@@ -1629,10 +1631,12 @@ bool App::LoadMediaFile(const std::string& path) {
         if (detectMode_ != DetectMode::Off && !manual)
             pr = VideoStereoProbe::Run(path, wantContent);
         else if (detectMode_ != DetectMode::Off)  // a pinned layout still wants the projection (#155)
-            pr.haveSpherical = VideoStereoProbe::ReadSpherical(path, pr.sphericalKind, pr.sphericalCoverageDeg);
+            pr.haveSpherical = VideoStereoProbe::ReadSpherical(path, pr.sphericalKind, pr.sphericalCoverageDeg,
+                                                               &pr.sphericalPadding);
         if (pr.haveSpherical) {
             loadSphKind_ = pr.sphericalKind;
             loadSphCoverage_ = pr.sphericalCoverageDeg;
+            loadSphPadding_ = pr.sphericalPadding;
         }
         MediaInfo meta;
         if (pr.haveMeta) {
@@ -2470,8 +2474,9 @@ float App::VrDefaultFovDeg() const {
     return std::min(vrLimits_.fovMaxDeg, std::max(vrLimits_.fovMinDeg, fov));
 }
 
-void App::ResolveVr(const std::string& path, int sphKind, float sphCoverage, int frameW, int frameH) {
+void App::ResolveVr(const std::string& path, int sphKind, float sphCoverage, int frameW, int frameH, int sphPadding) {
     vrAuto_ = vr::Projection::None;
+    vrCubePadPx_ = sphKind >= 0 ? sphPadding : 0;  // only the container states a cubemap's padding
     vrSignal_ = "";
     vrView_ = vr::ViewState{};  // every file opens re-centred, life-size
     ++vrViewGen_;
@@ -2531,11 +2536,13 @@ void App::SetVrProjectionPin(bool pin, vr::Projection p, const char* why) {
 
 void App::CycleVrProjection() {
     using P = vr::Projection;
-    // auto -> flat -> VR180 -> VR360 -> fisheye -> auto
+    // auto -> flat -> VR180 -> VR360 -> fisheye -> 360 cubemap -> 360 EAC -> auto
     if (!vrPinned_) SetVrProjectionPin(true, P::None, "key");
     else if (vrPinnedValue_ == P::None) SetVrProjectionPin(true, P::Equirect180, "key");
     else if (vrPinnedValue_ == P::Equirect180) SetVrProjectionPin(true, P::Equirect360, "key");
     else if (vrPinnedValue_ == P::Equirect360) SetVrProjectionPin(true, P::Fisheye, "key");
+    else if (vrPinnedValue_ == P::Fisheye) SetVrProjectionPin(true, P::Cubemap, "key");
+    else if (vrPinnedValue_ == P::Cubemap) SetVrProjectionPin(true, P::Eac, "key");
     else SetVrProjectionPin(false, vrAuto_, "key");
 }
 
@@ -2619,6 +2626,7 @@ std::string App::VrViewJson() const {
     o["pan_max_deg"] = vrLimits_.panMaxDeg;
     o["pitch_max_deg"] = vrLimits_.pitchMaxDeg;
     o["fisheye_fov_deg"] = vrFisheyeFovDeg_;
+    o["cube_padding_px"] = vrCubePadPx_;
     return o.dump();
 }
 
@@ -2708,7 +2716,8 @@ void App::SubmitAutoConv(const uint8_t* luma, int w, int h, double nowMs) {
         const auto t0 = std::chrono::steady_clock::now();
         for (int e = 0; e < 2; ++e)
             vr::RenderEyeGray(luma, w, h, w, vr::EyeRectFor(layout_, (e == 1) != swap), vrProj_, vrFisheyeFovDeg_, win,
-                              vrAutoConvBuf_.data() + e * ew, ew, eh, ew * 2);
+                              vrAutoConvBuf_.data() + e * ew, ew, eh, ew * 2,
+                              (int)std::lround((float)vrCubePadPx_ * (float)w / (float)std::max(1, mediaW_)));
         const double renderMs =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         autoConvDownsampleMs_ = renderMs + autoConvWorker_.Submit(vrAutoConvBuf_.data(), ew * 2, ew * 2, eh,
@@ -3543,10 +3552,11 @@ void App::SetupAgentTools() {
         "\"enum\":[\"auto\",\"mono\",\"sbs_full\",\"sbs_half\",\"tb_full\",\"tb_half\"],"
         "\"description\":\"Layout to pin, or 'auto' to restore detection.\"},"
         "\"projection\":{\"type\":\"string\","
-        "\"enum\":[\"auto\",\"flat\",\"equirect180\",\"equirect360\",\"fisheye\"],"
+        "\"enum\":[\"auto\",\"flat\",\"equirect180\",\"equirect360\",\"fisheye\",\"cubemap\",\"eac\"],"
         "\"description\":\"VR180 / VR360 viewer (#155, mirrors the P key): the spherical projection "
         "each eye holds, or 'flat' for an ordinary picture, or 'auto' (container metadata, then the "
-        "file name). The packing still comes from 'layout'.\"},"
+        "file name). cubemap = 360 cubemap in a 3x2 grid (FFmpeg v360 c3x2); eac = 360 equi-angular "
+        "cubemap (YouTube EAC, FFmpeg v360 eac). The packing still comes from 'layout'.\"},"
         "\"fisheye_fov_deg\":{\"type\":\"number\",\"minimum\":90,\"maximum\":250,"
         "\"description\":\"Dual-fisheye lens field of view (default 180).\"}}}");
 
@@ -4024,7 +4034,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
             else if (vr::ParseProjectionId(pj, p)) SetVrProjectionPin(true, p, "mcp");
             else {
                 success = false;
-                return "{\"error\":\"projection must be auto|flat|equirect180|equirect360|fisheye\"}";
+                return "{\"error\":\"projection must be auto|flat|equirect180|equirect360|fisheye|cubemap|eac\"}";
             }
         }
         if (!hasLayout && !hasProj && !args.contains("fisheye_fov_deg")) {
