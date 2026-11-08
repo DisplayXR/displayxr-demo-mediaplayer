@@ -87,6 +87,7 @@ private:
     bool LoadMediaFile(const std::string& path);
     int loadSphKind_ = -1;           // the video probe's spherical metadata for this load (#155)
     float loadSphCoverage_ = 0.0f;
+    int loadSphPadding_ = 0;         // cubemap face padding (px) from the same metadata
     void ReloadMedia(const std::string& path);
 
     // Drag and drop (#44). Filters the batch through MediaSource::IsSupported, toasts
@@ -284,6 +285,7 @@ private:
     vr::Projection vrForcedValue_ = vr::Projection::None;
     vr::Projection vrProj_ = vr::Projection::None;   // effective
     float vrFisheyeFovDeg_ = 180.0f;                 // dual-fisheye lens FOV (set_layout)
+    int vrCubePadPx_ = 0;                            // cubemap face padding (container metadata)
     vr::ViewState vrView_;                           // yaw / pitch / fov the user steers
     vr::Limits vrLimits_;
     uint32_t vrViewGen_ = 0;                         // bumps on every view change (auto-conv)
@@ -297,9 +299,10 @@ private:
     // Resolve the projection for freshly loaded media (after ApplyLayout): spherical
     // metadata (kind / coverage from VideoStereoProbe, kind < 0 = none), then the name.
     // A VR source whose packing no strong layer decided takes the packing its aspect implies.
-    void ResolveVr(const std::string& path, int sphericalKind, float sphericalCoverageDeg, int frameW, int frameH);
+    void ResolveVr(const std::string& path, int sphericalKind, float sphericalCoverageDeg, int frameW, int frameH,
+                   int sphericalPadding = 0);
     void SetVrProjectionPin(bool pin, vr::Projection p, const char* why);
-    void CycleVrProjection();  // `P`: auto -> flat -> VR180 -> VR360 -> fisheye -> auto
+    void CycleVrProjection();  // `P`: auto -> flat -> VR180 -> VR360 -> fisheye -> cubemap -> EAC -> auto
     void VrSteer(float dYawDeg, float dPitchDeg, float fovScale);  // clamps, bumps vrViewGen_
     void VrRecenter(const char* why);
     void VrHandleInput(bool& activity);
