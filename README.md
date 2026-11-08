@@ -253,8 +253,8 @@ and **Stop live** in the same menu ends it. Audio in a stream is ignored for now
 | `udp://` / `rtp://` | MPEG-TS over UDP (unicast or multicast, `udp://@239.0.0.1:1234`). |
 | `http://` / `https://` | progressive MPEG-TS / FLV / fragmented MP4. |
 | `*.m3u8` | HLS, local or remote. Its latency is the playlist's (seconds), not the player's. |
-| `*.mpd` | MPEG-DASH, VOD or live (dynamic MPD), local or remote (#195). Like HLS, its latency is the manifest's. Of several video representations FFmpeg's best-stream pick takes the highest bitrate. Windows and Linux builds; the macOS build's Homebrew FFmpeg has no DASH demuxer and says so. |
-| `srt://` | SRT (#198), caller by default: `srt://host:9000`. Options go in the query and are FFmpeg's libsrt ones: `mode=caller\|listener`, `streamid=…` (for example a media server's `read:<path>`), `passphrase=…` (AES; redacted in logs and `get_status`) and `latency=` in **microseconds** (`latency=200000` = 200 ms; libsrt's default is 120 ms). As a listener (`srt://0.0.0.0:9000?mode=listener`) the player waits up to 30 s for the sender. Windows and Linux builds; the macOS build's Homebrew FFmpeg has no libsrt and answers "Protocol not found". |
+| `*.mpd` | MPEG-DASH, VOD or live (dynamic MPD), local or remote (#195). Like HLS, its latency is the manifest's. Of several video representations FFmpeg's best-stream pick takes the highest bitrate. Every desktop build (macOS since #201). |
+| `srt://` | SRT (#198), caller by default: `srt://host:9000`. Options go in the query and are FFmpeg's libsrt ones: `mode=caller\|listener`, `streamid=…` (for example a media server's `read:<path>`), `passphrase=…` (AES; redacted in logs and `get_status`) and `latency=` in **microseconds** (`latency=200000` = 200 ms; libsrt's default is 120 ms). As a listener (`srt://0.0.0.0:9000?mode=listener`) the player waits up to 30 s for the sender. Every desktop build (macOS since #201). |
 
 **Latency.** Demuxing runs with `fflags=nobuffer`, a 0.5 s `max_delay`, a small probe
 (1 MB / 1.5 s, enough for a 4K SPS/PPS + IDR) and a low-delay decoder. The player adds
@@ -276,7 +276,7 @@ SHIFT+TAB text HUD has the same line. Agents drive it with the MCP tool
 stops a stream too.
 
 **FFmpeg must have network input.** The installer's slim FFmpeg (`scripts/build-ffmpeg-slim.sh`,
-`scripts/build_ffmpeg_linux.sh`) enables it. An older slim tree used as a local
+`scripts/build_ffmpeg_linux.sh`, `scripts/build_ffmpeg_macos.sh`) enables it. An older slim tree used as a local
 `-DFFMPEG_ROOT` does not, and every URL then fails with "Protocol not found". For local
 work, point `FFMPEG_ROOT` at any full shared FFmpeg 8.x dev build instead; the gitignored
 `third_party/ffmpeg-win64-full/` is the conventional place for it.
@@ -286,7 +286,7 @@ Ubuntu 22.04, 24.04 and 26.04. Each Linux TLS backend adds a library whose packa
 differs across those releases (`libssl3` / `libssl3t64`), so the Linux build has no TLS:
 `https://`, `rtsps://`, `rtmps://` and HLS over https are **Windows and macOS only**. Plain
 `http`, `rtsp`, `rtmp`, `udp` and `rtp` work everywhere. Windows uses the system SChannel
-(no extra DLL). macOS uses Homebrew's full FFmpeg.
+(no extra DLL), macOS the system Secure Transport (no extra dylib).
 
 Test it with no infrastructure by serving a camera from a second `ffmpeg` on the same box:
 

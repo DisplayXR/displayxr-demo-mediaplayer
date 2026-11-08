@@ -1,0 +1,58 @@
+From 54f0296dfefd43858ad607a3e5499f5fce35cf92 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kacper=20Michaj=C5=82ow?= <kasper93@gmail.com>
+Date: Tue, 12 May 2026 13:19:20 +0200
+Subject: [PATCH] avformat/hls: deduplicate playlists shared by multiple
+ variants
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Master playlists can reference the same media playlist URI from several
+rendition group. new_playlist() allocated a separate playlist struct for
+each reference, this is unndeded work and we can fold duplicates into
+single probe.
+
+Signed-off-by: Kacper Michajłow <kasper93@gmail.com>
+---
+ libavformat/hls.c | 21 ++++++++++++++-------
+ 1 file changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/libavformat/hls.c b/libavformat/hls.c
+index 4c56b954bbee7..16e3396dc480f 100644
+--- a/libavformat/hls.c
++++ b/libavformat/hls.c
+@@ -326,7 +326,19 @@ static void free_rendition_list(HLSContext *c)
+ static struct playlist *new_playlist(HLSContext *c, const char *url,
+                                      const char *base)
+ {
+-    struct playlist *pls = av_mallocz(sizeof(struct playlist));
++    struct playlist *pls;
++    char abs_url[MAX_URL_SIZE];
++
++    ff_make_absolute_url(abs_url, sizeof(abs_url), base, url);
++    if (!abs_url[0])
++        return NULL;
++
++    for (int i = 0; i < c->n_playlists; i++) {
++        if (!strcmp(c->playlists[i]->url, abs_url))
++            return c->playlists[i];
++    }
++
++    pls = av_mallocz(sizeof(struct playlist));
+     if (!pls)
+         return NULL;
+     pls->pkt = av_packet_alloc();
+@@ -334,12 +346,7 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
+         av_free(pls);
+         return NULL;
+     }
+-    ff_make_absolute_url(pls->url, sizeof(pls->url), base, url);
+-    if (!pls->url[0]) {
+-        av_packet_free(&pls->pkt);
+-        av_free(pls);
+-        return NULL;
+-    }
++    av_strlcpy(pls->url, abs_url, sizeof(pls->url));
+     pls->seek_timestamp = AV_NOPTS_VALUE;
+ 
+     pls->is_id3_timestamped = -1;

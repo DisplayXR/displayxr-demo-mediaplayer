@@ -126,8 +126,8 @@ build\mediaplayer_pro_handle_vk_win.exe --camera="SpatialLabs Eyes" --lut show.c
 set VERSION=0.1.0 && installer\build-installer.bat pro
 ```
 
-macOS (Apple Silicon; Homebrew `cmake ninja ffmpeg pkg-config vulkan-headers vulkan-loader
-molten-vk`; the script builds the OpenXR loader):
+macOS (Apple Silicon; Homebrew `cmake ninja meson pkg-config sdl3 vulkan-headers vulkan-loader
+molten-vk`; the script builds the OpenXR loader and the slim FFmpeg, `scripts/build_ffmpeg_macos.sh`):
 
 ```bash
 ./scripts/build_macos.sh --pro --ocio                 # build/: both apps, Pro with OpenColorIO
