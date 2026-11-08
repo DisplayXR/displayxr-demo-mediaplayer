@@ -73,8 +73,10 @@ ZLIB_LIB_W="$(cygpath -m "$ZLIB_PREFIX/lib" 2>/dev/null || echo "$ZLIB_PREFIX/li
 echo "zlib=$ZLIB_PREFIX ($ZLIB_TAG)"
 
 # --- netdeps: static libraries for the network demuxers (#195) ----------------------
-# libxml2 (FFmpeg's dash demuxer parses the MPD with it). Static, /MD, linked into
-# avformat: no new DLL to ship or sign. Only what an MPD parse needs: no iconv (an MPD
+# libxml2 (FFmpeg's dash demuxer parses the MPD with it). Static, linked into avformat:
+# no new DLL to ship or sign. /MT, the CRT FFmpeg's msvc build uses (configure passes
+# no -MD, so cl defaults to the static CRT); a /MD archive leaves __imp_fwrite & co.
+# unresolved in configure's link probe and libxml2 is then "not found". Only what an MPD parse needs: no iconv (an MPD
 # is UTF-8; libxml2 keeps its built-in UTF-8/16 + Latin-1 decoders), no zlib/lzma, no
 # HTTP/FTP, no programs/tests/python. Pinned; the cache key hashes this script.
 #
@@ -93,7 +95,8 @@ cmake_msvc() {
     s="$(cygpath -m "$1" 2>/dev/null || echo "$1")"; b="$(cygpath -m "$2" 2>/dev/null || echo "$2")"; shift 2
     cmake -S "$s" -B "$b" -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$NETDEPS_W" -DBUILD_SHARED_LIBS=OFF \
-        -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL "$@"
+        -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 "$@"
     cmake --build "$b"
     cmake --install "$b"
 }

@@ -851,7 +851,7 @@ if(MP_BUILD_TESTS)
     add_test(NAME image_sequence COMMAND image_sequence_test)
     if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
         add_executable(decode_formats_test tests/decode_formats_test.cpp src/media/VideoDecoder.cpp
-            src/media/ImageSequence.cpp src/Log.cpp)
+            src/media/StreamUrl.cpp src/media/ImageSequence.cpp src/Log.cpp)
         target_include_directories(decode_formats_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_compile_definitions(decode_formats_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
         if(TARGET PkgConfig::FFMPEG)
@@ -879,7 +879,7 @@ if(MP_BUILD_TESTS)
     # The decoder drains at EOF (short clips, last frames): writes a 5-frame ProRes clip.
     if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
         add_executable(short_clip_test tests/short_clip_test.cpp src/media/VideoDecoder.cpp
-            src/media/ImageSequence.cpp src/Log.cpp)
+            src/media/StreamUrl.cpp src/media/ImageSequence.cpp src/Log.cpp)
         target_include_directories(short_clip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_compile_definitions(short_clip_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
         if(TARGET PkgConfig::FFMPEG)
@@ -900,7 +900,7 @@ if(MP_BUILD_TESTS)
         add_executable(spatial_media_test tests/spatial_media_test.cpp src/media/SpatialMedia.cpp
             src/media/HeifLoader.cpp src/media/StereoCompose.cpp src/media/ImageDecoder.cpp
             src/media/VideoDecoder.cpp src/media/VideoStereoProbe.cpp src/media/StereoDetect.cpp
-            src/media/MediaSource.cpp src/media/ImageSequence.cpp src/Log.cpp)
+            src/media/MediaSource.cpp src/media/ImageSequence.cpp src/media/StreamUrl.cpp src/Log.cpp)
         target_include_directories(spatial_media_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
         target_compile_definitions(spatial_media_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1

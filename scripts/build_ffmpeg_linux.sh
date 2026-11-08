@@ -73,7 +73,10 @@ export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PAT
 # --- libxml2, static + PIC (the dash demuxer's MPD parser, #195) --------------
 # Only what an MPD parse needs: no iconv (MPDs are UTF-8), no zlib/lzma/ICU, no
 # HTTP/FTP, no programs/tests/python. The .pc is written here so configure links
-# the archive (and only it) — never the build host's libxml2.so.
+# the archive (and only it) — never the build host's libxml2.so: NETDEPS/lib holds
+# only libxml2.a, so -L there + -lxml2 resolves to it. (Not the archive's full path:
+# configure treats a non -l/-L word as a FLAG and puts it before the probe's object,
+# where the linker never uses it.)
 if [ ! -f "$NETDEPS/lib/libxml2.a" ]; then
     XMLSRC="/tmp/libxml2-src-$LIBXML2_TAG"
     rm -rf "$XMLSRC" "$NETDEPS"
@@ -93,7 +96,7 @@ Name: libXML
 Description: libxml2 (static, for the dash demuxer)
 Version: ${LIBXML2_TAG#v}
 Cflags: -I$NETDEPS/include -I$NETDEPS/include/libxml2
-Libs: $NETDEPS/lib/libxml2.a -lm
+Libs: -L$NETDEPS/lib -lxml2 -lm
 EOF
 export PKG_CONFIG_PATH="$NETDEPS/pc:$PKG_CONFIG_PATH"
 
