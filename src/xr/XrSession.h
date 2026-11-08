@@ -198,6 +198,19 @@ public:
     uint32_t CursorDepthSpec() const { return cursorDepthSpec_; }
     dxr::CursorDepth& Cursor() { return cursor_; }
 
+    // --- Fixed-viewer locates (XR_DXR_display_info v25, XrViewLocateFixedViewerDXR) ---
+    // Everything this player shows is an image PAIR (or a flat image): stereo / flat
+    // video, stereo photos, the live stereo camera, a Convert-to-3D result. Its picture
+    // is the same wherever the viewer stands, and the renderer reads the located views
+    // only to tell left from right. So BeginFrame tells the runtime its content does not
+    // depend on the viewer: the runtime returns the nominal viewer's fixed views and asks
+    // no viewer tracker. A display that does not track the viewer itself therefore never
+    // starts a camera-based tracker (webcam) for this app. On by default; a future
+    // viewer-dependent mode (anything rendered from a 3D scene, where look-around is the
+    // point) must turn it off while it is on screen. Runtimes before spec 25 never see it.
+    void SetViewerIndependentContent(bool on) { viewerIndependentContent_ = on; }
+    bool FixedViewerLocates() const { return displayInfoSpec_ >= 25 && viewerIndependentContent_; }
+
     // --- Agent tools (XR_DXR_mcp_tools) ---
     // The app exposes its playback controls as MCP tools on the per-process server the
     // runtime hosts. Registration is never load-bearing: when the MCP capability gate is
@@ -428,6 +441,8 @@ private:
     std::unique_ptr<DxrWeaveSnap> weaveSnap_;
 #endif
     bool hasDisplayInfoExt_ = false;
+    uint32_t displayInfoSpec_ = 0;          //!< XR_DXR_display_info extensionVersion (0 = absent)
+    bool viewerIndependentContent_ = true;  //!< see SetViewerIndependentContent()
     bool transparentBg_ = false;   // MEDIAPLAYER_TRANSPARENT — letterbox composes through
     uint32_t displayPixelWidth_ = 0;
     uint32_t displayPixelHeight_ = 0;

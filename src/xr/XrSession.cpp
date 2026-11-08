@@ -88,7 +88,10 @@ bool XrSession::InitInstanceAndSystem() {
         LOG_DEBUG("  instance ext: %s (v%u)", e.extensionName, e.extensionVersion);
         if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) hasVulkan = true;
         if (kWindowBindingExt && strcmp(e.extensionName, kWindowBindingExt) == 0) hasWindowBindingExt_ = true;
-        if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) hasDisplayInfoExt_ = true;
+        if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+            hasDisplayInfoExt_ = true;
+            displayInfoSpec_ = e.extensionVersion;  // >= 25: XrViewLocateFixedViewerDXR
+        }
         if (strcmp(e.extensionName, XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0)
             hasFilePickerExt_ = true;
         if (strcmp(e.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
@@ -117,7 +120,7 @@ bool XrSession::InitInstanceAndSystem() {
     LOG_INFO("window binding (%s): %s",
              kWindowBindingExt ? kWindowBindingExt : "<none>",
              hasWindowBindingExt_ ? "yes" : "no");
-    LOG_INFO("XR_DXR_display_info: %s", hasDisplayInfoExt_ ? "yes" : "no");
+    LOG_INFO("XR_DXR_display_info: %s (spec %u)", hasDisplayInfoExt_ ? "yes" : "no", displayInfoSpec_);
     LOG_INFO("XR_DXR_workspace_file_dialog: %s", hasFilePickerExt_ ? "yes" : "no");
     LOG_INFO("XR_DXR_atlas_capture: %s", hasAtlasCaptureExt_ ? "yes" : "no");
     LOG_INFO("XR_DXR_mcp_tools: %s", hasMcpToolsExt_ ? "yes" : "no");
@@ -1249,6 +1252,11 @@ bool XrSession::BeginFrame(Frame& frame) {
     XrViewState viewState = {XR_TYPE_VIEW_STATE};
     for (uint32_t i = 0; i < kMaxViews; ++i) frame.views[i] = {XR_TYPE_VIEW};
     uint32_t viewCountOut = 0;
+    // Viewer-independent content (display_info v25): the nominal viewer's fixed views,
+    // and no viewer tracker started on our account (see SetViewerIndependentContent).
+    XrViewLocateFixedViewerDXR fixedViewer = {XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR};
+    fixedViewer.fixedViewer = XR_TRUE;
+    if (FixedViewerLocates()) locate.next = &fixedViewer;
     // Depth cursor: prepends the hint (+ the measured-disparity request) and the draw
     // state to the two chains. A no-op unless the App enabled the helper.
     cursor_.chain(locate, viewState);
