@@ -194,7 +194,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential ninja-build pkg-config python3 file binutils \
             libvulkan-dev glslang-tools \
-            nasm libva-dev zlib1g-dev \
+            nasm meson libva-dev zlib1g-dev \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxfixes-dev \
             libwayland-dev wayland-protocols libxkbcommon-dev libdbus-1-dev libegl-dev libgl-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev libdbus-1-dev libudev-dev \
@@ -209,7 +209,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.FFMPEG_PREFIX }}
-          key: ffmpeg-slim-linux-2204-${{ hashFiles('scripts/build_ffmpeg_linux.sh') }}
+          key: ffmpeg-slim-linux-2204-${{ hashFiles('scripts/build_ffmpeg_linux.sh', 'scripts/ffmpeg_components.sh') }}
 
       - name: Build + package the demo .deb
         if: needs.DetectChanges.outputs.docs_only != 'true'

@@ -126,7 +126,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.FFMPEG_PREFIX }}
-          key: ffmpeg-slim-${{ env.FFMPEG_SHA }}-${{ hashFiles('scripts/build-ffmpeg-slim.sh') }}
+          key: ffmpeg-slim-${{ env.FFMPEG_SHA }}-${{ hashFiles('scripts/build-ffmpeg-slim.sh', 'scripts/ffmpeg_components.sh') }}
 
       # NASM - prefer the copy already on the runner image.
       #
