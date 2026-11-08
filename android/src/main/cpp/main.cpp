@@ -267,6 +267,13 @@ bool g_warned_view_clamp = false;
 uint32_t g_display_px_w = 0;     // native panel pixels (XR_DXR_display_info)
 uint32_t g_display_px_h = 0;
 bool g_has_display_info = false;
+// XR_DXR_display_info extensionVersion (0 = not advertised). >= 25: every locate
+// chains XrViewLocateFixedViewerDXR. This player shows image PAIRS (stereo / flat
+// video, stereo photos) whose picture is the same wherever the viewer stands, and
+// its SBS blit never reads pose/fov, so it asks the runtime for the nominal
+// viewer's fixed views and for no viewer tracking at all (no camera tracker is
+// started on its account on a display that does not track by itself).
+uint32_t g_display_info_spec = 0;
 
 // ── XR_DXR_view_rig contingency (runtime#540) ───────────────────────────────
 // On the OOP runtime the plain xrLocateViews path can return no valid view
@@ -959,6 +966,7 @@ create_instance(struct android_app *app)
 {
 	g_runtime_unavailable.store(false, std::memory_order_relaxed);
 	g_view_rig_enabled = false;  // re-evaluated below (rebuilds reuse these globals)
+	g_display_info_spec = 0;     // likewise
 #ifdef MP_HAVE_ANDROID_SURFACE_BINDING
 	// A rebuild (xrDestroyInstance → xrCreateInstance) invalidates these; they are
 	// re-resolved in create_session. g_app_window is NOT cleared — the window is
@@ -989,6 +997,9 @@ create_instance(struct android_app *app)
 		}
 		if (xrEnumerateInstanceExtensionProperties(nullptr, n, &n, props.data()) == XR_SUCCESS) {
 			for (uint32_t i = 0; i < n; ++i) {
+				if (std::strcmp(props[i].extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+					g_display_info_spec = props[i].extensionVersion;
+				}
 				if (std::strcmp(props[i].extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
 					extensions[extension_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
 					g_view_rig_enabled = true;
@@ -1002,6 +1013,8 @@ create_instance(struct android_app *app)
 		}
 	}
 	LOGI("XR_DXR_view_rig %s", g_view_rig_enabled ? "advertised -> enabled" : "not advertised");
+	LOGI("XR_DXR_display_info spec %u (fixed-viewer locates %s)", g_display_info_spec,
+	     g_display_info_spec >= 25 ? "on" : "unsupported");
 #ifdef MP_HAVE_ANDROID_SURFACE_BINDING
 	// Kill-switch: debug.dxr.mp.surface_binding=0 forces the legacy
 	// runtime-spawned-SurfaceView path (no rebuild needed).
@@ -2570,7 +2583,15 @@ render_frame()
 		rig.ipdFactor = 1.0f;
 		rig.parallaxFactor = 1.0f;
 		rig.perspectiveFactor = 1.0f;
+		// Viewer-independent content (display_info v25): see g_display_info_spec.
+		XrViewLocateFixedViewerDXR fixed_viewer = {};
+		fixed_viewer.type = XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR;
+		fixed_viewer.fixedViewer = XR_TRUE;
+		if (g_display_info_spec >= 25) {
+			locate_info.next = &fixed_viewer;
+		}
 		if (g_use_rig) {
+			rig.next = locate_info.next;
 			locate_info.next = &rig;
 		}
 
