@@ -93,8 +93,12 @@ jobs:
         # formula). FFmpeg is the repo's slim build (scripts/build_ffmpeg_macos.sh,
         # #201; meson is for its static dav1d), NOT Homebrew's. The app's dylib closure
         # is bundled by a recursive otool/install_name_tool walk in create_app_bundle.sh.
+        # sdl3 is explicit: it used to arrive as a dependency of Homebrew's ffmpeg, and
+        # CMake prefers an installed SDL3, so the shipped app has always carried
+        # Homebrew's SDL3. Without it CMake builds the pinned SDL3 instead (a different
+        # SDL3 in the .pkg, and the bundler does not resolve the build tree's @rpath).
         run: |
-          brew install cmake ninja meson pkg-config vulkan-headers vulkan-loader molten-vk opencolorio
+          brew install cmake ninja meson pkg-config sdl3 vulkan-headers vulkan-loader molten-vk opencolorio
           echo "VULKAN_SDK=$(brew --prefix)" >> "$GITHUB_ENV"
 
       # The slim FFmpeg build_macos.sh builds (and then reuses: the script stamps its
