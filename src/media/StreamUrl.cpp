@@ -26,11 +26,12 @@ std::string SchemeOf(const std::string& s) {
     return Lower(s.substr(0, p));
 }
 
-// Path part without the query/fragment ends with ".m3u8" (case-insensitive).
-bool EndsWithM3u8(const std::string& s) {
-    std::string path = s.substr(0, s.find_first_of("?#"));
-    if (path.size() < 5) return false;
-    return Lower(path.substr(path.size() - 5)) == ".m3u8";
+// Path part without the query/fragment ends with `ext` (case-insensitive).
+bool PathEndsWith(const std::string& s, const char* ext) {
+    const std::string path = s.substr(0, s.find_first_of("?#"));
+    const std::string e(ext);
+    if (path.size() < e.size()) return false;
+    return Lower(path.substr(path.size() - e.size())) == e;
 }
 
 // "authority" of scheme://authority/path?query — i.e. [userinfo@]host[:port].
@@ -45,12 +46,17 @@ std::string Authority(const std::string& url, size_t* begin = nullptr) {
 
 }  // namespace
 
+bool IsHlsPath(const std::string& s) { return PathEndsWith(s, ".m3u8"); }
+bool IsDashPath(const std::string& s) { return PathEndsWith(s, ".mpd"); }
+bool IsManifestPath(const std::string& s) { return IsHlsPath(s) || IsDashPath(s); }
+
 UrlVerdict ClassifyUrl(const std::string& s) {
     UrlVerdict v;
     const std::string scheme = SchemeOf(s);
     if (scheme.empty() || scheme == "file") {
-        // A local HLS playlist is still a live source (its segments may be remote).
-        if (EndsWithM3u8(s)) v.cls = UrlClass::Live;
+        // A local HLS playlist or DASH manifest is still a live source (its segments
+        // may be remote).
+        if (IsManifestPath(s)) v.cls = UrlClass::Live;
         return v;
     }
     v.scheme = scheme;
@@ -77,7 +83,7 @@ bool IsNetworkUrl(const std::string& s) {
 
 std::string UrlHost(const std::string& url) {
     if (SchemeOf(url).empty()) {
-        // Bare path (a local .m3u8): its file name.
+        // Bare path (a local .m3u8 / .mpd): its file name.
         const size_t slash = url.find_last_of("/\\");
         return slash == std::string::npos ? url : url.substr(slash + 1);
     }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "media/VideoDecoder.h"
 #include "media/ImageSequence.h"
+#include "media/StreamUrl.h"
 
 #include "Log.h"
 #include "color/ToneMap.h"  // scene-linear EXR -> PQ code (#134)
@@ -1398,13 +1399,10 @@ std::string LowerScheme(const std::string& url) {
     return s;
 }
 
-bool IsHls(const std::string& url) {
-    std::string path = url.substr(0, url.find_first_of("?#"));
-    if (path.size() < 5) return false;
-    std::string ext = path.substr(path.size() - 5);
-    for (char& c : ext) c = (char)std::tolower((unsigned char)c);
-    return ext == ".m3u8";
-}
+// HLS playlist or DASH manifest (#195): a segmented source. It opens by fetching a
+// manifest and then segments (DASH: the init segment of every representation), so it
+// gets the longer connect / read budgets and no tiny probe.
+bool IsSegmented(const std::string& url) { return stream::IsManifestPath(url); }
 
 constexpr int64_t kSec = 1000000000LL;
 }  // namespace
@@ -1472,7 +1470,16 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
     // Low-latency demux. Unknown keys are simply left unconsumed by protocols/demuxers
     // that don't have them, so one dictionary serves every scheme.
     const std::string scheme = LowerScheme(streamUrl_);
-    const bool hls = IsHls(streamUrl_);
+    const bool hls = IsSegmented(streamUrl_);
+    if (stream::IsDashPath(streamUrl_) && !av_find_input_format("dash")) {
+        // An FFmpeg built without libxml2 has no dash demuxer and would only say
+        // "Invalid data found" after downloading the manifest.
+        avformat_free_context(impl_->fmt);
+        impl_->fmt = nullptr;
+        err = "this build's FFmpeg has no DASH demuxer (needs libxml2)";
+        fatal = true;
+        return false;
+    }
     AVDictionary* opts = nullptr;
     av_dict_set(&opts, "fflags", "nobuffer", 0);
     av_dict_set(&opts, "max_delay", "500000", 0);           // demuxer reorder window, us
@@ -1505,7 +1512,10 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
 
     // Connect + probe must finish inside this budget (a dead server fails fast; Stop()
     // interrupts it at once through the callback).
-    ioDeadlineNs_.store(SteadyNowNs() + (hls ? 15 : 8) * kSec);
+    // DASH opens the init + first media segment of EVERY representation before it
+    // returns (a 3-rung UHD ladder is several MB), so it gets the longest budget.
+    const int connectSec = stream::IsDashPath(streamUrl_) ? 30 : hls ? 15 : 8;
+    ioDeadlineNs_.store(SteadyNowNs() + connectSec * kSec);
     int rc = avformat_open_input(&impl_->fmt, streamUrl_.c_str(), nullptr, &opts);
     av_dict_free(&opts);
     if (rc < 0) {
@@ -1529,6 +1539,39 @@ bool VideoDecoder::OpenLiveInput(std::string& err, bool& fatal) {
     AVCodec* dec = nullptr;
 #endif
     impl_->videoStream = av_find_best_stream(impl_->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
+    if (hls) {
+        // A DASH / HLS source lists every representation as its own stream, and
+        // av_find_best_stream ranks them by the bitrate it ESTIMATED from the probed
+        // segment, which can be the lowest one (DASH-IF UHD MultiRate: 5.7 of 5.7 /
+        // 8.3 / 10.9 Mbit/s). Take the highest advertised bandwidth that this build
+        // can decode (no ABR: FFmpeg's demuxers never switch). Ties: more pixels.
+        int bestIdx = -1;
+        int64_t bestBw = -1, bestPx = -1;
+        for (unsigned i = 0; i < impl_->fmt->nb_streams; ++i) {
+            const AVStream* st = impl_->fmt->streams[i];
+            if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+            if (st->disposition & AV_DISPOSITION_ATTACHED_PIC) continue;
+            if (!avcodec_find_decoder(st->codecpar->codec_id)) continue;
+            const AVDictionaryEntry* e = av_dict_get(st->metadata, "variant_bitrate", nullptr, 0);
+            const int64_t bw = e ? std::strtoll(e->value, nullptr, 10) : st->codecpar->bit_rate;
+            const int64_t px = (int64_t)st->codecpar->width * st->codecpar->height;
+            if (bw > bestBw || (bw == bestBw && px > bestPx)) {
+                bestIdx = (int)i;
+                bestBw = bw;
+                bestPx = px;
+            }
+        }
+        if (bestIdx >= 0 && bestIdx != impl_->videoStream) {
+            impl_->videoStream = bestIdx;
+            dec = avcodec_find_decoder(impl_->fmt->streams[bestIdx]->codecpar->codec_id);
+        }
+        if (bestIdx >= 0) {
+            const AVCodecParameters* cp = impl_->fmt->streams[bestIdx]->codecpar;
+            LOG_INFO("VideoDecoder: segmented source, video representation %d of %u streams: "
+                     "%dx%d at %lld bit/s advertised",
+                     bestIdx, impl_->fmt->nb_streams, cp->width, cp->height, (long long)bestBw);
+        }
+    }
     if (impl_->videoStream < 0 || !dec) {
         err = (impl_->videoStream == AVERROR_DECODER_NOT_FOUND) ? "no decoder for the video codec"
                                                                  : "no video stream";
@@ -1554,7 +1597,7 @@ void VideoDecoder::LiveLoop(const std::function<double(void*)>& fill, double& ti
     using clock = std::chrono::steady_clock;
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
-    const bool hls = IsHls(streamUrl_);
+    const bool hls = IsSegmented(streamUrl_);
     const int64_t readTimeoutNs = (hls ? 15 : 5) * kSec;
 
     // Before the first successful stream a dead URL gives up after kMaxInitialFailures

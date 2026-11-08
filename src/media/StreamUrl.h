@@ -8,8 +8,8 @@
 // (so a Windows drive letter "C:\x" / "C://x" is never a scheme). Live schemes are
 // the ones the bundled FFmpeg can open as a stream; `srt://` is recognised but
 // rejected (it needs libsrt, which is not bundled). `file://` and anything without
-// a scheme is a file — except a path ending in `.m3u8`, which is an HLS playlist and
-// is played as a live stream even from disk.
+// a scheme is a file — except a path ending in `.m3u8` (an HLS playlist) or `.mpd` (a
+// DASH manifest, #195), which is played as a live stream even from disk.
 #pragma once
 
 #include <string>
@@ -24,18 +24,24 @@ enum class UrlClass {
 
 struct UrlVerdict {
     UrlClass cls = UrlClass::File;
-    std::string scheme;  // lower-case, "" for File / a bare .m3u8 path
+    std::string scheme;  // lower-case, "" for File / a bare .m3u8 / .mpd path
     std::string reason;  // Unsupported only: a user-facing sentence
 };
 
 UrlVerdict ClassifyUrl(const std::string& s);
+
+// The path part (query / fragment ignored, case-insensitive) ends in `.m3u8` (HLS) /
+// `.mpd` (DASH) / either: a segmented source, slower to open than a raw stream.
+bool IsHlsPath(const std::string& s);
+bool IsDashPath(const std::string& s);
+bool IsManifestPath(const std::string& s);
 
 // True for anything that is a network URL — Live AND Unsupported — so a caller can
 // route it to the stream loader, which then reports the Unsupported reason.
 bool IsNetworkUrl(const std::string& s);
 
 // "host[:port]" for the HUD / pill (credentials and path stripped); the file name for
-// a bare .m3u8 path; "" when nothing sensible can be extracted.
+// a bare .m3u8 / .mpd path; "" when nothing sensible can be extracted.
 std::string UrlHost(const std::string& url);
 
 // The URL with any password replaced by "***" ("rtsp://user:***@cam/..."), for logs,

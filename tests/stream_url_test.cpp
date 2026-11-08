@@ -61,6 +61,24 @@ void TestHls() {
     ExpectClass("C:\\streams\\m3u8.mp4", UrlClass::File);
 }
 
+void TestDash() {
+    ExpectClass("https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd", UrlClass::Live);
+    ExpectClass("https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.MPD?x=1#t", UrlClass::Live);
+    ExpectClass("http://127.0.0.1:8080/live/manifest.mpd", UrlClass::Live);
+    // A local DASH manifest is played as a live stream too (segments may be remote).
+    ExpectClass("C:\\streams\\live.mpd", UrlClass::Live);
+    ExpectClass("/home/me/dash/Manifest.mpd", UrlClass::Live);
+    ExpectClass("file:///C:/streams/live.mpd", UrlClass::Live);
+    CHECK(IsNetworkUrl("/home/me/dash/Manifest.mpd"), "local .mpd routes to the stream loader");
+    CHECK(UrlHost("/home/me/dash/Manifest.mpd") == "Manifest.mpd", "bare .mpd host is its name");
+    ExpectClass("C:\\streams\\mpd.mp4", UrlClass::File);
+    ExpectClass("/home/me/clip.mpd.mp4", UrlClass::File);
+    CHECK(mp::stream::IsDashPath("x/a.MPD?q"), "IsDashPath ignores case + query");
+    CHECK(!mp::stream::IsDashPath("x/a.m3u8"), "an HLS path is not DASH");
+    CHECK(mp::stream::IsManifestPath("x/a.m3u8") && mp::stream::IsManifestPath("x/a.mpd"),
+          "both are manifests");
+}
+
 void TestRejected() {
     const auto v = ClassifyUrl("srt://127.0.0.1:9000?mode=caller");
     CHECK(v.cls == UrlClass::Unsupported, "srt is rejected");
@@ -101,6 +119,7 @@ void TestHostAndRedact() {
 int main() {
     TestLiveSchemes();
     TestHls();
+    TestDash();
     TestRejected();
     TestFiles();
     TestHostAndRedact();
