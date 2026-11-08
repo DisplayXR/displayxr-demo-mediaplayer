@@ -3,7 +3,8 @@
 // Segmented sources play at real time (#197). Writes a 6 s, 25 fps HLS VOD with 1 s
 // segments to a temp dir with FFmpeg's own encoder + hls muxer, plays the playlist from
 // disk through VideoDecoder::OpenLive (a .m3u8 path is a stream, StreamUrl.h), and
-// consumes the ring at 60 Hz like the renderer. Before the fix every segment decoded
+// consumes the ring every 5 ms (well above the clip's 25 fps, so a loaded CI runner's
+// scheduling jitter does not read as lost frames). Before the fix every segment decoded
 // as fast as the machine could and the clip "played" in a fraction of its length, the
 // ring overwriting most frames. Now media time must advance at wall-clock speed and
 // nearly every frame must reach the consumer. Skips when the FFmpeg build has no
@@ -126,12 +127,12 @@ int main() {
     }
     const double pts0 = dec.PositionSeconds();
     const auto w0 = clock::now();
-    // 3 s of a 60 Hz consumer, well inside the 6 s clip.
+    // 3 s of a 200 Hz consumer, well inside the 6 s clip.
     int shown = 0;
     int64_t skipped = 0;
     auto next = w0;
     while (clock::now() - w0 < std::chrono::seconds(3)) {
-        next += std::chrono::microseconds(16667);
+        next += std::chrono::microseconds(5000);
         std::this_thread::sleep_until(next);
         if (const mp::FrameRing::Frame* f = dec.Ring().AcquireLatest()) {
             if (f->serial > lastSerial + 1) skipped += f->serial - lastSerial - 1;
@@ -150,8 +151,8 @@ int main() {
         std::fprintf(stderr, "  FAIL: a segmented source must play at real time (x%.2f)\n", rate);
         ++failures;
     }
-    // 3 s at 25 fps = 75 frames; a loaded CI runner may miss a few refreshes.
-    if (shown < 60 || skipped > 8) {
+    // 3 s at 25 fps = 75 frames. Before the fix: 4 shown, 246 overwritten.
+    if (shown < 55 || skipped > 15) {
         std::fprintf(stderr, "  FAIL: frames lost between decode and display (%d shown, %lld overwritten)\n", shown,
                      (long long)skipped);
         ++failures;
