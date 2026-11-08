@@ -12,9 +12,11 @@
 //
 // Live mode (#93, OpenLive): a network stream URL (RTSP / RTMP / UDP / RTP / HTTP /
 // HLS). Connecting happens on the decode thread, so OpenLive returns at once and the
-// caller follows GetStreamState(). Live semantics like the camera: no PTS sleeping
-// (every decoded frame is published as it arrives; the ring keeps only the newest),
-// no seek / loop / duration, audio packets DROPPED (v1: a live feed never has an A/V
+// caller follows GetStreamState(). Push protocols (RTSP / SRT / UDP / RTMP) have live
+// semantics like the camera: no PTS sleeping (every decoded frame is published as it
+// arrives; the ring keeps only the newest). Segmented sources (HLS / DASH) arrive a
+// segment at a time, so they demux ahead on a second thread and each frame is shown at
+// its PTS on a wall clock (#197, SegmentedPlayback). Either way: no seek / loop / duration, audio packets DROPPED (v1: a live feed never has an A/V
 // clock to pace to), and automatic reconnect with 1-2-4-8 s backoff after a loss.
 // Zero-copy interop (#28) is off for streams: a reconnect rebuilds the whole decoder,
 // and the renderer's imports of the old device's shared textures must not dangle.
@@ -56,6 +58,7 @@ public:
         float kbps = 0.0f;           // demuxed bitrate, all streams (1 s window)
         uint64_t frames = 0;         // decoded + published this session
         uint64_t dropped = 0;        // published over a frame the renderer never took
+        uint64_t stalls = 0;         // HLS / DASH: the picture waited on the network (#197)
         int reconnects = 0;          // times the stream came back after a loss
         double connectMs = 0.0;      // open -> first frame of the current connection
         std::string lastError;       // last connect / read failure ("" = none)
@@ -144,6 +147,14 @@ private:
     // DecodeLoop's frame->ring copier (AVFrame* passed as void*, header stays libav-free);
     // `timeBase` is re-pointed at each connection's video stream.
     void LiveLoop(const std::function<double(void*)>& fill, double& timeBase);
+    // HLS / DASH (#197): demux ahead on a second thread, show each frame at its PTS.
+    // Returns when the connection ends (err set) or on Stop(). `publish` / `tick` are
+    // LiveLoop's ring + stats hooks, `winBytes` its bitrate window.
+    void SegmentedPlayback(::AVFrame* frame, const std::function<double(void*)>& fill,
+                           int64_t readTimeoutNs,
+                           const std::function<void(::AVFrame*, double)>& publish,
+                           const std::function<void()>& tick, std::atomic<uint64_t>& winBytes,
+                           std::string& err);
     // Open impl_->fmt on streamUrl_ with the low-latency options + the video decoder.
     // Returns false with `err` set; `fatal` = retrying cannot help (no such protocol /
     // demuxer / decoder, no video stream, HTTP 4xx).
@@ -185,6 +196,7 @@ private:
     std::string streamUrl_;
     std::atomic<StreamState> streamState_{StreamState::Idle};
     std::atomic<int64_t> ioDeadlineNs_{0};      // steady-clock ns; 0 = no deadline
+    std::atomic<bool> segAbort_{false};         // ends SegmentedPlayback's demux thread
     mutable std::mutex statsMutex_;
     StreamStats stats_;
     double durationSec_ = 0.0;                  // set in Open()

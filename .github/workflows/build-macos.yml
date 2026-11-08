@@ -210,11 +210,12 @@ jobs:
           cmake --build build --target lif_roundtrip_test stereo_detect_test \
                                      mpo_parse_test camera_select_test auto_convergence_test stereo_packing_test eye_assign_test stream_url_test lift_client_test input_provider_client_test color_test \
                                      stereo_sweep live_pixels_test timecode_pairer_test resolve_link_test thumbnail_test scopes_test overlays_test compare_clip_test look_loader_test rig_check_test \
-                                     image_sequence_test ocio_bake_test short_clip_test qc_report_test spatial_media_test vr_view_test display_calibration_test target_screen_test qc_exporter_test tone_map_test media_library_test stereo_classifier_test thumbnail_cache_test touch_scroller_test slide_gesture_test audio_layout_test
+                                     image_sequence_test ocio_bake_test short_clip_test segmented_pacing_test qc_report_test spatial_media_test vr_view_test display_calibration_test target_screen_test qc_exporter_test tone_map_test media_library_test stereo_classifier_test thumbnail_cache_test touch_scroller_test slide_gesture_test audio_layout_test
           ctest --test-dir build --output-on-failure -E "^decode_formats$"
 
-      # decode_formats (Pro review formats through the real VideoDecoder) and short_clip
-      # (which skips itself on the slim build: no ProRes encoder) need FFmpeg's
+      # decode_formats (Pro review formats through the real VideoDecoder), short_clip and
+      # segmented_pacing (both skip themselves on the slim build: no ProRes / mpeg2video
+      # encoder, no hls muxer) need FFmpeg's
       # encoders to write their fixtures, so they build in their own tree against Homebrew's
       # full FFmpeg, installed only now: after the shipped binaries are built and
       # packaged, so it can never reach them. Nothing from this tree is packaged.
@@ -225,8 +226,8 @@ jobs:
           brew install ffmpeg
           cmake -S . -B build-decode-test -G Ninja -DCMAKE_BUILD_TYPE=Release -DMP_BUILD_TESTS=ON \
               -DCMAKE_PREFIX_PATH="/tmp/openxr-install;$(brew --prefix)"
-          cmake --build build-decode-test --target decode_formats_test short_clip_test
-          ctest --test-dir build-decode-test --output-on-failure -R "^(decode_formats|short_clip)$"
+          cmake --build build-decode-test --target decode_formats_test short_clip_test segmented_pacing_test
+          ctest --test-dir build-decode-test --output-on-failure -R "^(decode_formats|short_clip|segmented_pacing)$"
 
       - name: Assert .pkg payload (regression guard)
         if: needs.DetectChanges.outputs.docs_only != 'true'

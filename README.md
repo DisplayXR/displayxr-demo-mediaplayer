@@ -262,6 +262,14 @@ about one decoded frame of latency. Most of what remains is the sender's encoder
 use a zerolatency tune and a short keyframe interval (`-g 30`). The first picture shows at
 the next keyframe.
 
+**HLS and DASH play at their own pace (#197).** A segmented source arrives a segment
+(2-10 s of media) at a time. The player demuxes it on a second thread up to 10 s ahead of
+the picture and shows each frame at its timestamp, so a VOD plays at normal speed and a
+live stream plays smoothly instead of in segment-sized bursts. When the network is slower
+than the stream the picture waits ("stall", counted in the 5 s `Stream:` log line and in
+`get_status` `stream_stalls`), then resumes once a second of media is queued again. Push
+protocols (RTSP, SRT, UDP, RTMP) are still shown as soon as each frame decodes.
+
 **Reconnect.** A stream that stops (the sender is killed or the network drops) is detected
 after 5 s without data (15 s for HLS and DASH). The pill turns amber (RECONNECTING) and the player
 retries with a 1, 2, 4, 8 s backoff (capped) until the stream is back. The last picture
@@ -272,7 +280,7 @@ While streaming, the top bar shows `STREAM host · fps · Mbit/s`: a blue dot wh
 amber while connecting, reconnecting or frozen, grey once the stream has failed. The
 SHIFT+TAB text HUD has the same line. Agents drive it with the MCP tool
 `open_url {url}`. `get_status` reports `stream`, `stream_state`, `stream_url`
-(password redacted), `stream_fps`, `stream_kbps` and `reconnects`, and `close_camera`
+(password redacted), `stream_fps`, `stream_kbps`, `stream_stalls` and `reconnects`, and `close_camera`
 stops a stream too.
 
 **FFmpeg must have network input.** The installer's slim FFmpeg (`scripts/build-ffmpeg-slim.sh`,

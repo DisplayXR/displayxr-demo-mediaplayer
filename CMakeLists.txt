@@ -897,6 +897,26 @@ if(MP_BUILD_TESTS)
         add_test(NAME short_clip COMMAND short_clip_test)
     endif()
 
+    # Segmented sources (#197): a local HLS VOD must play at real time, not decode speed.
+    # stream_pacing_probe is the same measurement against any URL (manual: needs network).
+    if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
+        foreach(_t segmented_pacing_test stream_pacing_probe)
+            add_executable(${_t} tests/${_t}.cpp src/media/VideoDecoder.cpp
+                src/media/StreamUrl.cpp src/media/ImageSequence.cpp src/Log.cpp)
+            target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            target_compile_definitions(${_t} PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
+            if(TARGET PkgConfig::FFMPEG)
+                target_link_libraries(${_t} PRIVATE PkgConfig::FFMPEG)
+            else()
+                target_link_libraries(${_t} PRIVATE mp_ffmpeg)
+            endif()
+            if(WIN32)
+                target_link_libraries(${_t} PRIVATE d3d11 dxgi d3dcompiler)
+            endif()
+        endforeach()
+        add_test(NAME segmented_pacing COMMAND segmented_pacing_test)
+    endif()
+
     # Phone spatial capture (#154): eye order + the HEIF `ster` walk (pure, always), and the
     # committed MV-HEVC / stereo HEIC fixtures through the real VideoDecoder + HeifLoader
     # when FFmpeg is linked (skips those parts on an FFmpeg older than 7.1).
