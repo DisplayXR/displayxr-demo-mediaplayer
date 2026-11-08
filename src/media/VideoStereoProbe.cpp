@@ -4,6 +4,7 @@
 #include "Log.h"
 #include "StereoDetect.h"
 
+#include <algorithm>
 #include <chrono>
 
 #if defined(MEDIAPLAYER_WITH_FFMPEG)
@@ -93,11 +94,14 @@ bool ReadStereo3D(const AVFrame* f, StereoLayout& layout, bool& invert, const ch
 }
 
 // VR180 / VR360 (#155): an AVSphericalMapping reduced to (kind, horizontal coverage) for
-// vr::FromSpherical. kind: 0 equirect, 1 bounded equirect, 2 half equirect, 3 fisheye.
-bool ReduceSpherical(const AVSphericalMapping* m, size_t size, int& kind, float& coverageDeg) {
+// vr::FromSpherical. kind: 0 equirect, 1 bounded equirect, 2 half equirect, 3 fisheye,
+// 4 cubemap (3x2: the MP4 / MKV demuxers only accept cbmp layout 0); `padding` = the
+// cubemap's per-face-edge padding in pixels (0 otherwise).
+bool ReduceSpherical(const AVSphericalMapping* m, size_t size, int& kind, float& coverageDeg, int& padding) {
     if (!m || size < sizeof(AVSphericalMapping)) return false;
     kind = -1;
     coverageDeg = 360.0f;
+    padding = 0;
     switch (m->projection) {
         case AV_SPHERICAL_EQUIRECTANGULAR: kind = 0; break;
         case AV_SPHERICAL_EQUIRECTANGULAR_TILE: {
@@ -112,7 +116,13 @@ bool ReduceSpherical(const AVSphericalMapping* m, size_t size, int& kind, float&
         case AV_SPHERICAL_HALF_EQUIRECTANGULAR: kind = 2; coverageDeg = 180.0f; break;
         case AV_SPHERICAL_FISHEYE: kind = 3; coverageDeg = 0.0f; break;
 #endif
-        default: break;  // cubemap, rectilinear, parametric immersive: not supported
+        case AV_SPHERICAL_CUBEMAP:
+            kind = 4;
+            padding = (int)std::min<uint32_t>(m->padding, 127u);
+            break;
+        // EAC never arrives here: YouTube marks it with an sv3d `mshp` mesh, which the
+        // demuxers skip (the name or the user picks it).
+        default: break;  // rectilinear, parametric immersive: not supported
     }
     return true;
 }
@@ -143,7 +153,8 @@ const AVSphericalMapping* StreamSpherical(const AVStream* st, size_t& size) {
 void ReadStreamSpherical(const AVStream* st, VideoStereoProbe::Result& out) {
     size_t sz = 0;
     const AVSphericalMapping* m = StreamSpherical(st, sz);
-    if (m && ReduceSpherical(m, sz, out.sphericalKind, out.sphericalCoverageDeg)) out.haveSpherical = true;
+    if (m && ReduceSpherical(m, sz, out.sphericalKind, out.sphericalCoverageDeg, out.sphericalPadding))
+        out.haveSpherical = true;
 }
 
 // Analyse a decoded frame's luma plane. Handles >8-bit planar formats by sampling the
@@ -276,7 +287,7 @@ VideoStereoProbe::Result VideoStereoProbe::Run(const std::string& path, bool wan
             if (!out.haveSpherical) {  // decoders that export it per frame (#155)
                 const AVFrameSideData* sd = av_frame_get_side_data(c.frame, AV_FRAME_DATA_SPHERICAL);
                 if (sd && ReduceSpherical(reinterpret_cast<const AVSphericalMapping*>(sd->data), (size_t)sd->size,
-                                          out.sphericalKind, out.sphericalCoverageDeg))
+                                          out.sphericalKind, out.sphericalCoverageDeg, out.sphericalPadding))
                     out.haveSpherical = true;
             }
             if (!out.haveMeta) {
@@ -330,7 +341,7 @@ VideoStereoProbe::Result VideoStereoProbe::Run(const std::string& path, bool wan
     return out;
 }
 
-bool VideoStereoProbe::ReadSpherical(const std::string& path, int& kind, float& coverageDeg) {
+bool VideoStereoProbe::ReadSpherical(const std::string& path, int& kind, float& coverageDeg, int* padding) {
     AVFormatContext* fmt = nullptr;
     if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return false;
     Result r;
@@ -339,6 +350,7 @@ bool VideoStereoProbe::ReadSpherical(const std::string& path, int& kind, float& 
     avformat_close_input(&fmt);
     kind = r.sphericalKind;
     coverageDeg = r.sphericalCoverageDeg;
+    if (padding) *padding = r.sphericalPadding;
     return r.haveSpherical;
 }
 

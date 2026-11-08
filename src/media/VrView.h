@@ -37,6 +37,10 @@
 //   column = azimuth through atan) - a cylindrical window - so rows align exactly at every
 //   heading, which wraps freely; pitch is the same kind of vertical lens shift.
 //
+//   A cubemap or EAC 360 eye is the same full sphere as a 360 equirect, only stored as six
+//   cube faces: stereo cubemap / EAC uses the same Cylinder model, and only the final
+//   direction -> source uv lookup (CubeLocalUV) differs.
+//
 //   A mono source has no pair to keep rectified: Model::Free is a plain rotating camera
 //   (yaw and pitch both real rotations).
 //
@@ -65,6 +69,8 @@ enum class Projection : uint8_t {
     Equirect180,  // equirectangular, 180 x 180 degrees per eye (YouTube VR180)
     Equirect360,  // equirectangular, 360 x 180 degrees per eye
     Fisheye,      // equidistant fisheye per eye (raw VR180 cameras), FOV Format::fisheyeFovDeg
+    Cubemap,      // 360 cubemap, 3x2 faces per eye (FFmpeg v360 `c3x2`; Spherical Video V2 `cbmp` layout 0)
+    Eac,          // 360 equi-angular cubemap, 3x2 faces per eye (YouTube EAC; FFmpeg v360 `eac`)
 };
 
 enum class Model : uint8_t {
@@ -73,15 +79,23 @@ enum class Model : uint8_t {
     Free = 2,      // mono: yaw and pitch both rotate
 };
 
-const char* ProjectionName(Projection p);  // HUD: "flat", "VR180", "VR360", "VR180 fisheye"
-const char* ProjectionId(Projection p);    // MCP: "flat", "equirect180", "equirect360", "fisheye"
-bool ParseProjectionId(const std::string& s, Projection& out);  // also accepts "none"
+// HUD: "flat", "VR180", "VR360", "VR180 fisheye", "360 cubemap", "360 EAC"
+const char* ProjectionName(Projection p);
+// MCP: "flat", "equirect180", "equirect360", "fisheye", "cubemap", "eac"
+const char* ProjectionId(Projection p);
+bool ParseProjectionId(const std::string& s, Projection& out);  // also accepts "none", "c3x2"
 
 inline bool IsStereoLayout(StereoLayout l) { return packing::IsPacked(l); }
 
+// Each eye covers the whole sphere (the heading wraps).
+inline bool IsFullSphere(Projection p) {
+    return p == Projection::Equirect360 || p == Projection::Cubemap || p == Projection::Eac;
+}
+inline bool IsCube(Projection p) { return p == Projection::Cubemap || p == Projection::Eac; }
+
 inline Model ModelFor(Projection p, bool stereo) {
     if (!stereo) return Model::Free;
-    return p == Projection::Equirect360 ? Model::Cylinder : Model::Plane;
+    return IsFullSphere(p) ? Model::Cylinder : Model::Plane;
 }
 
 // Pan / pitch / zoom bounds. Configurable (MEDIAPLAYER_VR_PAN_MAX, ...): the pan clamp is
@@ -147,11 +161,128 @@ inline void RayDir(const EyeWindow& w, float tx, float ty, float d[3]) {
     d[2] = -cx * sh + cz * ch;
 }
 
+// ---- cubemap / EAC -------------------------------------------------------------------
+//
+// Both are 3 x 2 grids of cube faces over one eye; they differ in which face sits in which
+// cell, how a face is rotated, and how a face coordinate maps to pixels. The definitions
+// are FFmpeg's v360 filter (libavfilter/vf_v360.c), the de-facto reference both for making
+// such files and for reading them:
+//
+//   Cubemap (v360 `c3x2`, Spherical Video V2 `cbmp` layout 0): top row right | left | up,
+//   bottom row down | front | back, no face rotated; a face coordinate a in [-1, 1] maps
+//   linearly across the face. `padding` (cbmp / AVSphericalMapping) = pixels on EACH edge
+//   of every face that sit outside the face's [-1, 1] (filtering margin).
+//
+//   EAC (v360 `eac`, YouTube's equi-angular cubemap): top row left | front | right, bottom
+//   row down | back | up, the bottom row turned (down 270, back 90, up 270 degrees), and a
+//   face coordinate maps through atan: pixel = 2/pi * atan(a) (equal angle per pixel).
+//   The frame carries a fixed 2-pixel margin on the outer left / right edges and at the
+//   top and bottom of each row (none between faces in a row). YouTube serves mono EAC at
+//   16:9 (the faces are not square; the mapping is per axis, so that changes nothing) and
+//   stereo EAC side by side with each eye's 3x2 grid turned 90 degrees counter-clockwise
+//   (a portrait eye): an EAC eye narrower than it is tall is read that way.
+//
+// v360 works with y DOWN; the face coordinates below are written in this file's y-up
+// frame, with (a, b) = (right, down) across the face as stored, before rotation.
+// Face directions, in this order: right (+x), left (-x), up (+y), down (-y), front (+z),
+// back (-z).
+enum CubeDir : int { kCubeRight = 0, kCubeLeft, kCubeUp, kCubeDown, kCubeFront, kCubeBack };
+
+// Which face a direction hits and its (a, b) on that face, in [-1, 1].
+inline int CubeFace(const float d[3], float& a, float& b) {
+    const float ax = std::fabs(d[0]), ay = std::fabs(d[1]), az = std::fabs(d[2]);
+    if (ay >= ax && ay >= az && ay > 0.f) {
+        if (d[1] > 0.f) { a = d[0] / ay; b = d[2] / ay; return kCubeUp; }  // its bottom edge meets front
+        a = d[0] / ay; b = -d[2] / ay; return kCubeDown;                     // its top edge meets front
+    }
+    if (ax >= az && ax > 0.f) {
+        if (d[0] > 0.f) { a = -d[2] / ax; b = -d[1] / ax; return kCubeRight; }
+        a = d[2] / ax; b = -d[1] / ax; return kCubeLeft;
+    }
+    const float zz = az > 0.f ? az : 1.f;
+    if (d[2] >= 0.f) { a = d[0] / zz; b = -d[1] / zz; return kCubeFront; }
+    a = -d[0] / zz; b = -d[1] / zz; return kCubeBack;
+}
+
+// The grid cell (0..5: col + 3 * row) of each face and its rotation in quarter turns, per
+// projection. v360's rotate_cube_face: 1 (90): (a, b) -> (-b, a); 2: (-a, -b); 3: (b, -a).
+inline int CubeCell(Projection p, int dir) {
+    static const int kC3x2[6] = {0, 1, 2, 3, 4, 5};
+    static const int kEac[6] = {2, 0, 5, 3, 1, 4};
+    return p == Projection::Eac ? kEac[dir] : kC3x2[dir];
+}
+inline int CubeRot(Projection p, int dir) {
+    static const int kEac[6] = {0, 0, 3, 3, 0, 1};
+    return p == Projection::Eac ? kEac[dir] : 0;
+}
+constexpr float kEacMarginPx = 2.0f;  // v360 `eac`: the fixed pixel margin of YouTube's layout
+
+// uv of a direction on a 3x2 cubemap / EAC grid. gridPxW / gridPxH = the grid's size in
+// pixels (0 = unknown: no edge inset); padPx = cubemap face padding (cbmp). The result is
+// clamped half a texel inside its face's cell, so bilinear taps never cross into a
+// neighbouring face that is not its neighbour on the sphere (the seam).
+inline void CubeGridUV(Projection p, float eyePxW, float eyePxH, float padPx, const float d[3], float& u,
+                       float& v) {
+    float a = 0.f, b = 0.f;
+    const int dir = CubeFace(d, a, b);
+    const int rot = CubeRot(p, dir);
+    if (rot == 1) { const float t = a; a = -b; b = t; }
+    else if (rot == 2) { a = -a; b = -b; }
+    else if (rot == 3) { const float t = a; a = b; b = -t; }
+    const int cell = CubeCell(p, dir);
+    const float col = (float)(cell % 3), row = (float)(cell / 3);
+    float cu0, cu1, cv0, cv1;  // the cell (face + its margin) in eye uv
+    if (p == Projection::Eac) {
+        const float pu = eyePxW > 0.f ? kEacMarginPx / eyePxW : 0.f;
+        const float pv = eyePxH > 0.f ? kEacMarginPx / eyePxH : 0.f;
+        const float fu = (2.0f / kPi) * std::atan(a) + 0.5f, fv = (2.0f / kPi) * std::atan(b) + 0.5f;
+        const float fw = (1.0f - 2.0f * pu) / 3.0f;
+        u = pu + (col + fu) * fw;
+        v = 0.5f * row + pv + fv * (0.5f - 2.0f * pv);
+        cu0 = col == 0.f ? 0.f : pu + col * fw;
+        cu1 = col == 2.f ? 1.f : pu + (col + 1.f) * fw;
+        cv0 = 0.5f * row;
+        cv1 = 0.5f * row + 0.5f;
+    } else {
+        const float sx = eyePxW > 0.f ? 1.0f - 2.0f * padPx * 3.0f / eyePxW : 1.f;
+        const float sy = eyePxH > 0.f ? 1.0f - 2.0f * padPx * 2.0f / eyePxH : 1.f;
+        u = (col + 0.5f * (a * sx + 1.0f)) / 3.0f;
+        v = (row + 0.5f * (b * sy + 1.0f)) / 2.0f;
+        cu0 = col / 3.0f;
+        cu1 = (col + 1.0f) / 3.0f;
+        cv0 = row / 2.0f;
+        cv1 = (row + 1.0f) / 2.0f;
+    }
+    const float hu = eyePxW > 0.f ? 0.5f / eyePxW : 0.f, hv = eyePxH > 0.f ? 0.5f / eyePxH : 0.f;
+    u = u < cu0 + hu ? cu0 + hu : u > cu1 - hu ? cu1 - hu : u;
+    v = v < cv0 + hv ? cv0 + hv : v > cv1 - hv ? cv1 - hv : v;
+}
+
+// Eye-local source uv of a direction on a cubemap / EAC eye (eyeAspect = eye width /
+// height). A portrait EAC eye is YouTube's stereo layout: the grid turned 90 degrees
+// counter-clockwise, so it is sampled as the upright grid (H x W) and rotated back.
+inline void CubeLocalUV(Projection p, float eyeAspect, float eyePxW, float eyePxH, float padPx, const float d[3],
+                        float& u, float& v) {
+    if (p == Projection::Eac && eyeAspect < 1.0f) {
+        float gu = 0.f, gv = 0.f;
+        CubeGridUV(p, eyePxH, eyePxW, padPx, d, gu, gv);
+        u = gv;
+        v = 1.0f - gu;
+        return;
+    }
+    CubeGridUV(p, eyePxW, eyePxH, padPx, d, u, v);
+}
+
 // Eye-local source uv of a world direction. `eyeAspect` = the eye rect's pixel width /
 // height (the fisheye image circle is inscribed in its shorter side). Returns false where
 // the projection has no picture (behind a 180 source, outside the fisheye circle).
+// eyePxW / eyePxH / cubePadPx: cubemap and EAC only (see CubeLocalUV).
 inline bool DirToLocalUV(Projection p, float fisheyeFovDeg, float eyeAspect, const float d[3], float& u,
-                         float& v) {
+                         float& v, float eyePxW = 0.f, float eyePxH = 0.f, float cubePadPx = 0.f) {
+    if (IsCube(p)) {
+        CubeLocalUV(p, eyeAspect, eyePxW, eyePxH, cubePadPx, d, u, v);
+        return true;
+    }
     if (p == Projection::Fisheye) {
         const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
         float c = len > 0.f ? d[2] / len : 1.f;
@@ -182,10 +313,10 @@ inline bool DirToLocalUV(Projection p, float fisheyeFovDeg, float eyeAspect, con
 // The whole per-pixel mapping: eye viewport (s, t) -> eye-local source uv. This is what
 // shaders/sbs.frag VrLocalUV computes; keep them identical.
 inline bool SampleUV(const EyeWindow& w, Projection p, float fisheyeFovDeg, float eyeAspect, float s, float t,
-                     float& u, float& v) {
+                     float& u, float& v, float eyePxW = 0.f, float eyePxH = 0.f, float cubePadPx = 0.f) {
     float d[3];
     RayDir(w, w.x0 + s * w.sx, w.y0 + t * w.sy, d);
-    return DirToLocalUV(p, fisheyeFovDeg, eyeAspect, d, u, v);
+    return DirToLocalUV(p, fisheyeFovDeg, eyeAspect, d, u, v, eyePxW, eyePxH, cubePadPx);
 }
 
 // The eye rect a VR source samples: SBS / TB halves, or the whole frame. Full vs half does
@@ -203,15 +334,18 @@ inline packing::EyeRect EyeRectFor(StereoLayout l, bool secondEye) {
 // the flags below sit in `mode` above the 2-bit source mode, the heading in viewFlags'
 // high 16 bits and the pitch in cdlPower.a (the CDL power is RGB only).
 //
-//   mode bits 8-9 projection, 10-11 model, 12-13 packing (0 whole, 1 SBS, 2 TB),
-//   14 = the second eye's rect, 16-24 fisheye FOV in degrees.
-inline uint32_t PackModeFlags(Projection p, Model m, StereoLayout l, bool secondEye, float fisheyeFovDeg) {
+//   mode bits 8-10 projection, 11-12 model, 13-14 packing (0 whole, 1 SBS, 2 TB),
+//   15 = the second eye's rect, 16-24 fisheye FOV in degrees, 25-31 cubemap face padding
+//   in pixels (0..127).
+inline uint32_t PackModeFlags(Projection p, Model m, StereoLayout l, bool secondEye, float fisheyeFovDeg,
+                              int cubePadPx = 0) {
     if (p == Projection::None) return 0;
     const uint32_t pk = packing::IsSbs(l) ? 1u : packing::IsTb(l) ? 2u : 0u;
     int fov = (int)(fisheyeFovDeg + 0.5f);
     fov = fov < 1 ? 1 : fov > 511 ? 511 : fov;
-    return ((uint32_t)p << 8) | ((uint32_t)m << 10) | (pk << 12) | ((secondEye ? 1u : 0u) << 14) |
-           ((uint32_t)fov << 16);
+    const uint32_t pad = (uint32_t)(cubePadPx < 0 ? 0 : cubePadPx > 127 ? 127 : cubePadPx);
+    return ((uint32_t)p << 8) | ((uint32_t)m << 11) | (pk << 13) | ((secondEye ? 1u : 0u) << 15) |
+           ((uint32_t)fov << 16) | (pad << 25);
 }
 // Heading as unorm16 of a turn, for viewFlags' high half.
 inline uint32_t PackHeading(float headingRad) {
@@ -227,18 +361,20 @@ inline float UnpackHeading(uint32_t viewFlags) { return (float)(viewFlags >> 16)
 // The container's spherical metadata, as FFmpeg reports it (AVSphericalMapping), reduced
 // to a projection. `kind`: 0 equirect, 1 equirect tile (bounded: VR180 writes its 180
 // degrees as a 360 equirect cropped to the middle half), 2 half equirect (Apple 'hequ'),
-// 3 fisheye, anything else unsupported. `horizCoverageDeg` = the bounded width for 0 / 1.
+// 3 fisheye, 4 cubemap (3x2, cbmp layout 0), anything else unsupported. `horizCoverageDeg`
+// = the bounded width for 0 / 1. EAC has no FFmpeg signal (YouTube marks it with an sv3d
+// `mshp` mesh, which FFmpeg's demuxers skip): it comes from the name or the user.
 Projection FromSpherical(int kind, float horizCoverageDeg);
 
 // File-name hints: tokens of the FILE name (not the folder) such as `vr180`, `180`,
-// `180x180`, `360`, `vr360`, `fisheye`, `equirect`, plus the packing tokens VR releases
+// `180x180`, `360`, `vr360`, `fisheye`, `equirect`, `cubemap` / `c3x2`, `eac`, plus the packing tokens VR releases
 // use (`3dh` / `sbs` / `lr` = side by side, `3dv` / `tb` / `ou` = top-bottom, `mono`).
 // `packingHint` = -1 none, 0 mono, 1 SBS, 2 TB. False when the name names no projection.
 bool ProjectionFromFilename(const std::string& path, Projection& out, int& packingHint);
 
 // The packing a VR frame's aspect implies (each eye's picture has a known aspect: 1:1 for
-// VR180 / fisheye, 2:1 for VR360): 360 mono 2:1, 360 TB 1:1, 360 SBS 4:1; 180 SBS 2:1,
-// 180 mono 1:1, 180 TB 1:2.
+// VR180 / fisheye, 2:1 for VR360, 3:2 for a 3x2 cubemap / EAC): 360 mono 2:1, 360 TB 1:1,
+// 360 SBS 4:1; 180 SBS 2:1, 180 mono 1:1, 180 TB 1:2; cube mono 3:2, TB 3:4, SBS 3:1.
 StereoLayout PackingFromAspect(Projection p, float frameAspect);
 // True when the frame aspect is within ~15 % of one of those packings. A bare `180` / `360`
 // file-name token is honoured only then, so `frame_180.png` stays a flat picture.
@@ -249,6 +385,7 @@ bool AspectPlausible(Projection p, float frameAspect);
 // Render one eye's window from an 8-bit luma frame (bilinear, clamped to the eye rect;
 // outside the projection = 0).
 void RenderEyeGray(const uint8_t* src, int srcW, int srcH, int srcStride, packing::EyeRect rect, Projection p,
-                   float fisheyeFovDeg, const EyeWindow& w, uint8_t* dst, int dstW, int dstH, int dstStride);
+                   float fisheyeFovDeg, const EyeWindow& w, uint8_t* dst, int dstW, int dstH, int dstStride,
+                   int cubePadPx = 0);
 
 }  // namespace mp::vr
