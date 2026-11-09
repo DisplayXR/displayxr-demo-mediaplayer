@@ -1688,6 +1688,9 @@ bool App::LoadMediaFile(const std::string& path) {
         mediaW_ = video_.Width();
         mediaH_ = video_.Height();
         contentAspect_ = PerEyeAspect(layout_, video_.Width(), video_.Height());
+        // MEDIAPLAYER_LOOP=1 starts every clip looping (a station left playing for hours,
+        // the soak harness scripts/soak_stress.ps1); the Loop button still toggles it.
+        if (const char* l = std::getenv("MEDIAPLAYER_LOOP"); l && *l && *l != '0') video_.SetLoop(true);
         // In slideshow, force play-once so the clip can end and advance, regardless of
         // the user's manual loop preference.
         if (uiState_.slideshowActive) video_.SetLoop(false);
@@ -4440,6 +4443,13 @@ void App::InitPro() {
     };
     h.mediaPosition = [this] { return isVideo_ ? video_.PositionSeconds() : -1.0; };
     h.mediaPaused = [this] { return isVideo_ && video_.Paused(); };
+    h.mediaFrameStats = [this](uint64_t& shown, uint64_t& dropped, uint64_t& late) {
+        if (!isVideo_) return false;
+        shown = video_.FramesPublished();
+        dropped = video_.FramesDropped();
+        late = video_.FramesLate();
+        return true;
+    };
     h.seekMedia = [this](double s, bool paused) {
         if (!isVideo_) return;
         video_.Seek(s);

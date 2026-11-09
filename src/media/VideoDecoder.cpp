@@ -1224,6 +1224,7 @@ void VideoDecoder::DecodeLoop() {
                    ReceiveFrame(frame) == 0) {
                 const double ptsSec = fillFrame(frame);
                 if (ptsSec <= -2.0) continue;
+                double drainLate = 0.0;
                 if (ptsSec >= 0.0) {
                     positionSec_.store(ptsSec);
                     if (firstPtsSec < 0.0) { firstPtsSec = ptsSec; wallStart = clock::now(); }
@@ -1243,8 +1244,9 @@ void VideoDecoder::DecodeLoop() {
                         if (left <= clock::duration::zero()) break;
                         std::this_thread::sleep_for(std::min<clock::duration>(left, std::chrono::milliseconds(8)));
                     }
+                    drainLate = std::chrono::duration<double>(clock::now() - (wallStart + due)).count();
                 }
-                ring_.Publish();
+                PublishPaced(drainLate);
             }
             avcodec_flush_buffers(impl_->codec);
             MvReset();  // reusable after the drain (loop / seek)
@@ -1273,6 +1275,7 @@ void VideoDecoder::DecodeLoop() {
             while (!stop_.load() && ReceiveFrame(frame) == 0) {
                 const double ptsSec = fillFrame(frame);
                 if (ptsSec <= -2.0) continue;  // dropped
+                double lateSec = 0.0;  // how far past its due time this frame is published
                 if (ptsSec >= 0.0) {
                     positionSec_.store(ptsSec);
                     // Present this frame in step with the audio master clock. Fall back to
@@ -1309,9 +1312,13 @@ void VideoDecoder::DecodeLoop() {
                         auto target = wallStart + std::chrono::duration_cast<clock::duration>(
                                                       std::chrono::duration<double>(ptsSec - firstPtsSec));
                         std::this_thread::sleep_until(target);
+                        lateSec = std::chrono::duration<double>(clock::now() - target).count();
+                    } else if (!paused_.load() && seekRequest_.load() < 0.0) {
+                        const double now = masterClock_();
+                        if (now >= 0.0) lateSec = now - ptsSec;
                     }
                 }
-                ring_.Publish();
+                PublishPaced(lateSec);
             }
         }
         av_packet_unref(pkt);
@@ -1319,6 +1326,16 @@ void VideoDecoder::DecodeLoop() {
 
     av_frame_free(&frame);
     av_packet_free(&pkt);
+}
+
+// Hand a paced file frame to the renderer and count it. A publish that replaces a frame the
+// renderer never took is a dropped frame; one handed over more than 1.5 frame times after
+// its due time is late (the decoder fell behind). A pause/seek break leaves lateSec at 0.
+void VideoDecoder::PublishPaced(double lateSec) {
+    framesPublished_.fetch_add(1, std::memory_order_relaxed);
+    if (ring_.Publish()) framesDropped_.fetch_add(1, std::memory_order_relaxed);
+    const double fps = frameRate_ > 0.0 ? frameRate_ : 24.0;
+    if (lateSec > 1.5 / fps) framesLate_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void VideoDecoder::MvReset() {
