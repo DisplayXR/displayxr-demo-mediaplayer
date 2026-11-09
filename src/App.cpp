@@ -4444,6 +4444,11 @@ void App::InitPro() {
         if (!isVideo_) return;
         video_.Seek(s);
         AutoConvNewPicture(/*newMedia=*/false);
+        ResetConvertStream();  // a jump: no pre-seek result may land after it
+        // Video paces itself on the audio clock, so audio must jump too. Without this a
+        // Resolve-link / A-B seek left audio where it was and the video fast-forwarded
+        // (2-4x, ~1,000 frames dropped or late) or froze until the clocks met again.
+        audio_.Seek(s);
         if (paused && !video_.Paused()) TogglePlayback();
     };
     h.mediaStart = [this] { return isVideo_ ? video_.StartSeconds() : 0.0; };
