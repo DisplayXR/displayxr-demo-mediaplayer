@@ -112,6 +112,10 @@ public:
     // long-GOP clips; the default exact seek decodes forward to the precise frame.
     void Seek(double seconds, bool preview = false);
     double PositionSeconds() const { return positionSec_.load(); }   // current frame PTS
+    // Paced file playback counters since this decoder was created (never reset).
+    uint64_t FramesPublished() const { return framesPublished_.load(); }
+    uint64_t FramesDropped() const { return framesDropped_.load(); }
+    uint64_t FramesLate() const { return framesLate_.load(); }
     double DurationSeconds() const { return durationSec_; }           // 0 if unknown
     // The container's first timestamp (MXF / TS / MOV edit lists start above 0): Position
     // and Seek are in the stream's own timestamps, so "t seconds into the file" is
@@ -211,6 +215,13 @@ private:
     std::atomic<double> seekRequest_{-1.0};   // target seconds, <0 = none pending
     std::atomic<bool> seekPreview_{false};    // current seek wants the nearest keyframe
     std::atomic<double> positionSec_{0.0};     // last published frame's PTS
+
+    // File playback health (soak / station status). Cumulative for the decoder's life,
+    // across opens, so a long run reads them as monotonic counters.
+    void PublishPaced(double lateSec);
+    std::atomic<uint64_t> framesPublished_{0};  // frames handed to the renderer
+    std::atomic<uint64_t> framesDropped_{0};    // overwritten in the ring before the renderer took them
+    std::atomic<uint64_t> framesLate_{0};       // published more than 1.5 frame times after due
 
     // Live stream (#93). streamUrl_ is written before the thread starts; the stats block
     // is written by the decode thread and read by the UI under statsMutex_.

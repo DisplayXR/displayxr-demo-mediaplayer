@@ -107,6 +107,12 @@ void ProController::TickResolveImpl(const Status& st) {
             s["file"] = {{"path", media},
                          {"seconds", host_.mediaPosition ? host_.mediaPosition() : -1.0},
                          {"paused", host_.mediaPaused && host_.mediaPaused()}};
+            uint64_t shown = 0, dropped = 0, late = 0;
+            if (host_.mediaFrameStats && host_.mediaFrameStats(shown, dropped, late)) {
+                s["file"]["frames"] = shown;
+                s["file"]["dropped"] = dropped;
+                s["file"]["late"] = late;
+            }
         }
         s["follow"] = followResolve_;
         s["following"] = followResolve_ && follower_.Active(now) && link_.follow;

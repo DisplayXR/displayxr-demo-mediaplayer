@@ -107,6 +107,9 @@ struct Host {
     std::function<bool(const std::string&)> reloadMedia;
     std::function<double()> mediaPosition;
     std::function<bool()> mediaPaused;
+    // Paced playback counters since start (shown / dropped before shown / late), for the
+    // station status file. False when no video decoder is open.
+    std::function<bool(uint64_t& shown, uint64_t& dropped, uint64_t& late)> mediaFrameStats;
     std::function<void(double seconds, bool paused)> seekMedia;
     std::function<void(bool paused)> setMediaPaused;
     std::function<double()> mediaStart;  // the file's first timestamp (Position/Seek are in it)
