@@ -79,7 +79,8 @@ CUDA/NVDEC may be used *transparently* when FFmpeg picks it — never a build de
 ## Platforms & graphics binding
 
 **One Vulkan codebase covers Windows, Linux, and macOS** (macOS via MoltenVK over a
-CAMetalLayer-backed `NSView`). Android is a v1.x stretch (also Vulkan).
+CAMetalLayer-backed `NSView`). Android ships too (Vulkan, `android/`, Gradle,
+`build-android.yml`); it is the base player only, with no Pro build.
 
 > **macOS note:** Vulkan works on macOS — do not believe any older "MoltenVK is
 > broken / `VK_ERROR_EXTENSION_NOT_PRESENT`" claim. The only real macOS-vk gotcha is
@@ -104,7 +105,7 @@ perf headroom.
 Release build of `mediaplayer_handle_vk_linux`. Deps: see the apt list in
 `.github/workflows/build-linux.yml` (base toolchain + FFmpeg dev packages +
 the X11/Wayland/ALSA headers SDL3 needs when built from source). That workflow
-is **non-required** and fires only on `workflow_dispatch` + `linux*` branches.
+runs on every PR, on pushes to `main`, on `v*` tags and on `workflow_dispatch`.
 `scripts/run_mediaplayer_handle_vk_linux.sh` sets the dev-runtime env
 (`XR_RUNTIME_JSON`, `XRT_PLUGIN_SEARCH_PATH`, `OXR_ENABLE_VK_NATIVE_COMPOSITOR=1`,
 `SIM_DISPLAY_OUTPUT=anaglyph`).
@@ -171,11 +172,16 @@ XR_RUNTIME_JSON=/path/to/displayxr-runtime/build/openxr_displayxr-dev.json ./med
 ## Conventions (inherited from the DisplayXR org)
 
 - **Feature work on a branch in a worktree** (`.claude/worktrees/`), not on `main`.
-- **Include the GitHub issue number** in commit messages once this repo has issues.
+- **Include the GitHub issue number** in commit messages (e.g. `fix(pro): ... (#169)`).
 - **Prefer local builds** for iteration; CI is for validation + releases.
 - Distribution follows the demo pattern: own CI/tags, Windows NSIS `.exe` + macOS
   `.pkg` installers, `versions.json` autobump, `/dxr-release mediaplayer <ver>` from
-  the runtime hub once wired. Carry a runtime-compat covenant in `README.md`.
+  the runtime hub. Carry a runtime-compat covenant in `README.md`.
+- **Installer versions.** A tag sets the version: `v1.2.3` for the base player,
+  `pro-v0.2.0` for Pro. An untagged CI build gets a dev version from its own product's
+  last tag, e.g. `0.9.0+3.g6240c9f` on Windows. Never ship `0.0.0`: testers read the
+  version in Apps & Features to know which build is installed. macOS untagged builds
+  still use `0.0.0-dev.<sha>`.
 - **Dev-build dependency rule — this repo is the reference.** OpenXR + the loader
   are **self-provisioned by CMake `FetchContent`** (`OpenXR-SDK`, pinned
   `release-*`), not a hardcoded SDK path and no separate `build-with-deps.bat` —
@@ -186,9 +192,17 @@ XR_RUNTIME_JSON=/path/to/displayxr-runtime/build/openxr_displayxr-dev.json ./med
 
 ## Where to start
 
-`docs/M0-KICKOFF.md` is the build prompt for the first milestone (skeleton: SDL3
-window + OpenXR stereo session clearing both eyes). Milestones M0–M6 are in
-`PRD.md` §11.
+The PRD milestones (M0–M6, `PRD.md` §11) are done; the base player is past v1.17, and
+`docs/M0-KICKOFF.md` / `docs/M5-NOTES.md` are history. Start from the doc for the area:
+
+- Pro: `docs/PRO.md` (design), `docs/PRO-USER-GUIDE.md` (operators).
+- Station hardware check: `docs/STATION-ACCEPTANCE.md` + `scripts/station_acceptance.ps1`.
+- Long runs / leaks / hotplug: `scripts/soak_stress.ps1` (#210). Run it as
+  `-Clip <sbs file> -Minutes 60 -Churn light [-Fullscreen]`. It drives Pro through
+  `Pictures\DisplayXR\resolve_link.json`, reads `station_status.json`
+  (`file.frames` / `dropped` / `late`), and writes `Desktop\soak_<stamp>\summary.txt`
+  with PASS/FAIL.
+- Gallery: `docs/BROWSER.md`.
 
 ## MCP atlas capture (agent-side debugging)
 
