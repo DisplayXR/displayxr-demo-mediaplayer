@@ -31,8 +31,9 @@ if "%BIN_DIR%"=="" (
 
 if "%VERSION%"=="" set "VERSION=0.0.0"
 :: Derive MAJOR/MINOR/PATCH from VERSION (e.g. 1.4.2 -> 1 / 4 / 2) so callers
-:: (CI on a v* tag) only need to set VERSION.
-for /f "tokens=1,2,3 delims=." %%a in ("%VERSION%") do (
+:: (CI) only need to set VERSION. A dev version (0.9.0+3.g6240c9f, untagged CI builds)
+:: stops at the "+", so VIProductVersion stays numeric (0.9.0.0).
+for /f "tokens=1,2,3 delims=.+" %%a in ("%VERSION%") do (
     set "VERSION_MAJOR=%%a"
     set "VERSION_MINOR=%%b"
     set "VERSION_PATCH=%%c"
