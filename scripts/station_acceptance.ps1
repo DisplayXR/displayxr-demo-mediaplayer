@@ -21,7 +21,7 @@
 #>
 param(
     [string]$Exe = "",           # default: the installed Media Player Pro
-    [string]$Out = "",           # default: Desktop\station_acceptance_<time>
+    [string]$Out = "",           # default: Documents\DisplayXR\Test Results\Station Acceptance\station_acceptance_<time>
     [switch]$DeckLink,           # also run the capture-card checks
     [string]$Left = "0",         # DeckLink device for the left eye (number or part of the name)
     [string]$Right = "1",        # ... and the right eye (two-input soak)
@@ -48,7 +48,7 @@ if (-not $Exe) {
 if (-not (Test-Path $Exe)) { Write-Host "Media Player Pro not found at $Exe (install it, or pass -Exe)." -ForegroundColor Red; exit 2 }
 $ExeDir = Split-Path $Exe
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-if (-not $Out) { $Out = Join-Path ([Environment]::GetFolderPath("Desktop")) "station_acceptance_$stamp" }
+if (-not $Out) { $Out = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "DisplayXR\Test Results\Station Acceptance\station_acceptance_$stamp" }
 New-Item -ItemType Directory -Force $Out | Out-Null
 $Pics = Join-Path ([Environment]::GetFolderPath("MyPictures")) "DisplayXR"
 $Status = Join-Path $Pics "station_status.json"
