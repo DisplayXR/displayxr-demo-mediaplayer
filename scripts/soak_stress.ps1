@@ -24,7 +24,7 @@
   growth per hour, plus the first-vs-last-window change, against the limits below. Exit
   code 0 = PASS, 1 = FAIL, 2 = could not run.
 
-  Output folder (Desktop\soak_<stamp> by default): samples.csv, events.csv, summary.txt,
+  Output folder (Documents\DisplayXR\Test Results\Soak\soak_<stamp> by default): samples.csv, events.csv, summary.txt,
   summary.json, the runtime log, stdout, and a zip of all of it.
 
 .EXAMPLE
@@ -41,7 +41,7 @@
 
 .EXAMPLE
   # Re-analyse an earlier run with other limits
-  powershell -ExecutionPolicy Bypass -File soak_stress.ps1 -Analyze -Out C:\Users\me\Desktop\soak_20261109_120000
+  powershell -ExecutionPolicy Bypass -File soak_stress.ps1 -Analyze -Out "C:\Users\me\Documents\DisplayXR\Test Results\Soak\soak_20261109_120000"
 #>
 param(
     [string]$Exe,
@@ -290,7 +290,7 @@ $Clip = @($Clip | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() 
 if ($Churn -eq "heavy" -and -not $DeckLink -and $Clip.Count -lt 2) { Write-Host "Note: heavy churn with one clip re-opens the same file." -ForegroundColor DarkYellow }
 $ExeDir = Split-Path $Exe
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-if (-not $Out) { $Out = Join-Path ([Environment]::GetFolderPath("Desktop")) "soak_$stamp" }
+if (-not $Out) { $Out = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "DisplayXR\Test Results\Soak\soak_$stamp" }
 New-Item -ItemType Directory -Force $Out | Out-Null
 $Station = Join-Path ([Environment]::GetFolderPath("MyPictures")) "DisplayXR"
 $Status = Join-Path $Station "station_status.json"

@@ -61,7 +61,7 @@ that feeds something else, say so: `-ExpectEyeWidth 1920 -ExpectFps 23.98 -Expec
 | D2 | one input | delivered rate within 2 % of the signal's, nothing late |
 | D3 | two inputs for 10 minutes (#141) | rate held, unpaired not climbing, nothing late, skew under half a frame |
 
-It writes everything to `Desktop\station_acceptance_<time>\` (atlas dumps, logs, the QC
+It writes everything to `Documents\DisplayXR\Test Results\Station Acceptance\station_acceptance_<time>\` (atlas dumps, logs, the QC
 report, `D3_soak.csv` with a row every 2 s, `summary.md`) and a `.zip` of it.
 
 ## 3. Check by eye
