@@ -16,6 +16,9 @@ namespace mp {
 
 class LiveSourceBase : public LiveProducer {
 public:
+    // Live frames go through the ring's queue mode (one frame per refresh, a one-frame
+    // cushion): MEDIAPLAYER_LIVE_QUEUE=<depth> sets the depth, 0 = the old latest-wins.
+    LiveSourceBase();
     LiveState GetState() const override { return state_.load(); }
     std::string LastError() const override;
     const std::string& DeviceName() const override { return name_; }
@@ -52,13 +55,14 @@ protected:
 
 private:
     void Published(int w, int h, bool fullRange, int eyeOffsetFrames, bool dropped);
-    FrameRing ring_;
+    mutable FrameRing ring_;  // mutable: GetStats reads its queue counters
     mutable std::mutex statsMutex_;
     LiveStats stats_;
     std::string lastError_;
     double openedAt_ = 0.0;
     double fpsWindowStart_ = 0.0;
     uint64_t fpsWindowCount_ = 0;
+    uint64_t trimmedAtReset_ = 0, repeatedAtReset_ = 0;
 };
 
 }  // namespace mp

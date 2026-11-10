@@ -185,7 +185,8 @@ function Analyze-Run([string]$dir) {
         if ($carried -gt 0) {
             $ld = ($drop1 - $drop0) / $carried
             $bt = if ($bursts.Count) { "; minutes with > 1 drop/s: " + (($bursts | Select-Object -First 40) -join ",") } else { "; no burst minutes" }
-            $d2 = "{0} of ~{1} frames dropped ({2}%){3}" -f ($drop1 - $drop0), [int]$carried, (F (100 * $ld) 2), $bt
+            $rep0 = & $num $live[0] "repeated"; $rep1 = & $num $live[-1] "repeated"
+            $d2 = "{0} of ~{1} frames dropped ({2}%), {4} repeated{3}" -f ($drop1 - $drop0), [int]$carried, (F (100 * $ld) 2), $bt, ($rep1 - $rep0)
             if ($ld -gt $MaxLiveDropShare) { Add-Result "Live drops" "FAIL" ($d2 + "; limit " + (F (100 * $MaxLiveDropShare) 1) + "%") } else { Add-Result "Live drops" "PASS" $d2 }
         }
     }
@@ -481,7 +482,7 @@ function Do-Churn([double]$t) {
 }
 
 # ------------------------------------------------------------------ sample loop
-"t_s,churn,private_mb,working_mb,handles,gdi,user,threads,cpu_pct,gpu_ded_mb,gpu_shr_mb,gpu_3d,gpu_copy,gpu_vdec,seq,file_s,paused,rate,signal_fps,delivered_fps,dropped,late,unpaired,skew_ms,log_mb,station_mb,f_dmedia,f_dwall,f_frames,f_dropped,f_late,rt_errors,rt_hotplug" | Set-Content $SamplesCsv -Encoding ascii
+"t_s,churn,private_mb,working_mb,handles,gdi,user,threads,cpu_pct,gpu_ded_mb,gpu_shr_mb,gpu_3d,gpu_copy,gpu_vdec,seq,file_s,paused,rate,signal_fps,delivered_fps,dropped,late,unpaired,skew_ms,log_mb,station_mb,f_dmedia,f_dwall,f_frames,f_dropped,f_late,rt_errors,rt_hotplug,repeated" | Set-Content $SamplesCsv -Encoding ascii
 $deadline = $t0.AddMinutes($Minutes)
 $lastCpu = $null; $lastWall = $null
 $lastSeq = -1; $lastSeqAt = Get-Date; $inHang = $false
@@ -529,11 +530,12 @@ try {
             $lastFile = @{ path = $cur.path; sec = $cur.sec; wall = $wallNow }
             if ($null -ne $st.file.frames) { $ffr = [string]$st.file.frames; $fdr = [string]$st.file.dropped; $flt = [string]$st.file.late }
         } else { $lastFile = $null }
-        $sig = 0; $del = 0; $drop = 0; $late = 0; $unp = 0; $skew = 0
+        $sig = 0; $del = 0; $drop = 0; $late = 0; $unp = 0; $skew = 0; $rep = 0
         $d = if ($st -and $st.rig) { if ($st.rig.decklink) { $st.rig.decklink } else { $st.rig.test_signal } } else { $null }
         if ($d) {
             $sig = [double]$d.signal_fps; $del = [double]$d.delivered_fps; $drop = [double]$d.dropped
             $late = [double]$d.late_frames; $unp = [double]$d.unpaired; $skew = [double]$d.max_skew_ms
+            if ($null -ne $d.repeated) { $rep = [double]$d.repeated }
         }
         $ld = Read-LogDelta
         $logMB = $ld.mb
@@ -544,7 +546,7 @@ try {
         $n++
         $row = @((F $t 0), $Churn, (F ($p.PrivateMemorySize64 / 1MB) 1), (F ($p.WorkingSet64 / 1MB) 1), $p.HandleCount, $gdi, $usr, $p.Threads.Count,
                  (F $cpu 1), (F $g.ded 1), (F $g.shr 1), (F $g.e3d 1), (F $g.ecopy 1), (F $g.evdec 1), $seq, $fileS, $paused, $rate,
-                 (F $sig 2), (F $del 2), (F $drop 0), (F $late 0), (F $unp 0), (F $skew 2), (F $logMB 2), (F ($stationMB - $stationAtStart) 1), $fdm, $fdw, $ffr, $fdr, $flt, $ld.err, $ld.hot)
+                 (F $sig 2), (F $del 2), (F $drop 0), (F $late 0), (F $unp 0), (F $skew 2), (F $logMB 2), (F ($stationMB - $stationAtStart) 1), $fdm, $fdw, $ffr, $fdr, $flt, $ld.err, $ld.hot, (F $rep 0))
         ($row -join ",") | Add-Content $SamplesCsv
         if (($n % 6) -eq 1) {
             Write-Host ("[{0,5} min] private {1} MB, GPU {2} MB, handles {3}, gdi {4}, threads {5}, cpu {6}%, 3D {7}%, rate {8}, fps {9}/{10}, log {11} MB, frames {12} dropped {13} late {14}" -f (F ($t / 60) 1), (F ($p.PrivateMemorySize64 / 1MB) 0), (F $g.ded 0), $p.HandleCount, $gdi, $p.Threads.Count, (F $cpu 0), (F $g.e3d 0), $rate, (F $del 1), (F $sig 1), (F $logMB 1), $ffr, $fdr, $flt)

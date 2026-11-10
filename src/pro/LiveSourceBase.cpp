@@ -2,9 +2,16 @@
 #include "pro/LiveSourceBase.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace mp {
+
+LiveSourceBase::LiveSourceBase() {
+    int depth = 3;
+    if (const char* q = std::getenv("MEDIAPLAYER_LIVE_QUEUE")) depth = std::atoi(q);
+    ring_.SetQueueDepth(depth);
+}
 
 std::string LiveSourceBase::LastError() const {
     std::lock_guard<std::mutex> lk(statsMutex_);
@@ -12,8 +19,16 @@ std::string LiveSourceBase::LastError() const {
 }
 
 LiveStats LiveSourceBase::GetStats() const {
-    std::lock_guard<std::mutex> lk(statsMutex_);
-    return stats_;
+    LiveStats s;
+    {
+        std::lock_guard<std::mutex> lk(statsMutex_);
+        s = stats_;
+    }
+    // Queue mode: a standing backlog trimmed on the consumer side is a drop too.
+    s.dropped += ring_.TrimmedFrames() - trimmedAtReset_;
+    s.repeated = ring_.RepeatedFrames() - repeatedAtReset_;
+    s.liveQueue = ring_.QueueMode();
+    return s;
 }
 
 void LiveSourceBase::Fail(LiveState s, const std::string& why) {
@@ -27,6 +42,8 @@ void LiveSourceBase::Fail(LiveState s, const std::string& why) {
 void LiveSourceBase::ResetStats(int fpsReq, double fps) {
     std::lock_guard<std::mutex> lk(statsMutex_);
     stats_ = LiveStats{};
+    trimmedAtReset_ = ring_.TrimmedFrames();
+    repeatedAtReset_ = ring_.RepeatedFrames();
     stats_.fpsReq = fpsReq;
     stats_.fps = fps;
     lastError_.clear();
