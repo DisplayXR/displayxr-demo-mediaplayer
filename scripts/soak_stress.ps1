@@ -185,8 +185,12 @@ function Analyze-Run([string]$dir) {
         if ($carried -gt 0) {
             $ld = ($drop1 - $drop0) / $carried
             $bt = if ($bursts.Count) { "; minutes with > 1 drop/s: " + (($bursts | Select-Object -First 40) -join ",") } else { "; no burst minutes" }
-            $rep0 = & $num $live[0] "repeated"; $rep1 = & $num $live[-1] "repeated"
-            $d2 = "{0} of ~{1} frames dropped ({2}%), {4} repeated{3}" -f ($drop1 - $drop0), [int]$carried, (F (100 * $ld) 2), $bt, ($rep1 - $rep0)
+            # "repeated" arrived with #213; a run recorded before it has no such column.
+            $rep = "repeated n/a (run predates #213)"
+            if ($live[0].PSObject.Properties.Name -contains "repeated") {
+                $rep = "{0} repeated" -f ((& $num $live[-1] "repeated") - (& $num $live[0] "repeated"))
+            }
+            $d2 = "{0} of ~{1} frames dropped ({2}%), {4}{3}" -f ($drop1 - $drop0), [int]$carried, (F (100 * $ld) 2), $bt, $rep
             if ($ld -gt $MaxLiveDropShare) { Add-Result "Live drops" "FAIL" ($d2 + "; limit " + (F (100 * $MaxLiveDropShare) 1) + "%") } else { Add-Result "Live drops" "PASS" $d2 }
         }
     }
