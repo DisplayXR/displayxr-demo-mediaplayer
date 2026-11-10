@@ -3,6 +3,7 @@
 #include "pro/DisplayCalibration.h"
 
 #include "Log.h"
+#include "ui/TabularText.h"
 #include "ui/UiScale.h"
 
 #include <SDL3/SDL.h>
@@ -1236,20 +1237,22 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
     const float x = std::max(px * W, 0.0f) + Px(8.0f);
     // A long line (file + format + look + calibration + rig numbers) ran off the right
     // edge of a window: end it with an ellipsis at the edge instead.
-    const float maxTextW = W - x - Px(8.0f) - 2.0f * pad;
-    if (n > 0 && ImGui::CalcTextSize(buf).x > maxTextW) {
+    const float maxTextW = W - x - Px(8.0f) - 2.0f * pad - (st.live && !fs ? Px(12.0f) : 0.0f);
+    // Digits are tabular (ui/TabularText.h) so the box keeps its width as the timecode and
+    // the rig / convergence numbers tick, instead of its right edge twitching every frame.
+    if (n > 0 && ui::CalcTabularTextSize(buf).x > maxTextW) {
         int lo = 0, hi = std::min(n, (int)sizeof(buf) - 4);
         char tmp[sizeof(buf)];
         while (lo < hi) {  // longest prefix that fits with the ellipsis
             const int mid = (lo + hi + 1) / 2;
             std::snprintf(tmp, sizeof(tmp), "%.*s...", mid, buf);
-            if (ImGui::CalcTextSize(tmp).x <= maxTextW) lo = mid;
+            if (ui::CalcTabularTextSize(tmp).x <= maxTextW) lo = mid;
             else hi = mid - 1;
         }
         std::snprintf(tmp, sizeof(tmp), "%.*s...", lo, buf);
         std::snprintf(buf, sizeof(buf), "%s", tmp);
     }
-    const ImVec2 ts = ImGui::CalcTextSize(buf);
+    const ImVec2 ts = ui::CalcTabularTextSize(buf);
     float y = std::min((py + ph) * H, H) - ts.y - 2.0f * pad - Px(8.0f);
     // When the picture reaches the window's bottom edge (any windowed layout) the line
     // would print straight over the transport strip: sit above it instead.
@@ -1257,13 +1260,15 @@ void ProController::BuildStatusBar(const Status& st, float alpha) {
         y = std::min(y, ui::g_transportTop - ts.y - 2.0f * pad - Px(6.0f));
         ui::g_bottomUiTop = std::min(ui::g_bottomUiTop, y);
     }
-    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + ts.x + 2.0f * pad, y + ts.y + 2.0f * pad), IM_COL32(10, 12, 16, 190), Px(4.0f));
-    float tx = x + pad;
-    if (st.live && !fs) {
+    // The LIVE dot sits before the text: the box grows by its width so the text doesn't
+    // run past the box's right edge.
+    const float dotW = st.live && !fs ? Px(12.0f) : 0.0f;
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + dotW + ts.x + 2.0f * pad, y + ts.y + 2.0f * pad), IM_COL32(10, 12, 16, 190),
+                      Px(4.0f));
+    const float tx = x + pad;
+    if (dotW > 0.0f)
         dl->AddCircleFilled(ImVec2(tx + Px(4.0f), y + pad + ts.y * 0.5f), Px(4.0f), IM_COL32(235, 60, 50, 255));
-        tx += 0.0f;
-    }
-    dl->AddText(ImVec2(tx + (st.live && !fs ? Px(12.0f) : 0.0f), y + pad), IM_COL32(235, 238, 242, 255), buf);
+    ui::AddTabularText(dl, ImVec2(tx + dotW, y + pad), IM_COL32(235, 238, 242, 255), buf);
 #else
     (void)st;
 #endif

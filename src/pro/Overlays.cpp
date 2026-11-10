@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pro/Overlays.h"
 
+#include "ui/TabularText.h"
 #include "ui/UiScale.h"
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
@@ -92,27 +93,38 @@ void DrawOverlays(const OverlaySettings& s, const BurnIn& b, float px, float py,
     dl->PopClipRect();
 
     // Burn-ins: fixed to the picture's top corners (not zoomed), like a monitor's.
-    char left[160] = "", right[160] = "";
-    int nl = 0, nr = 0;
+    // The right-hand label is anchored by its right edge, so its width must not follow the
+    // digits: drawn with the font's proportional digits, "TC 01:11:11:11" is narrower than
+    // "TC 00:00:00:00" and the whole label wiggled every frame. Digits are tabular, and the
+    // frame number reserves six digits, so a frame count gaining a digit doesn't shift the
+    // timecode either. `rightSize` is the same label with the frame number at its reserved
+    // width — sizing only, never drawn.
+    char left[160] = "", right[160] = "", rightSize[160] = "";
+    int nl = 0, nr = 0, ns = 0;
     if (s.burnClip && !b.clip.empty()) nl += std::snprintf(left + nl, sizeof(left) - nl, "%s", b.clip.c_str());
     if (s.burnColour && !b.colour.empty())
         nl += std::snprintf(left + nl, sizeof(left) - nl, "%s%s", nl ? "   " : "", b.colour.c_str());
-    if (s.burnTimecode && !b.timecode.empty())
+    if (s.burnTimecode && !b.timecode.empty()) {
         nr += std::snprintf(right + nr, sizeof(right) - nr, "TC %s", b.timecode.c_str());
-    if (s.burnFrame && b.frame >= 0)
+        ns += std::snprintf(rightSize + ns, sizeof(rightSize) - ns, "TC %s", b.timecode.c_str());
+    }
+    if (s.burnFrame && b.frame >= 0) {
         nr += std::snprintf(right + nr, sizeof(right) - nr, "%sF %lld", nr ? "   " : "", b.frame);
+        ns += std::snprintf(rightSize + ns, sizeof(rightSize) - ns, "%sF %06lld", ns ? "   " : "", b.frame);
+    }
     const float pad = Px(5.0f), inset = Px(10.0f);
-    auto label = [&](const char* t, bool alignRight) {
+    auto label = [&](const char* t, const char* sizing, bool alignRight) {
         if (!t[0]) return;
-        const ImVec2 ts = ImGui::CalcTextSize(t);
+        ImVec2 ts = ui::CalcTabularTextSize(t);
+        if (sizing) ts.x = std::max(ts.x, ui::CalcTabularTextSize(sizing).x);
         const float x = alignRight ? p1.x - std::max(inset, b.rightInset) - ts.x - 2 * pad
                                    : p0.x + std::max(inset, b.leftInset);
         const float y = p0.y + std::max(inset, b.topInset);
         dl->AddRectFilled(ImVec2(x, y), ImVec2(x + ts.x + 2 * pad, y + ts.y + 2 * pad), IM_COL32(0, 0, 0, 170));
-        dl->AddText(ImVec2(x + pad, y + pad), IM_COL32(255, 255, 255, 240), t);
+        ui::AddTabularText(dl, ImVec2(x + pad, y + pad), IM_COL32(255, 255, 255, 240), t);
     };
-    label(left, false);
-    label(right, true);
+    label(left, nullptr, false);
+    label(right, rightSize, true);
 #else
     (void)s;
     (void)b;
