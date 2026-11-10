@@ -654,6 +654,12 @@ std::string Station::RigStatusJson() const {
             dl["max_skew_ms"] = ps.maxAbsSkewMs;
         }
         out["decklink"] = dl;
+    } else if (testSignal_.GetState() != LiveState::Closed) {
+        // the synthetic rig: the same frame health, so a soak can run the live path without a card
+        const LiveStats ls = testSignal_.GetStats();
+        out["test_signal"] = {{"delivered_fps", ls.deliveredFps}, {"signal_fps", ls.fps}, {"published", ls.published},
+                              {"late_frames", ls.lateFrames}, {"dropped", ls.dropped},
+                              {"width", ls.w}, {"height", ls.h}, {"state", LiveStateName(testSignal_.GetState())}};
     }
     return out.dump();
 }

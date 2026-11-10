@@ -47,6 +47,7 @@ param(
     [string]$Exe,
     [string[]]$Clip,
     [switch]$DeckLink,
+    [string]$TestSignal,              # live input from Pro's synthetic rig, e.g. 1920x1080@60 (no card needed)
     [string]$Left = "0",
     [string]$Right = "",              # "" = one input
     [string]$Connection = "sdi",
@@ -70,6 +71,7 @@ param(
     [double]$MinPlaybackRate = 0.98,  # file: media seconds per wall second (median, last window)
     [double]$MinFpsShare = 0.98,      # live: delivered / signal fps (median, last window)
     [double]$MaxDropShare = 0.005,    # file: frames dropped before shown / frames shown
+    [double]$MaxLiveDropShare = 0.02, # live: frames dropped / frames the signal carried
     [double]$MaxLateShare = 0.01,     # file: frames shown > 1.5 frame times late / frames shown
     [double]$MinTrendMinutes = 30,    # shorter runs report leak trends as INFO, not PASS/FAIL
     [double]$MaxErrorsPerMin = 1,     # runtime [ERROR] lines per minute, whole run and last window
@@ -170,6 +172,22 @@ function Analyze-Run([string]$dir) {
         $skew = ($live | ForEach-Object { & $num $_ "skew_ms" } | Measure-Object -Maximum).Maximum
         $d = "delivered/signal median {0} first, {1} last, min {2}; dropped +{3}, late +{4}, unpaired +{5}, max skew {6} ms" -f (F $s0 3), (F $s1 3), (F $minS 3), ($drop1 - $drop0), ($late1 - $late0), ($unp1 - $unp0), (F $skew 1)
         if ($s1 -lt $MinFpsShare -or $s1 -lt $s0 - 0.02) { Add-Result "Live rate" "FAIL" $d } else { Add-Result "Live rate" "PASS" $d }
+        # Live drops: a captured frame overwritten before the render loop took it. Share of
+        # the frames the signal carried, plus the minutes where they bunched up (a periodic
+        # stall shows as bursts at a regular spacing).
+        $carried = 0.0; $bursts = New-Object System.Collections.ArrayList
+        for ($i = 1; $i -lt $live.Count; $i++) {
+            $dt = (& $num $live[$i] "t_s") - (& $num $live[$i - 1] "t_s")
+            $carried += $dt * (& $num $live[$i] "signal_fps")
+            $dd = (& $num $live[$i] "dropped") - (& $num $live[$i - 1] "dropped")
+            if ($dt -gt 0 -and $dd / $dt -gt 1.0) { $m = [int]((& $num $live[$i] "t_s") / 60); if ($bursts -notcontains $m) { [void]$bursts.Add($m) } }
+        }
+        if ($carried -gt 0) {
+            $ld = ($drop1 - $drop0) / $carried
+            $bt = if ($bursts.Count) { "; minutes with > 1 drop/s: " + (($bursts | Select-Object -First 40) -join ",") } else { "; no burst minutes" }
+            $d2 = "{0} of ~{1} frames dropped ({2}%){3}" -f ($drop1 - $drop0), [int]$carried, (F (100 * $ld) 2), $bt
+            if ($ld -gt $MaxLiveDropShare) { Add-Result "Live drops" "FAIL" ($d2 + "; limit " + (F (100 * $MaxLiveDropShare) 1) + "%") } else { Add-Result "Live drops" "PASS" $d2 }
+        }
     }
     $file = @($body | Where-Object { $_.f_dwall })
     if ($file.Count -ge 6) {
@@ -264,6 +282,7 @@ if (-not $Exe) {
     $Exe = Join-Path $dir "mediaplayer_pro_handle_vk_win.exe"
 }
 if (-not (Test-Path $Exe)) { Write-Host "Media Player Pro not found at $Exe (install it, or pass -Exe)." -ForegroundColor Red; exit 2 }
+if ($TestSignal) { $DeckLink = $true }   # same live probes and analysis as a capture card
 if (-not $DeckLink -and -not $Clip) { Write-Host "Give -Clip <file>[,<file>...] or -DeckLink." -ForegroundColor Red; exit 2 }
 # powershell -File passes "a,b" as one string; split it so both launch styles work.
 $Clip = @($Clip | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { (Resolve-Path $_).Path })
@@ -294,7 +313,9 @@ Add-Type -Namespace Soak -Name W -MemberDefinition @'
 New-Item -ItemType Directory -Force $Station | Out-Null
 
 $argv = @()
-if ($DeckLink) {
+if ($TestSignal) {
+    $argv += "--test-signal=$TestSignal"
+} elseif ($DeckLink) {
     $argv += "--decklink=$Left"
     if ($Right) { $argv += "--decklink-right=$Right" }
     $argv += "--decklink-input=$Connection"
@@ -509,8 +530,8 @@ try {
             if ($null -ne $st.file.frames) { $ffr = [string]$st.file.frames; $fdr = [string]$st.file.dropped; $flt = [string]$st.file.late }
         } else { $lastFile = $null }
         $sig = 0; $del = 0; $drop = 0; $late = 0; $unp = 0; $skew = 0
-        if ($st -and $st.rig -and $st.rig.decklink) {
-            $d = $st.rig.decklink
+        $d = if ($st -and $st.rig) { if ($st.rig.decklink) { $st.rig.decklink } else { $st.rig.test_signal } } else { $null }
+        if ($d) {
             $sig = [double]$d.signal_fps; $del = [double]$d.delivered_fps; $drop = [double]$d.dropped
             $late = [double]$d.late_frames; $unp = [double]$d.unpaired; $skew = [double]$d.max_skew_ms
         }
