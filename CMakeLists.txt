@@ -778,6 +778,12 @@ if(MP_BUILD_TESTS)
     target_include_directories(slide_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME slide_gesture COMMAND slide_gesture_test)
 
+    # Live frames: FrameRing queue mode (one frame per refresh, clock drift costs single
+    # drops/repeats instead of bursts). Header-only, pure.
+    add_executable(frame_ring_queue_test tests/frame_ring_queue_test.cpp)
+    target_include_directories(frame_ring_queue_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME frame_ring_queue COMMAND frame_ring_queue_test)
+
     # "Convert to 3D" (XR_DXR_lift spec v4): the LiftClient state machine over a fake
     # entry-point table, plus the CPU frame preparation. No runtime, no loader, no GPU.
     add_executable(lift_client_test

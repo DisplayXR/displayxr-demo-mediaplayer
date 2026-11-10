@@ -53,6 +53,8 @@ struct LiveStats {
     int noSignalEyes = 0;         // DeckLink: bit 0 = left / only input dark, bit 1 = right
     uint64_t lateFrames = 0;      // DeckLink: card frames skipped because the converter was
                                   // still busy with the previous one (the newest is kept)
+    uint64_t repeated = 0;        // queue mode: refreshes that found no new frame (last one shown again)
+    bool liveQueue = false;       // frames go through the ring's queue mode (not latest-wins)
 };
 
 class LiveProducer {
