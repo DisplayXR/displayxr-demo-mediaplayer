@@ -6,6 +6,7 @@
 #include "pro/ProController.h"
 
 #include "Log.h"
+#include "ui/TabularText.h"
 #include "ui/UiScale.h"
 
 #include <SDL3/SDL.h>
@@ -241,18 +242,39 @@ void ProController::BuildPixelProbe(const Status& st) {
     const int y = std::clamp((int)(sv * scope_.h), 0, scope_.h - 1);
     const uint8_t* p = &scope_.graded[((size_t)y * scope_.w + x) * 3];
     const float Y = (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / 255.0f * 100.0f;
-    char t[96];
-    std::snprintf(t, sizeof(t), "R %3d  G %3d  B %3d   Y %.1f%%", p[0], p[1], p[2], Y);
+    // Each value right-aligned in a fixed slot of tabular digits (ui/TabularText.h): drawn
+    // as one "%3d" string, the padding spaces are narrower than digits and Y gains digits,
+    // so the numbers and the box edge jittered as the probe crossed the picture.
+    char vals[4][16];
+    std::snprintf(vals[0], sizeof(vals[0]), "%d", p[0]);
+    std::snprintf(vals[1], sizeof(vals[1]), "%d", p[1]);
+    std::snprintf(vals[2], sizeof(vals[2]), "%d", p[2]);
+    std::snprintf(vals[3], sizeof(vals[3]), "%.1f%%", Y);
+    const char* names[4] = {"R ", "  G ", "  B ", "   Y "};
+    const char* widest[4] = {"000", "000", "000", "000.0%"};
+    float slotX[4], slotW[4], textW = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        textW += ImGui::CalcTextSize(names[i]).x;
+        slotX[i] = textW;
+        slotW[i] = ui::CalcTabularTextSize(widest[i]).x;
+        textW += slotW[i];
+    }
+    const ImVec2 ts(textW, ImGui::GetTextLineHeight());
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     const float arm = Px(10.0f);
     dl->AddLine(ImVec2(at.x - arm, at.y), ImVec2(at.x + arm, at.y), IM_COL32(255, 255, 255, 230), Px(1.5f));
     dl->AddLine(ImVec2(at.x, at.y - arm), ImVec2(at.x, at.y + arm), IM_COL32(255, 255, 255, 230), Px(1.5f));
-    const ImVec2 ts = ImGui::CalcTextSize(t);
     const ImVec2 o(at.x + Px(14.0f), at.y + Px(12.0f));
     const float sw = ts.y + Px(4.0f);  // swatch
     dl->AddRectFilled(o, ImVec2(o.x + sw + ts.x + Px(18.0f), o.y + ts.y + Px(8.0f)), IM_COL32(10, 12, 16, 220), Px(3.0f));
     dl->AddRectFilled(ImVec2(o.x + Px(4), o.y + Px(2)), ImVec2(o.x + Px(4) + sw - Px(4), o.y + ts.y + Px(6)), IM_COL32(p[0], p[1], p[2], 255));
-    dl->AddText(ImVec2(o.x + sw + Px(10.0f), o.y + Px(4.0f)), IM_COL32(235, 238, 242, 255), t);
+    const ImVec2 t0(o.x + sw + Px(10.0f), o.y + Px(4.0f));
+    for (int i = 0; i < 4; i++) {
+        dl->AddText(ImVec2(t0.x + slotX[i] - ImGui::CalcTextSize(names[i]).x, t0.y), IM_COL32(235, 238, 242, 255),
+                    names[i]);
+        const float vw = ui::CalcTabularTextSize(vals[i]).x;
+        ui::AddTabularText(dl, ImVec2(t0.x + slotX[i] + slotW[i] - vw, t0.y), IM_COL32(235, 238, 242, 255), vals[i]);
+    }
 #else
     (void)st;
 #endif
