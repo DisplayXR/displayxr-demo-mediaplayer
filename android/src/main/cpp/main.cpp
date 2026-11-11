@@ -2881,6 +2881,14 @@ destroy_all()
 	if (g_vk_device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(g_vk_device);
 	}
+	// The thumbnail atlas and the HUD live on this VkDevice. A re-entered android_main (same
+	// process) initializes both again on the new device. The atlas frees ImGui descriptors,
+	// so it goes first.
+	g_browser_ready.store(false, std::memory_order_relaxed);
+	g_stills.Shutdown();
+	g_browser.Shutdown();
+	g_imgui.Shutdown();
+	g_hud_ready = false;
 	if (g_sbs_ready) {
 		g_sbs.cleanup();
 		g_sbs_ready = false;
@@ -2892,6 +2900,10 @@ destroy_all()
 	if (g_atlas.swapchain != XR_NULL_HANDLE) {
 		xrDestroySwapchain(g_atlas.swapchain);
 		g_atlas.swapchain = XR_NULL_HANDLE;
+	}
+	if (g_hud_swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(g_hud_swapchain);
+		g_hud_swapchain = XR_NULL_HANDLE;
 	}
 	if (g_app_space != XR_NULL_HANDLE) {
 		xrDestroySpace(g_app_space);

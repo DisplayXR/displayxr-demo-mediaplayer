@@ -92,6 +92,7 @@ NeighbourStills::Shutdown()
 	}
 	jobs_.clear();
 	done_.clear();
+	slots_[0] = slots_[1] = Slot{};  // their uploads went with the renderer
 	provider_ = nullptr;
 	renderer_ = nullptr;
 }
