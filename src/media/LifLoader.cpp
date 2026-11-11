@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LifLoader.h"
 
+#include "DepthWarp.h"
 #include "Log.h"
 #include "StereoCompose.h"
 
@@ -165,6 +166,100 @@ LifResult MonoFallback(const std::vector<uint8_t>& buf, const std::string& path)
     return r;
 }
 
+// The parallax of a one-view LIF's whole disparity range, as a fraction of the width. A
+// classic Leia LIF has only "gain", whose scale isn't published: kGainToParallax is matched
+// by eye on the panel, kDefaultParallax is for a null gain.
+constexpr float kGainToParallax = 0.06f;
+constexpr float kDefaultParallax = 0.015f;
+// LIF 5.3 files from Leia's python encoder carry a stereo baseline of 1.0, which reads as
+// about 10% here, where the C++ encoder's 0.13-0.15 gives 1.3-1.5%.
+constexpr float kMaxParallax = 0.02f;
+
+bool Num(const json& o, const char* key, float& v) {
+    if (!o.contains(key) || !o[key].is_number()) return false;
+    v = o[key].get<float>();
+    return true;
+}
+
+// LIF 5.x: "inv_z_map" (legacy "disparity"), with the map's min/max inverse depth.
+const json* InvZMap(const json& view) {
+    for (const char* k : {"inv_z_map", "disparity"})
+        if (view.contains(k) && view[k].is_object()) return &view[k];
+    return nullptr;
+}
+
+// The disparity map blob: 5.x inv_z_map.blob_id, or classic Leia "disparityId".
+const Field* DisparityField(const json& view, const std::vector<Field>& fields) {
+    const json* m = InvZMap(view);
+    const json* id = (m && m->contains("blob_id")) ? &(*m)["blob_id"]
+                     : view.contains("disparityId") ? &view["disparityId"] : nullptr;
+    if (!id || !id->is_number_integer() || id->get<int64_t>() < 0) return nullptr;
+    return FindField(fields, (uint32_t)id->get<int64_t>());
+}
+
+float OneViewParallax(const json& root, const json& view) {
+    // 5.x: a pixel's disparity is focal_px * baseline * invZ, and the map spans max..min.
+    const json* m = InvZMap(view);
+    float mn = 0, mx = 0, focal = 0, width = 0, baseline = 0, gain = 0;
+    if (m && Num(*m, "min", mn) && Num(*m, "max", mx) && Num(view, "focal_px", focal) &&
+        Num(view, "width_px", width) && width > 0 && root.contains("stereo_render_data") &&
+        Num(root["stereo_render_data"], "baseline", baseline))
+        return focal * baseline * (mn - mx) / width;
+    if (Num(root, "gain", gain) && gain > 0) return kGainToParallax * gain;
+    return kDefaultParallax;
+}
+
+// One byte every `step` of an sw x sh plane, at w x h: sampled nearest when the sizes differ.
+std::vector<uint8_t> DepthPlane(const uint8_t* src, int step, int sw, int sh, int w, int h) {
+    std::vector<uint8_t> d((size_t)w * h);
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* row = src + (size_t)(y * sh / h) * sw * step;
+        for (int x = 0; x < w; ++x) d[(size_t)y * w + x] = row[(size_t)(x * sw / w) * step];
+    }
+    return d;
+}
+
+// #180: converges by the same measurement as a two-view LIF without a convergence.
+LifResult LoadOneView(const json& root, const std::vector<uint8_t>& buf,
+                      const std::vector<Field>& fields, const std::string& path) {
+    const json& view = root["views"][0];
+    const ViewRef img = ResolveView(view, buf, fields);
+    const Field* disp = DisparityField(view, fields);
+    if (!img.valid || !disp) {
+        LOG_INFO("LifLoader: '%s' has 1 view and no disparity map, flat 2D", path.c_str());
+        return MonoFallback(buf, path);
+    }
+    // The map's first channel is taken on its decode thread, overlapping the photo's decode.
+    std::vector<uint8_t> depth;
+    int mw = 0, mh = 0;
+    std::thread mdec([&] {
+        const DecodedImage map =
+            ImageDecoder::LoadFromMemory(buf.data() + disp->offset, disp->size, "LIF[disparity]");
+        if (!map.Valid()) return;
+        mw = map.width;
+        mh = map.height;
+        depth = DepthPlane(map.pixels.data(), 4, mw, mh, mw, mh);
+    });
+    const DecodedImage base = ImageDecoder::LoadFromMemory(img.data, img.size, "LIF[view]");
+    mdec.join();
+    if (!base.Valid() || depth.empty()) {
+        LOG_WARN("LifLoader: '%s' view or disparity map decode failed, flat 2D", path.c_str());
+        return MonoFallback(buf, path);
+    }
+    if (mw != base.width || mh != base.height)
+        depth = DepthPlane(depth.data(), 1, mw, mh, base.width, base.height);
+    const float parallax = std::clamp(OneViewParallax(root, view), -kMaxParallax, kMaxParallax);
+    LifResult r;
+    r.image = DepthWarp::MakeSbs(base, depth, parallax);
+    r.layout = StereoLayout::SbsFull;
+    r.ok = r.stereo = true;
+    r.autoConvergence = EstimateAutoConvergence(r.image);
+    LOG_INFO("LifLoader: '%s' one-view LIF %dx%d, pair from its disparity map (parallax %.2f%%), "
+             "convergence=%+.4f (auto estimate)",
+             path.c_str(), base.width, base.height, parallax * 100.0f, r.autoConvergence);
+    return r;
+}
+
 } // namespace
 
 bool LifLoader::IsLif(const std::string& path) {
@@ -215,6 +310,7 @@ LifResult LifLoader::Load(const std::string& path) {
     if (!root.contains("views") || !root["views"].is_array() || root["views"].size() < 2) {
         const size_t n = root.contains("views") && root["views"].is_array()
                              ? root["views"].size() : 0;
+        if (n == 1) return LoadOneView(root, buf, fields, path);
         LOG_INFO("LifLoader: '%s' has %zu view(s); stereo needs 2 — flat 2D", path.c_str(), n);
         return MonoFallback(buf, path);
     }

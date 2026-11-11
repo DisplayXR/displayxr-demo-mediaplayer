@@ -178,8 +178,9 @@ heavier — opt-in for LIF content). 2D images shown centered as flat; v2 adds t
 optional, runtime-provided "Convert to 3D" (`XR_DXR_lift`, off by default).
 **Stereo LIF** (`.lif`): the container is parsed directly (no vendor SDK) — the two
 embedded views are decoded and composed to a full-SBS frame (`src/media/LifLoader.*`,
-nlohmann/json for the metadata). Mono+depth LIFs fall back to flat 2D for now; their
-depth-based rendering (porting the raycast LIF shader) is a later step.
+nlohmann/json for the metadata). A one-view LIF (one image plus a disparity map, classic
+Leia or LIF 5.x) gets its pair from the map on the CPU (`src/media/DepthWarp.*`, #180) and
+takes the same path; its LDI layers are not used.
 **Video:** SBS H.264 / H.265 / AV1 in MP4/MKV via FFmpeg; `*_2x1` / `*_half_2x1`
 naming. 2D video shown flat.
 **Detection:** filename suffix first (matches Leia convention), container hints
@@ -244,8 +245,7 @@ any of them if product priorities shift.
   Leia HEIF content — not on the default path.
 - **Stereo LIF container parsing → implemented, on by default.** A two-view `.lif`
   is parsed in-tree (`LifLoader`, nlohmann/json header-only) and composed to SBS — no
-  vendor SDK, per the GOLDEN RULE. Mono+depth/LDI synthesis (raycast LIF shader port)
-  is the next step. Filename `*_2x1` / `*_half_2x1` detection still covers plain SBS
+  vendor SDK, per the GOLDEN RULE. Filename `*_2x1` / `*_half_2x1` detection still covers plain SBS
   JPG/PNG.
 - **Single-file open in v1**, via a tiny native dialog (SDL3 / tinyfiledialogs).
   *Low-cost stretch:* once a file is open, arrow-key prev/next across the

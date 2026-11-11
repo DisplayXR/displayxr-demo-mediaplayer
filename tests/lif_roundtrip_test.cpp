@@ -210,6 +210,51 @@ void TestMonoFallbackOneView() {
     CHECK(r.image.width == kW && r.image.height == kH, "mono1: W×H (not doubled)");
 }
 
+// One-view LIF with a disparity map (#180): a red bar, nearest, on a grey background,
+// farthest. The LIF 5.x metadata asks for a parallax of 0.25 of the width (focal_px =
+// width_px, baseline 1, inv_z_map 0.25..0), capped at 0.02: 16 px at 800 wide, so each eye
+// moves the bar 4 px one way and the background 4 px the other. The bar at x 396..403 lands
+// near 400..407 in the left view and 392..399 in the right.
+void TestOneViewDisparity() {
+    std::printf("[one view + disparity map]\n");
+    constexpr int w = 800, h = 8;
+    std::vector<uint8_t> rgb((size_t)w * h * 3), disp((size_t)w * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const bool bar = x >= 396 && x < 404;
+            uint8_t* p = &rgb[((size_t)y * w + x) * 3];
+            p[0] = bar ? 220 : 128;
+            p[1] = p[2] = bar ? 30 : 128;
+            disp[(size_t)y * w + x] = bar ? 255 : 0;
+        }
+    std::vector<uint8_t> jpg, png;
+    stbi_write_jpg_to_func(&JpegSink, &jpg, w, h, 3, rgb.data(), 95);
+    stbi_write_png_to_func(&JpegSink, &png, w, h, 1, disp.data(), w);
+    const std::string json =
+        R"({"stereo_render_data":{"baseline":1},"views":[{"image":{"blob_id":-1},)"
+        R"("focal_px":800,"width_px":800,"height_px":8,)"
+        R"("inv_z_map":{"blob_id":1000001,"min":0.25,"max":0}}]})";
+    const LifResult r =
+        LoadFromBytes(BuildLif(jpg, {{8, JsonBytes(json)}, {1000001, png}}), "mp_lif_disp.lif");
+
+    CHECK(r.ok && r.stereo, "disp: ok + stereo");
+    CHECK(r.layout == StereoLayout::SbsFull, "disp: SbsFull layout");
+    CHECK(!r.hasConvergence, "disp: converges by the estimate");
+    CHECK(r.image.width == 2 * w && r.image.height == h, "disp: 2W x H");
+    if (r.image.width != 2 * w || r.image.height != h) return;
+    CHECK(Reddish(PixelAt(r.image, 405, h / 2)) && !Reddish(PixelAt(r.image, 397, h / 2)),
+          "disp: the bar moves right in the left view");
+    CHECK(Reddish(PixelAt(r.image, w + 394, h / 2)) && !Reddish(PixelAt(r.image, w + 402, h / 2)),
+          "disp: the bar moves left in the right view");
+
+    // Classic Leia schema: "disparityId" names the map, "gain" sets the parallax.
+    const std::string classic =
+        R"({"gain":0.25,"convergence":null,"views":[{"albedoId":-1,"disparityId":1000001}]})";
+    const LifResult c =
+        LoadFromBytes(BuildLif(jpg, {{7, JsonBytes(classic)}, {1000001, png}}), "mp_lif_disp7.lif");
+    CHECK(c.ok && c.stereo && c.image.width == 2 * w, "disp classic: stereo 2W x H");
+}
+
 // No LIF trailer at all (a plain JPEG saved as .lif) → flat 2D, never a hard failure.
 void TestNonLifFallback() {
     std::printf("[fallback: plain JPEG, no trailer]\n");
@@ -265,6 +310,7 @@ int main() {
     TestOrderingByPosition();
     TestClassicLeiaSchema();
     TestMonoFallbackOneView();
+    TestOneViewDisparity();
     TestNonLifFallback();
     TestTruncatedRegion();
     TestIsLifReadAt();

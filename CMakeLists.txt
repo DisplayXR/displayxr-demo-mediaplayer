@@ -282,6 +282,7 @@ function(mp_add_player tgt is_pro)
         src/rhi/VulkanRenderer.cpp
         src/media/ImageDecoder.cpp
         src/media/LifLoader.cpp
+        src/media/DepthWarp.cpp      # one-view LIF -> stereo pair (#180)
         src/media/MpoLoader.cpp
         src/media/HeifLoader.cpp     # stereo HEIC (#154): HEIF `ster` pair via FFmpeg's HEIF demuxer
         src/media/SpatialMedia.cpp   # MV-HEVC / HEIC eye order + HEIF box walk (#154), pure
@@ -665,6 +666,7 @@ if(MP_BUILD_TESTS)
     add_executable(lif_roundtrip_test
         tests/lif_roundtrip_test.cpp
         src/media/LifLoader.cpp
+        src/media/DepthWarp.cpp
         src/media/StereoCompose.cpp
         src/media/AutoConvergence.cpp
         src/media/ImageDecoder.cpp
@@ -1005,6 +1007,7 @@ if(MP_BUILD_TESTS)
         src/media/AutoConvergence.cpp
         src/media/VideoStereoProbe.cpp
         src/media/LifLoader.cpp
+        src/media/DepthWarp.cpp
         src/media/MpoLoader.cpp
         src/media/ImageDecoder.cpp
         src/Log.cpp)
