@@ -203,7 +203,7 @@ bool IconButton(const char* id, Icon kind, float size, bool active = false,
     return ImGui::IsItemClicked();
 }
 
-// The touch player's 2D/3D switch (#180), drawn like LeiaPlayer's on the same tablets: a
+// The touch player's 2D/3D switch (#180), drawn like the stock player's on the same tablets: a
 // pill track and a round knob naming the mode in force, on the right for 3D and on the
 // left for 2D. `size` is the knob's diameter; the hit box grows like IconButton's.
 bool ModeSwitch(const char* id, bool on3D, float size, float hitScale) {

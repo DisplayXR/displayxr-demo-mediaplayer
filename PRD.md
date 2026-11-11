@@ -178,8 +178,8 @@ heavier — opt-in for LIF content). 2D images shown centered as flat; v2 adds t
 optional, runtime-provided "Convert to 3D" (`XR_DXR_lift`, off by default).
 **Stereo LIF** (`.lif`): the container is parsed directly (no vendor SDK) — the two
 embedded views are decoded and composed to a full-SBS frame (`src/media/LifLoader.*`,
-nlohmann/json for the metadata). A one-view LIF (one image plus a disparity map, classic
-Leia or LIF 5.x) gets its pair from the map on the CPU (`src/media/DepthWarp.*`, #180) and
+nlohmann/json for the metadata). A one-view LIF (one image plus a disparity map,
+classic Leia or LIF 5.x) gets its pair from the map on the CPU (`src/media/DepthWarp.*`, #180) and
 takes the same path; its LDI layers are not used.
 **Video:** SBS H.264 / H.265 / AV1 in MP4/MKV via FFmpeg; `*_2x1` / `*_half_2x1`
 naming. 2D video shown flat.

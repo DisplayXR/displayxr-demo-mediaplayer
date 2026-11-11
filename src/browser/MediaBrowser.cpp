@@ -358,7 +358,7 @@ void MediaBrowser::TopBar(float width, float height) {
     const float pad = Round(style.WindowPadding.x);
     dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(width, height), kPanel);
     if (selecting_) {
-        // As LeiaPlayer's: a cross, the count, and the bin.
+        // As the stock tablet player's: a cross, the count, and the bin.
         if (IconButton("##cancel", Icon::Close, ImVec2(pad, y), icon)) EndSelection();
         char count[32];
         std::snprintf(count, sizeof(count), "%d selected", (int)selected_.size());
@@ -629,7 +629,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
         const std::string format = library_.Kind(shown_[p]) == SourceKind::Unsupported ? Format(item.name) : "";
         if (!format.empty()) Badge(dl, right, a.y + margin, format.c_str());
         if (selecting_) {
-            // As LeiaPlayer's: a box on every tile; a picked one dimmed, ticked and outlined.
+            // As the stock tablet player's: a box on every tile; a picked one dimmed, ticked and outlined.
             const bool on = selected_.count(item.id) != 0;
             if (on) {
                 dl->AddRectFilled(a, b, kPicked);
