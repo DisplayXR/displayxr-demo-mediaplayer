@@ -10,7 +10,9 @@
 //   4. the content check (StereoDetect) on the thumbnail, side by side only. It takes
 //      about 2 ms per thumbnail on the NP02J (11 ms in a debug build), too much for the
 //      render thread with thumbnails arriving several a frame, so it runs on a worker.
-// Verdicts persist in a small text file between runs.
+// Verdicts persist in a small text file between runs, except a 2D one reached without the
+// file check it needed (the file did not open): a LIF's thumbnail is one view, so that 2D
+// may be wrong, and the next run looks again (#180).
 #pragma once
 
 #include "browser/MediaItem.h"
@@ -64,11 +66,13 @@ private:
     struct Entry {
         int64_t modified = 0, bytes = 0;
         StereoVerdict verdict;
+        bool save = true;
     };
     struct Job {
         MediaItem item;
         Thumbnail thumbnail;
         StereoVerdict verdict;
+        bool unchecked = false;  // the file check was needed but did not happen
     };
 
     void Load();

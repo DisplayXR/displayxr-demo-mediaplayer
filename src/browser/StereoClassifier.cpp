@@ -62,6 +62,7 @@ bool StereoClassifier::NeedsFileCheck(const MediaItem& item) const {
 void StereoClassifier::Classify(const MediaItem& item, Thumbnail thumbnail) {
     Job job{item, std::move(thumbnail), Get(item)};
     if (!job.verdict.known && job.thumbnail.file3D) job.verdict = StereoVerdict{true, true, StereoLayout::Dual};
+    job.unchecked = !job.verdict.known && !job.thumbnail.fileChecked && NeedsFileCheck(item);
     std::lock_guard<std::mutex> lock(mutex_);
     if (job.verdict.known) {
         done_.push_back(std::move(job));
@@ -83,8 +84,9 @@ bool StereoClassifier::TakeResult(Thumbnail& thumbnail, StereoVerdict& verdict) 
     const bool cached =
         it != verdicts_.end() && it->second.modified == job.item.modified && it->second.bytes == job.item.bytes;
     if (!cached) {
-        verdicts_[job.item.id] = Entry{job.item.modified, job.item.bytes, job.verdict};
-        dirty_ = true;
+        const bool save = job.verdict.stereo || !job.unchecked;
+        verdicts_[job.item.id] = Entry{job.item.modified, job.item.bytes, job.verdict, save};
+        dirty_ = dirty_ || save;
     }
     thumbnail = std::move(job.thumbnail);
     verdict = job.verdict;
@@ -134,6 +136,7 @@ void StereoClassifier::Save() {
     std::ofstream out(cachePath_, std::ios::trunc);
     for (const auto& entry : verdicts_) {
         const Entry& e = entry.second;
+        if (!e.save) continue;
         out << entry.first << ' ' << e.modified << ' ' << e.bytes << ' ' << (int)e.verdict.stereo << ' '
             << (int)e.verdict.layout << '\n';
     }

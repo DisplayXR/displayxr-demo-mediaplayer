@@ -37,6 +37,8 @@ struct Thumbnail {
     // on the NP02J was one or the other) or a two-track (LVF) video. The thumbnail then
     // shows one view.
     bool file3D = false;
+    // The file was read for file3D: asked for, and it opened.
+    bool fileChecked = false;
 };
 
 class MediaProvider {
