@@ -275,6 +275,7 @@ function(mp_add_player tgt is_pro)
         src/color/CubeLut.cpp    # Pro looks; compiled into both so the trunk stays one source list
         src/color/Cdl.cpp
         src/App.cpp
+        src/AgentTools.cpp       # the player's agent-tool table (#220)
         src/Log.cpp
         src/platform/Window.cpp
         $<$<PLATFORM_ID:Linux>:src/platform/WindowLinux.cpp>  # desktop Linux: displayxr-common window
@@ -466,6 +467,7 @@ function(mp_add_player tgt is_pro)
         target_sources(${tgt} PRIVATE
             src/pro/ProController.cpp
             src/pro/ProTools.cpp         # agent tools: grade, view, station
+            src/pro/ProToolList.cpp      # Pro's agent-tool table (#220)
             src/pro/LookLoader.cpp       # LUT parse / OCIO bake off the render thread
             src/pro/DisplayCalibration.cpp  # per-panel display calibration (#133)
             src/pro/TargetScreen.cpp     # target-screen depth model (#135)
@@ -840,6 +842,11 @@ if(MP_BUILD_TESTS)
     target_include_directories(resolve_link_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(resolve_link_test PRIVATE nlohmann_json::nlohmann_json)
     add_test(NAME resolve_link COMMAND resolve_link_test)
+    # Player + Pro agent tools: unique names, valid schemas, within the runtime's budget (#220).
+    add_executable(agent_tools_test tests/agent_tools_test.cpp src/AgentTools.cpp src/pro/ProToolList.cpp)
+    target_include_directories(agent_tools_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(agent_tools_test PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME agent_tools COMMAND agent_tools_test)
     add_executable(thumbnail_test tests/thumbnail_test.cpp src/pro/Thumbnail.cpp)
     target_include_directories(thumbnail_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME thumbnail COMMAND thumbnail_test)
