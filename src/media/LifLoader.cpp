@@ -171,7 +171,7 @@ LifResult MonoFallback(const std::vector<uint8_t>& buf, const std::string& path)
 // by eye on the panel, kDefaultParallax is for a null gain.
 constexpr float kGainToParallax = 0.06f;
 constexpr float kDefaultParallax = 0.015f;
-// LIF 5.3 files from Leia's python encoder carry a stereo baseline of 1.0, which reads as
+// LIF 5.3 files from the python LIF encoder carry a stereo baseline of 1.0, which reads as
 // about 10% here, where the C++ encoder's 0.13-0.15 gives 1.3-1.5%.
 constexpr float kMaxParallax = 0.02f;
 
