@@ -579,16 +579,18 @@ int App::Run() {
         }
         if (window_.TakeResetConvergence()) {                         // '0'
             convergence_ = 0.0f;
+            mediaAutoConvOn_ = false;
             LOG_INFO("convergence reset");
             ShowToast("Convergence reset");
             activity = true;
         }
         if (window_.TakeAutoConvergeRequest()) {                      // Backspace
             if (mediaAutoConvAvailable_) {
-                convergence_ = mediaAutoConvergence_;  // undo with '0'
-                LOG_INFO("auto-convergence applied: %+.4f", convergence_);
+                convergence_ = 0.0f;  // the estimate alone, as at load; undo with '0'
+                mediaAutoConvOn_ = true;
+                LOG_INFO("auto-convergence applied: %+.4f", mediaAutoConvergence_);
                 char t[48];
-                std::snprintf(t, sizeof(t), "Auto-converge %+.1f%%", convergence_ * 100.0f);
+                std::snprintf(t, sizeof(t), "Auto-converge %+.1f%%", mediaAutoConvergence_ * 100.0f);
                 ShowToast(t);
             } else {
                 ShowToast("Auto-converge: file already has convergence");
@@ -967,10 +969,11 @@ void App::RenderOneFrame() {
             // picture, as the picture's own parallax does.
             const float convBase = (convergence_ + 0.5f * mediaConvergence_) * proPictureScale_;
             const float contentW = (float)viewFit.w * sx;
+            const float autoShift = autoConvergence_ + MediaAutoShift();
             int32_t cdx[XrSession::kMaxViews];
             for (uint32_t v = 0; v < frame.viewCount; ++v) {
                 const float conv =
-                    convBase + autoConvergence_ * contentW / (float)std::max(1u, rects[v].w);
+                    convBase + autoShift * contentW / (float)std::max(1u, rects[v].w);
                 cdx[v] = autoconv::ConvergenceShiftPx(conv, rects[v].w, isLeftView[v]);
                 contentRects[v].x = rects[v].x + cdx[v] + lbx;
                 contentRects[v].y = rects[v].y + (int32_t)((float)viewFit.y * sy + 0.5f);
@@ -1017,7 +1020,7 @@ void App::RenderOneFrame() {
                 // moves the shown parallax by -2 x the shift, in % of the picture's width.
                 proParallaxOffsetPct_ =
                     contentW > 0.0f && frame.viewCount > 0
-                        ? -200.0f * (convBase * (float)rects[0].w + autoConvergence_ * contentW) / contentW
+                        ? -200.0f * (convBase * (float)rects[0].w + autoShift * contentW) / contentW
                         : 0.0f;
             }
 #endif
@@ -2663,8 +2666,19 @@ std::string App::VrViewJson() const {
 
 void App::SetAutoConv(bool on, const char* why) {
     if (on == autoConvEnabled_) return;
+    // A still's applied estimate (#180) is what A measures on it: hand the value over both
+    // ways, so A on / off neither drops to 0 nor stacks the two.
+    const float handover = MediaAutoShift();
     autoConvEnabled_ = on;
+    if (!on && MediaAutoShift() != 0.0f) {
+        autoConvCtl_.Reset();
+        autoConvergence_ = 0.0f;
+    }
     if (on) {
+        if (handover != 0.0f) {
+            autoConvCtl_.Seed(handover);
+            autoConvergence_ = handover;
+        }
         autoConvWorker_.Start();  // idles on a condition variable while off
         autoConvWorker_.RequestReset();
         autoConvHaveResult_ = false;
@@ -2701,6 +2715,12 @@ void App::SetAutoConvFocus(float u, float v) {
 bool App::AutoConvApplies() const {
     if (!hasMedia_ || isLogo_ || !packing::IsPacked(layout_)) return false;
     return LiveSource() || !mediaHasBakedConv_;
+}
+
+float App::MediaAutoShift() const {
+    if (!mediaAutoConvAvailable_ || !mediaAutoConvOn_ || layout_ != StereoLayout::SbsFull) return 0.0f;
+    if (autoConvEnabled_ && AutoConvApplies()) return 0.0f;
+    return swapEyes_ != mediaEyeSwap_ ? -mediaAutoConvergence_ : mediaAutoConvergence_;
 }
 
 const uint8_t* App::AutoConvLuma8(const FrameRing::Frame& f) {
@@ -2837,29 +2857,13 @@ void App::AutoConvNewPicture(bool newMedia) {
     autoConvStill_.clear();
     autoConvStillW_ = autoConvStillH_ = 0;
     mediaHasBakedConv_ = false;
+    mediaAutoConvOn_ = true;
 }
 
 void App::KeepStillForAutoConv(const uint8_t* rgba, int w, int h) {
-    // A still's luma (BT.709 weights), box-averaged to <= 1920 wide: the estimator works at
-    // <= 240 px per eye anyway, and this keeps an 8K pair to a few MB. Kept whether or not
-    // auto-conv is on, so A can be pressed later; a layout override re-measures from it.
-    autoConvStill_.clear();
-    autoConvStillW_ = autoConvStillH_ = 0;
-    if (!rgba || w < 64 || h < 32) return;
-    const int f = std::max(1, (w + 1919) / 1920);
-    const int ow = w / f, oh = h / f;
-    autoConvStill_.resize((size_t)ow * oh);
-    for (int y = 0; y < oh; ++y)
-        for (int x = 0; x < ow; ++x) {
-            uint32_t sum = 0;
-            for (int dy = 0; dy < f; ++dy) {
-                const uint8_t* p = rgba + ((size_t)(y * f + dy) * w + (size_t)x * f) * 4;
-                for (int dx = 0; dx < f; ++dx, p += 4) sum += 54u * p[0] + 183u * p[1] + 19u * p[2];
-            }
-            autoConvStill_[(size_t)y * ow + x] = (uint8_t)(sum / (256u * (uint32_t)(f * f)));
-        }
-    autoConvStillW_ = ow;
-    autoConvStillH_ = oh;
+    // Kept whether or not auto-conv is on, so A can be pressed later; a layout override
+    // re-measures from it.
+    autoconv::StillLuma(rgba, w, h, autoConvStill_, autoConvStillW_, autoConvStillH_);
 }
 
 void App::TickAutoConv() {
@@ -3754,6 +3758,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         o["auto_conv_active"] = autoConvEnabled_ && AutoConvApplies();  // something to measure
         o["auto_conv_policy"] = autoconv::PolicyName(autoConvPolicy_);
         o["auto_conv_value"] = autoConvergence_;  // applied per-eye shift, fraction of eye width
+        o["media_auto_conv"] = MediaAutoShift();  // the loader's estimate as applied (#180)
         o["auto_conv_target"] = autoConvCtl_.Target();
         o["auto_conv_clamp"] = autoConvCtl_.Clamp();
         o["auto_conv_disparity_frac"] = l.disparityFrac;  // x_left - x_right, + = in front

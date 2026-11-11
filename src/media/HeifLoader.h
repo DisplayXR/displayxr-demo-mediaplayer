@@ -32,7 +32,7 @@ struct HeifResult {
     StereoLayout layout = StereoLayout::Mono;  // SbsFull when stereo
     bool ok = false;                           // a picture was produced
     bool stereo = false;                       // the `ster` pair was found AND both eyes decoded
-    float autoConvergence = 0.0f;              // coarse estimate (stereo only), as for MPO
+    float autoConvergence = 0.0f;              // EstimateAutoConvergence (stereo only), as for MPO
 };
 
 class HeifLoader {

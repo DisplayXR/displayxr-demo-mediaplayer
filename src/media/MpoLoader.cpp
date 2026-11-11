@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <thread>
 #include <vector>
 
 namespace mp {
@@ -198,10 +199,12 @@ MpoResult MpoLoader::Load(const std::string& path) {
 
     // The primary image starts at file offset 0 and is a normal JPEG; stb stops at its
     // EOI, so handing it the whole buffer is both correct and avoids trusting entry[0].
-    DecodedImage left = ImageDecoder::LoadFromMemory(buf.data(), buf.size(), "MPO[1]");
+    // The two views decode at once, as LIF's do.
     const size_t start = tiffBase + entries[pick].offset;
-    DecodedImage right =
-        ImageDecoder::LoadFromMemory(buf.data() + start, entries[pick].size, "MPO[2]");
+    DecodedImage right;
+    std::thread rdec([&] { right = ImageDecoder::LoadFromMemory(buf.data() + start, entries[pick].size, "MPO[2]"); });
+    DecodedImage left = ImageDecoder::LoadFromMemory(buf.data(), buf.size(), "MPO[1]");
+    rdec.join();
     if (!left.Valid() || !right.Valid()) {
         LOG_WARN("MpoLoader: '%s' view decode failed", path.c_str());
         return r;
@@ -220,8 +223,8 @@ MpoResult MpoLoader::Load(const std::string& path) {
     r.layout = StereoLayout::SbsFull;
     r.ok = true;
     r.stereo = true;
-    // MPO carries no baked convergence, so the estimate is always what Backspace applies.
-    r.autoConvergence = EstimateAutoConvergence(left, right);
+    // MPO carries no baked convergence, so the estimate is always what the player applies.
+    r.autoConvergence = EstimateAutoConvergence(r.image);
     LOG_INFO("MpoLoader: '%s' stereo MPO %dx%d SBS (per-eye %dx%d), MPType=0x%06X, "
              "auto convergence %+.4f",
              path.c_str(), r.image.width, r.image.height, left.width, left.height,

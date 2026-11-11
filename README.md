@@ -172,7 +172,8 @@ devices and re-opens the same camera as soon as it is back.
 
 ## Auto-convergence (live and files, SBS and TB, #92)
 
-**Off by default**: the picture is shown raw unless you turn this on. When on, the
+**Off by default**: the picture is shown raw unless you turn this on (stereo stills with
+no convergence of their own are the exception, see the last bullet). When on, the
 player measures how far apart the subject sits in the two eyes and shifts the eyes in
 opposite directions so the subject lands at the display plane. It measures the pixels
 (NCC block matching on a downsampled luma plane, ~5 Hz, on a side thread). There is no
@@ -193,10 +194,17 @@ What it does with each source:
   the rate limit and glides quickly to the new scene.
 - **A LIF that carries its own convergence keeps it**: auto-conv stands aside (the HUD
   says `idle (LIF convergence)`) and is never stacked on the baked shift. A LIF without
-  one is measured like an MPO. `Backspace` (converge once from the file) is unchanged.
+  one is measured like an MPO.
 - **Not measured**: mono, the `Dual` two-track layout (this player decodes the first
   track only, so the second eye is not there to compare), a "Convert to 3D" picture,
   and zero-copy (`MEDIAPLAYER_ZEROCOPY=1`, Windows) frames, which carry no CPU pixels.
+- **A stereo still with no convergence of its own** (a LIF without the field or with
+  `"convergence": null`, an MPO, a stereo HEIC) opens auto-converged even with auto-conv
+  off, on every platform including Android (#180). The loader measures it once, with the
+  same estimator, policy `nearest`; if no subject matches, a coarse whole-picture shift
+  stands in. `0` turns it off, `Backspace` turns it back on, and the next file starts with
+  it on. Turning `A` on or off hands the value over without a jump. Plain SBS stills stay
+  at 0.
 
 | control | effect |
 |---|---|

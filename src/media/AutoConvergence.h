@@ -291,6 +291,8 @@ public:
     // Advance the applied value by dt seconds (render rate). Disabled -> glides to 0
     // (low-pass only, no rate limit) and lands on exactly 0.
     void Tick(double dt, bool enabled);
+    // Start at `v` as both value and target: a still's applied estimate handed over to A.
+    void Seed(float v) { value_ = target_ = v; hasTarget_ = true; }
     float Value() const { return value_; }
     float Target() const { return target_; }
     const char* Clamp() const { return clamp_; }
@@ -307,6 +309,17 @@ private:
     int expect_ = 0;  // ExpectChange pending: 0 none, 1 glide, 2 snap
     const char* clamp_ = "";
 };
+
+// ---- stills (#180) ----------------------------------------------------------------------
+
+// A still's luma (BT.709 weights), box-averaged to <= 1920 wide: the estimator works at
+// <= 240 px per eye anyway, and this keeps an 8K pair to a few MB. Empty below 64x32.
+void StillLuma(const uint8_t* rgba, int w, int h, std::vector<uint8_t>& out, int& outW, int& outH);
+
+// One measurement of a full-SBS RGBA still: the per-eye shift that puts the nearest subject
+// at zero parallax. It is the target A's first measurement of the same still gives (same
+// luma, estimator and controller). False when no subject matched confidently.
+bool MeasureStillShift(const uint8_t* rgba, int w, int h, float& shift, const char** rule = nullptr);
 
 // ---- the side thread --------------------------------------------------------------------
 

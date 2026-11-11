@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -35,20 +36,26 @@ bake_lif_convergence(DecodedImage &img, float conv)
 {
 	const int W = img.width / 2, H = img.height;
 	const int s = (int)std::lround(0.5f * conv * (float)W);
-	if (s == 0) {
+	if (s == 0 || std::abs(s) >= W) {
 		return;
 	}
-	std::vector<uint8_t> row((size_t)W * 4);
+	// A row move plus the edge strip: every stereo still pays this now (#180), and a
+	// per-pixel copy of an 8K pair costs about a second on the debug build.
+	const int n = std::abs(s);
+	const size_t keep = (size_t)(W - n) * 4;
 	auto shift_half = [&](int x0, int dx) {
 		for (int y = 0; y < H; ++y) {
 			uint8_t *base = img.pixels.data() + ((size_t)y * img.width + x0) * 4;
-			for (int x = 0; x < W; ++x) {
-				int sx = x - dx;
-				if (sx < 0) sx = 0;
-				if (sx >= W) sx = W - 1;
-				std::memcpy(row.data() + (size_t)x * 4, base + (size_t)sx * 4, 4);
+			uint32_t edge;
+			if (dx > 0) {
+				std::memcpy(&edge, base, 4);
+				std::memmove(base + (size_t)n * 4, base, keep);
+				for (int x = 0; x < n; ++x) std::memcpy(base + (size_t)x * 4, &edge, 4);
+			} else {
+				std::memcpy(&edge, base + (size_t)(W - 1) * 4, 4);
+				std::memmove(base, base + (size_t)n * 4, keep);
+				for (int x = W - n; x < W; ++x) std::memcpy(base + (size_t)x * 4, &edge, 4);
 			}
-			std::memcpy(base, row.data(), (size_t)W * 4);
 		}
 	};
 	shift_half(0, +s);  // left eye content moves right
@@ -111,15 +118,18 @@ StillImage::Decode(const std::string &path, const std::string &name, StillImage 
 		r.image = std::move(mpo.image);
 		r.layout = mpo.layout;
 		r.ok = r.stereo = mpo.ok;
+		r.autoConvergence = mpo.autoConvergence;
 	}
 	if (!r.ok) r = LifLoader::Load(path);  // a LIF, a plain image, or an MPO that is not a pair
 	if (!r.ok) {
 		LOGE("image failed to decode: %s", path.c_str());
 		return false;
 	}
-	out.convergenceBaked = r.stereo && r.hasConvergence;
+	// A pair with no convergence of its own gets the loader's estimate (#180), a per-eye
+	// shift, where a LIF's convergence is twice the per-eye shift.
+	out.convergenceBaked = r.stereo;
 	if (out.convergenceBaked) {
-		bake_lif_convergence(r.image, r.convergence);
+		bake_lif_convergence(r.image, r.hasConvergence ? r.convergence : 2.0f * r.autoConvergence);
 	}
 	// Layered resolution (desktop App.cpp parity): a composed LIF/MPO is
 	// container metadata; a plain JPEG/PNG falls through to the filename, then

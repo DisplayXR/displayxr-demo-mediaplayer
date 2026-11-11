@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <thread>
 #include <vector>
 
 #if defined(MEDIAPLAYER_WITH_FFMPEG)
@@ -249,11 +250,17 @@ HeifResult HeifLoader::Load(const std::string& path) {
         return r;
     }
     if (pair.hasPair) {
+        // The two eyes decode at once, as LIF's do: each item gets its own codec and sws
+        // context, and the reader's demuxed packets are only read.
         DecodedImage left, right;
-        if (rd.DecodeItem(pair.leftId, left) && rd.DecodeItem(pair.rightId, right)) {
+        bool rightOk = false;
+        std::thread rdec([&] { rightOk = rd.DecodeItem(pair.rightId, right); });
+        const bool leftOk = rd.DecodeItem(pair.leftId, left);
+        rdec.join();
+        if (leftOk && rightOk) {
             DecodedImage sbs = ComposeSbs(left, right);
             if (sbs.Valid()) {
-                r.autoConvergence = EstimateAutoConvergence(left, right);
+                r.autoConvergence = EstimateAutoConvergence(sbs);
                 r.image = std::move(sbs);
                 r.layout = StereoLayout::SbsFull;
                 r.ok = r.stereo = true;
