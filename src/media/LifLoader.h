@@ -5,10 +5,10 @@
 // at EOF-6; then a big-endian field table; the type-8/7 field is UTF-8 JSON; other
 // fields are binary blobs — embedded view JPEGs and depth PNGs — keyed by blob_id).
 //
-// Step 1 scope: STEREO LIFs only. A two-view LIF already carries a baked left and
-// right JPEG, so we extract both views and compose them into one full-SBS RGBA
-// buffer that feeds the existing SBS render path unchanged — no depth warp, no new
-// shaders. (Mono+depth synthesis / the raycast shader port is a later step.)
+// A two-view LIF already carries a baked left and right JPEG, so we extract both views
+// and compose them into one full-SBS RGBA buffer that feeds the existing SBS render
+// path unchanged. A one-view LIF with a disparity map gets its pair from DepthWarp
+// (#180), on the CPU, so it takes the same path.
 //
 // Container layout reference: dfattal/LIF-renderer src/LifLoader.ts.
 #pragma once
@@ -27,7 +27,7 @@ struct LifResult {
     DecodedImage image;                        // composed SBS (stereo) or base JPEG (mono fallback)
     StereoLayout layout = StereoLayout::Mono;
     bool ok = false;                           // a renderable image was produced
-    bool stereo = false;                       // two views were composed side-by-side
+    bool stereo = false;                       // two views were composed (or generated) side-by-side
     float convergence = 0.0f;                  // baked reconvergence from the LIF metadata
                                                // (normalized; 0 if absent/non-stereo)
     bool hasConvergence = false;               // the metadata actually carried a convergence field
@@ -49,6 +49,7 @@ public:
 
     // Parse `path` and produce a renderable image:
     //   * 2+ views  -> compose left|right into a full-SBS RGBA buffer (SbsFull, stereo=true)
+    //   * 1 view + disparity map -> generate left|right the same way (SbsFull, stereo=true)
     //   * otherwise -> decode the base JPEG as flat 2D (Mono) — never hard-fails on a
     //                  valid JPEG, even if the LIF trailer is missing or malformed.
     // Returns ok=false only if even the base image can't be decoded.
