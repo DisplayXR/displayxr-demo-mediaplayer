@@ -31,9 +31,8 @@ struct LifResult {
     float convergence = 0.0f;                  // baked reconvergence from the LIF metadata
                                                // (normalized; 0 if absent/non-stereo)
     bool hasConvergence = false;               // the metadata actually carried a convergence field
-    float autoConvergence = 0.0f;              // coarse estimate from the stereo pair (in the
-                                               // app's convergence_ units), set only when the
-                                               // field is missing — applied on demand (Backspace)
+    float autoConvergence = 0.0f;              // EstimateAutoConvergence of the pair, set only
+                                               // when the field is missing; applied by default
 };
 
 class LifLoader {

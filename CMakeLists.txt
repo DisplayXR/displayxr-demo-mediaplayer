@@ -666,6 +666,7 @@ if(MP_BUILD_TESTS)
         tests/lif_roundtrip_test.cpp
         src/media/LifLoader.cpp
         src/media/StereoCompose.cpp
+        src/media/AutoConvergence.cpp
         src/media/ImageDecoder.cpp
         src/Log.cpp)
     target_include_directories(lif_roundtrip_test PRIVATE
@@ -928,7 +929,7 @@ if(MP_BUILD_TESTS)
     # when FFmpeg is linked (skips those parts on an FFmpeg older than 7.1).
     if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
         add_executable(spatial_media_test tests/spatial_media_test.cpp src/media/SpatialMedia.cpp
-            src/media/HeifLoader.cpp src/media/StereoCompose.cpp src/media/ImageDecoder.cpp
+            src/media/HeifLoader.cpp src/media/StereoCompose.cpp src/media/AutoConvergence.cpp src/media/ImageDecoder.cpp
             src/media/VideoDecoder.cpp src/media/VideoStereoProbe.cpp src/media/StereoDetect.cpp
             src/media/MediaSource.cpp src/media/ImageSequence.cpp src/media/StreamUrl.cpp src/Log.cpp)
         target_include_directories(spatial_media_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -979,6 +980,7 @@ if(MP_BUILD_TESTS)
         tests/mpo_parse_test.cpp
         src/media/MpoLoader.cpp
         src/media/StereoCompose.cpp
+        src/media/AutoConvergence.cpp
         src/media/ImageDecoder.cpp
         src/Log.cpp)
     target_include_directories(mpo_parse_test PRIVATE
@@ -994,6 +996,7 @@ if(MP_BUILD_TESTS)
         src/media/MediaSource.cpp
         src/media/StereoDetect.cpp
         src/media/StereoCompose.cpp
+        src/media/AutoConvergence.cpp
         src/media/VideoStereoProbe.cpp
         src/media/LifLoader.cpp
         src/media/MpoLoader.cpp

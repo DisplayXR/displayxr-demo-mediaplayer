@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "StereoCompose.h"
 
+#include "Log.h"
+#include "media/AutoConvergence.h"
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -28,21 +32,30 @@ DecodedImage ComposeSbs(const DecodedImage& left, const DecodedImage& right) {
     return out;
 }
 
-float EstimateAutoConvergence(const DecodedImage& L, const DecodedImage& R) {
-    const int w = L.width, h = L.height;
-    if (w < 16 || h < 16 || R.width != w || R.height != h) return 0.0f;
+float EstimateAutoConvergence(const DecodedImage& sbs) {
+    float shift = 0.0f;
+    const char* rule = "none";
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = autoconv::MeasureStillShift(sbs.pixels.data(), sbs.width, sbs.height, shift, &rule);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ok) {
+        LOG_INFO("auto-convergence: subject (%s) %+.4f in %.0f ms", rule, shift, ms);
+        return shift;
+    }
+    const int w = sbs.width / 2, h = sbs.height;
+    if (w < 16 || h < 16) return 0.0f;
     constexpr int DW = 96;                       // downsample width
     const int DH = std::max(8, DW * h / w);
-    auto gray = [](const DecodedImage& im, int sx, int sy) {
-        const uint8_t* p = &im.pixels[((size_t)sy * im.width + sx) * 4];
+    auto gray = [&sbs](int sx, int sy) {
+        const uint8_t* p = &sbs.pixels[((size_t)sy * sbs.width + sx) * 4];
         return 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2];
     };
     std::vector<float> gl((size_t)DW * DH), gr((size_t)DW * DH);
     for (int y = 0; y < DH; ++y)
         for (int x = 0; x < DW; ++x) {
             const int sx = x * w / DW, sy = y * h / DH;
-            gl[(size_t)y * DW + x] = gray(L, sx, sy);
-            gr[(size_t)y * DW + x] = gray(R, sx, sy);
+            gl[(size_t)y * DW + x] = gray(sx, sy);
+            gr[(size_t)y * DW + x] = gray(w + sx, sy);
         }
     const int maxD = DW / 5;                      // search ±20% disparity
     float bestSad = 1e30f;
@@ -65,6 +78,7 @@ float EstimateAutoConvergence(const DecodedImage& L, const DecodedImage& R) {
     // Applying convergence_ reduces the dominant disparity by 2*conv, so conv = dFrac/2
     // pulls that plane to zero. (Yields a negative value for the usual pair, matching the
     // sign of the containers that do carry a convergence field.)
+    LOG_INFO("auto-convergence: no confident subject, coarse SAD %+.4f", 0.5f * dFrac);
     return 0.5f * dFrac;
 }
 

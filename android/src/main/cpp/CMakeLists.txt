@@ -124,6 +124,7 @@ add_library(mediaplayer_vk_android SHARED
     #    StereoCompose.cpp holds ComposeSbs + EstimateAutoConvergence, which LifLoader
     #    calls; they were factored out of LifLoader.cpp when MPO started sharing them
     #    (#45), so this target needs the extra TU or the link fails on both symbols.
+    #    EstimateAutoConvergence measures with AutoConvergence.cpp (#180).
     #
     #    ***THE RULE, GENERALLY***: this list names files individually and does NOT glob.
     #    Add or split ANY .cpp under ${REPO_ROOT}/src that this target uses and you must
@@ -143,6 +144,7 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/media/LifLoader.cpp
     ${REPO_ROOT}/src/media/MpoLoader.cpp
     ${REPO_ROOT}/src/media/StereoCompose.cpp
+    ${REPO_ROOT}/src/media/AutoConvergence.cpp
     ${REPO_ROOT}/src/media/ImageDecoder.cpp
     # The player's Dear ImGui chrome, SHARED VERBATIM with the desktop legs. This is
     # what makes the Android UI the same UI rather than a lookalike. ImGuiLayer builds

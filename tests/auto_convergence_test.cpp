@@ -311,6 +311,22 @@ void TestNoTextureHolds() {
     CHECK(!c.ok && !c.hasValue, "no texture, nothing held -> no value");
 }
 
+// A still with no convergence of its own (#180): one measurement of the RGBA pair, the
+// subject (the nearer square) at the plane; nothing to match -> no shift.
+void TestStillShift() {
+    const int E = 480, H = 270;
+    auto g = Sbs(E, H, {{0, Texture(21), {}}, {40, Texture(22), Rect(180, 70, 300, 190)}});
+    std::vector<uint8_t> rgba(g.size() * 4, 255);
+    for (size_t i = 0; i < g.size(); ++i) rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = g[i];
+    float shift = 1.f;
+    const char* rule = "";
+    CHECK(MeasureStillShift(rgba.data(), 2 * E, H, shift, &rule), "still: measured (%s)", rule);
+    CHECK(std::fabs(shift - (-0.5f * 40.f / (float)E)) < 0.004f, "still: shift %.4f puts the square at the plane",
+          shift);
+    std::vector<uint8_t> flat(rgba.size(), 90);
+    CHECK(!MeasureStillShift(flat.data(), 2 * E, H, shift), "still: a flat pair has no shift");
+}
+
 void TestPoliciesPickDifferentPlanes() {
     // A: near (d=30), coarse texture, left.  B: mid (d=16), FINE texture, right.
     // C: background (d=4), coarse texture, owns the centre.
@@ -578,6 +594,21 @@ void TestExpectChange() {
     CHECK(c.Value() > -0.0075f, "rate limited without ExpectChange: %.4f", c.Value());
 }
 
+// A still's applied estimate handed to A (#180): the value starts there and stays until a
+// measurement moves the target, then glides to it.
+void TestSeed() {
+    const double dt = 1.0 / 60.0;
+    AutoConvergenceController c;
+    c.Seed(-0.03f);
+    for (int i = 0; i < 30; ++i) c.Tick(dt, true);
+    CHECK(std::fabs(c.Value() + 0.03f) < 1e-6f, "seed holds before a measurement: %.4f", c.Value());
+    c.ExpectChange(/*snap=*/false);
+    c.Update(Synthetic(0.064f, 0.064f, 0.064f));  // target -0.032
+    CHECK(std::fabs(c.Value() + 0.03f) < 1e-6f, "seed: no jump on the first measurement");
+    for (int i = 0; i < 60 * 5; ++i) c.Tick(dt, true);
+    CHECK(std::fabs(c.Value() + 0.032f) < 0.0005f, "seed glides to the target: %.4f", c.Value());
+}
+
 }  // namespace
 
 int main() {
@@ -596,6 +627,7 @@ int main() {
     TestDownsample();
     TestKnownDisparityFullRes();
     TestNoTextureHolds();
+    TestStillShift();
     TestPoliciesPickDifferentPlanes();
     TestComfortClamp();
     TestTemporal();
@@ -603,6 +635,7 @@ int main() {
     TestTopBottomMatchesSbs();
     TestWorkerTopBottomTag();
     TestExpectChange();
+    TestSeed();
     if (g_failures) {
         std::fprintf(stderr, "auto_convergence_test: %d failure(s)\n", g_failures);
         return 1;

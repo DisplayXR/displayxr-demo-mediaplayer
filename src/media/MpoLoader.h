@@ -37,7 +37,7 @@ struct MpoResult {
     StereoLayout layout = StereoLayout::Mono;
     bool ok = false;                           // a composed stereo image was produced
     bool stereo = false;                       // always == ok; kept for symmetry with LIF
-    float autoConvergence = 0.0f;              // coarse estimate; MPO carries no baked
+    float autoConvergence = 0.0f;              // EstimateAutoConvergence; MPO carries no baked
                                                // convergence, so this is always available
 };
 

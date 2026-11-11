@@ -213,6 +213,9 @@ private:
     // convergence. Mono, Dual (this leg decodes its first track only), the idle logo and a
     // bound "Convert to 3D" picture (layout_ stays Mono) never measure.
     bool AutoConvApplies() const;
+    // The estimate's shift as applied now: only on the composed pair it measured (signed for
+    // the eye order on screen), and 0 while A measures the same picture itself.
+    float MediaAutoShift() const;
     void TickAutoConv();
     std::string AutoConvHudText() const;
 
@@ -367,10 +370,12 @@ private:
     // the LIF's normalized convergence to this app's per-tile shift (matches the
     // reference ViewShift: per-eye shift = 0.5 * convergence of an eye width).
     float mediaConvergence_ = 0.0f;
-    // Coarse auto-convergence estimate for LIFs whose metadata carries NO convergence
-    // field. Not applied automatically — Backspace sets convergence_ to it (undo with 0).
+    // The loader's auto-convergence estimate for a stereo still with NO convergence of its
+    // own (LIF without the field, MPO, stereo HEIC): a per-eye shift, fraction of the eye's
+    // width. Applied by default (#180): 0 turns it off, Backspace back on, a new file resets.
     bool mediaAutoConvAvailable_ = false;
     float mediaAutoConvergence_ = 0.0f;
+    bool mediaAutoConvOn_ = true;
 
     // The shared, platform-neutral UI state (scrubber drag machine, auto-hide fade,
     // toast). Lives in ui/TransportUI.h so the Android leg drives the exact same

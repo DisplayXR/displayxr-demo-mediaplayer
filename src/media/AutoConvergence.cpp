@@ -808,6 +808,41 @@ void AutoConvergenceController::Reset() {
     clamp_ = "";
 }
 
+// ---- stills ----------------------------------------------------------------------------------
+void StillLuma(const uint8_t* rgba, int w, int h, std::vector<uint8_t>& out, int& outW, int& outH) {
+    out.clear();
+    outW = outH = 0;
+    if (!rgba || w < 64 || h < 32) return;
+    const int f = std::max(1, (w + 1919) / 1920);
+    const int ow = w / f, oh = h / f;
+    out.resize((size_t)ow * oh);
+    for (int y = 0; y < oh; ++y)
+        for (int x = 0; x < ow; ++x) {
+            uint32_t sum = 0;
+            for (int dy = 0; dy < f; ++dy) {
+                const uint8_t* p = rgba + ((size_t)(y * f + dy) * w + (size_t)x * f) * 4;
+                for (int dx = 0; dx < f; ++dx, p += 4) sum += 54u * p[0] + 183u * p[1] + 19u * p[2];
+            }
+            out[(size_t)y * ow + x] = (uint8_t)(sum / (256u * (uint32_t)(f * f)));
+        }
+    outW = ow;
+    outH = oh;
+}
+
+bool MeasureStillShift(const uint8_t* rgba, int w, int h, float& shift, const char** rule) {
+    std::vector<uint8_t> luma;
+    int lw = 0, lh = 0;
+    StillLuma(rgba, w, h, luma, lw, lh);
+    if (luma.empty()) return false;
+    DisparityEstimator est;
+    const Result r =
+        est.Measure(luma.data(), lw, lw, lh, StereoLayout::SbsFull, SubjectPolicy::Nearest, nullptr, 0.0);
+    if (rule) *rule = r.rule;
+    if (!r.ok) return false;
+    shift = AutoConvergenceController().TargetFor(r, nullptr);
+    return true;
+}
+
 // ---- worker ----------------------------------------------------------------------------------
 void AutoConvergenceWorker::Start() {
     if (thread_.joinable()) return;
