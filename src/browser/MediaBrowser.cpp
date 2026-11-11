@@ -626,7 +626,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
             right = Badge(dl, right, a.y + margin, length) - badgeGap;
         }
         if (verdict.known && verdict.stereo) right = Badge(dl, right, a.y + margin, "3D") - badgeGap;
-        const std::string format = library_.Kind(shown_[p]) == SourceKind::Unsupported ? Format(item.name) : "";
+        const std::string format = library_.Kind(shown_[p - nf]) == SourceKind::Unsupported ? Format(item.name) : "";
         if (!format.empty()) Badge(dl, right, a.y + margin, format.c_str());
         if (selecting_) {
             // As the stock tablet player's: a box on every tile; a picked one dimmed, ticked and outlined.
