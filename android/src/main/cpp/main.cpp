@@ -68,6 +68,7 @@
 #include "ui/ImGuiLayer.h"
 #include "ui/TransportUI.h"
 #include "ui/UiScale.h"
+#include "xr/DisplayModeSwitch.h"
 #include "browser/AndroidMediaProvider.h"
 #include "browser/MediaBrowser.h"
 #include "browser/SlideGesture.h"
@@ -443,11 +444,13 @@ int32_t g_active_mode = -1;             // modeIndex of the mode the runtime rep
 int32_t g_mode_before_splash = -1;      // what to hand back
 int32_t g_splash_mode_requested = -1;   // what we borrowed
 int32_t g_pending_mode_request = -1;    // issued from the frame loop once running
+mp::DisplayModeSwitch g_mode_switch;    // the player's 2D/3D switch (#180); its Flat() is the borrow's
 
 static void
 adopt_mode(const XrDisplayRenderingModeInfoDXR &m)
 {
 	g_active_mode = (int32_t)m.modeIndex;
+	g_mode_switch.SetActive(m.modeIndex);
 	g_view_count = m.viewCount ? m.viewCount : 1;
 	g_tile_columns = m.tileColumns ? m.tileColumns : 1;
 	g_tile_rows = m.tileRows ? m.tileRows : 1;
@@ -455,25 +458,10 @@ adopt_mode(const XrDisplayRenderingModeInfoDXR &m)
 	g_view_scale_y = m.viewScaleY > 0.0f ? m.viewScaleY : 1.0f;
 }
 
-// Desktop rule (XrSession::FindFlatMode): mono + hardware 2D first; a mono mode
-// that leaves the lens on still beats a stereo one; -1 when nothing flat exists.
-static int32_t
-find_flat_mode()
-{
-	int32_t fallback = -1;
-	for (uint32_t i = 0; i < g_mode_count; ++i) {
-		const auto &m = g_modes[i];
-		if (m.viewCount != 1) continue;
-		if (!m.hardwareDisplay3D) return (int32_t)m.modeIndex;
-		if (fallback < 0) fallback = (int32_t)m.modeIndex;
-	}
-	return fallback;
-}
-
 static void
 request_flat_mode_for_splash()
 {
-	const int32_t flat = find_flat_mode();
+	const int32_t flat = g_mode_switch.Flat();
 	if (flat < 0 || g_active_mode < 0 || flat == g_active_mode) return;
 	g_mode_before_splash = g_active_mode;
 	g_splash_mode_requested = flat;
@@ -1467,6 +1455,11 @@ query_display_info_and_modes()
 	if (g_pfnEnumModes(g_session, count, &count, modes) != XR_SUCCESS) {
 		return true;
 	}
+	std::vector<mp::DisplayModeSwitch::Mode> switch_modes;
+	for (uint32_t i = 0; i < count; ++i) {
+		switch_modes.push_back({modes[i].modeIndex, modes[i].viewCount, modes[i].hardwareDisplay3D == XR_TRUE});
+	}
+	g_mode_switch.SetModes(std::move(switch_modes));
 	LOGI("Rendering modes (%u):", count);
 	for (uint32_t i = 0; i < count; ++i) {
 		const auto &m = modes[i];
@@ -1546,6 +1539,9 @@ fill_transport_state()
 	g_ui_state.hasMedia = g_scene_loaded.load(std::memory_order_relaxed) &&
 	                      !g_showing_splash.load(std::memory_order_relaxed);
 	g_ui_state.isVideo = g_is_video;
+	// The player's 2D/3D switch (#180), not the idle screen's: that one borrows 2D.
+	g_ui_state.caps.modeSwitch = g_ui_state.hasMedia && g_mode_switch.Available();
+	g_ui_state.mode3D = g_mode_switch.Is3D();
 	{
 		// SAF DISPLAY_NAME — already a basename, so no path work is needed here.
 		std::lock_guard<std::mutex> lk(g_pick_name_mx);
@@ -1751,8 +1747,8 @@ hud_init()
 	// permanently dead button reads as broken rather than absent.
 	g_ui_state.caps.slideshow = false;
 	// Wired in follow-ups (see the tracking issue): mute needs a PCM gate in
-	// AudioPlayer, loop needs a flag in the Android VideoDecoder, and Mode needs a
-	// RENDERING_MODE_CHANGED handler before it is safe to retile mid-session.
+	// AudioPlayer, loop needs a flag in the Android VideoDecoder. Mode is the 2D/3D
+	// switch (caps.modeSwitch, set per frame), not the desktop's cycle button.
 	g_ui_state.caps.mute = false;
 	g_ui_state.caps.loop = false;
 	g_ui_state.caps.mode = false;
@@ -1763,6 +1759,7 @@ hud_init()
 		(g_browser_ready.load(std::memory_order_relaxed) ? g_browser_request : g_open_picker_request)
 		    .store(true, std::memory_order_relaxed);
 	};
+	g_ui_actions.NextMode = [] { g_pending_mode_request = g_mode_switch.Flipped(); };
 	g_ui_actions.TogglePlayback = toggle_playback;
 	// AMediaExtractor has no cheap keyframe-preview mode here, so `preview` is
 	// ignored; the shared machine's follow-up exact seek is idempotent.

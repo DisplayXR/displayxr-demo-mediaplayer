@@ -21,6 +21,8 @@
 #include <string>
 #include <vector>
 
+struct ImFont;
+
 namespace mp::ui {
 
 // Which transport controls this platform can actually back. A false entry HIDES
@@ -46,6 +48,9 @@ struct TransportCaps {
     // desktop owner sets it whenever the runtime offers the extension (a family nobody can
     // supply then draws greyed, "no provider"; the row hides only without the extension).
     bool input = false;
+    // The touch player's 2D/3D switch (#180), in place of `mode`'s cycle button. DEFAULT
+    // FALSE; Android sets it while media plays and the runtime has a 2D and a 3D mode.
+    bool modeSwitch = false;
 };
 
 // One row of the "Convert to 3D" provider selector: the runtime's verbatim provider name
@@ -78,6 +83,7 @@ struct TransportState {
     bool isVideo = false;
     std::string mediaFilename;  // basename only; the caller does the path work
     std::string modeName;       // e.g. "2x1 Stereo"
+    bool mode3D = false;        // the 2D/3D switch's side; only read when caps.modeSwitch
     std::string layoutName;     // e.g. "SBS-half"
     std::string layoutTooltip;  // multi-line provenance shown on hover
     bool layoutPinned = false;  // renders a trailing '*'
@@ -170,7 +176,7 @@ struct TransportState {
 // control inert (but Caps is the right way to remove a control).
 struct TransportActions {
     std::function<void()> Open;
-    std::function<void()> NextMode;
+    std::function<void()> NextMode;  // the Mode button, or a flip of the 2D/3D switch
     std::function<void()> CycleLayout;
     std::function<void()> ToggleSlideshow;
     std::function<void()> TogglePlayback;
@@ -215,6 +221,11 @@ void ApplyMediaPlayerStyle(float metricScale = 1.0f);
 // The UI font size in HUD pixels for the same metricScale (desktop or touch), times the
 // UI scale (UiScale.h), rounded up. ImGuiLayer rasterizes the font at exactly this size.
 float UiFontPx(float metricScale = 1.0f);
+
+// The 2D/3D switch's knob label (#180): a size up from UiFontPx, rasterized at that size
+// by ImGuiLayer, which also sets the font.
+float SwitchFontPx(float metricScale = 1.0f);
+inline ImFont* g_switchFont = nullptr;
 
 // Advance the purely-visual timers: the auto-hide fade and the toast fade.
 // `uiAwake` is the caller's "should the chrome be visible" verdict (master
