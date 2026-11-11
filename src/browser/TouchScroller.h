@@ -3,7 +3,8 @@
 // TouchScroller: the vertical scroll offset of one list under a finger or a mouse. ImGui
 // has no touch scrolling, so this does it: a drag past the slop scrolls, a fling keeps
 // going and slows to a stop, a press that stops a fling only stops it (unless the fling
-// was nearly done), and a press that never moved past the slop is a tap. Pure logic, render thread. Times in seconds,
+// was nearly done), a press that never moved past the slop is a tap, and one held there
+// is a long press. Pure logic, render thread. Times in seconds,
 // distances in pixels; the offset grows as the content moves up.
 #pragma once
 
@@ -27,6 +28,9 @@ public:
     bool Release(double t);
     // Advance a fling to `t`.
     void Update(double t);
+    // True once when a press that would be a tap has been held for kLongPress by `t`. The
+    // release that follows is then not a tap.
+    bool TakeLongPress(double t);
 
     bool Pressed() const { return pressed_; }
     bool Dragging() const { return dragging_; }
@@ -34,6 +38,7 @@ public:
 private:
     static constexpr double kVelocityWindow = 0.1;  // the last 0.1 s of a drag sets the fling's speed
     static constexpr double kFlingTau = 0.4;        // a fling's speed falls by a factor e every 0.4 s
+    static constexpr double kLongPress = 0.5;       // Android's long-press timeout is 0.4 to 0.5 s
 
     struct Sample {
         float y;
@@ -50,6 +55,7 @@ private:
     bool pressed_ = false;
     bool dragging_ = false;
     bool tap_ = false;  // the press has stayed within the slop and did not stop a fling
+    double pressT_ = 0.0;
     float pressX_ = 0.0f, pressY_ = 0.0f, lastY_ = 0.0f;
     std::vector<Sample> samples_;  // the drag's recent positions, for the fling speed
 

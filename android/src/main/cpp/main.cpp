@@ -177,6 +177,10 @@ std::atomic<bool> g_browser_ready{false};  // read by nativeBack on the UI threa
 bool g_browsing = false;  // the browser is up; media loading clears it (leave_splash)
 // Back in the player, the Load button, a tap on the splash: show_browser() next loop.
 std::atomic<bool> g_browser_request{false};
+// Back in the browser (#180): MediaBrowser::Back() next loop, if CanGoBack() said it had
+// something to do (leave select mode, go up a folder). Else Back goes home.
+std::atomic<bool> g_browser_back_request{false};
+std::atomic<bool> g_browser_can_back{false};
 bool g_paused_for_background = false;  // APP_CMD_PAUSE paused the video; RESUME undoes it
 mp::ui::TransportState g_ui_state;
 mp::ui::TransportActions g_ui_actions;
@@ -2999,10 +3003,10 @@ bring_up(struct android_app *app)
 		g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
 		LOGI("DEBUG auto-load: %s (layout %s)", dbgFile, mp::LayoutName(g_layout));
 	} else {
-		// Start on the idle splash; content comes from the SAF picker (tap → Load).
-		// The old TEMP default.mp4 auto-load is gone — the picker round-trip is
-		// unblocked since runtime#528 + plugin v1.6.5.
+		// Start on the browser, over the idle splash (#180). Without a HUD there is no
+		// browser, and a tap on the splash opens the SAF picker.
 		load_splash(app);
+		if (g_browser_ready.load(std::memory_order_relaxed)) show_browser(app);
 	}
 	LOGI("Bring-up complete.");
 	return true;
@@ -3236,13 +3240,18 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 	}
 }
 
-// MainActivity.onBackPressed (UI thread). In the player, Back returns to the browser and
-// this returns true; anywhere else it returns false and Java sends the app home.
+// MainActivity.onBackPressed (UI thread). In the player, Back returns to the browser; in the
+// browser it leaves select mode or goes up a folder. Then this returns true; otherwise it
+// returns false and Java sends the app home.
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeBack(JNIEnv * /*env*/, jobject /*thiz*/)
 {
-	if (!g_browser_ready.load(std::memory_order_relaxed) || g_showing_splash.load(std::memory_order_relaxed))
-		return JNI_FALSE;
+	if (!g_browser_ready.load(std::memory_order_relaxed)) return JNI_FALSE;
+	if (g_showing_splash.load(std::memory_order_relaxed)) {
+		if (!g_browser_can_back.load(std::memory_order_relaxed)) return JNI_FALSE;
+		g_browser_back_request.store(true, std::memory_order_relaxed);
+		return JNI_TRUE;
+	}
 	g_browser_request.store(true, std::memory_order_relaxed);
 	return JNI_TRUE;
 }
@@ -3317,6 +3326,9 @@ android_main(struct android_app *app)
 				LOGI("xrRequestDisplayRenderingModeDXR(%d) -> %d", want, (int)mr);
 			}
 			if (g_browser_request.exchange(false, std::memory_order_relaxed)) show_browser(app);
+			if (g_browser_back_request.exchange(false, std::memory_order_relaxed) && browser_showing())
+				g_browser.Back();
+			g_browser_can_back.store(browser_showing() && g_browser.CanGoBack(), std::memory_order_relaxed);
 			if (g_browser_ready.load(std::memory_order_relaxed)) {
 				g_stills.Update();
 				if (g_slide_step != 0) open_slide_step();

@@ -2,8 +2,8 @@
 //
 // Unit tests for the media browser's TouchScroller (#160): tap vs drag, the drag follows
 // the finger past the slop, a fling travels speed x tau and stops at the ends, a finger
-// that stopped before lifting does not fling, and a press that stops a fling is no tap
-// unless the fling was nearly done.
+// that stopped before lifting does not fling, a press that stops a fling is no tap
+// unless the fling was nearly done, and a press held still is a long press, not a tap.
 
 #include "browser/TouchScroller.h"
 
@@ -123,6 +123,25 @@ void TestCatch() {
     CHECK(tail.Release(t2 + 1.8), "a press on a fling with less than the slop to go is a tap");
 }
 
+void TestLongPress() {
+    TouchScroller s = Make(1000.0f);
+    s.Press(100.0f, 100.0f, 0.0);
+    s.Move(104.0f, 106.0f, 0.2);
+    CHECK(!s.TakeLongPress(0.4), "0.4 s held is no long press yet");
+    CHECK(s.TakeLongPress(0.5), "0.5 s held within the slop is a long press");
+    CHECK(!s.TakeLongPress(0.6), "reported once");
+    CHECK(!s.Release(0.7), "and its release is no tap");
+
+    s.Press(100.0f, 100.0f, 1.0);
+    s.Move(100.0f, 130.0f, 1.1);
+    CHECK(!s.TakeLongPress(1.6), "a press that left the slop is no long press");
+    s.Release(1.7);
+
+    s.Press(100.0f, 100.0f, 2.0);
+    CHECK(s.Release(2.1), "a short press is still a tap");
+    CHECK(!s.TakeLongPress(3.0), "nor a long press once released");
+}
+
 }  // namespace
 
 int main() {
@@ -130,6 +149,7 @@ int main() {
     TestDrag();
     TestFling();
     TestCatch();
+    TestLongPress();
     if (g_failures) {
         std::fprintf(stderr, "touch_scroller_test: %d failure(s)\n", g_failures);
         return 1;

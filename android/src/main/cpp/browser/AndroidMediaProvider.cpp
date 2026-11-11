@@ -4,6 +4,7 @@
 #include "LifLoader.h"
 #include "lvf_probe_android.h"
 
+#include <android/api-level.h>
 #include <jni.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -63,6 +64,13 @@ void AndroidMediaProvider::Open(int64_t id) {
     openId_ = id;
 }
 
+bool AndroidMediaProvider::CanDelete() const { return android_get_device_api_level() >= 30; }
+
+void AndroidMediaProvider::Delete(const std::vector<int64_t>& ids) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    deleteIds_ = ids;
+}
+
 void AndroidMediaProvider::WantStills(const std::vector<int64_t>& ids, uint32_t maxEdge) {
     std::lock_guard<std::mutex> lock(mutex_);
     stillIds_ = ids;
@@ -118,6 +126,14 @@ bool AndroidMediaProvider::TakeOpenRequest(int64_t& id) {
     if (!openRequested_) return false;
     openRequested_ = false;
     id = openId_;
+    return true;
+}
+
+bool AndroidMediaProvider::TakeDeleteRequest(std::vector<int64_t>& ids) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (deleteIds_.empty()) return false;
+    ids = std::move(deleteIds_);
+    deleteIds_.clear();
     return true;
 }
 
@@ -282,6 +298,19 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeTakeOpenReq
 {
     int64_t id = 0;
     return AndroidMediaProvider::Instance().TakeOpenRequest(id) ? (jlong)id : -1;
+}
+
+// The ids to delete, or null for none.
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeTakeDeleteRequest(
+    JNIEnv* env, jobject /*thiz*/)
+{
+    std::vector<int64_t> ids;
+    if (!AndroidMediaProvider::Instance().TakeDeleteRequest(ids)) return nullptr;
+    std::vector<jlong> out(ids.begin(), ids.end());
+    jlongArray array = env->NewLongArray((jsize)out.size());
+    env->SetLongArrayRegion(array, 0, (jsize)out.size(), out.data());
+    return array;
 }
 
 // The new list of stills wanted, or null if it has not changed. edgeOut receives the

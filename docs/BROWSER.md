@@ -10,8 +10,8 @@ This is the developer reference.
 
 In: images and videos from the Android MediaStore, a sidebar of sources (All media,
 Camera, Downloads, Pictures, Movies, Unsupported, "Other files..." for the system picker),
-a square-tile grid, 3D and duration badges, and view options (Both / 3D / 2D, All /
-Videos / Images, newest or oldest first).
+a square-tile grid, 3D and duration badges, Downloads as folders, select and delete, and
+view options (Both / 3D / 2D, All / Videos / Images, newest or oldest first).
 
 Out for now: a desktop browser; the VR badge; HEIC and MV-HEVC on Android. Files
 the player cannot open are listed under Unsupported with their format, so the formats
@@ -25,7 +25,7 @@ src/browser/                    namespace mp::browser, platform-neutral
   MediaItem.h                   one media entry: id, name, kind, size, duration, date, folder
   MediaLibrary.{h,cpp}          the item list, sources, filter and sort
   MediaProvider.h               the interface a platform implements: permission, refresh,
-                                thumbnails, open
+                                thumbnails, open, delete
   ThumbnailAtlas.{h,cpp}        GPU: thumbnail slots packed into a few textures
   ThumbnailCache.{h,cpp}        media id -> atlas slot, least recently used reuse
   StereoClassifier.{h,cpp}      3D badge verdicts: background thread, cached on disk
@@ -98,10 +98,18 @@ LIF or two-track video, whose thumbnail is already one view.
 
 ## Android behaviour
 
-- Launch shows the splash. Tapping it, or the Load button, opens the browser.
+- Launch opens the browser, over the idle splash. Without a HUD there is no browser and a
+  tap on the splash opens the system picker.
 - The browser borrows the flat 2D mode and hands it back on play.
 - Back from the player stops playback and returns to the browser at the same source and
-  scroll position. Back from the browser goes to the home screen.
+  scroll position and folder. Back in the browser leaves select mode, then goes up a folder,
+  then to the home screen.
+- Downloads shows its sub-folders first, as tiles with a count, then the files directly in
+  it. The top bar names the folder ("Downloads / MEDIA / ZTEPics") beside an up arrow.
+  Folders ignore the 3D / 2D filter.
+- A long press on a tile starts select mode (a cross, the count and a bin in the top bar).
+  The bin hands the picked files to `MediaStore.createDeleteRequest`, so Android asks the
+  user; a refusal keeps the selection. Android 11+ only: on 10 a long press does nothing.
 - Swiping left or right in the player opens the next or previous file in grid order
   (the source, filter and sort the grid showed). The picture follows the finger with the
   neighbour beside it. An image neighbour is decoded ahead, so it becomes the picture at

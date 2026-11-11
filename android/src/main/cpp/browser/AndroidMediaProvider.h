@@ -41,6 +41,9 @@ public:
     void WantThumbnails(const std::vector<ThumbnailRequest>& wanted, uint32_t maxEdge) override;
     bool TakeThumbnail(Thumbnail& out) override;
     void Open(int64_t id) override;
+    // createDeleteRequest needs Android 11.
+    bool CanDelete() const override;
+    void Delete(const std::vector<int64_t>& ids) override;
 
     // The player's NeighbourStills (render thread). The stills wanted (the files either side
     // of the one playing), each video frame to fit in maxEdge x maxEdge. Replaces the previous
@@ -56,6 +59,7 @@ public:
     bool TakeRefreshRequest();
     bool TakeWantedThumbnails(std::vector<ThumbnailRequest>& wanted, uint32_t& maxEdge);
     bool TakeOpenRequest(int64_t& id);
+    bool TakeDeleteRequest(std::vector<int64_t>& ids);
     void AddStill(StillSource still);
     bool TakeWantedStills(std::vector<int64_t>& ids, uint32_t& maxEdge);
 
@@ -74,6 +78,7 @@ private:
     std::deque<Thumbnail> thumbnails_;
     bool openRequested_ = false;
     int64_t openId_ = 0;
+    std::vector<int64_t> deleteIds_;  // empty: no request
     bool stillsChanged_ = false;
     std::vector<int64_t> stillIds_;
     uint32_t stillEdge_ = 0;

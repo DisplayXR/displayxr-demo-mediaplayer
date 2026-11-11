@@ -2,9 +2,10 @@
 //
 // MediaBrowser: the in-app gallery (#160, docs/BROWSER.md), drawn with ImGui over the
 // whole HUD. A top bar (sources, the current source, view options), a sidebar of sources,
-// a grid of square thumbnails with 3D and duration badges, and the access and empty
-// states. It owns the library, the thumbnails and the 3D verdicts, and reaches the
-// device's media only through a MediaProvider. Render thread only.
+// a grid of square thumbnails with 3D and duration badges (Downloads: its folders first),
+// select mode for deleting (long-press), and the access and empty states. It owns the
+// library, the thumbnails and the 3D verdicts, and reaches the device's media only through
+// a MediaProvider. Render thread only.
 #pragma once
 
 #include "browser/MediaLibrary.h"
@@ -68,6 +69,9 @@ public:
     // Make the item `step` places away the one last opened, without opening it: the player
     // shows it already.
     bool StepTo(int step);
+    // Whether Back() has something to do: leave select mode, or go up a folder.
+    bool CanGoBack() const;
+    bool Back();
 
 private:
     static constexpr uint32_t kTile = 512;  // thumbnail edge, px
@@ -82,6 +86,9 @@ private:
     Action Grid(ImVec2 min, ImVec2 max, bool landscape, double now);
     void ViewOptionsPopup(float right, float top);
     void UploadReady(const std::unordered_set<int64_t>& window);
+    void GoTo(const std::string& folder);
+    void Up();
+    void EndSelection();
 
     MediaProvider* provider_ = nullptr;
     MediaLibrary library_;
@@ -92,12 +99,17 @@ private:
     bool listed_ = false;  // an item list has arrived
 
     SourceKind sourceKind_ = SourceKind::All;
+    std::string folder_;  // the folder shown, in a source browsed as folders
     ViewOptions options_;
     DepthFilter depth_ = DepthFilter::Both;
     bool sidebar_ = true;
 
-    bool dirty_ = true;            // shown_ needs a rebuild
-    std::vector<size_t> shown_;    // indices into the library's items, in grid order
+    bool selecting_ = false;  // select mode: a tap picks an item, the bin deletes the picked
+    std::unordered_set<int64_t> selected_;
+
+    bool dirty_ = true;            // folders_ and shown_ need a rebuild
+    std::vector<Folder> folders_;  // the folder's sub-folders: the first tiles
+    std::vector<size_t> shown_;    // indices into the library's items, in grid order after the folders
     std::vector<size_t> unknown_;  // under a depth filter: items with no verdict yet
     int64_t openedId_ = -1;        // the item last opened from the grid, or -1
 

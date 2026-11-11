@@ -29,6 +29,7 @@ void TouchScroller::Press(float x, float y, double t) {
     // travel: the fling looked stopped.
     tap_ = !flinging_ || FlingLeft(t) < slop_;
     flinging_ = false;
+    pressT_ = t;
     pressX_ = x;
     pressY_ = y;
     lastY_ = y;
@@ -77,6 +78,12 @@ bool TouchScroller::Release(double t) {
     }
     samples_.clear();
     return tap_;
+}
+
+bool TouchScroller::TakeLongPress(double t) {
+    if (!pressed_ || !tap_ || t - pressT_ < kLongPress) return false;
+    tap_ = false;
+    return true;
 }
 
 void TouchScroller::Update(double t) {

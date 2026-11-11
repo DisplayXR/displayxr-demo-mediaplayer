@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The Java half of the media browser's MediaProvider (#160, docs/BROWSER.md): reads the
-// MediaStore, asks for the read permission, makes thumbnails and opens files. Native
+// MediaStore, asks for the read permission, makes thumbnails, opens and deletes files. Native
 // (browser/AndroidMediaProvider.cpp) never calls in here: poll() takes its requests once
 // per Choreographer frame, and results go back through the native* calls (runtime#507).
 
@@ -36,6 +36,7 @@ class MediaStoreProvider(
     companion object {
         private const val TAG = "mediaplayer_vk_android"
         const val REQUEST_PERMISSION = 3
+        private const val REQUEST_DELETE = 4
 
         // MediaAccess in MediaProvider.h.
         private const val ACCESS_NONE = 1
@@ -83,6 +84,8 @@ class MediaStoreProvider(
     // Pairs of (id, 1 to check the file or 0), or null if unchanged.
     private external fun nativeTakeWantedThumbnails(edgeOut: IntArray): LongArray?
     private external fun nativeTakeOpenRequest(): Long
+    // The ids to delete, or null.
+    private external fun nativeTakeDeleteRequest(): LongArray?
     // The stills wanted, or null if unchanged; edgeOut receives the largest video frame's edge.
     private external fun nativeTakeWantedStills(edgeOut: IntArray): LongArray?
     // An image's file (or -1), which native closes, or a video's first frame (or null).
@@ -120,6 +123,7 @@ class MediaStoreProvider(
         }
         val open = nativeTakeOpenRequest()
         if (open >= 0) open(open)
+        nativeTakeDeleteRequest()?.let { delete(it) }
         nativeTakeWantedStills(stillEdgeOut)?.let { ids ->
             val edge = stillEdgeOut[0]
             synchronized(lock) { wantedStills = ids }
@@ -378,6 +382,20 @@ class MediaStoreProvider(
             openFd(pfd.detachFd(), length, row.name)
         } catch (e: Exception) { // FileNotFoundException, or SecurityException on a revoked grant
             Log.w(TAG, "media browser: cannot open ${row.name}: $e")
+        }
+    }
+
+    // ---------------------------------------------------------------- delete
+
+    // The system asks the user. When its prompt closes, onResume reads the list again.
+    private fun delete(ids: LongArray) {
+        val uris = ids.asList().mapNotNull { rows[it]?.uri }
+        if (uris.isEmpty() || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        try {
+            val request = MediaStore.createDeleteRequest(activity.contentResolver, uris)
+            activity.startIntentSenderForResult(request.intentSender, REQUEST_DELETE, null, 0, 0, 0)
+        } catch (e: Exception) { // SendIntentException, or SecurityException on a revoked grant
+            Log.w(TAG, "media browser: cannot delete ${uris.size} items: $e")
         }
     }
 }

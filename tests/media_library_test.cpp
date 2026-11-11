@@ -2,8 +2,9 @@
 //
 // Unit tests for the media browser's MediaLibrary (#160): what it counts as unsupported (the
 // player's supported set, with HEIC switched off as on Android), the sources it
-// builds (All media, Camera, Downloads, Pictures, Movies, Unsupported) and what Query()
-// returns for a source under the type filter and sort order. Pure logic: no Vulkan, no JNI.
+// builds (All media, Camera, Downloads, Pictures, Movies, Unsupported), what Query()
+// returns for a source under the type filter and sort order, and the Downloads folders.
+// Pure logic: no Vulkan, no JNI.
 
 #include "browser/MediaLibrary.h"
 
@@ -145,12 +146,55 @@ void TestQuery() {
     CHECK((Ids(library, library.Query(*movies, options)) == std::vector<int64_t>{5}), "Movies: videos anywhere");
 }
 
+void TestFolders() {
+    MediaLibrary library;
+    library.SetItems({
+        Item(1, "top.jpg", MediaType::Image, 10, "Download/"),
+        Item(2, "a.jpg", MediaType::Image, 20, "Download/MEDIA/ZTEPics/"),
+        Item(3, "b.mp4", MediaType::Video, 30, "Download/MEDIA/ZTEPics/"),
+        Item(4, "c.jpg", MediaType::Image, 40, "Download/MEDIA/"),
+        Item(5, "d.jpg", MediaType::Image, 50, "Download/apps/"),
+        Item(6, "e.webp", MediaType::Image, 60, "Download/webp/"),
+        Item(7, "f.jpg", MediaType::Image, 70, "Download/zoo/"),
+        Item(8, "pic.jpg", MediaType::Image, 80, "Pictures/"),
+    });
+    const Source* downloads = Find(library, SourceKind::Downloads);
+    if (!downloads) {
+        CHECK(false, "Downloads present");
+        return;
+    }
+    CHECK(downloads->folder == "Download/", "Downloads is browsed as folders from Download/");
+    CHECK(Find(library, SourceKind::All)->folder.empty(), "All media is one flat list");
+
+    ViewOptions options;
+    std::vector<mp::browser::Folder> f = library.Folders(*downloads, options, downloads->folder);
+    CHECK(f.size() == 3, "MEDIA, apps and zoo; the webp folder holds nothing the player opens");
+    if (f.size() == 3) {
+        CHECK(f[0].name == "apps" && f[1].name == "MEDIA" && f[2].name == "zoo", "by name, case ignored");
+        CHECK(f[1].path == "Download/MEDIA/", "the path ends in a slash");
+        CHECK(f[1].count == 3, "a count takes in the sub-folders");
+    }
+    CHECK((Ids(library, library.Query(*downloads, options, "Download/")) == std::vector<int64_t>{1}),
+          "a folder holds only what is directly in it");
+    CHECK((Ids(library, library.Query(*downloads, options)) == std::vector<int64_t>{7, 5, 4, 3, 2, 1}),
+          "no folder: the whole source");
+
+    f = library.Folders(*downloads, options, "Download/MEDIA/");
+    CHECK(f.size() == 1 && f[0].name == "ZTEPics" && f[0].path == "Download/MEDIA/ZTEPics/", "one level down");
+    CHECK(library.Folders(*downloads, options, "Download/MEDIA/ZTEPics/").empty(), "a leaf has no sub-folders");
+
+    options.type = TypeFilter::Videos;
+    f = library.Folders(*downloads, options, "Download/");
+    CHECK(f.size() == 1 && f[0].name == "MEDIA" && f[0].count == 1, "the type filter applies to folders");
+}
+
 }  // namespace
 
 int main() {
     TestSupportedSet();
     TestSources();
     TestQuery();
+    TestFolders();
     if (g_failures) {
         std::fprintf(stderr, "media_library_test: %d failure(s)\n", g_failures);
         return 1;

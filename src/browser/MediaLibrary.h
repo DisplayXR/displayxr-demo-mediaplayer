@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // MediaLibrary: the media list the browser shows. It groups the items into sources (All
-// media, Camera, Downloads, Pictures, Movies, Unsupported) and answers what a source holds
-// under the view options. Pure logic, render thread.
+// media, Camera, Downloads, Pictures, Movies, Unsupported) and answers what a source, or one
+// of its folders, holds under the view options. Pure logic, render thread.
 #pragma once
 
 #include "browser/MediaItem.h"
@@ -21,6 +21,14 @@ struct Source {
     SourceKind kind = SourceKind::All;
     std::string name;
     int count = 0;
+    // Browsed as folders from here (Downloads: "Download/"), or empty: one flat list.
+    std::string folder;
+};
+
+struct Folder {
+    std::string name;  // e.g. "ZTEPics"
+    std::string path;  // e.g. "Download/MEDIA/ZTEPics/"
+    int count = 0;     // what it and its sub-folders hold under the view options
 };
 
 enum class TypeFilter { All, Videos, Images };
@@ -45,10 +53,16 @@ public:
     const std::vector<Source>& Sources() const { return sources_; }
     // The source besides All media that holds Items()[item].
     SourceKind Kind(size_t item) const { return kinds_[item]; }
-    // Indices into Items() of what `source` holds under `options`, in display order.
-    std::vector<size_t> Query(const Source& source, const ViewOptions& options) const;
+    // Indices into Items() of what `source` holds under `options`, in display order. With a
+    // `folder`, only what is directly in it.
+    std::vector<size_t> Query(const Source& source, const ViewOptions& options,
+                              const std::string& folder = std::string()) const;
+    // The sub-folders of `folder` that hold something of `source` under `options`, by name.
+    std::vector<Folder> Folders(const Source& source, const ViewOptions& options, const std::string& folder) const;
 
 private:
+    bool Holds(const Source& source, const ViewOptions& options, size_t item) const;
+
     std::vector<MediaItem> items_;
     std::vector<SourceKind> kinds_;             // per item
     std::unordered_map<int64_t, size_t> byId_;  // id -> index into items_
