@@ -1662,7 +1662,15 @@ create_hud_swapchain()
 	ci.arraySize = 1;
 	ci.mipCount = 1;
 	XrSwapchain sc = XR_NULL_HANDLE;
-	if (xrCreateSwapchain(g_session, &ci, &sc) != XR_SUCCESS) {
+	const bool mutable_hud = xrCreateSwapchain(g_session, &ci, &sc) == XR_SUCCESS;
+	if (!mutable_hud) {
+		// A runtime may refuse MUTABLE_FORMAT. ImGuiLayer then draws into a staging image
+		// and copies it in, as before #174.
+		LOGW("HUD swapchain with MUTABLE_FORMAT failed, retrying with a staging copy");
+		ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+		                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	}
+	if (!mutable_hud && xrCreateSwapchain(g_session, &ci, &sc) != XR_SUCCESS) {
 		LOGW("HUD swapchain creation failed — no ImGui chrome this session");
 		return false;
 	}
@@ -1693,6 +1701,7 @@ create_hud_swapchain()
 	g_hud_w = render_w;
 	g_hud_h = render_h;
 	g_hud_format = (VkFormat)fmt;
+	g_imgui.SetMutableHud(mutable_hud);  // read by Init and RecreateTarget
 	LOGI("HUD swapchain: %ux%u, %u images, format=%lld (%s)", g_hud_w, g_hud_h, image_count,
 	     (long long)fmt, mp::color::IsSrgb8(fmt) ? "sRGB" : "UNORM");
 	return true;
@@ -1736,7 +1745,6 @@ hud_init()
 	// The touch UI was tuned on the 320 dpi NP02J through a 1920x1200 HUD stretched to the
 	// 2560x1600 panel (x1.33). dpi / 240 keeps that size there and follows density elsewhere.
 	if (g_density_dpi > 0) g_imgui.SetUiScale((float)g_density_dpi / 240.0f);
-	g_imgui.SetMutableHud(true);
 	if (!g_imgui.Init(nullptr, g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
 	                  g_vk_queue_family, g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images,
 	                  frames_in_flight())) {
