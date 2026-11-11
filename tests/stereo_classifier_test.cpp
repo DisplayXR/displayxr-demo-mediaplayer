@@ -3,7 +3,8 @@
 // Unit tests for the media browser's StereoClassifier (#160): the 3D badge needs positive
 // evidence (file name, a 3D file such as a LIF, or a decided side-by-side content check on the
 // thumbnail), and verdicts survive a restart through the cache file, keyed by id, date
-// modified and size. Synthetic thumbnails, no fixtures.
+// modified and size, except a 2D one reached without the file check it needed (#180).
+// Synthetic thumbnails, no fixtures.
 
 #include "browser/StereoClassifier.h"
 
@@ -122,15 +123,24 @@ void TestEvidence(const std::string& cachePath) {
     CHECK(t.id == 4 && t.width == 512 && v.known && v.stereo, "side by side content is stereo");
     CHECK(v.layout == StereoLayout::SbsFull, "two 16:9 eyes are full side by side");
 
-    c.Classify(Item(5, "street.jpg"), MakeThumbnail(5, false));
+    Thumbnail street = MakeThumbnail(5, false);
+    street.fileChecked = true;  // read, and not a LIF
+    c.Classify(Item(5, "street.jpg"), std::move(street));
     CHECK(Result(c, t, v), "mono: result arrives");
     CHECK(t.id == 5 && v.known && !v.stereo && v.layout == StereoLayout::Mono, "mono content is not stereo");
 
     Thumbnail none;
     none.id = 6;
+    none.fileChecked = true;
     c.Classify(Item(6, "broken.jpg"), std::move(none));
     CHECK(Result(c, t, v), "no thumbnail: result arrives");
     CHECK(t.id == 6 && v.known && !v.stereo, "no thumbnail and no other evidence: not stereo");
+
+    // The file did not open, so a LIF cannot be ruled out: 2D for now.
+    c.Classify(Item(8, "IMG_0008.jpg"), MakeThumbnail(8, false));
+    CHECK(Result(c, t, v), "unchecked file: result arrives");
+    CHECK(t.id == 8 && v.known && !v.stereo, "unchecked file with mono content: 2D for now");
+    CHECK(c.Get(Item(8, "IMG_0008.jpg")).known, "and for the rest of the run");
 
     CHECK(c.Get(Item(4, "beach.jpg")).stereo, "a content verdict is remembered");
     c.Shutdown();
@@ -143,6 +153,8 @@ void TestCache(const std::string& cachePath) {
     CHECK(beach.known && beach.stereo && beach.layout == StereoLayout::SbsFull, "the cache survives a restart");
     const StereoVerdict street = c.Get(Item(5, "street.jpg"));
     CHECK(street.known && !street.stereo, "a mono verdict is cached too");
+    CHECK(!c.Get(Item(8, "IMG_0008.jpg")).known, "but not one without the file check it needed");
+    CHECK(c.NeedsFileCheck(Item(8, "IMG_0008.jpg")), "that file gets its check next run");
     MediaItem edited = Item(4, "beach.jpg");
     edited.modified += 1;
     CHECK(!c.Get(edited).known, "an edited file is worked out again");

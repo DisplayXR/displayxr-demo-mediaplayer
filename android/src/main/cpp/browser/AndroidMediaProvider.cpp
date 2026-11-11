@@ -251,6 +251,7 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeThumbnail(
         t.rgba.resize((size_t)width * height * 4);
         env->GetByteArrayRegion(rgba, 0, (jsize)t.rgba.size(), (jbyte*)t.rgba.data());
     }
+    t.fileChecked = fd >= 0;
     t.file3D = File3D(fd, video != JNI_FALSE);
     AndroidMediaProvider::Instance().AddThumbnail(std::move(t));
 }
