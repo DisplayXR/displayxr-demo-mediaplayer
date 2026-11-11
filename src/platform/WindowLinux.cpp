@@ -24,12 +24,14 @@
 #include "dxr_linux_window.h"
 
 #include <SDL3/SDL.h>
+#include <X11/Xresource.h>
 #include <X11/keysym.h>
 #include <openxr/openxr.h>
 #include <openxr/XR_DXR_wayland_surface_binding.h>
 #include <openxr/XR_DXR_xlib_window_binding.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -39,6 +41,28 @@ namespace mp {
 namespace {
 
 int s_linuxPlatformRequest = 0;  // 0 auto, 1 x11, 2 wayland
+float s_x11Scale = 1.0f;         // XftScale() on X11; Wayland stays at 1.0
+
+//! Xft.dpi / 96: the X11 scale SDL and GTK read (GNOME and KDE set it from the display
+//! scale). One value for the whole X screen; 1.0 when unset.
+float XftScale() {
+    Display* dpy = XOpenDisplay(nullptr);
+    if (!dpy) return 1.0f;
+    float scale = 1.0f;
+    if (const char* rm = XResourceManagerString(dpy)) {
+        XrmInitialize();
+        XrmDatabase db = XrmGetStringDatabase(rm);
+        char* type = nullptr;
+        XrmValue v{};
+        if (XrmGetResource(db, "Xft.dpi", "Xft.Dpi", &type, &v) && v.addr) {
+            const float dpi = (float)atof(v.addr);
+            if (dpi > 0.0f) scale = dpi / 96.0f;
+        }
+        XrmDestroyDatabase(db);
+    }
+    XCloseDisplay(dpy);
+    return scale;
+}
 
 //! Which window platform: the helper's capability probe, fed by which binding
 //! extensions the runtime advertises (no instance needed).
@@ -116,6 +140,7 @@ bool Window::Create(const char* title, int width, int height) {
     const DxrWindowBackend b = ResolveLinuxPlatform();
     if (b == DxrWindowBackend::Auto) return true;   // no binding: the runtime's own window
     linuxBackend_ = b == DxrWindowBackend::X11 ? 1 : 2;
+    if (b == DxrWindowBackend::X11) s_x11Scale = XftScale();
     linux_.wayland = b == DxrWindowBackend::Wayland;
     nativeHandle_ = &linux_;
     LOG_INFO("Window: displayxr-common window (%s), created once the 3D panel is known",
@@ -180,9 +205,9 @@ void Window::PixelSize(uint32_t& width, uint32_t& height) const {
 // space is the pixel space here.
 void Window::PointSize(uint32_t& width, uint32_t& height) const { PixelSize(width, height); }
 
-// The helper does not report a display scale, so the Linux UI and window stay at 100%.
-float Window::DisplayScale() const { return 1.0f; }
-float Window::ContentScaleAt(int, int) { return 1.0f; }
+// The helper keeps its Wayland surface scale private, so native Wayland stays at 100%.
+float Window::DisplayScale() const { return s_x11Scale; }
+float Window::ContentScaleAt(int, int) { return s_x11Scale; }
 void Window::SetSize(int width, int height) {
     reqW_ = width;
     reqH_ = height;
