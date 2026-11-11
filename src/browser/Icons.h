@@ -18,6 +18,10 @@ enum class Icon {
     Files,        // a document: "Other files..."
     Image,        // Pictures, and a tile with no thumbnail
     Video,        // Movies, and a video tile with no thumbnail
+    Folder,
+    Up,           // a left arrow: the folder above
+    Close,        // a cross: leave select mode
+    Delete,       // a bin
 };
 
 // Draw `icon` to fit a `size` x `size` box centred on `center`.

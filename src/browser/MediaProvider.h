@@ -57,6 +57,11 @@ public:
     virtual bool TakeThumbnail(Thumbnail& out) = 0;
     // Hand the item to the player.
     virtual void Open(int64_t id) = 0;
+    // Whether Delete() can work here.
+    virtual bool CanDelete() const = 0;
+    // Delete the items once the user confirms; the platform asks. The new list arrives
+    // through TakeItems().
+    virtual void Delete(const std::vector<int64_t>& ids) = 0;
 };
 
 } // namespace mp::browser

@@ -60,6 +60,25 @@ void DrawIcon(ImDrawList* dl, Icon icon, ImVec2 c, float s, ImU32 col) {
             dl->AddRect(P(-0.34f, -0.26f), P(0.34f, 0.26f), col, s * 0.06f, 0, th);
             dl->AddTriangleFilled(P(-0.08f, -0.12f), P(-0.08f, 0.12f), P(0.13f, 0.0f), col);
             break;
+        case Icon::Folder:
+            dl->AddRectFilled(P(-0.36f, -0.28f), P(-0.04f, -0.12f), col, s * 0.04f);
+            dl->AddRectFilled(P(-0.36f, -0.20f), P(0.36f, 0.26f), col, s * 0.05f);
+            break;
+        case Icon::Up: {
+            dl->AddLine(P(-0.26f, 0.0f), P(0.28f, 0.0f), col, th);
+            const ImVec2 head[] = {P(-0.04f, -0.22f), P(-0.26f, 0.0f), P(-0.04f, 0.22f)};
+            dl->AddPolyline(head, 3, col, 0, th);
+            break;
+        }
+        case Icon::Close:
+            dl->AddLine(P(-0.24f, -0.24f), P(0.24f, 0.24f), col, th);
+            dl->AddLine(P(0.24f, -0.24f), P(-0.24f, 0.24f), col, th);
+            break;
+        case Icon::Delete:
+            dl->AddRectFilled(P(-0.10f, -0.32f), P(0.10f, -0.24f), col, th * 0.5f);
+            dl->AddRectFilled(P(-0.30f, -0.25f), P(0.30f, -0.18f), col, th * 0.5f);
+            dl->AddRectFilled(P(-0.23f, -0.14f), P(0.23f, 0.32f), col, s * 0.05f);
+            break;
     }
 }
 

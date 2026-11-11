@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <iterator>
 #include <utility>
 
 namespace mp::browser {
@@ -25,8 +26,11 @@ const ImU32 kPanel = IM_COL32(23, 26, 33, 255);         // top bar and sidebar
 const ImU32 kTileEmpty = IM_COL32(255, 255, 255, 16);
 const ImU32 kPressed = IM_COL32(255, 255, 255, 40);
 const ImU32 kSelected = IM_COL32(51, 166, 255, 72);     // the UI's accent
+const ImU32 kAccent = IM_COL32(51, 166, 255, 255);
+const ImU32 kPicked = IM_COL32(0, 0, 0, 110);           // over a tile picked in select mode
 const ImU32 kBadge = IM_COL32(0, 0, 0, 140);
 const ImU32 kBadgeText = IM_COL32(255, 255, 255, 255);
+const ImU32 kFolder = IM_COL32(190, 192, 198, 255);
 
 float Round(float v) { return std::floor(v + 0.5f); }
 
@@ -128,6 +132,36 @@ float Badge(ImDrawList* dl, float right, float top, const char* text) {
     return right - w;
 }
 
+// A folder's tile: the folder, its name along the bottom and its count top right.
+void FolderTile(ImDrawList* dl, const Folder& folder, ImVec2 a, ImVec2 b, float margin) {
+    const float tile = b.x - a.x, font = ImGui::GetFontSize();
+    dl->AddRectFilled(a, b, kTileEmpty);
+    DrawIcon(dl, Icon::Folder, ImVec2(a.x + tile * 0.5f, a.y + Round((tile - font) * 0.45f)), tile * 0.5f, kFolder);
+    const std::string name = Fit(folder.name, tile - margin * 2.0f);
+    const float w = Round(ImGui::CalcTextSize(name.c_str()).x);
+    dl->AddText(ImVec2(Round(a.x + (tile - w) * 0.5f), b.y - margin - font), ImGui::GetColorU32(ImGuiCol_Text),
+                name.c_str());
+    char count[16];
+    std::snprintf(count, sizeof(count), "%d", folder.count);
+    Badge(dl, b.x - margin, a.y + margin, count);
+}
+
+// Select mode's box on a tile, `size` square at `min`: an outline, or filled and ticked.
+void CheckBox(ImDrawList* dl, ImVec2 min, float size, bool on) {
+    const ImVec2 max(min.x + size, min.y + size);
+    const float th = Round(std::max(1.0f, size * 0.1f)), r = size * 0.15f;
+    if (!on) {
+        dl->AddRectFilled(min, max, kBadge, r);  // so the outline reads on a light picture
+        dl->AddRect(min, max, kBadgeText, r, 0, th);
+        return;
+    }
+    dl->AddRectFilled(min, max, kAccent, r);
+    const ImVec2 tick[] = {ImVec2(min.x + size * 0.22f, min.y + size * 0.52f),
+                           ImVec2(min.x + size * 0.42f, min.y + size * 0.72f),
+                           ImVec2(min.x + size * 0.78f, min.y + size * 0.30f)};
+    dl->AddPolyline(tick, 3, kBadgeText, 0, th * 1.5f);
+}
+
 bool IconButton(const char* id, Icon icon, ImVec2 pos, float size) {
     ImGui::SetCursorScreenPos(pos);
     const bool clicked = ImGui::InvisibleButton(id, ImVec2(size, size));
@@ -217,6 +251,12 @@ void MediaBrowser::TakeResults() {
         library_.SetItems(std::move(items));
         listed_ = true;
         dirty_ = true;
+        // Deleted items leave the selection, and with the last one select mode ends. A
+        // cancelled delete keeps both.
+        for (auto it = selected_.begin(); it != selected_.end();) {
+            it = library_.Find(*it) ? std::next(it) : selected_.erase(it);
+        }
+        if (selected_.empty()) selecting_ = false;
     }
 
     Thumbnail thumbnail;
@@ -240,7 +280,8 @@ void MediaBrowser::Rebuild() {
     shown_.clear();
     unknown_.clear();
     const std::vector<MediaItem>& items = library_.Items();
-    for (size_t i : library_.Query(CurrentSource(), options_)) {
+    folders_ = folder_.empty() ? std::vector<Folder>() : library_.Folders(CurrentSource(), options_, folder_);
+    for (size_t i : library_.Query(CurrentSource(), options_, folder_)) {
         if (depth_ == DepthFilter::Both) {
             shown_.push_back(i);
             continue;
@@ -316,11 +357,30 @@ void MediaBrowser::TopBar(float width, float height) {
     const float y = Round((height - icon) * 0.5f);
     const float pad = Round(style.WindowPadding.x);
     dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(width, height), kPanel);
+    if (selecting_) {
+        // As LeiaPlayer's: a cross, the count, and the bin.
+        if (IconButton("##cancel", Icon::Close, ImVec2(pad, y), icon)) EndSelection();
+        char count[32];
+        std::snprintf(count, sizeof(count), "%d selected", (int)selected_.size());
+        dl->AddText(ImVec2(pad + icon + Round(style.ItemSpacing.x), Round((height - ImGui::GetFontSize()) * 0.5f)),
+                    ImGui::GetColorU32(ImGuiCol_Text), count);
+        if (IconButton("##delete", Icon::Delete, ImVec2(width - pad - icon, y), icon))
+            provider_->Delete(std::vector<int64_t>(selected_.begin(), selected_.end()));
+        return;
+    }
     if (IconButton("##menu", Icon::Menu, ImVec2(pad, y), icon)) sidebar_ = !sidebar_;
     if (IconButton("##options", Icon::More, ImVec2(width - pad - icon, y), icon)) ImGui::OpenPopup("##view_options");
+    if (folder_ != CurrentSource().folder &&
+        IconButton("##up", Icon::Up, ImVec2(pad + icon + Round(style.ItemSpacing.x), y), icon))
+        Up();
 
-    // The current source, in a pill in the middle.
-    const std::string name = Fit(CurrentSource().name, width - (pad + icon) * 4.0f);
+    // The current source and the folder in it, "Downloads / MEDIA / ZTEPics", in a pill in
+    // the middle.
+    std::string title = CurrentSource().name;
+    size_t i = CurrentSource().folder.size();
+    for (size_t slash; (slash = folder_.find('/', i)) != std::string::npos; i = slash + 1)
+        title += " / " + folder_.substr(i, slash - i);
+    const std::string name = Fit(title, width - (pad + icon) * 4.0f);
     const ImVec2 text = ImGui::CalcTextSize(name.c_str());
     const float padX = Round(style.FramePadding.x);
     const float pillW = Round(text.x) + padX * 2.0f;
@@ -397,6 +457,8 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
         return Action::OtherFiles;
     }
     sourceKind_ = sources[r].kind;
+    folder_ = sources[r].folder;
+    EndSelection();
     sidebar_ = false;
     dirty_ = true;
     gridScroll_.SetOffset(0.0f);
@@ -442,7 +504,8 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
     if (tile <= 0.0f || size.y <= 0.0f) return Action::None;
     const float step = tile + gutter;
     const float x0 = min.x + Round((size.x - (cols * step - gutter)) * 0.5f);
-    const size_t n = shown_.size();
+    const size_t nf = folders_.size();
+    const size_t n = nf + shown_.size();  // tiles: the folders, then the items
     const int rows = (int)((n + cols - 1) / cols);
     if (cols != columns_ && columns_ > 0 && step_ > 0.0f) {
         // A reflow (rotation, the sidebar): keep the top row's first item in the top row.
@@ -474,8 +537,8 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
 
     const std::vector<MediaItem>& items = library_.Items();
     std::unordered_set<int64_t> window;
-    for (size_t p = winFirst; p < winEnd; ++p) {
-        const int64_t id = items[shown_[p]].id;
+    for (size_t p = std::max(winFirst, nf); p < winEnd; ++p) {
+        const int64_t id = items[shown_[p - nf]].id;
         window.insert(id);
         int slot = 0;
         cache_.Use(id, slot);  // so a new thumbnail never takes a slot the window still shows
@@ -489,8 +552,8 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
         if (cache_.Contains(item.id) || pending_.count(item.id) || noThumbnail_.count(item.id)) return;
         want.push_back(ThumbnailRequest{item.id, classifier_.NeedsFileCheck(item)});
     };
-    for (size_t p = visFirst; p < winEnd; ++p) ask(items[shown_[p]]);
-    for (size_t p = visFirst; p > winFirst; --p) ask(items[shown_[p - 1]]);
+    for (size_t p = std::max(visFirst, nf); p < winEnd; ++p) ask(items[shown_[p - nf]]);
+    for (size_t p = visFirst; p > std::max(winFirst, nf); --p) ask(items[shown_[p - 1 - nf]]);
     for (size_t k = 0; k < unknown_.size() && k < kScanBatch; ++k) ask(items[unknown_[k]]);
     if (!Same(want, wanted_)) {
         provider_->WantThumbnails(want, atlas_.Tile());
@@ -520,14 +583,25 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
     };
     size_t pressed = n;
     if (gridScroll_.Pressed() && !gridScroll_.Dragging() && !itemAt(gridPress_, pressed)) pressed = n;
+    // A long press on an item starts select mode with it. In select mode it is a tap.
+    if (pressed >= nf && pressed < n && !selecting_ && provider_->CanDelete() && gridScroll_.TakeLongPress(now)) {
+        selecting_ = true;
+        selected_ = {items[shown_[pressed - nf]].id};
+    }
 
     const float margin = Round(Px(6.0f));
     const float badgeGap = Round(Px(4.0f));
+    const float box = Round(ImGui::GetFontSize() * 1.2f);
     dl->PushClipRect(min, max, true);
     for (size_t p = visFirst; p < visEnd; ++p) {
-        const MediaItem& item = items[shown_[p]];
         const ImVec2 a(x0 + (float)(p % cols) * step, min.y + (float)(p / cols) * step - offset);
         const ImVec2 b(a.x + tile, a.y + tile);
+        if (p < nf) {
+            FolderTile(dl, folders_[p], a, b, margin);
+            if (p == pressed) dl->AddRectFilled(a, b, kPressed);
+            continue;
+        }
+        const MediaItem& item = items[shown_[p - nf]];
         const StereoVerdict verdict = classifier_.Get(item);
         int slot = 0;
         ThumbnailAtlas::Thumb thumb;
@@ -554,15 +628,59 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
         if (verdict.known && verdict.stereo) right = Badge(dl, right, a.y + margin, "3D") - badgeGap;
         const std::string format = library_.Kind(shown_[p]) == SourceKind::Unsupported ? Format(item.name) : "";
         if (!format.empty()) Badge(dl, right, a.y + margin, format.c_str());
+        if (selecting_) {
+            // As LeiaPlayer's: a box on every tile; a picked one dimmed, ticked and outlined.
+            const bool on = selected_.count(item.id) != 0;
+            if (on) {
+                dl->AddRectFilled(a, b, kPicked);
+                dl->AddRect(a, b, kAccent, 0.0f, 0, Round(Px(3.0f)));
+            }
+            CheckBox(dl, ImVec2(a.x + margin, a.y + margin), box, on);
+        }
         if (p == pressed) dl->AddRectFilled(a, b, kPressed);
     }
     dl->PopClipRect();
 
     size_t picked = 0;
     if (!tap || !itemAt(gridPress_, picked)) return Action::None;
-    openedId_ = items[shown_[picked]].id;
+    if (picked < nf) {
+        if (!selecting_) GoTo(folders_[picked].path);
+        return Action::None;
+    }
+    const int64_t id = items[shown_[picked - nf]].id;
+    if (selecting_) {
+        if (!selected_.erase(id)) selected_.insert(id);
+        if (selected_.empty()) selecting_ = false;
+        return Action::None;
+    }
+    openedId_ = id;
     provider_->Open(openedId_);
     return Action::Opened;
+}
+
+void MediaBrowser::GoTo(const std::string& folder) {
+    folder_ = folder;
+    dirty_ = true;
+    gridScroll_.SetOffset(0.0f);
+}
+
+void MediaBrowser::Up() { GoTo(folder_.substr(0, folder_.rfind('/', folder_.size() - 2) + 1)); }
+
+void MediaBrowser::EndSelection() {
+    selecting_ = false;
+    selected_.clear();
+}
+
+bool MediaBrowser::CanGoBack() const { return provider_ && (selecting_ || folder_ != CurrentSource().folder); }
+
+bool MediaBrowser::Back() {
+    if (!CanGoBack()) return false;
+    if (selecting_) {
+        EndSelection();
+    } else {
+        Up();
+    }
+    return true;
 }
 
 bool MediaBrowser::NextId(int step, int64_t& id) const {

@@ -41,7 +41,6 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
-import android.widget.Toast
 
 class MainActivity : NativeActivity() {
 
@@ -416,21 +415,6 @@ class MainActivity : NativeActivity() {
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
             .registerDisplayListener(displayListener, null)
         watchForRuntimeUnavailable()
-        showControlsHint()
-    }
-
-    // Brief on-screen legend of the transport controls. A Toast sits above the
-    // weave overlay, so no Vulkan HUD work is needed for a transient hint.
-    private fun showControlsHint() {
-        Handler(Looper.getMainLooper()).postDelayed({
-            if (!isFinishing) {
-                Toast.makeText(
-                    this,
-                    "Tap the screen to open a video / image / LIF",
-                    Toast.LENGTH_LONG,
-                ).show()
-            }
-        }, 2500)
     }
 
     @Deprecated("NativeActivity has no OnBackPressedDispatcher")
