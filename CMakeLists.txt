@@ -779,6 +779,12 @@ if(MP_BUILD_TESTS)
     target_include_directories(slide_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME slide_gesture COMMAND slide_gesture_test)
 
+    # The Android player's 2D/3D switch (#180): which rendering mode a flip asks for. Pure.
+    add_executable(display_mode_switch_test tests/display_mode_switch_test.cpp
+        src/xr/DisplayModeSwitch.cpp)
+    target_include_directories(display_mode_switch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME display_mode_switch COMMAND display_mode_switch_test)
+
     # Live frames: FrameRing queue mode (one frame per refresh, clock drift costs single
     # drops/repeats instead of bursts). Header-only, pure.
     add_executable(frame_ring_queue_test tests/frame_ring_queue_test.cpp)

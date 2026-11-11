@@ -1298,16 +1298,17 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		const float tx = (float)(tile_x * renderW);
 		const float ty = (float)(tile_y * renderH);
 
-		// UV: mono → whole image to every view; stereo SBS → this view's column
-		// slice (left half to view 0, right half to view 1 for a 2×1 layout).
-		// Which eye this tile is. Same column rule the SBS split uses (tile_x 0 =
-		// left), so a 2x2 quad mode gets left/right/left/right rather than every view
-		// past the first showing the right eye. With one column there is only one eye
-		// a tile can be, and the view index is all that is left to go on.
+		// UV: mono → whole image to every view; stereo SBS → this view's eye's half,
+		// whatever the tile grid (the 2D mode's one tile takes the left, #180).
+		// Which eye this tile is: tile_x 0 = left, so a 2x2 quad mode gets
+		// left/right/left/right rather than every view past the first showing the
+		// right eye. With one column there is only one eye a tile can be, and the
+		// view index is all that is left to go on.
 		const bool rightEye = (c > 1) ? (tile_x != 0) : (v != 0);
+		const float eyeOff = rightEye ? 0.5f : 0.0f;
 		// Dual adds: this eye's WHOLE image, shifted by half the convergence.
-		const float boxW = (dual || mono) ? 1.0f : 1.0f / (float)c;
-		float offBase = (dual || mono) ? 0.0f : (float)tile_x / (float)c;
+		const float boxW = (dual || mono) ? 1.0f : 0.5f;
+		float offBase = (dual || mono) ? 0.0f : eyeOff;
 		if (dual) offBase += rightEye ? convHalf : -convHalf;
 		VkDescriptorSet dsv = (dual && rightEye) ? dsR : ds;
 
@@ -1326,8 +1327,8 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		// The swipe's second page: a still, split like an RGBA image.
 		if (haveStill) {
 			SbsPush push = {};
-			push.uvOffset[0] = stillMono_ ? 0.0f : (float)tile_x / (float)c;
-			push.uvScale[0] = stillMono_ ? 1.0f : 1.0f / (float)c;
+			push.uvOffset[0] = stillMono_ ? 0.0f : eyeOff;
+			push.uvScale[0] = stillMono_ ? 1.0f : 0.5f;
 			push.uvScale[1] = 1.0f;
 			push.mode = 0;
 			push.fullRange = 1.0f;

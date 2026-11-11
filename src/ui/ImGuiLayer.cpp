@@ -267,6 +267,10 @@ void ImGuiLayer::AddUiFont() {
     static const ImWchar kGlyphs[] = {0x0020, 0x00FF, 0x2010, 0x2026, 0};  // Latin-1, dashes, quotes, ellipsis
     ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void*)kUiFontTtf, (int)sizeof(kUiFontTtf),
                                                ui::UiFontPx(metricScale_), &fontCfg, kGlyphs);
+    static const ImWchar kSwitchGlyphs[] = {'2', '3', 'D', 'D', 0};
+    ui::g_switchFont = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(
+        (void*)kUiFontTtf, (int)sizeof(kUiFontTtf), ui::SwitchFontPx(metricScale_), &fontCfg,
+        kSwitchGlyphs);
 }
 
 void ImGuiLayer::SetUiScale(float scale) {

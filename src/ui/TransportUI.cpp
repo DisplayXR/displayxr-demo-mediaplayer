@@ -4,6 +4,7 @@
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -102,6 +103,8 @@ float UiFontPx(float k) {
     return std::ceil((k > 1.0f ? 30.0f : 16.0f) * g_uiScale - 0.001f);
 }
 
+float SwitchFontPx(float k) { return std::ceil(UiFontPx(k) * 1.2f - 0.001f); }
+
 namespace {
 constexpr float kPi = 3.14159265358979f;  // IM_PI lives in imgui_internal.h; keep our own
 enum class Icon { Play, Pause, Loop, Slideshow, Speaker, SpeakerMuted };
@@ -197,6 +200,34 @@ bool IconButton(const char* id, Icon kind, float size, bool active = false,
             break;
         }
     }
+    return ImGui::IsItemClicked();
+}
+
+// The touch player's 2D/3D switch (#180), drawn like LeiaPlayer's on the same tablets: a
+// pill track and a round knob naming the mode in force, on the right for 3D and on the
+// left for 2D. `size` is the knob's diameter; the hit box grows like IconButton's.
+bool ModeSwitch(const char* id, bool on3D, float size, float hitScale) {
+    const float pad = size * (std::max(1.0f, hitScale) - 1.0f) * 0.5f;
+    const float trackW = size * 1.7f, trackH = size * 0.68f;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(trackW + pad * 2.0f, size + pad * 2.0f));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float x0 = p.x + pad, cy = p.y + pad + size * 0.5f, r = size * 0.5f;
+    dl->AddRectFilled(ImVec2(x0, cy - trackH * 0.5f), ImVec2(x0 + trackW, cy + trackH * 0.5f),
+                      ImGui::GetColorU32(on3D ? ImVec4(0.91f, 0.91f, 0.93f, 1.0f)
+                                              : ImVec4(0.48f, 0.51f, 0.58f, 0.85f)),
+                      trackH * 0.5f);
+    const ImVec2 c(on3D ? x0 + trackW - r : x0 + r, cy);
+    // A grey ring parts the knob from the track.
+    dl->AddCircleFilled(c, r, ImGui::GetColorU32(ImVec4(0.50f, 0.50f, 0.52f, 1.0f)));
+    dl->AddCircleFilled(c, r - std::max(1.0f, std::round(size * 0.06f)),
+                        ImGui::GetColorU32(ImVec4(0.96f, 0.96f, 0.97f, 1.0f)));
+    const char* label = on3D ? "3D" : "2D";
+    const float fontPx = g_switchFont->FontSize;
+    const ImVec2 ts = g_switchFont->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, label);
+    dl->AddText(g_switchFont, fontPx,
+                ImVec2(std::round(c.x - ts.x * 0.5f), std::round(c.y - ts.y * 0.5f)),
+                ImGui::GetColorU32(ImVec4(0.05f, 0.05f, 0.06f, 1.0f)), label);
     return ImGui::IsItemClicked();
 }
 
@@ -756,6 +787,14 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             }
             ImGui::End();
             if (strip) ImGui::PopStyleVar(2);
+        }
+        // The 2D/3D switch: alone at the right edge, level with the transport's row.
+        if (s.caps.modeSwitch) {
+            ImGui::SetNextWindowPos(ImVec2(W, H * 0.955f), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+            if (ImGui::Begin("##modeswitch", nullptr, pill | ImGuiWindowFlags_NoBackground) &&
+                ModeSwitch("##mode3d", s.mode3D, iconSz, s.hitTargetScale))
+                Fire(a.NextMode);
+            ImGui::End();
         }
         ImGui::PopStyleVar();
     }
