@@ -30,6 +30,8 @@ import kotlin.math.roundToInt
 
 class MediaStoreProvider(
     private val activity: Activity,
+    // Tells the player a file could not be opened at all, so it says so (#180).
+    private val openFailed: (name: String) -> Unit,
     // Hands an opened file to the player, as the system picker's result does.
     private val openFd: (fd: Int, length: Long, name: String) -> Unit,
 ) {
@@ -377,11 +379,16 @@ class MediaStoreProvider(
             return
         }
         try {
-            val pfd = activity.contentResolver.openFileDescriptor(row.uri, "r") ?: return
+            val pfd = activity.contentResolver.openFileDescriptor(row.uri, "r")
+            if (pfd == null) {
+                openFailed(row.name)
+                return
+            }
             val length = pfd.statSize
             openFd(pfd.detachFd(), length, row.name)
         } catch (e: Exception) { // FileNotFoundException, or SecurityException on a revoked grant
             Log.w(TAG, "media browser: cannot open ${row.name}: $e")
+            openFailed(row.name)
         }
     }
 

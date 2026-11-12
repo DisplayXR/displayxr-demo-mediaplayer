@@ -258,10 +258,14 @@ ImFont* StyleFont(TextStyle style);
 void TickTransportUI(TransportState& s, double dt, bool uiAwake);
 
 // Show a transient message. Fades in over the toast, independent of the bars,
-// so it's visible even while the chrome is hidden.
-void ShowTransportToast(TransportState& s, std::string msg);
+// so it's visible even while the chrome is hidden. `seconds` it stays lit; 0 = the default.
+void ShowTransportToast(TransportState& s, std::string msg, double seconds = 0.0);
 
 // Emit the whole UI. Must be called between ImGui NewFrame() and Render().
 void BuildTransportUI(TransportState& s, const TransportActions& a);
+
+// Emit only the toast (BuildTransportUI does too): for a screen that draws its own UI,
+// like the Android browser, so a message survives the change of screen (#180).
+void BuildTransportToast(const TransportState& s);
 
 }  // namespace mp::ui

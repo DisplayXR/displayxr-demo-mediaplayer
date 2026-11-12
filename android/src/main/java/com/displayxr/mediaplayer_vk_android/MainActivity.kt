@@ -109,6 +109,9 @@ class MainActivity : NativeActivity() {
     // (it blanks the scene while a pick is pending to avoid a stale-frame flash).
     private external fun nativePickCancelled()
 
+    // The browser's file could not be opened at all: the player says so (#180).
+    private external fun nativeOpenFailed(name: String)
+
     // Back. True when native took it (the player returns to the browser).
     private external fun nativeBack(): Boolean
 
@@ -430,7 +433,9 @@ class MainActivity : NativeActivity() {
             @Suppress("DEPRECATION") // only for Android 15+, which is edge to edge anyway
             window.setDecorFitsSystemWindows(false)
         }
-        mediaStore = MediaStoreProvider(this) { fd, length, name -> nativeOpenVideoFd(fd, 0L, length, name) }
+        mediaStore = MediaStoreProvider(this, { name -> nativeOpenFailed(name) }) { fd, length, name ->
+            nativeOpenVideoFd(fd, 0L, length, name)
+        }
         pushRotation()
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
             .registerDisplayListener(displayListener, null)

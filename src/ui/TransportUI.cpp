@@ -44,9 +44,9 @@ void TickTransportUI(TransportState& s, double dt, bool uiAwake) {
     if (!toastLive && s.toastAlpha <= 0.001f) s.toastText.clear();
 }
 
-void ShowTransportToast(TransportState& s, std::string msg) {
+void ShowTransportToast(TransportState& s, std::string msg, double seconds) {
     s.toastText = std::move(msg);
-    s.toastSecondsLeft = kToastSeconds;
+    s.toastSecondsLeft = seconds > 0.0 ? seconds : kToastSeconds;
 }
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
@@ -967,15 +967,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
     if (s.caps.url) UrlPopup(s, a);
 
     // --- Toast (convergence readout, nav filename): own alpha, shows even when hidden ---
-    if (s.toastAlpha > 0.001f && !s.toastText.empty()) {
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s.toastAlpha);
-        ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.14f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-        if (ImGui::Begin("##toast", nullptr, pill)) {
-            ImGui::TextUnformatted(s.toastText.c_str());
-        }
-        ImGui::End();
-        ImGui::PopStyleVar();
-    }
+    BuildTransportToast(s);
 
     // --- Slideshow dip-to-black: a full-canvas overlay above everything. Because the
     //     HUD layer composites on top of the content layer, this dims the whole view. ---
@@ -986,10 +978,40 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
     }
 }
 
+void BuildTransportToast(const TransportState& s) {
+    if (!(s.toastAlpha > 0.001f) || s.toastText.empty()) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    const ImGuiWindowFlags pill = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                                  ImGuiWindowFlags_NoBringToFrontOnFocus |
+                                  ImGuiWindowFlags_AlwaysAutoResize;
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s.toastAlpha);
+    if (s.caps.touchLayout) {
+        // Touch: low on the screen, above the transport, clear of the picture's middle, and
+        // cut to the screen's width.
+        const float margin = Dp(16.0f);
+        ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H - g_systemBarBottom - Dp(96.0f)), ImGuiCond_Always,
+                                ImVec2(0.5f, 1.0f));
+        if (ImGui::Begin("##toast", nullptr, pill)) {
+            const float pad = ImGui::GetStyle().WindowPadding.x * 2.0f;
+            ImGui::TextUnformatted(FitText(s.toastText, W - margin * 2.0f - pad).c_str());
+        }
+    } else {
+        ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.14f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        if (ImGui::Begin("##toast", nullptr, pill)) {
+            ImGui::TextUnformatted(s.toastText.c_str());
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 #else  // !MEDIAPLAYER_WITH_IMGUI
 
 void ApplyMediaPlayerStyle(float) {}
 void BuildTransportUI(TransportState&, const TransportActions&) {}
+void BuildTransportToast(const TransportState&) {}
 
 #endif
 

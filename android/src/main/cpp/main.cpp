@@ -438,6 +438,8 @@ constexpr uint8_t kIdleBg[3] = {31, 31, 33};  // 0.12,0.12,0.13 * 255
 std::atomic<int> g_pick_fd{-1};
 std::mutex g_pick_name_mx;
 std::string g_pick_name;  // display name of the picked document (filename layer)
+// The browser's file could not be opened at all: g_pick_name names it (#180).
+std::atomic<bool> g_open_failed{false};
 // True while the idle splash (the DisplayXR logo) is the scene. It is uploaded like
 // any image, so g_scene_loaded alone cannot tell "nothing loaded" from "an image is
 // loaded" — and that is the one distinction tap-to-open and the HUD both need.
@@ -2081,6 +2083,34 @@ show_browser(struct android_app *app)
 	g_slide_arrived = false;
 }
 
+// The format a file's name says it is, for a message ("HEIC"), or "" when it has none.
+static std::string
+name_format(const std::string &name)
+{
+	const size_t dot = name.rfind('.');
+	if (dot == std::string::npos || dot + 1 >= name.size() || name.size() - dot > 6) return std::string();
+	std::string ext = name.substr(dot + 1);
+	for (char &c : ext) c = (char)toupper((unsigned char)c);
+	return ext;
+}
+
+// A file that would not open (#180): say so, and go back to the grid it came from. It used
+// to fall back to the idle screen without a word, and a failed swipe left black until Back.
+static void
+open_failed(struct android_app *app, const std::string &name, const std::string &format)
+{
+	LOGW("could not open '%s' (%s)", name.c_str(), format.empty() ? "format unknown" : format.c_str());
+	if (g_browser_ready.load(std::memory_order_relaxed)) {
+		show_browser(app);
+	} else {
+		load_splash(app);
+	}
+	if (!g_hud_ready) return;
+	std::string msg = "Couldn't open " + (name.empty() ? std::string("the file") : name);
+	if (!format.empty()) msg += " \xC2\xB7 " + format;
+	mp::ui::ShowTransportToast(g_ui_state, msg, 4.0);
+}
+
 // The current press began on the chrome (the seek bar), so its drag is the chrome's.
 static bool
 press_on_chrome()
@@ -2610,6 +2640,7 @@ render_frame()
 			if (browsing) {
 				if (g_browser.Build() == mp::browser::MediaBrowser::Action::OtherFiles)
 					g_open_picker_request.store(true, std::memory_order_relaxed);
+				mp::ui::BuildTransportToast(g_ui_state);  // e.g. a file that would not open
 				g_browser.RecordUploads(g_sbs.frameCmd());
 			} else {
 				mp::ui::BuildTransportUI(g_ui_state, g_ui_actions);
@@ -3258,6 +3289,26 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeOpenVideoFd(
 	g_pick_fd.store((int)fd, std::memory_order_release);  // publish last
 }
 
+// The browser's file could not be opened at all (no descriptor: gone, or access revoked).
+// The player says so and returns to the grid (#180).
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeOpenFailed(
+    JNIEnv *env, jobject /*thiz*/, jstring name)
+{
+	{
+		std::lock_guard<std::mutex> lk(g_pick_name_mx);
+		g_pick_name.clear();
+		if (name != nullptr) {
+			const char *c = env->GetStringUTFChars(name, nullptr);
+			if (c) {
+				g_pick_name = c;
+				env->ReleaseStringUTFChars(name, c);
+			}
+		}
+	}
+	g_open_failed.store(true, std::memory_order_release);
+}
+
 // Picker dismissed without a selection: resume showing the previous asset.
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativePickCancelled(
@@ -3410,6 +3461,15 @@ android_main(struct android_app *app)
 				g_stills.Update();
 				if (g_slide_step != 0) open_slide_step();
 			}
+			if (g_open_failed.exchange(false, std::memory_order_acquire)) {
+				std::string name;
+				{
+					std::lock_guard<std::mutex> lk(g_pick_name_mx);
+					name = g_pick_name;
+				}
+				g_pick_pending.store(false, std::memory_order_relaxed);
+				open_failed(app, name, name_format(name));
+			}
 			const int pick = g_pick_fd.exchange(-1, std::memory_order_acquire);
 			if (pick >= 0) {
 				if (g_slide.Waiting()) g_slide_arrived = true;
@@ -3427,7 +3487,13 @@ android_main(struct android_app *app)
 				if (is_jpeg || is_png || is_gif || is_bmp) {
 					if (!load_picked_image(app, pick, off, len)) {
 						LOGE("Failed to load picked image (fd=%d)", pick);
-						load_splash(app);  // the old media is gone: never leave nothing on screen
+						std::string name;
+						{
+							std::lock_guard<std::mutex> lk(g_pick_name_mx);
+							name = g_pick_name;
+						}
+						const char *kind = is_jpeg ? "JPEG" : is_png ? "PNG" : is_gif ? "GIF" : "BMP";
+						open_failed(app, name, kind);  // never leave nothing on screen
 					}
 					close(pick);  // image path stages a copy; the fd is done
 				} else {
@@ -3487,7 +3553,7 @@ android_main(struct android_app *app)
 						if (audio_fd >= 0) close(audio_fd);
 						if (probe_fd >= 0) close(probe_fd);
 						LOGE("Failed to open picked video (fd=%d)", pick);
-						load_splash(app);
+						open_failed(app, pick_name, name_format(pick_name));
 					}
 				}
 			}
