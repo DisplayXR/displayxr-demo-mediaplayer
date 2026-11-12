@@ -44,7 +44,9 @@ float Round(float v) { return std::floor(v + 0.5f); }
 bool Same(const std::vector<ThumbnailRequest>& a, const std::vector<ThumbnailRequest>& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i].id != b[i].id || a[i].checkFile != b[i].checkFile || a[i].maxEdge != b[i].maxEdge) return false;
+        if (a[i].id != b[i].id || a[i].checkFile != b[i].checkFile || a[i].maxEdge != b[i].maxEdge ||
+            a[i].pairFile != b[i].pairFile)
+            return false;
     }
     return true;
 }
@@ -198,10 +200,18 @@ bool MediaBrowser::Initialize(MediaProvider* provider, VkPhysicalDevice physical
     return true;
 }
 
+void MediaBrowser::SetPairMaker(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close) {
+    closeFile_ = close;
+    pairs_.Initialize(std::move(decode), std::move(read), std::move(close));
+}
+
 void MediaBrowser::Shutdown() {
     if (!provider_) return;
     classifier_.Shutdown();
     thumbDepth_.Shutdown();
+    pairs_.Shutdown();
+    paired_.clear();
+    noPair_.clear();
     atlas_.Shutdown();
     provider_ = nullptr;
     listed_ = false;
@@ -231,6 +241,8 @@ void MediaBrowser::TakeResults() {
                 sharpen_.erase(item.id);
                 sharpened_.erase(item.id);
                 thumbDepth_.Forget(item.id);
+                paired_.erase(item.id);
+                noPair_.erase(item.id);
             }
         }
         library_.SetItems(std::move(items));
@@ -247,6 +259,15 @@ void MediaBrowser::TakeResults() {
     Thumbnail thumbnail;
     while (provider_->TakeThumbnail(thumbnail)) {
         const MediaItem* item = library_.Find(thumbnail.id);
+        if (thumbnail.file >= 0) {
+            // Asked for its pair: the file goes to StereoPairs (which closes it) with the view.
+            if (item && WantsStereo())
+                pairs_.Make(item->id, item->modified, thumbnail.file, thumbnail.fileSize, thumbnail.rgba.data(),
+                            thumbnail.width, thumbnail.height, viewScale_);
+            else if (closeFile_)
+                closeFile_(thumbnail.file);
+            thumbnail.file = -1;
+        }
         if (!item) continue;
         pending_.insert(thumbnail.id);
         classifier_.Classify(*item, std::move(thumbnail));
@@ -255,9 +276,28 @@ void MediaBrowser::TakeResults() {
     StereoVerdict verdict;
     while (classifier_.TakeResult(thumbnail, verdict)) {
         if (depth_ != DepthFilter::Both) dirty_ = true;  // it may join the grid now
-        ready_.push_back(Ready{std::move(thumbnail), verdict.layout});
+        // The 3D grid: a one-view 3D photo with a pair made already shows the pair.
+        const MediaItem* item = library_.Find(thumbnail.id);
+        Thumbnail pair;
+        if (item && WantsStereo() && NeedsPair(*item, verdict) && pairs_.Cached(item->id, item->modified, pair)) {
+            paired_.insert(item->id);
+            ready_.push_back(Ready{std::move(pair), StereoLayout::SbsFull});
+        } else {
+            if (item && !Packed(verdict.layout)) paired_.erase(item->id);  // a one-view thumbnail again
+            ready_.push_back(Ready{std::move(thumbnail), verdict.layout});
+        }
         thumbnail = Thumbnail{};
     }
+    std::vector<Thumbnail> made;
+    std::vector<int64_t> failed;
+    pairs_.TakeResults(made, failed);
+    for (Thumbnail& t : made) {
+        if (!WantsStereo() || !library_.Find(t.id)) continue;  // cached for later
+        paired_.insert(t.id);
+        pending_.insert(t.id);
+        ready_.push_back(Ready{std::move(t), StereoLayout::SbsFull});
+    }
+    noPair_.insert(failed.begin(), failed.end());
     thumbDepth_.TakeResults();
 }
 
@@ -349,6 +389,12 @@ MediaBrowser::Action MediaBrowser::Build() {
     }
     ImGui::End();
     if (action == Action::Opened) classifier_.Save();  // the app may be stopped while playing
+    if (action != Action::None && !wanted_.empty()) {
+        // The grid is going away: stop the thumbnail work, so it does not compete with
+        // opening the file and decoding its neighbours. The grid asks again when it shows.
+        wanted_.clear();
+        provider_->WantThumbnails(wanted_);
+    }
     return action;
 }
 
@@ -568,7 +614,11 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
         } else {
             edge = ThumbnailEdge(item.width, item.height, classifier_.Get(item).layout, need, atlas_.Tile(), kFetchCap);
         }
-        want.push_back(ThumbnailRequest{item.id, classifier_.NeedsFileCheck(item), edge});
+        ThumbnailRequest r{item.id, classifier_.NeedsFileCheck(item), edge};
+        // The 3D grid: the file too, for a one-view 3D photo whose pair is not made yet.
+        const StereoVerdict v = classifier_.Get(item);
+        r.pairFile = WantsStereo() && NeedsPair(item, v) && !pairs_.Busy(item.id) && !pairs_.Has(item.id, item.modified);
+        want.push_back(r);
     };
     for (size_t p = std::max(visFirst, nf); p < winEnd; ++p) ask(items[shown_[p - nf]]);
     for (size_t p = visFirst; p > std::max(winFirst, nf); --p) ask(items[shown_[p - 1 - nf]]);
@@ -638,8 +688,8 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
             t.x0 = a.x, t.y0 = a.y, t.x1 = b.x, t.y1 = b.y;
             ThumbnailAtlas::Thumb right = thumb;
             int rslot = 0;
-            const bool pair = Packed(verdict.layout) && cache_.Use(RightEyeKey(item.id), rslot) &&
-                              atlas_.Get(rslot, right);
+            const StereoLayout layout = SlotLayout(item, verdict);
+            const bool pair = Packed(layout) && cache_.Use(RightEyeKey(item.id), rslot) && atlas_.Get(rslot, right);
             DepthEstimate depth;
             const bool measured = thumbDepth_.Get(item.id, depth);
             UvRect l, r;
@@ -649,8 +699,10 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
             t.uv[0] = InSlot(l, thumb.uv0.x, thumb.uv0.y, thumb.uv1.x, thumb.uv1.y);
             t.uv[1] = InSlot(pair ? r : l, right.uv0.x, right.uv0.y, right.uv1.x, right.uv1.y);
             stereoFrame_.tiles.push_back(t);
-            // Uploaded before the 3D filter, without its right eye: fetch it again.
-            if (Packed(verdict.layout) && !pair && !pending_.count(item.id) && refetched_.insert(item.id).second)
+            // Uploaded before the 3D filter without its right eye, or a one-view 3D photo whose
+            // pair is not made: fetch it again (once), which asks for the pair too.
+            const bool wantsPair = Packed(layout) || (NeedsPair(item, verdict) && !pairs_.Busy(item.id));
+            if (wantsPair && !pair && !pending_.count(item.id) && refetched_.insert(item.id).second)
                 cache_.Remove(item.id);
         } else if (shown) {
             dl->AddImage(thumb.texture, a, b, thumb.uv0, thumb.uv1);  // the slot holds what the tile shows
@@ -821,6 +873,7 @@ void MediaBrowser::UploadReady(const std::unordered_set<int64_t>& window, uint32
         // Shown soft (3D found from the thumbnail itself, so it was asked for as 2D; black bars
         // taken off; a size the provider did not report): ask once more, larger.
         sharpen_.erase(t.id);
+        if (paired_.count(t.id)) sharpened_.insert(t.id);  // a made pair is sized for the 3D mode
         const uint32_t shorter = std::min(r.w, r.h), longer = std::max(r.w, r.h);
         const uint32_t own = item ? std::max(item->width, item->height) : 0;
         const uint32_t made = std::max(t.width, t.height);

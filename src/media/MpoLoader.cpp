@@ -155,6 +155,30 @@ bool ParseMpEntries(const std::vector<uint8_t>& b, size_t tiffBase,
 
 } // namespace
 
+bool MpoLoader::IsMpo(const std::vector<uint8_t>& head) {
+    size_t tiffBase = 0;
+    return FindMpfSegment(head, tiffBase);
+}
+
+size_t MpoLoader::SniffBytes() { return kSniffBytes; }
+
+bool MpoLoader::FindSecondView(const std::vector<uint8_t>& head, uint64_t fileSize, uint64_t& offset,
+                               uint64_t& size) {
+    size_t tiffBase = 0;
+    std::vector<MpEntry> entries;
+    if (!FindMpfSegment(head, tiffBase) || !ParseMpEntries(head, tiffBase, entries)) return false;
+    for (size_t i = 1; i < entries.size(); ++i) {
+        if ((entries[i].type & kMpTypeClassMask) == kMpTypeClassThumb) continue;
+        if (entries[i].size == 0 || entries[i].offset == 0) continue;
+        const uint64_t start = (uint64_t)tiffBase + entries[i].offset;
+        if (start >= fileSize || start + entries[i].size > fileSize) continue;
+        offset = start;
+        size = entries[i].size;
+        return true;
+    }
+    return false;
+}
+
 bool MpoLoader::IsMpo(const std::string& path) {
     std::vector<uint8_t> head;
     if (!ReadFile(path, head, kSniffBytes)) return false;

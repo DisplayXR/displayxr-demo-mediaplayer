@@ -12,6 +12,7 @@
 #include "browser/MediaProvider.h"
 #include "browser/StereoClassifier.h"
 #include "browser/StereoGrid.h"
+#include "browser/StereoPairs.h"
 #include "browser/ThumbnailAtlas.h"
 #include "browser/ThumbnailCache.h"
 #include "browser/ThumbnailDepth.h"
@@ -24,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -81,7 +83,15 @@ public:
     bool WantsStereo() const { return depth_ == DepthFilter::Only3D; }
     // The panel is in 3D and the caller draws Stereo() into the projection layer, so
     // Build() leaves the tiles' pictures and the background behind them out of the HUD.
-    void SetStereo(bool on) { stereo_ = on; }
+    // `viewScale` is the 3D mode's (the useful size of an eye is a tile times it).
+    void SetStereo(bool on, float viewScale) {
+        stereo_ = on;
+        if (viewScale > 0.0f) viewScale_ = viewScale;
+    }
+    // Make pairs for 3D photos whose thumbnail is one view (LIF, MPO: StereoPairs.h).
+    // `read` / `close` work on the file descriptors the provider hands over. Call after
+    // Initialize; without it those tiles stay flat.
+    void SetPairMaker(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close);
     // The tiles Build() laid out this frame, at this frame's rects; inactive unless set.
     const StereoFrame& Stereo() const { return stereoFrame_; }
 
@@ -148,6 +158,21 @@ private:
     StereoFrame stereoFrame_;    // this frame's tiles, when stereo_
     ThumbnailDepth thumbDepth_;  // per-thumbnail convergence for the 3D grid
     std::unordered_set<int64_t> refetched_;  // the 3D grid: asked again once for a right eye
+    float viewScale_ = 1.0f;
+    StereoPairs pairs_;                      // the 3D grid: pairs for one-view 3D photos
+    std::function<void(int)> closeFile_;
+    std::unordered_set<int64_t> paired_;     // their slot holds a made pair (full side by side)
+    std::unordered_set<int64_t> noPair_;     // no pair could be made: flat
+
+    // The packing the slot of `item` holds: a made pair is full side by side.
+    StereoLayout SlotLayout(const MediaItem& item, const StereoVerdict& v) const {
+        return paired_.count(item.id) ? StereoLayout::SbsFull : v.layout;
+    }
+    // A 3D photo whose thumbnail is one view, which the 3D grid makes a pair for.
+    bool NeedsPair(const MediaItem& item, const StereoVerdict& v) const {
+        return pairs_.Ready() && item.type == MediaType::Image && v.known && v.stereo && !Packed(v.layout) &&
+               !noPair_.count(item.id);
+    }
 };
 
 } // namespace mp::browser

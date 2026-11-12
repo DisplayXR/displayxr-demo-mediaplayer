@@ -149,8 +149,18 @@ eye in the left-eye views, its right eye in the others. Android only.
   same square of the right eye goes in a second slot (`RightEyeKey`), so the window counts
   two slots per tile; a tile uploaded before the filter is fetched again once for it. The
   pass samples the `ThumbnailAtlas` pages through their ImGui descriptor sets: one bind and
-  one instanced draw per page and eye. A LIF or two-track video's thumbnail is one view, so
-  that tile is flat (the same crop in every view). Folders are flat.
+  one instanced draw per page and eye. Folders are flat.
+- Photos whose thumbnail is one view (a LIF, an MPO) get a pair (`StereoPairs.h`): the
+  request asks the provider for the file too (`ThumbnailRequest::pairFile`), and one
+  low-priority worker reads where the second view is (`LifLoader::FindViews`: trailer and
+  JSON only; `MpoLoader::FindSecondView`: the MP index in the head) and decodes just that
+  JPEG at the eye size (the thumbnail times the 3D mode's view scale) with the platform's
+  scaled decoder (AImageDecoder, Android 11+). The left eye is the system's thumbnail. The
+  pair is kept in memory (24 MB, by id and modified time). LIFs carry no embedded thumbnail
+  or preview to use instead (checked on the phone's: base JPEG + one view blob, no EXIF
+  thumbnail). Still flat: a one-view LIF (depth map only) and two-track videos.
+- Leaving the grid for the player stops the thumbnail requests, so they do not compete
+  with opening the file and its neighbours.
 - Depth per tile (`StereoGrid.h` `TileShift`): `ThumbnailDepth` measures each stereo
   thumbnail once with the player's auto-convergence estimator. The subject goes 0.25 % of
   the tile behind the plane, and further back (up to 1 % for the subject) until the

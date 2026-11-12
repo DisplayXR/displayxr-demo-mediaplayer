@@ -28,7 +28,10 @@
 #include "ImageDecoder.h"   // DecodedImage
 #include "StereoTypes.h"    // StereoLayout
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace mp {
 
@@ -47,6 +50,18 @@ public:
     // often ship with a .jpg extension, so dispatch must detect them by content. Reads
     // only the leading header bytes, stopping at SOS.
     static bool IsMpo(const std::string& path);
+
+    // The same sniff on the file's leading bytes (the media browser reads through a file
+    // descriptor, #180). SniffBytes() of them is always enough.
+    static bool IsMpo(const std::vector<uint8_t>& head);
+    static size_t SniffBytes();
+
+    // Where the second view's JPEG is, from the file's leading bytes `head` (the MP index
+    // sits in the first image's header) and its size: the same pick as Load() — the first
+    // entry after the primary that is not a thumbnail and lies inside the file. For the
+    // browser's stereo thumbnails, which decode that view small without reading the rest.
+    static bool FindSecondView(const std::vector<uint8_t>& head, uint64_t fileSize, uint64_t& offset,
+                               uint64_t& size);
 
     // Parse `path` and compose its first two full-size views into a full-SBS RGBA buffer.
     // Returns ok=false for anything that is not a well-formed two-view MPO — including a

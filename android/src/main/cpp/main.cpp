@@ -498,6 +498,17 @@ request_browser_mode()
 	LOGI("browser: borrowing %s mode %d (active %d)", only3D ? "3D" : "flat", want, g_active_mode);
 }
 
+// The 3D mode's horizontal view scale (the useful size of an eye is a tile times it), from
+// the runtime's mode table: the 3D grid makes its pairs that size even before the switch.
+static float
+stereo_view_scale()
+{
+	const int32_t stereo = g_mode_switch.Stereo();
+	for (uint32_t i = 0; i < g_mode_count; ++i)
+		if ((int32_t)g_modes[i].modeIndex == stereo && g_modes[i].viewScaleX > 0.0f) return g_modes[i].viewScaleX;
+	return 1.0f;
+}
+
 // The 3D grid draws this frame: the "3D only" filter, and the panel already in 3D.
 static bool
 grid_stereo()
@@ -2760,7 +2771,7 @@ render_frame()
 					// the rects of THIS frame's HUD (#180). Without its tiles (flat filter, the
 					// panel not in 3D yet, no HUD this frame) the atlas is drawn as usual.
 					request_browser_mode();
-					g_browser.SetStereo(grid_stereo());
+					g_browser.SetStereo(grid_stereo(), stereo_view_scale());
 					hud_held = record_hud();
 					if (!hud_active ||
 					    !g_grid.draw(g_sbs.frameCmd(), g_atlas.images[img_idx].image, g_atlas.width,
@@ -3066,6 +3077,10 @@ bring_up(struct android_app *app)
 			                         g_vk_device, frames_in_flight(),
 			                         std::string(app->activity->internalDataPath) + "/stereo_verdicts.txt"),
 			    std::memory_order_relaxed);
+			if (g_browser_ready.load(std::memory_order_relaxed))  // the 3D grid's photo pairs (#180)
+				g_browser.SetPairMaker(&mp::browser::AndroidMediaProvider::DecodeJpegScaled,
+				                       &mp::browser::AndroidMediaProvider::ReadFileAt,
+				                       &mp::browser::AndroidMediaProvider::CloseFile);
 			if (g_browser_ready.load(std::memory_order_relaxed))
 				g_stills.Initialize(&mp::browser::AndroidMediaProvider::Instance(), &g_sbs,
 				                    std::string(app->activity->internalDataPath) + "/still_image",

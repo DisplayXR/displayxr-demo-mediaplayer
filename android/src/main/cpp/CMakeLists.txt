@@ -165,6 +165,7 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/browser/SlideGesture.cpp
     ${REPO_ROOT}/src/browser/StereoClassifier.cpp
     ${REPO_ROOT}/src/browser/StereoGrid.cpp       # the 3D grid's pure logic (#180)
+    ${REPO_ROOT}/src/browser/StereoPairs.cpp      # the 3D grid's pairs for LIF / MPO photos
     ${REPO_ROOT}/src/browser/ThumbnailAtlas.cpp
     ${REPO_ROOT}/src/browser/ThumbnailCache.cpp
     ${REPO_ROOT}/src/browser/ThumbnailDepth.cpp   # per-tile convergence for the 3D grid

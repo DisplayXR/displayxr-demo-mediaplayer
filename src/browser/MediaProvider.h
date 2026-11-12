@@ -29,6 +29,9 @@ struct ThumbnailRequest {
     bool checkFile = false;
     // Make it to fit in maxEdge x maxEdge (TileCrop.h's ThumbnailEdge: what fills a tile).
     uint32_t maxEdge = 0;
+    // The 3D grid: also hand the open file over (Thumbnail::file), to make the second view
+    // of a 3D photo whose thumbnail is one view (StereoPairs.h).
+    bool pairFile = false;
 };
 
 struct Thumbnail {
@@ -41,6 +44,10 @@ struct Thumbnail {
     bool file3D = false;
     // The file was read for file3D: asked for, and it opened.
     bool fileChecked = false;
+    // Asked for with pairFile: the file, open (-1 if not), and its size. Whoever takes the
+    // thumbnail owns the descriptor and closes it.
+    int file = -1;
+    uint64_t fileSize = 0;
 };
 
 class MediaProvider {

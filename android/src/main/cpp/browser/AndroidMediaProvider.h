@@ -58,10 +58,20 @@ public:
     bool TakeAccessRequest();
     bool TakeRefreshRequest();
     bool TakeWantedThumbnails(std::vector<ThumbnailRequest>& wanted);
+    // Whether the newest wanted list asks for `id`'s file (ThumbnailRequest::pairFile).
+    bool WantsPairFile(int64_t id) const;
     bool TakeOpenRequest(int64_t& id);
     bool TakeDeleteRequest(std::vector<int64_t>& ids);
     void AddStill(StillSource still);
     bool TakeWantedStills(std::vector<int64_t>& ids, uint32_t& maxEdge);
+
+    // The 3D grid's pair maker (StereoPairs.h), any thread: a JPEG decoded straight to
+    // w x h, scaled by the decoder (the NDK's AImageDecoder, Android 11+; false before), and
+    // reading / closing the descriptors handed over with Thumbnail::file.
+    static bool DecodeJpegScaled(const uint8_t* data, size_t size, uint32_t w, uint32_t h,
+                                 std::vector<uint8_t>& rgba);
+    static bool ReadFileAt(int fd, uint64_t offset, void* dst, size_t size);
+    static void CloseFile(int fd);
 
 private:
     AndroidMediaProvider() = default;

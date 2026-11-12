@@ -1,17 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Unit tests for the 3D grid (#180, src/browser/StereoGrid.h + ThumbnailDepth.h): each
-// eye's crop of a thumbnail, the per-tile convergence shift and its clamp, keeping a
-// shifted crop inside its eye, the tile-rect to per-view quad math, and the rendering-mode
-// borrow that takes the panel to 3D under the "3D only" filter and hands it back.
+// Unit tests for the 3D grid (#180, src/browser/StereoGrid.h, ThumbnailDepth.h,
+// StereoPairs.h): where the right eye's square is, the per-tile convergence shift and its
+// clamp, keeping a shifted crop inside its eye, the tile-rect to per-view quad math, the
+// rendering-mode borrow that takes the panel to 3D under the "3D only" filter and hands it
+// back, and the pairs made for one-view 3D photos (a two-view LIF, an MPO) at small size.
 
 #include "browser/StereoGrid.h"
+#include "browser/StereoPairs.h"
 #include "browser/ThumbnailDepth.h"
+#include "media/ImageDecoder.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
 
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -242,6 +252,135 @@ void TestModeBorrow() {
 
 // The depth of a real-sized thumbnail: a textured SBS pair with the whole picture 8 px in
 // front (eye 256 px: 3.1 %), measured on the worker.
+// --- pairs for one-view 3D photos ------------------------------------------------------
+
+void JpegSink(void* ctx, void* data, int size) {
+    auto* out = static_cast<std::vector<uint8_t>*>(ctx);
+    out->insert(out->end(), (const uint8_t*)data, (const uint8_t*)data + size);
+}
+std::vector<uint8_t> SolidJpeg(int w, int h, uint8_t r, uint8_t g, uint8_t b) {
+    std::vector<uint8_t> rgb((size_t)w * h * 3);
+    for (size_t i = 0; i < (size_t)w * h; ++i) rgb[i * 3] = r, rgb[i * 3 + 1] = g, rgb[i * 3 + 2] = b;
+    std::vector<uint8_t> out;
+    stbi_write_jpg_to_func(&JpegSink, &out, w, h, 3, rgb.data(), 95);
+    return out;
+}
+void PutU32BE(std::vector<uint8_t>& b, uint32_t v) {
+    for (int s = 24; s >= 0; s -= 8) b.push_back((uint8_t)(v >> s));
+}
+// A classic two-view LIF: the base JPEG (left), the right view as blob 1000001.
+std::vector<uint8_t> TwoViewLif(const std::vector<uint8_t>& left, const std::vector<uint8_t>& right) {
+    const std::string json =
+        R"({"views":[{"albedoId":-1,"xLocation":0.0},{"albedoId":1000001,"xLocation":1.0}]})";
+    std::vector<uint8_t> lif = left;
+    const size_t region = lif.size();
+    PutU32BE(lif, 2);
+    PutU32BE(lif, 7);
+    PutU32BE(lif, (uint32_t)json.size());
+    lif.insert(lif.end(), json.begin(), json.end());
+    PutU32BE(lif, 1000001);
+    PutU32BE(lif, (uint32_t)right.size());
+    lif.insert(lif.end(), right.begin(), right.end());
+    PutU32BE(lif, (uint32_t)(lif.size() + 6 - region));
+    lif.push_back(0x1E);
+    lif.push_back(0x1A);
+    return lif;
+}
+
+void TestPairHelpers() {
+    uint32_t ew = 0, eh = 0;
+    PairEyeSize(400, 300, 0.5f, ew, eh);
+    CHECK(ew == 200 && eh == 150, "eye at the view scale: %ux%u", ew, eh);
+    PairEyeSize(400, 300, 2.0f, ew, eh);
+    CHECK(ew == 400 && eh == 300, "never above the thumbnail");
+    PairEyeSize(20, 10, 0.1f, ew, eh);
+    CHECK(ew == 16 && eh == 10, "at least 16 px, within the thumbnail");
+
+    std::vector<uint8_t> src(4 * 2 * 4, 0), out;
+    for (int i = 0; i < 8; ++i) src[i * 4] = (uint8_t)(i % 2 ? 200 : 100);  // red 100,200,...
+    ResizeRgba(src.data(), 4, 2, 2, 1, out);
+    CHECK(out.size() == 8 && out[0] == 150 && out[4] == 150, "box filter averages (%u)", out[0]);
+
+    std::vector<uint8_t> l(2 * 2 * 4, 10), r(2 * 2 * 4, 20), sbs;
+    ComposePair(l, r, 2, 2, sbs);
+    CHECK(sbs.size() == 32 && sbs[0] == 10 && sbs[8] == 20 && sbs[16] == 10 && sbs[31] == 20,
+          "side by side, row by row");
+}
+
+// The pair of a two-view LIF, made from its right view decoded small and its one-view
+// thumbnail, with fake descriptors and a full decode + box filter standing in for the
+// platform's scaled decoder.
+void TestStereoPairs() {
+    const int W = 320, H = 200;
+    const std::vector<uint8_t> lif = TwoViewLif(SolidJpeg(W, H, 220, 30, 30), SolidJpeg(W, H, 30, 30, 220));
+    std::map<int, const std::vector<uint8_t>*> files{{7, &lif}};
+    std::vector<int> closed;
+    std::mutex closedMutex;
+    int decodes = 0;
+    StereoPairs pairs;
+    CHECK(pairs.Initialize(
+              [&](const uint8_t* d, size_t n, uint32_t w, uint32_t h, std::vector<uint8_t>& rgba) {
+                  ++decodes;
+                  const mp::DecodedImage img = mp::ImageDecoder::LoadFromMemory(d, n, "pair");
+                  if (!img.Valid()) return false;
+                  ResizeRgba(img.pixels.data(), (uint32_t)img.width, (uint32_t)img.height, w, h, rgba);
+                  return true;
+              },
+              [&](int fd, uint64_t off, void* dst, size_t n) {
+                  auto it = files.find(fd);
+                  if (it == files.end() || off + n > it->second->size()) return false;
+                  std::memcpy(dst, it->second->data() + off, n);
+                  return true;
+              },
+              [&](int fd) {
+                  std::lock_guard<std::mutex> lock(closedMutex);
+                  closed.push_back(fd);
+              }),
+          "pair maker starts");
+    // The one-view thumbnail: the left view at 160 x 100, red.
+    std::vector<uint8_t> thumb((size_t)160 * 100 * 4);
+    for (size_t i = 0; i < thumb.size(); i += 4) thumb[i] = 220, thumb[i + 1] = 30, thumb[i + 2] = 30, thumb[i + 3] = 255;
+    pairs.Make(42, 1000, 7, lif.size(), thumb.data(), 160, 100, 0.75f);
+    CHECK(pairs.Busy(42), "busy while it is made");
+    std::vector<Thumbnail> made;
+    std::vector<int64_t> failed;
+    for (int i = 0; i < 400 && made.empty() && failed.empty(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        pairs.TakeResults(made, failed);
+    }
+    CHECK(made.size() == 1 && failed.empty(), "a pair is made");
+    if (made.size() == 1) {
+        const Thumbnail& t = made[0];
+        CHECK(t.id == 42 && t.width == 240 && t.height == 75, "eyes at the view scale: %ux%u", t.width, t.height);
+        const uint8_t* lp = &t.rgba[((size_t)37 * t.width + 60) * 4];
+        const uint8_t* rp = &t.rgba[((size_t)37 * t.width + 180) * 4];
+        CHECK(lp[0] > 150 && lp[2] < 100, "left eye: the thumbnail (red)");
+        CHECK(rp[2] > 150 && rp[0] < 100, "right eye: the LIF's second view (blue)");
+    }
+    CHECK(decodes == 1, "only the right view is decoded (%d)", decodes);
+    CHECK(!pairs.Busy(42) && pairs.Has(42, 1000) && !pairs.Has(42, 1001), "cached by id and modified time");
+    Thumbnail again;
+    CHECK(pairs.Cached(42, 1000, again) && again.width == 240, "the cache hands it back");
+    {
+        std::lock_guard<std::mutex> lock(closedMutex);
+        CHECK(closed.size() == 1 && closed[0] == 7, "the descriptor is closed");
+    }
+
+    // A plain JPEG (no LIF trailer, no MP index) has no pair.
+    const std::vector<uint8_t> plain = SolidJpeg(64, 64, 9, 9, 9);
+    files[8] = &plain;
+    pairs.Make(43, 1, 8, plain.size(), thumb.data(), 160, 100, 1.0f);
+    made.clear();
+    for (int i = 0; i < 400 && failed.empty(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        pairs.TakeResults(made, failed);
+    }
+    CHECK(failed.size() == 1 && failed[0] == 43 && made.empty(), "no second view: failed, flat");
+    pairs.Shutdown();
+    std::lock_guard<std::mutex> lock(closedMutex);
+    CHECK(closed.size() == 2, "every descriptor closed (%zu)", closed.size());
+}
+
 void TestThumbnailDepth() {
     const int E = 256, H = 256, W = 2 * E, d = 8;
     std::vector<uint8_t> rgba((size_t)W * H * 4, 255);
@@ -287,6 +426,8 @@ int main() {
     TestBrowserMode();
     TestModeBorrow();
     TestThumbnailDepth();
+    TestPairHelpers();
+    TestStereoPairs();
     if (g_failures) {
         std::fprintf(stderr, "stereo_grid_test: %d failure(s)\n", g_failures);
         return 1;

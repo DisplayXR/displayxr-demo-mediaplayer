@@ -349,6 +349,31 @@ void TestInterleavedThumbnails() {
     std::filesystem::remove(p);
 }
 
+// FindSecondView (#180, the browser's stereo thumbnails): the second view's bytes, from the
+// file's head only, skipping thumbnails, exactly the bytes Load() would decode.
+void TestFindSecondView() {
+    const int w = 240, h = 180;
+    const std::vector<uint8_t> left = MakeJpeg(w, h, 0);
+    const std::vector<uint8_t> right = MakeJpeg(w, h, 7);
+    const std::vector<uint8_t> thumb = MakeFlatJpeg(w, h, 128);
+    MpfOpts o;
+    o.numImages = 4;
+    const std::vector<uint8_t> file =
+        BuildMpoN({left, thumb, right, thumb}, {0x030000u, 0x010002u, 0x020002u, 0x010002u}, o);
+    const std::vector<uint8_t> head(file.begin(), file.begin() + (long)std::min(file.size(), MpoLoader::SniffBytes()));
+    uint64_t off = 0, size = 0;
+    CHECK(MpoLoader::IsMpo(head), "head sniff: MPF found");
+    CHECK(MpoLoader::FindSecondView(head, file.size(), off, size), "second view found from the head");
+    CHECK(size == right.size() && off + size <= file.size() &&
+              std::memcmp(file.data() + off, right.data(), right.size()) == 0,
+          "second view: the right image's bytes, not a thumbnail's");
+    CHECK(!MpoLoader::FindSecondView(head, off, off, size), "a file cut before the view: none");
+
+    const std::vector<uint8_t> plain = MakeJpeg(160, 120, 0);
+    CHECK(!MpoLoader::IsMpo(plain) && !MpoLoader::FindSecondView(plain, plain.size(), off, size),
+          "plain JPEG: no second view");
+}
+
 } // namespace
 
 int main() {
@@ -359,6 +384,7 @@ int main() {
     TestNotAJpeg();
     TestInterleavedThumbnails();
     TestMalformed();
+    TestFindSecondView();
 
     if (g_failures == 0) {
         std::printf("  all checks passed\n");
