@@ -840,6 +840,12 @@ void App::RenderOneFrame() {
         const StageClock::time_point upload0 = StageClock::now();
         double nestedMs = 0.0;
         if (const FrameRing::Frame* vf = ring->AcquireLatest()) {
+            // Off-thread upload: hand the frame over first, so an on-demand copy also runs
+            // while the hooks below do. Only a frame that will be uploaded: not a zero-copy one,
+            // and not while a converted picture is bound. The hooks can unbind it (a size
+            // change) but never bind one, so a frame not staged here is staged below if needed.
+            const bool stageNow = !vf->gpu && !convertBound_;
+            const bool staged = stageNow && renderer_.StageFrame(ring, *vf);
 #if MEDIAPLAYER_PRO
             {
                 // Pro: timecode, measured delay and the rig checks see every uploaded frame.
@@ -886,11 +892,13 @@ void App::RenderOneFrame() {
                 bound = renderer_.BindSharedRGBA(vf->gpuSharedHandle, (uint32_t)vf->width,
                                                  (uint32_t)vf->height);
 #endif
+            if (bound && staged) renderer_.CancelStagedFrame();  // (cannot happen: see stageNow)
             if (!bound) {
-                // Staged off the render thread (copied ahead, or now while we go on), recorded
-                // at CommitUpload; else (MEDIAPLAYER_ASYNC_UPLOAD=0, no free slot) copied here.
+                // Staged off the render thread above (copied ahead, or on demand while we went
+                // on), recorded at CommitUpload; else (MEDIAPLAYER_ASYNC_UPLOAD=0, no free slot,
+                // a frame not staged above) staged now or copied here.
                 const bool i420 = (vf->format == PixFormat::I420);
-                if (!renderer_.StageFrame(ring, *vf))
+                if (!staged && (stageNow || !renderer_.StageFrame(ring, *vf)))
                     renderer_.UploadYUV(vf->plane[0].data(), vf->plane[1].data(),
                                         i420 ? vf->plane[2].data() : nullptr, (uint32_t)vf->width,
                                         (uint32_t)vf->height,

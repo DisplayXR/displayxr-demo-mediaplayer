@@ -201,6 +201,9 @@ public:
     void SetUploadSource(FrameRing* ring);
     bool StageFrame(const FrameRing* ring, const FrameRing::Frame& f);
     void CommitUpload();
+    // The frame staged this iteration will not be shown after all: CommitUpload still waits
+    // for its copy (the frame stays read until then) but records nothing.
+    void CancelStagedFrame() { CancelPendingUpload(); }
     // The HDR tags of the source just uploaded (#134): transfer 0 SDR, 1 HLG, 2 PQ, 3 scene-
     // linear stored as PQ; BT.2020 primaries; the stream's peak in nits (0 = unknown).
     void SetSourceHdr(int transfer, bool bt2020, float peakNits);

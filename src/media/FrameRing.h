@@ -101,7 +101,9 @@ public:
         freeCount_ = 0;
         for (int i = 0; i < kMaxBuffers; ++i)
             if (i != producer_ && i != consumer_ && i != pinned_) free_[freeCount_++] = i;
-        pinnedParked_ = pinned_ >= 0;  // a pin held across this goes to the free list at Unpin
+        // A pin held across this goes to the free list at Unpin, unless it is the consumer's
+        // (that one is released when the consumer moves on, as any other).
+        pinnedParked_ = pinned_ >= 0 && pinned_ != consumer_;
         windowAcquires_ = 0;
         windowMinBacklog_ = kMaxBuffers;
         hasNew_ = false;

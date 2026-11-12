@@ -440,9 +440,9 @@ struct FakeStaging {
 
 void UploaderOnDemand() {
     FakeStaging st;
+    FrameRing ring;  // latest-wins: copies on demand only. Outlives the uploader, as in App.
     au::Uploader up(3, 2, st.Fn());
     CHECK(up.Running() && up.Slots() == 3, "the upload thread runs");
-    FrameRing ring;  // latest-wins: copies on demand only
     up.SetSource(&ring);
 
     uint64_t frame = 0;
@@ -503,9 +503,9 @@ void UploaderOnDemand() {
 
 void UploaderAhead() {
     FakeStaging st;
-    au::Uploader up(5, 1, st.Fn());
-    FrameRing ring;
+    FrameRing ring;  // declared first: the uploader unhooks it in its destructor
     ring.SetQueueDepth(3);
+    au::Uploader up(5, 1, st.Fn());
     up.SetSource(&ring);
     Fill(ring.WriteBuffer(), 1, 128, 32);
     ring.Publish();  // wakes the upload thread through the ring's hook
@@ -525,6 +525,11 @@ void UploaderAhead() {
     up.Record(t, 1);
     const mp::AsyncUploadTally tally = up.TakeTally();
     CHECK(tally.copies == 1 && tally.ahead == 1, "one copy, ahead");
+    up.SetSource(nullptr);  // unhooked: nothing is copied ahead any more
+    Fill(ring.WriteBuffer(), 2, 128, 32);
+    ring.Publish();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // a 16 KB copy takes microseconds
+    CHECK(up.TakeTally().copies == 0, "no source: frame 2 is not copied ahead");
 }
 
 // The upload thread against a producer thread: a queue-mode ring at about the render loop's

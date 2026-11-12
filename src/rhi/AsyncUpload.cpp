@@ -278,28 +278,35 @@ void Uploader::SetSource(FrameRing* ring) {
 Ticket Uploader::Claim(const FrameRing* ring, const FrameRing::Frame& f) {
     if (!running_ || !ring) return Ticket{};
     Ticket t;
+    bool wake = false;
     {
         std::lock_guard<std::mutex> lk(tm_);
-        table_.DropStale(ring, f.serial);  // frames the ring dropped / trimmed, other sources
+        // Frames the ring dropped / trimmed, other sources: their slots can take the next
+        // frames ahead (wake the upload thread for that).
+        wake = table_.DropStale(ring, f.serial) > 0 && src_ != nullptr;
         t = table_.Find(ring, f.serial);
         if (t.Valid()) {  // copied ahead, or being copied
             table_.Claim(t);
-            return t;
+        } else {
+            Layout layout;
+            // Not a staged format, or (never: the render thread waits for each on-demand copy
+            // before its next take) one still pending: the render thread copies it itself.
+            if (!LayoutFor(f, layout) || job_.t.Valid()) {
+                t = Ticket{};
+            } else {
+                t = table_.Reserve(ring, f.serial, /*ahead=*/false);
+                if (t.Valid()) {
+                    table_.Claim(t);
+                    layout_[t.slot] = layout;
+                    job_ = Work{t, &f, layout, nullptr, false};
+                    wake = true;
+                } else {
+                    ++tally_.noSlot;
+                }
+            }
         }
-        Layout layout;
-        if (!LayoutFor(f, layout)) return Ticket{};
-        // One on-demand copy at a time: the render thread waits for each before its next take.
-        if (job_.t.Valid()) return Ticket{};
-        t = table_.Reserve(ring, f.serial, /*ahead=*/false);
-        if (!t.Valid()) {
-            ++tally_.noSlot;
-            return Ticket{};
-        }
-        table_.Claim(t);
-        layout_[t.slot] = layout;
-        job_ = Work{t, &f, layout, nullptr, false};
     }
-    Wake();
+    if (wake) Wake();
     return t;
 }
 
@@ -326,8 +333,14 @@ void Uploader::Record(Ticket t, uint64_t frame) {
 }
 
 void Uploader::Cancel(Ticket t) {
-    std::lock_guard<std::mutex> lk(tm_);
-    table_.Cancel(t);
+    bool wake;
+    {
+        std::lock_guard<std::mutex> lk(tm_);
+        const int before = table_.FreeCount();
+        table_.Cancel(t);
+        wake = table_.FreeCount() > before && src_ != nullptr;  // room to copy ahead again
+    }
+    if (wake) Wake();
 }
 
 void Uploader::Retire(uint64_t completedFrame) {
