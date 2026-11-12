@@ -107,7 +107,7 @@ float SwitchFontPx(float k) { return std::ceil(UiFontPx(k) * 1.2f - 0.001f); }
 
 namespace {
 constexpr float kPi = 3.14159265358979f;  // IM_PI lives in imgui_internal.h; keep our own
-enum class Icon { Play, Pause, Loop, Slideshow, Speaker, SpeakerMuted };
+enum class Icon { Play, Pause, Loop, Slideshow, Speaker, SpeakerMuted, Gallery };
 
 // A borderless icon button: an invisible hit-target with a hand-drawn glyph centered
 // in it (no icon font needed). `active` tints it with the accent color (toggle-on);
@@ -199,6 +199,18 @@ bool IconButton(const char* id, Icon kind, float size, bool active = false,
             }
             break;
         }
+        case Icon::Gallery: {
+            // A 3x3 grid of tiles, corners on whole pixels so the small gaps stay sharp.
+            const float cell = r * 2.0f / 3.0f, half = cell * 0.36f;
+            for (int j = -1; j <= 1; ++j)
+                for (int i = -1; i <= 1; ++i) {
+                    const ImVec2 m(c.x + i * cell, c.y + j * cell);
+                    dl->AddRectFilled(ImVec2(std::round(m.x - half), std::round(m.y - half)),
+                                      ImVec2(std::round(m.x + half), std::round(m.y + half)), u,
+                                      size * 0.02f);
+                }
+            break;
+        }
     }
     return ImGui::IsItemClicked();
 }
@@ -208,26 +220,23 @@ bool IconButton(const char* id, Icon kind, float size, bool active = false,
 // left for 2D. `size` is the knob's diameter; the hit box grows like IconButton's.
 bool ModeSwitch(const char* id, bool on3D, float size, float hitScale) {
     const float pad = size * (std::max(1.0f, hitScale) - 1.0f) * 0.5f;
-    const float trackW = size * 1.7f, trackH = size * 0.68f;
+    const float trackW = size * 1.5f, trackH = size * 0.45f;
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton(id, ImVec2(trackW + pad * 2.0f, size + pad * 2.0f));
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float x0 = p.x + pad, cy = p.y + pad + size * 0.5f, r = size * 0.5f;
     dl->AddRectFilled(ImVec2(x0, cy - trackH * 0.5f), ImVec2(x0 + trackW, cy + trackH * 0.5f),
-                      ImGui::GetColorU32(on3D ? ImVec4(0.91f, 0.91f, 0.93f, 1.0f)
-                                              : ImVec4(0.48f, 0.51f, 0.58f, 0.85f)),
-                      trackH * 0.5f);
+                      ImGui::GetColorU32(ImGuiCol_WindowBg), trackH * 0.5f);  // the bars' background
     const ImVec2 c(on3D ? x0 + trackW - r : x0 + r, cy);
-    // A grey ring parts the knob from the track.
-    dl->AddCircleFilled(c, r, ImGui::GetColorU32(ImVec4(0.50f, 0.50f, 0.52f, 1.0f)));
-    dl->AddCircleFilled(c, r - std::max(1.0f, std::round(size * 0.06f)),
-                        ImGui::GetColorU32(ImVec4(0.96f, 0.96f, 0.97f, 1.0f)));
+    // A 1 px dark grey ring parts the knob from the track.
+    dl->AddCircleFilled(c, r, ImGui::GetColorU32(ImVec4(0.30f, 0.30f, 0.32f, 1.0f)));
+    dl->AddCircleFilled(c, r - 1.0f, ImGui::GetColorU32(ImVec4(0.05f, 0.05f, 0.06f, 1.0f)));
     const char* label = on3D ? "3D" : "2D";
     const float fontPx = g_switchFont->FontSize;
     const ImVec2 ts = g_switchFont->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, label);
     dl->AddText(g_switchFont, fontPx,
                 ImVec2(std::round(c.x - ts.x * 0.5f), std::round(c.y - ts.y * 0.5f)),
-                ImGui::GetColorU32(ImVec4(0.05f, 0.05f, 0.06f, 1.0f)), label);
+                ImGui::GetColorU32(ImVec4(0.96f, 0.96f, 0.97f, 1.0f)), label);
     return ImGui::IsItemClicked();
 }
 
@@ -463,7 +472,9 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);  // flat bar, flush to edges
         if (!s.stripOnly && ImGui::Begin("##wsui_top", nullptr, topbar)) {
             ImGui::BeginDisabled(s.openFilePending);
-            if (ImGui::Button("Open")) Fire(a.Open);
+            if (s.caps.gallery ? IconButton("##gallery", Icon::Gallery, iconSz)
+                               : ImGui::Button("Open"))
+                Fire(a.Open);
             ImGui::EndDisabled();
             if (s.caps.camera || s.caps.url) {
                 ImGui::SameLine();

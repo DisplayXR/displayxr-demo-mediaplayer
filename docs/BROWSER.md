@@ -11,11 +11,12 @@ This is the developer reference.
 In: images and videos from the Android MediaStore, a sidebar of sources (All media,
 Camera, Downloads, Pictures, Movies, Unsupported, "Other files..." for the system picker),
 a square-tile grid, 3D and duration badges, Downloads as folders, select and delete, and
-view options (Both / 3D / 2D, All / Videos / Images, newest or oldest first).
+view options (Both / 3D / 2D, All / Videos / Images, newest or oldest first, show
+unsupported files, off by default).
 
 Out for now: a desktop browser; the VR badge; HEIC and MV-HEVC on Android. Files
 the player cannot open are listed under Unsupported with their format, so the formats
-left to do stay visible. MediaStore does not index MPO, JPS or JFIF as media, so the
+left to do stay findable. MediaStore does not index MPO, JPS or JFIF as media, so the
 gallery cannot list them; "Other files..." reaches them.
 
 ## Structure

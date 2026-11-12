@@ -153,6 +153,7 @@ add_library(mediaplayer_vk_android SHARED
     # input is fed through ImGuiLayer::PushPointer().
     ${REPO_ROOT}/src/ui/TransportUI.cpp
     ${REPO_ROOT}/src/ui/ImGuiLayer.cpp
+    ${REPO_ROOT}/src/ui/TapHandler.cpp         # a tap shows or hides the chrome (#180)
     ${REPO_ROOT}/src/xr/DisplayModeSwitch.cpp  # the player's 2D/3D switch (#180)
     # The media browser (#160, docs/BROWSER.md).
     ${REPO_ROOT}/src/browser/Icons.cpp

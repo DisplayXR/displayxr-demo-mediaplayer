@@ -787,6 +787,11 @@ if(MP_BUILD_TESTS)
     target_include_directories(display_mode_switch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME display_mode_switch COMMAND display_mode_switch_test)
 
+    # The Android player's chrome (#180): a tap shows or hides it. Pure.
+    add_executable(tap_handler_test tests/tap_handler_test.cpp src/ui/TapHandler.cpp)
+    target_include_directories(tap_handler_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME tap_handler COMMAND tap_handler_test)
+
     # Live frames: FrameRing queue mode (one frame per refresh, clock drift costs single
     # drops/repeats instead of bursts). Header-only, pure.
     add_executable(frame_ring_queue_test tests/frame_ring_queue_test.cpp)

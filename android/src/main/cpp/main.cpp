@@ -66,8 +66,10 @@
 #include "audio_player.h"
 #include "ColorPolicy.h"  // swapchain encoding policy, shared with the desktop leg (#78)
 #include "ui/ImGuiLayer.h"
+#include "ui/TapHandler.h"
 #include "ui/TransportUI.h"
 #include "ui/UiScale.h"
+#include "imgui_internal.h"  // FindHoveredWindowEx: is a touch over the chrome
 #include "xr/DisplayModeSwitch.h"
 #include "browser/AndroidMediaProvider.h"
 #include "browser/MediaBrowser.h"
@@ -813,11 +815,8 @@ std::atomic<int> g_display_rotation{0};
 std::atomic<bool> g_portrait{false};
 std::atomic<bool> g_runtime_unavailable{false};
 
-// Transport auto-hide: the bar stays up while paused and for a few seconds
-// after the last touch; during steady playback it fades away. Every touch
-// refreshes the timestamp (so any tap re-reveals the controls).
-std::atomic<int64_t> g_ui_interaction_ns{0};
-constexpr int64_t kOverlayHideAfterNs = 3000000000LL;  // 3 s
+// Whether the chrome shows (#180). Render thread.
+mp::ui::TapHandler g_taps;
 
 int64_t
 now_ns()
@@ -1563,10 +1562,8 @@ fill_transport_state()
 	// Auto-hide: visible while paused or shortly after a touch. The fade itself is
 	// the shared one, so Android now eases in/out like the desktop instead of the
 	// old hard on/off.
-	const bool awake =
-	    (g_is_video && g_video.paused()) ||
-	    (now - g_ui_interaction_ns.load(std::memory_order_relaxed)) < kOverlayHideAfterNs;
-	mp::ui::TickTransportUI(g_ui_state, dt, awake);
+	g_taps.SetHeld(g_is_video && g_video.paused());
+	mp::ui::TickTransportUI(g_ui_state, dt, g_taps.Shown((double)now * 1e-9));
 }
 
 // Swapchain colour-encoding choice (#78 on desktop; runtime #1589 / #1623). Since
@@ -1765,6 +1762,7 @@ hud_init()
 	g_ui_state.caps.loop = false;
 	g_ui_state.caps.mode = false;
 	g_ui_state.caps.layout = false;
+	g_ui_state.caps.gallery = true;
 	g_ui_state.hitTargetScale = 1.35f;
 
 	g_ui_actions.Open = [] {
@@ -2077,6 +2075,38 @@ press_on_chrome()
 	return io.MouseDown[0] && io.MouseDownOwned[0];
 }
 
+// Whether (x, y) is over the chrome as last drawn.
+static bool
+chrome_at(float x, float y)
+{
+	if (!g_imgui.Ready()) return false;
+	ImGuiWindow *hovered = nullptr, *under_moving = nullptr;
+	ImGui::FindHoveredWindowEx(ImVec2(x, y), false, &hovered, &under_moving);
+	return hovered != nullptr;
+}
+
+// A touch for the chrome. In the player the TapHandler shows or hides it, and ImGui gets
+// only the presses made while it showed, so a tap that brings it back presses nothing.
+// Elsewhere (the browser, the idle screen) ImGui gets every touch, and each one shows it.
+static void
+route_touch(const TouchEvent &e, bool in_player)
+{
+	static bool to_imgui = false;  // the current press's
+	if (!in_player || browser_showing()) {
+		g_taps.Show(e.t);
+		if (e.action == 0) to_imgui = true;
+	} else {
+		switch (e.action) {
+		case 0: to_imgui = g_taps.Press(e.x, e.y, e.t, chrome_at(e.x, e.y)); break;
+		case 1: g_taps.Release(e.x, e.y, e.t); break;
+		case 2: g_taps.Move(e.x, e.y, e.t); break;
+		default: g_taps.Cancel(e.t); break;  // a cancel, or a second finger
+		}
+	}
+	if (to_imgui && g_hud_ready && !g_ws_layer_unsupported.load(std::memory_order_relaxed))
+		g_imgui.PushPointer(e.action, e.x, e.y);
+}
+
 // Once a frame, before the atlas draw: hand the swipe its touches and neighbours, open the
 // file it asks for, and place the picture and the neighbour's page.
 static void
@@ -2088,16 +2118,20 @@ run_slide()
 		g_slide_arrived = false;
 	}
 	static std::vector<TouchEvent> touches;  // static: both queues keep their capacity
+	static std::vector<TouchEvent> held;     // the swipe's, while one slides or opens
 	touches.clear();
 	{
-		// A swipe made while one slides or opens waits its turn, and ends that slide early.
 		std::lock_guard<std::mutex> lk(g_touch_mx);
-		if (!g_slide.Busy())
-			touches.swap(g_touches);
-		else if (!g_touches.empty())
-			g_slide.Hurry();
+		touches.swap(g_touches);
 	}
 	const bool in_player = !g_showing_splash.load(std::memory_order_relaxed);
+	g_taps.SetSlop(mp::ui::Px(kDragSlop));
+	for (const TouchEvent &e : touches) route_touch(e, in_player);
+	if (in_player)
+		held.insert(held.end(), touches.begin(), touches.end());
+	else
+		held.clear();
+	if (held.size() > 256) held.erase(held.begin(), held.end() - 256);  // a long load: keep the latest
 	if (!g_slide.Waiting()) {  // the page shown while a file opens must stay
 		int64_t prev = -1, next = -1;  // left as -1 when there is none
 		const bool has_prev = in_player && g_browser.NextId(-1, prev);
@@ -2106,14 +2140,19 @@ run_slide()
 		g_stills.Want(prev, next);
 	}
 	g_slide.SetMetrics((float)g_hud_w, mp::ui::Px(kDragSlop), mp::ui::Px(kSwipeMin));
-	for (const TouchEvent &e : touches) {
-		if (!in_player) break;
-		switch (e.action) {
-		case 0: g_slide.Press(e.x, e.y); break;
-		case 1: g_slide.Release(e.t); break;
-		case 2: g_slide.Move(e.x, e.y); break;
-		default: g_slide.Cancel(e.t); break;  // a cancel, or a second finger
+	// A swipe made while one slides or opens waits its turn, and ends that slide early.
+	if (g_slide.Busy()) {
+		if (!held.empty()) g_slide.Hurry();
+	} else {
+		for (const TouchEvent &e : held) {
+			switch (e.action) {
+			case 0: g_slide.Press(e.x, e.y); break;
+			case 1: g_slide.Release(e.t); break;
+			case 2: g_slide.Move(e.x, e.y); break;
+			default: g_slide.Cancel(e.t); break;  // a cancel, or a second finger
+			}
 		}
+		held.clear();
 	}
 	const int step = g_slide.Update(now);
 	if (step != 0) g_slide_step = step;
@@ -2749,8 +2788,8 @@ render_frame()
 		//    a bar that only appears after a first tap is two taps for no reason.
 		//    A tap that ImGui claimed (the Open button itself, or any widget) is NOT
 		//    ours — firing on it too would launch the picker twice.
-		//  * Media loaded — the tap belongs to the chrome; revealing it is the whole
-		//    gesture, and nativeTouch's interaction stamp has already done that.
+		//  * Media loaded: the tap is the TapHandler's (route_touch), which shows or
+		//    hides the chrome.
 		//
 		// chrome_available still gates the no-chrome path so a tap before the first
 		// frame (or on a runtime without window-space layers) cannot fire it twice.
@@ -3001,7 +3040,7 @@ bring_up(struct android_app *app)
 	if (__system_property_get("debug.dxr.mp.file", dbgFile) > 0 && dbgFile[0] != '\0' &&
 	    dbg_is_image(dbgFile)) {
 		if (load_image_file(dbgFile, dbgFile)) {
-			g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
+			g_taps.Wake((double)now_ns() * 1e-9);
 			LOGI("DEBUG auto-load (image): %s", dbgFile);
 		}
 	} else if (dbgFile[0] != '\0' && (g_lvf_dbg = open_dual_if_lvf(dbgFile, -1, 0, 0, dbgFile),
@@ -3020,7 +3059,7 @@ bring_up(struct android_app *app)
 			             g_video.width(), g_video.height());
 		}
 		g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
-		g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
+		g_taps.Wake((double)now_ns() * 1e-9);
 		LOGI("DEBUG auto-load: %s (layout %s)", dbgFile, mp::LayoutName(g_layout));
 	} else {
 		// Start on the browser, over the idle splash (#180). Without a HUD there is no
@@ -3215,10 +3254,9 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativePickCancelled(
 // Raw touch, normalized to the WINDOW (not the display — see MainActivity).
 //
 // This runs on the Android UI thread while ImGui is driven from the render thread,
-// so it must NEVER touch ImGui state: it only enqueues into ImGuiLayer's
-// thread-safe pointer queue and records that a clean tap is pending. The render
-// thread adjudicates the tap against WantCaptureMouse() once ImGui has processed
-// the frame — that is what stops a tap on a widget ALSO firing the content gesture.
+// so it must NEVER touch ImGui state: it only queues the touch for the render
+// thread (route_touch hands it to ImGui and the chrome's TapHandler) and records
+// that a clean tap is pending, for the idle screen.
 //
 // Returns void: the SAF picker is now requested through g_open_picker_request and
 // polled by Java per Choreographer frame, the same poll-don't-push shape the
@@ -3232,7 +3270,6 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 	static float downX = 0.0f, downY = 0.0f;
 	constexpr int kDown = 0, kUp = 1, kMove = 2;
 
-	g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);  // re-reveal the chrome
 	{
 		std::lock_guard<std::mutex> lk(g_touch_mx);
 		if (g_touches.size() >= 256) g_touches.erase(g_touches.begin());  // a long load: keep the latest
@@ -3245,12 +3282,6 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 		moved = false;
 	} else if (action == kMove) {
 		if (std::fabs(nx - downX) + std::fabs(ny - downY) > 0.01f) moved = true;
-	}
-
-	// Feed ImGui in HUD pixels. The HUD covers the whole per-eye tile, so the window
-	// fraction maps straight onto it.
-	if (g_hud_ready && !g_ws_layer_unsupported.load(std::memory_order_relaxed)) {
-		g_imgui.PushPointer((int)action, nx * (float)g_hud_w, ny * (float)g_hud_h);
 	}
 
 	if (action == kUp && !moved) {
@@ -3416,7 +3447,7 @@ android_main(struct android_app *app)
 							apply_layout(vinfo.layout, g_video.width(), g_video.height());
 						}
 						g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
-						g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
+						g_taps.Wake((double)now_ns() * 1e-9);
 						LOGI("Opened picked video (fd=%d, audio_fd=%d, layout %s)", pick, audio_fd,
 						     mp::LayoutName(g_layout));
 						if (g_stereo_dual && g_hud_ready) {
