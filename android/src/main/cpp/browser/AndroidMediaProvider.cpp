@@ -2,15 +2,20 @@
 #include "browser/AndroidMediaProvider.h"
 
 #include "LifLoader.h"
+#include "MpoLoader.h"
 #include "lvf_probe_android.h"
 
 #include <android/api-level.h>
+#include <dlfcn.h>
 #include <jni.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace mp::browser {
 
@@ -121,6 +126,13 @@ bool AndroidMediaProvider::TakeRefreshRequest() {
     return std::exchange(refreshRequested_, false);
 }
 
+bool AndroidMediaProvider::WantsPairFile(int64_t id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const ThumbnailRequest& w : wanted_)
+        if (w.id == id) return w.pairFile;
+    return false;
+}
+
 bool AndroidMediaProvider::TakeWantedThumbnails(std::vector<ThumbnailRequest>& wanted) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!wantedChanged_) return false;
@@ -159,6 +171,71 @@ bool AndroidMediaProvider::TakeWantedStills(std::vector<int64_t>& ids, uint32_t&
     return true;
 }
 
+namespace {
+
+// AImageDecoder (libjnigraphics, API 30), looked up at run time: the app's minimum is 29.
+struct ImageDecoderApi {
+    using Create = int (*)(const void*, size_t, void**);
+    using SetTarget = int (*)(void*, int32_t, int32_t);
+    using Stride = size_t (*)(void*);
+    using Decode = int (*)(void*, void*, size_t, size_t);
+    using Delete = void (*)(void*);
+    Create create = nullptr;
+    SetTarget setTarget = nullptr;
+    Stride stride = nullptr;
+    Decode decode = nullptr;
+    Delete del = nullptr;
+    bool ok = false;
+
+    ImageDecoderApi() {
+        void* lib = dlopen("libjnigraphics.so", RTLD_NOW);
+        if (!lib) return;
+        create = (Create)dlsym(lib, "AImageDecoder_createFromBuffer");
+        setTarget = (SetTarget)dlsym(lib, "AImageDecoder_setTargetSize");
+        stride = (Stride)dlsym(lib, "AImageDecoder_getMinimumStride");
+        decode = (Decode)dlsym(lib, "AImageDecoder_decodeImage");
+        del = (Delete)dlsym(lib, "AImageDecoder_delete");
+        ok = create && setTarget && stride && decode && del;
+    }
+};
+
+} // namespace
+
+bool AndroidMediaProvider::DecodeJpegScaled(const uint8_t* data, size_t size, uint32_t w, uint32_t h,
+                                            std::vector<uint8_t>& rgba) {
+    static const ImageDecoderApi api;  // thread-safe static init
+    if (!api.ok || !data || size == 0 || w == 0 || h == 0) return false;
+    void* dec = nullptr;
+    if (api.create(data, size, &dec) != 0 || !dec) return false;  // ANDROID_IMAGE_DECODER_SUCCESS == 0
+    bool ok = api.setTarget(dec, (int32_t)w, (int32_t)h) == 0;     // RGBA_8888 is the default format
+    if (ok) {
+        const size_t stride = api.stride(dec);
+        std::vector<uint8_t> buf(stride * h);
+        ok = stride >= (size_t)w * 4 && api.decode(dec, buf.data(), stride, buf.size()) == 0;
+        if (ok) {
+            rgba.resize((size_t)w * h * 4);
+            for (uint32_t y = 0; y < h; ++y)
+                std::memcpy(rgba.data() + (size_t)y * w * 4, buf.data() + (size_t)y * stride, (size_t)w * 4);
+        }
+    }
+    api.del(dec);
+    return ok;
+}
+
+bool AndroidMediaProvider::ReadFileAt(int fd, uint64_t offset, void* dst, size_t size) {
+    size_t done = 0;
+    while (done < size) {
+        const ssize_t n = pread(fd, (uint8_t*)dst + done, size - done, (off_t)(offset + done));
+        if (n <= 0) return false;
+        done += (size_t)n;
+    }
+    return true;
+}
+
+void AndroidMediaProvider::CloseFile(int fd) {
+    if (fd >= 0) close(fd);
+}
+
 } // namespace mp::browser
 
 // ─── JNI: MediaStoreProvider.kt ──────────────────────────────────────────
@@ -190,7 +267,7 @@ std::vector<jlong> Longs(JNIEnv* env, jlongArray array) {
     return out;
 }
 
-// Is the file itself 3D: a two-track (LVF) video, or a LIF? Closes `fd`.
+// Is the file itself 3D: a two-track (LVF) video, a LIF, or an MPO (#180)? Closes `fd`.
 bool File3D(int fd, bool video) {
     if (fd < 0) return false;
     struct stat st{};
@@ -203,6 +280,10 @@ bool File3D(int fd, bool video) {
                 return pread(fd, dst, size, (off_t)offset) == (ssize_t)size;
             };
             is3D = mp::LifLoader::IsLif(readAt, (uint64_t)st.st_size);
+            if (!is3D) {
+                std::vector<uint8_t> head((size_t)std::min<uint64_t>((uint64_t)st.st_size, mp::MpoLoader::SniffBytes()));
+                is3D = !head.empty() && readAt(0, head.data(), head.size()) && mp::MpoLoader::IsMpo(head);
+            }
         }
     }
     close(fd);
@@ -265,6 +346,16 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeThumbnail(
         env->GetByteArrayRegion(rgba, 0, (jsize)t.rgba.size(), (jbyte*)t.rgba.data());
     }
     t.fileChecked = fd >= 0;
+    // The 3D grid asked for the file too (a one-view 3D photo's pair, StereoPairs.h): hand
+    // over a copy of the descriptor, which the browser's pair maker closes.
+    if (fd >= 0 && video == JNI_FALSE && AndroidMediaProvider::Instance().WantsPairFile(id)) {
+        struct stat st{};
+        const int copy = fstat(fd, &st) == 0 ? dup(fd) : -1;
+        if (copy >= 0) {
+            t.file = copy;
+            t.fileSize = (uint64_t)st.st_size;
+        }
+    }
     t.file3D = File3D(fd, video != JNI_FALSE);
     AndroidMediaProvider::Instance().AddThumbnail(std::move(t));
 }
@@ -302,7 +393,9 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeTakeWantedT
     triples.reserve(wanted.size() * 3);
     for (const mp::browser::ThumbnailRequest& w : wanted) {
         triples.push_back((jlong)w.id);
-        triples.push_back(w.checkFile ? 1 : 0);
+        // Flags: 1 = check the file (Thumbnail::file3D), 2 = hand it over (pairFile). Java
+        // opens the file for any non-zero value.
+        triples.push_back((w.checkFile ? 1 : 0) | (w.pairFile ? 2 : 0));
         triples.push_back((jlong)w.maxEdge);
     }
     jlongArray out = env->NewLongArray((jsize)triples.size());

@@ -316,6 +316,50 @@ void TestIsLifReadAt() {
     CHECK(!IsLifBytes({0x1A}), "read-at: shorter than the trailer");
 }
 
+// FindViews (#180, the browser's stereo thumbnails): where each view's JPEG is, read
+// through a callback, left/right by camera x, with no view decoded.
+bool FindViewsBytes(const std::vector<uint8_t>& bytes, LifLoader::ViewSpan& l, LifLoader::ViewSpan& r) {
+    return LifLoader::FindViews(
+        [&](uint64_t off, void* dst, size_t n) {
+            if (off + n > bytes.size()) return false;
+            std::memcpy(dst, bytes.data() + off, n);
+            return true;
+        },
+        bytes.size(), l, r);
+}
+
+void TestFindViews() {
+    std::printf("[FindViews: view spans without decoding]\n");
+    const auto red = MakeSolidJpeg(kW, kH, 220, 30, 30);
+    const auto blue = MakeSolidJpeg(kW, kH, 30, 30, 220);
+    const std::string classic =
+        R"({"views":[{"albedoId":-1,"xLocation":0.0},{"albedoId":1000001,"xLocation":1.0}]})";
+    const auto lif = BuildLif(red, {{7, JsonBytes(classic)}, {1000001, blue}});
+    LifLoader::ViewSpan l, r;
+    CHECK(FindViewsBytes(lif, l, r), "spans: classic two-view LIF");
+    CHECK(l.base && l.offset == 0 && l.size >= red.size(), "spans: left is the base JPEG");
+    CHECK(!r.base && r.size == blue.size() &&
+              std::memcmp(lif.data() + r.offset, blue.data(), blue.size()) == 0,
+          "spans: right is the embedded blob, byte for byte");
+
+    // 5.x schema, the base JPEG to the RIGHT of the blob: the spans swap.
+    const std::string modern =
+        R"({"views":[{"image":{"blob_id":-1},"position":[0.5,0,0]},)"
+        R"({"image":{"blob_id":1000002},"position":[-0.5,0,0]}]})";
+    const auto lif2 = BuildLif(red, {{8, JsonBytes(modern)}, {1000002, blue}});
+    CHECK(FindViewsBytes(lif2, l, r), "spans: 5.x schema");
+    CHECK(!l.base && r.base, "spans: ordered by camera x, not by index");
+
+    const std::string one = R"({"views":[{"image":{"blob_id":-1},"position":[0,0,0]}]})";
+    CHECK(!FindViewsBytes(BuildLif(red, {{8, JsonBytes(one)}}), l, r), "spans: one view is not a pair");
+    const std::string missing =
+        R"({"views":[{"albedoId":-1,"xLocation":0.0},{"albedoId":1000009,"xLocation":1.0}]})";
+    CHECK(!FindViewsBytes(BuildLif(red, {{7, JsonBytes(missing)}, {1000001, blue}}), l, r),
+          "spans: a blob id with no field");
+    CHECK(!FindViewsBytes(red, l, r), "spans: a plain JPEG");
+    CHECK(!FindViewsBytes(BuildLif(red, {{7, JsonBytes("{not json")}}), l, r), "spans: bad JSON");
+}
+
 } // namespace
 
 int main() {
@@ -328,6 +372,7 @@ int main() {
     TestNonLifFallback();
     TestTruncatedRegion();
     TestIsLifReadAt();
+    TestFindViews();
     if (g_failures == 0) {
         std::printf("ALL PASSED\n");
         return 0;

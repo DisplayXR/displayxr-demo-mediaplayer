@@ -805,6 +805,28 @@ if(MP_BUILD_TESTS)
     target_include_directories(slide_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME slide_gesture COMMAND slide_gesture_test)
 
+    # Media browser (#180): the 3D grid's right-eye squares, per-tile convergence, per-view
+    # quads and the rendering-mode borrow, the thumbnail depth worker, and the pairs made for
+    # one-view 3D photos (LIF / MPO). Pure, two worker threads.
+    add_executable(stereo_grid_test
+        tests/stereo_grid_test.cpp
+        src/browser/StereoGrid.cpp
+        src/browser/StereoPairs.cpp
+        src/browser/ThumbnailDepth.cpp
+        src/media/AutoConvergence.cpp
+        src/media/LifLoader.cpp
+        src/media/MpoLoader.cpp
+        src/media/DepthWarp.cpp
+        src/media/StereoCompose.cpp
+        src/media/ImageDecoder.cpp
+        src/Log.cpp)
+    target_include_directories(stereo_grid_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    find_package(Threads REQUIRED)
+    target_link_libraries(stereo_grid_test PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+    add_test(NAME stereo_grid COMMAND stereo_grid_test)
+
     # The Android player's 2D/3D switch (#180): which rendering mode a flip asks for. Pure.
     add_executable(display_mode_switch_test tests/display_mode_switch_test.cpp
         src/xr/DisplayModeSwitch.cpp)

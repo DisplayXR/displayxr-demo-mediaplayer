@@ -30,9 +30,11 @@ public:
     // Desktop rule (XrSession::FindFlatMode): mono and lens off first; a mono mode that
     // leaves the lens on still beats a stereo one; -1 when nothing is flat.
     int32_t Flat() const;
+    // The 3D mode a flip from 2D asks for: the one last in force, else the first that turns
+    // the lens on; -1 when there is none. (The browser's 3D grid borrows it too, #180.)
+    int32_t Stereo() const;
 
 private:
-    int32_t Stereo() const;
 
     std::vector<Mode> modes_;
     bool is3D_ = false;

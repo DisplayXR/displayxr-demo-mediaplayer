@@ -280,6 +280,81 @@ bool LifLoader::IsLif(const std::string& path) {
     return (bool)f && tail[0] == 0x1E && tail[1] == 0x1A;
 }
 
+bool LifLoader::FindViews(const ReadAtFn& readAt, uint64_t fileSize, ViewSpan& left, ViewSpan& right) {
+    constexpr uint32_t kMaxFields = 256;
+    constexpr uint32_t kMaxJson = 1u << 20;
+    auto u32 = [&](uint64_t at, uint32_t& v) {
+        uint8_t b[4];
+        if (!readAt(at, b, 4)) return false;
+        v = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
+        return true;
+    };
+    uint8_t tail[2] = {0, 0};
+    if (fileSize < 6 || !readAt(fileSize - 2, tail, 2) || tail[0] != 0x1E || tail[1] != 0x1A) return false;
+    uint32_t regionOffset = 0, count = 0;
+    if (!u32(fileSize - 6, regionOffset) || regionOffset == 0 || regionOffset > fileSize) return false;
+    const uint64_t region = fileSize - regionOffset;
+    if (!u32(region, count) || count > kMaxFields) return false;
+    struct Span { uint32_t type; uint64_t offset; uint32_t size; };
+    std::vector<Span> fields;
+    uint64_t cur = region + 4;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t type = 0, size = 0;
+        if (!u32(cur, type) || !u32(cur + 4, size)) return false;
+        cur += 8;
+        if (cur + size > fileSize) return false;
+        fields.push_back(Span{type, cur, size});
+        cur += size;
+    }
+    auto find = [&](uint32_t type) -> const Span* {
+        for (const Span& f : fields)
+            if (f.type == type) return &f;
+        return nullptr;
+    };
+    const Span* meta = find(kJsonMetaNew);
+    if (!meta) meta = find(kJsonMetaOld);
+    if (!meta || meta->size == 0 || meta->size > kMaxJson) return false;
+    std::vector<uint8_t> text(meta->size);
+    if (!readAt(meta->offset, text.data(), text.size())) return false;
+    json root;
+    try {
+        root = json::parse(text.begin(), text.end());
+    } catch (const std::exception&) {
+        return false;
+    }
+    if (!root.contains("views") || !root["views"].is_array() || root["views"].size() < 2) return false;
+    // The same blob-id rules as ResolveView: 5.x image/albedo.blob_id, classic albedoId;
+    // -1 is the base JPEG.
+    auto resolve = [&](const json& view, ViewSpan& out, float& posX) {
+        const json* img = nullptr;
+        if (view.contains("image") && view["image"].is_object()) img = &view["image"];
+        else if (view.contains("albedo") && view["albedo"].is_object()) img = &view["albedo"];
+        int64_t blobId = 0;
+        if (img && img->contains("blob_id") && (*img)["blob_id"].is_number_integer()) {
+            blobId = (*img)["blob_id"].get<int64_t>();
+        } else if (view.contains("albedoId") && view["albedoId"].is_number_integer()) {
+            blobId = view["albedoId"].get<int64_t>();
+        } else {
+            return false;
+        }
+        if (blobId == -1) {
+            out = ViewSpan{0, region, true};
+        } else {
+            const Span* f = blobId >= 0 ? find((uint32_t)blobId) : nullptr;
+            if (!f) return false;
+            out = ViewSpan{f->offset, f->size, false};
+        }
+        posX = ViewPosX(view);
+        return true;
+    };
+    ViewSpan a, b;
+    float ax = 0.0f, bx = 0.0f;
+    if (!resolve(root["views"][0], a, ax) || !resolve(root["views"][1], b, bx)) return false;
+    left = ax <= bx ? a : b;
+    right = ax <= bx ? b : a;
+    return true;
+}
+
 bool LifLoader::IsLif(const ReadAtFn& readAt, uint64_t fileSize) {
     unsigned char tail[2] = {0, 0};
     return fileSize >= 2 && readAt(fileSize - 2, tail, 2) && tail[0] == 0x1E && tail[1] == 0x1A;

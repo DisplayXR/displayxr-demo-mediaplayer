@@ -33,6 +33,9 @@ src/browser/                    namespace mp::browser, platform-neutral
   ThumbnailCache.{h,cpp}        media id -> atlas slot, least recently used reuse
   TileCrop.{h,cpp}              the part of a thumbnail a tile shows, and the size to ask for
   StereoClassifier.{h,cpp}      3D badge verdicts: background thread, cached on disk
+  StereoGrid.{h,cpp}            the 3D grid: eye crops, per-tile convergence, per-view quads,
+                                the rendering-mode borrow
+  ThumbnailDepth.{h,cpp}        the 3D grid: each stereo thumbnail's depth, on a worker
   TouchScroller.{h,cpp}         drag, inertia, tap vs drag
   SlideGesture.{h,cpp}          swiping to the next or previous file in the player
   BrowserLayout.{h,cpp}         pure layout: columns by width, rail or drawer, date sections,
@@ -44,9 +47,11 @@ android/src/main/cpp/browser/
   AndroidMediaProvider.{h,cpp}  MediaProvider over JNI, plus the swipe's stills; its JNI
                                 exports live here
 
-android/src/main/cpp/           the player side of the swipe
+android/src/main/cpp/           the player side of the swipe, and the 3D grid's pass
   neighbour_stills.{h,cpp}      the files either side of the one playing, ready on the GPU
   still_image.{h,cpp}           an image decoded as the player shows it, for opening and stills
+  stereo_grid.{h,cpp}           the 3D grid's tiles drawn into the projection atlas
+  shaders/stereo_grid.{vert,frag}
 
 android/src/main/java/.../
   MediaStoreProvider.kt         MediaStore query, permissions, thumbnails, stills, opening a file
@@ -54,8 +59,8 @@ android/src/main/java/.../
 tests/
   media_library_test.cpp, stereo_classifier_test.cpp, thumbnail_cache_test.cpp,
   tile_crop_test.cpp, letterbox_test.cpp (src/media/Letterbox),
-  touch_scroller_test.cpp, slide_gesture_test.cpp, browser_layout_test.cpp,
-  zoom_gesture_test.cpp
+  touch_scroller_test.cpp, slide_gesture_test.cpp, stereo_grid_test.cpp,
+  browser_layout_test.cpp, zoom_gesture_test.cpp
 ```
 
 ## Rules
@@ -107,7 +112,8 @@ thumbnail, as `Thumbnail::file3D`. The verdict also picks the thumbnail
 crop: the left eye for side by side, the top for top-bottom, the whole thumbnail for a
 LIF or two-track video, whose thumbnail is already one view.
 
-The "3D" badge sits at the tile's top left (right of the box in select mode). The top
+The "3D" badge sits at the tile's top left (right of the box in select mode; hidden in
+the 3D grid, where every tile is 3D). The top
 right holds a video's length and, under Unsupported, the file's format.
 
 ## Thumbnails
@@ -137,11 +143,61 @@ slot (512 px) holds exactly what the tile shows.
   the tile shows. Videos only: a still with a dark surround is more often a screenshot of a
   dialog than a letterboxed picture, and the measurement cannot tell them apart.
 
+## 3D grid
+
+Under the "3D only" filter the panel goes to its 3D mode and every tile is stereo: its left
+eye in the left-eye views, its right eye in the others. Android only.
+
+- No weave extension: the tiles are drawn into the app's own projection atlas, view by view,
+  at the rects the browser laid out that frame (`MediaBrowser::Stereo()`), by
+  `StereoGridRenderer`, which replaces the atlas pass for that frame. The browser lays out
+  first, so a scrolling tile is never drawn a frame behind the HUD.
+- The ImGui HUD stays the flat chrome (a window-space layer at disparity 0). It is
+  transparent over the grid: the bars, the chip row, the rail or drawer, folders, section
+  headers, badges and messages are flat,
+  the tiles' pictures are in the projection layer.
+- A tile's slot holds only the left eye's square (see Thumbnails). Under the filter the
+  same square of the right eye goes in a second slot (`RightEyeKey`), so the window counts
+  two slots per tile; a tile uploaded before the filter is fetched again once for it. The
+  pass samples the `ThumbnailAtlas` pages through their ImGui descriptor sets: one bind and
+  one instanced draw per page and eye. Folders are flat.
+- Photos whose thumbnail is one view (a LIF, an MPO) get a pair (`StereoPairs.h`): the
+  request asks the provider for the file too (`ThumbnailRequest::pairFile`), and one
+  low-priority worker reads where the second view is (`LifLoader::FindViews`: trailer and
+  JSON only; `MpoLoader::FindSecondView`: the MP index in the head) and decodes just that
+  JPEG at the eye size (the thumbnail times the 3D mode's view scale) with the platform's
+  scaled decoder (AImageDecoder, Android 11+). The left eye is the system's thumbnail. The
+  pair is kept in memory (24 MB, by id and modified time). LIFs carry no embedded thumbnail
+  or preview to use instead (checked on the phone's: base JPEG + one view blob, no EXIF
+  thumbnail). Still flat: a one-view LIF (depth map only) and two-track videos.
+- Leaving the grid for the player stops the thumbnail requests, so they do not compete
+  with opening the file and its neighbours.
+- Depth per tile (`StereoGrid.h` `TileShift`): `ThumbnailDepth` measures each stereo
+  thumbnail once with the player's auto-convergence estimator. The subject goes 0.25 % of
+  the tile behind the plane, and further back (up to 1 % for the subject) until the
+  nearest content is at the plane. Unmeasured tiles go 0.5 % back. A slot holds only the
+  square, so the two crops move apart by zooming in about as much as the shift. Every tile fades to
+  the flat background over a 3 dp border, so a border never cuts something in front of the
+  plane. The gutter widens from 4 to 12 dp.
+- The "3D" badge is hidden (every tile is 3D) and the duration sits on an opaque pill.
+- Modes (`ModeBorrow`): the browser borrows flat, or the 3D mode under the filter, and
+  hands back to the player the mode it had. Only the filter decides, never what the grid
+  happens to show, so a scroll never flips modes. Back from the player into a 3D-filtered
+  grid goes back to 3D. Until the panel is in 3D the grid is drawn flat as before.
+- Resolution: a tile's useful size per eye is its rect times the mode's view scale (0.75 on
+  the phone, half the width on a side-by-side panel); a video's squares are made about 1:1
+  with the tile, so they cover it. A side-by-side photo keeps the system's cached thumbnail
+  (see Thumbnails), so its eyes can be softer than the tile.
+- Only the browser's grid: the pass runs only while the browser shows, under the filter,
+  with the panel in 3D. The player's frames (and the swipe's pages) always take the atlas
+  pass as before.
+
 ## Android behaviour
 
 - Launch opens the browser, over the idle splash. Without a HUD there is no browser and a
   tap on the splash opens the system picker.
-- The browser borrows the flat 2D mode and hands it back on play.
+- The browser borrows the flat 2D mode (the 3D mode under "3D only", see 3D grid) and hands
+  the player's mode back on play.
 - Back from the player stops playback and returns to the browser at the same source and
   scroll position and folder. Back in the browser closes the drawer or a sheet, then leaves
   select mode, then goes up a folder, then goes to the home screen.

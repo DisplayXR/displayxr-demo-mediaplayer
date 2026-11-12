@@ -47,6 +47,18 @@ public:
     using ReadAtFn = std::function<bool(uint64_t offset, void* dst, size_t size)>;
     static bool IsLif(const ReadAtFn& readAt, uint64_t fileSize);
 
+    // Where a two-view LIF's two view JPEGs are in the file, left then right by camera x,
+    // read through `readAt` without loading the views: the trailer, the field headers and
+    // the JSON only (a few KB of a 20 MB file). For the media browser's stereo thumbnails
+    // (#180), which decode each view small. `base` = the view is the base JPEG (file
+    // offset 0, up to the metadata region). False for anything else: no trailer, bad
+    // JSON, fewer than two views (a one-view LIF's pair needs its depth map: Load()).
+    struct ViewSpan {
+        uint64_t offset = 0, size = 0;
+        bool base = false;
+    };
+    static bool FindViews(const ReadAtFn& readAt, uint64_t fileSize, ViewSpan& left, ViewSpan& right);
+
     // Parse `path` and produce a renderable image:
     //   * 2+ views  -> compose left|right into a full-SBS RGBA buffer (SbsFull, stereo=true)
     //   * 1 view + disparity map -> generate left|right the same way (SbsFull, stereo=true)
