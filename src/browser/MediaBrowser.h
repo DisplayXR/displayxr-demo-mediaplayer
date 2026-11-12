@@ -80,6 +80,7 @@ private:
     void TakeResults();
     void Rebuild();
     const Source& CurrentSource() const;
+    int SourceRows() const;
     float SidebarWidth(float screenW) const;
     void TopBar(float width, float height);
     Action Sidebar(ImVec2 min, ImVec2 max, double now);
@@ -102,6 +103,7 @@ private:
     std::string folder_;  // the folder shown, in a source browsed as folders
     ViewOptions options_;
     DepthFilter depth_ = DepthFilter::Both;
+    bool showUnsupported_ = false;  // the Unsupported source in the sidebar
     bool sidebar_ = true;
 
     bool selecting_ = false;  // select mode: a tap picks an item, the bin deletes the picked

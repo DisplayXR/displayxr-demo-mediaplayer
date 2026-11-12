@@ -295,11 +295,18 @@ void MediaBrowser::Rebuild() {
     }
 }
 
+// The sources the sidebar lists: Unsupported, the last, only when the view options show it.
+int MediaBrowser::SourceRows() const {
+    return (int)library_.Sources().size() - (showUnsupported_ ? 0 : 1);
+}
+
 float MediaBrowser::SidebarWidth(float screenW) const {
     // Wide enough for the longest row, within 11 font sizes and 30% of the screen.
     const ImGuiStyle& style = ImGui::GetStyle();
     float widest = ImGui::CalcTextSize("Other files...").x;
-    for (const Source& s : library_.Sources()) {
+    const std::vector<Source>& sources = library_.Sources();
+    for (int r = 0, rows = SourceRows(); r < rows; ++r) {
+        const Source& s = sources[(size_t)r];
         char count[16];
         std::snprintf(count, sizeof(count), "%d", s.count);
         widest = std::max(widest, ImGui::CalcTextSize(s.name.c_str()).x + style.ItemSpacing.x + ImGui::CalcTextSize(count).x);
@@ -399,7 +406,7 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
 
     const float rowH = Round(ImGui::GetFrameHeight() + style.ItemSpacing.y);
     const float gap = Round(style.ItemSpacing.y);  // around the line above "Other files..."
-    const int files = (int)sources.size();         // the row of "Other files..."
+    const int files = SourceRows();                // the row of "Other files..."
     const float top = min.y + gap;
     sidebarScroll_.SetSlop(Px(kSlop));
     sidebarScroll_.SetLimit((files + 1) * rowH + gap * 4.0f - size.y);
@@ -741,12 +748,15 @@ void MediaBrowser::UploadReady(const std::unordered_set<int64_t>& window) {
 void MediaBrowser::ViewOptionsPopup(float right, float top) {
     ImGui::SetNextWindowPos(ImVec2(right, top), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
     if (!ImGui::BeginPopup("##view_options")) return;
+    const ImGuiStyle& style = ImGui::GetStyle();
     ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(style.ItemSpacing.x, Round(style.ItemSpacing.y * 0.5f)));
+    const float rowH = Round(ImGui::GetFontSize() + style.FramePadding.y);
     bool changed = false;
     // A finger-sized row that keeps the popup open, so several options can be set.
     auto option = [&](const char* label, bool selected) {
         const bool picked = ImGui::Selectable(label, selected, ImGuiSelectableFlags_DontClosePopups,
-                                              ImVec2(0.0f, ImGui::GetFrameHeight()));
+                                              ImVec2(0.0f, rowH));
         changed = changed || picked;
         return picked;
     };
@@ -763,7 +773,16 @@ void MediaBrowser::ViewOptionsPopup(float right, float top) {
     ImGui::TextDisabled("Sort by date");
     if (option("Newest first", options_.order == SortOrder::NewestFirst)) options_.order = SortOrder::NewestFirst;
     if (option("Oldest first", options_.order == SortOrder::OldestFirst)) options_.order = SortOrder::OldestFirst;
-    ImGui::PopStyleVar();
+    ImGui::Separator();
+    if (option("Show unsupported files", showUnsupported_)) {
+        showUnsupported_ = !showUnsupported_;
+        if (!showUnsupported_ && sourceKind_ == SourceKind::Unsupported) {
+            sourceKind_ = SourceKind::All;
+            GoTo(CurrentSource().folder);
+            EndSelection();
+        }
+    }
+    ImGui::PopStyleVar(2);
     ImGui::EndPopup();
     if (changed) {
         dirty_ = true;
