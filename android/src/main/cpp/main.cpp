@@ -183,6 +183,11 @@ std::atomic<bool> g_browser_request{false};
 // something to do (leave select mode, go up a folder). Else Back goes home.
 std::atomic<bool> g_browser_back_request{false};
 std::atomic<bool> g_browser_can_back{false};
+// The status and nav bars (#180): Java shows them while this is true (the browser, or the
+// player's chrome showing) and reports the pixels they cover, which the UI stays clear of.
+std::atomic<bool> g_want_system_bars{false};
+std::atomic<int> g_system_bar_top{0};
+std::atomic<int> g_system_bar_bottom{0};
 bool g_paused_for_background = false;  // APP_CMD_PAUSE paused the video; RESUME undoes it
 mp::ui::TransportState g_ui_state;
 mp::ui::TransportActions g_ui_actions;
@@ -1563,7 +1568,12 @@ fill_transport_state()
 	// the shared one, so Android now eases in/out like the desktop instead of the
 	// old hard on/off.
 	g_taps.SetHeld(g_is_video && g_video.paused());
-	mp::ui::TickTransportUI(g_ui_state, dt, g_taps.Shown((double)now * 1e-9));
+	const bool shown = g_taps.Shown((double)now * 1e-9);
+	mp::ui::TickTransportUI(g_ui_state, dt, shown);
+
+	g_want_system_bars.store(browser_showing() || shown, std::memory_order_relaxed);
+	mp::ui::g_systemBarTop = (float)g_system_bar_top.load(std::memory_order_relaxed);
+	mp::ui::g_systemBarBottom = (float)g_system_bar_bottom.load(std::memory_order_relaxed);
 }
 
 // Swapchain colour-encoding choice (#78 on desktop; runtime #1589 / #1623). Since
@@ -3305,6 +3315,17 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeBack(JNIEnv * /*e
 	}
 	g_browser_request.store(true, std::memory_order_relaxed);
 	return JNI_TRUE;
+}
+
+// Polled by Java once per Choreographer frame with the pixels the status and nav bars cover
+// when shown. Returns whether to show them.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeSystemBars(
+    JNIEnv * /*env*/, jobject /*thiz*/, jint top, jint bottom)
+{
+	g_system_bar_top.store((int)top, std::memory_order_relaxed);
+	g_system_bar_bottom.store((int)bottom, std::memory_order_relaxed);
+	return g_want_system_bars.load(std::memory_order_relaxed) ? JNI_TRUE : JNI_FALSE;
 }
 
 // Java polls this once per Choreographer frame; a true result means "launch

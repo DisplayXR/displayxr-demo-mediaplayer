@@ -463,10 +463,19 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
     if (s.fadeAlpha > 0.001f) {
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s.fadeAlpha);
         const float iconSz = ImGui::GetFrameHeight();
+        const float barBottom = H - g_systemBarBottom;
+        const float rowY = H * 0.955f - g_systemBarBottom;  // the bottom row's lower edge
+        // A black band behind each system bar keeps its icons readable.
+        if (g_systemBarTop > 0.0f || g_systemBarBottom > 0.0f) {
+            ImDrawList* dl = ImGui::GetBackgroundDrawList();
+            const ImU32 black = ImGui::GetColorU32(IM_COL32_BLACK);
+            dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(W, g_systemBarTop), black);
+            dl->AddRectFilled(ImVec2(0.0f, barBottom), ImVec2(W, H), black);
+        }
 
         // --- Top window-space bar: full width, flush to the top of the window.
         //     Open / Mode on the left, Slideshow on the right. ---
-        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(0.0f, g_systemBarTop), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
         const ImGuiWindowFlags topbar = pill & ~ImGuiWindowFlags_AlwaysAutoResize;
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);  // flat bar, flush to edges
@@ -644,14 +653,13 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             // (the panels stop 90 px above the bottom edge, the scopes 52 px).
             const bool strip = s.stripOnly || s.panelsOn;
             if (strip) {
-                ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+                ImGui::SetNextWindowPos(ImVec2(W * 0.5f, barBottom), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
                 ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                                     ImVec2(ImGui::GetStyle().WindowPadding.x, 4.0f));
             } else {
-                ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.955f), ImGuiCond_Always,
-                                        ImVec2(0.5f, 1.0f));
+                ImGui::SetNextWindowPos(ImVec2(W * 0.5f, rowY), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
                 ImGui::SetNextWindowSize(ImVec2(W * 0.8f, 0.0f), ImGuiCond_Always);
             }
             const ImGuiWindowFlags bar = pill & ~ImGuiWindowFlags_AlwaysAutoResize;
@@ -801,7 +809,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
         }
         // The 2D/3D switch: alone at the right edge, level with the transport's row.
         if (s.caps.modeSwitch) {
-            ImGui::SetNextWindowPos(ImVec2(W, H * 0.955f), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+            ImGui::SetNextWindowPos(ImVec2(W, rowY), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
             if (ImGui::Begin("##modeswitch", nullptr, pill | ImGuiWindowFlags_NoBackground) &&
                 ModeSwitch("##mode3d", s.mode3D, iconSz, s.hitTargetScale))
                 Fire(a.NextMode);

@@ -344,13 +344,14 @@ MediaBrowser::Action MediaBrowser::Build() {
     Action action = Action::None;
     if (open) {
         const float left = sidebar_ ? sidebarW : 0.0f;
-        action = Grid(ImVec2(left, bar), ImVec2(w, h), w >= h, now);
+        const float top = ui::g_systemBarTop + bar, bottom = h - ui::g_systemBarBottom;
+        action = Grid(ImVec2(left, top), ImVec2(w, bottom), w >= h, now);
         if (sidebar_) {
-            const Action picked = Sidebar(ImVec2(0.0f, bar), ImVec2(sidebarW, h), now);
+            const Action picked = Sidebar(ImVec2(0.0f, top), ImVec2(sidebarW, bottom), now);
             if (picked != Action::None) action = picked;
         }
         TopBar(w, bar);
-        ViewOptionsPopup(w - style.WindowPadding.x, bar);
+        ViewOptionsPopup(w - style.WindowPadding.x, top);
     }
     ImGui::End();
     if (action == Action::Opened) classifier_.Save();  // the app may be stopped while playing
@@ -361,15 +362,16 @@ void MediaBrowser::TopBar(float width, float height) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImGuiStyle& style = ImGui::GetStyle();
     const float icon = ImGui::GetFrameHeight();
-    const float y = Round((height - icon) * 0.5f);
+    const float top = ui::g_systemBarTop;  // the bar sits under the status bar
+    const float y = top + Round((height - icon) * 0.5f);
     const float pad = Round(style.WindowPadding.x);
-    dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(width, height), kPanel);
+    dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(width, top + height), kPanel);
     if (selecting_) {
         // As the stock tablet player's: a cross, the count, and the bin.
         if (IconButton("##cancel", Icon::Close, ImVec2(pad, y), icon)) EndSelection();
         char count[32];
         std::snprintf(count, sizeof(count), "%d selected", (int)selected_.size());
-        dl->AddText(ImVec2(pad + icon + Round(style.ItemSpacing.x), Round((height - ImGui::GetFontSize()) * 0.5f)),
+        dl->AddText(ImVec2(pad + icon + Round(style.ItemSpacing.x), top + Round((height - ImGui::GetFontSize()) * 0.5f)),
                     ImGui::GetColorU32(ImGuiCol_Text), count);
         if (IconButton("##delete", Icon::Delete, ImVec2(width - pad - icon, y), icon))
             provider_->Delete(std::vector<int64_t>(selected_.begin(), selected_.end()));
