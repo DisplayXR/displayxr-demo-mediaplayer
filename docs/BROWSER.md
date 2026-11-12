@@ -109,8 +109,10 @@ half-packed eye unsqueezed (`TileCrop.h`). Only that square goes to the GPU, so 
 slot (512 px) holds exactly what the tile shows.
 
 - Size: each request carries the edge to fit the thumbnail in, chosen so the square is
-  about one thumbnail pixel per screen pixel (`ThumbnailEdge`), from the MediaStore's width
-  and height and the verdict known at the time. A 16:9 video on a 400 px tile is made at
+  about one thumbnail pixel per screen pixel (`ThumbnailEdge`). Videos only: a photo keeps
+  the system's cached thumbnail at one atlas slot, as before. Photos were sharp enough, and
+  decoding photo files for the grid takes CPU that opening a picture needs. The edge comes
+  from the MediaStore's width and height and the verdict known at the time. A 16:9 video on a 400 px tile is made at
   712 x 400, a full side-by-side one at 1423 x 400. The square never exceeds a slot, and no
   thumbnail is made above the file's own size or 2048 px.
 - A tile that still comes out soft (the content check found it side by side after it was
