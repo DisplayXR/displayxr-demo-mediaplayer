@@ -3,6 +3,7 @@
 
 #include "Log.h"
 #include "media/ImageDecoder.h"
+#include "pro/DeckLinkSpec.h"
 #include "pro/QcReport.h"
 #include "pro/Thumbnail.h"
 #include "stb_image_write.h"  // implementation compiled in src/rhi/VulkanRenderer.cpp
@@ -34,39 +35,6 @@ namespace {
 // How long after a snapshot the runtime is given to write its capture file: Tick() stops
 // looking for it then, and a QC export waits for it at most until then (#169).
 constexpr double kCaptureWaitS = 5.0;
-
-// "decklink:<dev>[+<right>][,sdi|hdmi][,dual|sbs|mono][,mode=Hp25]"
-bool ParseDeckLinkSpec(const std::string& args, DeckLinkConfig& c) {
-    c = DeckLinkConfig{};
-    std::string head = args, rest;
-    const size_t comma = args.find(',');
-    if (comma != std::string::npos) {
-        head = args.substr(0, comma);
-        rest = args.substr(comma + 1);
-    }
-    const size_t plus = head.find('+');
-    c.device = head.substr(0, plus);
-    if (c.device.empty()) c.device = "0";
-    if (plus != std::string::npos) {
-        c.rightDevice = head.substr(plus + 1);
-        c.stereo = DeckLinkConfig::Stereo::Pair;
-    }
-    size_t pos = 0;
-    while (!rest.empty() && pos <= rest.size()) {
-        const size_t e = rest.find(',', pos);
-        const std::string t = rest.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
-        if (t == "sdi" || t == "hdmi") c.input = t;
-        else if (t.rfind("mode=", 0) == 0) c.mode = t.substr(5);
-        else if (!t.empty()) {
-            DeckLinkConfig::Stereo st;
-            if (!DeckLinkConfig::ParseStereo(t, st)) return false;
-            c.stereo = st;
-        }
-        if (e == std::string::npos) break;
-        pos = e + 1;
-    }
-    return true;
-}
 
 std::string Clock(char* stampOut, size_t stampN) {
     const std::time_t now = std::time(nullptr);
@@ -856,11 +824,37 @@ void Station::BuildInputsSection(const std::string& liveName, bool live) {
 }
 
 void Station::OpenDeckLinkDialog() {
+    const bool opening = !dlgOpen_;  // Refresh re-lists the devices but keeps the choices being made
     dlgDevices_ = DeckLinkSource::Available() ? DeckLinkSource::Enumerate() : std::vector<std::string>{};
     dlgReason_ = dlgDevices_.empty() ? DeckLinkSource::UnavailableReason() : std::string();
+    if (opening) FillDeckLinkDialogFromInput();
     dlgLeft_ = std::clamp(dlgLeft_, 0, std::max(0, (int)dlgDevices_.size() - 1));
     dlgRight_ = std::clamp(dlgRight_, 0, (int)dlgDevices_.size());
     dlgOpen_ = true;
+}
+
+// The dialog opens on the DeckLink input that is set up (the live input when it is a
+// DeckLink, else the "DeckLink" input), not on its own last choices: a pair opened from
+// the command line (--decklink=0 --decklink-right=1) showed "right eye: none", and Open
+// as shown would have dropped the right eye.
+void Station::FillDeckLinkDialogFromInput() {
+    auto deckLinkArgs = [](const Input& in, std::string& args) {
+        if (in.spec.rfind("decklink:", 0) != 0) return false;
+        args = in.spec.substr(9);
+        return true;
+    };
+    std::string args;
+    bool found = inputIndex_ >= 0 && inputIndex_ < (int)inputs_.size() && deckLinkArgs(inputs_[inputIndex_], args);
+    for (size_t i = 0; !found && i < inputs_.size(); ++i)
+        if (inputs_[i].name == "DeckLink") found = deckLinkArgs(inputs_[i], args);
+    DeckLinkConfig c;
+    DeckLinkDialogFields f;
+    if (!found || !ParseDeckLinkSpec(args, c) || !DeckLinkDialogFromConfig(c, dlgDevices_, f)) return;
+    dlgLeft_ = f.left;
+    dlgRight_ = f.right;
+    dlgConn_ = f.conn;
+    dlgStereo_ = f.stereo;
+    std::snprintf(dlgMode_, sizeof(dlgMode_), "%s", f.mode.c_str());
 }
 
 void Station::BuildDeckLinkDialog() {
@@ -891,6 +885,8 @@ void Station::BuildDeckLinkDialog() {
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("Refresh")) OpenDeckLinkDialog();
+    if (decklink_.GetState() != LiveState::Closed)
+        ImGui::TextDisabled("Live now: %s", decklink_.DeviceName().c_str());
     ImGui::Separator();
     ImGui::BeginDisabled(!any);
     auto deviceCombo = [&](const char* label, int& sel, bool allowNone) {
@@ -925,16 +921,13 @@ void Station::BuildDeckLinkDialog() {
     ImGui::Separator();
     ImGui::BeginDisabled(sameDevice);
     if (ImGui::Button("Open")) {
-        std::string spec = std::to_string(dlgLeft_);
-        if (pair) spec += "+" + std::to_string(dlgRight_ - 1);
-        if (dlgConn_ == 1) spec += ",sdi";
-        if (dlgConn_ == 2) spec += ",hdmi";
-        if (!pair) {
-            const char* st[] = {"", "sbs", "dual", "mono"};
-            if (*st[dlgStereo_]) spec += std::string(",") + st[dlgStereo_];
-        }
-        if (dlgMode_[0]) spec += std::string(",mode=") + dlgMode_;
-        pendingDeckLinkSpec_ = spec;  // opened in Tick()
+        DeckLinkDialogFields f;
+        f.left = dlgLeft_;
+        f.right = dlgRight_;
+        f.conn = dlgConn_;
+        f.stereo = dlgStereo_;
+        f.mode = dlgMode_;
+        pendingDeckLinkSpec_ = DeckLinkSpecFromDialog(f);  // opened in Tick()
         dlgOpen_ = false;
     }
     ImGui::EndDisabled();
@@ -967,7 +960,7 @@ void Station::BuildSignalLines(bool live) {
         ImGui::Text("Eye skew %+.2f ms (max %.2f)  unpaired %llu", ps.lastSkewMs, ps.maxAbsSkewMs,
                     (unsigned long long)ps.unpaired);
         if (ps.timecode) ImGui::TextDisabled("paired by SMPTE timecode");
-        else if (ps.hwClockPairing) ImGui::TextDisabled("no timecode: paired by the card's clock");
+        else if (ps.hwClockPairing) ImGui::TextDisabled("paired by the card's clock (no matching timecode)");
         else if (ps.separateCards) ImGui::TextColored(kWarn, "no timecode, two cards: newest frames paired - jam-sync both inputs");
         else if (ps.pairs) ImGui::TextDisabled("no timecode: newest frames paired");
     }

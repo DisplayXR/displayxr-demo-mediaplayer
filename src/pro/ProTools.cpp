@@ -2,10 +2,12 @@
 //
 // Media Player Pro agent tools (XR_DXR_mcp_tools; the plan's "MCP tools for automation"):
 // the grade, the view, and the monitoring station. Registered and dispatched from the
-// trunk's agent-tool code through its two #if MEDIAPLAYER_PRO hooks. An agent can send
-// any JSON: a wrong-typed argument comes back as an error, never takes the app down.
+// trunk's agent-tool code through its two #if MEDIAPLAYER_PRO hooks; the tool table itself
+// is ProToolList.cpp. An agent can send any JSON: a wrong-typed argument comes back as an
+// error, never takes the app down.
 #include "pro/ProController.h"
 #include "pro/DisplayCalibration.h"
+#include "pro/ProToolList.h"
 
 #include "Log.h"
 #include "media/LiveProducer.h"
@@ -19,118 +21,7 @@ namespace mp::pro {
 
 using json = nlohmann::json;
 
-void ProController::RegisterTools(const RegisterFn& reg) {
-    reg("set_grade",
-        "Set Media Player Pro's grade: a .cube 3D LUT path, an ASC CDL file (.cc/.ccc/.cdl), "
-        "exposure in stops (-4..4, linear light) and bypass. HDR sources (HLG, PQ, scene-linear "
-        "EXR): tone_map auto (roll off HLG / PQ, clip EXR at white) | on | off (clip) | raw (the "
-        "signal unmapped, for a show LUT that expects PQ / HLG), peak_nits = the source's "
-        "brightest (0 = from the stream, else 1000; for HLG the display peak it is rendered for), "
-        "untagged = how a source with no HDR tag is taken: sdr (default) | hlg | pq. Arguments left out keep their "
-        "current value. Returns the grade. A LUT loads in the background: the reply carries "
-        "lut_loading, and get_grade shows the LUT (or lut_error) once it applies.",
-        "{\"type\":\"object\",\"properties\":{\"lut\":{\"type\":\"string\"},\"cdl\":{\"type\":\"string\"},"
-        "\"exposure\":{\"type\":\"number\"},\"bypass\":{\"type\":\"boolean\"},"
-        "\"tone_map\":{\"type\":\"string\",\"enum\":[\"auto\",\"on\",\"off\",\"raw\"]},"
-        "\"peak_nits\":{\"type\":\"number\"},"
-        "\"untagged\":{\"type\":\"string\",\"enum\":[\"sdr\",\"hlg\",\"pq\"]}}}");
-    reg("set_target_screen",
-        "Judge the depth for the screen the picture is made for (#135): target cinema, tv, monitor, "
-        "tablet or off, or a custom width_m + distance_m. With a target, get_rig_status reports near / "
-        "far in its terms (mm, arcminutes, background divergence) and the rig check alerts when the "
-        "background diverges past 0.5 deg there. preview (default true) shows the picture on the panel "
-        "at the angular size it has on the target, so the depth reads as it will there (the picture "
-        "crops or gets a border). Returns the target and the depth in its terms, for the picture as shown "
-        "(convergence included: parallax_offset_pct). picture_scale in the reply is the last frame's; "
-        "get_rig_status has the new one a frame later.",
-        "{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\",\"enum\":[\"off\",\"cinema\",\"tv\",\"monitor\",\"tablet\"]},"
-        "\"width_m\":{\"type\":\"number\",\"minimum\":0.1},\"distance_m\":{\"type\":\"number\",\"minimum\":0.2},"
-        "\"preview\":{\"type\":\"boolean\"}}}");
-    reg("set_display_calibration",
-        "Set this panel's display calibration (#133): a .cube 3D LUT (domain 0..1) from a calibration "
-        "tool (DisplayCAL, Calman, ColourSpace), applied after the grade and QC views. It is kept for "
-        "this panel and loads automatically from then on (keep: false = this run only). clear: true "
-        "removes it (and the kept file); bypass turns it off without removing it. The show grade's "
-        "bypass (set_grade bypass, G) does not affect it. Returns the panel key and the calibration; "
-        "the LUT loads in the background, so the reply may carry loading.",
-        "{\"type\":\"object\",\"properties\":{\"cube\":{\"type\":\"string\"},\"keep\":{\"type\":\"boolean\"},"
-        "\"clear\":{\"type\":\"boolean\"},\"bypass\":{\"type\":\"boolean\"}}}");
-    reg("get_grade", "Read the grade: LUT (with lut_loading / lut_error), CDL (slope/offset/power/"
-        "saturation), exposure, bypass, and the HDR mapping (tone_map, peak_nits, hdr = what "
-        "the current source gets: transfer, raw, roll_off, bt2020, peak_nits).",
-        "{\"type\":\"object\"}");
-    reg("set_view",
-        "Set the QC view: 3d, left, right, difference (|left - right| x4), anaglyph or false_colour; "
-        "optional zoom (1 = fit) applied to both eyes; channel isolation (rgb, red, green, blue, "
-        "alpha, luma); display gamma (0.25..4, 1 = none); a wipe (off, grade = source | graded, "
-        "eyes = left eye | right eye, clips = this clip | the set_compare B clip) at wipe_pos (0..1 across "
-        "the picture).",
-        "{\"type\":\"object\",\"properties\":{\"view\":{\"type\":\"string\",\"enum\":[\"3d\",\"left\",\"right\","
-        "\"difference\",\"anaglyph\",\"false_colour\"]},\"zoom\":{\"type\":\"number\",\"minimum\":1},"
-        "\"channel\":{\"type\":\"string\",\"enum\":[\"rgb\",\"red\",\"green\",\"blue\",\"alpha\",\"luma\"]},"
-        "\"gamma\":{\"type\":\"number\",\"minimum\":0.25,\"maximum\":4},"
-        "\"wipe\":{\"type\":\"string\",\"enum\":[\"off\",\"grade\",\"eyes\",\"clips\"]},"
-        "\"wipe_pos\":{\"type\":\"number\",\"minimum\":0,\"maximum\":1}}}");
-    reg("get_rig_status",
-        "Read the live rig checks for a side-by-side stereo source: vertical error (full-res px, + = "
-        "right eye lower), roll (degrees), near / far screen parallax (% of eye width, negative = in "
-        "front of the screen), edge violations (edge_left_pct / edge_right_pct: the most in-front "
-        "parallax along each frame edge, null = not measured), colour match between the eyes (CIE76 dE), eye sync (frames between "
-        "the paired inputs, -1 = unknown), the depth budget, recent alerts with timecode, and the "
-        "source timecode and capture-to-screen delay.",
-        "{\"type\":\"object\"}");
-    reg("set_depth_budget",
-        "Set the limits the rig checks alert on: near / far parallax in % of eye width (near "
-        "negative = in front), vertical error in px, colour match in dE, and edge_pct: the nearest "
-        "parallax allowed at the left / right frame edge (an edge violation below it).",
-        "{\"type\":\"object\",\"properties\":{\"near_pct\":{\"type\":\"number\"},\"far_pct\":{\"type\":\"number\"},"
-        "\"vertical_px\":{\"type\":\"number\"},\"delta_e\":{\"type\":\"number\"},"
-        "\"edge_pct\":{\"type\":\"number\"}}}");
-    reg("set_depth_overlay", "Show or hide the depth overlay (the rig check's matches on the picture).",
-        "{\"type\":\"object\",\"properties\":{\"on\":{\"type\":\"boolean\"}},\"required\":[\"on\"]}");
-    reg("snapshot",
-        "Capture both eyes as shown (graded) to a PNG in Pictures/DisplayXR, with a JSON note "
-        "beside it: the note text, timecode and rig numbers.",
-        "{\"type\":\"object\",\"properties\":{\"note\":{\"type\":\"string\"}}}");
-    reg("export_qc_report",
-        "Write this session's QC report to a new Pictures/DisplayXR/qc_<time> folder: report.html "
-        "(alerts, snapshots with both eyes, notes, rig numbers, depth budget; self-contained), "
-        "markers.edl (DaVinci Resolve timeline markers) and markers.csv. Returns the paths at once "
-        "(writing: true); the files are written in the background, report.html last, so the "
-        "report is complete once report.html exists.",
-        "{\"type\":\"object\"}");
-    reg("list_inputs", "List the station's configured live inputs (name, spec) and which one is live.",
-        "{\"type\":\"object\"}");
-    reg("select_input", "Switch to a configured input, by index (from list_inputs) or name.",
-        "{\"type\":\"object\",\"properties\":{\"index\":{\"type\":\"integer\"},\"name\":{\"type\":\"string\"}}}");
-    reg("set_ocio",
-        "Bake an OpenColorIO transform into the grade's LUT: config (a path, an ocio:// built-in, or "
-        "empty for $OCIO), src = the picture's colour space, then display + view (default: the "
-        "config's) or dst = a target colour space; optional looks. Needs a build with OpenColorIO. "
-        "Bakes in the background: poll get_grade until lut_loading is empty (lut or lut_error).",
-        "{\"type\":\"object\",\"properties\":{\"config\":{\"type\":\"string\"},\"src\":{\"type\":\"string\"},"
-        "\"display\":{\"type\":\"string\"},\"view\":{\"type\":\"string\"},\"dst\":{\"type\":\"string\"},"
-        "\"looks\":{\"type\":\"string\"}},\"required\":[\"src\"]}");
-    reg("describe_ocio", "List an OpenColorIO config's colour spaces, displays and the default display's views.",
-        "{\"type\":\"object\",\"properties\":{\"config\":{\"type\":\"string\"}}}");
-    reg("get_resolve_link",
-        "Read the live Resolve panel link: whether the panel is running, Resolve's timeline, playhead "
-        "timecode and the clip under it, whether the station follows it, and whether Resolve is "
-        "playing (inferred from the playhead).",
-        "{\"type\":\"object\"}");
-    reg("set_resolve_follow", "Make the station follow (or stop following) Resolve's playhead.",
-        "{\"type\":\"object\",\"properties\":{\"on\":{\"type\":\"boolean\"}},\"required\":[\"on\"]}");
-    reg("set_compare",
-        "A/B compare: set the B clip (a file path); toggle=true (or no path) swaps to the other clip "
-        "at the current position.",
-        "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"toggle\":{\"type\":\"boolean\"}}}");
-    reg("open_decklink",
-        "Open a Blackmagic DeckLink SDI/HDMI input as the live source. device = index or part of "
-        "the name; right = the right eye's device (two inputs paired by timecode); stereo = "
-        "auto|mono|sbs|dual|pair; input = sdi|hdmi; mode = starting format FourCC (e.g. Hp25).",
-        "{\"type\":\"object\",\"properties\":{\"device\":{\"type\":\"string\"},\"right\":{\"type\":\"string\"},"
-        "\"stereo\":{\"type\":\"string\"},\"input\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"}}}");
-}
+void ProController::RegisterTools(const RegisterFn& reg) { RegisterProAgentTools(reg); }
 
 namespace {
 bool Str(const json& a, const char* k, std::string& out) {
@@ -185,7 +76,7 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
         if (tool == "set_grade") {
             std::string p;
             if (Str(a, "lut", p)) {
-                LoadLut(p);  // asynchronous: get_grade's lut_loading / lut_error report it
+                LoadLut(p);  // asynchronous: set_grade {}'s lut_loading / lut_error report it
                 if (lutLoading_ != p) return err("LUT not loaded: " + lutError_);
             }
             if (Str(a, "cdl", p)) {
@@ -250,11 +141,7 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             result = calibrationJson().dump();
             return true;
         }
-        if (tool == "get_grade") {
-            result = gradeJson().dump();
-            return true;
-        }
-        if (tool == "set_view") {
+        if (tool == "set_qc_view") {  // #220: was set_view, which is the player's VR viewer tool
             std::string v;
             if (Str(a, "view", v)) {
                 const ViewMode m = v == "3d"          ? ViewMode::Stereo3D
@@ -306,7 +193,7 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             Str(a, "looks", req.looks);
             std::string e;
             if (!LoadOcio(req, &e)) return err(e);
-            result = json{{"lut_loading", lutLoading_}}.dump();  // get_grade reports the result
+            result = json{{"lut_loading", lutLoading_}}.dump();  // set_grade {} reports the result
             return true;
         }
         if (tool == "describe_ocio") {
@@ -334,7 +221,11 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
             result = json{{"depth_overlay", depthOverlay_}}.dump();
             return true;
         }
-        if (tool == "get_resolve_link") {
+        if (tool == "set_resolve_follow") {  // also the read (#220: was get_resolve_link)
+            if (a.contains("on")) {
+                if (!a["on"].is_boolean()) return err("on must be a boolean");
+                followResolve_ = a["on"].get<bool>();
+            }
             const double now = LiveProducer::NowSeconds();
             result = json{{"panel_running", follower_.Active(now)},
                           {"timeline", link_.timeline},
@@ -344,12 +235,6 @@ bool ProController::DispatchTool(const std::string& tool, const std::string& arg
                           {"follow", followResolve_},
                           {"panel_follow", link_.follow},
                           {"resolve_playing", follower_.ResolvePlaying()}}.dump();
-            return true;
-        }
-        if (tool == "set_resolve_follow") {
-            if (!a.contains("on") || !a["on"].is_boolean()) return err("on (boolean) is required");
-            followResolve_ = a["on"].get<bool>();
-            result = json{{"follow", followResolve_}}.dump();
             return true;
         }
         return station_.DispatchTool(tool, a.dump(), result, success);

@@ -68,6 +68,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # the installer's dev version comes from `git describe --tags`
 
       - name: Doc-only PR — skipping heavy build steps
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -313,17 +315,34 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          # v1.2.3 -> 1.2.3 for the installer filename + VIProductVersion. Untagged
-          # builds use 0.0.0 (valid version; never published).
-          # pro-v0.2.0 -> 0.2.0 for the Pro installer; the base installer is then built
-          # (validation only) as 0.0.0 and not published.
+          # v1.2.3 -> base 1.2.3; pro-v0.2.0 -> Pro 0.2.0 (installer filename, title,
+          # DisplayVersion, VIProductVersion). Untagged builds (main, PRs) get a dev version
+          # from the last tag of their OWN product, in the runtime's dev-installer style:
+          # pro-v0.9.0-3-g6240c9f -> 0.9.0+3.g6240c9f. Never 0.0.0: a tester has to see
+          # which build is installed. On a tag, the product not being released is built
+          # (validation only) with its dev version and not published.
+          # Needs the full history + tags (checkout fetch-depth: 0).
+          function DevVersion([string]$match, [string]$prefix) {
+            $fallback = "0.0.0+g$($env:GITHUB_SHA.Substring(0,8))"
+            $d = git describe --tags --long --match $match 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $d) { return $fallback }
+            if ($d -notmatch "^$([regex]::Escape($prefix))(\d+\.\d+\.\d+)-(\d+)-(g[0-9a-f]+)$") { return $fallback }
+            if ($Matches[2] -eq '0') { return $Matches[1] }
+            return "$($Matches[1])+$($Matches[2]).$($Matches[3])"
+          }
+          $version    = DevVersion 'v[0-9]*' 'v'
+          $proVersion = DevVersion 'pro-v[0-9]*' 'pro-v'
           if ($env:GITHUB_REF -like 'refs/tags/pro-v*') {
-            $version = $env:GITHUB_REF -replace '^refs/tags/pro-v',''
+            $proVersion = $env:GITHUB_REF -replace '^refs/tags/pro-v',''
           } elseif ($env:GITHUB_REF -like 'refs/tags/v*') {
             $version = $env:GITHUB_REF -replace '^refs/tags/v',''
-          } else { $version = "0.0.0" }
+          }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "VERSION=$version"
+          "pro_version=$proVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "VERSION=$version PRO_VERSION=$proVersion"
+          # A failed `git describe` (no matching tag) is handled above; don't let its
+          # exit code fail the step.
+          exit 0
 
       - name: Build installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -336,7 +355,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: cmd
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ steps.version.outputs.pro_version }}
         run: call installer\build-installer.bat pro
 
       - name: Assert installer payload (regression guard)
@@ -394,7 +413,7 @@ jobs:
         with:
           files: installer/DisplayXRMediaPlayerProSetup-*.exe
           fail_on_unmatched_files: true
-          name: Media Player Pro ${{ steps.version.outputs.version }}
+          name: Media Player Pro ${{ steps.version.outputs.pro_version }}
           draft: false
           prerelease: false
           make_latest: false

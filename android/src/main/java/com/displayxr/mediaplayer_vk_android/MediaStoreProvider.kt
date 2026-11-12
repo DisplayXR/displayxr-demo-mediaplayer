@@ -358,8 +358,10 @@ class MediaStoreProvider(
         }
         // The system's cached thumbnails stop at a size of its own. If that is well short of
         // what was asked and the file has more, make one from the file itself.
+        // Videos only: a photo's cached thumbnail was sharp enough, and decoding the file
+        // for every tile takes CPU that opening a picture needs.
         val own = max(row.width, row.height)
-        if (max(bitmap.width, bitmap.height) * 10 < edge * 9 && (own == 0 || own > max(bitmap.width, bitmap.height))) {
+        if (row.type == TYPE_VIDEO && max(bitmap.width, bitmap.height) * 10 < edge * 9 && (own == 0 || own > max(bitmap.width, bitmap.height))) {
             larger(row, edge)?.let { bitmap = it }
         }
         if (bitmap.config != Bitmap.Config.ARGB_8888) {

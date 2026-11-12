@@ -39,26 +39,69 @@ void FormatTimecode(const TimecodeFields& t, int fpsNominal, char* out, size_t n
 
 void TimecodePairer::Reset() { *this = TimecodePairer{}; }
 
-TimecodePairer::Decision TimecodePairer::Add(int eye, int slot, int key, double arrived, double period) {
+void TimecodePairer::UseClock(bool on) {
+    byClock_ = on;
+    for (int e = 0; e < 2; ++e)
+        for (int a = 0; a < kHistory; ++a) key_[e][a] = on ? clock_[e][a] : tc_[e][a];
+    // The last shown frame, in the new domain, so the switch never shows a frame again.
+    lastKey_ = on ? lastShownClock_ : lastShownTc_;
+    tcAgree_ = 0;
+}
+
+TimecodePairer::Decision TimecodePairer::Add(int eye, int slot, int key, double arrived, double period, int clockKey) {
     Decision d;
-    key_[eye][slot] = key;
+    tc_[eye][slot] = key;
+    clock_[eye][slot] = clockKey;
+    const int k = byClock_ ? clockKey : key;  // this frame's key in the active domain
+    key_[eye][slot] = k;
     arrived_[eye][slot] = arrived;
     valid_[eye][slot] = true;
     newest_[eye] = slot;
     next_[eye] = (slot + 1) % kHistory;
     if (eye == 0) ++sincePublish_;
-    if (key >= 0 && lastKey_ >= 0 && key < lastKey_) {
+    if (k >= 0 && lastKey_ >= 0 && k < lastKey_) {
         // This input went back (a deck rewind, midnight): the frames remembered from before
         // the jump would match "newer" keys and be shown again. Forget every frame keyed
         // after the new timecode, on both inputs, and wait for the other one to follow.
         for (int e2 = 0; e2 < 2; ++e2)
             for (int a = 0; a < kHistory; ++a)
-                if (valid_[e2][a] && key_[e2][a] > key) valid_[e2][a] = false;
+                if (valid_[e2][a] && key_[e2][a] > k) valid_[e2][a] = false;
         const int other = 1 - eye;
         if (newest_[other] >= 0 && !valid_[other][newest_[other]]) newest_[other] = -1;
         lastKey_ = -1;
     }
     if (newest_[0] < 0 || newest_[1] < 0) return d;
+
+    const int t0 = tc_[0][newest_[0]], t1 = tc_[1][newest_[1]];
+    const int tcOffset = t0 >= 0 && t1 >= 0 ? std::abs(t0 - t1) : -1;
+    const bool clocks = clock_[0][newest_[0]] >= 0 && clock_[1][newest_[1]] >= 0;
+    // One card, and an eye without timecode: pair by the card's clock.
+    if (!byClock_ && clocks && (t0 < 0 || t1 < 0)) UseClock(true);
+    Match(eye, period, d);
+    if (d.unsynced && !byClock_ && clocks) {
+        // Timecodes that don't belong together (Resolve's dual SDI output: timecode on the
+        // first output only), but one card: its clock pairs the frame-locked eyes exactly,
+        // where newest-of-each shows them a frame apart whenever one eye lands first.
+        UseClock(true);
+        d = Decision{};
+        Match(eye, period, d);
+    }
+    d.byClock = byClock_;
+    d.tcOffsetFrames = tcOffset;
+    if (d.publish) {
+        lastShownTc_ = tc_[0][d.slot[0]];
+        lastShownClock_ = clock_[0][d.slot[0]];
+    }
+    if (byClock_ && d.publish && !d.unsynced) {
+        // Trust timecode again once the clock-paired frames carry the same one on both eyes.
+        const int a = tc_[0][d.slot[0]], b = tc_[1][d.slot[1]];
+        tcAgree_ = (a >= 0 && a == b) ? tcAgree_ + 1 : 0;
+        if (tcAgree_ >= kTrustTimecodeAfter) UseClock(false);
+    }
+    return d;
+}
+
+void TimecodePairer::Match(int eye, double period, Decision& d) {
     const int n0 = key_[0][newest_[0]], n1 = key_[1][newest_[1]];
 
     auto newestOfEach = [&](bool unsynced) {
@@ -77,7 +120,7 @@ TimecodePairer::Decision TimecodePairer::Add(int eye, int slot, int key, double 
             // timecode. Gone back (a rewind, midnight): start matching again.
             if (n0 == lastKey_ && n1 == lastKey_) {
                 if (eye == 0) newestOfEach(false);
-                return d;
+                return;
             }
             lastKey_ = -1;
         }
@@ -98,7 +141,7 @@ TimecodePairer::Decision TimecodePairer::Add(int eye, int slot, int key, double 
             d.slot[1] = s1;
             lastKey_ = best;
             sincePublish_ = 0;
-            return d;
+            return;
         }
         // No common instant yet. Wait only while the lagging eye's NEXT frame can still find
         // its match when it lands: the leading eye keeps kHistory frames, so after a
@@ -107,20 +150,20 @@ TimecodePairer::Decision TimecodePairer::Add(int eye, int slot, int key, double 
         const int lagEye = n0 < n1 ? 0 : 1;
         const int lag = n0 < n1 ? n1 - n0 : n0 - n1;
         const int reach = (eye == lagEye) ? kHistory - 1 : kHistory;
-        if (lag <= reach && sincePublish_ <= lag + 1) return d;  // no longer than the lag explains
+        if (lag <= reach && sincePublish_ <= lag + 1) return;  // no longer than the lag explains
         // The inputs' clocks are too far apart to pair: newest of each, paced by the left.
         if (eye == 0) newestOfEach(true);
-        return d;
+        return;
     }
 
     // No timecode: newest of each, paced by the left eye's arrivals.
-    if (eye != 0) return d;
+    if (eye != 0) return;
     if (period > 0.0) {
         const double dt = std::fabs(arrived_[0][newest_[0]] - arrived_[1][newest_[1]]);
         d.offsetFrames = (int)std::lround(dt / period);
     }
     newestOfEach(false);
-    return d;
+    return;
 }
 
 }  // namespace mp
