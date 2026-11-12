@@ -23,4 +23,9 @@ inline float g_transportTop = 0.0f;
 // rig history) end above it rather than covering the status line.
 inline float g_bottomUiTop = 0.0f;
 
+// HUD pixels the system's status and nav bars cover at the top and bottom (Android, #180),
+// 0 elsewhere. The UI stays clear of them.
+inline float g_systemBarTop = 0.0f;
+inline float g_systemBarBottom = 0.0f;
+
 }  // namespace mp::ui

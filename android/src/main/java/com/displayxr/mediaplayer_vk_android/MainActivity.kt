@@ -100,6 +100,11 @@ class MainActivity : NativeActivity() {
      */
     private external fun nativeTakeOpenPickerRequest(): Boolean
 
+    // Polled once per Choreographer frame: true shows the status and nav bars (the browser, or
+    // the player's controls showing). They sit over the window, which keeps its full size, so
+    // native gets the pixels they cover and keeps the UI clear of them.
+    private external fun nativeSystemBars(top: Int, bottom: Int): Boolean
+
     // Picker dismissed without a selection — native resumes the previous asset
     // (it blanks the scene while a pick is pending to avoid a stale-frame flash).
     private external fun nativePickCancelled()
@@ -162,12 +167,22 @@ class MainActivity : NativeActivity() {
 
     private lateinit var mediaStore: MediaStoreProvider
 
+    private var systemBars = false
+
     private val rectCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!rectPollRunning) return
             sampleWindowRect()
             try {
                 if (nativeTakeOpenPickerRequest()) openVideoPicker()
+                // Stable: the bars' size whether they show or not.
+                val insets = window?.decorView?.rootWindowInsets
+                @Suppress("DEPRECATION")
+                val bars = nativeSystemBars(insets?.stableInsetTop ?: 0, insets?.stableInsetBottom ?: 0)
+                if (bars != systemBars) {
+                    systemBars = bars
+                    applySystemBars()
+                }
             } catch (_: Throwable) {
                 // Native lib not bound yet; the next frame retries.
             }
@@ -410,6 +425,11 @@ class MainActivity : NativeActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Edge to edge: shown bars cover the window instead of shrinking it.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            @Suppress("DEPRECATION") // only for Android 15+, which is edge to edge anyway
+            window.setDecorFitsSystemWindows(false)
+        }
         mediaStore = MediaStoreProvider(this) { fd, length, name -> nativeOpenVideoFd(fd, 0L, length, name) }
         pushRotation()
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
@@ -426,23 +446,26 @@ class MainActivity : NativeActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemBars()
+        if (hasFocus) applySystemBars()
     }
 
-    // Full screen: the status and nav bars would cover the browser's top bar and the
-    // player's controls. A swipe from an edge shows them for a moment.
-    private fun hideSystemBars() {
+    // Full screen, with the status and nav bars only while native wants them. When hidden,
+    // a swipe from an edge shows them for a moment.
+    private fun applySystemBars() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.insetsController?.let {
-                it.hide(WindowInsets.Type.systemBars())
+                if (systemBars) it.show(WindowInsets.Type.systemBars())
+                else it.hide(WindowInsets.Type.systemBars())
                 it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             }
         } else {
             @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
-                View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
-                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            val layout = View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = if (systemBars) layout else layout or
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
         }
     }
 
