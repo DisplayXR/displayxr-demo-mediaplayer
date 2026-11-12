@@ -15,11 +15,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.ImageDecoder
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.provider.Settings
+import android.os.SystemClock
 import android.util.Log
 import android.util.Size
 import java.io.FileNotFoundException
@@ -64,6 +66,8 @@ class MediaStoreProvider(
         val size: Long,
         val durationMs: Long,
         val folder: String,
+        val width: Int, // upright (rotation applied), 0 if unknown
+        val height: Int,
     )
 
     private external fun nativeSetAccess(access: Int)
@@ -76,13 +80,15 @@ class MediaStoreProvider(
         sizes: LongArray,
         durations: LongArray,
         folders: Array<String>,
+        widths: IntArray,
+        heights: IntArray,
     )
     // `fd` is the file itself (or -1), for native to check whether it is 3D. Native closes it.
     private external fun nativeThumbnail(id: Long, width: Int, height: Int, rgba: ByteArray?, fd: Int, video: Boolean)
     private external fun nativeTakeAccessRequest(): Boolean
     private external fun nativeTakeRefreshRequest(): Boolean
-    // Pairs of (id, 1 to check the file or 0), or null if unchanged.
-    private external fun nativeTakeWantedThumbnails(edgeOut: IntArray): LongArray?
+    // Triples of (id, 1 to check the file or 0, the edge to fit it in), or null if unchanged.
+    private external fun nativeTakeWantedThumbnails(): LongArray?
     private external fun nativeTakeOpenRequest(): Long
     // The ids to delete, or null.
     private external fun nativeTakeDeleteRequest(): LongArray?
@@ -96,16 +102,20 @@ class MediaStoreProvider(
     @Volatile private var rows: Map<Long, Row> = emptyMap()
     private var listed = false // native has asked for the list, so keep it fresh on resume
 
-    // Thumbnails. `made` holds what was made for ids still wanted, so an id is not made
-    // twice while its thumbnail is on its way to native. Guarded by `lock`.
+    // Thumbnails. `made` holds the edge each id still wanted was made at, so an id is not
+    // made twice while its thumbnail is on its way to native, unless native now asks for it
+    // larger (a tile that came out soft). Guarded by `lock`.
     private val lock = Any()
     private var wanted = LongArray(0)
     private var checkFile = HashSet<Long>()
-    private var wantedEdge = 0
+    private var wantedEdge = HashMap<Long, Int>()
     private val inFlight = HashSet<Long>()
-    private val made = HashSet<Long>()
+    private val made = HashMap<Long, Int>()
     private var workers = 0
-    private val edgeOut = IntArray(1)
+    // What making them costs, logged now and then (#180: larger thumbnails).
+    private var statCount = 0
+    private var statMs = 0L
+    private var statPixels = 0L
 
     // Stills of the files either side of the one playing, for the swipe. Guarded by `lock`.
     private val stillThread = Executors.newSingleThreadExecutor()
@@ -116,10 +126,13 @@ class MediaStoreProvider(
     fun poll() {
         if (nativeTakeAccessRequest()) requestAccess()
         if (nativeTakeRefreshRequest()) refresh()
-        nativeTakeWantedThumbnails(edgeOut)?.let { pairs ->
-            val ids = LongArray(pairs.size / 2) { pairs[2 * it] }
-            val check = (0 until pairs.size / 2).filter { pairs[2 * it + 1] != 0L }.mapTo(HashSet()) { pairs[2 * it] }
-            setWanted(ids, check, edgeOut[0])
+        nativeTakeWantedThumbnails()?.let { t ->
+            val n = t.size / 3
+            val ids = LongArray(n) { t[3 * it] }
+            val check = (0 until n).filter { t[3 * it + 1] != 0L }.mapTo(HashSet()) { t[3 * it] }
+            val edges = HashMap<Long, Int>(n * 2)
+            for (i in 0 until n) edges[t[3 * i]] = t[3 * i + 2].toInt()
+            setWanted(ids, check, edges)
         }
         val open = nativeTakeOpenRequest()
         if (open >= 0) open(open)
@@ -214,6 +227,8 @@ class MediaStoreProvider(
                 LongArray(list.size) { list[it].size },
                 LongArray(list.size) { list[it].durationMs },
                 Array(list.size) { list[it].folder },
+                IntArray(list.size) { list[it].width },
+                IntArray(list.size) { list[it].height },
             )
             Log.i(TAG, "media browser: ${list.size} items")
         }
@@ -228,6 +243,9 @@ class MediaStoreProvider(
             MediaStore.MediaColumns.SIZE,
             MediaStore.MediaColumns.DURATION,
             MediaStore.MediaColumns.RELATIVE_PATH,
+            MediaStore.MediaColumns.WIDTH,
+            MediaStore.MediaColumns.HEIGHT,
+            MediaStore.MediaColumns.ORIENTATION,
         )
         activity.contentResolver.query(collection, columns, null, null, null)?.use { c ->
             while (c.moveToNext()) {
@@ -235,10 +253,14 @@ class MediaStoreProvider(
                 val name = c.getString(1) ?: continue
                 val taken = c.getLong(2)
                 val modified = c.getLong(3)
+                // Stored as encoded; a quarter turn shows them the other way round.
+                val turned = c.getInt(9) % 180 != 0
+                val w = c.getInt(7)
+                val h = c.getInt(8)
                 out += Row(
                     id, ContentUris.withAppendedId(collection, id), name, type,
                     if (taken > 0) taken else modified * 1000, modified, c.getLong(4), c.getLong(5),
-                    c.getString(6) ?: "",
+                    c.getString(6) ?: "", if (turned) h else w, if (turned) w else h,
                 )
             }
         }
@@ -246,12 +268,12 @@ class MediaStoreProvider(
 
     // ---------------------------------------------------------------- thumbnails
 
-    private fun setWanted(ids: LongArray, check: HashSet<Long>, edge: Int) {
+    private fun setWanted(ids: LongArray, check: HashSet<Long>, edges: HashMap<Long, Int>) {
         synchronized(lock) {
             wanted = ids
             checkFile = check
-            wantedEdge = edge
-            made.retainAll(ids.toHashSet())
+            wantedEdge = edges
+            made.keys.retainAll(edges.keys)
             while (ids.isNotEmpty() && workers < THUMBNAIL_THREADS) {
                 workers++
                 thumbnailPool.execute { makeThumbnails() }
@@ -266,22 +288,33 @@ class MediaStoreProvider(
             val edge: Int
             val check: Boolean
             synchronized(lock) {
-                val next = wanted.firstOrNull { it !in inFlight && it !in made }
+                val next = wanted.firstOrNull { it !in inFlight && (made[it] ?: 0) < (wantedEdge[it] ?: 0) }
                 if (next == null) {
                     workers--
                     return
                 }
                 id = next
-                edge = wantedEdge
+                edge = wantedEdge[id] ?: 0
                 check = id in checkFile
                 inFlight += id
             }
             val row = rows[id]
+            val start = SystemClock.elapsedRealtime()
             val bitmap = row?.let { thumbnail(it, edge) }
             val rgba = bitmap?.let { rgbaOf(it) }
+            val ms = SystemClock.elapsedRealtime() - start
             synchronized(lock) {
                 inFlight -= id
-                made += id
+                made[id] = edge
+                statCount++
+                statMs += ms
+                statPixels += (bitmap?.width ?: 0).toLong() * (bitmap?.height ?: 0)
+                if (statCount == 64) {
+                    Log.i(TAG, "media browser: 64 thumbnails, ${statMs / 64} ms and ${statPixels / 64 / 1000} kpx each on average")
+                    statCount = 0
+                    statMs = 0
+                    statPixels = 0
+                }
             }
             nativeThumbnail(
                 id, bitmap?.width ?: 0, bitmap?.height ?: 0, rgba,
@@ -303,7 +336,10 @@ class MediaStoreProvider(
         -1
     }
 
+    // Fitted to edge x edge. Native picks the edge so the part a tile shows (one eye of a
+    // stereo frame, the black bars taken off) is about one pixel per screen pixel.
     private fun thumbnail(row: Row, edge: Int): Bitmap? {
+        if (edge <= 0) return null
         // Runs on a pool thread: any exception here would kill the process, and a revoked
         // partial-media grant (Android 14) surfaces as a SecurityException, not an IOException.
         var bitmap: Bitmap = try {
@@ -311,6 +347,12 @@ class MediaStoreProvider(
         } catch (e: Exception) {
             Log.w(TAG, "no thumbnail for ${row.name}: $e")
             return null
+        }
+        // The system's cached thumbnails stop at a size of its own. If that is well short of
+        // what was asked and the file has more, make one from the file itself.
+        val own = max(row.width, row.height)
+        if (max(bitmap.width, bitmap.height) * 10 < edge * 9 && (own == 0 || own > max(bitmap.width, bitmap.height))) {
+            larger(row, edge)?.let { bitmap = it }
         }
         if (bitmap.config != Bitmap.Config.ARGB_8888) {
             bitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false) ?: return null
@@ -326,6 +368,35 @@ class MediaStoreProvider(
             )
         }
         return bitmap
+    }
+
+    // A thumbnail decoded from the file at about edge x edge: a video's representative
+    // frame (the one the system's thumbnail shows), or the image subsampled. Null on failure.
+    private fun larger(row: Row, edge: Int): Bitmap? {
+        if (row.type == TYPE_VIDEO) {
+            val retriever = MediaMetadataRetriever()
+            return try {
+                activity.contentResolver.openFileDescriptor(row.uri, "r")?.use { pfd ->
+                    retriever.setDataSource(pfd.fileDescriptor)
+                    retriever.getScaledFrameAtTime(-1, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, edge, edge)
+                }
+            } catch (e: Exception) { // FileNotFoundException, SecurityException, the retriever's failures
+                Log.w(TAG, "no larger thumbnail for ${row.name}: $e")
+                null
+            } finally {
+                retriever.release()
+            }
+        }
+        return try {
+            ImageDecoder.decodeBitmap(ImageDecoder.createSource(activity.contentResolver, row.uri)) { decoder, info, _ ->
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                val sample = max(info.size.width, info.size.height) / edge
+                if (sample > 1) decoder.setTargetSampleSize(sample)
+            }
+        } catch (e: Exception) { // IOException, SecurityException on a revoked grant
+            Log.w(TAG, "no larger thumbnail for ${row.name}: $e")
+            null
+        }
     }
 
     // ---------------------------------------------------------------- stills
