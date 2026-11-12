@@ -23,7 +23,9 @@
 #include "rhi/Shaders.h"
 
 #include <algorithm>  // std::max / std::min (scissor clamp)
-#include <cstring>    // std::memcpy (half-float LUT pack, staging copies)
+#include <chrono>     // the perf window's timings
+#include <cstdlib>    // std::getenv
+#include <cstring>    // std::memcpy (half-float LUT pack)
 #include <vector>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -178,12 +180,145 @@ bool VulkanRenderer::Initialize(VkPhysicalDevice physicalDevice, VkDevice device
 
     if (!CreatePipeline()) return false;
 
-    LOG_INFO("VulkanRenderer ready (%u framebuffers, %ux%u, format=%d %s, %u frames in flight)",
+    // Upload copies into staging: this many threads, the render thread included (the pool
+    // itself is made at the first copy big enough to split).
+    copyThreads_ = bandcopy::UploadThreads();
+
+    LOG_INFO("VulkanRenderer ready (%u framebuffers, %ux%u, format=%d %s, %u frames in flight, "
+             "persistent staging, upload copy on up to %d thread(s))",
              (uint32_t)framebuffers_.size(), width_, height_, (int)format_,
              srgbTarget_ ? "sRGB — shader + clears converted to scene-linear"
                          : "UNORM — passthrough",
-             ring_.framesInFlight());
+             ring_.framesInFlight(), copyThreads_);
     return true;
+}
+
+VkCommandBuffer VulkanRenderer::OpenFrame() {
+    // The only wait on the frame path: the ring slot's fence (the frame N back), plus that
+    // slot's deferred releases. Timed for the perf window (frame_open).
+    const auto t0 = std::chrono::steady_clock::now();
+    VkCommandBuffer cmd = ring_.beginFrame();
+    perf_.FrameOpen(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return cmd;
+}
+
+// ---------------------------------------------------------------------------
+// Persistent staging
+// ---------------------------------------------------------------------------
+
+bool VulkanRenderer::CreateStaging(Staging& s, VkDeviceSize bytes) {
+    s = Staging{};
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device_, &bci, nullptr, &s.buffer) != VK_SUCCESS) {
+        s.buffer = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device_, s.buffer, &req);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    // The same memory type the one-off buffers always used (host-visible + coherent: no
+    // flush after the CPU copy).
+    ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &ai, nullptr, &s.memory) != VK_SUCCESS ||
+        vkBindBufferMemory(device_, s.buffer, s.memory, 0) != VK_SUCCESS ||
+        vkMapMemory(device_, s.memory, 0, VK_WHOLE_SIZE, 0, &s.mapped) != VK_SUCCESS || !s.mapped) {
+        if (s.memory) vkFreeMemory(device_, s.memory, nullptr);  // frees (and unmaps) it
+        vkDestroyBuffer(device_, s.buffer, nullptr);
+        s = Staging{};
+        return false;
+    }
+    s.size = bytes;
+    return true;
+}
+
+void VulkanRenderer::ReleaseStaging(Staging& s, bool deferred) {
+    if (s.buffer || s.memory) {
+        VkDevice dev = device_;
+        const VkBuffer b = s.buffer;
+        const VkDeviceMemory m = s.memory;
+        const bool mapped = s.mapped != nullptr;
+        auto destroy = [dev, b, m, mapped]() {
+            if (m && mapped) vkUnmapMemory(dev, m);
+            if (b) vkDestroyBuffer(dev, b, nullptr);
+            if (m) vkFreeMemory(dev, m, nullptr);
+        };
+        if (deferred) ring_.deferDestroy(destroy);
+        else destroy();
+    }
+    s = Staging{};
+}
+
+void* VulkanRenderer::AcquireStaging(int user, VkDeviceSize bytes, VkBuffer& buffer) {
+    // The slot is only known, and its fence only waited, inside an open frame.
+    if (!ring_.frameOpen() || user < 0 || user >= kStagingUsers || bytes == 0) return nullptr;
+    const uint32_t slot = ring_.slotIndex();
+    if (slot >= dxr::detail::kMaxFramesInFlight) return nullptr;
+    Staging& s = staging_[user][slot];
+    // Copied from earlier in this same frame (e.g. a source upload, then a converted
+    // picture into the same plane): rewriting it now would change what that earlier,
+    // still unsubmitted copy reads. The caller takes a one-off buffer instead.
+    if (s.mapped && s.usedSerial == frameSerial_) {
+        perf_.CountStagingOneOff();
+        return nullptr;
+    }
+    // Reuse is safe: this slot's buffer was last copied from by the frame recorded in this
+    // slot N frames ago, and beginFrame() waited that frame's fence before opening this
+    // one. A size change (or a much smaller frame: give the memory back) reallocates; the
+    // old buffer is idle for the same reason, deferred anyway.
+    if (!s.mapped || bytes > s.size || bytes < s.size / 2) {
+        ReleaseStaging(s, /*deferred=*/true);
+        if (!CreateStaging(s, bytes)) {
+            LOG_WARN("VulkanRenderer: staging buffer of %llu bytes failed; using a one-off buffer",
+                     (unsigned long long)bytes);
+            return nullptr;
+        }
+        perf_.CountStagingAlloc();
+    }
+    s.usedSerial = frameSerial_;
+    buffer = s.buffer;
+    return s.mapped;
+}
+
+void* VulkanRenderer::OneOffStaging(VkDeviceSize bytes, VkBuffer& buffer) {
+    // Only inside an open frame: the release below is queued on that frame's slot (outside
+    // one, or before the ring is up, deferDestroy would run it at once).
+    if (!ring_.frameOpen()) return nullptr;
+    Staging s;
+    if (!CreateStaging(s, bytes)) return nullptr;
+    // Unmapped, destroyed and freed once the GPU is past this frame (ReleaseStaging captures
+    // the handles; the mapping stays valid until then, and the caller copies now).
+    buffer = s.buffer;
+    void* mapped = s.mapped;
+    ReleaseStaging(s, /*deferred=*/true);
+    return mapped;
+}
+
+void VulkanRenderer::TrimIdleStaging() {
+    // A buffer no frame copied from in the whole last window (the source went from 8K live
+    // to a still, or the compare clip closed): give its memory back.
+    for (auto& user : staging_)
+        for (Staging& s : user)
+            if (s.mapped && s.usedSerial < trimSerial_) ReleaseStaging(s, /*deferred=*/true);
+    trimSerial_ = frameSerial_;
+}
+
+int VulkanRenderer::CopyToStaging(void* dst, const uint8_t* src, size_t rowBytes, size_t rows) {
+    if (copyThreads_ > 1 && !copyPool_ && bandcopy::BandsFor(rowBytes * rows, copyThreads_) > 1) {
+        copyPool_ = std::make_unique<bandcopy::Pool>(copyThreads_);
+        LOG_INFO("VulkanRenderer: upload copies run on %d thread(s)%s", copyPool_->Threads(),
+                 std::getenv("MEDIAPLAYER_UPLOAD_THREADS") ? " (MEDIAPLAYER_UPLOAD_THREADS)" : "");
+    }
+    return bandcopy::CopyRows(copyPool_.get(), dst, rowBytes, src, rowBytes, rowBytes, rows);
+}
+
+void VulkanRenderer::NoteUpload(std::chrono::steady_clock::time_point t0, const UploadTally& tally) {
+    perf_.Upload(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                 tally.copyMs, tally.bytes, tally.threads);
 }
 
 uint32_t VulkanRenderer::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const {
@@ -403,7 +538,8 @@ bool VulkanRenderer::ClearViews(uint32_t imageIndex, const ClearColor* colors,
 }
 
 bool VulkanRenderer::RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8_t* data,
-        uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel, bool& recreated) {
+        uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel, bool& recreated,
+        UploadTally& tally) {
     Plane& p = planes_[idx];
     const VkDeviceSize bytes = (VkDeviceSize)w * h * bytesPerTexel;
 
@@ -470,35 +606,22 @@ bool VulkanRenderer::RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8
         }
     }
 
-    // Host-visible staging buffer with the plane's pixels (released via deferDestroy once
-    // the frame that copies from it has executed).
+    // The plane's pixels into host-visible staging: this plane's persistent buffer for the
+    // open frame's ring slot (AcquireStaging: allocated and mapped once, reused every N
+    // frames), else a one-off buffer released once this frame has executed. The copy is the
+    // render thread's biggest per-frame cost at 8K (~50 MB of P016): row bands on copyPool_.
     VkBuffer sbuf = VK_NULL_HANDLE;
-    VkDeviceMemory smem = VK_NULL_HANDLE;
-    VkBufferCreateInfo bci = {};
-    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = bytes;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    vkCreateBuffer(device_, &bci, nullptr, &sbuf);
-    VkMemoryRequirements breq;
-    vkGetBufferMemoryRequirements(device_, sbuf, &breq);
-    VkMemoryAllocateInfo bai = {};
-    bai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    bai.allocationSize = breq.size;
-    bai.memoryTypeIndex = FindMemoryType(breq.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    vkAllocateMemory(device_, &bai, nullptr, &smem);
-    vkBindBufferMemory(device_, sbuf, smem, 0);
-    void* mapped = nullptr;
-    vkMapMemory(device_, smem, 0, bytes, 0, &mapped);
-    memcpy(mapped, data, (size_t)bytes);
-    vkUnmapMemory(device_, smem);
+    void* mapped = AcquireStaging(idx, bytes, sbuf);
+    if (!mapped) mapped = OneOffStaging(bytes, sbuf);
+    if (!mapped) {
+        LOG_ERROR("plane %d: no staging buffer for %llu bytes", idx, (unsigned long long)bytes);
+        return false;
+    }
     {
-        VkDevice dev = device_;
-        ring_.deferDestroy([dev, sbuf, smem]() {
-            vkDestroyBuffer(dev, sbuf, nullptr);
-            vkFreeMemory(dev, smem, nullptr);
-        });
+        const auto c0 = std::chrono::steady_clock::now();
+        tally.threads = std::max(tally.threads, CopyToStaging(mapped, data, (size_t)w * bytesPerTexel, h));
+        tally.copyMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+        tally.bytes += (double)bytes;
     }
 
     VkImageMemoryBarrier toDst = {};
@@ -547,10 +670,13 @@ bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t
 
     VkCommandBuffer cmd = FrameCmd();
     if (cmd == VK_NULL_HANDLE) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    UploadTally tally;
     bool rec = false;
     const bool ok = RecordPlaneUpload(cmd, 0, rgba, width, height, VK_FORMAT_R8G8B8A8_UNORM, 4,
-                                      rec);
+                                      rec, tally);
     if (!ok) return false;
+    NoteUpload(t0, tally);
 
     sourceMode_ = 0;
     sourceFullRange_ = 0.0f;
@@ -593,13 +719,16 @@ bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, con
 
     VkCommandBuffer cmd = FrameCmd();
     if (cmd == VK_NULL_HANDLE) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    UploadTally tally;
     bool rec[3] = {false, false, false};
     bool ok = true;
     for (int i = 0; i < count && ok; ++i) {
         ok = RecordPlaneUpload(cmd, i, specs[i].data, specs[i].w, specs[i].h, specs[i].fmt,
-                               specs[i].bpt, rec[i]);
+                               specs[i].bpt, rec[i], tally);
     }
     if (!ok) return false;
+    NoteUpload(t0, tally);
 
     sourceMode_ = mode;
     sourceFullRange_ = fullRange ? 1.0f : 0.0f;
@@ -655,8 +784,11 @@ bool VulkanRenderer::UploadCompareTexture(const uint8_t* rgba, uint32_t width, u
     if (!EnsureDummy()) return false;
     VkCommandBuffer cmd = FrameCmd();
     if (cmd == VK_NULL_HANDLE) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    UploadTally tally;
     bool rec = false;
-    if (!RecordPlaneUpload(cmd, 3, rgba, width, height, VK_FORMAT_R8G8B8A8_UNORM, 4, rec)) return false;
+    if (!RecordPlaneUpload(cmd, 3, rgba, width, height, VK_FORMAT_R8G8B8A8_UNORM, 4, rec, tally)) return false;
+    NoteUpload(t0, tally);
     compareMode_ = 0;
     compareFullRange_ = false;
     compare16_ = false;
@@ -692,11 +824,14 @@ bool VulkanRenderer::UploadCompareYUV(const uint8_t* plane0, const uint8_t* plan
     }
     VkCommandBuffer cmd = FrameCmd();
     if (cmd == VK_NULL_HANDLE) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    UploadTally tally;
     bool rec[3] = {false, false, false};
     for (int i = 0; i < count; ++i)
         if (!RecordPlaneUpload(cmd, 3 + i, specs[i].data, specs[i].w, specs[i].h, specs[i].fmt, specs[i].bpt,
-                               rec[i]))
+                               rec[i], tally))
             return false;
+    NoteUpload(t0, tally);
     compareMode_ = mode;
     compareFullRange_ = fullRange;
     compare16_ = format == 2;
@@ -991,10 +1126,12 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
 void VulkanRenderer::SubmitFrame() {
     if (!ring_.frameOpen()) return;
     const VkResult r = ring_.endFrame();  // EXACTLY one vkQueueSubmit, slot fence, no wait
+    ++frameSerial_;  // staging marked with the old value belongs to a submitted frame now
     if (r != VK_SUCCESS && !submitErrLogged_) {
         submitErrLogged_ = true;
         LOG_ERROR("frame vkQueueSubmit failed: %d (logged once)", (int)r);
     }
+    if (perf_.FrameSubmitted(PerfNow())) TrimIdleStaging();  // a perf window closed (~10 s)
 #if defined(_WIN32)
     // Zero-copy (#28): the D3D11 producer refills its shared textures with no GPU-side
     // sync against our sample (it CPU-waits its own copy, then publishes), so a frame that
@@ -1173,42 +1310,20 @@ void VulkanRenderer::DestroyTexture() {
 
 bool VulkanRenderer::UploadToSwapchainImage(VkImage image, const uint8_t* rgba,
                                             uint32_t width, uint32_t height) {
-    if (image == VK_NULL_HANDLE || !rgba) return false;
+    if (image == VK_NULL_HANDLE || !rgba || width == 0 || height == 0) return false;
     const VkDeviceSize bytes = (VkDeviceSize)width * height * 4;
 
-    VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
-    VkBufferCreateInfo bci = {};
-    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = bytes;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    vkCreateBuffer(device_, &bci, nullptr, &staging);
-    VkMemoryRequirements breq;
-    vkGetBufferMemoryRequirements(device_, staging, &breq);
-    VkMemoryAllocateInfo bai = {};
-    bai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    bai.allocationSize = breq.size;
-    bai.memoryTypeIndex = FindMemoryType(breq.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    vkAllocateMemory(device_, &bai, nullptr, &stagingMem);
-    vkBindBufferMemory(device_, staging, stagingMem, 0);
-    void* mapped = nullptr;
-    vkMapMemory(device_, stagingMem, 0, bytes, 0, &mapped);
-    memcpy(mapped, rgba, (size_t)bytes);
-    vkUnmapMemory(device_, stagingMem);
-    {
-        VkDevice dev = device_;
-        ring_.deferDestroy([dev, staging, stagingMem]() {
-            vkDestroyBuffer(dev, staging, nullptr);
-            vkFreeMemory(dev, stagingMem, nullptr);
-        });
-    }
-
     // Recorded into the frame command buffer (after the atlas pass); SubmitFrame()
-    // submits it before the HUD image is released.
+    // submits it before the HUD image is released. Opened first: the staging below is the
+    // open frame's (its ring slot's persistent buffer, as for the planes).
     VkCommandBuffer cmd = FrameCmd();
     if (cmd == VK_NULL_HANDLE) return false;
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    void* mapped = AcquireStaging(kHudStaging, bytes, staging);
+    if (!mapped) mapped = OneOffStaging(bytes, staging);
+    if (!mapped) return false;
+    CopyToStaging(mapped, rgba, (size_t)width * 4, height);
 
     // We overwrite the whole image, so UNDEFINED old layout is fine each frame.
     VkImageMemoryBarrier toDst = {};
@@ -1437,6 +1552,9 @@ void VulkanRenderer::Shutdown() {
     DestroyLut(cal_, false);
     DestroyLut(lutDummy_, false);
     ring_.destroy();  // waits its fences, runs the deferred releases, frees cmds/fences
+    for (auto& user : staging_)  // the device is idle (above): release now
+        for (Staging& s : user) ReleaseStaging(s, /*deferred=*/false);
+    copyPool_.reset();  // joins the copy threads
     if (sampler_) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
     if (descPool_) { vkDestroyDescriptorPool(device_, descPool_, nullptr); descPool_ = VK_NULL_HANDLE; }
     for (uint32_t i = 0; i < kMaxSlots; ++i) descSets_[i] = VK_NULL_HANDLE;

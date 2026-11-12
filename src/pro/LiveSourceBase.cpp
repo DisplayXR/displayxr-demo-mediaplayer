@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pro/LiveSourceBase.h"
 
+#include "pro/ConvertPool.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -80,13 +82,14 @@ void LiveSourceBase::Publish(const livepix::Nv12& src, bool fullRange, double ca
 }
 
 void LiveSourceBase::Publish(const livepix::P016& src, bool fullRange, double captureSec,
-                             const char* timecode, int eyeOffsetFrames) {
+                             const char* timecode, int eyeOffsetFrames, livepix::ConvertPool* pool) {
     if (src.width <= 0 || src.height <= 0) return;
     FrameRing::Frame& f = ring_.WriteBuffer();
-    const uint8_t* yb = reinterpret_cast<const uint8_t*>(src.y.data());
-    const uint8_t* uvb = reinterpret_cast<const uint8_t*>(src.uv.data());
-    f.plane[0].assign(yb, yb + src.y.size() * 2);
-    f.plane[1].assign(uvb, uvb + src.uv.size() * 2);
+    f.plane[0].resize(src.y.size() * 2);  // same size after warm-up: no allocation
+    f.plane[1].resize(src.uv.size() * 2);
+    // (a dual-stream 4K pair is 50 MB: row bands on the caller's convert threads)
+    livepix::CopyFrameBanded(pool, src, reinterpret_cast<uint16_t*>(f.plane[0].data()),
+                             reinterpret_cast<uint16_t*>(f.plane[1].data()));
     f.width = src.width;
     f.height = src.height;
     f.format = PixFormat::P016;
@@ -103,24 +106,17 @@ void LiveSourceBase::Publish(const livepix::P016& src, bool fullRange, double ca
 }
 
 void LiveSourceBase::PublishPair(const livepix::P016& l, const livepix::P016& r, bool fullRange,
-                                 double captureSec, const char* timecode, int eyeOffsetFrames) {
+                                 double captureSec, const char* timecode, int eyeOffsetFrames,
+                                 livepix::ConvertPool* pool) {
     const int cw = std::min(l.width, r.width), ch = std::min(l.height, r.height) & ~1;
     if (cw <= 0 || ch <= 0) return;
     const int w = 2 * cw;
     FrameRing::Frame& f = ring_.WriteBuffer();
     f.plane[0].resize((size_t)w * ch * 2);  // same size after warm-up: no allocation
     f.plane[1].resize((size_t)w * (ch / 2) * 2);
-    uint16_t* y = reinterpret_cast<uint16_t*>(f.plane[0].data());
-    uint16_t* uv = reinterpret_cast<uint16_t*>(f.plane[1].data());
-    const size_t eyeBytes = (size_t)cw * 2;
-    for (int row = 0; row < ch; ++row) {
-        std::memcpy(y + (size_t)row * w, l.y.data() + (size_t)row * l.width, eyeBytes);
-        std::memcpy(y + (size_t)row * w + cw, r.y.data() + (size_t)row * r.width, eyeBytes);
-    }
-    for (int row = 0; row < ch / 2; ++row) {
-        std::memcpy(uv + (size_t)row * w, l.uv.data() + (size_t)row * l.width, eyeBytes);
-        std::memcpy(uv + (size_t)row * w + cw, r.uv.data() + (size_t)row * r.width, eyeBytes);
-    }
+    // Row bands on the caller's convert threads: ~10 ms for a 4K pair on one thread.
+    livepix::ComposePairBanded(pool, l, r, cw, ch, reinterpret_cast<uint16_t*>(f.plane[0].data()),
+                               reinterpret_cast<uint16_t*>(f.plane[1].data()));
     f.width = w;
     f.height = ch;
     f.format = PixFormat::P016;
