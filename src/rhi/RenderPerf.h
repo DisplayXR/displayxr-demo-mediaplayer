@@ -25,7 +25,9 @@ namespace mp {
 // The Pro-only stages read 0 in the base player.
 enum class RenderStage : int {
     Pump = 0,  // window events + keys, xrPollEvent, file picks, PollLive / PollStream
-    Upload,    // the source frame: ring acquire, live layout, the plane upload (incl. the staging copy)
+    Upload,    // the source frame: ring acquire, live layout, the plane upload. Off-thread upload
+               // (rhi/AsyncUpload): the hand-over and the commit (recording the GPU copy, plus
+               // any wait for a copy still running); else the staging copy itself
     Rig,       // Pro: the rig check's Submit (its Downsample on the frames it measures)
     Thumbs,    // Pro: the live input's thumbnail (twice a second)
     Scopes,    // Pro: ProController::OnFrame (the scopes / pixel-probe gather while they are on)
@@ -64,6 +66,19 @@ inline const char* RenderStageName(RenderStage s) {
         default: return "?";
     }
 }
+
+// What the upload thread did (rhi/AsyncUpload) since the render thread last drained it
+// (every frame).
+struct AsyncUploadTally {
+    uint32_t copies = 0;   // frames copied into staging (ahead + on demand)
+    uint32_t ahead = 0;    // of them, copied from the ring's queue before the render thread took them
+    uint32_t failed = 0;   // copies that got no staging memory (the render thread copied those)
+    uint32_t skipped = 0;  // staged frames never shown: a newer frame came first, or the source changed
+    uint32_t noSlot = 0;   // frames the render thread copied itself: no staging slot was free
+    double copyMsSum = 0.0, copyMsMax = 0.0;
+    double bytes = 0.0;
+    int threads = 0;       // the last copy's threads (its bands), the upload thread included
+};
 
 // One timing over a window: count, mean and worst, in ms.
 struct PerfAcc {
@@ -105,6 +120,23 @@ struct RenderPerfWindow {
     // flat while streaming - and uploads that used a one-off buffer (the same plane twice
     // in one frame).
     uint64_t stagingAllocs = 0, stagingOneOff = 0;
+    // Off-thread upload (rhi/AsyncUpload, MEDIAPLAYER_ASYNC_UPLOAD, on by default): the
+    // source frame's copy into staging runs on the upload thread, the render thread records
+    // only the GPU copy (its time is in uploadAvgMs and the upload stage; copyAvgMs above is
+    // the render thread's own copies, ~0 then). Per window except the slot / thread counts.
+    bool asyncUpload = false;
+    int asyncSlots = 0;           // staging slots, one frame's planes each
+    int asyncThreads = 0;         // the copy's threads (bands), the upload thread included
+    uint32_t asyncCopies = 0;     // frames the upload thread copied
+    uint32_t asyncAhead = 0;      // of them, before the render thread took them (queue mode)
+    double asyncCopyAvgMs = 0.0, asyncCopyMaxMs = 0.0;  // one copy, on the upload thread
+    double asyncMB = 0.0;         // per copy
+    uint32_t asyncTaken = 0;      // staged frames the render thread recorded (shown)
+    uint32_t asyncSkipped = 0;    // staged frames never shown (a newer one came first, a source change)
+    uint32_t asyncNoSlot = 0;     // frames the render thread copied itself: no staging slot was free
+    uint32_t asyncFailed = 0;     // copies with no staging memory (the render thread copied them)
+    // The render thread's wait at the commit for a copy still running (0 when it was staged).
+    double asyncWaitAvgMs = 0.0, asyncWaitMaxMs = 0.0;
     // The render loop's stages (RenderStage): the average per loop iteration over the
     // window, and the worst single iteration. A stage that runs twice a second is averaged
     // over every frame, so the averages add up: their sum + xrWaitAvgMs is the loop's
@@ -133,6 +165,23 @@ inline std::string FormatRenderStages(const RenderPerfWindow& w) {
         out += buf;
     }
     return out;
+}
+
+// The off-thread upload for the `perf:` line: "async upload on: 5 slots, copy 7.41 avg /
+// 8.90 max ms on 8 thread(s), 47.5 MB, 600 copied (598 ahead), taken 599, skipped 1, no free
+// slot 0, failed 0, render-thread wait 0.02 avg / 0.40 max ms"; off: "async upload off
+// (MEDIAPLAYER_ASYNC_UPLOAD=0)".
+inline std::string FormatAsyncUpload(const RenderPerfWindow& w) {
+    if (!w.asyncUpload) return "async upload off (MEDIAPLAYER_ASYNC_UPLOAD=0)";
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "async upload on: %d slots, copy %.2f avg / %.2f max ms on %d thread(s), %.1f MB, %u copied "
+                  "(%u ahead), taken %u, skipped %u, no free slot %u, failed %u, render-thread wait %.2f avg / "
+                  "%.2f max ms",
+                  w.asyncSlots, w.asyncCopyAvgMs, w.asyncCopyMaxMs, w.asyncThreads, w.asyncMB, w.asyncCopies,
+                  w.asyncAhead, w.asyncTaken, w.asyncSkipped, w.asyncNoSlot, w.asyncFailed, w.asyncWaitAvgMs,
+                  w.asyncWaitMaxMs);
+    return buf;
 }
 
 class RenderPerfMeter {
@@ -166,7 +215,28 @@ public:
         copyThreads_ = copyThreads;
     }
     void CountStagingAlloc() { ++stagingAllocs_; }
+    void CountStagingAllocs(uint64_t n) { stagingAllocs_ += n; }
     void CountStagingOneOff() { ++stagingOneOff_; }
+
+    // Off-thread upload (rhi/AsyncUpload): on / off and its slot count (once), what the upload
+    // thread did (drained every frame), and each staged frame the render thread recorded with
+    // how long it waited at the commit for a copy still running.
+    void SetAsyncUpload(bool on, int slots) {
+        asyncOn_ = on;
+        asyncSlots_ = slots;
+    }
+    void AsyncCopies(const AsyncUploadTally& t) {
+        asyncTally_.copies += t.copies;
+        asyncTally_.ahead += t.ahead;
+        asyncTally_.failed += t.failed;
+        asyncTally_.skipped += t.skipped;
+        asyncTally_.noSlot += t.noSlot;
+        asyncTally_.copyMsSum += t.copyMsSum;
+        if (t.copyMsMax > asyncTally_.copyMsMax) asyncTally_.copyMsMax = t.copyMsMax;
+        asyncTally_.bytes += t.bytes;
+        if (t.copies) asyncThreads_ = t.threads;
+    }
+    void AsyncTaken(double waitMs) { asyncWait_.Add(waitMs); }
 
     // The render loop's stages. Stage() adds to the open loop iteration (several calls for
     // one stage add up; Other is computed, never reported). EndLoop() closes the iteration
@@ -214,6 +284,22 @@ private:
         w.copyThreads = copyThreads_;
         w.stagingAllocs = stagingAllocs_;
         w.stagingOneOff = stagingOneOff_;
+        w.asyncUpload = asyncOn_;
+        w.asyncSlots = asyncSlots_;
+        w.asyncThreads = asyncThreads_;
+        w.asyncCopies = asyncTally_.copies;
+        w.asyncAhead = asyncTally_.ahead;
+        w.asyncCopyAvgMs = asyncTally_.copies ? asyncTally_.copyMsSum / asyncTally_.copies : 0.0;
+        w.asyncCopyMaxMs = asyncTally_.copyMsMax;
+        w.asyncMB = asyncTally_.copies ? asyncTally_.bytes / asyncTally_.copies / (1024.0 * 1024.0) : 0.0;
+        w.asyncTaken = asyncWait_.n;
+        w.asyncSkipped = asyncTally_.skipped;
+        w.asyncNoSlot = asyncTally_.noSlot;
+        w.asyncFailed = asyncTally_.failed;
+        w.asyncWaitAvgMs = asyncWait_.Avg();
+        w.asyncWaitMaxMs = asyncWait_.max;
+        asyncTally_ = AsyncUploadTally{};
+        asyncWait_ = PerfAcc{};
         w.stageFrames = loops_;
         for (int i = 0; i < kRenderStages; ++i) {
             w.stages[i].avgMs = loops_ ? stageSum_[i] / loops_ : 0.0;
@@ -235,6 +321,10 @@ private:
     double uploadBytes_ = 0.0;
     int copyThreads_ = 1;
     uint64_t stagingAllocs_ = 0, stagingOneOff_ = 0;
+    bool asyncOn_ = false;
+    int asyncSlots_ = 0, asyncThreads_ = 0;
+    AsyncUploadTally asyncTally_;  // this window's upload-thread copies
+    PerfAcc asyncWait_;            // this window's recorded staged frames: the commit's wait
     double loopStage_[kRenderStages] = {};  // the open loop iteration's stages
     double loopWait_ = 0.0;                 // ... and its xrWaitFrame
     double stageSum_[kRenderStages] = {}, stageMax_[kRenderStages] = {};

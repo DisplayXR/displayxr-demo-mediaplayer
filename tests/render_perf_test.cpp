@@ -252,6 +252,74 @@ void ProPerfSwitches() {
     CHECK(all.Off() == "rig, thumbs, autoconv, ui", "all off");
 }
 
+// The off-thread upload (rhi/AsyncUpload): the upload thread's copies drained every frame,
+// the render thread's wait per recorded frame, per window; the `perf:` text on and off.
+void AsyncUploadWindow() {
+    const double mb = 47.5 * 1024 * 1024;
+    mp::RenderPerfMeter m(10.0);
+    m.SetAsyncUpload(true, 5);
+    Clock60 c{0.0, 0};
+    m.FrameSubmitted(c.base);
+    for (int i = 0; i < 600; ++i) {
+        mp::AsyncUploadTally t;  // one copy a frame, ahead except every 10th; a 9 ms worst
+        t.copies = 1;
+        t.ahead = (i % 10) ? 1 : 0;
+        t.copyMsSum = t.copyMsMax = (i == 300) ? 9.0 : 7.0;
+        t.bytes = mb;
+        t.threads = 8;
+        if (i == 100) t.skipped = 2;
+        if (i == 200) t.noSlot = 1;
+        m.AsyncCopies(t);
+        m.AsyncTaken((i % 10) ? 0.0 : 0.5);  // an on-demand frame waits 0.5 ms
+        m.XrWait(6.0);
+        m.Upload(0.3, 0.0, mb, 8);
+        m.FrameSubmitted(c.Next());
+    }
+    const mp::RenderPerfWindow& w = m.Last();
+    CHECK(w.serial == 1, "the window closed");
+    CHECK(w.asyncUpload && w.asyncSlots == 5 && w.asyncThreads == 8, "on, 5 slots, 8 threads");
+    CHECK(w.asyncCopies == 600 && w.asyncAhead == 540, "600 copies, 540 ahead");
+    CHECK(Near(w.asyncCopyAvgMs, (599 * 7.0 + 9.0) / 600, 1e-9) && Near(w.asyncCopyMaxMs, 9.0), "copy avg / max");
+    CHECK(Near(w.asyncMB, 47.5, 1e-9), "MB per copy");
+    CHECK(w.asyncTaken == 600 && w.asyncSkipped == 2 && w.asyncNoSlot == 1 && w.asyncFailed == 0,
+          "taken, skipped, no free slot");
+    CHECK(Near(w.asyncWaitAvgMs, 0.05, 1e-9) && Near(w.asyncWaitMaxMs, 0.5), "the render thread's wait");
+    CHECK(Near(w.uploadAvgMs, 0.3, 1e-9) && Near(w.copyAvgMs, 0.0), "the render thread's upload share, no copy");
+
+    // The next window starts clean (the slot count and threads stay).
+    for (int i = 0; i < 600; ++i) {
+        m.XrWait(6.0);
+        m.FrameSubmitted(c.Next());
+    }
+    const mp::RenderPerfWindow& w2 = m.Last();
+    CHECK(w2.serial == 2 && w2.asyncCopies == 0 && w2.asyncTaken == 0 && w2.asyncSkipped == 0 &&
+              Near(w2.asyncCopyMaxMs, 0.0) && Near(w2.asyncWaitMaxMs, 0.0),
+          "per window");
+    CHECK(w2.asyncUpload && w2.asyncSlots == 5 && w2.asyncThreads == 8, "the configuration stays");
+
+    mp::RenderPerfWindow t;
+    t.asyncUpload = true;
+    t.asyncSlots = 5;
+    t.asyncThreads = 8;
+    t.asyncCopyAvgMs = 7.41;
+    t.asyncCopyMaxMs = 8.9;
+    t.asyncMB = 47.46;
+    t.asyncCopies = 600;
+    t.asyncAhead = 598;
+    t.asyncTaken = 599;
+    t.asyncSkipped = 1;
+    t.asyncWaitAvgMs = 0.02;
+    t.asyncWaitMaxMs = 0.4;
+    const std::string s = mp::FormatAsyncUpload(t);
+    const char* want =
+        "async upload on: 5 slots, copy 7.41 avg / 8.90 max ms on 8 thread(s), 47.5 MB, 600 copied (598 ahead), "
+        "taken 599, skipped 1, no free slot 0, failed 0, render-thread wait 0.02 avg / 0.40 max ms";
+    CHECK(s == want, "the `perf:` async text");
+    if (s != want) std::fprintf(stderr, "    got:  %s\n    want: %s\n", s.c_str(), want);
+    CHECK(mp::FormatAsyncUpload(mp::RenderPerfWindow{}) == "async upload off (MEDIAPLAYER_ASYNC_UPLOAD=0)",
+          "off");
+}
+
 }  // namespace
 
 int main() {
@@ -262,6 +330,7 @@ int main() {
     StagesOtherAndCarry();
     StagesText();
     ProPerfSwitches();
+    AsyncUploadWindow();
     if (g_failures) {
         std::fprintf(stderr, "render_perf_test: %d failure(s)\n", g_failures);
         return 1;
