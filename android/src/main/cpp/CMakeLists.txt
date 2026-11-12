@@ -156,6 +156,7 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/ui/UiText.cpp             # fitting and wrapping text (#180)
     ${REPO_ROOT}/src/ui/ImGuiLayer.cpp
     ${REPO_ROOT}/src/ui/TapHandler.cpp         # a tap shows or hides the chrome (#180)
+    ${REPO_ROOT}/src/ui/ZoomGesture.cpp        # pinch and double-tap zoom on a still (#180)
     ${REPO_ROOT}/src/xr/DisplayModeSwitch.cpp  # the player's 2D/3D switch (#180)
     # The media browser (#160, docs/BROWSER.md).
     ${REPO_ROOT}/src/browser/MediaBrowser.cpp

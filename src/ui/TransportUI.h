@@ -19,6 +19,7 @@
 
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct ImFont;
@@ -60,6 +61,11 @@ struct TransportCaps {
     // "2D | 3D" control, docked at the end of the transport row for a video and alone
     // bottom right for a still. Times and names use the touch type scale.
     bool touchLayout = false;
+    // Touch layout only (#180), DEFAULT FALSE. `skip`: the -10 s / +10 s buttons beside play
+    // (Android: a tablet, shortest side >= 600 dp). `info`: the (i) at the top right, which
+    // opens the info sheet (TransportState::info).
+    bool skip = false;
+    bool info = false;
 };
 
 // One row of the "Convert to 3D" provider selector: the runtime's verbatim provider name
@@ -92,6 +98,9 @@ struct TransportState {
     bool isVideo = false;
     std::string mediaFilename;  // basename only; the caller does the path work
     std::string mediaPosition;  // "12 / 112": its place in the list browsed; touch layout only
+    // The info sheet's rows, label then value ("Resolution", "3840 x 1080"); only read while
+    // infoOpen, so the owner may fill it only then.
+    std::vector<std::pair<std::string, std::string>> info;
     std::string modeName;       // e.g. "2x1 Stereo"
     bool mode3D = false;        // the 2D/3D switch's side; only read when caps.modeSwitch
     std::string layoutName;     // e.g. "SBS-half"
@@ -168,6 +177,8 @@ struct TransportState {
     bool cameraComboWasOpen = false;
     // Stream URL popup's edit buffer (#93), seeded from urlSeed each time it opens.
     char urlBuf[1024] = {};
+    // The info sheet is open (caps.info); the owner may close it (a new file).
+    bool infoOpen = false;
 
     // Auto-hide fade (whole-UI alpha) and the independent toast fade.
     float fadeAlpha = 0.0f;
@@ -193,6 +204,7 @@ struct TransportActions {
     std::function<void()> ToggleMute;
     std::function<void()> ToggleLoop;
     std::function<void()> TogglePanels;  // Pro, used only when panelsButton
+    std::function<void(float seconds)> Skip;  // caps.skip: seek this far from where it plays
 
     // Scrub machine. Seek(preview=true) is a cheap keyframe seek for a fast
     // sweep; preview=false is the exact frame. ScrubHeld fires once when the

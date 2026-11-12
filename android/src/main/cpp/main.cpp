@@ -70,6 +70,7 @@
 #include "ui/TapHandler.h"
 #include "ui/TransportUI.h"
 #include "ui/UiScale.h"
+#include "ui/ZoomGesture.h"
 #include "imgui_internal.h"  // FindHoveredWindowEx: is a touch over the chrome
 #include "xr/DisplayModeSwitch.h"
 #include "browser/AndroidMediaProvider.h"
@@ -209,6 +210,8 @@ struct TouchEvent {
 	int action;  // MotionEvent's: 0 down, 1 up, 2 move, the rest end the gesture
 	float x, y;  // HUD pixels
 	double t;    // seconds
+	int pointers;  // fingers down
+	float x1, y1;  // the second finger, when pointers >= 2 (the still's pinch, #180)
 };
 std::mutex g_touch_mx;
 std::vector<TouchEvent> g_touches;
@@ -218,6 +221,8 @@ NeighbourStills g_stills;
 int g_slide_step = 0;
 // The image on screen (when it is one), for NeighbourStills to keep when it is swiped away.
 NeighbourStills::Adopted g_picture;
+// Pinch and double-tap zoom on a still (#180); swiping is for fit zoom only.
+mp::ui::ZoomGesture g_zoom;
 // The file the slide asked for has arrived: once it is on screen the slide is over.
 bool g_slide_arrived = false;
 // Design units, through ui::Px(): 8 dp and 64 dp.
@@ -1536,6 +1541,62 @@ browser_showing()
 // Create the SINGLE tiled-atlas swapchain, sized worst-case over all modes AND
 // both orientations (the swapchain is never recreated on rotation, so it must
 // hold either orientation's largest tile layout; each frame renders a
+// The format a file's name says it is, for a message ("HEIC"), or "" when it has none.
+static std::string
+name_format(const std::string &name)
+{
+	const size_t dot = name.rfind('.');
+	if (dot == std::string::npos || dot + 1 >= name.size() || name.size() - dot > 6) return std::string();
+	std::string ext = name.substr(dot + 1);
+	for (char &c : ext) c = (char)toupper((unsigned char)c);
+	return ext;
+}
+
+// The info sheet's rows (#180): what the file is, as far as the player knows.
+static void
+fill_info()
+{
+	std::vector<std::pair<std::string, std::string>> &rows = g_ui_state.info;
+	rows.clear();
+	std::string name;
+	{
+		std::lock_guard<std::mutex> lk(g_pick_name_mx);
+		name = g_pick_name;
+	}
+	const std::string format = name_format(name);
+	if (!format.empty()) rows.push_back({"Format", format + (g_is_video ? " video" : " image")});
+	const int w = g_is_video ? g_video.width() : g_picture.width;
+	const int h = g_is_video ? g_video.height() : g_picture.height;
+	if (w > 0 && h > 0) rows.push_back({"Resolution", std::to_string(w) + " \xC3\x97 " + std::to_string(h)});
+	const char *layout = "2D (one view)";
+	switch (g_layout) {
+	case mp::StereoLayout::SbsFull: layout = "3D, side by side (full width)"; break;
+	case mp::StereoLayout::SbsHalf: layout = "3D, side by side (half width)"; break;
+	case mp::StereoLayout::TbFull: layout = "3D, top and bottom (full height)"; break;
+	case mp::StereoLayout::TbHalf: layout = "3D, top and bottom (half height)"; break;
+	case mp::StereoLayout::Dual: layout = "3D, one view per video track"; break;
+	default: break;
+	}
+	rows.push_back({"Stereo layout", layout});
+	if (g_is_video && g_video.durationSeconds() > 0.0) {
+		const int t = (int)g_video.durationSeconds();
+		char d[32];
+		if (t >= 3600)
+			snprintf(d, sizeof(d), "%d:%02d:%02d", t / 3600, t / 60 % 60, t % 60);
+		else
+			snprintf(d, sizeof(d), "%d:%02d", t / 60, t % 60);
+		rows.push_back({"Duration", d});
+	}
+	mp::browser::MediaItem item;
+	if (g_browser_ready.load(std::memory_order_relaxed) && g_browser.OpenedItem(item) && item.dateMs > 0) {
+		const time_t secs = (time_t)(item.dateMs / 1000);
+		struct tm local = {};
+		char d[48];
+		if (localtime_r(&secs, &local) && strftime(d, sizeof(d), "%d %b %Y, %H:%M", &local) > 0)
+			rows.push_back({"Date", d});
+	}
+}
+
 // Refresh the shared UI state from live player state. Everything the widgets read
 // is plain data — see src/ui/TransportUI.h for the ownership rules (the scrub block
 // belongs to the widget code and must not be written here).
@@ -1552,6 +1613,10 @@ fill_transport_state()
 	g_ui_state.isVideo = g_is_video;
 	// The player's 2D/3D switch (#180), not the idle screen's: that one borrows 2D.
 	g_ui_state.caps.modeSwitch = g_ui_state.hasMedia && g_mode_switch.Available();
+	// The 10 s skips on a tablet (shortest side 600 dp or more), the info sheet always (#180).
+	const float short_side = (float)(g_hud_w < g_hud_h ? g_hud_w : g_hud_h);
+	g_ui_state.caps.skip = g_is_video && short_side >= mp::ui::Dp(600.0f);
+	g_ui_state.caps.info = g_ui_state.hasMedia;
 	g_ui_state.mode3D = g_mode_switch.Is3D();
 	{
 		// SAF DISPLAY_NAME — already a basename, so no path work is needed here.
@@ -1565,6 +1630,7 @@ fill_transport_state()
 	    g_browser.OpenedPosition(index, count) && count > 1)
 		g_ui_state.mediaPosition = std::to_string(index + 1) + " / " + std::to_string(count);
 	g_ui_state.layoutName = mp::MediaSource::LayoutName(g_layout);
+	if (g_ui_state.infoOpen) fill_info();
 	g_ui_state.positionSeconds = g_is_video ? g_video.positionSeconds() : 0.0;
 	g_ui_state.durationSeconds = g_is_video ? g_video.durationSeconds() : 0.0;
 	g_ui_state.paused = g_is_video ? g_video.paused() : true;
@@ -1572,7 +1638,7 @@ fill_transport_state()
 	// Auto-hide: visible while paused or shortly after a touch. The fade itself is
 	// the shared one, so Android now eases in/out like the desktop instead of the
 	// old hard on/off.
-	g_taps.SetHeld(g_is_video && g_video.paused());
+	g_taps.SetHeld((g_is_video && g_video.paused()) || g_ui_state.infoOpen);
 	const bool shown = g_taps.Shown((double)now * 1e-9);
 	mp::ui::TickTransportUI(g_ui_state, dt, shown);
 
@@ -1796,6 +1862,15 @@ hud_init()
 	g_ui_actions.Seek = [](float sec, bool /*preview*/) {
 		g_video.seekTo((double)sec);
 		if (g_stereo_dual) g_video_right.seekTo((double)sec);
+	};
+	g_ui_actions.Skip = [](float delta) {  // the tablet's 10 s skips (#180)
+		const double dur = g_video.durationSeconds();
+		double t = g_video.positionSeconds() + (double)delta;
+		if (t > dur - 0.5) t = dur - 0.5;
+		if (t < 0.0) t = 0.0;
+		g_video.seekTo(t);
+		if (g_stereo_dual) g_video_right.seekTo(t);
+		g_audio.seekTo(t);
 	};
 	g_ui_actions.ScrubReleased = [](float sec) {
 		g_video.seekTo((double)sec);
@@ -2061,6 +2136,8 @@ stop_media()
 	g_sbs.resetVideoAhb();
 	LOGI("[LVF] teardown: complete");
 	g_scene_loaded.store(false, std::memory_order_relaxed);
+	g_zoom.Reset();
+	g_ui_state.infoOpen = false;
 	// A seek the old clip's scrubber still waits on must not hold the next clip's knob
 	// (the desktop resets these on every open).
 	g_ui_state.scrubValue = 0.0f;
@@ -2081,17 +2158,6 @@ show_browser(struct android_app *app)
 	g_slide.Reset();
 	g_slide_step = 0;
 	g_slide_arrived = false;
-}
-
-// The format a file's name says it is, for a message ("HEIC"), or "" when it has none.
-static std::string
-name_format(const std::string &name)
-{
-	const size_t dot = name.rfind('.');
-	if (dot == std::string::npos || dot + 1 >= name.size() || name.size() - dot > 6) return std::string();
-	std::string ext = name.substr(dot + 1);
-	for (char &c : ext) c = (char)toupper((unsigned char)c);
-	return ext;
 }
 
 // A file that would not open (#180): say so, and go back to the grid it came from. It used
@@ -2171,11 +2237,32 @@ run_slide()
 	}
 	const bool in_player = !g_showing_splash.load(std::memory_order_relaxed);
 	g_taps.SetSlop(mp::ui::Px(kDragSlop));
-	for (const TouchEvent &e : touches) route_touch(e, in_player);
-	if (in_player)
-		held.insert(held.end(), touches.begin(), touches.end());
-	else
+	// A still zooms (#180). Its size at fit is what the atlas pass draws (fitFraction).
+	const bool can_zoom = in_player && !g_is_video && !browser_showing() &&
+	                      g_scene_loaded.load(std::memory_order_relaxed) && !g_slide.Busy();
+	if (can_zoom) {
+		uint32_t tw = 0, th = 0, tc = 0, tr = 0;
+		active_tile_dims(&tw, &th, &tc, &tr);
+		float fw = 1.0f, fh = 1.0f;
+		SbsRenderer::fitFraction(g_content_aspect.load(std::memory_order_relaxed), tw, th, &fw, &fh);
+		g_zoom.SetView((float)g_hud_w, (float)g_hud_h, fw * (float)g_hud_w, fh * (float)g_hud_h);
+		g_zoom.SetSlop(mp::ui::Px(kDragSlop));
+	} else if (!g_slide.Busy()) {
+		g_zoom.Reset();
+	}
+	for (const TouchEvent &e : touches) {
+		route_touch(e, in_player);
+		if (can_zoom) g_zoom.Touch(e.action, e.x, e.y, e.pointers, e.x1, e.y1, e.t);
+	}
+	if (in_player && can_zoom && (g_zoom.Zoomed() || g_zoom.Active())) {
+		// Zoomed, a finger pans: no swipe.
 		held.clear();
+		g_slide.Cancel(now);
+	} else if (in_player) {
+		held.insert(held.end(), touches.begin(), touches.end());
+	} else {
+		held.clear();
+	}
 	if (held.size() > 256) held.erase(held.begin(), held.end() - 256);  // a long load: keep the latest
 	if (!g_slide.Waiting()) {  // the page shown while a file opens must stay
 		int64_t prev = -1, next = -1;  // left as -1 when there is none
@@ -2203,6 +2290,8 @@ run_slide()
 	if (step != 0) g_slide_step = step;
 	const int side = g_slide.Neighbour();
 	g_sbs.setSlide(g_slide.Offset());
+	if (g_hud_w > 0 && g_hud_h > 0)
+		g_sbs.setZoom(g_zoom.Zoom(), g_zoom.OffsetX() / (float)g_hud_w, g_zoom.OffsetY() / (float)g_hud_h);
 	g_stills.ShowPage(side, g_slide.Offset() + (float)side);
 }
 
@@ -2212,6 +2301,7 @@ show_image(const NeighbourStills::Adopted &a)
 {
 	apply_layout(a.info.layout, a.width, a.height);
 	g_picture = a;
+	g_zoom.Reset();
 	g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox for media
 	g_is_video = false;
 	leave_splash();
@@ -3330,7 +3420,8 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativePickCancelled(
 // are classloader-fragile).
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
-    JNIEnv * /*env*/, jobject /*thiz*/, jint action, jfloat nx, jfloat ny)
+    JNIEnv * /*env*/, jobject /*thiz*/, jint action, jfloat nx, jfloat ny, jint pointers, jfloat nx1,
+    jfloat ny1)
 {
 	static bool moved = false;
 	static float downX = 0.0f, downY = 0.0f;
@@ -3339,7 +3430,8 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 	{
 		std::lock_guard<std::mutex> lk(g_touch_mx);
 		if (g_touches.size() >= 256) g_touches.erase(g_touches.begin());  // a long load: keep the latest
-		g_touches.push_back({(int)action, nx * (float)g_hud_w, ny * (float)g_hud_h, (double)now_ns() * 1e-9});
+		g_touches.push_back({(int)action, nx * (float)g_hud_w, ny * (float)g_hud_h, (double)now_ns() * 1e-9,
+		                     (int)pointers, nx1 * (float)g_hud_w, ny1 * (float)g_hud_h});
 	}
 
 	if (action == kDown) {

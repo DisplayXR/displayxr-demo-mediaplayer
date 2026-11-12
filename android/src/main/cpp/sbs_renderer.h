@@ -104,6 +104,17 @@ struct SbsRenderer {
 	// The swipe slide: every tile's picture, crop included, moved by `s` tile widths
 	// (+ = right). Both eyes move together, so the depth is unchanged.
 	void setSlide(float s) { slide_ = s; }
+	// The still's zoom (#180): `zoom` x its fit size, its centre moved (x, y) tile sizes from
+	// the tile's. Every tile the same, so the depth is kept. 1, 0, 0 = fit.
+	void setZoom(float zoom, float x, float y)
+	{
+		zoom_ = zoom;
+		zoomX_ = x;
+		zoomY_ = y;
+	}
+	// The size of content of `aspect` fitted min-to-min in a w x h tile, in tile sizes (one
+	// side is 1, the other may pass 1: that axis crops). What drawAtlas draws at fit.
+	static void fitFraction(float aspect, uint32_t w, uint32_t h, float *fw, float *fh);
 
 	// ── Stills: the swipe's second page (NeighbourStills) ─────────────────
 	// RGBA8 into still slot 0 or 1. A one-off: drains the frames in flight first.
@@ -275,6 +286,7 @@ private:
 	bool ahbStereo_ = false;
 	float convergence_ = 0.0f;   // fraction of view width; see drawAtlas()
 	float slide_ = 0.0f;         // tile widths; see setSlide()
+	float zoom_ = 1.0f, zoomX_ = 0.0f, zoomY_ = 0.0f;  // see setZoom()
 	float convSign_ = 1.0f;      // debug.dxr.mp.conv_sign: 1 = vendor convention (+ = nearer), -1 inverts
 	float convScale_ = 1.0f;     // debug.dxr.mp.conv_scale (0 = off, 1 = as authored)
 	bool convPropsRead_ = false;

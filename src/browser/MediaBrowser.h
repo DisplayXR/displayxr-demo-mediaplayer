@@ -72,6 +72,8 @@ public:
     // The item last opened from the grid: its index in grid order and how many the grid
     // holds. False when none was (the system picker) or it is no longer in the grid.
     bool OpenedPosition(int& index, int& count) const;
+    // The item last opened from the grid, if any.
+    bool OpenedItem(MediaItem& out) const;
     // Whether Back() has something to do: leave select mode, or go up a folder.
     bool CanGoBack() const;
     bool Back();

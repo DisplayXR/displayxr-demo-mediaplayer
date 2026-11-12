@@ -509,6 +509,38 @@ bool SegmentSwitch(const char* id, bool on3D, float h, float hitH) {
     return tapped && tapped3D != on3D;
 }
 
+// The info sheet (caps.info): what the file is, under the top bar at the right, on a
+// translucent panel rather than over the picture's middle. A tap outside closes it.
+void InfoSheet(TransportState& s, float W, float y, float edge) {
+    ImFont* rowFont = StyleFont(TextStyle::Row);
+    ImFont* smallFont = StyleFont(TextStyle::Small);
+    const float w = std::min(W - edge * 2.0f, Dp(320.0f));
+    ImGui::SetNextWindowPos(ImVec2(W - edge, y), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0.0f), ImGuiCond_Always);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.06f, 0.08f, 0.78f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Dp(16.0f), Dp(12.0f)));
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav;
+    if (ImGui::Begin("##info_sheet", nullptr, flags)) {
+        const float inner = w - Dp(32.0f);
+        for (size_t i = 0; i < s.info.size(); ++i) {
+            if (i > 0) ImGui::Dummy(ImVec2(0.0f, Dp(6.0f)));
+            ImGui::PushFont(smallFont);
+            ImGui::TextColored(ImVec4(0.72f, 0.76f, 0.82f, 1.0f), "%s", s.info[i].first.c_str());
+            ImGui::PopFont();
+            ImGui::PushFont(rowFont);
+            ImGui::TextUnformatted(FitText(s.info[i].second, inner).c_str());
+            ImGui::PopFont();
+        }
+        if (ImGui::IsMouseClicked(0) && !ImGui::IsWindowHovered() &&
+            !ImGui::IsAnyItemHovered())  // the (i) itself toggles it
+            s.infoOpen = false;
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
+
 // The touch player's chrome: scrims instead of slabs, the back arrow and the file's name
 // at the top left, the transport (or, for a still, the 2D/3D switch) at the bottom.
 //
@@ -551,7 +583,14 @@ void TouchChrome(TransportState& s, const TransportActions& a, float W, float H)
         if (IconButton("##back", Glyph::Back, iconSz, false, s.hitTargetScale)) Fire(a.Open);
         ImGui::EndDisabled();
         const float x = row.x + hit + ImGui::GetStyle().ItemSpacing.x * 0.5f;
-        const float right = W - edge;
+        float right = W - edge;
+        if (s.caps.info) {
+            right -= hit + ImGui::GetStyle().ItemSpacing.x;
+            ImGui::SetCursorScreenPos(ImVec2(W - edge - hit, row.y));
+            if (IconButton("##info", Glyph::Info, iconSz, s.infoOpen, s.hitTargetScale)) s.infoOpen = !s.infoOpen;
+        } else {
+            s.infoOpen = false;
+        }
         if (!s.mediaFilename.empty() && right > x) {
             ImGui::PushFont(titleFont);
             const std::string name = FitText(s.mediaFilename, right - x);
@@ -563,7 +602,9 @@ void TouchChrome(TransportState& s, const TransportActions& a, float W, float H)
             if (posH > 0.0f) TextAt(smallFont, ImVec2(x, y + titleH + Dp(2.0f)), s.mediaPosition.c_str(), dim);
         }
     }
+    const float topBottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
     ImGui::End();
+    if (s.infoOpen) InfoSheet(s, W, topBottom, edge);
 
     // --- Bottom: the transport for a video, the 2D/3D switch docked at its end ---
     const float switchH = std::round(iconSz * 0.82f);
@@ -589,6 +630,14 @@ void TouchChrome(TransportState& s, const TransportActions& a, float W, float H)
             const ImVec2 row = ImGui::GetCursorScreenPos();
             if (IconButton("##playpause", s.paused ? Glyph::Play : Glyph::Pause, iconSz, false, s.hitTargetScale))
                 Fire(a.TogglePlayback);
+            if (s.caps.skip) {
+                ImGui::SameLine();
+                if (IconButton("##skipback", Glyph::SkipBack, iconSz, false, s.hitTargetScale) && a.Skip)
+                    a.Skip(-10.0f);
+                ImGui::SameLine();
+                if (IconButton("##skipfwd", Glyph::SkipForward, iconSz, false, s.hitTargetScale) && a.Skip)
+                    a.Skip(10.0f);
+            }
             const float slot = TimeSlotW(smallFont, tot);
             const float textY = row.y + (hit - FontPx(smallFont)) * 0.5f;
             ImGui::SameLine();

@@ -706,6 +706,13 @@ bool MediaBrowser::OpenedPosition(int& index, int& count) const {
     return false;
 }
 
+bool MediaBrowser::OpenedItem(MediaItem& out) const {
+    const MediaItem* item = openedId_ >= 0 ? library_.Find(openedId_) : nullptr;
+    if (!item) return false;
+    out = *item;
+    return true;
+}
+
 bool MediaBrowser::StepTo(int step) {
     int64_t id = 0;
     if (!NextId(step, id)) return false;

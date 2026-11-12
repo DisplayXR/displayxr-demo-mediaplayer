@@ -1272,17 +1272,22 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	// content's shorter side == the tile's shorter side, centered; the longer axis crops
 	// (scissor) or letterboxes (cleared black); no stretch), moved `slide` tile widths and
 	// scissored to the tile. Nothing is drawn when the page is wholly off the tile.
+	// `zoom`: the still's zoom and offset (setZoom), the main picture's only.
 	auto page = [&](float tx, float ty, float aspect, float slide, VkPipeline p, VkPipelineLayout l,
-	                VkDescriptorSet set, const SbsPush &push) {
-		const float tileMin = renderW < renderH ? (float)renderW : (float)renderH;
-		const float cqW = aspect >= 1.0f ? tileMin * aspect : tileMin;
-		const float cqH = aspect >= 1.0f ? tileMin : tileMin / aspect;
+	                VkDescriptorSet set, const SbsPush &push, bool zoom) {
+		float fw = 1.0f, fh = 1.0f;
+		fitFraction(aspect, renderW, renderH, &fw, &fh);
+		const float z = zoom ? zoom_ : 1.0f;
+		const float cqW = fw * (float)renderW * z;
+		const float cqH = fh * (float)renderH * z;
+		const float ox = zoom ? zoomX_ * (float)renderW : 0.0f;
+		const float oy = zoom ? zoomY_ * (float)renderH : 0.0f;
 		const float shift = std::round(slide * (float)renderW);
 		const float x0 = shift > 0.0f ? tx + shift : tx;
 		const float x1 = shift < 0.0f ? tx + (float)renderW + shift : tx + (float)renderW;
 		if (x1 <= x0) return;
-		const VkViewport vp = {tx + ((float)renderW - cqW) * 0.5f + shift,
-		                       ty + ((float)renderH - cqH) * 0.5f, cqW, cqH, 0.0f, 1.0f};
+		const VkViewport vp = {tx + ((float)renderW - cqW) * 0.5f + shift + ox,
+		                       ty + ((float)renderH - cqH) * 0.5f + oy, cqW, cqH, 0.0f, 1.0f};
 		const VkRect2D sc = {{(int32_t)x0, (int32_t)ty}, {(uint32_t)(x1 - x0), renderH}};
 		vkCmdSetViewport(cmd, 0, 1, &vp);
 		vkCmdSetScissor(cmd, 0, 1, &sc);
@@ -1322,7 +1327,7 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 			push.mode = sourceMode_;
 			push.fullRange = sourceFullRange_;
 			push.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
-			page(tx, ty, contentAspect, slide_, pipe, pl, dsv, push);
+			page(tx, ty, contentAspect, slide_, pipe, pl, dsv, push, true);
 		}
 		// The swipe's second page: a still, split like an RGBA image.
 		if (haveStill) {
@@ -1333,13 +1338,27 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 			push.mode = 0;
 			push.fullRange = 1.0f;
 			push.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
-			page(tx, ty, stillAspect_, stillOffset_, pipeline_, pipeLayout_, stillSets_[slot], push);
+			page(tx, ty, stillAspect_, stillOffset_, pipeline_, pipeLayout_, stillSets_[slot], push, false);
 		}
 	}
 
 	vkCmdEndRenderPass(cmd);
 	// No submit, no wait: the HUD pass joins this command buffer, and endFrame()
 	// submits it once before the swapchain images are released (INV-4.10).
+}
+
+void
+SbsRenderer::fitFraction(float aspect, uint32_t w, uint32_t h, float *fw, float *fh)
+{
+	// MatchMinRect: the content's shorter side == the tile's shorter side, centered; the
+	// longer axis crops or letterboxes; no stretch.
+	const float tileMin = w < h ? (float)w : (float)h;
+	if (w == 0 || h == 0 || !(aspect > 0.0f)) {
+		*fw = *fh = 1.0f;
+		return;
+	}
+	*fw = (aspect >= 1.0f ? tileMin * aspect : tileMin) / (float)w;
+	*fh = (aspect >= 1.0f ? tileMin : tileMin / aspect) / (float)h;
 }
 
 void

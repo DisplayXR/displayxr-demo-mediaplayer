@@ -87,7 +87,8 @@ class MainActivity : NativeActivity() {
     // Raw touch (normalized coords) → native hit-tests the on-screen transport
     // bar (play/pause, scrub, load). Returns 1 when the Load button was tapped —
     // only Java can launch the system file picker.
-    private external fun nativeTouch(action: Int, nx: Float, ny: Float)
+    // The second finger too, when there is one: the still's pinch zoom (#180).
+    private external fun nativeTouch(action: Int, nx: Float, ny: Float, pointers: Int, nx1: Float, ny1: Float)
 
     /**
      * Polled once per Choreographer frame. True means native wants the SAF picker
@@ -279,7 +280,11 @@ class MainActivity : NativeActivity() {
             val w = (decor?.width ?: 0).takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
             val h = (decor?.height ?: 0).takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
             try {
-                nativeTouch(event.actionMasked, event.x / w.toFloat(), event.y / h.toFloat())
+                val two = event.pointerCount >= 2
+                nativeTouch(
+                    event.actionMasked, event.getX(0) / w.toFloat(), event.getY(0) / h.toFloat(), event.pointerCount,
+                    if (two) event.getX(1) / w.toFloat() else 0f, if (two) event.getY(1) / h.toFloat() else 0f,
+                )
             } catch (_: Throwable) {
                 // Native lib not bound yet — ignore until it is.
             }
