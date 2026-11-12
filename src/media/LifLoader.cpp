@@ -248,7 +248,14 @@ LifResult LoadOneView(const json& root, const std::vector<uint8_t>& buf,
     }
     if (mw != base.width || mh != base.height)
         depth = DepthPlane(depth.data(), 1, mw, mh, base.width, base.height);
-    const float parallax = std::clamp(OneViewParallax(root, view), -kMaxParallax, kMaxParallax);
+    float parallax = OneViewParallax(root, view);
+    // inv_z_map min < max puts the far end at 255, where DepthWarp's occlusion takes 255 as
+    // the nearest.
+    if (parallax < 0) {
+        for (uint8_t& d : depth) d = 255 - d;
+        parallax = -parallax;
+    }
+    parallax = std::min(parallax, kMaxParallax);
     LifResult r;
     r.image = DepthWarp::MakeSbs(base, depth, parallax);
     r.layout = StereoLayout::SbsFull;
