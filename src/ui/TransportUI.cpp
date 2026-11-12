@@ -105,6 +105,21 @@ float UiFontPx(float k) {
 
 float SwitchFontPx(float k) { return std::ceil(UiFontPx(k) * 1.2f - 0.001f); }
 
+float TextStylePx(TextStyle style, float k) {
+    if (!(k > 1.0f)) return UiFontPx(k);  // desktop: one size, as before
+    const float dp = style == TextStyle::Title ? 22.0f : style == TextStyle::Row ? 18.0f : 14.0f;
+    return std::ceil(Dp(dp) - 0.001f);
+}
+
+ImFont* StyleFont(TextStyle style) {
+    switch (style) {
+        case TextStyle::Title: return g_titleFont;
+        case TextStyle::Row: return g_rowFont;
+        case TextStyle::Small: return g_smallFont;
+    }
+    return nullptr;
+}
+
 namespace {
 constexpr float kPi = 3.14159265358979f;  // IM_PI lives in imgui_internal.h; keep our own
 enum class Icon { Play, Pause, Loop, Slideshow, Speaker, SpeakerMuted, Gallery };

@@ -271,6 +271,19 @@ void ImGuiLayer::AddUiFont() {
     ui::g_switchFont = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(
         (void*)kUiFontTtf, (int)sizeof(kUiFontTtf), ui::SwitchFontPx(metricScale_), &fontCfg,
         kSwitchGlyphs);
+    // The touch type scale (#180). Not on desktop: its atlas, and so every pixel, stays as
+    // it was, and the null fonts mean the UI font.
+    ui::g_titleFont = ui::g_rowFont = ui::g_smallFont = nullptr;
+    if (metricScale_ > 1.0f) {
+        auto add = [&](ui::TextStyle style) {
+            return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(
+                (void*)kUiFontTtf, (int)sizeof(kUiFontTtf), ui::TextStylePx(style, metricScale_),
+                &fontCfg, kGlyphs);
+        };
+        ui::g_titleFont = add(ui::TextStyle::Title);
+        ui::g_rowFont = add(ui::TextStyle::Row);
+        ui::g_smallFont = add(ui::TextStyle::Small);
+    }
 }
 
 void ImGuiLayer::SetUiScale(float scale) {

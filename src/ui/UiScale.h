@@ -13,6 +13,10 @@ inline float g_uiScale = 1.0f;
 
 inline float Px(float v) { return v * g_uiScale; }
 
+// Android's dp in HUD pixels. There g_uiScale = density / 1.5, so a design unit is 2/3 dp.
+// Only touch code sizes things in dp (the browser, the touch player's chrome).
+inline float Dp(float v) { return Px(v * 1.5f); }
+
 // Top edge (HUD pixels) of the bottom transport this frame, or 0 when none is showing.
 // Written by BuildTransportUI, which runs before Pro's UI, so the Pro status line can
 // sit above the strip instead of under it.

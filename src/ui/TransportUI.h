@@ -230,6 +230,20 @@ float UiFontPx(float metricScale = 1.0f);
 float SwitchFontPx(float metricScale = 1.0f);
 inline ImFont* g_switchFont = nullptr;
 
+// The touch UI's type scale (#180): three sizes besides the UI font, in dp so they follow
+// the device - Title about 22 dp (the player's file name, the browser's title), Row 18 dp
+// (list rows, chips, section headers) and Small 14 dp (badges, counts, times). ImGuiLayer
+// rasterizes them only on touch (metricScale > 1). On desktop the pointers stay null, and
+// ImGui::PushFont(nullptr) / AddText(nullptr, 0, ...) mean the UI font: the desktop draws
+// exactly what it drew before.
+enum class TextStyle { Title, Row, Small };
+float TextStylePx(TextStyle style, float metricScale = 1.0f);
+inline ImFont* g_titleFont = nullptr;
+inline ImFont* g_rowFont = nullptr;
+inline ImFont* g_smallFont = nullptr;
+// The font for `style`: null (the UI font) where the type scale is not built.
+ImFont* StyleFont(TextStyle style);
+
 // Advance the purely-visual timers: the auto-hide fade and the toast fade.
 // `uiAwake` is the caller's "should the chrome be visible" verdict (master
 // toggle AND not idle) — the caller owns what counts as activity, because that
