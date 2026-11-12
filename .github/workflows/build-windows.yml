@@ -68,6 +68,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # the installer's dev version comes from `git describe --tags`
 
       - name: Doc-only PR — skipping heavy build steps
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -338,6 +340,9 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "pro_version=$proVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "VERSION=$version PRO_VERSION=$proVersion"
+          # A failed `git describe` (no matching tag) is handled above; don't let its
+          # exit code fail the step.
+          exit 0
 
       - name: Build installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
