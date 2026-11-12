@@ -153,7 +153,8 @@ eye in the left-eye views, its right eye in the others. Android only.
   `StereoGridRenderer`, which replaces the atlas pass for that frame. The browser lays out
   first, so a scrolling tile is never drawn a frame behind the HUD.
 - The ImGui HUD stays the flat chrome (a window-space layer at disparity 0). It is
-  transparent over the grid: the bars, the sidebar, folders, badges and messages are flat,
+  transparent over the grid: the bars, the chip row, the rail or drawer, folders, section
+  headers, badges and messages are flat,
   the tiles' pictures are in the projection layer.
 - A tile's slot holds only the left eye's square (see Thumbnails). Under the filter the
   same square of the right eye goes in a second slot (`RightEyeKey`), so the window counts
@@ -184,8 +185,9 @@ eye in the left-eye views, its right eye in the others. Android only.
   happens to show, so a scroll never flips modes. Back from the player into a 3D-filtered
   grid goes back to 3D. Until the panel is in 3D the grid is drawn flat as before.
 - Resolution: a tile's useful size per eye is its rect times the mode's view scale (0.75 on
-  the phone, half the width on a side-by-side panel); the squares are made about 1:1 with
-  the tile, so they cover it.
+  the phone, half the width on a side-by-side panel); a video's squares are made about 1:1
+  with the tile, so they cover it. A side-by-side photo keeps the system's cached thumbnail
+  (see Thumbnails), so its eyes can be softer than the tile.
 - Only the browser's grid: the pass runs only while the browser shows, under the filter,
   with the panel in 3D. The player's frames (and the swipe's pages) always take the atlas
   pass as before.
