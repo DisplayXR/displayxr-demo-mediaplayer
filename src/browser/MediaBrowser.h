@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // MediaBrowser: the in-app gallery (#160, docs/BROWSER.md), drawn with ImGui over the
-// whole HUD. A top bar (sources, the current source, view options), a sidebar of sources,
-// a grid of square thumbnails with 3D and duration badges (Downloads: its folders first),
-// select mode for deleting (long-press), and the access and empty states. It owns the
+// whole HUD. A top bar (sources, the current source, view options), a row of filter chips,
+// the sources as a rail (wide landscape) or a drawer, a grid of square thumbnails with 3D
+// and duration badges (date sections; Downloads: its folders first), select mode for
+// deleting (long-press), and the access and empty states. It owns the
 // library, the thumbnails and the 3D verdicts, and reaches the device's media only through
 // a MediaProvider. Render thread only.
 #pragma once
 
+#include "browser/BrowserLayout.h"
 #include "browser/MediaLibrary.h"
 #include "browser/MediaProvider.h"
 #include "browser/StereoClassifier.h"
@@ -27,8 +29,6 @@
 #include <vector>
 
 namespace mp::browser {
-
-enum class DepthFilter { Both, Only3D, Only2D };
 
 class MediaBrowser {
 public:
@@ -74,7 +74,8 @@ public:
     bool OpenedPosition(int& index, int& count) const;
     // The item last opened from the grid, if any.
     bool OpenedItem(MediaItem& out) const;
-    // Whether Back() has something to do: leave select mode, or go up a folder.
+    // Whether Back() has something to do: close the drawer or a sheet, leave select mode, or
+    // go up a folder.
     bool CanGoBack() const;
     bool Back();
 
@@ -89,8 +90,13 @@ private:
     float SidebarWidth(float screenW) const;
     void TopBar(float width, float height);
     Action Sidebar(ImVec2 min, ImVec2 max, double now);
-    Action Grid(ImVec2 min, ImVec2 max, bool landscape, double now);
-    void ViewOptionsPopup(float right, float top);
+    Action Drawer(float width, float height, double now);
+    void ChipRow(ImVec2 min, ImVec2 max);
+    Action Grid(ImVec2 min, ImVec2 max, double now);
+    void ViewOptionsSheet(float width, float top, float bottom);
+    void TypeMenu();
+    void SetDepth(DepthFilter depth);
+    void SetType(TypeFilter type);
     void UploadReady(const std::unordered_set<int64_t>& window);
     void GoTo(const std::string& folder);
     void Up();
@@ -109,7 +115,13 @@ private:
     ViewOptions options_;
     DepthFilter depth_ = DepthFilter::Both;
     bool showUnsupported_ = false;  // the Unsupported source in the sidebar
-    bool sidebar_ = true;
+    bool sidebar_ = true;   // the rail shows (a wide landscape screen)
+    bool rail_ = false;     // this frame: the sources are a rail, not a drawer
+    bool drawer_ = false;   // the drawer is open (anywhere else)
+    bool sourcePicked_ = false;  // Sidebar() picked a source this frame
+    bool sheetOpen_ = false;     // the view options sheet or the type menu is open
+    bool closeSheets_ = false;   // Back: close them in the next Build()
+    ImVec2 typeChip_;       // where the type chip's menu opens, its bottom left
 
     bool selecting_ = false;  // select mode: a tap picks an item, the bin deletes the picked
     std::unordered_set<int64_t> selected_;
@@ -118,6 +130,11 @@ private:
     std::vector<Folder> folders_;  // the folder's sub-folders: the first tiles
     std::vector<size_t> shown_;    // indices into the library's items, in grid order after the folders
     std::vector<size_t> unknown_;  // under a depth filter: items with no verdict yet
+    // The grid's date sections (All media, Camera: "Today", "October 2026"): how many of
+    // shown_ each holds, in order, and their labels. Empty: one section, no headers.
+    std::vector<size_t> sectionSizes_;
+    std::vector<std::string> sectionLabels_;
+    GridLayout layout_;
     int64_t openedId_ = -1;        // the item last opened from the grid, or -1
 
     std::unordered_set<int64_t> pending_;      // thumbnails taken from the provider, not yet uploaded
@@ -128,7 +145,7 @@ private:
     TouchScroller gridScroll_, sidebarScroll_;
     ImVec2 gridPress_, sidebarPress_;
     int columns_ = 0;   // the last frame's, to keep the top row on a reflow
-    float step_ = 0.0f;
+    float thumbGrab_ = 0.0f;  // where the fast-scroll thumb was taken, from its top
 };
 
 } // namespace mp::browser

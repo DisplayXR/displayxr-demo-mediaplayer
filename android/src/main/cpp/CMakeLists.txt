@@ -159,6 +159,7 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/ui/ZoomGesture.cpp        # pinch and double-tap zoom on a still (#180)
     ${REPO_ROOT}/src/xr/DisplayModeSwitch.cpp  # the player's 2D/3D switch (#180)
     # The media browser (#160, docs/BROWSER.md).
+    ${REPO_ROOT}/src/browser/BrowserLayout.cpp
     ${REPO_ROOT}/src/browser/MediaBrowser.cpp
     ${REPO_ROOT}/src/browser/MediaLibrary.cpp
     ${REPO_ROOT}/src/browser/SlideGesture.cpp
