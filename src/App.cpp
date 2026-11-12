@@ -67,6 +67,14 @@ constexpr float kIdleBgR = 0.12f, kIdleBgG = 0.12f, kIdleBgB = 0.13f;
 constexpr float kConvergenceStep = 0.0025f;
 constexpr float kConvergenceMax = 0.05f;
 
+// The render loop's stage clock (rhi/RenderPerf.h): a few steady-clock reads per frame,
+// handed to the renderer's perf window (VulkanRenderer::NoteStage).
+using StageClock = std::chrono::steady_clock;
+double StageMs(StageClock::time_point t0, StageClock::time_point t1) {
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+double StageMs(StageClock::time_point t0) { return StageMs(t0, StageClock::now()); }
+
 // Where the 'I'-key atlas captures land: <Pictures>/DisplayXR on Windows, else the
 // working directory. xrCaptureAtlasDXR appends "_atlas.png" to the prefix we return;
 // we number against existing "<stem>-<N>_<cols>x<rows>_atlas.png" so repeats accumulate
@@ -547,6 +555,10 @@ int App::Run() {
     window_.SetLiveResizeCallback([this]() { RenderOneFrame(); });
 
     bool keepRunning = true;
+    // The render loop's stages (rhi/RenderPerf.h): the pump is timed here, the rest inside
+    // RenderOneFrame, and each rendered iteration is closed with its wall time, loop top to
+    // loop top (what no stage covers is "other").
+    StageClock::time_point loopT0 = StageClock::now();
     while (keepRunning && !xr_.ExitRequested()) {
         keepRunning = window_.PumpEvents();
         const auto nowT = std::chrono::steady_clock::now();
@@ -743,7 +755,15 @@ int App::Run() {
 
         PollLive();
         PollStream();
-        if (xr_.IsRunning()) RenderOneFrame();
+        if (xr_.IsRunning()) {
+            renderer_.NoteStage(RenderStage::Pump, StageMs(loopT0));
+            RenderOneFrame();
+            const StageClock::time_point loopEnd = StageClock::now();
+            renderer_.EndStageLoop(StageMs(loopT0, loopEnd));
+            loopT0 = loopEnd;
+        } else {
+            loopT0 = StageClock::now();  // not rendering: nothing to time
+        }
     }
 
     LOG_INFO("Exiting render loop after %llu frames (%llu rendered, userQuit=%d xrExit=%d)",
@@ -803,21 +823,43 @@ void App::RenderOneFrame() {
                       : isStream_ ? (streamPaused_ ? nullptr : &video_.Ring())
                                   : (isVideo_ ? &video_.Ring() : nullptr);
     if (ring) {
+        // Stage "upload": this block, less the Pro hooks and the auto-convergence sampling
+        // inside it, which are stages of their own (nestedMs).
+        const StageClock::time_point upload0 = StageClock::now();
+        double nestedMs = 0.0;
         if (const FrameRing::Frame* vf = ring->AcquireLatest()) {
 #if MEDIAPLAYER_PRO
-            // Pro: timecode, measured delay and the rig checks see every uploaded frame.
-            pro_.GetStation().OnFrame(*vf, layout_, isLive_, isLive_ ? live_->GetStats().eyeOffsetFrames : -1,
-                                      swapEyes_ != mediaEyeSwap_);  // rig checks measure the eyes as shown
-            pro_.OnFrame(*vf, layout_);  // scopes, pixel probe, colour-space burn-in
+            {
+                // Pro: timecode, measured delay and the rig checks see every uploaded frame.
+                const StageClock::time_point pro0 = StageClock::now();
+                pro::Station& station = pro_.GetStation();
+                station.OnFrame(*vf, layout_, isLive_, isLive_ ? live_->GetStats().eyeOffsetFrames : -1,
+                                swapEyes_ != mediaEyeSwap_);  // rig checks measure the eyes as shown
+                const StageClock::time_point pro1 = StageClock::now();
+                pro_.OnFrame(*vf, layout_);  // scopes, pixel probe, colour-space burn-in
+                const StageClock::time_point pro2 = StageClock::now();
+                // The station's rest (alert log, delay) is "other".
+                renderer_.NoteStage(RenderStage::Rig, station.LastRigMs());
+                renderer_.NoteStage(RenderStage::Thumbs, station.LastThumbMs());
+                renderer_.NoteStage(RenderStage::Scopes, StageMs(pro1, pro2));
+                nestedMs += StageMs(pro0, pro2);
+            }
 #endif
+            const auto sampleAutoConv = [&] {
+                const StageClock::time_point ac0 = StageClock::now();
+                SampleAutoConv(*vf);
+                const double ms = StageMs(ac0);
+                renderer_.NoteStage(RenderStage::AutoConv, ms);
+                nestedMs += ms;
+            };
             if (isLive_) {
                 OnLiveFrame(*vf);
-                SampleAutoConv(*vf);  // ~5 Hz; downsample only, measured on the worker
+                sampleAutoConv();  // ~5 Hz; downsample only, measured on the worker
             } else if (isStream_) {
                 SettleLiveLayout(*vf, "Stream");
-                SampleAutoConv(*vf);  // streams converge like the camera (#93 follow-up)
+                sampleAutoConv();  // streams converge like the camera (#93 follow-up)
             } else if (isVideo_) {
-                SampleAutoConv(*vf);  // a playing clip converges like a stream (Part of #128)
+                sampleAutoConv();  // a playing clip converges like a stream (Part of #128)
             }
             // "Convert to 3D": hand the frame to the converter (latest-wins, one in flight).
             // While a converted picture is bound it REPLACES the source, so the source frame
@@ -849,6 +891,7 @@ void App::RenderOneFrame() {
 #endif
             }
         }
+        renderer_.NoteStage(RenderStage::Upload, StageMs(upload0) - nestedMs);
     }
 
     if (!inputRequestAtStart_.empty() && rendered_ == 60) {  // MEDIAPLAYER_INPUT_REQUEST
@@ -868,22 +911,32 @@ void App::RenderOneFrame() {
             convertAtStart_ = false;
     }
     PumpConvert(SteadySeconds());  // "Convert to 3D": poll + upload a landed result (no-op off)
-    SampleAutoConvStatic();  // a still / a paused clip: measured once per change (Part of #128)
-    TickAutoConv();  // smoothed auto-convergence shift (#92); exactly 0 while never enabled
+    {
+        const StageClock::time_point ac0 = StageClock::now();
+        SampleAutoConvStatic();  // a still / a paused clip: measured once per change (Part of #128)
+        TickAutoConv();  // smoothed auto-convergence shift (#92); exactly 0 while never enabled
+        renderer_.NoteStage(RenderStage::AutoConv, StageMs(ac0));
+    }
     UpdateDepthCursor();
 
     XrSession::Frame frame;
     // xrWaitFrame is where the display paces us; the renderer's perf window subtracts it
-    // from the frame time to get the render thread's own (rhi/RenderPerf.h).
-    const auto xrWait0 = std::chrono::steady_clock::now();
-    if (!xr_.BeginFrame(frame)) return;
-    renderer_.NoteXrWait(
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - xrWait0).count());
+    // from the frame time to get the render thread's own (rhi/RenderPerf.h). XrSession
+    // times it alone; the rest of BeginFrame (xrBeginFrame, xrLocateViews, the swapchain
+    // image acquire / wait) is the xr_begin stage.
+    const StageClock::time_point begin0 = StageClock::now();
+    const bool begun = xr_.BeginFrame(frame);
+    renderer_.NoteXrWait(frame.waitFrameMs);
+    renderer_.NoteStage(RenderStage::XrBegin, StageMs(begin0) - frame.waitFrameMs);
+    if (!begun) return;
 
     XrSession::ViewRect rects[XrSession::kMaxViews];          // full per-view tiles (submitted)
     XrSession::ViewRect contentRects[XrSession::kMaxViews];   // aspect-fit content within each tile
 
     if (frame.shouldRender) {
+        // Stage "draw": the geometry and the recorded draw, less Pro's Tick (pro_tick).
+        const StageClock::time_point draw0 = StageClock::now();
+        double proTickMs = 0.0;
         // Each active view's tile = canvas_px * mode.viewScale, so the rects we clear
         // and submit match what the runtime samples.
         uint32_t canvasW = 0, canvasH = 0;
@@ -943,7 +996,10 @@ void App::RenderOneFrame() {
             if (!VrActive())  // the VR viewer owns pan / zoom (#155)
                 pro_.ApplyViewTransform(uvs, frame.viewCount, stereoSrc && hasMedia_ && !isLogo_,
                                         swapEyes_ != mediaEyeSwap_, packing::IsTb(layout_));
+            const StageClock::time_point tick0 = StageClock::now();
             pro_.Tick(ProStatus());
+            proTickMs = StageMs(tick0);
+            renderer_.NoteStage(RenderStage::ProTick, proTickMs);
         }
 #endif
         // Diagnostic: dump the per-view geometry once per mode change.
@@ -1094,6 +1150,7 @@ void App::RenderOneFrame() {
         } else {
             renderer_.ClearViews(frame.imageIndex, colors, rects, frame.viewCount);
         }
+        renderer_.NoteStage(RenderStage::Draw, StageMs(draw0) - proTickMs);
         ++rendered_;
 
         if (dumpPath_ && !dumped_ && rendered_ >= dumpFrame_) {
@@ -1121,8 +1178,15 @@ void App::RenderOneFrame() {
     // HUD layer every frame so auto-hide is driven purely by alpha — no layer on/off that
     // could flicker or be held stale by the compositor. Stop only when master-off and
     // nothing transient (toast / slideshow dip) needs to show.
+#if MEDIAPLAYER_PRO
+    // MEDIAPLAYER_PRO_UI=0, an A/B of the UI's render-thread cost (docs/PRO.md, first check
+    // 7): no HUD at all while a live source is up, as in the clean feed with nothing showing.
+    const bool uiAllowed = proPerf_.ui || !isLive_;
+#else
+    const bool uiAllowed = true;
+#endif
     const bool wantHud =
-        frame.shouldRender && xr_.HasHud() &&
+        frame.shouldRender && xr_.HasHud() && uiAllowed &&
         (imguiReady ? (showHud_ || uiState_.fadeAlpha > 0.001f || uiState_.toastAlpha > 0.001f ||
                        uiState_.transitionAlpha > 0.001f
 #if MEDIAPLAYER_PRO
@@ -1150,8 +1214,12 @@ void App::RenderOneFrame() {
 
         if (imguiReady) imgui_.SetUiScale(window_.DisplayScale());
         uint32_t hudIdx = 0;
-        if (xr_.AcquireHudImage(hudIdx)) {
+        const StageClock::time_point hudAcquire0 = StageClock::now();
+        const bool hudAcquired = xr_.AcquireHudImage(hudIdx);
+        renderer_.NoteStage(RenderStage::HudImage, StageMs(hudAcquire0));
+        if (hudAcquired) {
             if (imguiReady) {
+                const StageClock::time_point uiBuild0 = StageClock::now();
                 // Laid out in window pixels, shown over the whole window. The SAME rect
                 // drives the cursor remap below.
                 hud.enabled = true;
@@ -1185,17 +1253,22 @@ void App::RenderOneFrame() {
                 hud.windowPxH = ch;
                 pro_.ClearFlatRects();
 #endif
+                const StageClock::time_point uiRender0 = StageClock::now();
+                renderer_.NoteStage(RenderStage::UiBuild, StageMs(uiBuild0, uiRender0));
                 imgui_.RenderToHud(hudIdx, renderer_.FrameCmd());  // joins the frame's command buffer
                 // Desktop Linux: the pointer shape ImGui wants (I-beam over the URL
                 // field, ...). The SDL backend does this itself elsewhere.
                 window_.SetImGuiCursor(imgui_.MouseCursor());
+                renderer_.NoteStage(RenderStage::UiRender, StageMs(uiRender0));
                 if (dumpHudPath_ && !dumpedHud_ && rendered_ >= dumpFrame_) {
                     renderer_.DumpExternalImage(xr_.HudImages()[hudIdx], xr_.HudWidth(),
                                                 xr_.HudHeight(), dumpHudPath_);
                     dumpedHud_ = true;
                 }
             } else {
-                // CPU text-HUD fallback: top-left stats panel (pre-M4 behavior).
+                // CPU text-HUD fallback: top-left stats panel (pre-M4 behavior). Its raster
+                // and upload count as ui_render.
+                const StageClock::time_point textHud0 = StageClock::now();
                 const uint32_t tileW = rects[0].w, tileH = rects[0].h;
                 char stereo[200];
                 std::snprintf(stereo, sizeof(stereo), "conv %+.3f  eyes %s%s%s%s", convergence_,
@@ -1251,17 +1324,26 @@ void App::RenderOneFrame() {
                 hud.height = 0.125f;
                 hud.width = hud.height * hudAR / winAR;
                 hud.disparity = 0.0f;
+                renderer_.NoteStage(RenderStage::UiRender, StageMs(textHud0));
             }
             // The frame's ONE submit (upload + atlas + HUD), no wait — BEFORE the HUD
             // image is released (the runtime composes on this same queue).
+            const StageClock::time_point submit0 = StageClock::now();
             renderer_.SubmitFrame();
+            const StageClock::time_point release0 = StageClock::now();
+            renderer_.NoteStage(RenderStage::Submit, StageMs(submit0, release0));
             xr_.ReleaseHudImage();
+            renderer_.NoteStage(RenderStage::HudImage, StageMs(release0));
         }
     }
 
     // No HUD this frame: the same single submit, before EndFrame releases the atlas image.
+    const StageClock::time_point submit0 = StageClock::now();
     renderer_.SubmitFrame();
+    const StageClock::time_point end0 = StageClock::now();
+    renderer_.NoteStage(RenderStage::Submit, StageMs(submit0, end0));
     xr_.EndFrame(frame, rects, &hud);
+    renderer_.NoteStage(RenderStage::XrEnd, StageMs(end0));
     ++frames_;
     UpdateFps();
 }
@@ -2791,6 +2873,9 @@ void App::SampleAutoConv(const FrameRing::Frame& f) {
     if (!isVideo_ && !LiveSource()) return;
     if (isVideo_) autoConvHeldFrame_ = &f;  // the static path re-reads it while paused
     if (!autoConvEnabled_ || !AutoConvApplies()) return;
+#if MEDIAPLAYER_PRO
+    if (!proPerf_.autoConv) return;  // MEDIAPLAYER_PRO_AUTOCONV=0: no sampling (A/B, docs/PRO.md)
+#endif
     if (LiveSource() && LivePaused()) return;
     // A paused / ended clip shows one picture: SampleAutoConvStatic measures it (a frame
     // step or a seek lands here as a new frame and is picked up there, unthrottled).
@@ -2805,6 +2890,9 @@ void App::SampleAutoConv(const FrameRing::Frame& f) {
 
 void App::SampleAutoConvStatic() {
     if (!autoConvEnabled_ || LiveSource() || !AutoConvApplies()) return;
+#if MEDIAPLAYER_PRO
+    if (!proPerf_.autoConv) return;  // MEDIAPLAYER_PRO_AUTOCONV=0: no sampling (A/B, docs/PRO.md)
+#endif
     const uint8_t* luma = nullptr;
     int w = 0, h = 0;
     int64_t serial = 0;
@@ -4251,6 +4339,12 @@ void App::NativeFileCallback(void* userdata, const char* const* filelist, int /*
 // ---------------------------------------------------------------------------
 
 void App::InitPro() {
+    // A/B switches for the render thread's optional per-frame work (pro/PerfSwitches.h,
+    // docs/PRO.md first check 7): read once, logged once each when set.
+    proPerf_ = pro::ReadPerfSwitches([](const char* name) { return std::getenv(name); },
+                                     [](const char* name, const char* value, bool on, const char* what) {
+                                         LOG_INFO("Pro A/B: %s=%s: %s %s", name, value, what, on ? "on" : "OFF");
+                                     });
     pro::Host h;
     h.getConvergence = [this] { return convergence_; };
     h.setConvergence = [this](float c) {
@@ -4438,6 +4532,7 @@ void App::InitPro() {
     so.budget.edgePct = launch_.proBudget[4];
     so.timecode = launch_.proTimecode;
     so.startFirstInput = !hasMedia_ || isLogo_;  // a file / camera / URL from the command line wins
+    so.perf = proPerf_;                          // the station skips the rig check / thumbnails when off
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_VSHIFT")) so.testCfg.vShiftPx = (float)std::atof(e);
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_EYE_DELAY")) so.testCfg.eyeDelay = std::atoi(e);
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_GAIN_R")) so.testCfg.gainR = (float)std::atof(e);

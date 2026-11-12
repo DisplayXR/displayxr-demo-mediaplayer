@@ -14,6 +14,7 @@
 #include "media/LiveProducer.h"
 #include "media/StereoTypes.h"
 #include "pro/DeckLinkSource.h"
+#include "pro/PerfSwitches.h"
 #include "pro/QcExporter.h"
 #include "pro/RigCheck.h"
 #include "pro/TargetScreen.h"
@@ -53,6 +54,9 @@ struct StationOptions {
     bool timecode = true;
     TestSignalConfig testCfg;         // faults from MEDIAPLAYER_TEST_*
     bool startFirstInput = true;      // false when the command line already opened media
+    // A/B switches (MEDIAPLAYER_PRO_RIG / _THUMBS / ...): OnFrame skips the rig check and the
+    // thumbnail when off; the `perf:` line and get_rig_status name the ones that are off.
+    PerfSwitches perf;
 };
 
 class Station {
@@ -75,6 +79,11 @@ public:
     // checks measure the eyes as shown.
     void OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live, int eyeOffsetFrames,
                  bool eyesSwapped = false);
+    // The last OnFrame's render-thread time in the rig check's Submit (its Downsample when
+    // it measures) and in the live input's thumbnail, ms (0 when it did not run): App adds
+    // them to the render loop's stages (rhi/RenderPerf.h: rig, thumbs).
+    double LastRigMs() const { return lastRigMs_; }
+    double LastThumbMs() const { return lastThumbMs_; }
 
     bool SwitchInput(int index);
     // Agent tools for the station (called from ProController::DispatchTool).
@@ -179,6 +188,7 @@ private:
     uint64_t perfLogged_ = 0;                      // the last render perf window logged (LogPerf)
     uint64_t perfDropped_ = 0, perfLate_ = 0;      // the capture's counters at that line
     bool perfCaptureSeen_ = false;                 // ... valid (the deltas need a previous line)
+    double lastRigMs_ = 0.0, lastThumbMs_ = 0.0;   // the last OnFrame's stages (LastRigMs)
     QcExporter qcExport_;  // QC report thumbnails + file writes, off the render thread
     uintmax_t alertsOffset_ = 0;              // station_alerts.jsonl size when the session began
     std::string sessionClock_, sessionDate_;  // HH:MM:SS / YYYYMMDD the session began

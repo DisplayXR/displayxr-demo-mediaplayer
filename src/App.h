@@ -19,6 +19,7 @@
 #include "ui/TransportUI.h"
 #include "xr/XrSession.h"
 #if MEDIAPLAYER_PRO
+#include "pro/PerfSwitches.h"
 #include "pro/ProController.h"
 #endif
 
@@ -566,6 +567,10 @@ private:
     bool proPanelsBeforeClean_ = false;
     bool proPanelsSeen_ = false;    // edge detector: Tab pressed while in the clean feed
     bool proCursorIdle_ = false;    // pointer hidden with the strip
+    // A/B switches for the render thread's optional per-frame work (pro/PerfSwitches.h),
+    // read once in InitPro: App skips auto-convergence sampling (autoConv) and the UI while
+    // live (ui); the station gets the rest.
+    pro::PerfSwitches proPerf_;
 #endif
     // The OS pointer is hidden while the runtime draws the depth cursor, and (Pro) while
     // the UI is idle; ApplyCursorHidden() combines the two.
