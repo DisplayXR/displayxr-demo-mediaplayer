@@ -2,6 +2,7 @@
 #include "pro/DeckLinkSource.h"
 
 #include "Log.h"
+#include "pro/ConvertPool.h"
 #include "pro/DeckLinkFormat.h"
 #include "pro/TimecodePairer.h"
 
@@ -49,26 +50,7 @@
 
 namespace mp {
 
-bool DeckLinkConfig::ParseStereo(const std::string& s, Stereo& out) {
-    if (s.empty() || s == "auto") out = Stereo::Auto;
-    else if (s == "mono") out = Stereo::Mono;
-    else if (s == "sbs") out = Stereo::Sbs;
-    else if (s == "dual") out = Stereo::Dual;
-    else if (s == "pair") out = Stereo::Pair;
-    else return false;
-    return true;
-}
-
-const char* DeckLinkConfig::StereoName(Stereo s) {
-    switch (s) {
-        case Stereo::Auto: return "auto";
-        case Stereo::Mono: return "mono";
-        case Stereo::Sbs: return "sbs";
-        case Stereo::Dual: return "dual";
-        case Stereo::Pair: return "pair";
-    }
-    return "?";
-}
+// DeckLinkConfig::ParseStereo / StereoName are in pro/DeckLinkSpec.cpp (no SDK, unit-tested).
 
 DeckLinkSource::~DeckLinkSource() { Stop(); }
 
@@ -408,23 +390,26 @@ int SignalBits(BMDDetectedVideoInputFormatFlags d) {
     return 0;
 }
 
-// One eye's copied pixels -> P016 at column x0 of dst (10-bit kept; 8-bit widened).
-// hasMatrix / matrix: the signal's colorimetry, if the card reported it. An r210 (RGB)
-// frame is encoded with it, so the tag the caller sets afterwards is the one the pixels
-// were encoded with.
-void ConvertEye(const RawPixels& p, livepix::P016& dst, int x0, bool hasMatrix, ColorMatrix matrix) {
+// One eye's copied pixels as a conversion to P016 at column x0 of dst (10-bit kept; 8-bit
+// widened), for livepix::ToP016Banded. hasMatrix / matrix: the signal's colorimetry, if the
+// card reported it. An r210 (RGB) frame is encoded with it, so the tag the caller sets
+// afterwards is the one the pixels were encoded with.
+livepix::EyeJob ConvertJob(const RawPixels& p, livepix::P016& dst, int x0, bool hasMatrix, ColorMatrix matrix) {
     const bool deep = p.pf == bmdFormat10BitYUV || p.pf == bmdFormat10BitRGB;
     g_lastBitDepth.store(deep ? 10 : 8, std::memory_order_relaxed);
-    const int w = p.w & ~1, h = p.h & ~1;
-    if (p.pf == bmdFormat10BitYUV)
-        livepix::V210ToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
-    else if (p.pf == bmdFormat10BitRGB)
-        livepix::R210ToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0,
-                            hasMatrix ? matrix : DefaultMatrixForHeight(h));
-    else if (p.pf == bmdFormat8BitBGRA)
-        livepix::BgraToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
-    else
-        livepix::UyvyToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
+    livepix::EyeJob j;
+    j.fmt = p.pf == bmdFormat10BitYUV   ? livepix::RawFormat::V210
+            : p.pf == bmdFormat10BitRGB ? livepix::RawFormat::R210
+            : p.pf == bmdFormat8BitBGRA ? livepix::RawFormat::Bgra
+                                        : livepix::RawFormat::Uyvy;
+    j.src = p.bytes.data();
+    j.srcRowBytes = p.rowBytes;
+    j.w = p.w & ~1;
+    j.h = p.h & ~1;
+    j.dst = &dst;
+    j.x0 = x0;
+    j.rgbMatrix = hasMatrix ? matrix : DefaultMatrixForHeight(j.h);
+    return j;
 }
 
 // The frame's timecode as text and as a frame count at the full frame rate (-1 when it
@@ -520,7 +505,13 @@ struct DeckLinkCapture {
     std::atomic<bool> noSignal[2]{};
     std::atomic<bool> dualActive{false};  // Auto switched to the card's dual-stream mode
 
-    std::mutex m;  // the frames below + the ring's single-producer side
+    std::mutex m;  // the frames below + the pairing state
+    // The ring's single-producer side: one compose + publish at a time. Taken while m is
+    // held (lock order m, then publishM), so publishes keep the order of the pairing
+    // decisions; a pair is then composed with only publishM held, so the other eye's lane
+    // can claim a slot and pair meanwhile (pins below). The worker takes both to clear
+    // `alive`: no publish is in progress after that.
+    std::mutex publishM;
     std::atomic<bool> alive{true};  // cleared before the inputs stop: late callbacks do nothing
     livepix::P016 out;
 
@@ -541,7 +532,13 @@ struct DeckLinkCapture {
     std::atomic<int64_t> hwT0{INT64_MIN};
     uint64_t framesIn[2] = {0, 0};
     EyeFrame hist[2][TimecodePairer::kHistory];
+    // Pair: composes reading hist[eye][slot] outside m (m guards the counts). A lane never
+    // converts into a pinned slot: it waits on pinCv until the compose is done (rare: the
+    // slot it is due to fill is normally the oldest, and the pair shown the newest).
+    int pins[2][TimecodePairer::kHistory] = {};
+    std::condition_variable pinCv;
     bool warnedUnsynced = false;
+    bool warnedTcByClock = false;  // said once: timecodes disagree, paired by the card's clock
     bool warnedSize = false;
     bool warnedConvert = false;
     bool warnedHdr = false;
@@ -594,6 +591,9 @@ struct DeckLinkCapture {
     // frame's metadata, and each input's own lane thread converts, pairs and publishes.
     // A lane holds one pending frame: if the next arrives first, the pending one is
     // replaced (newest wins) and counted in LiveStats::lateFrames.
+    // The convert is split into row bands over the lane's ConvertPool: on one thread a
+    // station's two 2160p59.94 inputs reached ~40 fps, and a dual-stream input converts two
+    // eyes per frame on its one lane (MEDIAPLAYER_DECKLINK_CONVERT_THREADS, pro/ConvertPool.h).
     struct RawFrame {
         RawPixels px, right;  // right: dual-stream 3D's right eye
         bool dual = false;
@@ -613,12 +613,23 @@ struct DeckLinkCapture {
         int pending = -1, busy = -1;
         bool quit = false;
         std::thread th;
+        std::unique_ptr<livepix::ConvertPool> pool;  // the convert's threads (th runs band 0)
     };
     Lane lanes[2];
     std::atomic<uint32_t> generation{0};  // bumped on a format change: queued frames are stale
 
-    void StartLanes(int n) {
-        for (int e = 0; e < n; ++e) lanes[e].th = std::thread([this, e] { LaneLoop(e); });
+    // n lanes, each carrying up to inputEyes eyes per frame (2: a dual-stream input, or
+    // Auto, which switches to dual-stream when the card detects it).
+    void StartLanes(int n, int inputEyes) {
+        if (n <= 0) return;
+        const int threads = livepix::ConvertThreads(n * inputEyes, inputEyes);
+        for (int e = 0; e < n; ++e) {
+            lanes[e].pool = std::make_unique<livepix::ConvertPool>(threads);
+            lanes[e].th = std::thread([this, e] { LaneLoop(e); });
+        }
+        LOG_INFO("decklink: converting on %d thread(s) per input%s%s", lanes[0].pool->Threads(),
+                 inputEyes > 1 ? " (shared by the two eyes in dual-stream 3D)" : "",
+                 std::getenv("MEDIAPLAYER_DECKLINK_CONVERT_THREADS") ? " (MEDIAPLAYER_DECKLINK_CONVERT_THREADS)" : "");
     }
     void StopLanes() {
         for (Lane& l : lanes) {
@@ -628,6 +639,7 @@ struct DeckLinkCapture {
             }
             l.cv.notify_all();
             if (l.th.joinable()) l.th.join();
+            l.pool.reset();  // after the lane: it is the pool's only caller
         }
     }
 
@@ -704,48 +716,66 @@ struct DeckLinkCapture {
     void Process(int eye, const RawFrame& r) {
         if (!alive) return;
         const int w = r.px.w & ~1, h = r.px.h & ~1;
+        livepix::ConvertPool* pool = lanes[eye].pool.get();
         if (!pair) {
             // one input: only this lane touches `out`; the lock keeps Stop() simple
             std::lock_guard<std::mutex> lk(m);
             out.Resize(r.dual ? 2 * w : w, h);
-            ConvertEye(r.px, out, 0, r.hasMatrix, r.matrix);
-            if (r.dual) ConvertEye(r.right, out, w, r.hasMatrix, r.matrix);
+            // dual-stream: both eyes in one go, their bands side by side on the pool
+            livepix::EyeJob jobs[2];
+            int n = 0;
+            jobs[n++] = ConvertJob(r.px, out, 0, r.hasMatrix, r.matrix);
+            if (r.dual) jobs[n++] = ConvertJob(r.right, out, w, r.hasMatrix, r.matrix);
+            livepix::ToP016Banded(pool, jobs, n);
             if (r.hasMatrix) out.matrix = r.matrix;
             out.transfer = r.transfer;
-            if (alive) src->Publish(out, /*fullRange=*/false, r.now, r.tc[0] ? r.tc : nullptr, r.dual ? 0 : -1);
+            // into the ring in row bands on the same pool (a dual-stream 4K pair is 50 MB)
+            if (alive)
+                src->Publish(out, /*fullRange=*/false, r.now, r.tc[0] ? r.tc : nullptr, r.dual ? 0 : -1, pool);
             return;
         }
         // Pair: claim this eye's oldest slot, convert into it WITHOUT the lock (the two
-        // lanes convert in parallel; a busy slot is never chosen), then decide.
+        // lanes convert in parallel; a busy slot is never chosen, nor one the other lane is
+        // still composing into the ring), then decide.
         int slot;
         {
-            std::lock_guard<std::mutex> lk(m);
+            std::unique_lock<std::mutex> lk(m);
+            pinCv.wait(lk, [&] { return pins[eye][pairer.NextSlot(eye)] == 0; });
             slot = pairer.NextSlot(eye);
             pairer.MarkBusy(eye, slot);
         }
         EyeFrame& ef = hist[eye][slot];
         ef.px.Resize(w, h);
-        ConvertEye(r.px, ef.px, 0, r.hasMatrix, r.matrix);
+        const livepix::EyeJob job = ConvertJob(r.px, ef.px, 0, r.hasMatrix, r.matrix);
+        livepix::ToP016Banded(pool, &job, 1);
         if (r.hasMatrix) ef.px.matrix = r.matrix;
         ef.px.transfer = r.transfer;
         ef.arrived = r.now;
         ef.hwNs = r.hwNs;
-        int key = r.key;
-        bool hwKey = false;
-        if (key < 0 && r.hwNs >= 0 && sameCard) {
+        // Two keys: the frame's timecode, and (both inputs on one card) its frame on the
+        // card's clock. The pairer uses the clock when the timecode is missing or the two
+        // inputs' timecodes don't belong together (Resolve's dual SDI output).
+        int clockKey = -1;
+        if (r.hwNs >= 0 && sameCard) {
             int64_t t0 = hwT0.load();
             if (t0 == INT64_MIN) {
                 hwT0.compare_exchange_strong(t0, r.hwNs);
                 t0 = hwT0.load();
             }
             const int64_t period = r.durNs > 0 ? r.durNs : (int64_t)std::llround(1e9 / std::max(1.0, fpsExact.load()));
-            key = HwClockKey(r.hwNs, t0, period);
-            hwKey = true;
+            clockKey = HwClockKey(r.hwNs, t0, period);
         }
         std::memcpy(ef.tc, r.tc, sizeof(r.tc));
-        std::lock_guard<std::mutex> lk(m);
+        std::unique_lock<std::mutex> lk(m);
         ++framesIn[eye];
-        const TimecodePairer::Decision d = pairer.Add(eye, slot, key, r.now, 1.0 / std::max(1.0, fpsExact.load()));
+        const TimecodePairer::Decision d =
+            pairer.Add(eye, slot, r.key, r.now, 1.0 / std::max(1.0, fpsExact.load()), clockKey);
+        if (d.byClock && d.tcOffsetFrames > 0 && !warnedTcByClock) {
+            LOG_WARN("decklink: the two inputs' timecodes are %d frames apart (not jam-synced; e.g. Resolve's dual "
+                     "SDI output times only its first output) - pairing by the card's clock instead",
+                     d.tcOffsetFrames);
+            warnedTcByClock = true;
+        }
         if (!d.publish || !alive) return;
         if (noSignal[1 - eye]) return;  // the other eye is dark: never fuse it with a stale frame
         {
@@ -756,9 +786,9 @@ struct DeckLinkCapture {
             ++st.pairs;
             const uint64_t in = framesIn[0] + framesIn[1];
             st.unpaired = in > 2 * st.pairs ? in - 2 * st.pairs : 0;
-            st.hwClockPairing = hwKey;
+            st.hwClockPairing = d.byClock;
             st.separateCards = !sameCard;
-            st.timecode = !hwKey && key >= 0;
+            st.timecode = !d.byClock && !d.unsynced && r.key >= 0;
             if (lf.hwNs >= 0 && rf.hwNs >= 0 && sameCard) {
                 st.lastSkewMs = (double)(rf.hwNs - lf.hwNs) / 1e6;
                 st.maxAbsSkewMs = std::max(st.maxAbsSkewMs, std::fabs(st.lastSkewMs));
@@ -779,9 +809,28 @@ struct DeckLinkCapture {
                      rt.px.width, rt.px.height);
             warnedSize = true;
         }
-        // (the pair is composed straight into the ring: no intermediate side-by-side frame)
-        src->PublishPair(l.px, rt.px, /*fullRange=*/false, std::min(l.arrived, rt.arrived),
-                         l.tc[0] ? l.tc : nullptr, d.offsetFrames);
+        // The pair is composed straight into the ring (no intermediate side-by-side frame),
+        // in row bands on this lane's pool, and outside m: ~50 MB at 4K, which held the
+        // other eye's lane off its next frame for the whole copy. The two slots are pinned
+        // so neither lane converts into them meanwhile; publishM, taken before m is
+        // released, keeps the ring single-producer and the publishes in decision order.
+        const int s0 = d.slot[0], s1 = d.slot[1];
+        const double captureSec = std::min(l.arrived, rt.arrived);
+        char tc[sizeof(l.tc)];
+        std::memcpy(tc, l.tc, sizeof(tc));
+        const int offsetFrames = d.offsetFrames;
+        std::unique_lock<std::mutex> pub(publishM);
+        ++pins[0][s0];
+        ++pins[1][s1];
+        lk.unlock();
+        if (alive)
+            src->PublishPair(l.px, rt.px, /*fullRange=*/false, captureSec, tc[0] ? tc : nullptr, offsetFrames, pool);
+        pub.unlock();  // before m: the next publisher may be holding m while it waits for publishM
+        lk.lock();
+        --pins[0][s0];
+        --pins[1][s1];
+        lk.unlock();
+        pinCv.notify_all();
     }
 };
 
@@ -1027,7 +1076,10 @@ void DeckLinkSource::Worker() {
     cap.src = this;
     cap.pair = pair;
     cap.dual = cfg_.stereo == DeckLinkConfig::Stereo::Dual;
-    cap.StartLanes(nInputs);  // before any input streams: the callbacks hand frames to these
+    // One input carries two eyes per frame in dual-stream 3D, which Auto switches to when
+    // the card detects it: its lane's pool is sized for both.
+    const bool twoEyeInput = !pair && (cap.dual || cfg_.stereo == DeckLinkConfig::Stereo::Auto);
+    cap.StartLanes(nInputs, twoEyeInput ? 2 : 1);  // before any input streams: the callbacks hand frames to these
 
     IDeckLinkInput* inputs[2] = {nullptr, nullptr};
     Callback* callbacks[2] = {nullptr, nullptr};
@@ -1137,8 +1189,9 @@ void DeckLinkSource::Worker() {
     }
 
     {
-        std::lock_guard<std::mutex> lk(cap.m);  // no callback is mid-publish or mid-restart...
-        cap.alive = false;                      // ...and none starts one from here on
+        std::lock_guard<std::mutex> lk(cap.m);          // no callback is mid-restart, no lane mid-pairing...
+        std::lock_guard<std::mutex> pk(cap.publishM);   // ...or mid-publish (a pair composes without m)...
+        cap.alive = false;                              // ...and none starts one from here on
     }
     for (int e = 0; e < 2; ++e) {
         if (inputs[e]) {

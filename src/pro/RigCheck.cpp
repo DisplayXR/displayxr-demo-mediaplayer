@@ -752,12 +752,21 @@ RigMonitor::~RigMonitor() {
 void RigMonitor::Submit(const FrameRing::Frame& f, StereoLayout layout, int eyeOffsetFrames,
                         const std::string& timecode, bool swapEyes) {
     const double now = LiveProducer::NowSeconds();
-    if (burst_.empty()) {
+    if (burst_.empty() && !burstBroken_) {
         std::lock_guard<std::mutex> lk(m_);
         if (pending_ || now - lastSubmit_ < 0.25) return;  // ~4 measurements a second
-    } else if (f.serial != burstLastSerial_ + 1 || layout != burstLayout_ || swapEyes != burstSwap_) {
-        burst_.clear();  // a dropped frame or a change: the burst is no longer consecutive
+    } else if (!burst_.empty() &&
+               (f.serial != burstLastSerial_ + 1 || layout != burstLayout_ || swapEyes != burstSwap_)) {
+        // A dropped frame or a change: no consecutive burst this time. The window keeps its
+        // start, so after 0.5 s the latest frame is measured alone (spatial checks, no eye
+        // sync), and the frames until then are not downsampled for nothing (render thread).
+        // Restarting the window at every gap measured NOTHING while frames kept dropping:
+        // UHD 59.94 on the station dropped every few frames and the rig check went blank.
+        burst_.clear();
+        burstBroken_ = true;
     }
+    if (burstStart_ < 0.0) burstStart_ = now;
+    if (burstBroken_ && now - burstStart_ < 0.5) return;  // wait out the window, then one frame
     EyePair e;
     e.serial = f.serial;
     const auto dt0 = std::chrono::steady_clock::now();
@@ -781,18 +790,21 @@ void RigMonitor::Submit(const FrameRing::Frame& f, StereoLayout layout, int eyeO
     }
     if (!downOk) {
         burst_.clear();
+        burstBroken_ = false;
+        burstStart_ = -1.0;
         return;
     }
-    if (burst_.empty()) burstStart_ = now;
     burst_.push_back(std::move(e));
     burstLastSerial_ = f.serial;
     burstLayout_ = layout;
     burstSwap_ = swapEyes;
     // Hand over once the burst is complete - or, when frames keep dropping, after 0.5 s
     // with the latest frame alone (spatial checks only, eye sync not measured).
-    const bool complete = (int)burst_.size() >= kSyncFrames;
+    const bool complete = !burstBroken_ && (int)burst_.size() >= kSyncFrames;
     if (!complete && now - burstStart_ < 0.5) return;
     if (!complete) burst_.erase(burst_.begin(), burst_.end() - 1);
+    burstStart_ = -1.0;  // the next window starts with the next collection
+    burstBroken_ = false;
     std::lock_guard<std::mutex> lk(m_);
     work_ = std::move(burst_);
     burst_.clear();

@@ -16,15 +16,27 @@
 // releases the HUD / atlas swapchain images. Nothing on the frame path waits the frame
 // it just submitted. Descriptor sets are per ring slot (written each frame), and
 // anything a queued frame may still read is released through the ring's deferDestroy().
+//
+// Staging: the per-frame CPU uploads (the source planes, the CPU text HUD) copy into a
+// PERSISTENT, persistently mapped host-visible buffer, one per plane per ring slot, reused
+// every N frames and reallocated only when the size changes (AcquireStaging). The slot's
+// fence, which beginFrame() waits before a frame records into that slot, is what makes the
+// reuse safe: the frame that last copied from the buffer has finished on the GPU. The copy
+// itself runs in row bands on a small worker pool (rhi/BandCopy.h) when the plane is big
+// enough to pay for it. (A LUT upload is a one-off and keeps its own blocking staging.)
 #pragma once
 
 #include <vulkan/vulkan.h>
 
 #include <vk_frame_ring.h>  // displayxr-common: dxr::VkFrameRing (INV-4.10)
 
+#include <chrono>
 #include <cstdint>
+#include <memory>
 
+#include "rhi/BandCopy.h"
 #include "rhi/PushPack.h"
+#include "rhi/RenderPerf.h"
 #include <utility>
 #include <vector>
 
@@ -104,12 +116,18 @@ public:
     // The open frame's command buffer, opening one (waiting only the fence of the frame
     // that used its ring slot N frames ago) if none is open. Every per-frame recording
     // below goes through it; ImGuiLayer::RenderToHud records into it too.
-    VkCommandBuffer FrameCmd() { return ring_.beginFrame(); }
+    VkCommandBuffer FrameCmd() { return ring_.frameOpen() ? ring_.current() : OpenFrame(); }
     // Submit everything recorded this frame: EXACTLY one vkQueueSubmit, no wait. Call
     // BEFORE releasing the HUD / atlas swapchain images (the runtime composes on the same
     // queue, so our work must be queued ahead of it). No-op when no frame is open.
     void SubmitFrame();
     uint32_t FramesInFlight() const { return ring_.framesInFlight(); }
+
+    // The render thread's timings, always on (rhi/RenderPerf.h): the last closed window
+    // (~10 s; serial 0 until one has closed). App reports the time it spent blocked in
+    // xrWaitFrame each frame, which separates the display's pacing from our own work.
+    const RenderPerfWindow& LastPerfWindow() const { return perf_.Last(); }
+    void NoteXrWait(double ms) { perf_.XrWait(ms); }
 
     // Record a copy of an RGBA8 buffer into an external (e.g. HUD swapchain) VkImage into
     // the frame command buffer, leaving it in COLOR_ATTACHMENT_OPTIMAL (the layout the
@@ -140,8 +158,9 @@ public:
                     const XrSession::ViewRect* rects, uint32_t viewCount);
 
     // Upload an RGBA8 image as the source for DrawViews (images / test patterns). Records
-    // into the frame command buffer (opening one if needed); the staging buffer and any
-    // replaced plane image are released once the GPU is past them.
+    // into the frame command buffer (opening one if needed); the pixels go through the
+    // plane's persistent staging (see the file comment) and a replaced plane image is
+    // released once the GPU is past it.
     bool UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t height);
 
     // Upload a planar YUV frame (the video decoder's native output): the shader does the
@@ -262,6 +281,49 @@ private:
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     dxr::VkFrameRing ring_;
     bool submitErrLogged_ = false;
+    // Bumped by every submitted frame: a staging buffer marked with the current value was
+    // already copied from in the open frame (see AcquireStaging).
+    uint64_t frameSerial_ = 1;
+    VkCommandBuffer OpenFrame();  // FrameCmd's slow path: beginFrame(), timed
+
+    // Persistent staging (see the file comment). One buffer per user per ring slot; users
+    // 0..5 are planes_[0..5], 6 is the CPU text-HUD fallback (UploadToSwapchainImage).
+    static constexpr int kStagingUsers = 7;
+    static constexpr int kHudStaging = 6;
+    struct Staging {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        void* mapped = nullptr;      // mapped once at creation, unmapped at release
+        VkDeviceSize size = 0;       // capacity
+        uint64_t usedSerial = 0;     // frameSerial_ of the last frame that copied from it
+    };
+    // The open frame's staging for `user`, at least `bytes`: mapped memory to write and the
+    // buffer to copy from. Null when there is no open frame, the buffer was already used in
+    // this frame, or it cannot be made: the caller then uses a one-off buffer.
+    void* AcquireStaging(int user, VkDeviceSize bytes, VkBuffer& buffer);
+    // A one-off staging buffer, released by deferDestroy once this frame has executed (the
+    // only path before persistent staging). Null on failure.
+    void* OneOffStaging(VkDeviceSize bytes, VkBuffer& buffer);
+    bool CreateStaging(Staging& s, VkDeviceSize bytes);
+    void ReleaseStaging(Staging& s, bool deferred);
+    void TrimIdleStaging();  // releases buffers no frame copied from in the last perf window
+    // Copy a plane (rows x rowBytes, packed) into mapped staging, in row bands on copyPool_
+    // when it is big enough. Returns the threads it used.
+    int CopyToStaging(void* dst, const uint8_t* src, size_t rowBytes, size_t rows);
+    Staging staging_[kStagingUsers][dxr::detail::kMaxFramesInFlight];
+    uint64_t trimSerial_ = 0;        // frameSerial_ when the last perf window closed
+    int copyThreads_ = 1;            // bandcopy::UploadThreads(), read at Initialize
+    std::unique_ptr<bandcopy::Pool> copyPool_;  // made at the first copy that splits
+    RenderPerfMeter perf_;
+    struct UploadTally {             // one Upload* call: its copies, for perf_
+        double copyMs = 0.0;
+        double bytes = 0.0;
+        int threads = 1;
+    };
+    std::chrono::steady_clock::time_point perfEpoch_ = std::chrono::steady_clock::now();
+    double PerfNow() const {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - perfEpoch_).count();
+    }
 
     std::vector<VkImageView> imageViews_;
     std::vector<VkFramebuffer> framebuffers_;
@@ -350,11 +412,15 @@ private:
     // Display-referred ClearColor -> the value to hand the attachment (decoded to
     // scene-linear when the attachment encodes on store, verbatim otherwise).
     VkClearColorValue ToTargetClear(const ClearColor& c) const;
-    // Record plane (re)creation + a staged copy into `cmd` (the open frame). The staging
-    // buffer and a replaced plane's image/view/memory go to the ring's deferDestroy (a
-    // queued frame may still read them). `recreated` = the image view changed.
+    // Record plane (re)creation + a staged copy into `cmd` (the open frame). The pixels go
+    // through the plane's persistent staging for this ring slot (a one-off buffer only when
+    // the plane was already uploaded this frame); a replaced plane's image/view/memory goes
+    // to the ring's deferDestroy (a queued frame may still read it). `recreated` = the
+    // image view changed. The copy's time and size are added to `tally`.
     bool RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8_t* data, uint32_t w,
-                           uint32_t h, VkFormat fmt, uint32_t bytesPerTexel, bool& recreated);
+                           uint32_t h, VkFormat fmt, uint32_t bytesPerTexel, bool& recreated,
+                           UploadTally& tally);
+    void NoteUpload(std::chrono::steady_clock::time_point t0, const UploadTally& tally);
     bool EnsureDummy();
     void BindDescriptors(VkDescriptorSet set);  // point the 3 sampler bindings at planes_/dummy
     void DestroyTexture();

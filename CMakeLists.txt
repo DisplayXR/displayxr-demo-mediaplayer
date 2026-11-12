@@ -275,11 +275,13 @@ function(mp_add_player tgt is_pro)
         src/color/CubeLut.cpp    # Pro looks; compiled into both so the trunk stays one source list
         src/color/Cdl.cpp
         src/App.cpp
+        src/AgentTools.cpp       # the player's agent-tool table (#220)
         src/Log.cpp
         src/platform/Window.cpp
         $<$<PLATFORM_ID:Linux>:src/platform/WindowLinux.cpp>  # desktop Linux: displayxr-common window
         src/xr/XrSession.cpp
         src/rhi/VulkanRenderer.cpp
+        src/rhi/BandCopy.cpp         # upload copies into staging in row bands (8K live frames)
         src/media/ImageDecoder.cpp
         src/media/LifLoader.cpp
         src/media/DepthWarp.cpp      # one-view LIF -> stereo pair (#180)
@@ -306,6 +308,8 @@ function(mp_add_player tgt is_pro)
         # split a TU here, mirror it into android/src/main/cpp/CMakeLists.txt — that list
         # is hand-curated and desktop CI cannot catch the resulting Android link error.
         src/ui/TransportUI.cpp
+        src/ui/Icons.cpp  # every icon the chrome draws, shared with the browser (#180)
+        src/ui/UiText.cpp  # fitting and wrapping text (#180)
         src/media/FrameRing.h  # header-only triple buffer
         ${MP_IMGUI_SOURCES}
     )
@@ -466,14 +470,17 @@ function(mp_add_player tgt is_pro)
         target_sources(${tgt} PRIVATE
             src/pro/ProController.cpp
             src/pro/ProTools.cpp         # agent tools: grade, view, station
+            src/pro/ProToolList.cpp      # Pro's agent-tool table (#220)
             src/pro/LookLoader.cpp       # LUT parse / OCIO bake off the render thread
             src/pro/DisplayCalibration.cpp  # per-panel display calibration (#133)
             src/pro/TargetScreen.cpp     # target-screen depth model (#135)
             src/pro/LivePixels.cpp       # UYVY / v210 / BGRA -> NV12 / P016 for capture cards
+            src/pro/ConvertPool.cpp      # ... split into row bands over a per-input thread pool (4K60)
             src/pro/LiveSourceBase.cpp   # shared ring + stats of the Pro live sources
             src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)
             src/pro/TimecodePairer.cpp   # two-input stereo pairing by SMPTE timecode
             src/pro/DeckLinkSource.cpp   # Blackmagic DeckLink SDI / HDMI input
+            src/pro/DeckLinkSpec.cpp     # the DeckLink input spec + setup dialog fields (no SDK)
             src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
             src/pro/Station.cpp          # inputs, timecode / delay, rig UI, snapshots
             src/pro/QcReport.cpp         # the session's QC report: HTML + marker EDL / CSV
@@ -787,6 +794,12 @@ if(MP_BUILD_TESTS)
     target_include_directories(touch_scroller_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME touch_scroller COMMAND touch_scroller_test)
 
+    # The browser's layout (#180): columns by width, rail or drawer, date sections, the
+    # sectioned grid. Pure.
+    add_executable(browser_layout_test tests/browser_layout_test.cpp src/browser/BrowserLayout.cpp)
+    target_include_directories(browser_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME browser_layout COMMAND browser_layout_test)
+
     # Media browser (#160): swiping to the next or previous file in the player. Pure.
     add_executable(slide_gesture_test tests/slide_gesture_test.cpp src/browser/SlideGesture.cpp)
     target_include_directories(slide_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -825,11 +838,28 @@ if(MP_BUILD_TESTS)
     target_include_directories(tap_handler_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME tap_handler COMMAND tap_handler_test)
 
+    # The Android player's zoom on a still (#180): pinch, double tap, pan. Pure.
+    add_executable(zoom_gesture_test tests/zoom_gesture_test.cpp src/ui/ZoomGesture.cpp)
+    target_include_directories(zoom_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME zoom_gesture COMMAND zoom_gesture_test)
+
     # Live frames: FrameRing queue mode (one frame per refresh, clock drift costs single
     # drops/repeats instead of bursts). Header-only, pure.
     add_executable(frame_ring_queue_test tests/frame_ring_queue_test.cpp)
     target_include_directories(frame_ring_queue_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME frame_ring_queue COMMAND frame_ring_queue_test)
+
+    # The renderer's upload copy in row bands (rhi/BandCopy): bit for bit a memcpy per row on
+    # 1, 2, 3 and 7 threads, odd sizes and strides; prints an 8K P016 timing, 1 vs N threads.
+    find_package(Threads REQUIRED)
+    add_executable(band_copy_test tests/band_copy_test.cpp src/rhi/BandCopy.cpp)
+    target_include_directories(band_copy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(band_copy_test PRIVATE Threads::Threads)
+    add_test(NAME band_copy COMMAND band_copy_test)
+    # The render thread's perf window (rhi/RenderPerf.h): header-only, pure.
+    add_executable(render_perf_test tests/render_perf_test.cpp)
+    target_include_directories(render_perf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME render_perf COMMAND render_perf_test)
 
     # "Convert to 3D" (XR_DXR_lift spec v4): the LiftClient state machine over a fake
     # entry-point table, plus the CPU frame preparation. No runtime, no loader, no GPU.
@@ -854,11 +884,21 @@ if(MP_BUILD_TESTS)
 
     # Media Player Pro looks: .cube LUT + ASC CDL loaders (pure C++).
     # Pro live sources, two-input pairing and rig checks (src/pro/, pure: no SDK, no GPU).
-    add_executable(live_pixels_test tests/live_pixels_test.cpp src/pro/LivePixels.cpp
+    # (LiveSourceBase publishes in row bands: pro/ConvertPool.cpp, and so threads.)
+    find_package(Threads REQUIRED)
+    add_executable(live_pixels_test tests/live_pixels_test.cpp src/pro/LivePixels.cpp src/pro/ConvertPool.cpp
         src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
     target_include_directories(live_pixels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_link_libraries(live_pixels_test PRIVATE Threads::Threads)
     add_test(NAME live_pixels COMMAND live_pixels_test)
+    # The capture convert in row bands on 1..7 threads (incl. a dual-stream pair of eyes) =
+    # the one-pass convert, bit for bit; prints a 4K v210 timing, 1 vs N threads.
+    # Also the ring publish (one frame; a two-input pair side by side) in row bands.
+    add_executable(live_convert_test tests/live_convert_test.cpp src/pro/ConvertPool.cpp src/pro/LivePixels.cpp)
+    target_include_directories(live_convert_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(live_convert_test PRIVATE Threads::Threads)
+    add_test(NAME live_convert COMMAND live_convert_test)
     add_executable(qc_report_test tests/qc_report_test.cpp src/pro/QcReport.cpp)
     target_include_directories(qc_report_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME qc_report COMMAND qc_report_test)
@@ -878,6 +918,14 @@ if(MP_BUILD_TESTS)
     target_include_directories(resolve_link_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(resolve_link_test PRIVATE nlohmann_json::nlohmann_json)
     add_test(NAME resolve_link COMMAND resolve_link_test)
+    add_executable(decklink_spec_test tests/decklink_spec_test.cpp src/pro/DeckLinkSpec.cpp)
+    target_include_directories(decklink_spec_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME decklink_spec COMMAND decklink_spec_test)
+    # Player + Pro agent tools: unique names, valid schemas, within the runtime's budget (#220).
+    add_executable(agent_tools_test tests/agent_tools_test.cpp src/AgentTools.cpp src/pro/ProToolList.cpp)
+    target_include_directories(agent_tools_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(agent_tools_test PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME agent_tools COMMAND agent_tools_test)
     add_executable(thumbnail_test tests/thumbnail_test.cpp src/pro/Thumbnail.cpp)
     target_include_directories(thumbnail_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME thumbnail COMMAND thumbnail_test)
@@ -897,9 +945,11 @@ if(MP_BUILD_TESTS)
     target_include_directories(overlays_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME overlays COMMAND overlays_test)
     add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/TargetScreen.cpp src/pro/LivePixels.cpp
-        src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
+        src/pro/ConvertPool.cpp src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp
+        src/Log.cpp)
     target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_link_libraries(rig_check_test PRIVATE Threads::Threads)
     add_test(NAME rig_check COMMAND rig_check_test)
 
     # Pro review formats: sequences, EXR display encoding, 10-bit -> P016 (real decodes).

@@ -8,10 +8,14 @@
 #include "pro/RigCheck.h"
 #include "pro/TestSignalSource.h"
 
+#include "media/LiveProducer.h"
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <vector>
 
 using namespace mp;
@@ -339,6 +343,44 @@ void AlertClosesOnBlack() {
           "start and last-good timecodes");
 }
 
+// The render thread's path (RigMonitor::Submit) in real time, with frames dropping:
+// UHD 59.94 on the station dropped a frame every few, the burst restarted its 0.5 s
+// fallback window at every gap, and the rig check measured nothing (went blank). Drops
+// must still give a measurement about every 0.5 s; a clean feed keeps its ~4 a second.
+size_t MeasurementsWhileFeeding(int dropEveryN, double seconds) {
+    TestSignalConfig cfg;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    FrameRing::Frame f = ToFrame(px);
+    rig::RigMonitor m;
+    int64_t serial = 0;
+    int frames = 0;
+    const double t0 = LiveProducer::NowSeconds();
+    while (LiveProducer::NowSeconds() - t0 < seconds) {
+        ++frames;
+        serial += (dropEveryN > 0 && frames % dropEveryN == 0) ? 2 : 1;  // skip one serial = a dropped frame
+        f.serial = serial;
+        m.Submit(f, StereoLayout::SbsFull, -1, "01:00:00:00");
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+    for (int i = 0; i < 200 && m.LastMeasureMs() <= 0.0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));  // let the last hand-over finish
+    return m.History(seconds + 5.0).size();
+}
+
+void MeasuresWithDroppedFrames() {
+    const size_t clean = MeasurementsWhileFeeding(0, 2.0);
+    const size_t drops3 = MeasurementsWhileFeeding(3, 2.0);
+    const size_t drops2 = MeasurementsWhileFeeding(2, 2.0);
+    std::printf("  measurements in 2 s: clean %zu, a frame dropped every 3rd %zu, every 2nd %zu\n", clean, drops3,
+                drops2);
+    // ~4 a second nominally (8 in 2 s); a slow CI runner (macOS) has measured 4, so only
+    // check that a clean feed measures more often than the drop cases' ~2 a second.
+    CHECK(clean >= 3, "a clean feed is measured several times a second");
+    CHECK(drops3 >= 2, "dropping every 3rd frame still measures (about every 0.5 s)");
+    CHECK(drops2 >= 2, "dropping every 2nd frame still measures");
+}
+
 std::vector<rig::EyePair> Burst(const TestSignalConfig& cfg, int64_t last, bool swap) {
     std::vector<rig::EyePair> seq;
     for (int64_t n = last - rig::RigMonitor::kSyncFrames + 1; n <= last; ++n) {
@@ -565,6 +607,7 @@ int main() {
     EyeSyncLikeTheApp(0.0f, confirmedRight);
     EyeSyncLikeTheApp(0.5f, confirmedRight);  // a rolled eye: dy runs across x, far more than a frame of motion
     CHECK(confirmedRight >= 1, "the 2-frame delay is confirmed from the pixels on the app's path");
+    MeasuresWithDroppedFrames();
     if (g_failures) {
         std::fprintf(stderr, "rig_check_test: %d failure(s)\n", g_failures);
         return 1;

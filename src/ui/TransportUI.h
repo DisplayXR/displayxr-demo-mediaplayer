@@ -19,6 +19,7 @@
 
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct ImFont;
@@ -51,9 +52,20 @@ struct TransportCaps {
     // The touch player's 2D/3D switch (#180), in place of `mode`'s cycle button. DEFAULT
     // FALSE; Android sets it while media plays and the runtime has a 2D and a 3D mode.
     bool modeSwitch = false;
-    // The touch player's gallery button (#180): a grid icon in place of the "Open" text
-    // button. DEFAULT FALSE; Android sets it.
+    // The touch player's way back to the gallery (#180): a back arrow (the browser's own)
+    // in place of the "Open" text button. DEFAULT FALSE; Android sets it.
     bool gallery = false;
+    // The touch player's layout (#180). DEFAULT FALSE; Android sets it. Instead of the flat
+    // bars: gradient scrims at the top and bottom, the back arrow then the file's name left
+    // aligned (and its place in the list under it), and the 2D/3D switch as a labelled
+    // "2D | 3D" control, docked at the end of the transport row for a video and alone
+    // bottom right for a still. Times and names use the touch type scale.
+    bool touchLayout = false;
+    // Touch layout only (#180), DEFAULT FALSE. `skip`: the -10 s / +10 s buttons beside play
+    // (Android: a tablet, shortest side >= 600 dp). `info`: the (i) at the top right, which
+    // opens the info sheet (TransportState::info).
+    bool skip = false;
+    bool info = false;
 };
 
 // One row of the "Convert to 3D" provider selector: the runtime's verbatim provider name
@@ -85,6 +97,10 @@ struct TransportState {
     bool hasMedia = false;
     bool isVideo = false;
     std::string mediaFilename;  // basename only; the caller does the path work
+    std::string mediaPosition;  // "12 / 112": its place in the list browsed; touch layout only
+    // The info sheet's rows, label then value ("Resolution", "3840 x 1080"); only read while
+    // infoOpen, so the owner may fill it only then.
+    std::vector<std::pair<std::string, std::string>> info;
     std::string modeName;       // e.g. "2x1 Stereo"
     bool mode3D = false;        // the 2D/3D switch's side; only read when caps.modeSwitch
     std::string layoutName;     // e.g. "SBS-half"
@@ -161,6 +177,8 @@ struct TransportState {
     bool cameraComboWasOpen = false;
     // Stream URL popup's edit buffer (#93), seeded from urlSeed each time it opens.
     char urlBuf[1024] = {};
+    // The info sheet is open (caps.info); the owner may close it (a new file).
+    bool infoOpen = false;
 
     // Auto-hide fade (whole-UI alpha) and the independent toast fade.
     float fadeAlpha = 0.0f;
@@ -186,6 +204,7 @@ struct TransportActions {
     std::function<void()> ToggleMute;
     std::function<void()> ToggleLoop;
     std::function<void()> TogglePanels;  // Pro, used only when panelsButton
+    std::function<void(float seconds)> Skip;  // caps.skip: seek this far from where it plays
 
     // Scrub machine. Seek(preview=true) is a cheap keyframe seek for a fast
     // sweep; preview=false is the exact frame. ScrubHeld fires once when the
@@ -222,13 +241,27 @@ struct TransportActions {
 void ApplyMediaPlayerStyle(float metricScale = 1.0f);
 
 // The UI font size in HUD pixels for the same metricScale (desktop or touch), times the
-// UI scale (UiScale.h), rounded up. ImGuiLayer rasterizes the font at exactly this size.
+// UI scale and the system font scale (UiScale.h), rounded up. ImGuiLayer rasterizes the font at exactly this size.
 float UiFontPx(float metricScale = 1.0f);
 
 // The 2D/3D switch's knob label (#180): a size up from UiFontPx, rasterized at that size
 // by ImGuiLayer, which also sets the font.
 float SwitchFontPx(float metricScale = 1.0f);
 inline ImFont* g_switchFont = nullptr;
+
+// The touch UI's type scale (#180): three sizes besides the UI font, in dp so they follow
+// the device - Title about 22 dp (the player's file name, the browser's title), Row 18 dp
+// (list rows, chips, section headers) and Small 14 dp (badges, counts, times). ImGuiLayer
+// rasterizes them only on touch (metricScale > 1). On desktop the pointers stay null, and
+// ImGui::PushFont(nullptr) / AddText(nullptr, 0, ...) mean the UI font: the desktop draws
+// exactly what it drew before.
+enum class TextStyle { Title, Row, Small };
+float TextStylePx(TextStyle style, float metricScale = 1.0f);
+inline ImFont* g_titleFont = nullptr;
+inline ImFont* g_rowFont = nullptr;
+inline ImFont* g_smallFont = nullptr;
+// The font for `style`: null (the UI font) where the type scale is not built.
+ImFont* StyleFont(TextStyle style);
 
 // Advance the purely-visual timers: the auto-hide fade and the toast fade.
 // `uiAwake` is the caller's "should the chrome be visible" verdict (master
@@ -237,10 +270,14 @@ inline ImFont* g_switchFont = nullptr;
 void TickTransportUI(TransportState& s, double dt, bool uiAwake);
 
 // Show a transient message. Fades in over the toast, independent of the bars,
-// so it's visible even while the chrome is hidden.
-void ShowTransportToast(TransportState& s, std::string msg);
+// so it's visible even while the chrome is hidden. `seconds` it stays lit; 0 = the default.
+void ShowTransportToast(TransportState& s, std::string msg, double seconds = 0.0);
 
 // Emit the whole UI. Must be called between ImGui NewFrame() and Render().
 void BuildTransportUI(TransportState& s, const TransportActions& a);
+
+// Emit only the toast (BuildTransportUI does too): for a screen that draws its own UI,
+// like the Android browser, so a message survives the change of screen (#180).
+void BuildTransportToast(const TransportState& s);
 
 }  // namespace mp::ui

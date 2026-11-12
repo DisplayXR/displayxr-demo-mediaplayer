@@ -8,11 +8,11 @@ This is the developer reference.
 
 ## Scope
 
-In: images and videos from the Android MediaStore, a sidebar of sources (All media,
-Camera, Downloads, Pictures, Movies, Unsupported, "Other files..." for the system picker),
-a square-tile grid, 3D and duration badges, Downloads as folders, select and delete, and
-view options (Both / 3D / 2D, All / Videos / Images, newest or oldest first, show
-unsupported files, off by default).
+In: images and videos from the Android MediaStore, the sources (All media, Camera,
+Downloads, Pictures, Movies, Unsupported, "Other files..." for the system picker) as a
+rail or a drawer, a square-tile grid with date sections, 3D and duration badges,
+Downloads as folders, select and delete, filter chips (All / 3D / 2D, All types / Videos /
+Photos) and view options (newest or oldest first, show unsupported files, off by default).
 
 Out for now: a desktop browser; the VR badge; HEIC and MV-HEVC on Android. Files
 the player cannot open are listed under Unsupported with their format, so the formats
@@ -22,6 +22,8 @@ gallery cannot list them; "Other files..." reaches them.
 ## Structure
 
 ```
+src/ui/Icons.{h,cpp}            every icon, the player's and the browser's (one set)
+
 src/browser/                    namespace mp::browser, platform-neutral
   MediaItem.h                   one media entry: id, name, kind, size, duration, date, folder
   MediaLibrary.{h,cpp}          the item list, sources, filter and sort
@@ -36,8 +38,10 @@ src/browser/                    namespace mp::browser, platform-neutral
   ThumbnailDepth.{h,cpp}        the 3D grid: each stereo thumbnail's depth, on a worker
   TouchScroller.{h,cpp}         drag, inertia, tap vs drag
   SlideGesture.{h,cpp}          swiping to the next or previous file in the player
-  MediaBrowser.{h,cpp}          the ImGui view: sidebar, top bar, grid, view options, empty states
-  Icons.{h,cpp}                 hand-drawn icons
+  BrowserLayout.{h,cpp}         pure layout: columns by width, rail or drawer, date sections,
+                                the sectioned grid's positions
+  MediaBrowser.{h,cpp}          the ImGui view: top bar, chips, rail / drawer, grid, view
+                                options, empty states
 
 android/src/main/cpp/browser/
   AndroidMediaProvider.{h,cpp}  MediaProvider over JNI, plus the swipe's stills; its JNI
@@ -55,7 +59,8 @@ android/src/main/java/.../
 tests/
   media_library_test.cpp, stereo_classifier_test.cpp, thumbnail_cache_test.cpp,
   tile_crop_test.cpp, letterbox_test.cpp (src/media/Letterbox),
-  touch_scroller_test.cpp, slide_gesture_test.cpp, stereo_grid_test.cpp
+  touch_scroller_test.cpp, slide_gesture_test.cpp, stereo_grid_test.cpp,
+  browser_layout_test.cpp, zoom_gesture_test.cpp
 ```
 
 ## Rules
@@ -74,7 +79,10 @@ tests/
   (`bool Get(int slot, Thumb& out)`). No `std::optional`, no factory functions, no
   `assert`: check the inputs and return false.
 - The pure logic (library, cache, scroller) has unit tests that run on desktop.
-- Every fixed UI size goes through `ui::Px()`.
+- Every fixed UI size goes through `ui::Px()`, or `ui::Dp()` for a size meant in Android dp
+  (touch targets of 48 dp, the 280 dp drawer).
+- Text uses the touch type scale (`ui::TextStyle`: Title, Row, Small) and icons the one set
+  in `src/ui/Icons.h`.
 
 ## Threads and data flow
 
@@ -115,8 +123,10 @@ half-packed eye unsqueezed (`TileCrop.h`). Only that square goes to the GPU, so 
 slot (512 px) holds exactly what the tile shows.
 
 - Size: each request carries the edge to fit the thumbnail in, chosen so the square is
-  about one thumbnail pixel per screen pixel (`ThumbnailEdge`), from the MediaStore's width
-  and height and the verdict known at the time. A 16:9 video on a 400 px tile is made at
+  about one thumbnail pixel per screen pixel (`ThumbnailEdge`). Videos only: a photo keeps
+  the system's cached thumbnail at one atlas slot, as before. Photos were sharp enough, and
+  decoding photo files for the grid takes CPU that opening a picture needs. The edge comes
+  from the MediaStore's width and height and the verdict known at the time. A 16:9 video on a 400 px tile is made at
   712 x 400, a full side-by-side one at 1423 x 400. The square never exceeds a slot, and no
   thumbnail is made above the file's own size or 2048 px.
 - A tile that still comes out soft (the content check found it side by side after it was
@@ -187,8 +197,17 @@ eye in the left-eye views, its right eye in the others. Android only.
 - The browser borrows the flat 2D mode (the 3D mode under "3D only", see 3D grid) and hands
   the player's mode back on play.
 - Back from the player stops playback and returns to the browser at the same source and
-  scroll position and folder. Back in the browser leaves select mode, then goes up a folder,
-  then to the home screen.
+  scroll position and folder. Back in the browser closes the drawer or a sheet, then leaves
+  select mode, then goes up a folder, then goes to the home screen.
+- Sources: on a landscape screen 840 dp wide or more, a rail beside the grid that a pick
+  leaves open (the menu button hides it). Anywhere else, a 280 dp drawer over a dimmed
+  grid, closed by a pick, a tap outside it or Back.
+- The grid has about one column per 180 dp of its width. All media and Camera are in date
+  sections ("Today", "Yesterday", "October 2026"). Past 200 items a fast-scroll thumb on the
+  right shows the section at the top while it is held.
+- The chip row under the top bar filters by 3D / 2D and by type. The overflow menu holds
+  the sort and "Show unsupported files", as a bottom sheet in portrait and a side sheet in
+  landscape, and shows an accent dot when either is not as it starts.
 - Downloads shows its sub-folders first, as tiles with a count, then the files directly in
   it. The top bar names the folder ("Downloads / MEDIA / ZTEPics") beside an up arrow.
   Folders ignore the 3D / 2D filter.
@@ -202,8 +221,19 @@ eye in the left-eye views, its right eye in the others. Android only.
   first frame while it opens. At either end the picture gives a little and slides back.
   No swiping after "Other files..." or under Unsupported.
 - Swipe limits: one file each side is prepared; opening a video takes about 0.6 s; a
-  two-track video's first frame is flat; a file that fails to open leaves black until
-  Back; Back returns to the grid where it was, not to the file swiped to.
+  two-track video's first frame is flat; Back returns to the grid where it was, not to the
+  file swiped to.
+- A file that fails to open, from the grid, a swipe or the system picker, returns to the
+  grid with a toast: "Couldn't open <name>" and the format when it is known.
+- A still zooms: a double tap toggles fit and 2x, a pinch goes up to 4x, one finger pans
+  while zoomed. Both views get the same zoom, so the depth is kept. Swiping to the next file
+  works at fit only.
 - Home mid-video pauses it; the app icon resumes it.
 - Permission states the browser shows: not granted, partial access (with "select more"),
   denied, and empty source.
+- Text follows the system font size (Configuration.fontScale, clamped to 0.85-1.3 so the
+  bars still fit a phone), and a long press that starts select mode gives a haptic tick.
+- **Not accessible to TalkBack.** The browser and the player chrome are drawn with ImGui
+  into the HUD layer: there are no Android views, so a screen reader sees nothing to
+  focus or read. Reaching TalkBack would mean an accessibility node tree mirroring the
+  ImGui widgets (`AccessibilityNodeProvider` on the activity's view); not done.

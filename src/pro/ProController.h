@@ -228,7 +228,8 @@ public:
     ViewMode Mode() const { return mode_; }
     // The monitoring station: inputs, timecode / delay, rig checks, snapshots (Station.h).
     Station& GetStation() { return station_; }
-    // Agent tools (ProTools.cpp): registered and dispatched from the trunk's MCP code.
+    // Agent tools (table: ProToolList.cpp; dispatch: ProTools.cpp): registered and
+    // dispatched from the trunk's MCP code.
     using RegisterFn = std::function<void(const char* name, const char* description, const char* schema)>;
     void RegisterTools(const RegisterFn& reg);
     // True when `tool` is a Pro tool (result / success set).

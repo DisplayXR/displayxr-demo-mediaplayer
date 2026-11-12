@@ -3,6 +3,7 @@
 
 #include "Log.h"
 #include "media/ImageDecoder.h"
+#include "pro/DeckLinkSpec.h"
 #include "pro/QcReport.h"
 #include "pro/Thumbnail.h"
 #include "stb_image_write.h"  // implementation compiled in src/rhi/VulkanRenderer.cpp
@@ -34,39 +35,6 @@ namespace {
 // How long after a snapshot the runtime is given to write its capture file: Tick() stops
 // looking for it then, and a QC export waits for it at most until then (#169).
 constexpr double kCaptureWaitS = 5.0;
-
-// "decklink:<dev>[+<right>][,sdi|hdmi][,dual|sbs|mono][,mode=Hp25]"
-bool ParseDeckLinkSpec(const std::string& args, DeckLinkConfig& c) {
-    c = DeckLinkConfig{};
-    std::string head = args, rest;
-    const size_t comma = args.find(',');
-    if (comma != std::string::npos) {
-        head = args.substr(0, comma);
-        rest = args.substr(comma + 1);
-    }
-    const size_t plus = head.find('+');
-    c.device = head.substr(0, plus);
-    if (c.device.empty()) c.device = "0";
-    if (plus != std::string::npos) {
-        c.rightDevice = head.substr(plus + 1);
-        c.stereo = DeckLinkConfig::Stereo::Pair;
-    }
-    size_t pos = 0;
-    while (!rest.empty() && pos <= rest.size()) {
-        const size_t e = rest.find(',', pos);
-        const std::string t = rest.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
-        if (t == "sdi" || t == "hdmi") c.input = t;
-        else if (t.rfind("mode=", 0) == 0) c.mode = t.substr(5);
-        else if (!t.empty()) {
-            DeckLinkConfig::Stereo st;
-            if (!DeckLinkConfig::ParseStereo(t, st)) return false;
-            c.stereo = st;
-        }
-        if (e == std::string::npos) break;
-        pos = e + 1;
-    }
-    return true;
-}
 
 std::string Clock(char* stampOut, size_t stampN) {
     const std::time_t now = std::time(nullptr);
@@ -603,6 +571,69 @@ void Station::LogNewAlerts() {
     alertsLoggedUntil_ = newest;
 }
 
+// The render thread's last closed perf window (rhi/RenderPerf.h), in get_rig_status and so
+// in station_status.json; null until one has closed (~10 s after the first frame).
+static nlohmann::json RenderPerfJson(const RenderPerfWindow& w) {
+    if (w.serial == 0) return nullptr;
+    auto r2 = [](double v) { return std::round(v * 100.0) / 100.0; };
+    return {{"window_s", r2(w.seconds)},
+            {"fps", r2(w.fps)},
+            {"frame_avg_ms", r2(w.frameAvgMs)},
+            {"frame_max_ms", r2(w.frameMaxMs)},
+            {"busy_avg_ms", r2(w.busyAvgMs)},
+            {"xr_wait_avg_ms", r2(w.xrWaitAvgMs)},
+            {"frame_open_avg_ms", r2(w.frameOpenAvgMs)},
+            {"frame_open_max_ms", r2(w.frameOpenMaxMs)},
+            {"uploads", w.uploads},
+            {"upload_avg_ms", r2(w.uploadAvgMs)},
+            {"upload_max_ms", r2(w.uploadMaxMs)},
+            {"copy_avg_ms", r2(w.copyAvgMs)},
+            {"copy_max_ms", r2(w.copyMaxMs)},
+            {"upload_mb", r2(w.uploadMB)},
+            {"copy_threads", w.copyThreads},
+            {"staging_allocs", w.stagingAllocs},
+            {"staging_one_off", w.stagingOneOff}};
+}
+
+void Station::LogPerf(bool live) {
+    if (!host_.renderPerf) return;
+    const RenderPerfWindow w = host_.renderPerf();
+    if (w.serial == 0 || w.serial == perfLogged_) return;
+    perfLogged_ = w.serial;
+    // The capture's health next to it: DeckLink, else the test rig. Its counters since the
+    // previous line (the totals on the first line after an open).
+    LiveStats ls;
+    const char* kind = nullptr;
+    if (decklink_.GetState() != LiveState::Closed) {
+        ls = decklink_.GetStats();
+        kind = "decklink";
+    } else if (testSignal_.GetState() != LiveState::Closed) {
+        ls = testSignal_.GetStats();
+        kind = "test signal";
+    }
+    char cap[200] = "";
+    if (kind) {
+        const bool delta = perfCaptureSeen_ && ls.dropped >= perfDropped_ && ls.lateFrames >= perfLate_;
+        std::snprintf(cap, sizeof(cap), " | %s %.2f fps delivered (signal %.2f), dropped %s%llu, late %s%llu%s", kind,
+                      ls.deliveredFps, ls.fps, delta ? "+" : "",
+                      (unsigned long long)(delta ? ls.dropped - perfDropped_ : ls.dropped), delta ? "+" : "",
+                      (unsigned long long)(delta ? ls.lateFrames - perfLate_ : ls.lateFrames),
+                      delta ? " in the window" : " since open");
+        perfDropped_ = ls.dropped;
+        perfLate_ = ls.lateFrames;
+        perfCaptureSeen_ = true;
+    } else {
+        perfCaptureSeen_ = false;
+    }
+    if (!live) return;
+    LOG_INFO("perf: render %.2f fps over %.0f s | frame %.2f avg / %.2f max ms, busy %.2f ms (xrWaitFrame %.2f ms), "
+             "frame open %.2f / %.2f ms | upload %.2f avg / %.2f max ms (copy %.2f / %.2f ms, %.1f MB, %d thread(s); "
+             "staging allocs %llu, one-off %llu)%s",
+             w.fps, w.seconds, w.frameAvgMs, w.frameMaxMs, w.busyAvgMs, w.xrWaitAvgMs, w.frameOpenAvgMs,
+             w.frameOpenMaxMs, w.uploadAvgMs, w.uploadMaxMs, w.copyAvgMs, w.copyMaxMs, w.uploadMB, w.copyThreads,
+             (unsigned long long)w.stagingAllocs, (unsigned long long)w.stagingOneOff, cap);
+}
+
 std::string Station::RigStatusJson() const {
     using json = nlohmann::json;
     const rig::Result r = rig_.Last();
@@ -636,6 +667,8 @@ std::string Station::RigStatusJson() const {
     out["target"] = target_.On() ? TargetJson(target_, pictureScale_, r, parallaxOffsetPct_) : nlohmann::json(nullptr);
     if (target_.On() && viewerDistanceM_ > 0.0f) out["target"]["viewer_distance_m"] = viewerDistanceM_;
     out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
+    // the render thread: can it show every frame the capture delivers? (docs/PRO.md, check 7)
+    out["render"] = host_.renderPerf ? RenderPerfJson(host_.renderPerf()) : nlohmann::json(nullptr);
     if (decklink_.GetState() != LiveState::Closed) {
         // capture health (#141): the "Done when" of a two-input 4K60 run reads these
         const LiveStats ls = decklink_.GetStats();
@@ -856,11 +889,37 @@ void Station::BuildInputsSection(const std::string& liveName, bool live) {
 }
 
 void Station::OpenDeckLinkDialog() {
+    const bool opening = !dlgOpen_;  // Refresh re-lists the devices but keeps the choices being made
     dlgDevices_ = DeckLinkSource::Available() ? DeckLinkSource::Enumerate() : std::vector<std::string>{};
     dlgReason_ = dlgDevices_.empty() ? DeckLinkSource::UnavailableReason() : std::string();
+    if (opening) FillDeckLinkDialogFromInput();
     dlgLeft_ = std::clamp(dlgLeft_, 0, std::max(0, (int)dlgDevices_.size() - 1));
     dlgRight_ = std::clamp(dlgRight_, 0, (int)dlgDevices_.size());
     dlgOpen_ = true;
+}
+
+// The dialog opens on the DeckLink input that is set up (the live input when it is a
+// DeckLink, else the "DeckLink" input), not on its own last choices: a pair opened from
+// the command line (--decklink=0 --decklink-right=1) showed "right eye: none", and Open
+// as shown would have dropped the right eye.
+void Station::FillDeckLinkDialogFromInput() {
+    auto deckLinkArgs = [](const Input& in, std::string& args) {
+        if (in.spec.rfind("decklink:", 0) != 0) return false;
+        args = in.spec.substr(9);
+        return true;
+    };
+    std::string args;
+    bool found = inputIndex_ >= 0 && inputIndex_ < (int)inputs_.size() && deckLinkArgs(inputs_[inputIndex_], args);
+    for (size_t i = 0; !found && i < inputs_.size(); ++i)
+        if (inputs_[i].name == "DeckLink") found = deckLinkArgs(inputs_[i], args);
+    DeckLinkConfig c;
+    DeckLinkDialogFields f;
+    if (!found || !ParseDeckLinkSpec(args, c) || !DeckLinkDialogFromConfig(c, dlgDevices_, f)) return;
+    dlgLeft_ = f.left;
+    dlgRight_ = f.right;
+    dlgConn_ = f.conn;
+    dlgStereo_ = f.stereo;
+    std::snprintf(dlgMode_, sizeof(dlgMode_), "%s", f.mode.c_str());
 }
 
 void Station::BuildDeckLinkDialog() {
@@ -891,6 +950,8 @@ void Station::BuildDeckLinkDialog() {
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("Refresh")) OpenDeckLinkDialog();
+    if (decklink_.GetState() != LiveState::Closed)
+        ImGui::TextDisabled("Live now: %s", decklink_.DeviceName().c_str());
     ImGui::Separator();
     ImGui::BeginDisabled(!any);
     auto deviceCombo = [&](const char* label, int& sel, bool allowNone) {
@@ -925,16 +986,13 @@ void Station::BuildDeckLinkDialog() {
     ImGui::Separator();
     ImGui::BeginDisabled(sameDevice);
     if (ImGui::Button("Open")) {
-        std::string spec = std::to_string(dlgLeft_);
-        if (pair) spec += "+" + std::to_string(dlgRight_ - 1);
-        if (dlgConn_ == 1) spec += ",sdi";
-        if (dlgConn_ == 2) spec += ",hdmi";
-        if (!pair) {
-            const char* st[] = {"", "sbs", "dual", "mono"};
-            if (*st[dlgStereo_]) spec += std::string(",") + st[dlgStereo_];
-        }
-        if (dlgMode_[0]) spec += std::string(",mode=") + dlgMode_;
-        pendingDeckLinkSpec_ = spec;  // opened in Tick()
+        DeckLinkDialogFields f;
+        f.left = dlgLeft_;
+        f.right = dlgRight_;
+        f.conn = dlgConn_;
+        f.stereo = dlgStereo_;
+        f.mode = dlgMode_;
+        pendingDeckLinkSpec_ = DeckLinkSpecFromDialog(f);  // opened in Tick()
         dlgOpen_ = false;
     }
     ImGui::EndDisabled();
@@ -967,7 +1025,7 @@ void Station::BuildSignalLines(bool live) {
         ImGui::Text("Eye skew %+.2f ms (max %.2f)  unpaired %llu", ps.lastSkewMs, ps.maxAbsSkewMs,
                     (unsigned long long)ps.unpaired);
         if (ps.timecode) ImGui::TextDisabled("paired by SMPTE timecode");
-        else if (ps.hwClockPairing) ImGui::TextDisabled("no timecode: paired by the card's clock");
+        else if (ps.hwClockPairing) ImGui::TextDisabled("paired by the card's clock (no matching timecode)");
         else if (ps.separateCards) ImGui::TextColored(kWarn, "no timecode, two cards: newest frames paired - jam-sync both inputs");
         else if (ps.pairs) ImGui::TextDisabled("no timecode: newest frames paired");
     }

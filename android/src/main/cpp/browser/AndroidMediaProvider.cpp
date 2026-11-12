@@ -68,6 +68,16 @@ void AndroidMediaProvider::Open(int64_t id) {
     openId_ = id;
 }
 
+void AndroidMediaProvider::Haptic() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    hapticRequested_ = true;
+}
+
+bool AndroidMediaProvider::TakeHapticRequest() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::exchange(hapticRequested_, false);
+}
+
 bool AndroidMediaProvider::CanDelete() const { return android_get_device_api_level() >= 30; }
 
 void AndroidMediaProvider::Delete(const std::vector<int64_t>& ids) {
@@ -355,6 +365,13 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeTakeAccessR
     JNIEnv* /*env*/, jobject /*thiz*/)
 {
     return AndroidMediaProvider::Instance().TakeAccessRequest() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeTakeHapticRequest(
+    JNIEnv* /*env*/, jobject /*thiz*/)
+{
+    return AndroidMediaProvider::Instance().TakeHapticRequest() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

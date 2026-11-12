@@ -24,6 +24,7 @@ import android.provider.Settings
 import android.os.SystemClock
 import android.util.Log
 import android.util.Size
+import android.view.HapticFeedbackConstants
 import java.io.FileNotFoundException
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
@@ -32,6 +33,8 @@ import kotlin.math.roundToInt
 
 class MediaStoreProvider(
     private val activity: Activity,
+    // Tells the player a file could not be opened at all, so it says so (#180).
+    private val openFailed: (name: String) -> Unit,
     // Hands an opened file to the player, as the system picker's result does.
     private val openFd: (fd: Int, length: Long, name: String) -> Unit,
 ) {
@@ -87,6 +90,7 @@ class MediaStoreProvider(
     private external fun nativeThumbnail(id: Long, width: Int, height: Int, rgba: ByteArray?, fd: Int, video: Boolean)
     private external fun nativeTakeAccessRequest(): Boolean
     private external fun nativeTakeRefreshRequest(): Boolean
+    private external fun nativeTakeHapticRequest(): Boolean
     // Triples of (id, 1 to check the file or 0, the edge to fit it in), or null if unchanged.
     private external fun nativeTakeWantedThumbnails(): LongArray?
     private external fun nativeTakeOpenRequest(): Long
@@ -126,6 +130,10 @@ class MediaStoreProvider(
     fun poll() {
         if (nativeTakeAccessRequest()) requestAccess()
         if (nativeTakeRefreshRequest()) refresh()
+        // A long press started select mode: the tick a stock gallery gives (#180).
+        if (nativeTakeHapticRequest()) {
+            activity.window?.decorView?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        }
         nativeTakeWantedThumbnails()?.let { t ->
             val n = t.size / 3
             val ids = LongArray(n) { t[3 * it] }
@@ -350,8 +358,10 @@ class MediaStoreProvider(
         }
         // The system's cached thumbnails stop at a size of its own. If that is well short of
         // what was asked and the file has more, make one from the file itself.
+        // Videos only: a photo's cached thumbnail was sharp enough, and decoding the file
+        // for every tile takes CPU that opening a picture needs.
         val own = max(row.width, row.height)
-        if (max(bitmap.width, bitmap.height) * 10 < edge * 9 && (own == 0 || own > max(bitmap.width, bitmap.height))) {
+        if (row.type == TYPE_VIDEO && max(bitmap.width, bitmap.height) * 10 < edge * 9 && (own == 0 || own > max(bitmap.width, bitmap.height))) {
             larger(row, edge)?.let { bitmap = it }
         }
         if (bitmap.config != Bitmap.Config.ARGB_8888) {
@@ -448,11 +458,16 @@ class MediaStoreProvider(
             return
         }
         try {
-            val pfd = activity.contentResolver.openFileDescriptor(row.uri, "r") ?: return
+            val pfd = activity.contentResolver.openFileDescriptor(row.uri, "r")
+            if (pfd == null) {
+                openFailed(row.name)
+                return
+            }
             val length = pfd.statSize
             openFd(pfd.detachFd(), length, row.name)
         } catch (e: Exception) { // FileNotFoundException, or SecurityException on a revoked grant
             Log.w(TAG, "media browser: cannot open ${row.name}: $e")
+            openFailed(row.name)
         }
     }
 

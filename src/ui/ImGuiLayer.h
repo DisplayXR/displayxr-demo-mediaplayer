@@ -59,6 +59,8 @@ public:
     // HUD pixels per design unit (ui/UiScale.h). Before Init it only records the scale;
     // after Init a change rebuilds the font and the style at the new scale.
     void SetUiScale(float scale);
+    // The system font scale (ui::g_fontScale) changed: rebuild the fonts at it. Android only.
+    void SetFontScale(float scale);
     void Shutdown();
     bool Ready() const { return ready_; }
 

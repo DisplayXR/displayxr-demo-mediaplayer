@@ -12,6 +12,10 @@
 #include <mutex>
 #include <string>
 
+namespace mp::livepix {
+class ConvertPool;  // pro/ConvertPool.h
+}
+
 namespace mp {
 
 class LiveSourceBase : public LiveProducer {
@@ -32,14 +36,15 @@ protected:
     // Copy a finished frame into the ring and publish it. timecode may be null.
     void Publish(const livepix::Nv12& f, bool fullRange, double captureSec, const char* timecode,
                  int eyeOffsetFrames);
-    // The 16-bit (P016) twin: 10-bit capture kept to the GPU.
+    // The 16-bit (P016) twin: 10-bit capture kept to the GPU. `pool` (the caller's convert
+    // threads; nullptr = this thread) copies it in row bands (pro/ConvertPool.h).
     void Publish(const livepix::P016& f, bool fullRange, double captureSec, const char* timecode,
-                 int eyeOffsetFrames);
+                 int eyeOffsetFrames, livepix::ConvertPool* pool = nullptr);
     // Two eyes composed side by side straight into the ring (no intermediate frame; a
-    // 4K pair is 50 MB a copy). Sizes may differ: the smaller one is used. The left eye's
-    // colour tags stand for the pair.
+    // 4K pair is 50 MB a copy, in row bands on `pool`). Sizes may differ: the smaller one is
+    // used. The left eye's colour tags stand for the pair.
     void PublishPair(const livepix::P016& l, const livepix::P016& r, bool fullRange, double captureSec,
-                     const char* timecode, int eyeOffsetFrames);
+                     const char* timecode, int eyeOffsetFrames, livepix::ConvertPool* pool = nullptr);
     // A frame the source had to skip before converting it (LiveStats::lateFrames).
     void CountLate();
     // Streaming (or Opening) -> Stalled when nothing was published for stallSec since

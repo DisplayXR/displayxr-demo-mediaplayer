@@ -957,6 +957,7 @@ void ProController::Tick(const Status& st) {
     stereoSource_ = st.stereo;
     station_.SetSignalFps(st.live ? st.sourceFps : 0.0f);
     station_.Tick();
+    station_.LogPerf(st.live);  // `perf:` every ~10 s while live
     TickResolve(st);
     if (++ticks_ == testCompareFrame_) pendingCompare_ = true;
     // Full screen shows the picture alone (the plan's "full screen hides everything except
