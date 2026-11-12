@@ -18,6 +18,7 @@
 #include "pro/RigCheck.h"
 #include "pro/TargetScreen.h"
 #include "pro/TestSignalSource.h"
+#include "rhi/RenderPerf.h"
 
 #include <functional>
 #include <string>
@@ -38,6 +39,9 @@ struct StationHost {
     std::function<bool(const std::string& prefix)> captureAtlas;
     std::function<void(const std::string&)> toast;
     std::function<double()> displayPeriodMs;  // one panel frame, for the delay readout
+    // The render thread's last closed perf window (VulkanRenderer::LastPerfWindow): the
+    // "render" block of get_rig_status / station_status.json and the `perf:` log line.
+    std::function<RenderPerfWindow()> renderPerf;
     // Input-list thumbnails (kThumbW x kThumbH RGBA): upload `rgba` for thumbnail `slot`
     // (nullptr = no change) and return its ImTextureID, nullptr when there is none.
     std::function<void*(int slot, const uint8_t* rgba)> thumbTexture;
@@ -62,6 +66,10 @@ public:
     // Keys (SDL keycode); true when consumed. Actions that change the player run in Tick().
     bool HandleKey(int sdlKey);
     void Tick();  // per frame, from ProController::Tick (outside the SDL event hook)
+    // Per frame too: while a live source is up (`live`), one INFO line per closed render
+    // perf window (~10 s) with the render thread's timings and the capture's health
+    // (`perf: ...`), the on-site proof for 4K60 (docs/PRO.md, first check 7).
+    void LogPerf(bool live);
     // Every frame the trunk uploads (live or file): timecode, delay, rig checks.
     // eyesSwapped = the player's effective eye swap (X toggle XOR a R|L container): the rig
     // checks measure the eyes as shown.
@@ -168,6 +176,9 @@ private:
     int signalFps_ = 0;
     double delayMs_ = 0.0;
     double alertsLoggedUntil_ = 0.0;
+    uint64_t perfLogged_ = 0;                      // the last render perf window logged (LogPerf)
+    uint64_t perfDropped_ = 0, perfLate_ = 0;      // the capture's counters at that line
+    bool perfCaptureSeen_ = false;                 // ... valid (the deltas need a previous line)
     QcExporter qcExport_;  // QC report thumbnails + file writes, off the render thread
     uintmax_t alertsOffset_ = 0;              // station_alerts.jsonl size when the session began
     std::string sessionClock_, sessionDate_;  // HH:MM:SS / YYYYMMDD the session began

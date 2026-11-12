@@ -571,6 +571,69 @@ void Station::LogNewAlerts() {
     alertsLoggedUntil_ = newest;
 }
 
+// The render thread's last closed perf window (rhi/RenderPerf.h), in get_rig_status and so
+// in station_status.json; null until one has closed (~10 s after the first frame).
+static nlohmann::json RenderPerfJson(const RenderPerfWindow& w) {
+    if (w.serial == 0) return nullptr;
+    auto r2 = [](double v) { return std::round(v * 100.0) / 100.0; };
+    return {{"window_s", r2(w.seconds)},
+            {"fps", r2(w.fps)},
+            {"frame_avg_ms", r2(w.frameAvgMs)},
+            {"frame_max_ms", r2(w.frameMaxMs)},
+            {"busy_avg_ms", r2(w.busyAvgMs)},
+            {"xr_wait_avg_ms", r2(w.xrWaitAvgMs)},
+            {"frame_open_avg_ms", r2(w.frameOpenAvgMs)},
+            {"frame_open_max_ms", r2(w.frameOpenMaxMs)},
+            {"uploads", w.uploads},
+            {"upload_avg_ms", r2(w.uploadAvgMs)},
+            {"upload_max_ms", r2(w.uploadMaxMs)},
+            {"copy_avg_ms", r2(w.copyAvgMs)},
+            {"copy_max_ms", r2(w.copyMaxMs)},
+            {"upload_mb", r2(w.uploadMB)},
+            {"copy_threads", w.copyThreads},
+            {"staging_allocs", w.stagingAllocs},
+            {"staging_one_off", w.stagingOneOff}};
+}
+
+void Station::LogPerf(bool live) {
+    if (!host_.renderPerf) return;
+    const RenderPerfWindow w = host_.renderPerf();
+    if (w.serial == 0 || w.serial == perfLogged_) return;
+    perfLogged_ = w.serial;
+    // The capture's health next to it: DeckLink, else the test rig. Its counters since the
+    // previous line (the totals on the first line after an open).
+    LiveStats ls;
+    const char* kind = nullptr;
+    if (decklink_.GetState() != LiveState::Closed) {
+        ls = decklink_.GetStats();
+        kind = "decklink";
+    } else if (testSignal_.GetState() != LiveState::Closed) {
+        ls = testSignal_.GetStats();
+        kind = "test signal";
+    }
+    char cap[200] = "";
+    if (kind) {
+        const bool delta = perfCaptureSeen_ && ls.dropped >= perfDropped_ && ls.lateFrames >= perfLate_;
+        std::snprintf(cap, sizeof(cap), " | %s %.2f fps delivered (signal %.2f), dropped %s%llu, late %s%llu%s", kind,
+                      ls.deliveredFps, ls.fps, delta ? "+" : "",
+                      (unsigned long long)(delta ? ls.dropped - perfDropped_ : ls.dropped), delta ? "+" : "",
+                      (unsigned long long)(delta ? ls.lateFrames - perfLate_ : ls.lateFrames),
+                      delta ? " in the window" : " since open");
+        perfDropped_ = ls.dropped;
+        perfLate_ = ls.lateFrames;
+        perfCaptureSeen_ = true;
+    } else {
+        perfCaptureSeen_ = false;
+    }
+    if (!live) return;
+    LOG_INFO("perf: render %.2f fps over %.0f s | frame %.2f avg / %.2f max ms, busy %.2f ms (xrWaitFrame %.2f ms), "
+             "frame open %.2f / %.2f ms | upload %.2f avg / %.2f max ms (copy %.2f / %.2f ms, %.1f MB, %d thread(s); "
+             "staging allocs %llu, one-off %llu)%s",
+             w.fps, w.seconds, w.frameAvgMs, w.frameMaxMs, w.busyAvgMs, w.xrWaitAvgMs, w.frameOpenAvgMs,
+             w.frameOpenMaxMs, w.uploadAvgMs, w.uploadMaxMs, w.copyAvgMs, w.copyMaxMs, w.uploadMB, w.copyThreads,
+             (unsigned long long)w.stagingAllocs, (unsigned long long)w.stagingOneOff, cap);
+}
+
 std::string Station::RigStatusJson() const {
     using json = nlohmann::json;
     const rig::Result r = rig_.Last();
@@ -604,6 +667,8 @@ std::string Station::RigStatusJson() const {
     out["target"] = target_.On() ? TargetJson(target_, pictureScale_, r, parallaxOffsetPct_) : nlohmann::json(nullptr);
     if (target_.On() && viewerDistanceM_ > 0.0f) out["target"]["viewer_distance_m"] = viewerDistanceM_;
     out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
+    // the render thread: can it show every frame the capture delivers? (docs/PRO.md, check 7)
+    out["render"] = host_.renderPerf ? RenderPerfJson(host_.renderPerf()) : nlohmann::json(nullptr);
     if (decklink_.GetState() != LiveState::Closed) {
         // capture health (#141): the "Done when" of a two-input 4K60 run reads these
         const LiveStats ls = decklink_.GetStats();

@@ -281,6 +281,7 @@ function(mp_add_player tgt is_pro)
         $<$<PLATFORM_ID:Linux>:src/platform/WindowLinux.cpp>  # desktop Linux: displayxr-common window
         src/xr/XrSession.cpp
         src/rhi/VulkanRenderer.cpp
+        src/rhi/BandCopy.cpp         # upload copies into staging in row bands (8K live frames)
         src/media/ImageDecoder.cpp
         src/media/LifLoader.cpp
         src/media/DepthWarp.cpp      # one-view LIF -> stereo pair (#180)
@@ -826,6 +827,18 @@ if(MP_BUILD_TESTS)
     target_include_directories(frame_ring_queue_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME frame_ring_queue COMMAND frame_ring_queue_test)
 
+    # The renderer's upload copy in row bands (rhi/BandCopy): bit for bit a memcpy per row on
+    # 1, 2, 3 and 7 threads, odd sizes and strides; prints an 8K P016 timing, 1 vs N threads.
+    find_package(Threads REQUIRED)
+    add_executable(band_copy_test tests/band_copy_test.cpp src/rhi/BandCopy.cpp)
+    target_include_directories(band_copy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(band_copy_test PRIVATE Threads::Threads)
+    add_test(NAME band_copy COMMAND band_copy_test)
+    # The render thread's perf window (rhi/RenderPerf.h): header-only, pure.
+    add_executable(render_perf_test tests/render_perf_test.cpp)
+    target_include_directories(render_perf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME render_perf COMMAND render_perf_test)
+
     # "Convert to 3D" (XR_DXR_lift spec v4): the LiftClient state machine over a fake
     # entry-point table, plus the CPU frame preparation. No runtime, no loader, no GPU.
     add_executable(lift_client_test
@@ -849,16 +862,19 @@ if(MP_BUILD_TESTS)
 
     # Media Player Pro looks: .cube LUT + ASC CDL loaders (pure C++).
     # Pro live sources, two-input pairing and rig checks (src/pro/, pure: no SDK, no GPU).
-    add_executable(live_pixels_test tests/live_pixels_test.cpp src/pro/LivePixels.cpp
+    # (LiveSourceBase publishes in row bands: pro/ConvertPool.cpp, and so threads.)
+    find_package(Threads REQUIRED)
+    add_executable(live_pixels_test tests/live_pixels_test.cpp src/pro/LivePixels.cpp src/pro/ConvertPool.cpp
         src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
     target_include_directories(live_pixels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_link_libraries(live_pixels_test PRIVATE Threads::Threads)
     add_test(NAME live_pixels COMMAND live_pixels_test)
     # The capture convert in row bands on 1..7 threads (incl. a dual-stream pair of eyes) =
     # the one-pass convert, bit for bit; prints a 4K v210 timing, 1 vs N threads.
+    # Also the ring publish (one frame; a two-input pair side by side) in row bands.
     add_executable(live_convert_test tests/live_convert_test.cpp src/pro/ConvertPool.cpp src/pro/LivePixels.cpp)
     target_include_directories(live_convert_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    find_package(Threads REQUIRED)
     target_link_libraries(live_convert_test PRIVATE Threads::Threads)
     add_test(NAME live_convert COMMAND live_convert_test)
     add_executable(qc_report_test tests/qc_report_test.cpp src/pro/QcReport.cpp)
@@ -907,9 +923,11 @@ if(MP_BUILD_TESTS)
     target_include_directories(overlays_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME overlays COMMAND overlays_test)
     add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/TargetScreen.cpp src/pro/LivePixels.cpp
-        src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp src/Log.cpp)
+        src/pro/ConvertPool.cpp src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp
+        src/Log.cpp)
     target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_link_libraries(rig_check_test PRIVATE Threads::Threads)
     add_test(NAME rig_check COMMAND rig_check_test)
 
     # Pro review formats: sequences, EXR display encoding, 10-bit -> P016 (real decodes).

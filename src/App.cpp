@@ -873,7 +873,12 @@ void App::RenderOneFrame() {
     UpdateDepthCursor();
 
     XrSession::Frame frame;
+    // xrWaitFrame is where the display paces us; the renderer's perf window subtracts it
+    // from the frame time to get the render thread's own (rhi/RenderPerf.h).
+    const auto xrWait0 = std::chrono::steady_clock::now();
     if (!xr_.BeginFrame(frame)) return;
+    renderer_.NoteXrWait(
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - xrWait0).count());
 
     XrSession::ViewRect rects[XrSession::kMaxViews];          // full per-view tiles (submitted)
     XrSession::ViewRect contentRects[XrSession::kMaxViews];   // aspect-fit content within each tile
@@ -4410,6 +4415,7 @@ void App::InitPro() {
     };
     sh.toast = [this](const std::string& t) { ShowToast(t); };
     sh.displayPeriodMs = [this] { return fps_ > 1.0f ? 1000.0 / fps_ : 1000.0 / 60.0; };
+    sh.renderPerf = [this] { return renderer_.LastPerfWindow(); };  // get_rig_status "render", `perf:` log
     // Input-list thumbnails: one small ImGui texture per input slot, created on first use.
     auto thumbIds = std::make_shared<std::vector<int>>(pro::Station::kMaxThumbs, -1);
     sh.thumbTexture = [this, thumbIds](int slot, const uint8_t* rgba) -> void* {

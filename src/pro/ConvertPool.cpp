@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <system_error>
 
 namespace mp::livepix {
@@ -127,6 +128,51 @@ void ToP016Banded(ConvertPool* pool, RawFormat fmt, const uint8_t* src, int srcR
     j.x0 = x0;
     j.rgbMatrix = rgbMatrix;
     ToP016Banded(pool, &j, 1);
+}
+
+void ComposePairBanded(ConvertPool* pool, const P016& l, const P016& r, int cw, int ch, uint16_t* y, uint16_t* uv) {
+    if (cw <= 0 || ch <= 0 || !y || !uv) return;
+    const size_t w = 2 * (size_t)cw;
+    const size_t eyeBytes = (size_t)cw * sizeof(uint16_t);
+    const int bands = BandsFor(ch, pool ? pool->Threads() : 1);
+    // Whole 4:2:0 row pairs per band (BandRows): luma rows [r0, r1), chroma [r0/2, r1/2).
+    auto band = [&](int b) {
+        int r0 = 0, r1 = 0;
+        BandRows(ch, bands, b, r0, r1);
+        for (size_t row = (size_t)r0; row < (size_t)r1; ++row) {
+            std::memcpy(y + row * w, l.y.data() + row * (size_t)l.width, eyeBytes);
+            std::memcpy(y + row * w + cw, r.y.data() + row * (size_t)r.width, eyeBytes);
+        }
+        for (size_t row = (size_t)r0 / 2; row < (size_t)r1 / 2; ++row) {
+            std::memcpy(uv + row * w, l.uv.data() + row * (size_t)l.width, eyeBytes);
+            std::memcpy(uv + row * w + cw, r.uv.data() + row * (size_t)r.width, eyeBytes);
+        }
+    };
+    if (!pool) {
+        for (int b = 0; b < bands; ++b) band(b);
+        return;
+    }
+    pool->Run(bands, band);
+}
+
+void CopyFrameBanded(ConvertPool* pool, const P016& src, uint16_t* y, uint16_t* uv) {
+    if ((!y && !src.y.empty()) || (!uv && !src.uv.empty())) return;  // (a 1-row frame has no chroma)
+    const size_t w = (size_t)std::max(0, src.width), h = (size_t)std::max(0, src.height);
+    if (src.y.size() != w * h || src.uv.size() != w * (h / 2) || !pool) {  // not Resize()d: as it is
+        if (!src.y.empty()) std::memcpy(y, src.y.data(), src.y.size() * sizeof(uint16_t));
+        if (!src.uv.empty()) std::memcpy(uv, src.uv.data(), src.uv.size() * sizeof(uint16_t));
+        return;
+    }
+    const int bands = BandsFor((int)h, pool->Threads());
+    pool->Run(bands, [&](int b) {
+        int r0 = 0, r1 = 0;
+        BandRows((int)h, bands, b, r0, r1);
+        // contiguous planes: one block per band (chroma rows [r0/2, r1/2); an odd last luma
+        // row has no chroma row, as in P016::Resize)
+        std::memcpy(y + (size_t)r0 * w, src.y.data() + (size_t)r0 * w, (size_t)(r1 - r0) * w * sizeof(uint16_t));
+        const size_t c0 = (size_t)r0 / 2, c1 = (size_t)r1 / 2;
+        if (c1 > c0) std::memcpy(uv + c0 * w, src.uv.data() + c0 * w, (c1 - c0) * w * sizeof(uint16_t));
+    });
 }
 
 int ConvertThreads(int eyes, int inputEyes, unsigned hardwareThreads, const char* env) {

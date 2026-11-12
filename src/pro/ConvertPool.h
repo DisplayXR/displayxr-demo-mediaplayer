@@ -82,6 +82,16 @@ void ToP016Banded(ConvertPool* pool, const EyeJob* eyes, int n);
 void ToP016Banded(ConvertPool* pool, RawFormat fmt, const uint8_t* src, int srcRowBytes, int w, int h, P016& dst,
                   int x0, ColorMatrix rgbMatrix);
 
+// The capture's last step, the converted frame into the ring's planes (16-bit samples; y is
+// width x height, uv width x height/2), also in row bands over `pool` (nullptr: this thread):
+// a 4K pair is ~50 MB to copy, ~10 ms on one thread, on the lane that the other eye's lane
+// waits for. Bit-identical to the one-pass copy; nothing outside the frame is written.
+// Two eyes side by side, each cropped to cw x ch (ch even, each eye at least that big):
+// y and uv are 2*cw samples wide (DeckLink two-input stereo, LiveSourceBase::PublishPair).
+void ComposePairBanded(ConvertPool* pool, const P016& l, const P016& r, int cw, int ch, uint16_t* y, uint16_t* uv);
+// One frame as it is: y gets src.y, uv gets src.uv (LiveSourceBase::Publish).
+void CopyFrameBanded(ConvertPool* pool, const P016& src, uint16_t* y, uint16_t* uv);
+
 // The conversion threads for one capture input (its own thread included). `env` is
 // MEDIAPLAYER_DECKLINK_CONVERT_THREADS: a number >= 1 sets them (at most 64; 1 = no
 // workers, every eye in one pass on the input's own thread, as before). Otherwise: per eye, half the logical

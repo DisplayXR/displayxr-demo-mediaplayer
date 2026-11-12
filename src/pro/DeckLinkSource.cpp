@@ -505,7 +505,13 @@ struct DeckLinkCapture {
     std::atomic<bool> noSignal[2]{};
     std::atomic<bool> dualActive{false};  // Auto switched to the card's dual-stream mode
 
-    std::mutex m;  // the frames below + the ring's single-producer side
+    std::mutex m;  // the frames below + the pairing state
+    // The ring's single-producer side: one compose + publish at a time. Taken while m is
+    // held (lock order m, then publishM), so publishes keep the order of the pairing
+    // decisions; a pair is then composed with only publishM held, so the other eye's lane
+    // can claim a slot and pair meanwhile (pins below). The worker takes both to clear
+    // `alive`: no publish is in progress after that.
+    std::mutex publishM;
     std::atomic<bool> alive{true};  // cleared before the inputs stop: late callbacks do nothing
     livepix::P016 out;
 
@@ -526,6 +532,11 @@ struct DeckLinkCapture {
     std::atomic<int64_t> hwT0{INT64_MIN};
     uint64_t framesIn[2] = {0, 0};
     EyeFrame hist[2][TimecodePairer::kHistory];
+    // Pair: composes reading hist[eye][slot] outside m (m guards the counts). A lane never
+    // converts into a pinned slot: it waits on pinCv until the compose is done (rare: the
+    // slot it is due to fill is normally the oldest, and the pair shown the newest).
+    int pins[2][TimecodePairer::kHistory] = {};
+    std::condition_variable pinCv;
     bool warnedUnsynced = false;
     bool warnedTcByClock = false;  // said once: timecodes disagree, paired by the card's clock
     bool warnedSize = false;
@@ -718,14 +729,18 @@ struct DeckLinkCapture {
             livepix::ToP016Banded(pool, jobs, n);
             if (r.hasMatrix) out.matrix = r.matrix;
             out.transfer = r.transfer;
-            if (alive) src->Publish(out, /*fullRange=*/false, r.now, r.tc[0] ? r.tc : nullptr, r.dual ? 0 : -1);
+            // into the ring in row bands on the same pool (a dual-stream 4K pair is 50 MB)
+            if (alive)
+                src->Publish(out, /*fullRange=*/false, r.now, r.tc[0] ? r.tc : nullptr, r.dual ? 0 : -1, pool);
             return;
         }
         // Pair: claim this eye's oldest slot, convert into it WITHOUT the lock (the two
-        // lanes convert in parallel; a busy slot is never chosen), then decide.
+        // lanes convert in parallel; a busy slot is never chosen, nor one the other lane is
+        // still composing into the ring), then decide.
         int slot;
         {
-            std::lock_guard<std::mutex> lk(m);
+            std::unique_lock<std::mutex> lk(m);
+            pinCv.wait(lk, [&] { return pins[eye][pairer.NextSlot(eye)] == 0; });
             slot = pairer.NextSlot(eye);
             pairer.MarkBusy(eye, slot);
         }
@@ -751,7 +766,7 @@ struct DeckLinkCapture {
             clockKey = HwClockKey(r.hwNs, t0, period);
         }
         std::memcpy(ef.tc, r.tc, sizeof(r.tc));
-        std::lock_guard<std::mutex> lk(m);
+        std::unique_lock<std::mutex> lk(m);
         ++framesIn[eye];
         const TimecodePairer::Decision d =
             pairer.Add(eye, slot, r.key, r.now, 1.0 / std::max(1.0, fpsExact.load()), clockKey);
@@ -794,9 +809,28 @@ struct DeckLinkCapture {
                      rt.px.width, rt.px.height);
             warnedSize = true;
         }
-        // (the pair is composed straight into the ring: no intermediate side-by-side frame)
-        src->PublishPair(l.px, rt.px, /*fullRange=*/false, std::min(l.arrived, rt.arrived),
-                         l.tc[0] ? l.tc : nullptr, d.offsetFrames);
+        // The pair is composed straight into the ring (no intermediate side-by-side frame),
+        // in row bands on this lane's pool, and outside m: ~50 MB at 4K, which held the
+        // other eye's lane off its next frame for the whole copy. The two slots are pinned
+        // so neither lane converts into them meanwhile; publishM, taken before m is
+        // released, keeps the ring single-producer and the publishes in decision order.
+        const int s0 = d.slot[0], s1 = d.slot[1];
+        const double captureSec = std::min(l.arrived, rt.arrived);
+        char tc[sizeof(l.tc)];
+        std::memcpy(tc, l.tc, sizeof(tc));
+        const int offsetFrames = d.offsetFrames;
+        std::unique_lock<std::mutex> pub(publishM);
+        ++pins[0][s0];
+        ++pins[1][s1];
+        lk.unlock();
+        if (alive)
+            src->PublishPair(l.px, rt.px, /*fullRange=*/false, captureSec, tc[0] ? tc : nullptr, offsetFrames, pool);
+        pub.unlock();  // before m: the next publisher may be holding m while it waits for publishM
+        lk.lock();
+        --pins[0][s0];
+        --pins[1][s1];
+        lk.unlock();
+        pinCv.notify_all();
     }
 };
 
@@ -1155,8 +1189,9 @@ void DeckLinkSource::Worker() {
     }
 
     {
-        std::lock_guard<std::mutex> lk(cap.m);  // no callback is mid-publish or mid-restart...
-        cap.alive = false;                      // ...and none starts one from here on
+        std::lock_guard<std::mutex> lk(cap.m);          // no callback is mid-restart, no lane mid-pairing...
+        std::lock_guard<std::mutex> pk(cap.publishM);   // ...or mid-publish (a pair composes without m)...
+        cap.alive = false;                              // ...and none starts one from here on
     }
     for (int e = 0; e < 2; ++e) {
         if (inputs[e]) {

@@ -4,8 +4,10 @@
 // every raw format (UYVY, v210, BGRA, r210) converted on 1, 2, 3 and 7 threads equals the
 // one-pass convert bit for bit, at 4K, HD and odd sizes, for one eye and for a dual-stream
 // input's two eyes converted together into one side-by-side frame; the band split keeps
-// 4:2:0 chroma rows whole; the pool runs every band once; the default thread counts. Then a
-// 4K v210 timing, 1 vs N threads, which is printed and never fails (machines vary).
+// 4:2:0 chroma rows whole; the pool runs every band once; the ring publish in row bands (a
+// two-input pair composed side by side, one frame as it is) equals the one-pass copy; the
+// default thread counts. Then a 4K v210 timing and a 4K pair's compose, 1 vs N threads,
+// which are printed and never fail (machines vary).
 // Pure: no SDK, no card, no GPU.
 
 #include "pro/ConvertPool.h"
@@ -255,6 +257,88 @@ void DualStreamEqualsOnePass(std::vector<std::unique_ptr<ConvertPool>>& pools) {
     CHECK(Same(d, ref), "dual-stream: a right eye too wide for the frame is skipped, as one pass skips it");
 }
 
+// A P016 frame w x h of random samples.
+P016 RandomP016(int w, int h, uint32_t seed) {
+    P016 p;
+    p.Resize(w, h);
+    for (uint16_t& s : p.y) {
+        seed = seed * 1664525u + 1013904223u;
+        s = (uint16_t)(seed >> 16);
+    }
+    for (uint16_t& s : p.uv) {
+        seed = seed * 1664525u + 1013904223u;
+        s = (uint16_t)(seed >> 16);
+    }
+    return p;
+}
+
+// The ring publish: two eyes side by side (two-input stereo) and one frame as it is, in row
+// bands == the one-pass loop LiveSourceBase used, bit for bit; nothing past the frame written.
+void PublishEqualsOnePass(std::vector<std::unique_ptr<ConvertPool>>& pools) {
+    struct Case {
+        int lw, lh, rw, rh;
+    };
+    // equal 4K eyes; HD; odd widths; eyes of different sizes (the smaller one is used);
+    // an odd height (the last row is dropped); a 2-row frame (one band)
+    const Case cases[] = {{3840, 2160, 3840, 2160}, {1920, 1080, 1920, 1080}, {1283, 723, 1283, 723},
+                          {1290, 722, 1282, 730},   {641, 131, 643, 129},     {7, 2, 9, 3}};
+    for (const Case& c : cases) {
+        const P016 l = RandomP016(c.lw, c.lh, 21u + (uint32_t)c.lw), r = RandomP016(c.rw, c.rh, 22u + (uint32_t)c.rw);
+        const int cw = std::min(c.lw, c.rw), ch = std::min(c.lh, c.rh) & ~1, w = 2 * cw;
+        const size_t ys = (size_t)w * ch, uvs = (size_t)w * (ch / 2);
+        // reference: LiveSourceBase::PublishPair's loop before the bands; 8 guard samples after each plane
+        std::vector<uint16_t> refY(ys + 8, 0x5A5A), refUv(uvs + 8, 0x5A5A);
+        for (int row = 0; row < ch; ++row) {
+            std::memcpy(refY.data() + (size_t)row * w, l.y.data() + (size_t)row * l.width, (size_t)cw * 2);
+            std::memcpy(refY.data() + (size_t)row * w + cw, r.y.data() + (size_t)row * r.width, (size_t)cw * 2);
+        }
+        for (int row = 0; row < ch / 2; ++row) {
+            std::memcpy(refUv.data() + (size_t)row * w, l.uv.data() + (size_t)row * l.width, (size_t)cw * 2);
+            std::memcpy(refUv.data() + (size_t)row * w + cw, r.uv.data() + (size_t)row * r.width, (size_t)cw * 2);
+        }
+        bool ok = true;
+        std::vector<uint16_t> y(ys + 8), uv(uvs + 8);
+        auto run = [&](ConvertPool* pool) {
+            std::fill(y.begin(), y.end(), (uint16_t)0x5A5A);
+            std::fill(uv.begin(), uv.end(), (uint16_t)0x5A5A);
+            mp::livepix::ComposePairBanded(pool, l, r, cw, ch, y.data(), uv.data());
+            ok = ok && y == refY && uv == refUv;
+        };
+        run(nullptr);
+        for (const auto& pool : pools) run(pool.get());
+        char msg[160];
+        std::snprintf(msg, sizeof(msg), "pair %dx%d + %dx%d side by side: banded on 1/2/3/7 threads == one pass", c.lw,
+                      c.lh, c.rw, c.rh);
+        CHECK(ok, msg);
+
+        // one frame as it is (Publish): the left eye's planes
+        bool same = true;
+        std::vector<uint16_t> fy(l.y.size() + 8), fuv(l.uv.size() + 8);
+        std::vector<uint16_t> wantY(l.y), wantUv(l.uv);
+        wantY.resize(fy.size(), 0x5A5A);
+        wantUv.resize(fuv.size(), 0x5A5A);
+        auto runOne = [&](ConvertPool* pool) {
+            std::fill(fy.begin(), fy.end(), (uint16_t)0x5A5A);
+            std::fill(fuv.begin(), fuv.end(), (uint16_t)0x5A5A);
+            mp::livepix::CopyFrameBanded(pool, l, fy.data(), fuv.data());
+            same = same && fy == wantY && fuv == wantUv;
+        };
+        runOne(nullptr);
+        for (const auto& pool : pools) runOne(pool.get());
+        std::snprintf(msg, sizeof(msg), "frame %dx%d: copied in bands on 1/2/3/7 threads == the planes", c.lw, c.lh);
+        CHECK(same, msg);
+    }
+    // a frame whose planes do not match its size (not Resize()d) is still copied as it is
+    P016 odd;
+    odd.width = 4;
+    odd.height = 4;
+    odd.y.assign(10, 7);
+    odd.uv.assign(3, 9);
+    std::vector<uint16_t> oy(10, 0), ouv(3, 0);
+    mp::livepix::CopyFrameBanded(pools.back().get(), odd, oy.data(), ouv.data());
+    CHECK(oy == odd.y && ouv == odd.uv, "a frame not Resize()d: its planes copied as they are");
+}
+
 void ThreadCounts() {
     using mp::livepix::ConvertThreads;
     // two inputs (Pair): one eye each
@@ -328,6 +412,19 @@ void Timing() {
                     dualOne > 0 ? dualOne / ms : 1.0, t == dualDef && t > 1 ? "  <- default, one dual-stream input" : "");
         if (dualDef == 1) break;
     }
+    // The two-input pair composed side by side into the ring (PublishPair, ~50 MB).
+    const P016 le = RandomP016(w, h, 31u), re = RandomP016(w, h, 32u);
+    std::vector<uint16_t> py((size_t)2 * w * h), puv((size_t)2 * w * (h / 2));
+    double pairOne = 0.0;
+    for (int t : {1, def}) {
+        ConvertPool pool(t);
+        const double ms =
+            MedianMs([&] { mp::livepix::ComposePairBanded(&pool, le, re, w, h, py.data(), puv.data()); }, 15);
+        if (t == 1) pairOne = ms;
+        std::printf("    pair compose 7680x2160, %2d thread(s): %6.2f ms  (x%.1f)%s\n", t, ms,
+                    pairOne > 0 ? pairOne / ms : 1.0, t == def && t > 1 ? "  <- default per input" : "");
+        if (def == 1) break;
+    }
 }
 
 }  // namespace
@@ -340,6 +437,7 @@ int main() {
     for (int t : kThreads) pools.push_back(std::make_unique<ConvertPool>(t));
     BandedEqualsOnePass(pools);
     DualStreamEqualsOnePass(pools);
+    PublishEqualsOnePass(pools);
     ThreadCounts();
     Timing();
     if (g_failures) {
