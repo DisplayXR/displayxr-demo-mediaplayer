@@ -44,6 +44,7 @@ public:
     // createDeleteRequest needs Android 11.
     bool CanDelete() const override;
     void Delete(const std::vector<int64_t>& ids) override;
+    void Haptic() override;
 
     // The player's NeighbourStills (render thread). The stills wanted (the files either side
     // of the one playing), each video frame to fit in maxEdge x maxEdge. Replaces the previous
@@ -60,6 +61,7 @@ public:
     bool TakeWantedThumbnails(std::vector<ThumbnailRequest>& wanted);
     bool TakeOpenRequest(int64_t& id);
     bool TakeDeleteRequest(std::vector<int64_t>& ids);
+    bool TakeHapticRequest();
     void AddStill(StillSource still);
     bool TakeWantedStills(std::vector<int64_t>& ids, uint32_t& maxEdge);
 
@@ -78,6 +80,7 @@ private:
     bool openRequested_ = false;
     int64_t openId_ = 0;
     std::vector<int64_t> deleteIds_;  // empty: no request
+    bool hapticRequested_ = false;
     bool stillsChanged_ = false;
     std::vector<int64_t> stillIds_;
     uint32_t stillEdge_ = 0;

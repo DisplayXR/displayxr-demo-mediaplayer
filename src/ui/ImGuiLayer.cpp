@@ -271,6 +271,30 @@ void ImGuiLayer::AddUiFont() {
     ui::g_switchFont = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(
         (void*)kUiFontTtf, (int)sizeof(kUiFontTtf), ui::SwitchFontPx(metricScale_), &fontCfg,
         kSwitchGlyphs);
+    // The touch type scale (#180). Not on desktop: its atlas, and so every pixel, stays as
+    // it was, and the null fonts mean the UI font.
+    ui::g_titleFont = ui::g_rowFont = ui::g_smallFont = nullptr;
+    if (metricScale_ > 1.0f) {
+        auto add = [&](ui::TextStyle style) {
+            return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(
+                (void*)kUiFontTtf, (int)sizeof(kUiFontTtf), ui::TextStylePx(style, metricScale_),
+                &fontCfg, kGlyphs);
+        };
+        ui::g_titleFont = add(ui::TextStyle::Title);
+        ui::g_rowFont = add(ui::TextStyle::Row);
+        ui::g_smallFont = add(ui::TextStyle::Small);
+    }
+}
+
+void ImGuiLayer::SetFontScale(float scale) {
+    if (!(scale > 0.0f) || scale == ui::g_fontScale) return;
+    ui::g_fontScale = scale;
+    if (!ready_) return;  // Init builds the fonts at this scale
+    vkDeviceWaitIdle(device_);  // rare: idle rather than track the old font texture's frames
+    ImGui_ImplVulkan_DestroyFontsTexture();
+    ImGui::GetIO().Fonts->Clear();
+    AddUiFont();
+    ImGui_ImplVulkan_CreateFontsTexture();
 }
 
 void ImGuiLayer::SetUiScale(float scale) {
@@ -892,6 +916,7 @@ void ImGuiLayer::PushPointer(int, float, float) {}
 void ImGuiLayer::ProcessEvent(const void*) {}
 void ImGuiLayer::BeginFrame(float, float, float, float, float, float) {}
 void ImGuiLayer::SetUiScale(float) {}
+void ImGuiLayer::SetFontScale(float) {}
 void ImGuiLayer::RenderToHud(uint32_t, VkCommandBuffer) {}
 bool ImGuiLayer::WantCaptureMouse() const { return false; }
 void ImGuiLayer::SetCursorLocked(bool) {}

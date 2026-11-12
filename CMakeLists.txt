@@ -307,6 +307,8 @@ function(mp_add_player tgt is_pro)
         # split a TU here, mirror it into android/src/main/cpp/CMakeLists.txt — that list
         # is hand-curated and desktop CI cannot catch the resulting Android link error.
         src/ui/TransportUI.cpp
+        src/ui/Icons.cpp  # every icon the chrome draws, shared with the browser (#180)
+        src/ui/UiText.cpp  # fitting and wrapping text (#180)
         src/media/FrameRing.h  # header-only triple buffer
         ${MP_IMGUI_SOURCES}
     )
@@ -791,6 +793,12 @@ if(MP_BUILD_TESTS)
     target_include_directories(touch_scroller_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME touch_scroller COMMAND touch_scroller_test)
 
+    # The browser's layout (#180): columns by width, rail or drawer, date sections, the
+    # sectioned grid. Pure.
+    add_executable(browser_layout_test tests/browser_layout_test.cpp src/browser/BrowserLayout.cpp)
+    target_include_directories(browser_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME browser_layout COMMAND browser_layout_test)
+
     # Media browser (#160): swiping to the next or previous file in the player. Pure.
     add_executable(slide_gesture_test tests/slide_gesture_test.cpp src/browser/SlideGesture.cpp)
     target_include_directories(slide_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -806,6 +814,11 @@ if(MP_BUILD_TESTS)
     add_executable(tap_handler_test tests/tap_handler_test.cpp src/ui/TapHandler.cpp)
     target_include_directories(tap_handler_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME tap_handler COMMAND tap_handler_test)
+
+    # The Android player's zoom on a still (#180): pinch, double tap, pan. Pure.
+    add_executable(zoom_gesture_test tests/zoom_gesture_test.cpp src/ui/ZoomGesture.cpp)
+    target_include_directories(zoom_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME zoom_gesture COMMAND zoom_gesture_test)
 
     # Live frames: FrameRing queue mode (one frame per refresh, clock drift costs single
     # drops/repeats instead of bursts). Header-only, pure.

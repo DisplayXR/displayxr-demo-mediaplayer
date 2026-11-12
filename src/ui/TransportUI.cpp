@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ui/TransportUI.h"
+#include "ui/Icons.h"
 #include "ui/UiScale.h"
+#include "ui/UiText.h"
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include <algorithm>
@@ -42,9 +44,9 @@ void TickTransportUI(TransportState& s, double dt, bool uiAwake) {
     if (!toastLive && s.toastAlpha <= 0.001f) s.toastText.clear();
 }
 
-void ShowTransportToast(TransportState& s, std::string msg) {
+void ShowTransportToast(TransportState& s, std::string msg, double seconds) {
     s.toastText = std::move(msg);
-    s.toastSecondsLeft = kToastSeconds;
+    s.toastSecondsLeft = seconds > 0.0 ? seconds : kToastSeconds;
 }
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
@@ -100,23 +102,35 @@ float UiFontPx(float k) {
     // Touch is bigger for arm's-length tablet viewing: 30 is 40 px on the 320 dpi NP02J,
     // 16 is 40 px at Windows' 250%. Rounded up to a whole pixel; the epsilon keeps float
     // error (320 / 240 = 1.3333334f) from pushing a whole size to the next one.
-    return std::ceil((k > 1.0f ? 30.0f : 16.0f) * g_uiScale - 0.001f);
+    return std::ceil((k > 1.0f ? 30.0f : 16.0f) * g_uiScale * g_fontScale - 0.001f);
 }
 
 float SwitchFontPx(float k) { return std::ceil(UiFontPx(k) * 1.2f - 0.001f); }
 
-namespace {
-constexpr float kPi = 3.14159265358979f;  // IM_PI lives in imgui_internal.h; keep our own
-enum class Icon { Play, Pause, Loop, Slideshow, Speaker, SpeakerMuted, Gallery };
+float TextStylePx(TextStyle style, float k) {
+    if (!(k > 1.0f)) return UiFontPx(k);  // desktop: one size, as before
+    const float dp = style == TextStyle::Title ? 22.0f : style == TextStyle::Row ? 18.0f : 14.0f;
+    return std::ceil(Dp(dp) * g_fontScale - 0.001f);
+}
 
+ImFont* StyleFont(TextStyle style) {
+    switch (style) {
+        case TextStyle::Title: return g_titleFont;
+        case TextStyle::Row: return g_rowFont;
+        case TextStyle::Small: return g_smallFont;
+    }
+    return nullptr;
+}
+
+namespace {
 // A borderless icon button: an invisible hit-target with a hand-drawn glyph centered
-// in it (no icon font needed). `active` tints it with the accent color (toggle-on);
-// hover brightens. Returns true on click. Glyph colors go through GetColorU32 so the
-// surrounding ImGui Alpha (the auto-hide fade) applies for free.
+// in it (ui/Icons.h, no icon font needed). `active` tints it with the accent color
+// (toggle-on); hover brightens. Returns true on click. Glyph colors go through
+// GetColorU32 so the surrounding ImGui Alpha (the auto-hide fade) applies for free.
 //
 // `hitScale` grows the invisible hit target WITHOUT changing the drawn glyph, so a
 // touch leg gets finger-sized targets while looking identical to the desktop.
-bool IconButton(const char* id, Icon kind, float size, bool active = false,
+bool IconButton(const char* id, Glyph kind, float size, bool active = false,
                 float hitScale = 1.0f) {
     const float hit = size * (hitScale > 1.0f ? hitScale : 1.0f);
     const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -135,83 +149,7 @@ bool IconButton(const char* id, Icon kind, float size, bool active = false,
     if (held) col = active ? ImVec4(0.55f, 0.85f, 1.00f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
     else if (hovered) col = active ? ImVec4(0.42f, 0.78f, 1.00f, 1.0f)
                                    : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
-    const ImU32 u = ImGui::GetColorU32(col);
-    const float r = size * 0.30f;
-    const float th = size * 0.11f;
-
-    switch (kind) {
-        case Icon::Play: {
-            const float h = size * 0.30f;
-            dl->AddTriangleFilled(ImVec2(c.x - h * 0.7f, c.y - h),
-                                  ImVec2(c.x - h * 0.7f, c.y + h),
-                                  ImVec2(c.x + h, c.y), u);
-            break;
-        }
-        case Icon::Pause: {
-            const float bw = size * 0.13f, bh = size * 0.30f, gap = size * 0.10f;
-            dl->AddRectFilled(ImVec2(c.x - gap - bw, c.y - bh), ImVec2(c.x - gap, c.y + bh), u,
-                              th * 0.4f);
-            dl->AddRectFilled(ImVec2(c.x + gap, c.y - bh), ImVec2(c.x + gap + bw, c.y + bh), u,
-                              th * 0.4f);
-            break;
-        }
-        case Icon::Loop: {
-            // Two arcs forming a near-circle, with a small arrowhead at each open end.
-            dl->PathArcTo(c, r, kPi * 0.30f, kPi * 0.95f);
-            dl->PathStroke(u, 0, th);
-            dl->PathArcTo(c, r, kPi * 1.30f, kPi * 1.95f);
-            dl->PathStroke(u, 0, th);
-            const float ah = size * 0.13f;
-            const ImVec2 e1(c.x + r * std::cos(kPi * 0.95f), c.y + r * std::sin(kPi * 0.95f));
-            dl->AddTriangleFilled(ImVec2(e1.x - ah, e1.y), ImVec2(e1.x + ah * 0.4f, e1.y - ah),
-                                  ImVec2(e1.x + ah * 0.4f, e1.y + ah), u);
-            const ImVec2 e2(c.x + r * std::cos(kPi * 1.95f), c.y + r * std::sin(kPi * 1.95f));
-            dl->AddTriangleFilled(ImVec2(e2.x + ah, e2.y), ImVec2(e2.x - ah * 0.4f, e2.y - ah),
-                                  ImVec2(e2.x - ah * 0.4f, e2.y + ah), u);
-            break;
-        }
-        case Icon::Slideshow: {
-            // A photo frame with a small play triangle inside (auto-advancing stills).
-            dl->AddRect(ImVec2(c.x - r, c.y - r * 0.78f), ImVec2(c.x + r, c.y + r * 0.78f), u,
-                        size * 0.10f, 0, th * 0.8f);
-            const float h = size * 0.16f;
-            dl->AddTriangleFilled(ImVec2(c.x - h * 0.5f, c.y - h), ImVec2(c.x - h * 0.5f, c.y + h),
-                                  ImVec2(c.x + h, c.y), u);
-            break;
-        }
-        case Icon::Speaker:
-        case Icon::SpeakerMuted: {
-            // Body box + cone (triangle pointing right).
-            const float bx = -r * 0.35f;
-            dl->AddRectFilled(ImVec2(c.x - r * 0.95f, c.y - r * 0.30f),
-                              ImVec2(c.x + bx, c.y + r * 0.30f), u);
-            dl->AddTriangleFilled(ImVec2(c.x + bx, c.y - r * 0.62f),
-                                  ImVec2(c.x + bx, c.y + r * 0.62f), ImVec2(c.x + r * 0.25f, c.y), u);
-            if (kind == Icon::Speaker) {  // two sound-wave arcs
-                dl->PathArcTo(ImVec2(c.x + r * 0.1f, c.y), r * 0.58f, -kPi * 0.28f, kPi * 0.28f);
-                dl->PathStroke(u, 0, th * 0.7f);
-                dl->PathArcTo(ImVec2(c.x + r * 0.1f, c.y), r * 0.92f, -kPi * 0.28f, kPi * 0.28f);
-                dl->PathStroke(u, 0, th * 0.7f);
-            } else {                      // muted: a small X
-                const float xc = c.x + r * 0.72f, d = r * 0.26f;
-                dl->AddLine(ImVec2(xc - d, c.y - d), ImVec2(xc + d, c.y + d), u, th * 0.9f);
-                dl->AddLine(ImVec2(xc - d, c.y + d), ImVec2(xc + d, c.y - d), u, th * 0.9f);
-            }
-            break;
-        }
-        case Icon::Gallery: {
-            // A 3x3 grid of tiles, corners on whole pixels so the small gaps stay sharp.
-            const float cell = r * 2.0f / 3.0f, half = cell * 0.36f;
-            for (int j = -1; j <= 1; ++j)
-                for (int i = -1; i <= 1; ++i) {
-                    const ImVec2 m(c.x + i * cell, c.y + j * cell);
-                    dl->AddRectFilled(ImVec2(std::round(m.x - half), std::round(m.y - half)),
-                                      ImVec2(std::round(m.x + half), std::round(m.y + half)), u,
-                                      size * 0.02f);
-                }
-            break;
-        }
-    }
+    DrawGlyph(dl, kind, c, size, ImGui::GetColorU32(col));
     return ImGui::IsItemClicked();
 }
 
@@ -293,6 +231,45 @@ bool ScrubBar(const char* id, float* v, float vmax, float width, bool* outActive
 }
 
 void Fire(const std::function<void()>& fn) { if (fn) fn(); }
+
+// Track playback into the scrubber's knob, but not while dragging, and not while a seek we
+// issued is still landing — else it snaps back on release.
+void TrackScrubKnob(TransportState& s, float pos) {
+    if (!s.scrubActive) {
+        if (s.scrubTarget >= 0.0f) {
+            if (std::fabs(pos - s.scrubTarget) < 0.3f) s.scrubTarget = -1.0f;
+        } else {
+            s.scrubValue = pos;
+        }
+    }
+}
+
+// The scrubber at the cursor, `width` wide, and the seek machine behind it.
+void DriveScrub(TransportState& s, const TransportActions& a, float dur, float width) {
+    bool active = false;
+    const bool changed = ScrubBar("##scrub", &s.scrubValue, dur, width, &active);
+    const float scrubDelta = std::fabs(s.scrubValue - s.lastScrubValue);
+    if (changed) {
+        // Fast sweep -> keyframe preview (responsive); slow/fine drag -> exact
+        // frame (precise). Audio goes silent while scrubbing.
+        const bool fast = active && scrubDelta > kFastScrubSeconds;
+        if (a.Seek) a.Seek(s.scrubValue, fast);
+        s.scrubWasPreview = fast;
+        s.scrubTarget = s.scrubValue;  // hold the knob until the decode lands
+        if (active) Fire(a.ScrubHeld);
+    } else if (active && s.scrubWasPreview) {
+        // Settled after a fast sweep -> resolve to the exact frame.
+        if (a.Seek) a.Seek(s.scrubValue, false);
+        s.scrubWasPreview = false;
+    }
+    if (s.scrubActive && !active) {
+        // Released: settle on the exact frame and realign + resume audio.
+        if (a.ScrubReleased) a.ScrubReleased(s.scrubValue);
+        s.scrubWasPreview = false;
+    }
+    s.scrubActive = active;
+    s.lastScrubValue = s.scrubValue;
+}
 
 // The top bar's live-source picker: a combo next to Open. Live cameras (#90, refreshed
 // once each time it opens, so enumeration stays lazy) and the "Stream URL..." row
@@ -448,6 +425,250 @@ void StreamPill(const TransportState& s, const TransportActions& a) {
         dot = kDotAmber;
     StatusPill("##streampill", text, dot, s.streamStatus == "FROZEN", a);
 }
+
+// ---- The touch layout (#180) ----------------------------------------------------------
+
+constexpr float kScrimAlpha = 0.60f;  // the scrims' darkest, at the screen's edge
+constexpr float kScrimDp = 112.0f;    // how far they reach in from the system bar
+
+// A font's pixel size, the UI font's for null.
+float FontPx(ImFont* f) { return f ? f->FontSize : ImGui::GetFontSize(); }
+
+// The width of a time label in `font` that can never grow: `sample` with every digit as
+// the font's widest, so neither the label nor the scrubber beside it moves as it counts.
+float TimeSlotW(ImFont* font, const char* sample) {
+    ImFont* f = font ? font : ImGui::GetFont();
+    const float px = FontPx(font);
+    char wide = '0';
+    float wideW = 0.0f;
+    for (char d = '0'; d <= '9'; d++) {
+        const char ds[2] = {d, '\0'};
+        const float w = f->CalcTextSizeA(px, FLT_MAX, 0.0f, ds).x;
+        if (w > wideW) {
+            wideW = w;
+            wide = d;
+        }
+    }
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%s", sample);
+    for (char* p = buf; *p; p++)
+        if (*p >= '0' && *p <= '9') *p = wide;
+    return std::ceil(f->CalcTextSizeA(px, FLT_MAX, 0.0f, buf).x);
+}
+
+// `text` in `font` at `pos`, right-aligned in `slotW` when `right`.
+void TextAt(ImFont* font, ImVec2 pos, const char* text, ImU32 col, float slotW = 0.0f, bool right = false) {
+    ImFont* f = font ? font : ImGui::GetFont();
+    const float px = FontPx(font);
+    if (right) pos.x += slotW - f->CalcTextSizeA(px, FLT_MAX, 0.0f, text).x;
+    ImGui::GetWindowDrawList()->AddText(f, px, ImVec2(std::round(pos.x), std::round(pos.y)), col, text);
+}
+
+// The 2D/3D switch's width (SegmentSwitch).
+float SegmentSwitchW() {
+    ImFont* f = StyleFont(TextStyle::Row);
+    ImFont* font = f ? f : ImGui::GetFont();
+    const float seg = font->CalcTextSizeA(FontPx(f), FLT_MAX, 0.0f, "3D").x + Dp(28.0f);
+    return std::round(seg) * 2.0f;
+}
+
+// The touch layout's 2D/3D switch: a labelled two-segment control, "2D | 3D", the mode in
+// force filled with the accent. A dark fill and a light 2 dp outline make it read over a
+// dark picture and a light one alike. Drawn `h` tall in a `hitH` tall hit box at the
+// cursor. True when the other segment is tapped.
+bool SegmentSwitch(const char* id, bool on3D, float h, float hitH) {
+    const float w = SegmentSwitchW(), seg = w * 0.5f;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(w, hitH));
+    const bool tapped = ImGui::IsItemClicked();
+    const bool tapped3D = ImGui::GetIO().MouseClickedPos[0].x >= p.x + seg;
+    const bool held = ImGui::IsItemActive();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 a(p.x, std::round(p.y + (hitH - h) * 0.5f)), b(p.x + w, a.y + h);
+    const float r = h * 0.5f;
+    dl->AddRectFilled(a, b, ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, held ? 0.55f : 0.40f)), r);
+    const ImVec2 on0(on3D ? a.x + seg : a.x, a.y), on1(on3D ? b.x : a.x + seg, b.y);
+    dl->AddRectFilled(on0, on1, ImGui::GetColorU32(ImGuiCol_SliderGrab), r,
+                      on3D ? ImDrawFlags_RoundCornersRight : ImDrawFlags_RoundCornersLeft);
+    const float stroke = std::max(Px(2.0f), g_iconStroke);
+    dl->AddRect(a, b, ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.85f)), r, 0, stroke);
+
+    ImFont* f = StyleFont(TextStyle::Row);
+    ImFont* font = f ? f : ImGui::GetFont();
+    const float px = FontPx(f);
+    for (int i = 0; i < 2; ++i) {
+        const char* label = i ? "3D" : "2D";
+        const bool on = (i == 1) == on3D;
+        const ImVec2 ts = font->CalcTextSizeA(px, FLT_MAX, 0.0f, label);
+        const ImVec2 at(a.x + seg * (float)i + (seg - ts.x) * 0.5f, a.y + (h - ts.y) * 0.5f);
+        dl->AddText(font, px, ImVec2(std::round(at.x), std::round(at.y)),
+                    ImGui::GetColorU32(on ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : ImVec4(0.86f, 0.88f, 0.92f, 1.0f)),
+                    label);
+    }
+    return tapped && tapped3D != on3D;
+}
+
+// The info sheet (caps.info): what the file is, under the top bar at the right, on a
+// translucent panel rather than over the picture's middle. A tap outside closes it.
+void InfoSheet(TransportState& s, float W, float y, float edge) {
+    ImFont* rowFont = StyleFont(TextStyle::Row);
+    ImFont* smallFont = StyleFont(TextStyle::Small);
+    const float w = std::min(W - edge * 2.0f, Dp(320.0f));
+    ImGui::SetNextWindowPos(ImVec2(W - edge, y), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0.0f), ImGuiCond_Always);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.06f, 0.08f, 0.78f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Dp(16.0f), Dp(12.0f)));
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav;
+    if (ImGui::Begin("##info_sheet", nullptr, flags)) {
+        const float inner = w - Dp(32.0f);
+        for (size_t i = 0; i < s.info.size(); ++i) {
+            if (i > 0) ImGui::Dummy(ImVec2(0.0f, Dp(6.0f)));
+            ImGui::PushFont(smallFont);
+            ImGui::TextColored(ImVec4(0.72f, 0.76f, 0.82f, 1.0f), "%s", s.info[i].first.c_str());
+            ImGui::PopFont();
+            ImGui::PushFont(rowFont);
+            ImGui::TextUnformatted(FitText(s.info[i].second, inner).c_str());
+            ImGui::PopFont();
+        }
+        if (ImGui::IsMouseClicked(0) && !ImGui::IsWindowHovered() &&
+            !ImGui::IsAnyItemHovered())  // the (i) itself toggles it
+            s.infoOpen = false;
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
+
+// The touch player's chrome: scrims instead of slabs, the back arrow and the file's name
+// at the top left, the transport (or, for a still, the 2D/3D switch) at the bottom.
+//
+// 3D comfort: everything is drawn once into the HUD, which both views share, so it sits
+// flat at the screen plane. A gradient scrim instead of an opaque bar means no hard edge
+// cuts a flat plane across the picture's depth.
+void TouchChrome(TransportState& s, const TransportActions& a, float W, float H) {
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                                   ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground;
+    const float iconSz = ImGui::GetFrameHeight();
+    const float hit = iconSz * std::max(1.0f, s.hitTargetScale);
+    const float top = g_systemBarTop, bottom = H - g_systemBarBottom;
+    const float edge = std::round(Dp(8.0f));
+    const bool video = s.isVideo && s.durationSeconds > 0.0;
+    ImFont* titleFont = StyleFont(TextStyle::Title);
+    ImFont* smallFont = StyleFont(TextStyle::Small);
+    const ImU32 text = ImGui::GetColorU32(ImGuiCol_Text);
+    const ImU32 dim = ImGui::GetColorU32(ImVec4(0.80f, 0.83f, 0.88f, 1.0f));
+
+    // Scrims: darkest under the system bars, so their icons read, then fading out.
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
+    const ImU32 dark = ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, kScrimAlpha));
+    const ImU32 clear = ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    const float ramp = Dp(kScrimDp);
+    if (top > 0.0f) bg->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(W, top), dark);
+    bg->AddRectFilledMultiColor(ImVec2(0.0f, top), ImVec2(W, top + ramp), dark, dark, clear, clear);
+    if (video || s.caps.modeSwitch) {
+        bg->AddRectFilledMultiColor(ImVec2(0.0f, bottom - ramp), ImVec2(W, bottom), clear, clear, dark, dark);
+        if (bottom < H) bg->AddRectFilled(ImVec2(0.0f, bottom), ImVec2(W, H), dark);
+    }
+
+    // --- Top: back, then the name and its place in the list, left-aligned ---
+    ImGui::SetNextWindowPos(ImVec2(0.0f, top), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(edge, edge));
+    if (ImGui::Begin("##touch_top", nullptr, flags)) {
+        const ImVec2 row = ImGui::GetCursorScreenPos();
+        ImGui::BeginDisabled(s.openFilePending);
+        if (IconButton("##back", Glyph::Back, iconSz, false, s.hitTargetScale)) Fire(a.Open);
+        ImGui::EndDisabled();
+        const float x = row.x + hit + ImGui::GetStyle().ItemSpacing.x * 0.5f;
+        float right = W - edge;
+        if (s.caps.info) {
+            right -= hit + ImGui::GetStyle().ItemSpacing.x;
+            ImGui::SetCursorScreenPos(ImVec2(W - edge - hit, row.y));
+            if (IconButton("##info", Glyph::Info, iconSz, s.infoOpen, s.hitTargetScale)) s.infoOpen = !s.infoOpen;
+        } else {
+            s.infoOpen = false;
+        }
+        if (!s.mediaFilename.empty() && right > x) {
+            ImGui::PushFont(titleFont);
+            const std::string name = FitText(s.mediaFilename, right - x);
+            ImGui::PopFont();
+            const float titleH = FontPx(titleFont);
+            const float posH = s.mediaPosition.empty() ? 0.0f : FontPx(smallFont) + Dp(2.0f);
+            const float y = row.y + (hit - titleH - posH) * 0.5f;
+            TextAt(titleFont, ImVec2(x, y), name.c_str(), text);
+            if (posH > 0.0f) TextAt(smallFont, ImVec2(x, y + titleH + Dp(2.0f)), s.mediaPosition.c_str(), dim);
+        }
+    }
+    const float topBottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
+    ImGui::End();
+    if (s.infoOpen) InfoSheet(s, W, topBottom, edge);
+
+    // --- Bottom: the transport for a video, the 2D/3D switch docked at its end ---
+    const float switchH = std::round(iconSz * 0.82f);
+    if (video) {
+        ImGui::SetNextWindowPos(ImVec2(0.0f, bottom), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+        ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
+        if (ImGui::Begin("##touch_transport", nullptr, flags)) {
+            if (s.fadeAlpha > 0.01f) g_transportTop = ImGui::GetWindowPos().y;
+            const float dur = (float)s.durationSeconds;
+            TrackScrubKnob(s, (float)s.positionSeconds);
+            auto mmss = [](double sec, char* out, size_t n) {
+                if (sec < 0.0) sec = 0.0;
+                const int t = (int)sec;
+                if (t >= 3600)
+                    std::snprintf(out, n, "%d:%02d:%02d", t / 3600, t / 60 % 60, t % 60);
+                else
+                    std::snprintf(out, n, "%d:%02d", t / 60, t % 60);
+            };
+            char cur[16], tot[16];
+            mmss(s.scrubValue, cur, sizeof(cur));
+            mmss(dur, tot, sizeof(tot));
+            const ImGuiStyle& st = ImGui::GetStyle();
+            const ImVec2 row = ImGui::GetCursorScreenPos();
+            if (IconButton("##playpause", s.paused ? Glyph::Play : Glyph::Pause, iconSz, false, s.hitTargetScale))
+                Fire(a.TogglePlayback);
+            if (s.caps.skip) {
+                ImGui::SameLine();
+                if (IconButton("##skipback", Glyph::SkipBack, iconSz, false, s.hitTargetScale) && a.Skip)
+                    a.Skip(-10.0f);
+                ImGui::SameLine();
+                if (IconButton("##skipfwd", Glyph::SkipForward, iconSz, false, s.hitTargetScale) && a.Skip)
+                    a.Skip(10.0f);
+            }
+            const float slot = TimeSlotW(smallFont, tot);
+            const float textY = row.y + (hit - FontPx(smallFont)) * 0.5f;
+            ImGui::SameLine();
+            float x = ImGui::GetCursorScreenPos().x;
+            TextAt(smallFont, ImVec2(x, textY), cur, text, slot, true);
+            x += slot + st.ItemSpacing.x;
+            const float switchW = s.caps.modeSwitch ? SegmentSwitchW() + st.ItemSpacing.x : 0.0f;
+            const float scrubW = W - edge - switchW - slot - st.ItemSpacing.x * 2.0f - x;
+            ImGui::SetCursorScreenPos(ImVec2(x, row.y + (hit - ImGui::GetFrameHeight()) * 0.5f));
+            DriveScrub(s, a, dur, scrubW);
+            x += std::max(Px(8.0f), scrubW) + st.ItemSpacing.x;
+            TextAt(smallFont, ImVec2(x, textY), tot, text);
+            x += slot + st.ItemSpacing.x;
+            if (s.caps.modeSwitch) {
+                ImGui::SetCursorScreenPos(ImVec2(x, row.y));
+                if (SegmentSwitch("##mode3d", s.mode3D, switchH, hit)) Fire(a.NextMode);
+            }
+            ImGui::SetCursorScreenPos(ImVec2(row.x, row.y + hit));
+            ImGui::Dummy(ImVec2(0.0f, 0.0f));
+        }
+        ImGui::End();
+    } else if (s.caps.modeSwitch) {
+        // A still: the switch alone, bottom right.
+        ImGui::SetNextWindowPos(ImVec2(W, bottom), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+        if (ImGui::Begin("##touch_modeswitch", nullptr, flags | ImGuiWindowFlags_AlwaysAutoResize) &&
+            SegmentSwitch("##mode3d", s.mode3D, switchH, hit))
+            Fire(a.NextMode);
+        ImGui::End();
+    }
+    ImGui::PopStyleVar();
+}
 }  // namespace
 
 void BuildTransportUI(TransportState& s, const TransportActions& a) {
@@ -460,7 +681,11 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                                   ImGuiWindowFlags_AlwaysAutoResize;
 
     // The bars fade in/out together with the idle timer.
-    if (s.fadeAlpha > 0.001f) {
+    if (s.fadeAlpha > 0.001f && s.caps.touchLayout) {
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s.fadeAlpha);
+        TouchChrome(s, a, W, H);
+        ImGui::PopStyleVar();
+    } else if (s.fadeAlpha > 0.001f) {
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s.fadeAlpha);
         const float iconSz = ImGui::GetFrameHeight();
         const float barBottom = H - g_systemBarBottom;
@@ -481,7 +706,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);  // flat bar, flush to edges
         if (!s.stripOnly && ImGui::Begin("##wsui_top", nullptr, topbar)) {
             ImGui::BeginDisabled(s.openFilePending);
-            if (s.caps.gallery ? IconButton("##gallery", Icon::Gallery, iconSz)
+            if (s.caps.gallery ? IconButton("##gallery", Glyph::Back, iconSz)
                                : ImGui::Button("Open"))
                 Fire(a.Open);
             ImGui::EndDisabled();
@@ -636,7 +861,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             if (s.caps.slideshow) {
                 ImGui::SameLine(ImGui::GetWindowWidth() - iconSz -
                                 ImGui::GetStyle().WindowPadding.x);
-                if (IconButton("##slideshow", Icon::Slideshow, iconSz, s.slideshowActive,
+                if (IconButton("##slideshow", Glyph::Slideshow, iconSz, s.slideshowActive,
                                s.hitTargetScale))
                     Fire(a.ToggleSlideshow);
             }
@@ -667,15 +892,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 if (s.fadeAlpha > 0.01f) g_transportTop = ImGui::GetWindowPos().y;
                 const float dur = (float)s.durationSeconds;
                 const float pos = (float)s.positionSeconds;
-                // Track playback into the knob, but not while dragging, and not while a
-                // seek we issued is still landing — else it snaps back on release.
-                if (!s.scrubActive) {
-                    if (s.scrubTarget >= 0.0f) {
-                        if (std::fabs(pos - s.scrubTarget) < 0.3f) s.scrubTarget = -1.0f;
-                    } else {
-                        s.scrubValue = pos;
-                    }
-                }
+                TrackScrubKnob(s, pos);
                 auto mmss = [](double sec, char* out, size_t n) {
                     if (sec < 0.0) sec = 0.0;
                     const int t = (int)sec;
@@ -689,7 +906,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     std::snprintf(frm, sizeof(frm), "f %lld",
                                   (long long)std::llround(s.scrubValue * s.frameRate));
 
-                if (IconButton("##playpause", s.paused ? Icon::Play : Icon::Pause, iconSz, false,
+                if (IconButton("##playpause", s.paused ? Glyph::Play : Glyph::Pause, iconSz, false,
                                s.hitTargetScale))
                     Fire(a.TogglePlayback);
                 // A touch leg's icon hit boxes are taller than a frame: drop the frame-high
@@ -756,43 +973,20 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                                      (float)rightIcons * (iconSz * s.hitTargetScale) +
                                      (float)(rightIcons + 2) * st.ItemSpacing.x +
                                      st.WindowPadding.x + panelsW;
-                bool active = false;
-                const bool changed = ScrubBar("##scrub", &s.scrubValue, dur,
-                                              ImGui::GetContentRegionAvail().x - rightW, &active);
-                const float scrubDelta = std::fabs(s.scrubValue - s.lastScrubValue);
-                if (changed) {
-                    // Fast sweep -> keyframe preview (responsive); slow/fine drag -> exact
-                    // frame (precise). Audio goes silent while scrubbing.
-                    const bool fast = active && scrubDelta > kFastScrubSeconds;
-                    if (a.Seek) a.Seek(s.scrubValue, fast);
-                    s.scrubWasPreview = fast;
-                    s.scrubTarget = s.scrubValue;  // hold the knob until the decode lands
-                    if (active) Fire(a.ScrubHeld);
-                } else if (active && s.scrubWasPreview) {
-                    // Settled after a fast sweep -> resolve to the exact frame.
-                    if (a.Seek) a.Seek(s.scrubValue, false);
-                    s.scrubWasPreview = false;
-                }
-                if (s.scrubActive && !active) {
-                    // Released: settle on the exact frame and realign + resume audio.
-                    if (a.ScrubReleased) a.ScrubReleased(s.scrubValue);
-                    s.scrubWasPreview = false;
-                }
-                s.scrubActive = active;
-                s.lastScrubValue = s.scrubValue;
+                DriveScrub(s, a, dur, ImGui::GetContentRegionAvail().x - rightW);
                 ImGui::SameLine();
                 ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
                 ImGui::AlignTextToFramePadding();
                 ImGui::Text("%s", tot);
                 if (s.caps.mute) {
                     ImGui::SameLine();
-                    if (IconButton("##mute", s.muted ? Icon::SpeakerMuted : Icon::Speaker, iconSz,
+                    if (IconButton("##mute", s.muted ? Glyph::SpeakerMuted : Glyph::Speaker, iconSz,
                                    s.muted, s.hitTargetScale))
                         Fire(a.ToggleMute);
                 }
                 if (s.caps.loop) {
                     ImGui::SameLine();
-                    if (IconButton("##loop", Icon::Loop, iconSz, s.loop, s.hitTargetScale))
+                    if (IconButton("##loop", Glyph::Loop, iconSz, s.loop, s.hitTargetScale))
                         Fire(a.ToggleLoop);
                 }
                 if (s.panelsButton) {
@@ -822,15 +1016,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
     if (s.caps.url) UrlPopup(s, a);
 
     // --- Toast (convergence readout, nav filename): own alpha, shows even when hidden ---
-    if (s.toastAlpha > 0.001f && !s.toastText.empty()) {
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s.toastAlpha);
-        ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.14f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-        if (ImGui::Begin("##toast", nullptr, pill)) {
-            ImGui::TextUnformatted(s.toastText.c_str());
-        }
-        ImGui::End();
-        ImGui::PopStyleVar();
-    }
+    BuildTransportToast(s);
 
     // --- Slideshow dip-to-black: a full-canvas overlay above everything. Because the
     //     HUD layer composites on top of the content layer, this dims the whole view. ---
@@ -841,10 +1027,40 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
     }
 }
 
+void BuildTransportToast(const TransportState& s) {
+    if (!(s.toastAlpha > 0.001f) || s.toastText.empty()) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    const ImGuiWindowFlags pill = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                                  ImGuiWindowFlags_NoBringToFrontOnFocus |
+                                  ImGuiWindowFlags_AlwaysAutoResize;
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s.toastAlpha);
+    if (s.caps.touchLayout) {
+        // Touch: low on the screen, above the transport, clear of the picture's middle, and
+        // cut to the screen's width.
+        const float margin = Dp(16.0f);
+        ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H - g_systemBarBottom - Dp(96.0f)), ImGuiCond_Always,
+                                ImVec2(0.5f, 1.0f));
+        if (ImGui::Begin("##toast", nullptr, pill)) {
+            const float pad = ImGui::GetStyle().WindowPadding.x * 2.0f;
+            ImGui::TextUnformatted(FitText(s.toastText, W - margin * 2.0f - pad).c_str());
+        }
+    } else {
+        ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.14f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        if (ImGui::Begin("##toast", nullptr, pill)) {
+            ImGui::TextUnformatted(s.toastText.c_str());
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 #else  // !MEDIAPLAYER_WITH_IMGUI
 
 void ApplyMediaPlayerStyle(float) {}
 void BuildTransportUI(TransportState&, const TransportActions&) {}
+void BuildTransportToast(const TransportState&) {}
 
 #endif
 
