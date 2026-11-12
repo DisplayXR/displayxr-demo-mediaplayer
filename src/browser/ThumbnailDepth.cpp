@@ -31,7 +31,8 @@ void ThumbnailDepth::Shutdown() {
     order_.clear();
 }
 
-void ThumbnailDepth::Measure(int64_t id, const uint8_t* rgba, uint32_t w, uint32_t h, StereoLayout layout) {
+void ThumbnailDepth::Measure(int64_t id, const uint8_t* rgba, uint32_t w, uint32_t h, StereoLayout layout,
+                             float cropFrac) {
     if (!worker_.joinable() || !rgba || w == 0 || h == 0 || !Packed(layout) || asked_.count(id)) return;
     asked_[id] = true;
     order_.push_back(id);
@@ -45,6 +46,7 @@ void ThumbnailDepth::Measure(int64_t id, const uint8_t* rgba, uint32_t w, uint32
     job.w = w;
     job.h = h;
     job.layout = layout;
+    job.cropFrac = cropFrac;
     job.rgba.assign(rgba, rgba + (size_t)w * h * 4);
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -92,6 +94,7 @@ void ThumbnailDepth::Work() {
         autoconv::StillLuma(job.rgba.data(), (int)job.w, (int)job.h, luma, lw, lh);
         Done done;
         done.id = job.id;
+        done.estimate.cropFrac = job.cropFrac;
         if (!luma.empty()) {
             // A fresh estimator per thumbnail: its tracker and median hold belong to a feed.
             autoconv::DisparityEstimator estimator;

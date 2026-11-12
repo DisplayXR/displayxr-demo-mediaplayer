@@ -276,20 +276,24 @@ StereoGridRenderer::draw(VkCommandBuffer cmd, VkImage image, uint32_t atlasW, ui
 	// one instanced draw per page and view. Instances: every tile's left crop, then every
 	// tile's right crop, each half in that order.
 	const uint32_t n = (uint32_t)std::min<size_t>(frame.tiles.size(), kMaxTiles);
-	std::vector<uint32_t> order(n);
-	for (uint32_t i = 0; i < n; ++i) order[i] = i;
-	std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-		return frame.tiles[a].texture < frame.tiles[b].texture;
-	});
+	// Per eye: the tiles ordered by the page that eye samples.
+	std::vector<uint32_t> order[2];
+	for (uint32_t eye = 0; eye < 2; ++eye) {
+		order[eye].resize(n);
+		for (uint32_t i = 0; i < n; ++i) order[eye][i] = i;
+		std::stable_sort(order[eye].begin(), order[eye].end(), [&](uint32_t a, uint32_t b) {
+			return frame.tiles[a].texture[eye] < frame.tiles[b].texture[eye];
+		});
+	}
 	Buffer &buf = buffers_[nextBuffer_];
 	nextBuffer_ = (nextBuffer_ + 1) % bufferCount_;
 	for (uint32_t eye = 0; eye < 2; ++eye) {
 		for (uint32_t k = 0; k < n; ++k) {
-			const StereoTile &t = frame.tiles[order[k]];
+			const StereoTile &t = frame.tiles[order[eye][k]];
 			Instance &inst = buf.mapped[eye * n + k];
 			UvRect q;
 			if (!ViewQuad(t.x0, t.y0, t.x1, t.y1, frame.hudW, frame.hudH, q)) q = UvRect{0.0f, 0.0f, 0.0f, 0.0f};
-			const UvRect &uv = eye ? t.right : t.left;
+			const UvRect &uv = t.uv[eye];
 			const float rect[4] = {q.u0, q.v0, q.u1, q.v1}, crop[4] = {uv.u0, uv.v0, uv.u1, uv.v1};
 			std::memcpy(inst.rect, rect, sizeof(rect));
 			std::memcpy(inst.uv, crop, sizeof(crop));
@@ -332,11 +336,12 @@ StereoGridRenderer::draw(VkCommandBuffer cmd, VkImage image, uint32_t atlasW, ui
 			const VkRect2D sc = {{sx, sy}, {sw, sh}};
 			vkCmdSetViewport(cmd, 0, 1, &vp);
 			vkCmdSetScissor(cmd, 0, 1, &sc);
-			const uint32_t base = RightEye(v, c) ? n : 0;
+			const uint32_t eye = RightEye(v, c) ? 1u : 0u;
+			const uint32_t base = eye * n;
 			for (uint32_t k = 0; k < n;) {
-				const uint64_t tex = frame.tiles[order[k]].texture;
+				const uint64_t tex = frame.tiles[order[eye][k]].texture[eye];
 				uint32_t end = k + 1;
-				while (end < n && frame.tiles[order[end]].texture == tex) ++end;
+				while (end < n && frame.tiles[order[eye][end]].texture[eye] == tex) ++end;
 				if (tex != 0) {
 					const VkDescriptorSet set = (VkDescriptorSet)tex;
 					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout_, 0, 1, &set, 0,

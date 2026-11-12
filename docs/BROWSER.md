@@ -29,6 +29,7 @@ src/browser/                    namespace mp::browser, platform-neutral
                                 thumbnails, open, delete
   ThumbnailAtlas.{h,cpp}        GPU: thumbnail slots packed into a few textures
   ThumbnailCache.{h,cpp}        media id -> atlas slot, least recently used reuse
+  TileCrop.{h,cpp}              the part of a thumbnail a tile shows, and the size to ask for
   StereoClassifier.{h,cpp}      3D badge verdicts: background thread, cached on disk
   StereoGrid.{h,cpp}            the 3D grid: eye crops, per-tile convergence, per-view quads,
                                 the rendering-mode borrow
@@ -53,6 +54,7 @@ android/src/main/java/.../
 
 tests/
   media_library_test.cpp, stereo_classifier_test.cpp, thumbnail_cache_test.cpp,
+  tile_crop_test.cpp, letterbox_test.cpp (src/media/Letterbox),
   touch_scroller_test.cpp, slide_gesture_test.cpp, stereo_grid_test.cpp
 ```
 
@@ -102,6 +104,35 @@ thumbnail, as `Thumbnail::file3D`. The verdict also picks the thumbnail
 crop: the left eye for side by side, the top for top-bottom, the whole thumbnail for a
 LIF or two-track video, whose thumbnail is already one view.
 
+The "3D" badge sits at the tile's top left (right of the box in select mode; hidden in
+the 3D grid, where every tile is 3D). The top
+right holds a video's length and, under Unsupported, the file's format.
+
+## Thumbnails
+
+A tile shows a square: one eye (as above), without black bars, centre-cropped, a
+half-packed eye unsqueezed (`TileCrop.h`). Only that square goes to the GPU, so an atlas
+slot (512 px) holds exactly what the tile shows.
+
+- Size: each request carries the edge to fit the thumbnail in, chosen so the square is
+  about one thumbnail pixel per screen pixel (`ThumbnailEdge`), from the MediaStore's width
+  and height and the verdict known at the time. A 16:9 video on a 400 px tile is made at
+  712 x 400, a full side-by-side one at 1423 x 400. The square never exceeds a slot, and no
+  thumbnail is made above the file's own size or 2048 px.
+- A tile that still comes out soft (the content check found it side by side after it was
+  asked for as 2D, bars came off, the size was unknown) asks once more, larger. The verdict
+  is cached, so the next launch asks for the right size first.
+- The system's cached thumbnail stops at a size of its own. When it is well short of what
+  was asked, the provider decodes the file: a video's representative frame through
+  `MediaMetadataRetriever.getScaledFrameAtTime`, an image subsampled. The provider logs the
+  average time and size every 64 thumbnails.
+- Black bars (`media/Letterbox.h`): the runtime's 2D-to-3D letterbox measurement
+  (u_lift_mailbox.c), made safe for one picture: bars must be near black, come in a pair of
+  about equal size, end at a hard edge and leave at least 30% of the picture. Otherwise
+  nothing is cropped, so a dark scene keeps its dark. A stereo frame is measured on the eye
+  the tile shows. Videos only: a still with a dark surround is more often a screenshot of a
+  dialog than a letterboxed picture, and the measurement cannot tell them apart.
+
 ## 3D grid
 
 Under the "3D only" filter the panel goes to its 3D mode and every tile is stereo: its left
@@ -114,15 +145,17 @@ eye in the left-eye views, its right eye in the others. Android only.
 - The ImGui HUD stays the flat chrome (a window-space layer at disparity 0). It is
   transparent over the grid: the bars, the sidebar, folders, badges and messages are flat,
   the tiles' pictures are in the projection layer.
-- The thumbnails already hold both eyes of a side-by-side or top-bottom file. The pass
-  samples the `ThumbnailAtlas` pages through their ImGui descriptor sets: one bind and one
-  instanced draw per page and view. A LIF or two-track video's thumbnail is one view, so
+- A tile's slot holds only the left eye's square (see Thumbnails). Under the filter the
+  same square of the right eye goes in a second slot (`RightEyeKey`), so the window counts
+  two slots per tile; a tile uploaded before the filter is fetched again once for it. The
+  pass samples the `ThumbnailAtlas` pages through their ImGui descriptor sets: one bind and
+  one instanced draw per page and eye. A LIF or two-track video's thumbnail is one view, so
   that tile is flat (the same crop in every view). Folders are flat.
 - Depth per tile (`StereoGrid.h` `TileShift`): `ThumbnailDepth` measures each stereo
   thumbnail once with the player's auto-convergence estimator. The subject goes 0.25 % of
   the tile behind the plane, and further back (up to 1 % for the subject) until the
-  nearest content is at the plane. Unmeasured tiles go 0.5 % back. The two crops move
-  apart inside their eyes, zooming in a little when there is no room. Every tile fades to
+  nearest content is at the plane. Unmeasured tiles go 0.5 % back. A slot holds only the
+  square, so the two crops move apart by zooming in about as much as the shift. Every tile fades to
   the flat background over a 3 dp border, so a border never cuts something in front of the
   plane. The gutter widens from 4 to 12 dp.
 - The "3D" badge is hidden (every tile is 3D) and the duration sits on an opaque pill.
@@ -130,8 +163,12 @@ eye in the left-eye views, its right eye in the others. Android only.
   hands back to the player the mode it had. Only the filter decides, never what the grid
   happens to show, so a scroll never flips modes. Back from the player into a 3D-filtered
   grid goes back to 3D. Until the panel is in 3D the grid is drawn flat as before.
-- Resolution: a tile's useful size per eye is its rect times the mode's view scale (half
-  the width on a side-by-side panel). The 512 px thumbnails cover that on a phone.
+- Resolution: a tile's useful size per eye is its rect times the mode's view scale (0.75 on
+  the phone, half the width on a side-by-side panel); the squares are made about 1:1 with
+  the tile, so they cover it.
+- Only the browser's grid: the pass runs only while the browser shows, under the filter,
+  with the panel in 3D. The player's frames (and the swipe's pages) always take the atlas
+  pass as before.
 
 ## Android behaviour
 

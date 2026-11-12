@@ -2,6 +2,7 @@
 #include "browser/MediaBrowser.h"
 
 #include "browser/Icons.h"
+#include "browser/TileCrop.h"
 #include "ui/UiScale.h"
 
 #include <algorithm>
@@ -22,6 +23,9 @@ constexpr float kStereoGutter = 12.0f;  // ...in the 3D grid: flat space between
 constexpr float kStereoFade = 3.0f;     // the 3D grid: each tile fades to flat at its border
 constexpr float kSlop = 12.0f;     // how far a tap may move, design units
 constexpr size_t kScanBatch = 16;  // under a depth filter: items with no verdict asked for at once
+constexpr uint32_t kFetchCap = 2048;  // the largest thumbnail asked for, px (a wide panorama's)
+// A tile shown softer than this fraction of 1:1 asks once more, for a sharper thumbnail.
+constexpr float kSoft = 0.8f;
 
 const ImVec4 kBackground(0.05f, 0.06f, 0.08f, 1.0f);    // the UI's window colour, opaque
 const ImU32 kPanel = IM_COL32(23, 26, 33, 255);         // top bar and sidebar
@@ -40,7 +44,7 @@ float Round(float v) { return std::floor(v + 0.5f); }
 bool Same(const std::vector<ThumbnailRequest>& a, const std::vector<ThumbnailRequest>& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i].id != b[i].id || a[i].checkFile != b[i].checkFile) return false;
+        if (a[i].id != b[i].id || a[i].checkFile != b[i].checkFile || a[i].maxEdge != b[i].maxEdge) return false;
     }
     return true;
 }
@@ -79,42 +83,6 @@ std::string Format(const std::string& name) {
     return ext;
 }
 
-// The part of a thumbnail a tile shows: one eye, centre-cropped to a square on screen.
-void Crop(const ThumbnailAtlas::Thumb& t, StereoLayout layout, ImVec2& uv0, ImVec2& uv1) {
-    float x0 = 0.0f, x1 = 1.0f, y0 = 0.0f, y1 = 1.0f;
-    float aspect = (float)t.w / (float)t.h;  // the eye's width over height, on screen
-    switch (layout) {
-        case StereoLayout::SbsFull:
-            x1 = 0.5f;
-            aspect *= 0.5f;
-            break;
-        case StereoLayout::SbsHalf:  // a squeezed eye is shown at the whole frame's aspect
-            x1 = 0.5f;
-            break;
-        case StereoLayout::TbFull:
-            y1 = 0.5f;
-            aspect *= 2.0f;
-            break;
-        case StereoLayout::TbHalf:
-            y1 = 0.5f;
-            break;
-        default:
-            break;
-    }
-    if (aspect > 1.0f) {
-        const float mid = (x0 + x1) * 0.5f, half = (x1 - x0) * 0.5f / aspect;
-        x0 = mid - half;
-        x1 = mid + half;
-    } else {
-        const float mid = (y0 + y1) * 0.5f, half = (y1 - y0) * 0.5f * aspect;
-        y0 = mid - half;
-        y1 = mid + half;
-    }
-    const ImVec2 span(t.uv1.x - t.uv0.x, t.uv1.y - t.uv0.y);
-    uv0 = ImVec2(t.uv0.x + span.x * x0, t.uv0.y + span.y * y0);
-    uv1 = ImVec2(t.uv0.x + span.x * x1, t.uv0.y + span.y * y1);
-}
-
 void Duration(int64_t ms, char* out, size_t n) {
     const int s = (int)(ms / 1000);
     if (s >= 3600) {
@@ -133,6 +101,12 @@ float Badge(ImDrawList* dl, float right, float top, const char* text, ImU32 fill
     dl->AddRectFilled(ImVec2(right - w, top), ImVec2(right, top + h), fill, h * 0.5f);
     dl->AddText(ImVec2(right - w + padX, top + padY), kBadgeText, text);
     return right - w;
+}
+
+// The same pill, its left edge at `left`.
+void LeftBadge(ImDrawList* dl, float left, float top, const char* text) {
+    const float padX = Round(ImGui::GetFontSize() * 0.3f);
+    Badge(dl, left + Round(ImGui::CalcTextSize(text).x) + padX * 2.0f, top, text);
 }
 
 // A folder's tile: the folder, its name along the bottom and its count top right.
@@ -235,6 +209,8 @@ void MediaBrowser::Shutdown() {
     pending_.clear();
     ready_.clear();
     noThumbnail_.clear();
+    sharpen_.clear();
+    sharpened_.clear();
     wanted_.clear();
 }
 
@@ -251,6 +227,9 @@ void MediaBrowser::TakeResults() {
             if (old && old->modified != item.modified) {
                 cache_.Remove(item.id);
                 noThumbnail_.erase(item.id);
+                cache_.Remove(RightEyeKey(item.id));
+                sharpen_.erase(item.id);
+                sharpened_.erase(item.id);
                 thumbDepth_.Forget(item.id);
             }
         }
@@ -276,7 +255,7 @@ void MediaBrowser::TakeResults() {
     StereoVerdict verdict;
     while (classifier_.TakeResult(thumbnail, verdict)) {
         if (depth_ != DepthFilter::Both) dirty_ = true;  // it may join the grid now
-        ready_.push_back(std::move(thumbnail));
+        ready_.push_back(Ready{std::move(thumbnail), verdict.layout});
         thumbnail = Thumbnail{};
     }
     thumbDepth_.TakeResults();
@@ -554,8 +533,9 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
     const int lastRow = std::min(rows - 1, (int)((offset + size.y) / step));
     const size_t visFirst = (size_t)firstRow * cols;
     const size_t visEnd = std::min(n, (size_t)(lastRow + 1) * cols);
-    const int spare = (int)atlas_.SlotCount() - (lastRow - firstRow + 1) * cols;
-    const int extra = std::max(0, std::min(2, spare / (2 * cols)));
+    const int perTile = WantsStereo() ? 2 : 1;  // the 3D grid keeps each eye in a slot
+    const int spare = (int)atlas_.SlotCount() - (lastRow - firstRow + 1) * cols * perTile;
+    const int extra = std::max(0, std::min(2, spare / (2 * cols * perTile)));
     const size_t winFirst = (size_t)std::max(0, firstRow - extra) * cols;
     const size_t winEnd = std::min(n, (size_t)(lastRow + 1 + extra) * cols);
 
@@ -566,21 +546,35 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
         window.insert(id);
         int slot = 0;
         cache_.Use(id, slot);  // so a new thumbnail never takes a slot the window still shows
+        if (perTile > 1) cache_.Use(RightEyeKey(id), slot);
     }
-    UploadReady(window);
+    // A thumbnail big enough that the part a tile shows covers it pixel for pixel, as far as
+    // an atlas slot holds.
+    const uint32_t need = std::min(atlas_.Tile(), (uint32_t)tile);
+    UploadReady(window, need);
 
     // Ask for what the window lacks: the visible rows, then those below, then above. Under a
     // depth filter also for the next few items with no verdict, so they can be sorted in.
+    // Also for the ones shown soft, sharper (UploadReady). The size goes by the verdict known
+    // now: an item found 3D by its thumbnail is asked for again if its eye came out soft.
     std::vector<ThumbnailRequest> want;
     auto ask = [&](const MediaItem& item) {
-        if (cache_.Contains(item.id) || pending_.count(item.id) || noThumbnail_.count(item.id)) return;
-        want.push_back(ThumbnailRequest{item.id, classifier_.NeedsFileCheck(item)});
+        if (pending_.count(item.id) || noThumbnail_.count(item.id)) return;
+        uint32_t edge = 0;
+        if (cache_.Contains(item.id)) {
+            const auto it = sharpen_.find(item.id);
+            if (it == sharpen_.end()) return;
+            edge = it->second;
+        } else {
+            edge = ThumbnailEdge(item.width, item.height, classifier_.Get(item).layout, need, atlas_.Tile(), kFetchCap);
+        }
+        want.push_back(ThumbnailRequest{item.id, classifier_.NeedsFileCheck(item), edge});
     };
     for (size_t p = std::max(visFirst, nf); p < winEnd; ++p) ask(items[shown_[p - nf]]);
     for (size_t p = visFirst; p > std::max(winFirst, nf); --p) ask(items[shown_[p - 1 - nf]]);
     for (size_t k = 0; k < unknown_.size() && k < kScanBatch; ++k) ask(items[unknown_[k]]);
     if (!Same(want, wanted_)) {
-        provider_->WantThumbnails(want, atlas_.Tile());
+        provider_->WantThumbnails(want);
         wanted_ = std::move(want);
     }
 
@@ -638,20 +632,28 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
         ThumbnailAtlas::Thumb thumb;
         const bool shown = cache_.Use(item.id, slot) && atlas_.Get(slot, thumb);
         if (shown && stereo_) {
-            StereoTile t;  // drawn into both views by the caller, at this rect
-            t.texture = (uint64_t)thumb.texture;
+            // Drawn into the views by the caller, at this rect: the left eye's square from
+            // this slot, the right eye's from its own slot (flat until it has one).
+            StereoTile t;
             t.x0 = a.x, t.y0 = a.y, t.x1 = b.x, t.y1 = b.y;
+            ThumbnailAtlas::Thumb right = thumb;
+            int rslot = 0;
+            const bool pair = Packed(verdict.layout) && cache_.Use(RightEyeKey(item.id), rslot) &&
+                              atlas_.Get(rslot, right);
             DepthEstimate depth;
             const bool measured = thumbDepth_.Get(item.id, depth);
-            TileCrops(verdict.layout, thumb.w, thumb.h, 1.0f, measured ? &depth : nullptr, DepthPolicy{}, t.left,
-                      t.right);
-            t.left = InSlot(t.left, thumb.uv0.x, thumb.uv0.y, thumb.uv1.x, thumb.uv1.y);
-            t.right = InSlot(t.right, thumb.uv0.x, thumb.uv0.y, thumb.uv1.x, thumb.uv1.y);
+            UvRect l, r;
+            if (pair) SlotCrops(measured ? &depth : nullptr, DepthPolicy{}, l, r);
+            t.texture[0] = (uint64_t)thumb.texture;
+            t.texture[1] = (uint64_t)right.texture;
+            t.uv[0] = InSlot(l, thumb.uv0.x, thumb.uv0.y, thumb.uv1.x, thumb.uv1.y);
+            t.uv[1] = InSlot(pair ? r : l, right.uv0.x, right.uv0.y, right.uv1.x, right.uv1.y);
             stereoFrame_.tiles.push_back(t);
+            // Uploaded before the 3D filter, without its right eye: fetch it again.
+            if (Packed(verdict.layout) && !pair && !pending_.count(item.id) && refetched_.insert(item.id).second)
+                cache_.Remove(item.id);
         } else if (shown) {
-            ImVec2 uv0, uv1;
-            Crop(thumb, verdict.layout, uv0, uv1);
-            dl->AddImage(thumb.texture, a, b, uv0, uv1);
+            dl->AddImage(thumb.texture, a, b, thumb.uv0, thumb.uv1);  // the slot holds what the tile shows
         } else {
             dl->AddRectFilled(a, b, kTileEmpty);
             if (noThumbnail_.count(item.id)) {
@@ -660,15 +662,17 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
                          ImGui::GetColorU32(ImGuiCol_TextDisabled));
             }
         }
-        // Badges, top right: the length of a video, "3D" to its left, then the format of a
-        // file the player cannot open.
+        // Badges. Top left "3D", beside select mode's box. Top right the length of a video,
+        // then to its left the format of a file the player cannot open.
+        if (verdict.known && verdict.stereo && !stereo_) {  // the 3D grid: every tile is 3D
+            LeftBadge(dl, a.x + margin + (selecting_ ? box + badgeGap : 0.0f), a.y + margin, "3D");
+        }
         float right = b.x - margin;
         if (item.type == MediaType::Video && item.durationMs > 0) {
             char length[24];
             Duration(item.durationMs, length, sizeof(length));
             right = Badge(dl, right, a.y + margin, length, stereo_ ? kBadgeOpaque : kBadge) - badgeGap;
         }
-        if (verdict.known && verdict.stereo && !stereo_) right = Badge(dl, right, a.y + margin, "3D") - badgeGap;
         const std::string format = library_.Kind(shown_[p - nf]) == SourceKind::Unsupported ? Format(item.name) : "";
         if (!format.empty()) Badge(dl, right, a.y + margin, format.c_str());
         if (selecting_) {
@@ -752,12 +756,13 @@ bool MediaBrowser::OpenNext(int step) {
     return true;
 }
 
-void MediaBrowser::UploadReady(const std::unordered_set<int64_t>& window) {
+void MediaBrowser::UploadReady(const std::unordered_set<int64_t>& window, uint32_t need) {
     bool budget = true;
+    const uint32_t tile = atlas_.Tile();
     for (auto it = ready_.begin(); it != ready_.end();) {
-        const Thumbnail& t = *it;
+        const Thumbnail& t = it->thumbnail;
         const bool wanted = window.count(t.id) != 0;
-        const bool fits = t.width > 0 && t.height > 0 && t.width <= atlas_.Tile() && t.height <= atlas_.Tile();
+        const bool fits = t.width > 0 && t.height > 0 && t.rgba.size() >= (size_t)t.width * t.height * 4;
         if (!wanted || !fits) {
             // Scrolled away meanwhile, or nothing to show.
             if (wanted) noThumbnail_.insert(t.id);
@@ -770,15 +775,61 @@ void MediaBrowser::UploadReady(const std::unordered_set<int64_t>& window) {
             ++it;
             continue;
         }
-        if (!atlas_.Upload(slot, t.rgba.data(), t.width, t.height)) {
+        // Only the part the tile shows goes to the GPU, at most a slot's worth of it. Black
+        // bars come off a video's frame only: a still with a dark surround is more often a
+        // screenshot of a dialog than a letterboxed picture.
+        const MediaItem* item = library_.Find(t.id);
+        const bool bars = item && item->type == MediaType::Video;
+        TileRegion r = ShownRegion(bars ? t.rgba.data() : nullptr, t.width, t.height, it->layout);
+        if (r.w > tile) {
+            r.x += (r.w - tile) / 2;
+            r.w = tile;
+        }
+        if (r.h > tile) {
+            r.y += (r.h - tile) / 2;
+            r.h = tile;
+        }
+        const uint8_t* origin = t.rgba.data() + ((size_t)r.y * t.width + r.x) * 4;
+        if (!atlas_.Upload(slot, origin, r.w, r.h, (size_t)t.width * 4)) {
             cache_.Remove(t.id);  // this frame's uploads are spent: the rest wait for the next
             budget = false;
             ++it;
             continue;
         }
-        if (const MediaItem* item = library_.Find(t.id)) {
-            const StereoVerdict v = classifier_.Get(*item);
-            if (v.stereo) thumbDepth_.Measure(t.id, t.rgba.data(), t.width, t.height, v.layout);
+        if (Packed(it->layout)) {
+            // The 3D grid: the right eye's same square in a slot of its own (only under the
+            // "3D only" filter, so the 2D grid's slots are not halved), and the pair's depth.
+            uint32_t rx = 0, ry = 0;
+            int rslot = 0;
+            if (WantsStereo() && OtherEyeRegion(it->layout, t.width, t.height, r.x, r.y, r.w, r.h, rx, ry) &&
+                cache_.Assign(RightEyeKey(t.id), rslot)) {
+                const uint8_t* rorigin = t.rgba.data() + ((size_t)ry * t.width + rx) * 4;
+                if (!atlas_.Upload(rslot, rorigin, r.w, r.h, (size_t)t.width * 4)) {
+                    cache_.Remove(RightEyeKey(t.id));  // spent: both eyes again next frame
+                    cache_.Remove(t.id);
+                    budget = false;
+                    ++it;
+                    continue;
+                }
+            }
+            const uint32_t eyeW = (it->layout == StereoLayout::SbsFull || it->layout == StereoLayout::SbsHalf)
+                                      ? t.width / 2
+                                      : t.width;
+            thumbDepth_.Measure(t.id, t.rgba.data(), t.width, t.height, it->layout,
+                                eyeW > 0 ? (float)r.w / (float)eyeW : 1.0f);
+        }
+        // Shown soft (3D found from the thumbnail itself, so it was asked for as 2D; black bars
+        // taken off; a size the provider did not report): ask once more, larger.
+        sharpen_.erase(t.id);
+        const uint32_t shorter = std::min(r.w, r.h), longer = std::max(r.w, r.h);
+        const uint32_t own = item ? std::max(item->width, item->height) : 0;
+        const uint32_t made = std::max(t.width, t.height);
+        if (!sharpened_.count(t.id) && shorter < kSoft * (float)need && longer < tile && (own == 0 || made < own)) {
+            const double scale = std::min((double)need / std::max(1u, shorter), (double)tile / std::max(1u, longer));
+            uint32_t edge = (uint32_t)std::ceil(scale * made);
+            edge = std::min(edge, own > 0 ? std::min(own, kFetchCap) : kFetchCap);
+            if (edge > made + made / 8) sharpen_[t.id] = edge;
+            sharpened_.insert(t.id);
         }
         pending_.erase(t.id);
         it = ready_.erase(it);

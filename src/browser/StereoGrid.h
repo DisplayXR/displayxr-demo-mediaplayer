@@ -6,7 +6,7 @@
 // disparity 0); the tiles are drawn into the projection atlas by the platform's renderer
 // at the rects the HUD laid out THAT frame, from the frame description below.
 //
-// This file is the pure part: which crop of a thumbnail each eye shows, the per-tile
+// This file is the pure part: where the right eye's square is, the per-tile
 // convergence shift and its clamp, the tile-rect to per-view quad math, and the
 // rendering-mode borrow the browser holds while it shows. No ImGui, no Vulkan.
 #pragma once
@@ -25,25 +25,27 @@ struct UvRect {
     float H() const { return v1 - v0; }
 };
 
-// Where each eye is in a thumbnail of `layout`, normalised over the whole thumbnail. Side
-// by side: the left half is the left eye. Top-bottom: the top. Mono and Dual (a LIF or a
-// two-track video, whose thumbnail is one view): both eyes are the whole image.
-void EyeRegions(StereoLayout layout, UvRect& left, UvRect& right);
-// Whether `layout` packs both eyes into the thumbnail, so the tile can be stereo.
+// Whether `layout` packs both eyes into the thumbnail, so the tile can be stereo. Mono and
+// Dual (a LIF or a two-track video, whose thumbnail is one view) are flat.
 bool Packed(StereoLayout layout);
-// One eye's width over its height as the player shows it, for a w x h thumbnail: a
-// squeezed (half) packing is shown at the whole frame's aspect.
-float EyeAspect(StereoLayout layout, uint32_t w, uint32_t h);
-// The centred part of `eye` (an eye shown at `eyeAspect`) that fills a tile of
-// `tileAspect` (w / h) without stretching.
-UvRect CenterCrop(const UvRect& eye, float eyeAspect, float tileAspect);
+
+// A tile's atlas slot holds only the square it shows of the LEFT eye (TileCrop.h
+// ShownRegion: bars off, centre square). The 3D grid puts the same square of the RIGHT eye
+// (x, y, w, h of a w x h thumbnail) in a second slot, under this key.
+inline int64_t RightEyeKey(int64_t id) { return -id - 2; }  // ids are >= 0; -1 is "none"
+// The right eye's copy of the left eye's region (x, y, w, h) of a fullW x fullH thumbnail:
+// the same place in the other half. False for an unpacked layout or a region that does not
+// fit in the other half.
+bool OtherEyeRegion(StereoLayout layout, uint32_t fullW, uint32_t fullH, uint32_t x, uint32_t y, uint32_t w,
+                    uint32_t h, uint32_t& ox, uint32_t& oy);
 
 // What the content check measured on a thumbnail's two eyes, as fractions of the eye's
 // width with AutoConvergence's sign: x_left - x_right, + = crossed = in front of the plane.
 struct DepthEstimate {
     bool ok = false;
-    float subject = 0.0f;  // the subject (the nearest strong disparity mode)
-    float nearest = 0.0f;  // the nearest content (95th percentile), >= subject
+    float subject = 0.0f;   // the subject (the nearest strong disparity mode)
+    float nearest = 0.0f;   // the nearest content (95th percentile), >= subject
+    float cropFrac = 1.0f;  // the tile's square's width over the eye's width
 };
 
 // How deep a tile sits. Amounts are in TILE widths, uncrossed (+ = behind the plane).
@@ -66,21 +68,20 @@ float TileShift(const DepthEstimate& e, float cropFrac, const DepthPolicy& polic
 // by the same amount. False (crops unchanged) when no zoom makes room.
 bool ApplyShift(UvRect& left, UvRect& right, const UvRect& leftEye, const UvRect& rightEye, float shift);
 
-// A tile's two crops, normalised over the thumbnail, for a w x h thumbnail of `layout`
-// shown in a tile of `tileAspect`. Packed: one eye each, shifted by TileShift (`e` may be
-// null). Otherwise both are the same whole-image crop: the tile is flat. Returns whether
-// the tile is stereo.
-bool TileCrops(StereoLayout layout, uint32_t w, uint32_t h, float tileAspect, const DepthEstimate* e,
-               const DepthPolicy& policy, UvRect& left, UvRect& right);
+// A stereo tile's two crops, each normalised over its eye's slot image (the square the tile
+// shows), moved apart by TileShift (`e` may be null: unmeasured). The slot holds only the
+// square, so room for the shift comes from zooming in a little (ApplyShift). Returns the
+// shift applied, in tile widths (0 when it did not fit).
+float SlotCrops(const DepthEstimate* e, const DepthPolicy& policy, UvRect& left, UvRect& right);
 
-// `r` (normalised over a thumbnail) mapped into the atlas slot that holds it, uv0..uv1.
+// `r` (normalised over a slot's image) mapped into the page uv of the slot, uv0..uv1.
 UvRect InSlot(const UvRect& r, float slotU0, float slotV0, float slotU1, float slotV1);
 
-// One tile of the stereo grid, this frame.
+// One tile of the stereo grid, this frame. A flat tile has the same page and crop twice.
 struct StereoTile {
-    uint64_t texture = 0;  // the thumbnail page the tile samples (its ImGui texture id)
+    uint64_t texture[2] = {0, 0};  // the pages view 0 / view 1 sample (ImGui texture ids)
     float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;  // HUD px
-    UvRect left, right;                         // page uv: view 0's crop, view 1's crop
+    UvRect uv[2];                  // page uv: view 0's crop, view 1's crop
 };
 
 // What the renderer draws into the projection atlas this frame. The HUD fills each view's

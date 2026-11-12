@@ -38,34 +38,20 @@ bool Inside(const UvRect& r, const UvRect& bounds) {
     return r.u0 >= bounds.u0 - e && r.u1 <= bounds.u1 + e && r.v0 >= bounds.v0 - e && r.v1 <= bounds.v1 + e;
 }
 
-// The eyes: side by side splits the width, top-bottom the height, one view is both.
-void TestEyeRegions() {
-    UvRect l, r;
-    EyeRegions(StereoLayout::SbsFull, l, r);
-    CHECK(Near(l.u1, 0.5f) && Near(r.u0, 0.5f) && Near(r.u1, 1.0f) && Near(l.v1, 1.0f), "SBS: halves of the width");
-    EyeRegions(StereoLayout::TbHalf, l, r);
-    CHECK(Near(l.v1, 0.5f) && Near(r.v0, 0.5f) && Near(l.u1, 1.0f), "TB: halves of the height");
-    EyeRegions(StereoLayout::Dual, l, r);
-    CHECK(Near(l.W(), 1.0f) && Near(r.W(), 1.0f) && Near(l.H(), 1.0f), "Dual: one view, both eyes whole");
+// Packed layouts, the right eye's key and where its square is.
+void TestEyes() {
     CHECK(Packed(StereoLayout::SbsHalf) && Packed(StereoLayout::TbFull), "SBS and TB are packed");
     CHECK(!Packed(StereoLayout::Mono) && !Packed(StereoLayout::Dual), "mono and two-track are not");
-}
+    CHECK(RightEyeKey(0) < -1 && RightEyeKey(7) != RightEyeKey(8) && RightEyeKey(7) != 7, "right keys stay apart");
 
-// The crop of a square tile matches the 2D grid's: a 1024 x 288 full-SBS thumbnail has
-// 512 x 288 eyes, so the tile shows the centre 288 px of each.
-void TestCenterCrop() {
-    const float aspect = EyeAspect(StereoLayout::SbsFull, 1024, 288);
-    CHECK(Near(aspect, 512.0f / 288.0f), "full SBS eye aspect %.4f", aspect);
-    CHECK(Near(EyeAspect(StereoLayout::SbsHalf, 512, 288), 512.0f / 288.0f), "half SBS: the frame's aspect");
-    CHECK(Near(EyeAspect(StereoLayout::TbFull, 512, 576), 512.0f / 288.0f), "full TB eye aspect");
-    UvRect l, r;
-    EyeRegions(StereoLayout::SbsFull, l, r);
-    const UvRect c = CenterCrop(l, aspect, 1.0f);
-    CHECK(Near(c.W(), 0.5f * 288.0f / 512.0f) && Near(c.H(), 1.0f), "SBS square crop %.4f x %.4f", c.W(), c.H());
-    CHECK(Near((c.u0 + c.u1) * 0.5f, 0.25f), "centred in the left eye");
-    // A tall eye in a square tile: the height is cropped.
-    const UvRect t = CenterCrop(UvRect{}, 0.5f, 1.0f);
-    CHECK(Near(t.W(), 1.0f) && Near(t.H(), 0.5f) && Near(t.v0, 0.25f), "tall eye: centre half of the height");
+    // A 1024 x 288 full-SBS thumbnail: the tile's square of the left eye is 288 px at 112.
+    uint32_t ox = 0, oy = 0;
+    CHECK(OtherEyeRegion(StereoLayout::SbsFull, 1024, 288, 112, 0, 288, 288, ox, oy), "SBS: fits");
+    CHECK(ox == 112 + 512 && oy == 0, "SBS: the same place in the right half (%u, %u)", ox, oy);
+    CHECK(OtherEyeRegion(StereoLayout::TbHalf, 512, 576, 0, 16, 512, 256, ox, oy), "TB: fits");
+    CHECK(ox == 0 && oy == 16 + 288, "TB: the same place in the bottom half (%u, %u)", ox, oy);
+    CHECK(!OtherEyeRegion(StereoLayout::Mono, 512, 512, 0, 0, 512, 512, ox, oy), "mono has no other eye");
+    CHECK(!OtherEyeRegion(StereoLayout::SbsFull, 1024, 288, 600, 0, 288, 288, ox, oy), "past the frame: refused");
 }
 
 // The shift: subject just behind the plane, the nearest content pulled back to the plane
@@ -108,10 +94,9 @@ void TestTileShift() {
 // Applying it: the left crop moves right in uv (its picture moves left), the right crop
 // left, by half the shift each, and both stay inside their eye.
 void TestApplyShift() {
-    UvRect eyeL, eyeR;
-    EyeRegions(StereoLayout::SbsFull, eyeL, eyeR);
-    const float aspect = EyeAspect(StereoLayout::SbsFull, 1024, 288);
-    UvRect l = CenterCrop(eyeL, aspect, 1.0f), r = CenterCrop(eyeR, aspect, 1.0f);
+    const UvRect eyeL{0.0f, 0.0f, 0.5f, 1.0f}, eyeR{0.5f, 0.0f, 1.0f, 1.0f};
+    const float half = 0.5f * 288.0f / 512.0f * 0.5f;  // a square crop of a 512 x 288 eye
+    UvRect l{0.25f - half, 0.0f, 0.25f + half, 1.0f}, r{0.75f - half, 0.0f, 0.75f + half, 1.0f};
     const float w = l.W(), cl = (l.u0 + l.u1) * 0.5f, cr = (r.u0 + r.u1) * 0.5f;
     CHECK(ApplyShift(l, r, eyeL, eyeR, 0.02f), "room in a wide eye");
     CHECK(Near(l.W(), w) && Near(r.W(), w), "no zoom needed");
@@ -135,21 +120,29 @@ void TestApplyShift() {
     CHECK(Near(bl.u0, eyeL.u0) && Near(br.u1, eyeR.u1), "...and leaves the crops alone");
 }
 
-// A tile's crops: stereo for a packed layout, the same crop for both eyes otherwise.
-void TestTileCrops() {
+// A tile's crops over its two slots: each slot holds exactly the square, so the shift
+// zooms in a little and the crops move apart inside [0, 1].
+void TestSlotCrops() {
     const DepthPolicy p;
     UvRect l, r;
-    CHECK(TileCrops(StereoLayout::SbsFull, 1024, 288, 1.0f, nullptr, p, l, r), "SBS is stereo");
-    UvRect eyeL, eyeR;
-    EyeRegions(StereoLayout::SbsFull, eyeL, eyeR);
-    CHECK(Inside(l, eyeL) && Inside(r, eyeR), "each crop in its eye");
-    CHECK((l.u0 + l.u1) * 0.5f > 0.25f && (r.u0 + r.u1) * 0.5f < 0.75f, "no estimate: biased behind");
-    CHECK(!TileCrops(StereoLayout::Dual, 512, 288, 1.0f, nullptr, p, l, r), "two-track thumbnail is flat");
-    CHECK(Near(l.u0, r.u0) && Near(l.u1, r.u1) && Near(l.v0, r.v0), "flat: one crop for both views");
-    CHECK(!TileCrops(StereoLayout::Mono, 512, 288, 1.0f, nullptr, p, l, r), "mono is flat");
+    const float s = SlotCrops(nullptr, p, l, r);
+    CHECK(Near(s, p.unmeasured), "unmeasured: biased back by %.4f", s);
+    const UvRect whole;
+    CHECK(Inside(l, whole) && Inside(r, whole), "inside the slots");
+    CHECK((l.u0 + l.u1) * 0.5f > 0.5f && (r.u0 + r.u1) * 0.5f < 0.5f, "left crop right, right crop left");
+    const float moved = (((l.u0 + l.u1) * 0.5f - 0.5f) - ((r.u0 + r.u1) * 0.5f - 0.5f)) / l.W();
+    CHECK(Near(moved, s), "adds %.4f of the tile", moved);
 
-    const UvRect s = InSlot(UvRect{0.0f, 0.0f, 0.5f, 1.0f}, 0.25f, 0.5f, 0.5f, 0.75f);
-    CHECK(Near(s.u0, 0.25f) && Near(s.u1, 0.375f) && Near(s.v0, 0.5f) && Near(s.v1, 0.75f), "mapped into its slot");
+    // A measured subject in front, the square a third of the eye: the subject's shift in
+    // tile widths is three times its share of the eye.
+    DepthEstimate e;
+    e.ok = true;
+    e.subject = e.nearest = 0.005f;
+    e.cropFrac = 1.0f / 3.0f;
+    CHECK(Near(SlotCrops(&e, p, l, r), 0.015f + p.subjectBehind), "measured: subject just behind");
+
+    const UvRect m = InSlot(UvRect{0.0f, 0.0f, 0.5f, 1.0f}, 0.25f, 0.5f, 0.5f, 0.75f);
+    CHECK(Near(m.u0, 0.25f) && Near(m.u1, 0.375f) && Near(m.v0, 0.5f) && Near(m.v1, 0.75f), "mapped into its slot");
 }
 
 // The tile at its HUD rect is the same normalised quad in every view; the clip becomes a
@@ -266,8 +259,8 @@ void TestThumbnailDepth() {
         }
     ThumbnailDepth depth;
     CHECK(depth.Initialize(), "worker starts");
-    depth.Measure(7, rgba.data(), (uint32_t)W, (uint32_t)H, StereoLayout::SbsFull);
-    depth.Measure(8, rgba.data(), (uint32_t)W, (uint32_t)H, StereoLayout::Mono);  // not packed: ignored
+    depth.Measure(7, rgba.data(), (uint32_t)W, (uint32_t)H, StereoLayout::SbsFull, 0.5f);
+    depth.Measure(8, rgba.data(), (uint32_t)W, (uint32_t)H, StereoLayout::Mono, 1.0f);  // not packed: ignored
     DepthEstimate e;
     for (int i = 0; i < 400 && !depth.Get(7, e); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -286,11 +279,10 @@ void TestThumbnailDepth() {
 } // namespace
 
 int main() {
-    TestEyeRegions();
-    TestCenterCrop();
+    TestEyes();
     TestTileShift();
     TestApplyShift();
-    TestTileCrops();
+    TestSlotCrops();
     TestViewMath();
     TestBrowserMode();
     TestModeBorrow();

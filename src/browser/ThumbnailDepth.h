@@ -33,7 +33,8 @@ public:
 
     // Measure a packed (side by side or top-bottom) w x h RGBA thumbnail of item `id`. The
     // pixels are copied. Ignored for an unpacked layout or an id already measured.
-    void Measure(int64_t id, const uint8_t* rgba, uint32_t w, uint32_t h, StereoLayout layout);
+    // `cropFrac` is the tile square's width over the eye's, kept with the estimate.
+    void Measure(int64_t id, const uint8_t* rgba, uint32_t w, uint32_t h, StereoLayout layout, float cropFrac);
     // Take the finished measurements (once a frame).
     void TakeResults();
     // The estimate for `id`; false while it is unmeasured (or was never asked for).
@@ -48,6 +49,7 @@ private:
         int64_t id = 0;
         uint32_t w = 0, h = 0;
         StereoLayout layout = StereoLayout::Mono;
+        float cropFrac = 1.0f;
         std::vector<uint8_t> rgba;
     };
     struct Done {

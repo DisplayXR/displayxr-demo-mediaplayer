@@ -6,54 +6,28 @@
 
 namespace mp::browser {
 
-void EyeRegions(StereoLayout layout, UvRect& left, UvRect& right) {
-    left = UvRect{};
-    right = UvRect{};
-    switch (layout) {
-        case StereoLayout::SbsFull:
-        case StereoLayout::SbsHalf:
-            left.u1 = 0.5f;
-            right.u0 = 0.5f;
-            break;
-        case StereoLayout::TbFull:
-        case StereoLayout::TbHalf:
-            left.v1 = 0.5f;
-            right.v0 = 0.5f;
-            break;
-        default:
-            break;
-    }
-}
-
 bool Packed(StereoLayout layout) {
     return layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf || layout == StereoLayout::TbFull ||
            layout == StereoLayout::TbHalf;
 }
 
-float EyeAspect(StereoLayout layout, uint32_t w, uint32_t h) {
-    if (w == 0 || h == 0) return 1.0f;
-    const float aspect = (float)w / (float)h;
+bool OtherEyeRegion(StereoLayout layout, uint32_t fullW, uint32_t fullH, uint32_t x, uint32_t y, uint32_t w,
+                    uint32_t h, uint32_t& ox, uint32_t& oy) {
+    ox = x;
+    oy = y;
     switch (layout) {
-        case StereoLayout::SbsFull: return aspect * 0.5f;
-        case StereoLayout::TbFull: return aspect * 2.0f;
-        default: return aspect;  // a half packing is shown at the whole frame's aspect
+        case StereoLayout::SbsFull:
+        case StereoLayout::SbsHalf:
+            ox = x + fullW / 2;
+            break;
+        case StereoLayout::TbFull:
+        case StereoLayout::TbHalf:
+            oy = y + fullH / 2;
+            break;
+        default:
+            return false;
     }
-}
-
-UvRect CenterCrop(const UvRect& eye, float eyeAspect, float tileAspect) {
-    UvRect r = eye;
-    if (eyeAspect <= 0.0f || tileAspect <= 0.0f) return r;
-    const float ratio = eyeAspect / tileAspect;  // > 1: the eye is wider than the tile
-    if (ratio > 1.0f) {
-        const float mid = (eye.u0 + eye.u1) * 0.5f, half = eye.W() * 0.5f / ratio;
-        r.u0 = mid - half;
-        r.u1 = mid + half;
-    } else {
-        const float mid = (eye.v0 + eye.v1) * 0.5f, half = eye.H() * 0.5f * ratio;
-        r.v0 = mid - half;
-        r.v1 = mid + half;
-    }
-    return r;
+    return w > 0 && h > 0 && ox + w <= fullW && oy + h <= fullH;
 }
 
 float TileShift(const DepthEstimate& e, float cropFrac, const DepthPolicy& policy) {
@@ -101,20 +75,13 @@ bool ApplyShift(UvRect& left, UvRect& right, const UvRect& leftEye, const UvRect
     return true;
 }
 
-bool TileCrops(StereoLayout layout, uint32_t w, uint32_t h, float tileAspect, const DepthEstimate* e,
-               const DepthPolicy& policy, UvRect& left, UvRect& right) {
-    UvRect eyeL, eyeR;
-    EyeRegions(layout, eyeL, eyeR);
-    const float aspect = EyeAspect(layout, w, h);
-    left = CenterCrop(eyeL, aspect, tileAspect);
-    if (!Packed(layout)) {
-        right = left;
-        return false;
-    }
-    right = CenterCrop(eyeR, aspect, tileAspect);
-    const float cropFrac = eyeL.W() > 0.0f ? left.W() / eyeL.W() : 1.0f;
-    ApplyShift(left, right, eyeL, eyeR, TileShift(e ? *e : DepthEstimate{}, cropFrac, policy));
-    return true;
+float SlotCrops(const DepthEstimate* e, const DepthPolicy& policy, UvRect& left, UvRect& right) {
+    left = right = UvRect{};
+    const DepthEstimate none;
+    const DepthEstimate& d = e ? *e : none;
+    const float shift = TileShift(d, d.cropFrac, policy);
+    const UvRect whole;
+    return ApplyShift(left, right, whole, whole, shift) ? shift : 0.0f;
 }
 
 UvRect InSlot(const UvRect& r, float slotU0, float slotV0, float slotU1, float slotV1) {
