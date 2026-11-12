@@ -128,6 +128,10 @@ public:
     // xrWaitFrame each frame, which separates the display's pacing from our own work.
     const RenderPerfWindow& LastPerfWindow() const { return perf_.Last(); }
     void NoteXrWait(double ms) { perf_.XrWait(ms); }
+    // The render loop's stages (App): a stage's time in this loop iteration (several calls
+    // add up), then the iteration's end with its wall time, loop top to loop top.
+    void NoteStage(RenderStage s, double ms) { perf_.Stage(s, ms); }
+    void EndStageLoop(double loopMs) { perf_.EndLoop(loopMs); }
 
     // Record a copy of an RGBA8 buffer into an external (e.g. HUD swapchain) VkImage into
     // the frame command buffer, leaving it in COLOR_ATTACHMENT_OPTIMAL (the layout the
@@ -305,6 +309,7 @@ private:
     // only path before persistent staging). Null on failure.
     void* OneOffStaging(VkDeviceSize bytes, VkBuffer& buffer);
     bool CreateStaging(Staging& s, VkDeviceSize bytes);
+    bool stagingTypeLogged_ = false;  // the staging memory type, logged at the first creation
     void ReleaseStaging(Staging& s, bool deferred);
     void TrimIdleStaging();  // releases buffers no frame copied from in the last perf window
     // Copy a plane (rows x rowBytes, packed) into mapped staging, in row bands on copyPool_

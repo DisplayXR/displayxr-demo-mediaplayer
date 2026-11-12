@@ -6,11 +6,64 @@
 // live source is up and puts in get_rig_status / station_status.json ("render"). It is the
 // on-site proof of where a frame's time goes: a station that can only run signed release
 // builds has no profiler. Pure (no Vulkan): tests/render_perf_test.cpp.
+//
+// The window also splits the render loop into stages (RenderStage), which App times around
+// each step of one loop iteration. Per frame the stages add up to the busy time, so a slow
+// frame names its stage.
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
+#include <string>
 
 namespace mp {
+
+// The stages of one render-loop iteration (App::Run's loop body: the event pump, then
+// RenderOneFrame), in the order they run. Per frame they add up to the loop's period minus
+// xrWaitFrame, which is the busy time. Other is the remainder no stage covers: the UI
+// fades, mode / convert / depth-cursor upkeep, the station's alert log, the fps counter.
+// The Pro-only stages read 0 in the base player.
+enum class RenderStage : int {
+    Pump = 0,  // window events + keys, xrPollEvent, file picks, PollLive / PollStream
+    Upload,    // the source frame: ring acquire, live layout, the plane upload (incl. the staging copy)
+    Rig,       // Pro: the rig check's Submit (its Downsample on the frames it measures)
+    Thumbs,    // Pro: the live input's thumbnail (twice a second)
+    Scopes,    // Pro: ProController::OnFrame (the scopes / pixel-probe gather while they are on)
+    AutoConv,  // auto-convergence: sampling (~5 Hz while on) + the smoothed shift
+    ProTick,   // Pro: ProController::Tick (station, looks, Resolve, the `perf:` line)
+    UiBuild,   // ImGui new frame + building the UI (transport, Pro panels)
+    UiRender,  // ImGui render into the HUD image, recorded into the frame's command buffer
+    Draw,      // the picture: view geometry + recording DrawViews / ClearViews
+    Submit,    // the frame's one vkQueueSubmit
+    XrBegin,   // xrBeginFrame + xrLocateViews + the projection swapchain acquire / wait
+    HudImage,  // the HUD swapchain image: acquire / wait + release
+    XrEnd,     // xrEndFrame (the runtime's in-process compositor and weaver)
+    Other,     // busy minus the stages above
+    Count
+};
+constexpr int kRenderStages = (int)RenderStage::Count;
+
+// A stage's name in the `perf:` line and its key under rig.render.stages.
+inline const char* RenderStageName(RenderStage s) {
+    switch (s) {
+        case RenderStage::Pump: return "pump";
+        case RenderStage::Upload: return "upload";
+        case RenderStage::Rig: return "rig";
+        case RenderStage::Thumbs: return "thumbs";
+        case RenderStage::Scopes: return "scopes";
+        case RenderStage::AutoConv: return "autoconv";
+        case RenderStage::ProTick: return "pro_tick";
+        case RenderStage::UiBuild: return "ui_build";
+        case RenderStage::UiRender: return "ui_render";
+        case RenderStage::Draw: return "draw";
+        case RenderStage::Submit: return "submit";
+        case RenderStage::XrBegin: return "xr_begin";
+        case RenderStage::HudImage: return "hud_image";
+        case RenderStage::XrEnd: return "xr_end";
+        case RenderStage::Other: return "other";
+        default: return "?";
+    }
+}
 
 // One timing over a window: count, mean and worst, in ms.
 struct PerfAcc {
@@ -32,9 +85,9 @@ struct RenderPerfWindow {
     double fps = 0.0;           // frames / seconds
     // Submit-to-submit interval: the render loop's period (16.7 ms at 60 Hz).
     double frameAvgMs = 0.0, frameMaxMs = 0.0;
-    // Of that, blocked in xrWaitFrame (the display's pacing; App times its BeginFrame, which
-    // is xrWaitFrame + xrBeginFrame + xrLocateViews), and the rest: the render thread's own
-    // time per frame (avg frame - avg wait). A render thread that keeps up has busy well
+    // Of that, blocked in xrWaitFrame (the display's pacing; XrSession times the call alone,
+    // the rest of its BeginFrame is the xr_begin stage), and the rest: the render thread's
+    // own time per frame (avg frame - avg wait). A render thread that keeps up has busy well
     // under the display period and spends the rest waiting.
     double xrWaitAvgMs = 0.0;
     double busyAvgMs = 0.0;
@@ -52,7 +105,35 @@ struct RenderPerfWindow {
     // flat while streaming - and uploads that used a one-off buffer (the same plane twice
     // in one frame).
     uint64_t stagingAllocs = 0, stagingOneOff = 0;
+    // The render loop's stages (RenderStage): the average per loop iteration over the
+    // window, and the worst single iteration. A stage that runs twice a second is averaged
+    // over every frame, so the averages add up: their sum + xrWaitAvgMs is the loop's
+    // period, i.e. the sum is busyAvgMs.
+    struct StageStat {
+        double avgMs = 0.0, maxMs = 0.0;
+    };
+    StageStat stages[kRenderStages];
+    uint32_t stageFrames = 0;  // loop iterations the stages average over
+    double StagesSumMs() const {
+        double sum = 0.0;
+        for (const StageStat& st : stages) sum += st.avgMs;
+        return sum;
+    }
 };
+
+// The stages for the `perf:` line, in loop order, avg / max ms per frame:
+// "sum 19.97 = pump 0.10/0.52, upload 9.10/12.40, ..., other 0.31/1.20".
+inline std::string FormatRenderStages(const RenderPerfWindow& w) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "sum %.2f =", w.StagesSumMs());
+    std::string out = buf;
+    for (int i = 0; i < kRenderStages; ++i) {
+        std::snprintf(buf, sizeof(buf), "%s %s %.2f/%.2f", i ? "," : "", RenderStageName((RenderStage)i),
+                      w.stages[i].avgMs, w.stages[i].maxMs);
+        out += buf;
+    }
+    return out;
+}
 
 class RenderPerfMeter {
 public:
@@ -73,7 +154,10 @@ public:
         Close(nowSec);
         return true;
     }
-    void XrWait(double ms) { xrWait_.Add(ms); }
+    void XrWait(double ms) {
+        xrWait_.Add(ms);
+        loopWait_ += ms;
+    }
     void FrameOpen(double ms) { frameOpen_.Add(ms); }
     void Upload(double ms, double copyMs, double bytes, int copyThreads) {
         upload_.Add(ms);
@@ -83,6 +167,28 @@ public:
     }
     void CountStagingAlloc() { ++stagingAllocs_; }
     void CountStagingOneOff() { ++stagingOneOff_; }
+
+    // The render loop's stages. Stage() adds to the open loop iteration (several calls for
+    // one stage add up; Other is computed, never reported). EndLoop() closes the iteration
+    // with its wall time, loop top to loop top: what neither a stage nor xrWaitFrame covered
+    // is Other. An iteration counts in the window that is open when it ends.
+    void Stage(RenderStage s, double ms) {
+        const int i = (int)s;
+        if (i >= 0 && i < (int)RenderStage::Other && ms > 0.0) loopStage_[i] += ms;
+    }
+    void EndLoop(double loopMs) {
+        const int other = (int)RenderStage::Other;
+        double covered = loopWait_;
+        for (int i = 0; i < other; ++i) covered += loopStage_[i];
+        loopStage_[other] = loopMs > covered ? loopMs - covered : 0.0;
+        for (int i = 0; i < kRenderStages; ++i) {
+            stageSum_[i] += loopStage_[i];
+            if (loopStage_[i] > stageMax_[i]) stageMax_[i] = loopStage_[i];
+            loopStage_[i] = 0.0;
+        }
+        loopWait_ = 0.0;
+        ++loops_;
+    }
 
     const RenderPerfWindow& Last() const { return last_; }
 
@@ -108,11 +214,18 @@ private:
         w.copyThreads = copyThreads_;
         w.stagingAllocs = stagingAllocs_;
         w.stagingOneOff = stagingOneOff_;
+        w.stageFrames = loops_;
+        for (int i = 0; i < kRenderStages; ++i) {
+            w.stages[i].avgMs = loops_ ? stageSum_[i] / loops_ : 0.0;
+            w.stages[i].maxMs = stageMax_[i];
+            stageSum_[i] = stageMax_[i] = 0.0;
+        }
         last_ = w;
         windowStart_ = nowSec;
         frames_ = 0;
         frame_ = xrWait_ = frameOpen_ = upload_ = copy_ = PerfAcc{};
         uploadBytes_ = 0.0;
+        loops_ = 0;  // the open iteration (loopStage_, loopWait_) carries into the new window
     }
 
     double windowSec_;
@@ -122,6 +235,10 @@ private:
     double uploadBytes_ = 0.0;
     int copyThreads_ = 1;
     uint64_t stagingAllocs_ = 0, stagingOneOff_ = 0;
+    double loopStage_[kRenderStages] = {};  // the open loop iteration's stages
+    double loopWait_ = 0.0;                 // ... and its xrWaitFrame
+    double stageSum_[kRenderStages] = {}, stageMax_[kRenderStages] = {};
+    uint32_t loops_ = 0;                    // iterations ended in this window
     RenderPerfWindow last_;
 };
 

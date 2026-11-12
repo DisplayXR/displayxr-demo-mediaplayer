@@ -26,6 +26,7 @@
 #include <chrono>     // the perf window's timings
 #include <cstdlib>    // std::getenv
 #include <cstring>    // std::memcpy (half-float LUT pack)
+#include <string>
 #include <vector>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -224,6 +225,30 @@ bool VulkanRenderer::CreateStaging(Staging& s, VkDeviceSize bytes) {
     // flush after the CPU copy).
     ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits,
                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!stagingTypeLogged_ && ai.memoryTypeIndex != UINT32_MAX) {
+        // Once: where the staging lives (the first host-visible + coherent type). On a
+        // discrete GPU it is normally system RAM; a type that is DEVICE_LOCAL too is the BAR
+        // heap, which the CPU copy writes over PCIe.
+        stagingTypeLogged_ = true;
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &mp);
+        const VkMemoryType& t = mp.memoryTypes[ai.memoryTypeIndex];
+        const VkMemoryHeap& h = mp.memoryHeaps[t.heapIndex];
+        std::string props;
+        const auto prop = [&props, &t](VkMemoryPropertyFlagBits bit, const char* name) {
+            if (!(t.propertyFlags & bit)) return;
+            if (!props.empty()) props += '|';
+            props += name;
+        };
+        prop(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "DEVICE_LOCAL");
+        prop(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, "HOST_VISIBLE");
+        prop(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, "HOST_COHERENT");
+        prop(VK_MEMORY_PROPERTY_HOST_CACHED_BIT, "HOST_CACHED");
+        LOG_INFO("VulkanRenderer: staging memory type %u, propertyFlags 0x%x (%s), heap %u, flags 0x%x (%s), %.1f GB",
+                 ai.memoryTypeIndex, (unsigned)t.propertyFlags, props.c_str(), t.heapIndex, (unsigned)h.flags,
+                 (h.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? "DEVICE_LOCAL: video memory" : "system RAM",
+                 (double)h.size / (1024.0 * 1024.0 * 1024.0));
+    }
     if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &ai, nullptr, &s.memory) != VK_SUCCESS ||
         vkBindBufferMemory(device_, s.buffer, s.memory, 0) != VK_SUCCESS ||
         vkMapMemory(device_, s.memory, 0, VK_WHOLE_SIZE, 0, &s.mapped) != VK_SUCCESS || !s.mapped) {

@@ -84,6 +84,7 @@ public:
         // them — EndFrame aliases [viewCount, locatedCount) onto view 0's tile.
         uint32_t locatedCount = 0;
         XrView views[kMaxViews];       // per-view pose + fov from xrLocateViews
+        double waitFrameMs = 0.0;      // BeginFrame's time blocked in xrWaitFrame (perf)
     };
 
     XrSession();   // out of line: members of incomplete type (desktop Linux)

@@ -856,7 +856,8 @@ if(MP_BUILD_TESTS)
     target_include_directories(band_copy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(band_copy_test PRIVATE Threads::Threads)
     add_test(NAME band_copy COMMAND band_copy_test)
-    # The render thread's perf window (rhi/RenderPerf.h): header-only, pure.
+    # The render thread's perf window (rhi/RenderPerf.h) with the render loop's stages, and
+    # Pro's A/B switches (pro/PerfSwitches.h): header-only, pure.
     add_executable(render_perf_test tests/render_perf_test.cpp)
     target_include_directories(render_perf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME render_perf COMMAND render_perf_test)

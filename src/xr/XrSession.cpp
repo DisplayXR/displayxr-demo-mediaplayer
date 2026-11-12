@@ -2,6 +2,7 @@
 #include "XrSession.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 #include "ColorPolicy.h"      // swapchain encoding choice (#78)
@@ -1230,7 +1231,11 @@ bool XrSession::CaptureAtlas(const std::string& pathPrefix) {
 bool XrSession::BeginFrame(Frame& frame) {
     frame.frameState = {XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
-    if (XR_FAILED(xrWaitFrame(session_, &waitInfo, &frame.frameState))) {
+    // The display's pacing, timed alone for the render loop's perf window (rhi/RenderPerf.h).
+    const auto wait0 = std::chrono::steady_clock::now();
+    const XrResult waited = xrWaitFrame(session_, &waitInfo, &frame.frameState);
+    frame.waitFrameMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait0).count();
+    if (XR_FAILED(waited)) {
         exitRequested_ = true;
         return false;
     }

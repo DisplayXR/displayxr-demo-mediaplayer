@@ -230,14 +230,22 @@ bool Station::OpenDeckLinkSpec(const std::string& spec) {
 
 void Station::OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live, int eyeOffsetFrames,
                       bool eyesSwapped) {
+    using StageClock = std::chrono::steady_clock;  // the render loop's rig / thumbs stages
+    const auto stageMs = [](StageClock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(StageClock::now() - t0).count();
+    };
+    lastRigMs_ = lastThumbMs_ = 0.0;
     LogNewAlerts();
-    if (live && inputIndex_ >= 0 && inputIndex_ < (int)inputs_.size() && inputIndex_ < kMaxThumbs) {
+    if (opt_.perf.thumbs && live && inputIndex_ >= 0 && inputIndex_ < (int)inputs_.size() &&
+        inputIndex_ < kMaxThumbs) {
         // The live input's thumbnail, twice a second; the others keep their last one.
         Input& in = inputs_[inputIndex_];
         const double now = LiveProducer::NowSeconds();
         if (in.thumbSec < 0.0 || now - in.thumbSec >= 0.5) {
+            const auto t0 = StageClock::now();
             if (pro::MakeThumbnail(f, layout, kThumbW, kThumbH, in.thumb)) in.thumbDirty = true;
             in.thumbSec = now;
+            lastThumbMs_ = stageMs(t0);
         }
     }
     if (live) {
@@ -250,8 +258,11 @@ void Station::OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live,
         timecode_.clear();
         delayMs_ = 0.0;
     }
-    if (layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf)
+    if (opt_.perf.rig && (layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf)) {
+        const auto t0 = StageClock::now();
         rig_.Submit(f, layout, live ? eyeOffsetFrames : -1, f.timecode, eyesSwapped);
+        lastRigMs_ = stageMs(t0);
+    }
 }
 
 int Station::MeasuredEyeSync(int* lateEye) const {
@@ -572,10 +583,17 @@ void Station::LogNewAlerts() {
 }
 
 // The render thread's last closed perf window (rhi/RenderPerf.h), in get_rig_status and so
-// in station_status.json; null until one has closed (~10 s after the first frame).
-static nlohmann::json RenderPerfJson(const RenderPerfWindow& w) {
+// in station_status.json; null until one has closed (~10 s after the first frame). With
+// the render loop's stages ({name: {avg_ms, max_ms}}, per frame; their sum is busy) and the
+// A/B switches that are off.
+static nlohmann::json RenderPerfJson(const RenderPerfWindow& w, const PerfSwitches& sw) {
     if (w.serial == 0) return nullptr;
     auto r2 = [](double v) { return std::round(v * 100.0) / 100.0; };
+    nlohmann::json stages = nlohmann::json::object();
+    for (int i = 0; i < kRenderStages; ++i)
+        stages[RenderStageName((RenderStage)i)] = {{"avg_ms", r2(w.stages[i].avgMs)}, {"max_ms", r2(w.stages[i].maxMs)}};
+    nlohmann::json off = nlohmann::json::array();
+    for (const char* n : sw.OffNames()) off.push_back(n);
     return {{"window_s", r2(w.seconds)},
             {"fps", r2(w.fps)},
             {"frame_avg_ms", r2(w.frameAvgMs)},
@@ -592,7 +610,10 @@ static nlohmann::json RenderPerfJson(const RenderPerfWindow& w) {
             {"upload_mb", r2(w.uploadMB)},
             {"copy_threads", w.copyThreads},
             {"staging_allocs", w.stagingAllocs},
-            {"staging_one_off", w.stagingOneOff}};
+            {"staging_one_off", w.stagingOneOff},
+            {"stages", stages},
+            {"stages_sum_ms", r2(w.StagesSumMs())},
+            {"switched_off", off}};
 }
 
 void Station::LogPerf(bool live) {
@@ -626,12 +647,17 @@ void Station::LogPerf(bool live) {
         perfCaptureSeen_ = false;
     }
     if (!live) return;
+    // The render loop's stages, avg / max ms per frame (their sum is busy), and the A/B
+    // switches that are off (MEDIAPLAYER_PRO_RIG / _THUMBS / _AUTOCONV / _UI).
+    const std::string stages = FormatRenderStages(w);
+    const std::string off = opt_.perf.Off();
     LOG_INFO("perf: render %.2f fps over %.0f s | frame %.2f avg / %.2f max ms, busy %.2f ms (xrWaitFrame %.2f ms), "
              "frame open %.2f / %.2f ms | upload %.2f avg / %.2f max ms (copy %.2f / %.2f ms, %.1f MB, %d thread(s); "
-             "staging allocs %llu, one-off %llu)%s",
+             "staging allocs %llu, one-off %llu) | stages avg/max ms: %s%s%s%s",
              w.fps, w.seconds, w.frameAvgMs, w.frameMaxMs, w.busyAvgMs, w.xrWaitAvgMs, w.frameOpenAvgMs,
              w.frameOpenMaxMs, w.uploadAvgMs, w.uploadMaxMs, w.copyAvgMs, w.copyMaxMs, w.uploadMB, w.copyThreads,
-             (unsigned long long)w.stagingAllocs, (unsigned long long)w.stagingOneOff, cap);
+             (unsigned long long)w.stagingAllocs, (unsigned long long)w.stagingOneOff, stages.c_str(),
+             off.empty() ? "" : " | off: ", off.c_str(), cap);
 }
 
 std::string Station::RigStatusJson() const {
@@ -668,7 +694,7 @@ std::string Station::RigStatusJson() const {
     if (target_.On() && viewerDistanceM_ > 0.0f) out["target"]["viewer_distance_m"] = viewerDistanceM_;
     out["delay_ms"] = delayMs_ > 0.0 ? delayMs_ + (host_.displayPeriodMs ? host_.displayPeriodMs() : 16.7) : 0.0;
     // the render thread: can it show every frame the capture delivers? (docs/PRO.md, check 7)
-    out["render"] = host_.renderPerf ? RenderPerfJson(host_.renderPerf()) : nlohmann::json(nullptr);
+    out["render"] = host_.renderPerf ? RenderPerfJson(host_.renderPerf(), opt_.perf) : nlohmann::json(nullptr);
     if (decklink_.GetState() != LiveState::Closed) {
         // capture health (#141): the "Done when" of a two-input 4K60 run reads these
         const LiveStats ls = decklink_.GetStats();
