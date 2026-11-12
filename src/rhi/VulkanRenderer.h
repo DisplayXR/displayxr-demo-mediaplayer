@@ -24,16 +24,26 @@
 // reuse safe: the frame that last copied from the buffer has finished on the GPU. The copy
 // itself runs in row bands on a small worker pool (rhi/BandCopy.h) when the plane is big
 // enough to pay for it. (A LUT upload is a one-off and keeps its own blocking staging.)
+//
+// Off the render thread (rhi/AsyncUpload.h, MEDIAPLAYER_ASYNC_UPLOAD, on by default): a video /
+// live frame from a FrameRing is copied into staging by the upload thread instead (ahead of
+// the take for a queue-mode ring, else on demand from the take), into STAGING SLOTS of its
+// own; the render thread records only the buffer-to-image copy (StageFrame / CommitUpload).
+// A slot is reused only after the frame that read it has passed its fence (Retire, from
+// OpenFrame), the same guarantee as the per-ring-slot staging above.
 #pragma once
 
 #include <vulkan/vulkan.h>
 
 #include <vk_frame_ring.h>  // displayxr-common: dxr::VkFrameRing (INV-4.10)
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 
+#include "media/FrameRing.h"
+#include "rhi/AsyncUpload.h"
 #include "rhi/BandCopy.h"
 #include "rhi/PushPack.h"
 #include "rhi/RenderPerf.h"
@@ -176,6 +186,21 @@ public:
     bool UploadYUV(const uint8_t* plane0, const uint8_t* plane1, const uint8_t* plane2,
                    uint32_t width, uint32_t height, int format, bool fullRange, int matrix = 0);
     int SourceMatrix() const { return sourceMatrix_; }  // last YUV upload's matrix (UI)
+
+    // Off-thread upload (rhi/AsyncUpload.h; MEDIAPLAYER_ASYNC_UPLOAD, on by default). Every
+    // render-loop iteration: SetUploadSource(the ring the source frames come from, or nullptr),
+    // then for a frame just taken from it StageFrame(ring, frame) in place of UploadYUV
+    // (false: not staged, call UploadYUV as before), then CommitUpload() before the draw.
+    // The copy into staging runs on the upload thread meanwhile; CommitUpload records the
+    // buffer-to-image copy into the frame command buffer, waiting only for a copy that is
+    // still running. Until CommitUpload the frame may still be read: do not acquire from that
+    // ring again before it. A synchronous source upload (UploadTexture / UploadYUV /
+    // BindSharedRGBA) in between replaces the staged frame, as it would have replaced the
+    // uploaded one. All no-ops when the switch is off.
+    bool AsyncUploadOn() const { return uploader_ != nullptr; }
+    void SetUploadSource(FrameRing* ring);
+    bool StageFrame(const FrameRing* ring, const FrameRing::Frame& f);
+    void CommitUpload();
     // The HDR tags of the source just uploaded (#134): transfer 0 SDR, 1 HLG, 2 PQ, 3 scene-
     // linear stored as PQ; BT.2020 primaries; the stream's peak in nits (0 = unknown).
     void SetSourceHdr(int transfer, bool bt2020, float peakNits);
@@ -308,8 +333,8 @@ private:
     // A one-off staging buffer, released by deferDestroy once this frame has executed (the
     // only path before persistent staging). Null on failure.
     void* OneOffStaging(VkDeviceSize bytes, VkBuffer& buffer);
-    bool CreateStaging(Staging& s, VkDeviceSize bytes);
-    bool stagingTypeLogged_ = false;  // the staging memory type, logged at the first creation
+    bool CreateStaging(Staging& s, VkDeviceSize bytes);  // any thread (the upload thread too)
+    std::atomic<bool> stagingTypeLogged_{false};  // the staging memory type, logged at the first creation
     void ReleaseStaging(Staging& s, bool deferred);
     void TrimIdleStaging();  // releases buffers no frame copied from in the last perf window
     // Copy a plane (rows x rowBytes, packed) into mapped staging, in row bands on copyPool_
@@ -319,6 +344,26 @@ private:
     uint64_t trimSerial_ = 0;        // frameSerial_ when the last perf window closed
     int copyThreads_ = 1;            // bandcopy::UploadThreads(), read at Initialize
     std::unique_ptr<bandcopy::Pool> copyPool_;  // made at the first copy that splits
+
+    // Off-thread upload (see the file comment). asyncSlots_[i] is slot i's staging: written by
+    // the upload thread while it fills the slot (EnsureAsyncSlot reallocates it then), read by
+    // the GPU after CommitUpload recorded it, released by TrimIdle / Shutdown while it is free.
+    std::unique_ptr<asyncup::Uploader> uploader_;  // null: MEDIAPLAYER_ASYNC_UPLOAD=0
+    Staging asyncSlots_[asyncup::kMaxSlots];
+    std::atomic<uint64_t> asyncAllocs_{0};         // slot (re)allocations, for perf_
+    FrameRing* uploadSource_ = nullptr;
+    struct PendingUpload {  // staged at the take, recorded at CommitUpload
+        bool active = false;
+        bool cancelled = false;  // a synchronous source upload replaced it meanwhile
+        asyncup::Ticket ticket;
+        const FrameRing::Frame* frame = nullptr;  // the caller still holds it (the fallback copies it)
+        bool fullRange = false;
+        int matrix = 0;
+    } pending_;
+    void* EnsureAsyncSlot(int slot, size_t bytes);  // the upload thread
+    void CancelPendingUpload() {
+        if (pending_.active) pending_.cancelled = true;
+    }
     RenderPerfMeter perf_;
     struct UploadTally {             // one Upload* call: its copies, for perf_
         double copyMs = 0.0;
@@ -425,6 +470,10 @@ private:
     bool RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8_t* data, uint32_t w,
                            uint32_t h, VkFormat fmt, uint32_t bytesPerTexel, bool& recreated,
                            UploadTally& tally);
+    // Its two halves: (re)create plane `idx` for w x h of fmt (the old image to deferDestroy),
+    // and record the copy into it from `buffer` at `offset` with its layout barriers.
+    bool EnsurePlane(int idx, uint32_t w, uint32_t h, VkFormat fmt, bool& recreated);
+    void RecordPlaneCopy(VkCommandBuffer cmd, int idx, VkBuffer buffer, VkDeviceSize offset);
     void NoteUpload(std::chrono::steady_clock::time_point t0, const UploadTally& tally);
     bool EnsureDummy();
     void BindDescriptors(VkDescriptorSet set);  // point the 3 sampler bindings at planes_/dummy

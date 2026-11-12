@@ -594,6 +594,22 @@ static nlohmann::json RenderPerfJson(const RenderPerfWindow& w, const PerfSwitch
         stages[RenderStageName((RenderStage)i)] = {{"avg_ms", r2(w.stages[i].avgMs)}, {"max_ms", r2(w.stages[i].maxMs)}};
     nlohmann::json off = nlohmann::json::array();
     for (const char* n : sw.OffNames()) off.push_back(n);
+    // Off-thread upload (rhi/AsyncUpload): the upload thread's copy, and what became of the
+    // staged frames. upload_avg_ms / stages.upload are the render thread's share.
+    const nlohmann::json async = {{"on", w.asyncUpload},
+                                  {"slots", w.asyncSlots},
+                                  {"copy_threads", w.asyncThreads},
+                                  {"copies", w.asyncCopies},
+                                  {"copied_ahead", w.asyncAhead},
+                                  {"copy_avg_ms", r2(w.asyncCopyAvgMs)},
+                                  {"copy_max_ms", r2(w.asyncCopyMaxMs)},
+                                  {"copy_mb", r2(w.asyncMB)},
+                                  {"taken", w.asyncTaken},
+                                  {"skipped", w.asyncSkipped},
+                                  {"no_free_slot", w.asyncNoSlot},
+                                  {"failed", w.asyncFailed},
+                                  {"wait_avg_ms", r2(w.asyncWaitAvgMs)},
+                                  {"wait_max_ms", r2(w.asyncWaitMaxMs)}};
     return {{"window_s", r2(w.seconds)},
             {"fps", r2(w.fps)},
             {"frame_avg_ms", r2(w.frameAvgMs)},
@@ -611,6 +627,7 @@ static nlohmann::json RenderPerfJson(const RenderPerfWindow& w, const PerfSwitch
             {"copy_threads", w.copyThreads},
             {"staging_allocs", w.stagingAllocs},
             {"staging_one_off", w.stagingOneOff},
+            {"async_upload", async},
             {"stages", stages},
             {"stages_sum_ms", r2(w.StagesSumMs())},
             {"switched_off", off}};
@@ -650,13 +667,14 @@ void Station::LogPerf(bool live) {
     // The render loop's stages, avg / max ms per frame (their sum is busy), and the A/B
     // switches that are off (MEDIAPLAYER_PRO_RIG / _THUMBS / _AUTOCONV / _UI).
     const std::string stages = FormatRenderStages(w);
+    const std::string async = FormatAsyncUpload(w);  // the upload thread's copy, taken / skipped
     const std::string off = opt_.perf.Off();
     LOG_INFO("perf: render %.2f fps over %.0f s | frame %.2f avg / %.2f max ms, busy %.2f ms (xrWaitFrame %.2f ms), "
-             "frame open %.2f / %.2f ms | upload %.2f avg / %.2f max ms (copy %.2f / %.2f ms, %.1f MB, %d thread(s); "
-             "staging allocs %llu, one-off %llu) | stages avg/max ms: %s%s%s%s",
+             "frame open %.2f / %.2f ms | upload %.2f avg / %.2f max ms (render-thread copy %.2f / %.2f ms, %.1f MB, "
+             "%d thread(s); staging allocs %llu, one-off %llu) | %s | stages avg/max ms: %s%s%s%s",
              w.fps, w.seconds, w.frameAvgMs, w.frameMaxMs, w.busyAvgMs, w.xrWaitAvgMs, w.frameOpenAvgMs,
              w.frameOpenMaxMs, w.uploadAvgMs, w.uploadMaxMs, w.copyAvgMs, w.copyMaxMs, w.uploadMB, w.copyThreads,
-             (unsigned long long)w.stagingAllocs, (unsigned long long)w.stagingOneOff, stages.c_str(),
+             (unsigned long long)w.stagingAllocs, (unsigned long long)w.stagingOneOff, async.c_str(), stages.c_str(),
              off.empty() ? "" : " | off: ", off.c_str(), cap);
 }
 

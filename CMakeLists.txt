@@ -282,6 +282,7 @@ function(mp_add_player tgt is_pro)
         src/xr/XrSession.cpp
         src/rhi/VulkanRenderer.cpp
         src/rhi/BandCopy.cpp         # upload copies into staging in row bands (8K live frames)
+        src/rhi/AsyncUpload.cpp      # ...on an upload thread, off the render thread (MEDIAPLAYER_ASYNC_UPLOAD)
         src/media/ImageDecoder.cpp
         src/media/LifLoader.cpp
         src/media/DepthWarp.cpp      # one-view LIF -> stereo pair (#180)
@@ -856,6 +857,15 @@ if(MP_BUILD_TESTS)
     target_include_directories(band_copy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(band_copy_test PRIVATE Threads::Threads)
     add_test(NAME band_copy COMMAND band_copy_test)
+    # The upload copy off the render thread (rhi/AsyncUpload): the staging slots' state machine
+    # (free -> filling -> ready -> in flight -> free, gated by the frame's completion), the
+    # newest-wins pick, the ring's pin (a pinned frame is never handed back to the producer;
+    # cadence and counters unchanged), and the upload thread against a producer thread with
+    # plain memory standing in for the GPU staging.
+    add_executable(async_upload_test tests/async_upload_test.cpp src/rhi/AsyncUpload.cpp src/rhi/BandCopy.cpp)
+    target_include_directories(async_upload_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(async_upload_test PRIVATE Threads::Threads)
+    add_test(NAME async_upload COMMAND async_upload_test)
     # The render thread's perf window (rhi/RenderPerf.h) with the render loop's stages, and
     # Pro's A/B switches (pro/PerfSwitches.h): header-only, pure.
     add_executable(render_perf_test tests/render_perf_test.cpp)

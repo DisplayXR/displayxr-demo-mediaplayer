@@ -185,6 +185,26 @@ bool VulkanRenderer::Initialize(VkPhysicalDevice physicalDevice, VkDevice device
     // itself is made at the first copy big enough to split).
     copyThreads_ = bandcopy::UploadThreads();
 
+    // Off-thread upload (MEDIAPLAYER_ASYNC_UPLOAD, default on): the video / live frames' copy
+    // into staging runs on an upload thread with the same number of copy threads, into
+    // frames-in-flight + 2 staging slots (one being read by each frame in flight, one being
+    // filled, one ready).
+    if (asyncup::Enabled()) {
+        auto up = std::make_unique<asyncup::Uploader>(
+            asyncup::SlotCount(ring_.framesInFlight()), copyThreads_,
+            [this](int slot, size_t bytes) { return EnsureAsyncSlot(slot, bytes); });
+        if (up->Running()) uploader_ = std::move(up);
+        else LOG_WARN("VulkanRenderer: the upload thread did not start; upload copies stay on the render thread");
+    } else {
+        LOG_INFO("VulkanRenderer: upload copies ON the render thread (MEDIAPLAYER_ASYNC_UPLOAD=%s)",
+                 std::getenv("MEDIAPLAYER_ASYNC_UPLOAD"));
+    }
+    perf_.SetAsyncUpload(uploader_ != nullptr, uploader_ ? uploader_->Slots() : 0);
+    if (uploader_)
+        LOG_INFO("VulkanRenderer: upload copies OFF the render thread (MEDIAPLAYER_ASYNC_UPLOAD on): %d staging "
+                 "slots, %d copy thread(s) on the upload thread; a queue-mode ring's frames are copied ahead",
+                 uploader_->Slots(), copyThreads_);
+
     LOG_INFO("VulkanRenderer ready (%u framebuffers, %ux%u, format=%d %s, %u frames in flight, "
              "persistent staging, upload copy on up to %d thread(s))",
              (uint32_t)framebuffers_.size(), width_, height_, (int)format_,
@@ -200,6 +220,13 @@ VkCommandBuffer VulkanRenderer::OpenFrame() {
     const auto t0 = std::chrono::steady_clock::now();
     VkCommandBuffer cmd = ring_.beginFrame();
     perf_.FrameOpen(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    // beginFrame() waited the fence of the frame that used this ring slot N frames ago, and a
+    // fence covers every earlier submission on the queue: every frame up to that one has
+    // finished on the GPU, so the staging slots they copied from may be refilled.
+    if (uploader_ && cmd != VK_NULL_HANDLE) {
+        const uint64_t n = ring_.framesInFlight();
+        if (frameSerial_ > n) uploader_->Retire(frameSerial_ - n);
+    }
     return cmd;
 }
 
@@ -225,11 +252,10 @@ bool VulkanRenderer::CreateStaging(Staging& s, VkDeviceSize bytes) {
     // flush after the CPU copy).
     ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits,
                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (!stagingTypeLogged_ && ai.memoryTypeIndex != UINT32_MAX) {
+    if (ai.memoryTypeIndex != UINT32_MAX && !stagingTypeLogged_.exchange(true)) {
         // Once: where the staging lives (the first host-visible + coherent type). On a
         // discrete GPU it is normally system RAM; a type that is DEVICE_LOCAL too is the BAR
         // heap, which the CPU copy writes over PCIe.
-        stagingTypeLogged_ = true;
         VkPhysicalDeviceMemoryProperties mp;
         vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &mp);
         const VkMemoryType& t = mp.memoryTypes[ai.memoryTypeIndex];
@@ -330,6 +356,12 @@ void VulkanRenderer::TrimIdleStaging() {
         for (Staging& s : user)
             if (s.mapped && s.usedSerial < trimSerial_) ReleaseStaging(s, /*deferred=*/true);
     trimSerial_ = frameSerial_;
+    // The upload thread's slots: one no fill used in the window, and free (no frame reads it,
+    // and the upload thread cannot take it while TrimIdle holds the lock).
+    if (uploader_)
+        uploader_->TrimIdle([this](int slot) {
+            if (asyncSlots_[slot].mapped) ReleaseStaging(asyncSlots_[slot], /*deferred=*/true);
+        });
 }
 
 int VulkanRenderer::CopyToStaging(void* dst, const uint8_t* src, size_t rowBytes, size_t rows) {
@@ -565,9 +597,33 @@ bool VulkanRenderer::ClearViews(uint32_t imageIndex, const ClearColor* colors,
 bool VulkanRenderer::RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8_t* data,
         uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel, bool& recreated,
         UploadTally& tally) {
-    Plane& p = planes_[idx];
     const VkDeviceSize bytes = (VkDeviceSize)w * h * bytesPerTexel;
+    if (!EnsurePlane(idx, w, h, fmt, recreated)) return false;
 
+    // The plane's pixels into host-visible staging: this plane's persistent buffer for the
+    // open frame's ring slot (AcquireStaging: allocated and mapped once, reused every N
+    // frames), else a one-off buffer released once this frame has executed. The copy is the
+    // render thread's biggest per-frame cost at 8K (~50 MB of P016): row bands on copyPool_.
+    // (A video / live frame normally takes the off-thread path instead: StageFrame.)
+    VkBuffer sbuf = VK_NULL_HANDLE;
+    void* mapped = AcquireStaging(idx, bytes, sbuf);
+    if (!mapped) mapped = OneOffStaging(bytes, sbuf);
+    if (!mapped) {
+        LOG_ERROR("plane %d: no staging buffer for %llu bytes", idx, (unsigned long long)bytes);
+        return false;
+    }
+    {
+        const auto c0 = std::chrono::steady_clock::now();
+        tally.threads = std::max(tally.threads, CopyToStaging(mapped, data, (size_t)w * bytesPerTexel, h));
+        tally.copyMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+        tally.bytes += (double)bytes;
+    }
+    RecordPlaneCopy(cmd, idx, sbuf, 0);
+    return true;
+}
+
+bool VulkanRenderer::EnsurePlane(int idx, uint32_t w, uint32_t h, VkFormat fmt, bool& recreated) {
+    Plane& p = planes_[idx];
     recreated = (p.image == VK_NULL_HANDLE || p.w != w || p.h != h || p.fmt != fmt);
     if (recreated) {
         // A queued frame may still sample the old plane: release it only once the GPU
@@ -630,24 +686,12 @@ bool VulkanRenderer::RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8
             return false;
         }
     }
+    return true;
+}
 
-    // The plane's pixels into host-visible staging: this plane's persistent buffer for the
-    // open frame's ring slot (AcquireStaging: allocated and mapped once, reused every N
-    // frames), else a one-off buffer released once this frame has executed. The copy is the
-    // render thread's biggest per-frame cost at 8K (~50 MB of P016): row bands on copyPool_.
-    VkBuffer sbuf = VK_NULL_HANDLE;
-    void* mapped = AcquireStaging(idx, bytes, sbuf);
-    if (!mapped) mapped = OneOffStaging(bytes, sbuf);
-    if (!mapped) {
-        LOG_ERROR("plane %d: no staging buffer for %llu bytes", idx, (unsigned long long)bytes);
-        return false;
-    }
-    {
-        const auto c0 = std::chrono::steady_clock::now();
-        tally.threads = std::max(tally.threads, CopyToStaging(mapped, data, (size_t)w * bytesPerTexel, h));
-        tally.copyMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
-        tally.bytes += (double)bytes;
-    }
+void VulkanRenderer::RecordPlaneCopy(VkCommandBuffer cmd, int idx, VkBuffer sbuf, VkDeviceSize offset) {
+    Plane& p = planes_[idx];
+    const uint32_t w = p.w, h = p.h;
 
     VkImageMemoryBarrier toDst = {};
     toDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -664,6 +708,7 @@ bool VulkanRenderer::RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8
                          1, &toDst);
 
     VkBufferImageCopy copy = {};
+    copy.bufferOffset = offset;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {w, h, 1};
     vkCmdCopyBufferToImage(cmd, sbuf, p.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
@@ -676,7 +721,6 @@ bool VulkanRenderer::RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &toRead);
     p.initialized = true;
-    return true;
 }
 
 // Record N plane uploads into the FRAME command buffer, ahead of the DrawViews pass that
@@ -684,7 +728,32 @@ bool VulkanRenderer::RecordPlaneUpload(VkCommandBuffer cmd, int idx, const uint8
 // wait: the frame's single submit carries upload + draw + HUD (INV-4.10).
 namespace {
 struct PlaneSpec { const uint8_t* data; uint32_t w, h; VkFormat fmt; uint32_t bpt; };
+
+// UploadYUV's planes for format 0 (I420: Y, U, V), 1 (NV12: Y, interleaved UV) or 2 (P016:
+// NV12 with 16-bit samples): texel formats, sizes (chroma (w+1)/2 x (h+1)/2) and bytes per
+// texel. Returns the plane count and the shader mode (1 I420, 2 NV12 / P016). The off-thread
+// commit uses the same, so both paths make the same images.
+int YuvPlaneSpecs(int format, uint32_t width, uint32_t height, const uint8_t* plane0, const uint8_t* plane1,
+                  const uint8_t* plane2, PlaneSpec specs[3], int& mode) {
+    const uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
+    specs[0] = {plane0, width, height, VK_FORMAT_R8_UNORM, 1};
+    if (format == 2) {  // P016 (Pro 10-bit capture): 16-bit planes, sampled as NV12
+        specs[0] = {plane0, width, height, VK_FORMAT_R16_UNORM, 2};
+        specs[1] = {plane1, cw, ch, VK_FORMAT_R16G16_UNORM, 4};
+        mode = 2;
+        return 2;
+    }
+    if (format == 1) {
+        specs[1] = {plane1, cw, ch, VK_FORMAT_R8G8_UNORM, 2};
+        mode = 2;
+        return 2;
+    }
+    specs[1] = {plane1, cw, ch, VK_FORMAT_R8_UNORM, 1};
+    specs[2] = {plane2, cw, ch, VK_FORMAT_R8_UNORM, 1};
+    mode = 1;
+    return 3;
 }
+}  // namespace
 
 bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t height) {
     if (!rgba || width == 0 || height == 0) return false;
@@ -702,6 +771,7 @@ bool VulkanRenderer::UploadTexture(const uint8_t* rgba, uint32_t width, uint32_t
                                       rec, tally);
     if (!ok) return false;
     NoteUpload(t0, tally);
+    CancelPendingUpload();  // this picture replaces a frame staged earlier in this iteration
 
     sourceMode_ = 0;
     sourceFullRange_ = 0.0f;
@@ -719,28 +789,11 @@ bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, con
 #endif
     if (format == 0 && !plane2) return false;
     if (!EnsureDummy()) return false;
-    const uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
 
-    // 0 = I420 (Y, U, V); 1 = NV12 (Y, interleaved UV).
+    // 0 = I420 (Y, U, V); 1 = NV12 (Y, interleaved UV); 2 = P016.
     PlaneSpec specs[3];
-    int count;
-    int mode;
-    specs[0] = {plane0, width, height, VK_FORMAT_R8_UNORM, 1};
-    if (format == 2) {  // P016 (Pro 10-bit capture): 16-bit planes, sampled as NV12
-        specs[0] = {plane0, width, height, VK_FORMAT_R16_UNORM, 2};
-        specs[1] = {plane1, cw, ch, VK_FORMAT_R16G16_UNORM, 4};
-        count = 2;
-        mode = 2;
-    } else if (format == 1) {
-        specs[1] = {plane1, cw, ch, VK_FORMAT_R8G8_UNORM, 2};
-        count = 2;
-        mode = 2;
-    } else {
-        specs[1] = {plane1, cw, ch, VK_FORMAT_R8_UNORM, 1};
-        specs[2] = {plane2, cw, ch, VK_FORMAT_R8_UNORM, 1};
-        count = 3;
-        mode = 1;
-    }
+    int mode = 1;
+    const int count = YuvPlaneSpecs(format, width, height, plane0, plane1, plane2, specs, mode);
 
     VkCommandBuffer cmd = FrameCmd();
     if (cmd == VK_NULL_HANDLE) return false;
@@ -754,6 +807,7 @@ bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, con
     }
     if (!ok) return false;
     NoteUpload(t0, tally);
+    CancelPendingUpload();  // this frame replaces one staged earlier in this iteration
 
     sourceMode_ = mode;
     sourceFullRange_ = fullRange ? 1.0f : 0.0f;
@@ -762,6 +816,112 @@ bool VulkanRenderer::UploadYUV(const uint8_t* plane0, const uint8_t* plane1, con
     // Descriptor sets are written per frame (DrawViews), so nothing to rebind here.
     if (rec[0]) LOG_INFO("VulkanRenderer: YUV source %ux%u mode=%d", width, height, mode);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Off-thread upload (rhi/AsyncUpload.h)
+// ---------------------------------------------------------------------------
+
+void VulkanRenderer::SetUploadSource(FrameRing* ring) {
+    if (!uploader_ || ring == uploadSource_) return;
+    uploadSource_ = ring;
+    uploader_->SetSource(ring);  // copies a queue-mode ring's waiting frames ahead
+}
+
+bool VulkanRenderer::StageFrame(const FrameRing* ring, const FrameRing::Frame& f) {
+    if (!uploader_ || !ring) return false;
+    if (pending_.active) CommitUpload();  // one take per iteration; keep the order if not
+    // Open the frame's command buffer now, as UploadYUV did at the take: its fence wait
+    // retires the slots of the frame N back before this frame claims one.
+    if (FrameCmd() == VK_NULL_HANDLE) return false;
+    // Copied ahead (or being copied), else handed to the upload thread now. Invalid: a
+    // frame the async path does not take (zero-copy, RGBA) or no free slot: UploadYUV.
+    const asyncup::Ticket t = uploader_->Claim(ring, f);
+    if (!t.Valid()) return false;
+    pending_ = PendingUpload{};
+    pending_.active = true;
+    pending_.ticket = t;
+    pending_.frame = &f;
+    pending_.fullRange = f.fullRange;
+    pending_.matrix = (int)f.matrix;
+    return true;
+}
+
+void VulkanRenderer::CommitUpload() {
+    if (!pending_.active) return;
+    const PendingUpload p = pending_;
+    pending_ = PendingUpload{};
+    const auto t0 = std::chrono::steady_clock::now();
+    // Blocks only while the copy is still running. After it the upload thread no longer reads
+    // the caller's frame, so the caller may acquire from its ring again.
+    const asyncup::Uploader::Done d = uploader_->Wait(p.ticket);
+    if (p.cancelled) {  // a synchronous upload replaced this frame meanwhile: never recorded
+        uploader_->Cancel(p.ticket);
+        return;
+    }
+    if (!d.ok) {
+        // The upload thread got no staging memory for it: copy it here, as before. The caller
+        // still holds the frame (it has not acquired since StageFrame).
+        uploader_->Cancel(p.ticket);
+        const FrameRing::Frame& f = *p.frame;
+        const int format = asyncup::UploadFormat(f.format);
+        UploadYUV(f.plane[0].data(), f.plane[1].data(), format == 0 ? f.plane[2].data() : nullptr,
+                  (uint32_t)f.width, (uint32_t)f.height, format, p.fullRange, p.matrix);
+        return;
+    }
+#if defined(_WIN32)
+    sharedActive_ = false;  // CPU-plane upload -> leave the zero-copy path
+#endif
+    const asyncup::Layout& L = d.layout;
+    PlaneSpec specs[3];
+    int mode = 1;
+    const int count = YuvPlaneSpecs(L.format, L.w[0], L.h[0], nullptr, nullptr, nullptr, specs, mode);
+    bool rec[3] = {false, false, false};
+    // As UploadYUV: the frame's command buffer first (opening it retires finished slots), then
+    // the planes' images.
+    VkCommandBuffer cmd = (count == L.planes && EnsureDummy()) ? FrameCmd() : VK_NULL_HANDLE;
+    bool ok = cmd != VK_NULL_HANDLE;
+    for (int i = 0; i < count && ok; ++i) ok = EnsurePlane(i, specs[i].w, specs[i].h, specs[i].fmt, rec[i]);
+    if (!ok) {
+        uploader_->Cancel(p.ticket);  // nothing recorded: the GPU never reads this fill
+        LOG_ERROR("VulkanRenderer: could not record the staged frame (planes / command buffer)");
+        return;
+    }
+    // Only the GPU copy is recorded here; the slot stays the GPU's until this frame has
+    // passed its fence (Record, then Retire from OpenFrame N frames on).
+    const VkBuffer buffer = asyncSlots_[p.ticket.slot].buffer;
+    for (int i = 0; i < count; ++i) RecordPlaneCopy(cmd, i, buffer, (VkDeviceSize)L.offset[i]);
+    uploader_->Record(p.ticket, frameSerial_);
+
+    sourceMode_ = mode;
+    sourceFullRange_ = p.fullRange ? 1.0f : 0.0f;
+    source16_ = (L.format == 2);
+    sourceMatrix_ = (p.matrix == 1 || p.matrix == 2) ? p.matrix : 0;  // anything else -> BT.709
+    // The render thread's share of the upload (the wait, if any, and the recording); the copy
+    // itself is the upload thread's (perf_.AsyncCopies).
+    perf_.Upload(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), 0.0,
+                 (double)L.total, d.threads);
+    perf_.AsyncTaken(d.waitMs);
+    if (rec[0])
+        LOG_INFO("VulkanRenderer: YUV source %ux%u mode=%d (copied into staging off the render thread)", L.w[0],
+                 L.h[0], mode);
+}
+
+void* VulkanRenderer::EnsureAsyncSlot(int slot, size_t bytes) {
+    // The upload thread, for a slot it is filling: Free -> Filling, so no submitted frame
+    // reads it (the frame that last did has passed its fence: SlotTable::Retire) and the
+    // render thread does not touch it. An old buffer of the wrong size can go at once.
+    if (slot < 0 || slot >= asyncup::kMaxSlots || bytes == 0) return nullptr;
+    Staging& s = asyncSlots_[slot];
+    if (s.mapped && bytes <= s.size && bytes >= s.size / 2) return s.mapped;
+    ReleaseStaging(s, /*deferred=*/false);
+    if (!CreateStaging(s, (VkDeviceSize)bytes)) {
+        LOG_WARN("VulkanRenderer: staging slot %d of %llu bytes failed; that frame is copied on the render thread",
+                 slot, (unsigned long long)bytes);
+        return nullptr;
+    }
+    asyncAllocs_.fetch_add(1, std::memory_order_relaxed);
+    return s.mapped;
 }
 
 void VulkanRenderer::SetSourceHdr(int transfer, bool bt2020, float peakNits) {
@@ -828,25 +988,9 @@ bool VulkanRenderer::UploadCompareYUV(const uint8_t* plane0, const uint8_t* plan
     if (!plane0 || !plane1 || width == 0 || height == 0) return false;
     if (format == 0 && !plane2) return false;
     if (!EnsureDummy()) return false;
-    const uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
     PlaneSpec specs[3];
-    int count, mode;
-    specs[0] = {plane0, width, height, VK_FORMAT_R8_UNORM, 1};
-    if (format == 2) {
-        specs[0] = {plane0, width, height, VK_FORMAT_R16_UNORM, 2};
-        specs[1] = {plane1, cw, ch, VK_FORMAT_R16G16_UNORM, 4};
-        count = 2;
-        mode = 2;
-    } else if (format == 1) {
-        specs[1] = {plane1, cw, ch, VK_FORMAT_R8G8_UNORM, 2};
-        count = 2;
-        mode = 2;
-    } else {
-        specs[1] = {plane1, cw, ch, VK_FORMAT_R8_UNORM, 1};
-        specs[2] = {plane2, cw, ch, VK_FORMAT_R8_UNORM, 1};
-        count = 3;
-        mode = 1;
-    }
+    int mode = 1;
+    const int count = YuvPlaneSpecs(format, width, height, plane0, plane1, plane2, specs, mode);
     VkCommandBuffer cmd = FrameCmd();
     if (cmd == VK_NULL_HANDLE) return false;
     const auto t0 = std::chrono::steady_clock::now();
@@ -1156,6 +1300,10 @@ void VulkanRenderer::SubmitFrame() {
         submitErrLogged_ = true;
         LOG_ERROR("frame vkQueueSubmit failed: %d (logged once)", (int)r);
     }
+    if (uploader_) {  // the upload thread's copies since the last frame, into this window
+        perf_.AsyncCopies(uploader_->TakeTally());
+        perf_.CountStagingAllocs(asyncAllocs_.exchange(0, std::memory_order_relaxed));
+    }
     if (perf_.FrameSubmitted(PerfNow())) TrimIdleStaging();  // a perf window closed (~10 s)
 #if defined(_WIN32)
     // Zero-copy (#28): the D3D11 producer refills its shared textures with no GPU-side
@@ -1269,6 +1417,7 @@ bool VulkanRenderer::BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t
     if (!sharedHandle) return false;
     SharedImport* imp = ImportSharedRGBA(sharedHandle, width, height);
     if (!imp) return false;
+    CancelPendingUpload();  // this frame replaces one staged earlier in this iteration
     if (planes_[0].view != VK_NULL_HANDLE) DestroyTexture();  // drop CPU planes; sample the import
     sharedActive_ = true;
     sharedImage_ = imp->image;
@@ -1302,7 +1451,9 @@ void VulkanRenderer::ClearSharedImports() {
 
 void VulkanRenderer::DestroyTexture() {
     // Queued frames may still sample these: release them once the GPU is past every frame
-    // submitted so far (immediately when the ring is not up).
+    // submitted so far (immediately when the ring is not up). A frame staged for these planes
+    // is not recorded after this.
+    CancelPendingUpload();
     VkDevice dev = device_;
     for (int idx = 0; idx < 3; ++idx) {  // the source's planes; B (3..5) is ClearCompare's
         Plane& p = planes_[idx];
@@ -1567,6 +1718,11 @@ bool VulkanRenderer::DumpExternalImage(VkImage image, uint32_t width, uint32_t h
 
 void VulkanRenderer::Shutdown() {
     if (device_ == VK_NULL_HANDLE) return;
+    // The upload thread first: it finishes a copy in progress, unpins, unhooks its ring and
+    // joins. A staged frame not recorded by now never will be.
+    pending_ = PendingUpload{};
+    uploader_.reset();
+    uploadSource_ = nullptr;
     vkDeviceWaitIdle(device_);
 #if defined(_WIN32)
     ClearSharedImports();  // zero-copy (#28) imported textures
@@ -1579,6 +1735,7 @@ void VulkanRenderer::Shutdown() {
     ring_.destroy();  // waits its fences, runs the deferred releases, frees cmds/fences
     for (auto& user : staging_)  // the device is idle (above): release now
         for (Staging& s : user) ReleaseStaging(s, /*deferred=*/false);
+    for (Staging& s : asyncSlots_) ReleaseStaging(s, /*deferred=*/false);
     copyPool_.reset();  // joins the copy threads
     if (sampler_) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
     if (descPool_) { vkDestroyDescriptorPool(device_, descPool_, nullptr); descPool_ = VK_NULL_HANDLE; }

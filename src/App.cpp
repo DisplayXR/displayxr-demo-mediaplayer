@@ -783,8 +783,16 @@ void App::RenderOneFrame() {
     // frame command buffer that is submitted once. The normal path calls SubmitFrame()
     // explicitly before releasing the HUD / atlas images; this backstop covers every
     // early return (e.g. xrBeginFrame failing after an upload was recorded) so a
-    // recorded frame is never left open. No-op when nothing is open.
-    struct SubmitGuard { VulkanRenderer& r; ~SubmitGuard() { r.SubmitFrame(); } } submitGuard{renderer_};
+    // recorded frame is never left open. No-op when nothing is open. It commits a frame
+    // staged off the render thread first (normally already committed after BeginFrame), so
+    // no copy of a ring frame outlives this call.
+    struct SubmitGuard {
+        VulkanRenderer& r;
+        ~SubmitGuard() {
+            r.CommitUpload();
+            r.SubmitFrame();
+        }
+    } submitGuard{renderer_};
 
     // Advance UI fades + the slideshow machine (may swap media at a fade's mid-black).
     TickUi();
@@ -822,6 +830,10 @@ void App::RenderOneFrame() {
     FrameRing* ring = isLive_     ? (livePaused_ ? nullptr : &live_->Ring())
                       : isStream_ ? (streamPaused_ ? nullptr : &video_.Ring())
                                   : (isVideo_ ? &video_.Ring() : nullptr);
+    // Off-thread upload (rhi/AsyncUpload): the upload thread copies this ring's waiting frames
+    // into staging ahead of the take (queue mode, the live sources), and a frame taken below
+    // on demand. The frame stays ours (no AcquireLatest) until CommitUpload after BeginFrame.
+    renderer_.SetUploadSource(ring);
     if (ring) {
         // Stage "upload": this block, less the Pro hooks and the auto-convergence sampling
         // inside it, which are stages of their own (nestedMs).
@@ -875,12 +887,15 @@ void App::RenderOneFrame() {
                                                  (uint32_t)vf->height);
 #endif
             if (!bound) {
+                // Staged off the render thread (copied ahead, or now while we go on), recorded
+                // at CommitUpload; else (MEDIAPLAYER_ASYNC_UPLOAD=0, no free slot) copied here.
                 const bool i420 = (vf->format == PixFormat::I420);
-                renderer_.UploadYUV(vf->plane[0].data(), vf->plane[1].data(),
-                                    i420 ? vf->plane[2].data() : nullptr, (uint32_t)vf->width,
-                                    (uint32_t)vf->height,
-                                    i420 ? 0 : vf->format == PixFormat::P016 ? 2 : 1, vf->fullRange,
-                                    (int)vf->matrix);  // the frame's colour tag (BT.709 default)
+                if (!renderer_.StageFrame(ring, *vf))
+                    renderer_.UploadYUV(vf->plane[0].data(), vf->plane[1].data(),
+                                        i420 ? vf->plane[2].data() : nullptr, (uint32_t)vf->width,
+                                        (uint32_t)vf->height,
+                                        i420 ? 0 : vf->format == PixFormat::P016 ? 2 : 1, vf->fullRange,
+                                        (int)vf->matrix);  // the frame's colour tag (BT.709 default)
 #if MEDIAPLAYER_PRO
                 // HDR (#134): the shader maps HLG / PQ / scene-linear EXR to the SDR panel. A
                 // live source tags HDR but not primaries; HDR on the BT.2020 matrix is BT.2020.
@@ -928,6 +943,15 @@ void App::RenderOneFrame() {
     const bool begun = xr_.BeginFrame(frame);
     renderer_.NoteXrWait(frame.waitFrameMs);
     renderer_.NoteStage(RenderStage::XrBegin, StageMs(begin0) - frame.waitFrameMs);
+    {
+        // The frame staged above: its copy ran on the upload thread meanwhile (the Pro hooks,
+        // xrWaitFrame); record its GPU copy now, waiting only for what is left of the copy.
+        // Before the `begun` check, as the synchronous upload was recorded before BeginFrame.
+        // Part of the upload stage. After it the ring frame is no longer read.
+        const StageClock::time_point commit0 = StageClock::now();
+        renderer_.CommitUpload();
+        renderer_.NoteStage(RenderStage::Upload, StageMs(commit0));
+    }
     if (!begun) return;
 
     XrSession::ViewRect rects[XrSession::kMaxViews];          // full per-view tiles (submitted)
@@ -1618,6 +1642,7 @@ void App::UpdateFps() {
 }
 
 void App::Shutdown() {
+    renderer_.SetUploadSource(nullptr);  // the upload thread lets go of the live ring first
     autoConvWorker_.Stop();  // #92
 #if MEDIAPLAYER_PRO
     pro_.GetStation().Shutdown();  // Pro live inputs (DeckLink / test rig) join their threads

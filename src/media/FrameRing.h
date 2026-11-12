@@ -8,6 +8,10 @@
 //
 // Frames carry planar YUV (the decoder's native output: I420 or NV12) so the GPU does
 // the colour convert + downscale — no swscale on the decode thread.
+//
+// In queue mode the renderer's upload thread may pin the next waiting frame and copy it into
+// GPU staging before the consumer takes it (PinNextQueued, rhi/AsyncUpload.h); a pinned
+// buffer is never handed back to the producer until it is unpinned.
 #pragma once
 
 #include <algorithm>
@@ -89,12 +93,15 @@ public:
     // Call before the producer starts; 0 = latest-wins (the default).
     void SetQueueDepth(int depth) {
         std::lock_guard<std::mutex> lk(mutex_);
-        queueDepth_ = depth <= 0 ? 0 : std::min(std::max(depth, 2), kMaxBuffers - 2);
+        // At most kMaxBuffers - 3: the producer's, the consumer's and a pinned one (below)
+        // must fit beside a full queue.
+        queueDepth_ = depth <= 0 ? 0 : std::min(std::max(depth, 2), kMaxBuffers - 3);
         queueLen_ = 0;
         queueHead_ = 0;
         freeCount_ = 0;
         for (int i = 0; i < kMaxBuffers; ++i)
-            if (i != producer_ && i != consumer_) free_[freeCount_++] = i;
+            if (i != producer_ && i != consumer_ && i != pinned_) free_[freeCount_++] = i;
+        pinnedParked_ = pinned_ >= 0;  // a pin held across this goes to the free list at Unpin
         windowAcquires_ = 0;
         windowMinBacklog_ = kMaxBuffers;
         hasNew_ = false;
@@ -119,24 +126,67 @@ public:
     bool Publish() {
         std::lock_guard<std::mutex> lk(mutex_);
         buffers_[producer_].serial = ++serial_;
+        bool dropped = false;
         if (queueDepth_ > 0) {
-            bool dropped = false;
             if (queueLen_ == queueDepth_) {  // full: drop the oldest waiting frame
-                free_[freeCount_++] = queue_[queueHead_];
+                ReleaseLocked(queue_[queueHead_]);
                 queueHead_ = (queueHead_ + 1) % kMaxBuffers;
                 --queueLen_;
                 dropped = true;
             }
             queue_[(queueHead_ + queueLen_) % kMaxBuffers] = producer_;
             ++queueLen_;
-            producer_ = free_[--freeCount_];
+            producer_ = free_[--freeCount_];  // never the pinned buffer (ReleaseLocked parks it)
             everPublished_ = true;
-            return dropped;
+        } else {
+            std::swap(producer_, middle_);
+            dropped = hasNew_;
+            hasNew_ = true;
         }
-        std::swap(producer_, middle_);
-        const bool dropped = hasNew_;
-        hasNew_ = true;
+        if (publishHook_) publishHook_(publishHookCtx_);
         return dropped;
+    }
+
+    // --- Pre-staging (the renderer's upload thread, rhi/AsyncUpload.h) ---
+    // Queue mode only. The oldest waiting frame with a serial above `afterSerial` that has
+    // CPU planes (not a zero-copy `gpu` frame), PINNED: until Unpin() its buffer is never
+    // handed back to the producer. A drop of the oldest waiting frame, a trim, or the
+    // consumer moving on parks it instead, and Unpin() frees it then. The consumer may still
+    // acquire a pinned frame (both sides only read it), so the cadence, the drops, the trims
+    // and the repeats are exactly those of an unpinned ring. One pin at a time: nullptr when
+    // a pin is held, nothing qualifies, or the ring is latest-wins.
+    const Frame* PinNextQueued(int64_t afterSerial) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (queueDepth_ <= 0 || pinned_ >= 0) return nullptr;
+        for (int i = 0; i < queueLen_; ++i) {
+            const int b = queue_[(queueHead_ + i) % kMaxBuffers];
+            if (buffers_[b].serial > afterSerial && !buffers_[b].gpu) {
+                pinned_ = b;
+                pinnedParked_ = false;
+                return &buffers_[b];
+            }
+        }
+        return nullptr;
+    }
+    void Unpin(const Frame* f) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (pinned_ < 0 || f != &buffers_[pinned_]) return;
+        if (pinnedParked_) free_[freeCount_++] = pinned_;  // released while pinned: free it now
+        pinned_ = -1;
+        pinnedParked_ = false;
+    }
+    bool IsPinned(const Frame* f) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return pinned_ >= 0 && f == &buffers_[pinned_];
+    }
+    // Called on the producer's thread, under the ring's lock, at the end of every Publish():
+    // the pre-stager's wake-up, so keep it short and never call back into the ring. nullptr
+    // removes it; once this returns, the previous hook is never called again.
+    using PublishHook = void (*)(void* ctx);
+    void SetPublishHook(PublishHook fn, void* ctx) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        publishHook_ = fn;
+        publishHookCtx_ = fn ? ctx : nullptr;
     }
 
     // --- Consumer (render thread) ---
@@ -152,7 +202,14 @@ public:
     }
 
 private:
-    static constexpr int kMaxBuffers = 6;  // producer + consumer + up to 4 waiting
+    static constexpr int kMaxBuffers = 7;  // producer + consumer + up to 4 waiting + 1 pinned
+
+    // A queue-mode buffer the ring is done with: back to the free list, or parked until
+    // Unpin() when it is pinned (the upload thread is still copying it).
+    void ReleaseLocked(int b) {
+        if (b == pinned_) pinnedParked_ = true;
+        else free_[freeCount_++] = b;
+    }
 
     const Frame* AcquireQueuedLocked() {
         if (queueLen_ == 0) {
@@ -160,7 +217,7 @@ private:
             NoteBacklogLocked(0);
             return nullptr;
         }
-        free_[freeCount_++] = consumer_;
+        ReleaseLocked(consumer_);
         consumer_ = queue_[queueHead_];
         queueHead_ = (queueHead_ + 1) % kMaxBuffers;
         --queueLen_;
@@ -177,7 +234,7 @@ private:
         windowMinBacklog_ = std::min(windowMinBacklog_, backlog);
         if (++windowAcquires_ < kTrimWindow) return;
         if (windowMinBacklog_ >= 2 && queueLen_ > 0) {
-            free_[freeCount_++] = queue_[queueHead_];
+            ReleaseLocked(queue_[queueHead_]);
             queueHead_ = (queueHead_ + 1) % kMaxBuffers;
             --queueLen_;
             ++trimmed_;
@@ -202,6 +259,12 @@ private:
     bool everPublished_ = false;
     int windowAcquires_ = 0, windowMinBacklog_ = kMaxBuffers;
     uint64_t trimmed_ = 0, repeated_ = 0;
+    // Pre-staging (queue mode): the pinned buffer, and whether the ring released it while
+    // pinned (it goes to the free list at Unpin).
+    int pinned_ = -1;
+    bool pinnedParked_ = false;
+    PublishHook publishHook_ = nullptr;
+    void* publishHookCtx_ = nullptr;
 };
 
 } // namespace mp
