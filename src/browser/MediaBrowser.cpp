@@ -548,7 +548,11 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
             if (it == sharpen_.end()) return;
             edge = it->second;
         } else {
-            edge = ThumbnailEdge(item.width, item.height, classifier_.Get(item).layout, need, atlas_.Tile(), kFetchCap);
+            // Photos keep the system's cached thumbnail at one slot, as before #223: they were
+            // sharp enough, and decoding the file for each tile takes CPU that opening one needs.
+            edge = item.type == MediaType::Video
+                       ? ThumbnailEdge(item.width, item.height, classifier_.Get(item).layout, need, atlas_.Tile(), kFetchCap)
+                       : atlas_.Tile();
         }
         want.push_back(ThumbnailRequest{item.id, classifier_.NeedsFileCheck(item), edge});
     };
@@ -749,13 +753,13 @@ void MediaBrowser::UploadReady(const std::unordered_set<int64_t>& window, uint32
             ++it;
             continue;
         }
-        // Shown soft (3D found from the thumbnail itself, so it was asked for as 2D; black bars
-        // taken off; a size the provider did not report): ask once more, larger.
+        // A video shown soft (3D found from the thumbnail itself, so it was asked for as 2D;
+        // black bars taken off; a size the provider did not report): ask once more, larger.
         sharpen_.erase(t.id);
         const uint32_t shorter = std::min(r.w, r.h), longer = std::max(r.w, r.h);
         const uint32_t own = item ? std::max(item->width, item->height) : 0;
         const uint32_t made = std::max(t.width, t.height);
-        if (!sharpened_.count(t.id) && shorter < kSoft * (float)need && longer < tile && (own == 0 || made < own)) {
+        if (bars && !sharpened_.count(t.id) && shorter < kSoft * (float)need && longer < tile && (own == 0 || made < own)) {
             const double scale = std::min((double)need / std::max(1u, shorter), (double)tile / std::max(1u, longer));
             uint32_t edge = (uint32_t)std::ceil(scale * made);
             edge = std::min(edge, own > 0 ? std::min(own, kFetchCap) : kFetchCap);
