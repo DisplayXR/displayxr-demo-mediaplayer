@@ -147,6 +147,7 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/media/StereoCompose.cpp
     ${REPO_ROOT}/src/media/AutoConvergence.cpp
     ${REPO_ROOT}/src/media/ImageDecoder.cpp
+    ${REPO_ROOT}/src/media/Letterbox.cpp       # black bars off a grid thumbnail (#180)
     # The player's Dear ImGui chrome, SHARED VERBATIM with the desktop legs. This is
     # what makes the Android UI the same UI rather than a lookalike. ImGuiLayer builds
     # here WITHOUT MEDIAPLAYER_IMGUI_SDL, so its SDL3 platform backend compiles out and
@@ -163,6 +164,7 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/browser/StereoClassifier.cpp
     ${REPO_ROOT}/src/browser/ThumbnailAtlas.cpp
     ${REPO_ROOT}/src/browser/ThumbnailCache.cpp
+    ${REPO_ROOT}/src/browser/TileCrop.cpp
     ${REPO_ROOT}/src/browser/TouchScroller.cpp
     browser/AndroidMediaProvider.cpp
     neighbour_stills.cpp

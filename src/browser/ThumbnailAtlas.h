@@ -42,9 +42,10 @@ public:
     uint32_t Tile() const { return tile_; }
     uint32_t SlotCount() const { return (uint32_t)sizes_.size(); }
 
-    // Copy a w x h image into `slot`. False if the slot or size is out of range, or if this
-    // frame's upload budget is spent (then try again next frame).
-    bool Upload(int slot, const uint8_t* rgba, uint32_t w, uint32_t h);
+    // Copy a w x h image into `slot`, its rows `rowStride` bytes apart (0: w * 4, so a part
+    // of a larger image can go in directly). False if the slot or size is out of range, or
+    // if this frame's upload budget is spent (then try again next frame).
+    bool Upload(int slot, const uint8_t* rgba, uint32_t w, uint32_t h, size_t rowStride = 0);
     // Record this frame's uploads into the frame command buffer, before
     // ImGuiLayer::RenderToHud draws with them.
     void RecordUploads(VkCommandBuffer cmd);
