@@ -54,6 +54,12 @@ struct TransportCaps {
     // The touch player's way back to the gallery (#180): a back arrow (the browser's own)
     // in place of the "Open" text button. DEFAULT FALSE; Android sets it.
     bool gallery = false;
+    // The touch player's layout (#180). DEFAULT FALSE; Android sets it. Instead of the flat
+    // bars: gradient scrims at the top and bottom, the back arrow then the file's name left
+    // aligned (and its place in the list under it), and the 2D/3D switch as a labelled
+    // "2D | 3D" control, docked at the end of the transport row for a video and alone
+    // bottom right for a still. Times and names use the touch type scale.
+    bool touchLayout = false;
 };
 
 // One row of the "Convert to 3D" provider selector: the runtime's verbatim provider name
@@ -85,6 +91,7 @@ struct TransportState {
     bool hasMedia = false;
     bool isVideo = false;
     std::string mediaFilename;  // basename only; the caller does the path work
+    std::string mediaPosition;  // "12 / 112": its place in the list browsed; touch layout only
     std::string modeName;       // e.g. "2x1 Stereo"
     bool mode3D = false;        // the 2D/3D switch's side; only read when caps.modeSwitch
     std::string layoutName;     // e.g. "SBS-half"

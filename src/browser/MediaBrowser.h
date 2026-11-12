@@ -69,6 +69,9 @@ public:
     // Make the item `step` places away the one last opened, without opening it: the player
     // shows it already.
     bool StepTo(int step);
+    // The item last opened from the grid: its index in grid order and how many the grid
+    // holds. False when none was (the system picker) or it is no longer in the grid.
+    bool OpenedPosition(int& index, int& count) const;
     // Whether Back() has something to do: leave select mode, or go up a folder.
     bool CanGoBack() const;
     bool Back();

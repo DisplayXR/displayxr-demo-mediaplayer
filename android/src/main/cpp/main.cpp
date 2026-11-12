@@ -1556,10 +1556,12 @@ fill_transport_state()
 		std::lock_guard<std::mutex> lk(g_pick_name_mx);
 		g_ui_state.mediaFilename = g_pick_name;
 	}
-	// Make container-level stereo visible without a logcat: `[LVF]` on the filename
-	// says "this file's two eyes came from two tracks", which is the one thing a
-	// human cannot tell by looking at the picture.
-	if (g_stereo_dual) g_ui_state.mediaFilename = "[LVF] " + g_ui_state.mediaFilename;
+	// Its place in the list browsed, "12 / 112" under the name (#180); none after the picker.
+	g_ui_state.mediaPosition.clear();
+	int index = 0, count = 0;
+	if (g_ui_state.hasMedia && g_browser_ready.load(std::memory_order_relaxed) &&
+	    g_browser.OpenedPosition(index, count) && count > 1)
+		g_ui_state.mediaPosition = std::to_string(index + 1) + " / " + std::to_string(count);
 	g_ui_state.layoutName = mp::MediaSource::LayoutName(g_layout);
 	g_ui_state.positionSeconds = g_is_video ? g_video.positionSeconds() : 0.0;
 	g_ui_state.durationSeconds = g_is_video ? g_video.durationSeconds() : 0.0;
@@ -1775,6 +1777,7 @@ hud_init()
 	g_ui_state.caps.mode = false;
 	g_ui_state.caps.layout = false;
 	g_ui_state.caps.gallery = true;
+	g_ui_state.caps.touchLayout = true;  // scrims, left-aligned name, docked 2D | 3D (#180)
 	g_ui_state.hitTargetScale = 1.35f;
 
 	g_ui_actions.Open = [] {

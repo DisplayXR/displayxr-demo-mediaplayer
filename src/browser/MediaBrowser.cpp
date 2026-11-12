@@ -3,6 +3,7 @@
 
 #include "ui/Icons.h"
 #include "ui/UiScale.h"
+#include "ui/UiText.h"
 
 #include <algorithm>
 #include <cctype>
@@ -41,19 +42,6 @@ bool Same(const std::vector<ThumbnailRequest>& a, const std::vector<ThumbnailReq
         if (a[i].id != b[i].id || a[i].checkFile != b[i].checkFile) return false;
     }
     return true;
-}
-
-// `text` cut to fit in `width`, ending in an ellipsis if it was cut.
-std::string Fit(const std::string& text, float width) {
-    if (ImGui::CalcTextSize(text.c_str()).x <= width) return text;
-    const char* kEllipsis = "\xE2\x80\xA6";
-    const float ellipsis = ImGui::CalcTextSize(kEllipsis).x;
-    size_t n = text.size();
-    while (n > 0 && ImGui::CalcTextSize(text.c_str(), text.c_str() + n).x + ellipsis > width) {
-        --n;
-        while (n > 0 && ((unsigned char)text[n] & 0xC0) == 0x80) --n;  // whole UTF-8 characters
-    }
-    return text.substr(0, n) + kEllipsis;
 }
 
 Glyph SourceIcon(SourceKind kind) {
@@ -138,7 +126,7 @@ void FolderTile(ImDrawList* dl, const Folder& folder, ImVec2 a, ImVec2 b, float 
     const float tile = b.x - a.x, font = ImGui::GetFontSize();
     dl->AddRectFilled(a, b, kTileEmpty);
     ui::DrawGlyph(dl, Glyph::Folder, ImVec2(a.x + tile * 0.5f, a.y + Round((tile - font) * 0.45f)), tile * 0.5f, kFolder);
-    const std::string name = Fit(folder.name, tile - margin * 2.0f);
+    const std::string name = ui::FitText(folder.name, tile - margin * 2.0f);
     const float w = Round(ImGui::CalcTextSize(name.c_str()).x);
     dl->AddText(ImVec2(Round(a.x + (tile - w) * 0.5f), b.y - margin - font), ImGui::GetColorU32(ImGuiCol_Text),
                 name.c_str());
@@ -176,7 +164,7 @@ bool IconButton(const char* id, Glyph icon, ImVec2 pos, float size) {
 // Centred `text`, and a button under it if `button` is set. True when the button is pressed.
 bool Message(ImVec2 min, ImVec2 max, const char* text, const char* button) {
     const ImGuiStyle& style = ImGui::GetStyle();
-    const std::string line = Fit(text, max.x - min.x - style.WindowPadding.x * 2.0f);
+    const std::string line = ui::FitText(text, max.x - min.x - style.WindowPadding.x * 2.0f);
     const ImVec2 size = ImGui::CalcTextSize(line.c_str());
     const float gap = Round(style.ItemSpacing.y * 2.0f);
     const float buttonH = button ? gap + ImGui::GetFrameHeight() : 0.0f;
@@ -390,7 +378,7 @@ void MediaBrowser::TopBar(float width, float height) {
     size_t i = CurrentSource().folder.size();
     for (size_t slash; (slash = folder_.find('/', i)) != std::string::npos; i = slash + 1)
         title += " / " + folder_.substr(i, slash - i);
-    const std::string name = Fit(title, width - (pad + icon) * 4.0f);
+    const std::string name = ui::FitText(title, width - (pad + icon) * 4.0f);
     const ImVec2 text = ImGui::CalcTextSize(name.c_str());
     const float padX = Round(style.FramePadding.x);
     const float pillW = Round(text.x) + padX * 2.0f;
@@ -449,14 +437,14 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
                       icon, text, s && s->kind == sourceKind_);
         const float textY = y + Round((rowH - ImGui::GetFontSize()) * 0.5f);
         if (!s) {
-            dl->AddText(ImVec2(textX, textY), text, Fit("Other files...", right - textX).c_str());
+            dl->AddText(ImVec2(textX, textY), text, ui::FitText("Other files...", right - textX).c_str());
             continue;
         }
         char count[16];
         std::snprintf(count, sizeof(count), "%d", s->count);
         const float countX = right - Round(ImGui::CalcTextSize(count).x);
         dl->AddText(ImVec2(countX, textY), dim, count);
-        dl->AddText(ImVec2(textX, textY), text, Fit(s->name, countX - Round(style.ItemSpacing.x) - textX).c_str());
+        dl->AddText(ImVec2(textX, textY), text, ui::FitText(s->name, countX - Round(style.ItemSpacing.x) - textX).c_str());
     }
     dl->PopClipRect();
 
@@ -496,7 +484,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
         dl->AddRectFilled(min, ImVec2(max.x, min.y + h), kPanel);
         dl->AddText(ImVec2(min.x + pad, min.y + Round((h - ImGui::GetFontSize()) * 0.5f)),
                     ImGui::GetColorU32(ImGuiCol_Text),
-                    Fit("Showing only the items you picked.", buttonX - Round(style.ItemSpacing.x) - min.x - pad).c_str());
+                    ui::FitText("Showing only the items you picked.", buttonX - Round(style.ItemSpacing.x) - min.x - pad).c_str());
         ImGui::SetCursorScreenPos(ImVec2(buttonX, min.y + Round(style.ItemSpacing.y)));
         if (ImGui::Button(kSelectMore)) provider_->RequestAccess();
         min.y += h;
@@ -701,6 +689,18 @@ bool MediaBrowser::NextId(int step, int64_t& id) const {
         const long next = (long)p + step;
         if (next < 0 || next >= (long)shown_.size()) return false;
         id = items[shown_[(size_t)next]].id;
+        return true;
+    }
+    return false;
+}
+
+bool MediaBrowser::OpenedPosition(int& index, int& count) const {
+    if (openedId_ < 0) return false;
+    const std::vector<MediaItem>& items = library_.Items();
+    for (size_t p = 0; p < shown_.size(); ++p) {
+        if (items[shown_[p]].id != openedId_) continue;
+        index = (int)p;
+        count = (int)shown_.size();
         return true;
     }
     return false;

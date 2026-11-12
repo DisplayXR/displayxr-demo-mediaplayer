@@ -2,6 +2,7 @@
 #include "ui/TransportUI.h"
 #include "ui/Icons.h"
 #include "ui/UiScale.h"
+#include "ui/UiText.h"
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
 #include <algorithm>
@@ -231,6 +232,45 @@ bool ScrubBar(const char* id, float* v, float vmax, float width, bool* outActive
 
 void Fire(const std::function<void()>& fn) { if (fn) fn(); }
 
+// Track playback into the scrubber's knob, but not while dragging, and not while a seek we
+// issued is still landing — else it snaps back on release.
+void TrackScrubKnob(TransportState& s, float pos) {
+    if (!s.scrubActive) {
+        if (s.scrubTarget >= 0.0f) {
+            if (std::fabs(pos - s.scrubTarget) < 0.3f) s.scrubTarget = -1.0f;
+        } else {
+            s.scrubValue = pos;
+        }
+    }
+}
+
+// The scrubber at the cursor, `width` wide, and the seek machine behind it.
+void DriveScrub(TransportState& s, const TransportActions& a, float dur, float width) {
+    bool active = false;
+    const bool changed = ScrubBar("##scrub", &s.scrubValue, dur, width, &active);
+    const float scrubDelta = std::fabs(s.scrubValue - s.lastScrubValue);
+    if (changed) {
+        // Fast sweep -> keyframe preview (responsive); slow/fine drag -> exact
+        // frame (precise). Audio goes silent while scrubbing.
+        const bool fast = active && scrubDelta > kFastScrubSeconds;
+        if (a.Seek) a.Seek(s.scrubValue, fast);
+        s.scrubWasPreview = fast;
+        s.scrubTarget = s.scrubValue;  // hold the knob until the decode lands
+        if (active) Fire(a.ScrubHeld);
+    } else if (active && s.scrubWasPreview) {
+        // Settled after a fast sweep -> resolve to the exact frame.
+        if (a.Seek) a.Seek(s.scrubValue, false);
+        s.scrubWasPreview = false;
+    }
+    if (s.scrubActive && !active) {
+        // Released: settle on the exact frame and realign + resume audio.
+        if (a.ScrubReleased) a.ScrubReleased(s.scrubValue);
+        s.scrubWasPreview = false;
+    }
+    s.scrubActive = active;
+    s.lastScrubValue = s.scrubValue;
+}
+
 // The top bar's live-source picker: a combo next to Open. Live cameras (#90, refreshed
 // once each time it opens, so enumeration stays lazy) and the "Stream URL..." row
 // (#93), each behind its own cap.
@@ -385,6 +425,201 @@ void StreamPill(const TransportState& s, const TransportActions& a) {
         dot = kDotAmber;
     StatusPill("##streampill", text, dot, s.streamStatus == "FROZEN", a);
 }
+
+// ---- The touch layout (#180) ----------------------------------------------------------
+
+constexpr float kScrimAlpha = 0.60f;  // the scrims' darkest, at the screen's edge
+constexpr float kScrimDp = 112.0f;    // how far they reach in from the system bar
+
+// A font's pixel size, the UI font's for null.
+float FontPx(ImFont* f) { return f ? f->FontSize : ImGui::GetFontSize(); }
+
+// The width of a time label in `font` that can never grow: `sample` with every digit as
+// the font's widest, so neither the label nor the scrubber beside it moves as it counts.
+float TimeSlotW(ImFont* font, const char* sample) {
+    ImFont* f = font ? font : ImGui::GetFont();
+    const float px = FontPx(font);
+    char wide = '0';
+    float wideW = 0.0f;
+    for (char d = '0'; d <= '9'; d++) {
+        const char ds[2] = {d, '\0'};
+        const float w = f->CalcTextSizeA(px, FLT_MAX, 0.0f, ds).x;
+        if (w > wideW) {
+            wideW = w;
+            wide = d;
+        }
+    }
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%s", sample);
+    for (char* p = buf; *p; p++)
+        if (*p >= '0' && *p <= '9') *p = wide;
+    return std::ceil(f->CalcTextSizeA(px, FLT_MAX, 0.0f, buf).x);
+}
+
+// `text` in `font` at `pos`, right-aligned in `slotW` when `right`.
+void TextAt(ImFont* font, ImVec2 pos, const char* text, ImU32 col, float slotW = 0.0f, bool right = false) {
+    ImFont* f = font ? font : ImGui::GetFont();
+    const float px = FontPx(font);
+    if (right) pos.x += slotW - f->CalcTextSizeA(px, FLT_MAX, 0.0f, text).x;
+    ImGui::GetWindowDrawList()->AddText(f, px, ImVec2(std::round(pos.x), std::round(pos.y)), col, text);
+}
+
+// The 2D/3D switch's width (SegmentSwitch).
+float SegmentSwitchW() {
+    ImFont* f = StyleFont(TextStyle::Row);
+    ImFont* font = f ? f : ImGui::GetFont();
+    const float seg = font->CalcTextSizeA(FontPx(f), FLT_MAX, 0.0f, "3D").x + Dp(28.0f);
+    return std::round(seg) * 2.0f;
+}
+
+// The touch layout's 2D/3D switch: a labelled two-segment control, "2D | 3D", the mode in
+// force filled with the accent. A dark fill and a light 2 dp outline make it read over a
+// dark picture and a light one alike. Drawn `h` tall in a `hitH` tall hit box at the
+// cursor. True when the other segment is tapped.
+bool SegmentSwitch(const char* id, bool on3D, float h, float hitH) {
+    const float w = SegmentSwitchW(), seg = w * 0.5f;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(w, hitH));
+    const bool tapped = ImGui::IsItemClicked();
+    const bool tapped3D = ImGui::GetIO().MouseClickedPos[0].x >= p.x + seg;
+    const bool held = ImGui::IsItemActive();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 a(p.x, std::round(p.y + (hitH - h) * 0.5f)), b(p.x + w, a.y + h);
+    const float r = h * 0.5f;
+    dl->AddRectFilled(a, b, ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, held ? 0.55f : 0.40f)), r);
+    const ImVec2 on0(on3D ? a.x + seg : a.x, a.y), on1(on3D ? b.x : a.x + seg, b.y);
+    dl->AddRectFilled(on0, on1, ImGui::GetColorU32(ImGuiCol_SliderGrab), r,
+                      on3D ? ImDrawFlags_RoundCornersRight : ImDrawFlags_RoundCornersLeft);
+    const float stroke = std::max(Px(2.0f), g_iconStroke);
+    dl->AddRect(a, b, ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.85f)), r, 0, stroke);
+
+    ImFont* f = StyleFont(TextStyle::Row);
+    ImFont* font = f ? f : ImGui::GetFont();
+    const float px = FontPx(f);
+    for (int i = 0; i < 2; ++i) {
+        const char* label = i ? "3D" : "2D";
+        const bool on = (i == 1) == on3D;
+        const ImVec2 ts = font->CalcTextSizeA(px, FLT_MAX, 0.0f, label);
+        const ImVec2 at(a.x + seg * (float)i + (seg - ts.x) * 0.5f, a.y + (h - ts.y) * 0.5f);
+        dl->AddText(font, px, ImVec2(std::round(at.x), std::round(at.y)),
+                    ImGui::GetColorU32(on ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : ImVec4(0.86f, 0.88f, 0.92f, 1.0f)),
+                    label);
+    }
+    return tapped && tapped3D != on3D;
+}
+
+// The touch player's chrome: scrims instead of slabs, the back arrow and the file's name
+// at the top left, the transport (or, for a still, the 2D/3D switch) at the bottom.
+//
+// 3D comfort: everything is drawn once into the HUD, which both views share, so it sits
+// flat at the screen plane. A gradient scrim instead of an opaque bar means no hard edge
+// cuts a flat plane across the picture's depth.
+void TouchChrome(TransportState& s, const TransportActions& a, float W, float H) {
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                                   ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground;
+    const float iconSz = ImGui::GetFrameHeight();
+    const float hit = iconSz * std::max(1.0f, s.hitTargetScale);
+    const float top = g_systemBarTop, bottom = H - g_systemBarBottom;
+    const float edge = std::round(Dp(8.0f));
+    const bool video = s.isVideo && s.durationSeconds > 0.0;
+    ImFont* titleFont = StyleFont(TextStyle::Title);
+    ImFont* smallFont = StyleFont(TextStyle::Small);
+    const ImU32 text = ImGui::GetColorU32(ImGuiCol_Text);
+    const ImU32 dim = ImGui::GetColorU32(ImVec4(0.80f, 0.83f, 0.88f, 1.0f));
+
+    // Scrims: darkest under the system bars, so their icons read, then fading out.
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
+    const ImU32 dark = ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, kScrimAlpha));
+    const ImU32 clear = ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    const float ramp = Dp(kScrimDp);
+    if (top > 0.0f) bg->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(W, top), dark);
+    bg->AddRectFilledMultiColor(ImVec2(0.0f, top), ImVec2(W, top + ramp), dark, dark, clear, clear);
+    if (video || s.caps.modeSwitch) {
+        bg->AddRectFilledMultiColor(ImVec2(0.0f, bottom - ramp), ImVec2(W, bottom), clear, clear, dark, dark);
+        if (bottom < H) bg->AddRectFilled(ImVec2(0.0f, bottom), ImVec2(W, H), dark);
+    }
+
+    // --- Top: back, then the name and its place in the list, left-aligned ---
+    ImGui::SetNextWindowPos(ImVec2(0.0f, top), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(edge, edge));
+    if (ImGui::Begin("##touch_top", nullptr, flags)) {
+        const ImVec2 row = ImGui::GetCursorScreenPos();
+        ImGui::BeginDisabled(s.openFilePending);
+        if (IconButton("##back", Glyph::Back, iconSz, false, s.hitTargetScale)) Fire(a.Open);
+        ImGui::EndDisabled();
+        const float x = row.x + hit + ImGui::GetStyle().ItemSpacing.x * 0.5f;
+        const float right = W - edge;
+        if (!s.mediaFilename.empty() && right > x) {
+            ImGui::PushFont(titleFont);
+            const std::string name = FitText(s.mediaFilename, right - x);
+            ImGui::PopFont();
+            const float titleH = FontPx(titleFont);
+            const float posH = s.mediaPosition.empty() ? 0.0f : FontPx(smallFont) + Dp(2.0f);
+            const float y = row.y + (hit - titleH - posH) * 0.5f;
+            TextAt(titleFont, ImVec2(x, y), name.c_str(), text);
+            if (posH > 0.0f) TextAt(smallFont, ImVec2(x, y + titleH + Dp(2.0f)), s.mediaPosition.c_str(), dim);
+        }
+    }
+    ImGui::End();
+
+    // --- Bottom: the transport for a video, the 2D/3D switch docked at its end ---
+    const float switchH = std::round(iconSz * 0.82f);
+    if (video) {
+        ImGui::SetNextWindowPos(ImVec2(0.0f, bottom), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+        ImGui::SetNextWindowSize(ImVec2(W, 0.0f), ImGuiCond_Always);
+        if (ImGui::Begin("##touch_transport", nullptr, flags)) {
+            if (s.fadeAlpha > 0.01f) g_transportTop = ImGui::GetWindowPos().y;
+            const float dur = (float)s.durationSeconds;
+            TrackScrubKnob(s, (float)s.positionSeconds);
+            auto mmss = [](double sec, char* out, size_t n) {
+                if (sec < 0.0) sec = 0.0;
+                const int t = (int)sec;
+                if (t >= 3600)
+                    std::snprintf(out, n, "%d:%02d:%02d", t / 3600, t / 60 % 60, t % 60);
+                else
+                    std::snprintf(out, n, "%d:%02d", t / 60, t % 60);
+            };
+            char cur[16], tot[16];
+            mmss(s.scrubValue, cur, sizeof(cur));
+            mmss(dur, tot, sizeof(tot));
+            const ImGuiStyle& st = ImGui::GetStyle();
+            const ImVec2 row = ImGui::GetCursorScreenPos();
+            if (IconButton("##playpause", s.paused ? Glyph::Play : Glyph::Pause, iconSz, false, s.hitTargetScale))
+                Fire(a.TogglePlayback);
+            const float slot = TimeSlotW(smallFont, tot);
+            const float textY = row.y + (hit - FontPx(smallFont)) * 0.5f;
+            ImGui::SameLine();
+            float x = ImGui::GetCursorScreenPos().x;
+            TextAt(smallFont, ImVec2(x, textY), cur, text, slot, true);
+            x += slot + st.ItemSpacing.x;
+            const float switchW = s.caps.modeSwitch ? SegmentSwitchW() + st.ItemSpacing.x : 0.0f;
+            const float scrubW = W - edge - switchW - slot - st.ItemSpacing.x * 2.0f - x;
+            ImGui::SetCursorScreenPos(ImVec2(x, row.y + (hit - ImGui::GetFrameHeight()) * 0.5f));
+            DriveScrub(s, a, dur, scrubW);
+            x += std::max(Px(8.0f), scrubW) + st.ItemSpacing.x;
+            TextAt(smallFont, ImVec2(x, textY), tot, text);
+            x += slot + st.ItemSpacing.x;
+            if (s.caps.modeSwitch) {
+                ImGui::SetCursorScreenPos(ImVec2(x, row.y));
+                if (SegmentSwitch("##mode3d", s.mode3D, switchH, hit)) Fire(a.NextMode);
+            }
+            ImGui::SetCursorScreenPos(ImVec2(row.x, row.y + hit));
+            ImGui::Dummy(ImVec2(0.0f, 0.0f));
+        }
+        ImGui::End();
+    } else if (s.caps.modeSwitch) {
+        // A still: the switch alone, bottom right.
+        ImGui::SetNextWindowPos(ImVec2(W, bottom), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+        if (ImGui::Begin("##touch_modeswitch", nullptr, flags | ImGuiWindowFlags_AlwaysAutoResize) &&
+            SegmentSwitch("##mode3d", s.mode3D, switchH, hit))
+            Fire(a.NextMode);
+        ImGui::End();
+    }
+    ImGui::PopStyleVar();
+}
 }  // namespace
 
 void BuildTransportUI(TransportState& s, const TransportActions& a) {
@@ -397,7 +632,11 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                                   ImGuiWindowFlags_AlwaysAutoResize;
 
     // The bars fade in/out together with the idle timer.
-    if (s.fadeAlpha > 0.001f) {
+    if (s.fadeAlpha > 0.001f && s.caps.touchLayout) {
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s.fadeAlpha);
+        TouchChrome(s, a, W, H);
+        ImGui::PopStyleVar();
+    } else if (s.fadeAlpha > 0.001f) {
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s.fadeAlpha);
         const float iconSz = ImGui::GetFrameHeight();
         const float barBottom = H - g_systemBarBottom;
@@ -604,15 +843,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 if (s.fadeAlpha > 0.01f) g_transportTop = ImGui::GetWindowPos().y;
                 const float dur = (float)s.durationSeconds;
                 const float pos = (float)s.positionSeconds;
-                // Track playback into the knob, but not while dragging, and not while a
-                // seek we issued is still landing — else it snaps back on release.
-                if (!s.scrubActive) {
-                    if (s.scrubTarget >= 0.0f) {
-                        if (std::fabs(pos - s.scrubTarget) < 0.3f) s.scrubTarget = -1.0f;
-                    } else {
-                        s.scrubValue = pos;
-                    }
-                }
+                TrackScrubKnob(s, pos);
                 auto mmss = [](double sec, char* out, size_t n) {
                     if (sec < 0.0) sec = 0.0;
                     const int t = (int)sec;
@@ -693,30 +924,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                                      (float)rightIcons * (iconSz * s.hitTargetScale) +
                                      (float)(rightIcons + 2) * st.ItemSpacing.x +
                                      st.WindowPadding.x + panelsW;
-                bool active = false;
-                const bool changed = ScrubBar("##scrub", &s.scrubValue, dur,
-                                              ImGui::GetContentRegionAvail().x - rightW, &active);
-                const float scrubDelta = std::fabs(s.scrubValue - s.lastScrubValue);
-                if (changed) {
-                    // Fast sweep -> keyframe preview (responsive); slow/fine drag -> exact
-                    // frame (precise). Audio goes silent while scrubbing.
-                    const bool fast = active && scrubDelta > kFastScrubSeconds;
-                    if (a.Seek) a.Seek(s.scrubValue, fast);
-                    s.scrubWasPreview = fast;
-                    s.scrubTarget = s.scrubValue;  // hold the knob until the decode lands
-                    if (active) Fire(a.ScrubHeld);
-                } else if (active && s.scrubWasPreview) {
-                    // Settled after a fast sweep -> resolve to the exact frame.
-                    if (a.Seek) a.Seek(s.scrubValue, false);
-                    s.scrubWasPreview = false;
-                }
-                if (s.scrubActive && !active) {
-                    // Released: settle on the exact frame and realign + resume audio.
-                    if (a.ScrubReleased) a.ScrubReleased(s.scrubValue);
-                    s.scrubWasPreview = false;
-                }
-                s.scrubActive = active;
-                s.lastScrubValue = s.scrubValue;
+                DriveScrub(s, a, dur, ImGui::GetContentRegionAvail().x - rightW);
                 ImGui::SameLine();
                 ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
                 ImGui::AlignTextToFramePadding();

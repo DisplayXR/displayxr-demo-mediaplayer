@@ -307,6 +307,7 @@ function(mp_add_player tgt is_pro)
         # is hand-curated and desktop CI cannot catch the resulting Android link error.
         src/ui/TransportUI.cpp
         src/ui/Icons.cpp  # every icon the chrome draws, shared with the browser (#180)
+        src/ui/UiText.cpp  # fitting and wrapping text (#180)
         src/media/FrameRing.h  # header-only triple buffer
         ${MP_IMGUI_SOURCES}
     )
