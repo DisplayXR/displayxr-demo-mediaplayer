@@ -499,6 +499,8 @@ struct DeckLinkCapture {
     bool pair = false;     // two inputs, eye 0 and eye 1
     bool dual = false;     // one input in the card's dual-stream 3D mode
     bool sameCard = false; // Pair: both inputs are sub-devices of one card (one clock)
+    bool strictPairs = false;  // matched pairs only: one card, MEDIAPLAYER_DECKLINK_STRICT_PAIRS != 0
+    bool warnedRefused = false;
     std::atomic<int> fpsInt{25};
     std::atomic<double> fpsExact{25.0};
     std::atomic<bool> tcFullCount[2] = {false, false};  // per input: timecode counts every frame
@@ -776,6 +778,17 @@ struct DeckLinkCapture {
                      d.tcOffsetFrames);
             warnedTcByClock = true;
         }
+        if (d.refused && alive) {
+            std::lock_guard<std::mutex> ps(src->pairMutex_);
+            ++src->pairStats_.mismatchRefused;
+            src->pairStats_.strict = true;
+            if (!warnedRefused) {
+                LOG_WARN("decklink: matched pairs only: the eyes are %d frame(s) apart (an input fell behind) - "
+                         "holding the last matched pair instead of showing them (counted in mismatch_refused)",
+                         d.offsetFrames);
+                warnedRefused = true;
+            }
+        }
         if (!d.publish || !alive) return;
         if (noSignal[1 - eye]) return;  // the other eye is dark: never fuse it with a stale frame
         {
@@ -783,6 +796,17 @@ struct DeckLinkCapture {
             const EyeFrame& rf = hist[1][d.slot[1]];
             std::lock_guard<std::mutex> ps(src->pairMutex_);
             DeckLinkSource::PairStats& st = src->pairStats_;
+            st.strict = strictPairs;
+            // Last line of defence: on one card both eyes of a true pair carry the same
+            // capture instant on the card's clock. More than half a frame apart is not a
+            // pair, whatever the pairing decided: never show it.
+            if (strictPairs && lf.hwNs >= 0 && rf.hwNs >= 0) {
+                const double halfFrameMs = 500.0 / std::max(1.0, fpsExact.load());
+                if (std::fabs((double)(rf.hwNs - lf.hwNs) / 1e6) > halfFrameMs) {
+                    ++st.mismatchRefused;
+                    return;
+                }
+            }
             ++st.pairs;
             const uint64_t in = framesIn[0] + framesIn[1];
             st.unpaired = in > 2 * st.pairs ? in - 2 * st.pairs : 0;
@@ -1174,6 +1198,19 @@ void DeckLinkSource::Worker() {
             cap.sameCard = g0 >= 0 && g0 == g1;
             LOG_INFO("decklink: two inputs on %s", cap.sameCard ? "one card: paired by timecode, else by the card's clock"
                                                                 : "separate cards: paired by timecode only (jam-sync both)");
+            // Matched pairs only, on one card: a left and a right from different instants
+            // are never shown (the last matched pair holds instead). The card's clock always
+            // matches eventually, so this cannot freeze; two cards without matching timecode
+            // have nothing to match on and keep newest-of-each.
+            const char* sp = std::getenv("MEDIAPLAYER_DECKLINK_STRICT_PAIRS");
+            cap.strictPairs = cap.sameCard && !(sp && sp[0] == '0');
+            {
+                std::lock_guard<std::mutex> lk(cap.m);
+                cap.pairer.SetStrict(cap.strictPairs);
+            }
+            LOG_INFO("decklink: matched pairs only: %s%s", cap.strictPairs ? "on" : "off",
+                     cap.sameCard ? (cap.strictPairs ? "" : " (MEDIAPLAYER_DECKLINK_STRICT_PAIRS=0)")
+                                  : " (two cards: no shared clock to verify pairs)");
         }
     }
 

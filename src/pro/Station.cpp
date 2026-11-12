@@ -728,7 +728,9 @@ std::string Station::RigStatusJson() const {
             dl["pairing"] = ps.timecode ? "timecode" : ps.hwClockPairing ? "hardware_clock" : "newest";
             dl["pairs"] = ps.pairs;
             dl["unpaired"] = ps.unpaired;
-            dl["max_skew_ms"] = ps.maxAbsSkewMs;
+            dl["max_skew_ms"] = ps.maxAbsSkewMs;  // shown pairs only
+            dl["strict_pairs"] = ps.strict;
+            dl["mismatch_refused"] = ps.mismatchRefused;
         }
         out["decklink"] = dl;
     } else if (testSignal_.GetState() != LiveState::Closed) {
@@ -1068,6 +1070,9 @@ void Station::BuildSignalLines(bool live) {
         const DeckLinkSource::PairStats ps = decklink_.GetPairStats();
         ImGui::Text("Eye skew %+.2f ms (max %.2f)  unpaired %llu", ps.lastSkewMs, ps.maxAbsSkewMs,
                     (unsigned long long)ps.unpaired);
+        if (ps.strict)
+            ImGui::TextDisabled("matched pairs only (%llu mismatched held back)",
+                                (unsigned long long)ps.mismatchRefused);
         if (ps.timecode) ImGui::TextDisabled("paired by SMPTE timecode");
         else if (ps.hwClockPairing) ImGui::TextDisabled("paired by the card's clock (no matching timecode)");
         else if (ps.separateCards) ImGui::TextColored(kWarn, "no timecode, two cards: newest frames paired - jam-sync both inputs");
