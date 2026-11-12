@@ -49,26 +49,7 @@
 
 namespace mp {
 
-bool DeckLinkConfig::ParseStereo(const std::string& s, Stereo& out) {
-    if (s.empty() || s == "auto") out = Stereo::Auto;
-    else if (s == "mono") out = Stereo::Mono;
-    else if (s == "sbs") out = Stereo::Sbs;
-    else if (s == "dual") out = Stereo::Dual;
-    else if (s == "pair") out = Stereo::Pair;
-    else return false;
-    return true;
-}
-
-const char* DeckLinkConfig::StereoName(Stereo s) {
-    switch (s) {
-        case Stereo::Auto: return "auto";
-        case Stereo::Mono: return "mono";
-        case Stereo::Sbs: return "sbs";
-        case Stereo::Dual: return "dual";
-        case Stereo::Pair: return "pair";
-    }
-    return "?";
-}
+// DeckLinkConfig::ParseStereo / StereoName are in pro/DeckLinkSpec.cpp (no SDK, unit-tested).
 
 DeckLinkSource::~DeckLinkSource() { Stop(); }
 
