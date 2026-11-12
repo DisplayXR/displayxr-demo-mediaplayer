@@ -542,6 +542,7 @@ struct DeckLinkCapture {
     uint64_t framesIn[2] = {0, 0};
     EyeFrame hist[2][TimecodePairer::kHistory];
     bool warnedUnsynced = false;
+    bool warnedTcByClock = false;  // said once: timecodes disagree, paired by the card's clock
     bool warnedSize = false;
     bool warnedConvert = false;
     bool warnedHdr = false;
@@ -730,22 +731,30 @@ struct DeckLinkCapture {
         ef.px.transfer = r.transfer;
         ef.arrived = r.now;
         ef.hwNs = r.hwNs;
-        int key = r.key;
-        bool hwKey = false;
-        if (key < 0 && r.hwNs >= 0 && sameCard) {
+        // Two keys: the frame's timecode, and (both inputs on one card) its frame on the
+        // card's clock. The pairer uses the clock when the timecode is missing or the two
+        // inputs' timecodes don't belong together (Resolve's dual SDI output).
+        int clockKey = -1;
+        if (r.hwNs >= 0 && sameCard) {
             int64_t t0 = hwT0.load();
             if (t0 == INT64_MIN) {
                 hwT0.compare_exchange_strong(t0, r.hwNs);
                 t0 = hwT0.load();
             }
             const int64_t period = r.durNs > 0 ? r.durNs : (int64_t)std::llround(1e9 / std::max(1.0, fpsExact.load()));
-            key = HwClockKey(r.hwNs, t0, period);
-            hwKey = true;
+            clockKey = HwClockKey(r.hwNs, t0, period);
         }
         std::memcpy(ef.tc, r.tc, sizeof(r.tc));
         std::lock_guard<std::mutex> lk(m);
         ++framesIn[eye];
-        const TimecodePairer::Decision d = pairer.Add(eye, slot, key, r.now, 1.0 / std::max(1.0, fpsExact.load()));
+        const TimecodePairer::Decision d =
+            pairer.Add(eye, slot, r.key, r.now, 1.0 / std::max(1.0, fpsExact.load()), clockKey);
+        if (d.byClock && d.tcOffsetFrames > 0 && !warnedTcByClock) {
+            LOG_WARN("decklink: the two inputs' timecodes are %d frames apart (not jam-synced; e.g. Resolve's dual "
+                     "SDI output times only its first output) - pairing by the card's clock instead",
+                     d.tcOffsetFrames);
+            warnedTcByClock = true;
+        }
         if (!d.publish || !alive) return;
         if (noSignal[1 - eye]) return;  // the other eye is dark: never fuse it with a stale frame
         {
@@ -756,9 +765,9 @@ struct DeckLinkCapture {
             ++st.pairs;
             const uint64_t in = framesIn[0] + framesIn[1];
             st.unpaired = in > 2 * st.pairs ? in - 2 * st.pairs : 0;
-            st.hwClockPairing = hwKey;
+            st.hwClockPairing = d.byClock;
             st.separateCards = !sameCard;
-            st.timecode = !hwKey && key >= 0;
+            st.timecode = !d.byClock && !d.unsynced && r.key >= 0;
             if (lf.hwNs >= 0 && rf.hwNs >= 0 && sameCard) {
                 st.lastSkewMs = (double)(rf.hwNs - lf.hwNs) / 1e6;
                 st.maxAbsSkewMs = std::max(st.maxAbsSkewMs, std::fabs(st.lastSkewMs));

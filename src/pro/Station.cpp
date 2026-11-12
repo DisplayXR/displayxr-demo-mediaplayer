@@ -967,7 +967,7 @@ void Station::BuildSignalLines(bool live) {
         ImGui::Text("Eye skew %+.2f ms (max %.2f)  unpaired %llu", ps.lastSkewMs, ps.maxAbsSkewMs,
                     (unsigned long long)ps.unpaired);
         if (ps.timecode) ImGui::TextDisabled("paired by SMPTE timecode");
-        else if (ps.hwClockPairing) ImGui::TextDisabled("no timecode: paired by the card's clock");
+        else if (ps.hwClockPairing) ImGui::TextDisabled("paired by the card's clock (no matching timecode)");
         else if (ps.separateCards) ImGui::TextColored(kWarn, "no timecode, two cards: newest frames paired - jam-sync both inputs");
         else if (ps.pairs) ImGui::TextDisabled("no timecode: newest frames paired");
     }
