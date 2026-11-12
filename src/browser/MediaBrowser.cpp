@@ -589,14 +589,17 @@ void MediaBrowser::TypeMenu() {
         ImGui::EndPopup();
         return;
     }
-    FontScope font(TextStyle::Row);
-    const TypeFilter types[] = {TypeFilter::All, TypeFilter::Videos, TypeFilter::Images};
-    const float w = Round(ImGui::CalcTextSize("All types").x + Dp(48.0f) * 2.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
-    for (TypeFilter t : types) {
-        if (ImGui::Selectable(TypeLabel(t), options_.type == t, 0, ImVec2(w, Dp(48.0f)))) SetType(t);
+    {
+        // Popped before EndPopup: ImGui asserts on a font still pushed at End().
+        FontScope font(TextStyle::Row);
+        const TypeFilter types[] = {TypeFilter::All, TypeFilter::Videos, TypeFilter::Images};
+        const float w = Round(ImGui::CalcTextSize("All types").x + Dp(48.0f) * 2.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
+        for (TypeFilter t : types) {
+            if (ImGui::Selectable(TypeLabel(t), options_.type == t, 0, ImVec2(w, Dp(48.0f)))) SetType(t);
+        }
+        ImGui::PopStyleVar();
     }
-    ImGui::PopStyleVar();
     ImGui::EndPopup();
 }
 
