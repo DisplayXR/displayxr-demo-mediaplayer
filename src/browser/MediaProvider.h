@@ -27,6 +27,8 @@ struct ThumbnailRequest {
     // Also look at the file itself for Thumbnail::file3D. It costs opening the file, so
     // ask only when the answer can matter (StereoClassifier::NeedsFileCheck).
     bool checkFile = false;
+    // Make it to fit in maxEdge x maxEdge (TileCrop.h's ThumbnailEdge: what fills a tile).
+    uint32_t maxEdge = 0;
 };
 
 struct Thumbnail {
@@ -52,9 +54,10 @@ public:
     virtual void Refresh() = 0;
     // The latest list, if a new one arrived since the last call.
     virtual bool TakeItems(std::vector<MediaItem>& out) = 0;
-    // The thumbnails wanted, most wanted first, each to fit in maxEdge x maxEdge. Replaces
-    // the previous list, so an id that drops out is not made. List only ids not yet received.
-    virtual void WantThumbnails(const std::vector<ThumbnailRequest>& wanted, uint32_t maxEdge) = 0;
+    // The thumbnails wanted, most wanted first. Replaces the previous list, so an id that
+    // drops out is not made. List only ids not yet received, or received smaller than the
+    // maxEdge now asked for (a sharper one is then made).
+    virtual void WantThumbnails(const std::vector<ThumbnailRequest>& wanted) = 0;
     // One finished thumbnail, with what the file says about its views, if any.
     virtual bool TakeThumbnail(Thumbnail& out) = 0;
     // Hand the item to the player.

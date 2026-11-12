@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <deque>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -97,7 +98,7 @@ private:
     void TypeMenu();
     void SetDepth(DepthFilter depth);
     void SetType(TypeFilter type);
-    void UploadReady(const std::unordered_set<int64_t>& window);
+    void UploadReady(const std::unordered_set<int64_t>& window, uint32_t need);
     void GoTo(const std::string& folder);
     void Up();
     void EndSelection();
@@ -137,8 +138,15 @@ private:
     GridLayout layout_;
     int64_t openedId_ = -1;        // the item last opened from the grid, or -1
 
+    struct Ready {
+        Thumbnail thumbnail;
+        StereoLayout layout = StereoLayout::Mono;  // its verdict's: which part a tile shows
+    };
+
     std::unordered_set<int64_t> pending_;      // thumbnails taken from the provider, not yet uploaded
-    std::deque<Thumbnail> ready_;              // classified, waiting for an upload
+    std::deque<Ready> ready_;                  // classified, waiting for an upload
+    std::unordered_map<int64_t, uint32_t> sharpen_;  // shown soft: the edge to ask for again
+    std::unordered_set<int64_t> sharpened_;    // asked for again already (once is enough)
     std::unordered_set<int64_t> noThumbnail_;  // the provider could not make one
     std::vector<ThumbnailRequest> wanted_;     // the list the provider has
 

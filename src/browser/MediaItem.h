@@ -21,6 +21,7 @@ struct MediaItem {
     int64_t bytes = 0;
     int64_t durationMs = 0;  // videos only
     std::string folder;      // its path in shared storage, e.g. "DCIM/Camera/"
+    uint32_t width = 0, height = 0;  // px, upright (rotation applied); 0 x 0 if unknown
 };
 
 } // namespace mp::browser

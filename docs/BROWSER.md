@@ -31,6 +31,7 @@ src/browser/                    namespace mp::browser, platform-neutral
                                 thumbnails, open, delete
   ThumbnailAtlas.{h,cpp}        GPU: thumbnail slots packed into a few textures
   ThumbnailCache.{h,cpp}        media id -> atlas slot, least recently used reuse
+  TileCrop.{h,cpp}              the part of a thumbnail a tile shows, and the size to ask for
   StereoClassifier.{h,cpp}      3D badge verdicts: background thread, cached on disk
   TouchScroller.{h,cpp}         drag, inertia, tap vs drag
   SlideGesture.{h,cpp}          swiping to the next or previous file in the player
@@ -52,6 +53,7 @@ android/src/main/java/.../
 
 tests/
   media_library_test.cpp, stereo_classifier_test.cpp, thumbnail_cache_test.cpp,
+  tile_crop_test.cpp, letterbox_test.cpp (src/media/Letterbox),
   touch_scroller_test.cpp, slide_gesture_test.cpp, browser_layout_test.cpp,
   zoom_gesture_test.cpp
 ```
@@ -104,6 +106,34 @@ evidence (a LIF, a two-track video) is read by the provider while it makes the
 thumbnail, as `Thumbnail::file3D`. The verdict also picks the thumbnail
 crop: the left eye for side by side, the top for top-bottom, the whole thumbnail for a
 LIF or two-track video, whose thumbnail is already one view.
+
+The "3D" badge sits at the tile's top left (right of the box in select mode). The top
+right holds a video's length and, under Unsupported, the file's format.
+
+## Thumbnails
+
+A tile shows a square: one eye (as above), without black bars, centre-cropped, a
+half-packed eye unsqueezed (`TileCrop.h`). Only that square goes to the GPU, so an atlas
+slot (512 px) holds exactly what the tile shows.
+
+- Size: each request carries the edge to fit the thumbnail in, chosen so the square is
+  about one thumbnail pixel per screen pixel (`ThumbnailEdge`), from the MediaStore's width
+  and height and the verdict known at the time. A 16:9 video on a 400 px tile is made at
+  712 x 400, a full side-by-side one at 1423 x 400. The square never exceeds a slot, and no
+  thumbnail is made above the file's own size or 2048 px.
+- A tile that still comes out soft (the content check found it side by side after it was
+  asked for as 2D, bars came off, the size was unknown) asks once more, larger. The verdict
+  is cached, so the next launch asks for the right size first.
+- The system's cached thumbnail stops at a size of its own. When it is well short of what
+  was asked, the provider decodes the file: a video's representative frame through
+  `MediaMetadataRetriever.getScaledFrameAtTime`, an image subsampled. The provider logs the
+  average time and size every 64 thumbnails.
+- Black bars (`media/Letterbox.h`): the runtime's 2D-to-3D letterbox measurement
+  (u_lift_mailbox.c), made safe for one picture: bars must be near black, come in a pair of
+  about equal size, end at a hard edge and leave at least 30% of the picture. Otherwise
+  nothing is cropped, so a dark scene keeps its dark. A stereo frame is measured on the eye
+  the tile shows. Videos only: a still with a dark surround is more often a screenshot of a
+  dialog than a letterboxed picture, and the measurement cannot tell them apart.
 
 ## Android behaviour
 

@@ -164,12 +164,15 @@ void ThumbnailAtlas::SlotOrigin(int slot, uint32_t& x, uint32_t& y) const {
     y = i / cols_ * tile_;
 }
 
-bool ThumbnailAtlas::Upload(int slot, const uint8_t* rgba, uint32_t w, uint32_t h) {
+bool ThumbnailAtlas::Upload(int slot, const uint8_t* rgba, uint32_t w, uint32_t h, size_t rowStride) {
     if (slot < 0 || slot >= (int)sizes_.size() || !rgba || w == 0 || h == 0 || w > tile_ || h > tile_ ||
         pending_.size() == kUploadsPerFrame) {
         return false;
     }
-    std::memcpy(staging_[stagingNext_].mapped + pending_.size() * TileBytes(), rgba, (size_t)w * h * 4);
+    const size_t row = (size_t)w * 4;
+    if (rowStride == 0) rowStride = row;
+    uint8_t* dst = staging_[stagingNext_].mapped + pending_.size() * TileBytes();
+    for (uint32_t y = 0; y < h; ++y) std::memcpy(dst + y * row, rgba + y * rowStride, row);
     pending_.push_back({slot, {w, h}});
     sizes_[slot] = {w, h};
     return true;

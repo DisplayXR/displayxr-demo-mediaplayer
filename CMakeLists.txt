@@ -773,6 +773,17 @@ if(MP_BUILD_TESTS)
     target_include_directories(thumbnail_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME thumbnail_cache COMMAND thumbnail_cache_test)
 
+    # Media browser (#180): the square a grid tile shows (one eye, no black bars) and the
+    # thumbnail size that fills it 1:1. Pure.
+    add_executable(tile_crop_test tests/tile_crop_test.cpp src/browser/TileCrop.cpp src/media/Letterbox.cpp)
+    target_include_directories(tile_crop_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME tile_crop COMMAND tile_crop_test)
+
+    # Black bars off one picture, conservatively (a dark scene keeps its dark). Pure.
+    add_executable(letterbox_test tests/letterbox_test.cpp src/media/Letterbox.cpp)
+    target_include_directories(letterbox_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME letterbox COMMAND letterbox_test)
+
     # Media browser (#160): drag, fling and tap for touch scrolling. Pure.
     add_executable(touch_scroller_test tests/touch_scroller_test.cpp src/browser/TouchScroller.cpp)
     target_include_directories(touch_scroller_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

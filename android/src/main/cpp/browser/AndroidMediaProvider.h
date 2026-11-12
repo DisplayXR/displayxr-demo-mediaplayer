@@ -38,7 +38,7 @@ public:
     void RequestAccess() override;
     void Refresh() override;
     bool TakeItems(std::vector<MediaItem>& out) override;
-    void WantThumbnails(const std::vector<ThumbnailRequest>& wanted, uint32_t maxEdge) override;
+    void WantThumbnails(const std::vector<ThumbnailRequest>& wanted) override;
     bool TakeThumbnail(Thumbnail& out) override;
     void Open(int64_t id) override;
     // createDeleteRequest needs Android 11.
@@ -58,7 +58,7 @@ public:
     void AddThumbnail(Thumbnail thumbnail);
     bool TakeAccessRequest();
     bool TakeRefreshRequest();
-    bool TakeWantedThumbnails(std::vector<ThumbnailRequest>& wanted, uint32_t& maxEdge);
+    bool TakeWantedThumbnails(std::vector<ThumbnailRequest>& wanted);
     bool TakeOpenRequest(int64_t& id);
     bool TakeDeleteRequest(std::vector<int64_t>& ids);
     bool TakeHapticRequest();
@@ -76,7 +76,6 @@ private:
     std::vector<MediaItem> items_;
     bool wantedChanged_ = false;
     std::vector<ThumbnailRequest> wanted_;
-    uint32_t wantedEdge_ = 0;
     std::deque<Thumbnail> thumbnails_;
     bool openRequested_ = false;
     int64_t openId_ = 0;

@@ -43,10 +43,9 @@ bool AndroidMediaProvider::TakeItems(std::vector<MediaItem>& out) {
     return true;
 }
 
-void AndroidMediaProvider::WantThumbnails(const std::vector<ThumbnailRequest>& wanted, uint32_t maxEdge) {
+void AndroidMediaProvider::WantThumbnails(const std::vector<ThumbnailRequest>& wanted) {
     std::lock_guard<std::mutex> lock(mutex_);
     wanted_ = wanted;
-    wantedEdge_ = maxEdge;
     wantedChanged_ = true;
 }
 
@@ -122,12 +121,11 @@ bool AndroidMediaProvider::TakeRefreshRequest() {
     return std::exchange(refreshRequested_, false);
 }
 
-bool AndroidMediaProvider::TakeWantedThumbnails(std::vector<ThumbnailRequest>& wanted, uint32_t& maxEdge) {
+bool AndroidMediaProvider::TakeWantedThumbnails(std::vector<ThumbnailRequest>& wanted) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!wantedChanged_) return false;
     wantedChanged_ = false;
     wanted = wanted_;
-    maxEdge = wantedEdge_;
     return true;
 }
 
@@ -224,12 +222,15 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeSetAccess(
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeSetItems(
     JNIEnv* env, jobject /*thiz*/, jlongArray ids, jobjectArray names, jintArray types, jlongArray dates,
-    jlongArray modified, jlongArray sizes, jlongArray durations, jobjectArray folders)
+    jlongArray modified, jlongArray sizes, jlongArray durations, jobjectArray folders, jintArray widths,
+    jintArray heights)
 {
     const std::vector<jlong> id = Longs(env, ids), date = Longs(env, dates), mod = Longs(env, modified),
                              size = Longs(env, sizes), duration = Longs(env, durations);
-    std::vector<jint> type(id.size());
+    std::vector<jint> type(id.size()), width(id.size()), height(id.size());
     env->GetIntArrayRegion(types, 0, (jsize)type.size(), type.data());
+    env->GetIntArrayRegion(widths, 0, (jsize)width.size(), width.data());
+    env->GetIntArrayRegion(heights, 0, (jsize)height.size(), height.data());
 
     std::vector<mp::browser::MediaItem> items(id.size());
     for (size_t i = 0; i < items.size(); ++i) {
@@ -242,6 +243,8 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeSetItems(
         item.bytes = size[i];
         item.durationMs = duration[i];
         item.folder = StringAt(env, folders, (jsize)i);
+        item.width = width[i] > 0 ? (uint32_t)width[i] : 0;
+        item.height = height[i] > 0 ? (uint32_t)height[i] : 0;
     }
     AndroidMediaProvider::Instance().SetItems(std::move(items));
 }
@@ -287,25 +290,23 @@ Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeTakeRefresh
     return AndroidMediaProvider::Instance().TakeRefreshRequest() ? JNI_TRUE : JNI_FALSE;
 }
 
-// The new wanted list, or null if it has not changed: pairs of (id, 1 to check the file
-// or 0). edgeOut[0] receives the max edge.
+// The new wanted list, or null if it has not changed: triples of (id, 1 to check the file
+// or 0, the edge to fit the thumbnail in).
 extern "C" JNIEXPORT jlongArray JNICALL
 Java_com_displayxr_mediaplayer_1vk_1android_MediaStoreProvider_nativeTakeWantedThumbnails(
-    JNIEnv* env, jobject /*thiz*/, jintArray edgeOut)
+    JNIEnv* env, jobject /*thiz*/)
 {
     std::vector<mp::browser::ThumbnailRequest> wanted;
-    uint32_t maxEdge = 0;
-    if (!AndroidMediaProvider::Instance().TakeWantedThumbnails(wanted, maxEdge)) return nullptr;
-    const jint edge = (jint)maxEdge;
-    env->SetIntArrayRegion(edgeOut, 0, 1, &edge);
-    std::vector<jlong> pairs;
-    pairs.reserve(wanted.size() * 2);
+    if (!AndroidMediaProvider::Instance().TakeWantedThumbnails(wanted)) return nullptr;
+    std::vector<jlong> triples;
+    triples.reserve(wanted.size() * 3);
     for (const mp::browser::ThumbnailRequest& w : wanted) {
-        pairs.push_back((jlong)w.id);
-        pairs.push_back(w.checkFile ? 1 : 0);
+        triples.push_back((jlong)w.id);
+        triples.push_back(w.checkFile ? 1 : 0);
+        triples.push_back((jlong)w.maxEdge);
     }
-    jlongArray out = env->NewLongArray((jsize)pairs.size());
-    env->SetLongArrayRegion(out, 0, (jsize)pairs.size(), pairs.data());
+    jlongArray out = env->NewLongArray((jsize)triples.size());
+    env->SetLongArrayRegion(out, 0, (jsize)triples.size(), triples.data());
     return out;
 }
 
