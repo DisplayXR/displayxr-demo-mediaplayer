@@ -64,6 +64,8 @@ public:
     // Delete the items once the user confirms; the platform asks. The new list arrives
     // through TakeItems().
     virtual void Delete(const std::vector<int64_t>& ids) = 0;
+    // A short haptic tick, e.g. a long press starting select mode. Optional.
+    virtual void Haptic() {}
 };
 
 } // namespace mp::browser

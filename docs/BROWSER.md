@@ -124,3 +124,9 @@ LIF or two-track video, whose thumbnail is already one view.
 - Home mid-video pauses it; the app icon resumes it.
 - Permission states the browser shows: not granted, partial access (with "select more"),
   denied, and empty source.
+- Text follows the system font size (Configuration.fontScale, clamped to 0.85-1.3 so the
+  bars still fit a phone), and a long press that starts select mode gives a haptic tick.
+- **Not accessible to TalkBack.** The browser and the player chrome are drawn with ImGui
+  into the HUD layer: there are no Android views, so a screen reader sees nothing to
+  focus or read. Reaching TalkBack would mean an accessibility node tree mirroring the
+  ImGui widgets (`AccessibilityNodeProvider` on the activity's view); not done.

@@ -110,6 +110,9 @@ class MainActivity : NativeActivity() {
     // (it blanks the scene while a pick is pending to avoid a stale-frame flash).
     private external fun nativePickCancelled()
 
+    // The system's font size setting: the UI's text follows it (#180).
+    private external fun nativeSetFontScale(scale: Float)
+
     // The browser's file could not be opened at all: the player says so (#180).
     private external fun nativeOpenFailed(name: String)
 
@@ -412,6 +415,7 @@ class MainActivity : NativeActivity() {
         val portrait = dm.heightPixels > dm.widthPixels
         try {
             nativeSetRotation(rotation, portrait)
+            nativeSetFontScale(resources.configuration.fontScale)
         } catch (_: Throwable) {
             // Native lib not bound yet — a later display/config change retries.
         }

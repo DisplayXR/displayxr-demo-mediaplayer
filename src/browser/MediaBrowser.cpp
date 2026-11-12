@@ -585,6 +585,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
     if (pressed >= nf && pressed < n && !selecting_ && provider_->CanDelete() && gridScroll_.TakeLongPress(now)) {
         selecting_ = true;
         selected_ = {items[shown_[pressed - nf]].id};
+        provider_->Haptic();
     }
 
     const float margin = Round(Px(6.0f));

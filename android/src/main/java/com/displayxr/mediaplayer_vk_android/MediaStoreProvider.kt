@@ -22,6 +22,7 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
 import android.util.Size
+import android.view.HapticFeedbackConstants
 import java.io.FileNotFoundException
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
@@ -83,6 +84,7 @@ class MediaStoreProvider(
     private external fun nativeThumbnail(id: Long, width: Int, height: Int, rgba: ByteArray?, fd: Int, video: Boolean)
     private external fun nativeTakeAccessRequest(): Boolean
     private external fun nativeTakeRefreshRequest(): Boolean
+    private external fun nativeTakeHapticRequest(): Boolean
     // Pairs of (id, 1 to check the file or 0), or null if unchanged.
     private external fun nativeTakeWantedThumbnails(edgeOut: IntArray): LongArray?
     private external fun nativeTakeOpenRequest(): Long
@@ -118,6 +120,10 @@ class MediaStoreProvider(
     fun poll() {
         if (nativeTakeAccessRequest()) requestAccess()
         if (nativeTakeRefreshRequest()) refresh()
+        // A long press started select mode: the tick a stock gallery gives (#180).
+        if (nativeTakeHapticRequest()) {
+            activity.window?.decorView?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        }
         nativeTakeWantedThumbnails(edgeOut)?.let { pairs ->
             val ids = LongArray(pairs.size / 2) { pairs[2 * it] }
             val check = (0 until pairs.size / 2).filter { pairs[2 * it + 1] != 0L }.mapTo(HashSet()) { pairs[2 * it] }

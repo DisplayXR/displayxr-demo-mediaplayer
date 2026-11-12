@@ -102,7 +102,7 @@ float UiFontPx(float k) {
     // Touch is bigger for arm's-length tablet viewing: 30 is 40 px on the 320 dpi NP02J,
     // 16 is 40 px at Windows' 250%. Rounded up to a whole pixel; the epsilon keeps float
     // error (320 / 240 = 1.3333334f) from pushing a whole size to the next one.
-    return std::ceil((k > 1.0f ? 30.0f : 16.0f) * g_uiScale - 0.001f);
+    return std::ceil((k > 1.0f ? 30.0f : 16.0f) * g_uiScale * g_fontScale - 0.001f);
 }
 
 float SwitchFontPx(float k) { return std::ceil(UiFontPx(k) * 1.2f - 0.001f); }
@@ -110,7 +110,7 @@ float SwitchFontPx(float k) { return std::ceil(UiFontPx(k) * 1.2f - 0.001f); }
 float TextStylePx(TextStyle style, float k) {
     if (!(k > 1.0f)) return UiFontPx(k);  // desktop: one size, as before
     const float dp = style == TextStyle::Title ? 22.0f : style == TextStyle::Row ? 18.0f : 14.0f;
-    return std::ceil(Dp(dp) - 0.001f);
+    return std::ceil(Dp(dp) * g_fontScale - 0.001f);
 }
 
 ImFont* StyleFont(TextStyle style) {

@@ -286,6 +286,17 @@ void ImGuiLayer::AddUiFont() {
     }
 }
 
+void ImGuiLayer::SetFontScale(float scale) {
+    if (!(scale > 0.0f) || scale == ui::g_fontScale) return;
+    ui::g_fontScale = scale;
+    if (!ready_) return;  // Init builds the fonts at this scale
+    vkDeviceWaitIdle(device_);  // rare: idle rather than track the old font texture's frames
+    ImGui_ImplVulkan_DestroyFontsTexture();
+    ImGui::GetIO().Fonts->Clear();
+    AddUiFont();
+    ImGui_ImplVulkan_CreateFontsTexture();
+}
+
 void ImGuiLayer::SetUiScale(float scale) {
     if (!(scale > 0.0f) || scale == ui::g_uiScale) return;
     ui::g_uiScale = scale;
@@ -905,6 +916,7 @@ void ImGuiLayer::PushPointer(int, float, float) {}
 void ImGuiLayer::ProcessEvent(const void*) {}
 void ImGuiLayer::BeginFrame(float, float, float, float, float, float) {}
 void ImGuiLayer::SetUiScale(float) {}
+void ImGuiLayer::SetFontScale(float) {}
 void ImGuiLayer::RenderToHud(uint32_t, VkCommandBuffer) {}
 bool ImGuiLayer::WantCaptureMouse() const { return false; }
 void ImGuiLayer::SetCursorLocked(bool) {}

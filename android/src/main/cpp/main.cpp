@@ -443,6 +443,8 @@ constexpr uint8_t kIdleBg[3] = {31, 31, 33};  // 0.12,0.12,0.13 * 255
 std::atomic<int> g_pick_fd{-1};
 std::mutex g_pick_name_mx;
 std::string g_pick_name;  // display name of the picked document (filename layer)
+// The system font scale (Configuration.fontScale) as Java last reported it (#180).
+std::atomic<float> g_font_scale{1.0f};
 // The browser's file could not be opened at all: g_pick_name names it (#180).
 std::atomic<bool> g_open_failed{false};
 // True while the idle splash (the DisplayXR logo) is the scene. It is uploaded like
@@ -1798,6 +1800,15 @@ toggle_playback()
 	g_audio.setPaused(g_video.paused());  // mirror play/pause to audio
 }
 
+// The system font scale, within what the layout can take: Android's smallest is 0.85, and
+// past 1.3 the touch bars no longer fit a phone's width.
+static float
+clamped_font_scale()
+{
+	const float v = g_font_scale.load(std::memory_order_relaxed);
+	return v < 0.85f ? 0.85f : v > 1.3f ? 1.3f : v;
+}
+
 // Bring up the shared ImGui chrome. `debug.dxr.mp.ws_ui=0` disables it (the same
 // kill-switch modelviewer ships), leaving a bare projection layer.
 bool
@@ -1820,6 +1831,7 @@ hud_init()
 		if (v > 0.5f && v < 4.0f) ui_scale = v;
 	}
 	g_imgui.SetMetricScale(ui_scale);  // before Init: the font is rasterized at its size
+	g_imgui.SetFontScale(clamped_font_scale());  // the system's font size setting (#180)
 	// The touch UI was tuned on the 320 dpi NP02J through a 1920x1200 HUD stretched to the
 	// 2560x1600 panel (x1.33). dpi / 240 keeps that size there and follows density elsewhere.
 	if (g_density_dpi > 0) g_imgui.SetUiScale((float)g_density_dpi / 240.0f);
@@ -3379,6 +3391,14 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeOpenVideoFd(
 	g_pick_fd.store((int)fd, std::memory_order_release);  // publish last
 }
 
+// The system's font size setting (Configuration.fontScale), at start and on a change (#180).
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeSetFontScale(
+    JNIEnv * /*env*/, jobject /*thiz*/, jfloat scale)
+{
+	if (scale > 0.0f) g_font_scale.store((float)scale, std::memory_order_relaxed);
+}
+
 // The browser's file could not be opened at all (no descriptor: gone, or access revoked).
 // The player says so and returns to the grid (#180).
 extern "C" JNIEXPORT void JNICALL
@@ -3545,6 +3565,7 @@ android_main(struct android_app *app)
 				const XrResult mr = g_pfnReqMode(g_session, (uint32_t)want);
 				LOGI("xrRequestDisplayRenderingModeDXR(%d) -> %d", want, (int)mr);
 			}
+			if (g_hud_ready) g_imgui.SetFontScale(clamped_font_scale());  // a no-op unless it changed
 			if (g_browser_request.exchange(false, std::memory_order_relaxed)) show_browser(app);
 			if (g_browser_back_request.exchange(false, std::memory_order_relaxed) && browser_showing())
 				g_browser.Back();

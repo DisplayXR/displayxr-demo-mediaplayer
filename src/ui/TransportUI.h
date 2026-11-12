@@ -241,7 +241,7 @@ struct TransportActions {
 void ApplyMediaPlayerStyle(float metricScale = 1.0f);
 
 // The UI font size in HUD pixels for the same metricScale (desktop or touch), times the
-// UI scale (UiScale.h), rounded up. ImGuiLayer rasterizes the font at exactly this size.
+// UI scale and the system font scale (UiScale.h), rounded up. ImGuiLayer rasterizes the font at exactly this size.
 float UiFontPx(float metricScale = 1.0f);
 
 // The 2D/3D switch's knob label (#180): a size up from UiFontPx, rasterized at that size

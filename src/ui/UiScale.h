@@ -17,6 +17,10 @@ inline float Px(float v) { return v * g_uiScale; }
 // Only touch code sizes things in dp (the browser, the touch player's chrome).
 inline float Dp(float v) { return Px(v * 1.5f); }
 
+// The system's font size setting (Android's Configuration.fontScale, clamped by the
+// caller): every UI font size is multiplied by it. Always 1 on desktop.
+inline float g_fontScale = 1.0f;
+
 // Top edge (HUD pixels) of the bottom transport this frame, or 0 when none is showing.
 // Written by BuildTransportUI, which runs before Pro's UI, so the Pro status line can
 // sit above the strip instead of under it.
