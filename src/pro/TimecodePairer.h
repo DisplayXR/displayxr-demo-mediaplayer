@@ -10,6 +10,15 @@
 // rolling, a deck rewinding, midnight) restarts the matching instead of freezing it.
 // Without usable timecode - none, or the two inputs' clocks far apart - the newest
 // frame of each is shown, paced by the left eye, and the offset reported.
+//
+// When both inputs are on one card the caller also gives each frame a clock key (its
+// place on the card's hardware clock, HwClockKey). Then a missing timecode, or two
+// timecodes that don't belong together, pairs by the card's clock instead: the same
+// matching, on clock keys, so a frame-locked source pairs exactly. DaVinci Resolve's dual
+// SDI stereo output is that case: both eyes frame-locked, timecode on the first output
+// only. Newest-of-each there paired the eyes a frame apart whenever one eye's frame
+// landed first. Timecode is trusted again once kTrustTimecodeAfter clock-paired frames
+// in a row carry the same timecode on both eyes.
 #pragma once
 
 #include <algorithm>
@@ -72,12 +81,16 @@ public:
     // frame (4K60) the leading eye overwrites a slot before the lagging eye's match lands,
     // so a 3-frame lag needs the slack. ~25 MB a slot for a 4K 10-bit eye.
     static constexpr int kHistory = 6;
+    // Clock-paired frames in a row whose timecodes agree before timecode is trusted again.
+    static constexpr int kTrustTimecodeAfter = 60;
 
     struct Decision {
         bool publish = false;
         int slot[2] = {-1, -1};  // the slots to show, left and right
         int offsetFrames = -1;   // how far apart the eyes' newest frames are (-1 unknown)
-        bool unsynced = false;   // paired without a matching timecode
+        bool unsynced = false;   // paired without a matching timecode or clock (newest of each)
+        bool byClock = false;    // paired by the card's clock (clock keys), not by timecode
+        int tcOffsetFrames = -1; // the eyes' newest timecodes apart, frames (-1 = not both)
     };
 
     void Reset();
@@ -86,11 +99,20 @@ public:
     int NextSlot(int eye) const { return next_[eye]; }
     void MarkBusy(int eye, int slot) { valid_[eye][slot] = false; }
     // A frame of `eye` landed in `slot` with timecode `key` (frames, -1 = none) at time
-    // `arrived` (seconds). `period` = one frame in seconds.
-    Decision Add(int eye, int slot, int key, double arrived, double period);
+    // `arrived` (seconds). `period` = one frame in seconds. `clockKey` = its frame on the
+    // card's clock when both inputs share one card (HwClockKey), else -1.
+    Decision Add(int eye, int slot, int key, double arrived, double period, int clockKey = -1);
+    bool ByClock() const { return byClock_; }
 
 private:
-    int key_[2][kHistory] = {};
+    void Match(int eye, double period, Decision& d);
+    void UseClock(bool on);  // re-key every remembered frame in the other domain
+    int tc_[2][kHistory] = {};
+    int clock_[2][kHistory] = {};
+    bool byClock_ = false;
+    int tcAgree_ = 0;
+    int lastShownTc_ = -1, lastShownClock_ = -1;  // the last shown left frame's keys
+    int key_[2][kHistory] = {};  // the active domain's key: tc_ or clock_
     double arrived_[2][kHistory] = {};
     bool valid_[2][kHistory] = {};
     int next_[2] = {0, 0};

@@ -371,6 +371,130 @@ void FullRateTimecode() {
     CHECK(repeats == 0, "50p: each frame shown once, in order");
 }
 
+// Two inputs on one card, frame-locked, each frame with a clock key (its frame on the card's
+// clock) and a timecode chosen by the case. The eyes' frames reach the pairer in a jittery
+// order, as the two conversion lanes finish: sometimes left first, sometimes right, now
+// and then one eye two frames ahead. `trueFrame` is what is really in each slot.
+struct ClockSim {
+    TimecodePairer p;
+    int trueFrame[2][TimecodePairer::kHistory] = {};
+    int shown = 0, mismatched = 0, repeats = 0, unsynced = 0, byClock = 0, lastShown = -1;
+    bool useClock = true;
+    bool orderMix = false;  // the run had each eye land first a fair share of the time
+    void Frame(int eye, int i, int tc) {
+        const int s = p.NextSlot(eye);
+        p.MarkBusy(eye, s);
+        trueFrame[eye][s] = i;
+        const TimecodePairer::Decision d = p.Add(eye, s, tc, i / 59.94, 1.0 / 59.94, useClock ? i : -1);
+        if (!d.publish) return;
+        ++shown;
+        const int l = trueFrame[0][d.slot[0]], r = trueFrame[1][d.slot[1]];
+        if (l != r) ++mismatched;
+        if (l <= lastShown) ++repeats;
+        lastShown = l;
+        if (d.unsynced) ++unsynced;
+        if (d.byClock) ++byClock;
+    }
+    // n frames; tcOf(eye, i) gives each frame's timecode key.
+    template <class TcOf>
+    void Run(int first, int n, TcOf tcOf) {
+        uint32_t rng = 12345;
+        auto next = [&] { return (rng = rng * 1664525u + 1013904223u) >> 16; };
+        int li = first, ri = first;
+        const int end = first + n;
+        int leftFirst = 0, rightFirst = 0;
+        while (li < end || ri < end) {
+            // A random eye next, never more than 2 frames ahead of the other.
+            bool left = (next() & 1) != 0;
+            if (li >= end || li - ri >= 2) left = false;
+            if (ri >= end || ri - li >= 2) left = true;
+            if (left) {
+                if (li == ri) ++leftFirst;
+                Frame(0, li, tcOf(0, li)), ++li;
+            } else {
+                if (li == ri) ++rightFirst;
+                Frame(1, ri, tcOf(1, ri)), ++ri;
+            }
+        }
+        orderMix = leftFirst > n / 5 && rightFirst > n / 5;
+    }
+};
+
+// DaVinci Resolve's dual SDI stereo output, as on the 8K station: both eyes frame-locked,
+// timecode on the first output only (the right eye carries 00:00:00:00). Paired by the
+// card's clock, every shown pair is one frame; newest-of-each (no clock key) was not.
+void ResolveDualOutput() {
+    const int start = 409672;  // the left eye's timecode, 01:53:47:52 at 60
+    auto tcOf = [&](int eye, int i) { return eye == 0 ? start + i : 0; };
+    ClockSim c;
+    c.Run(0, 600, tcOf);
+    std::printf("  Resolve dual output, by clock: %d shown, %d mismatched, %d repeats, %d unsynced, %d by clock\n",
+                c.shown, c.mismatched, c.repeats, c.unsynced, c.byClock);
+    CHECK(c.orderMix, "the simulated arrivals put each eye first often (the jitter that broke it)");
+    CHECK(c.mismatched == 0, "Resolve dual output: every shown pair is the same frame on both eyes");
+    CHECK(c.repeats == 0, "...each frame shown once, in order");
+    CHECK(c.shown >= 590, "...one pair per frame");
+    CHECK(c.unsynced == 0, "...never newest-of-each");
+    CHECK(c.byClock == c.shown, "...all by the card's clock");
+    CHECK(c.p.ByClock(), "...and it stays on the clock (the timecodes never agree)");
+
+    ClockSim old;  // the same frames without clock keys: the old newest-of-each fallback
+    old.useClock = false;
+    old.Run(0, 600, tcOf);
+    std::printf("  Resolve dual output, no clock (old): %d shown, %d mismatched\n", old.shown, old.mismatched);
+    CHECK(old.mismatched > 0, "sanity: newest-of-each does pair the eyes a frame apart (the bug)");
+}
+
+// One card, no timecode at all: by the clock from the first frame.
+void NoTimecodeSameCard() {
+    ClockSim c;
+    c.Run(0, 300, [](int, int) { return -1; });
+    CHECK(c.mismatched == 0 && c.repeats == 0 && c.shown >= 290, "no timecode, one card: exact pairs by the clock");
+    CHECK(c.byClock == c.shown && c.unsynced == 0, "...all by the clock");
+}
+
+// One card, jam-synced timecode on both eyes: timecode pairs as before, the clock is unused.
+void MatchingTimecodeSameCard() {
+    ClockSim c;
+    c.Run(0, 300, [](int, int i) { return 5000 + i; });
+    CHECK(c.mismatched == 0 && c.shown >= 290, "matching timecode, one card: exact pairs");
+    CHECK(c.byClock == 0 && !c.p.ByClock(), "...by timecode, not the clock");
+}
+
+// The right eye's timecode starts matching (Resolve fixed mid-session): the clock pairs
+// until kTrustTimecodeAfter frames in a row agree, then timecode again; exact throughout.
+void TimecodeTrustedAgain() {
+    const int fixAt = 200;
+    ClockSim c;
+    c.Run(0, 500, [&](int eye, int i) { return eye == 0 || i >= fixAt ? 7000 + i : 0; });
+    std::printf("  timecode fixed at frame %d: %d shown, %d mismatched, %d by clock, by clock at the end: %d\n",
+                fixAt, c.shown, c.mismatched, c.byClock, (int)c.p.ByClock());
+    CHECK(c.mismatched == 0 && c.repeats == 0, "switching back to timecode keeps every pair exact");
+    CHECK(!c.p.ByClock(), "timecode is trusted again once both eyes agree");
+    CHECK(c.byClock >= fixAt - 5 && c.byClock <= fixAt + TimecodePairer::kTrustTimecodeAfter + 10,
+          "...after kTrustTimecodeAfter agreeing frames, not before");
+}
+
+// Two cards (no shared clock: no clock keys) with unrelated timecodes: unchanged, newest of
+// each flagged unsynced (the Unsynced case, through the new argument).
+void UnsyncedTwoCards() {
+    Sim s;
+    for (int i = 0; i < 20; ++i) {
+        const int a = s.p.NextSlot(0);
+        s.p.MarkBusy(0, a);
+        s.slotKey[0][a] = 1000 + i;
+        TimecodePairer::Decision d = s.p.Add(0, a, 1000 + i, 0.0, 0.04, -1);
+        if (d.publish && d.unsynced) ++s.unsynced;
+        CHECK(!d.byClock, "two cards: never by clock");
+        const int b = s.p.NextSlot(1);
+        s.p.MarkBusy(1, b);
+        s.slotKey[1][b] = 70000 + i;
+        d = s.p.Add(1, b, 70000 + i, 0.0, 0.04, -1);
+        if (d.publish && d.unsynced) ++s.unsynced;
+    }
+    CHECK(s.unsynced >= 15, "two cards, unrelated timecodes: newest of each, flagged unsynced");
+}
+
 }  // namespace
 
 int main() {
@@ -392,6 +516,11 @@ int main() {
     OneEyeMissing();
     HighRateTimecodeKeys();
     HardwareClockKeys();
+    ResolveDualOutput();
+    NoTimecodeSameCard();
+    MatchingTimecodeSameCard();
+    TimecodeTrustedAgain();
+    UnsyncedTwoCards();
     if (g_failures) {
         std::fprintf(stderr, "timecode_pairer_test: %d failure(s)\n", g_failures);
         return 1;

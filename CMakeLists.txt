@@ -275,6 +275,7 @@ function(mp_add_player tgt is_pro)
         src/color/CubeLut.cpp    # Pro looks; compiled into both so the trunk stays one source list
         src/color/Cdl.cpp
         src/App.cpp
+        src/AgentTools.cpp       # the player's agent-tool table (#220)
         src/Log.cpp
         src/platform/Window.cpp
         $<$<PLATFORM_ID:Linux>:src/platform/WindowLinux.cpp>  # desktop Linux: displayxr-common window
@@ -466,10 +467,12 @@ function(mp_add_player tgt is_pro)
         target_sources(${tgt} PRIVATE
             src/pro/ProController.cpp
             src/pro/ProTools.cpp         # agent tools: grade, view, station
+            src/pro/ProToolList.cpp      # Pro's agent-tool table (#220)
             src/pro/LookLoader.cpp       # LUT parse / OCIO bake off the render thread
             src/pro/DisplayCalibration.cpp  # per-panel display calibration (#133)
             src/pro/TargetScreen.cpp     # target-screen depth model (#135)
             src/pro/LivePixels.cpp       # UYVY / v210 / BGRA -> NV12 / P016 for capture cards
+            src/pro/ConvertPool.cpp      # ... split into row bands over a per-input thread pool (4K60)
             src/pro/LiveSourceBase.cpp   # shared ring + stats of the Pro live sources
             src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)
             src/pro/TimecodePairer.cpp   # two-input stereo pairing by SMPTE timecode
@@ -838,6 +841,13 @@ if(MP_BUILD_TESTS)
     target_include_directories(live_pixels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
     add_test(NAME live_pixels COMMAND live_pixels_test)
+    # The capture convert in row bands on 1..7 threads (incl. a dual-stream pair of eyes) =
+    # the one-pass convert, bit for bit; prints a 4K v210 timing, 1 vs N threads.
+    add_executable(live_convert_test tests/live_convert_test.cpp src/pro/ConvertPool.cpp src/pro/LivePixels.cpp)
+    target_include_directories(live_convert_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    find_package(Threads REQUIRED)
+    target_link_libraries(live_convert_test PRIVATE Threads::Threads)
+    add_test(NAME live_convert COMMAND live_convert_test)
     add_executable(qc_report_test tests/qc_report_test.cpp src/pro/QcReport.cpp)
     target_include_directories(qc_report_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME qc_report COMMAND qc_report_test)
@@ -860,6 +870,11 @@ if(MP_BUILD_TESTS)
     add_executable(decklink_spec_test tests/decklink_spec_test.cpp src/pro/DeckLinkSpec.cpp)
     target_include_directories(decklink_spec_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME decklink_spec COMMAND decklink_spec_test)
+    # Player + Pro agent tools: unique names, valid schemas, within the runtime's budget (#220).
+    add_executable(agent_tools_test tests/agent_tools_test.cpp src/AgentTools.cpp src/pro/ProToolList.cpp)
+    target_include_directories(agent_tools_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(agent_tools_test PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME agent_tools COMMAND agent_tools_test)
     add_executable(thumbnail_test tests/thumbnail_test.cpp src/pro/Thumbnail.cpp)
     target_include_directories(thumbnail_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME thumbnail COMMAND thumbnail_test)
