@@ -62,6 +62,7 @@
 #include <unistd.h>
 
 #include "sbs_renderer.h"
+#include "stereo_grid.h"
 #include "video_decoder.h"
 #include "audio_player.h"
 #include "ColorPolicy.h"  // swapchain encoding policy, shared with the desktop leg (#78)
@@ -318,6 +319,10 @@ VkFormat g_swapchain_format = VK_FORMAT_UNDEFINED;
 // video YUV) plus the 2D transport overlay; the runtime's DP weaves the views.
 SbsRenderer g_sbs;
 bool g_sbs_ready = false;
+// The browser's 3D grid (#180): replaces the atlas pass while the browser shows its tiles
+// in stereo. Without it the "3D only" filter keeps the flat mode.
+StereoGridRenderer g_grid;
+bool g_grid_ready = false;
 std::atomic<bool> g_scene_loaded{false};
 
 // Media sources. The app starts on the DisplayXR idle screen (same lockup as
@@ -452,8 +457,9 @@ std::atomic<bool> g_showing_splash{false};
 XrDisplayRenderingModeInfoDXR g_modes[kMaxViews] = {};
 uint32_t g_mode_count = 0;
 int32_t g_active_mode = -1;             // modeIndex of the mode the runtime reports active
-int32_t g_mode_before_splash = -1;      // what to hand back
-int32_t g_splash_mode_requested = -1;   // what we borrowed
+// What the idle screen and the browser borrowed, and what to hand back: flat, or the 3D
+// mode under the browser's "3D only" filter (the 3D grid, #180).
+mp::browser::ModeBorrow g_mode_borrow;
 int32_t g_pending_mode_request = -1;    // issued from the frame loop once running
 mp::DisplayModeSwitch g_mode_switch;    // the player's 2D/3D switch (#180); its Flat() is the borrow's
 
@@ -473,11 +479,30 @@ static void
 request_flat_mode_for_splash()
 {
 	const int32_t flat = g_mode_switch.Flat();
-	if (flat < 0 || g_active_mode < 0 || flat == g_active_mode) return;
-	g_mode_before_splash = g_active_mode;
-	g_splash_mode_requested = flat;
-	g_pending_mode_request = flat;
+	const int32_t want = g_mode_borrow.Borrow(flat, g_active_mode);
+	if (want < 0) return;
+	g_pending_mode_request = want;
 	LOGI("splash: borrowing flat mode %d (was %d)", flat, g_active_mode);
+}
+
+// While the browser shows: the flat mode, or the 3D mode under its "3D only" filter (the
+// 3D grid, #180). Never from what the grid happens to show, so a scroll cannot flip modes.
+static void
+request_browser_mode()
+{
+	const bool only3D = g_browser.WantsStereo() && g_grid_ready;
+	const int32_t mode = mp::browser::BrowserMode(only3D, g_mode_switch.Flat(), g_mode_switch.Stereo());
+	const int32_t want = g_mode_borrow.Borrow(mode, g_active_mode);
+	if (want < 0) return;
+	g_pending_mode_request = want;
+	LOGI("browser: borrowing %s mode %d (active %d)", only3D ? "3D" : "flat", want, g_active_mode);
+}
+
+// The 3D grid draws this frame: the "3D only" filter, and the panel already in 3D.
+static bool
+grid_stereo()
+{
+	return g_grid_ready && g_browser.WantsStereo() && g_mode_switch.Is3D() && g_view_count >= 2;
 }
 
 // Every user-media load goes through here: clears the splash flag and hands the
@@ -487,13 +512,11 @@ leave_splash()
 {
 	g_showing_splash.store(false, std::memory_order_relaxed);
 	g_browsing = false;
-	if (g_splash_mode_requested >= 0 && g_mode_before_splash >= 0 &&
-	    g_active_mode == g_splash_mode_requested) {
-		g_pending_mode_request = g_mode_before_splash;
-		LOGI("splash: handing mode %d back", g_mode_before_splash);
+	const int32_t back = g_mode_borrow.Return(g_active_mode);
+	if (back >= 0) {
+		g_pending_mode_request = back;
+		LOGI("splash: handing mode %d back", back);
 	}
-	g_mode_before_splash = -1;
-	g_splash_mode_requested = -1;
 }
 
 // ── Stereo layout (desktop parity, #45) ─────────────────────────────────────
@@ -1962,6 +1985,11 @@ sbs_init()
 	g_video_right.setImageRetirer(retire_decoder_image);
 	g_sbs_ready = true;
 	LOGI("SbsRenderer ready (atlas %ux%u)", g_atlas.width, g_atlas.height);
+	g_grid_ready = g_grid.init(g_vk_phys_device, g_vk_device, g_swapchain_format, frames_in_flight());
+	if (!g_grid_ready) {
+		LOGE("StereoGridRenderer::init failed: the browser's 3D grid stays flat");
+		g_grid.cleanup();
+	}
 	return true;
 }
 
@@ -2721,10 +2749,28 @@ render_frame()
 			if (res == XR_SUCCESS) {
 				const float aC = g_content_aspect.load(std::memory_order_relaxed);
 				run_slide();
-				g_sbs.drawAtlas(g_atlas.images[img_idx].image, g_atlas.width, g_atlas.height,
-				                render_w, render_h, cols, rows, submit_views, aC, g_image_mono,
-				                g_clear_rgb);
-				const bool hud_held = record_hud();
+				auto draw_atlas = [&] {
+					g_sbs.drawAtlas(g_atlas.images[img_idx].image, g_atlas.width, g_atlas.height,
+					                render_w, render_h, cols, rows, submit_views, aC, g_image_mono,
+					                g_clear_rgb);
+				};
+				bool hud_held = false;
+				if (browser_showing()) {
+					// The browser lays the grid out first, so the 3D grid's tiles are drawn at
+					// the rects of THIS frame's HUD (#180). Without its tiles (flat filter, the
+					// panel not in 3D yet, no HUD this frame) the atlas is drawn as usual.
+					request_browser_mode();
+					g_browser.SetStereo(grid_stereo());
+					hud_held = record_hud();
+					if (!hud_active ||
+					    !g_grid.draw(g_sbs.frameCmd(), g_atlas.images[img_idx].image, g_atlas.width,
+					                 g_atlas.height, render_w, render_h, cols, submit_views,
+					                 g_browser.Stereo()))
+						draw_atlas();
+				} else {
+					draw_atlas();
+					hud_held = record_hud();
+				}
 				// The frame's ONE vkQueueSubmit (atlas + HUD), no wait — and BEFORE
 				// either image is released: the runtime composes on this same queue,
 				// so our work must be queued ahead of it (INV-4.10).
@@ -2946,6 +2992,8 @@ destroy_all()
 	g_browser.Shutdown();
 	g_imgui.Shutdown();
 	g_hud_ready = false;
+	g_grid.cleanup();
+	g_grid_ready = false;
 	if (g_sbs_ready) {
 		g_sbs.cleanup();
 		g_sbs_ready = false;

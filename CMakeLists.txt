@@ -781,6 +781,18 @@ if(MP_BUILD_TESTS)
     target_include_directories(slide_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME slide_gesture COMMAND slide_gesture_test)
 
+    # Media browser (#180): the 3D grid's eye crops, per-tile convergence, per-view quads
+    # and the rendering-mode borrow, plus the thumbnail depth worker. Pure, one thread.
+    add_executable(stereo_grid_test
+        tests/stereo_grid_test.cpp
+        src/browser/StereoGrid.cpp
+        src/browser/ThumbnailDepth.cpp
+        src/media/AutoConvergence.cpp)
+    target_include_directories(stereo_grid_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    find_package(Threads REQUIRED)
+    target_link_libraries(stereo_grid_test PRIVATE Threads::Threads)
+    add_test(NAME stereo_grid COMMAND stereo_grid_test)
+
     # The Android player's 2D/3D switch (#180): which rendering mode a flip asks for. Pure.
     add_executable(display_mode_switch_test tests/display_mode_switch_test.cpp
         src/xr/DisplayModeSwitch.cpp)

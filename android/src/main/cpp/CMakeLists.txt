@@ -103,6 +103,8 @@ endfunction()
 mp_compile_shader("${REPO_ROOT}/shaders" fullscreen.vert)
 mp_compile_shader("${REPO_ROOT}/shaders" sbs.frag)
 mp_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders" sbs_ahb.frag)  # zero-copy AHB ycbcr blit
+mp_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders" stereo_grid.vert)  # the browser's 3D grid (#180)
+mp_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders" stereo_grid.frag)
 
 # ── NativeActivity glue (ships with the NDK) ─────────────────────────────
 add_library(native_app_glue STATIC
@@ -161,10 +163,13 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/browser/MediaLibrary.cpp
     ${REPO_ROOT}/src/browser/SlideGesture.cpp
     ${REPO_ROOT}/src/browser/StereoClassifier.cpp
+    ${REPO_ROOT}/src/browser/StereoGrid.cpp       # the 3D grid's pure logic (#180)
     ${REPO_ROOT}/src/browser/ThumbnailAtlas.cpp
     ${REPO_ROOT}/src/browser/ThumbnailCache.cpp
+    ${REPO_ROOT}/src/browser/ThumbnailDepth.cpp   # per-tile convergence for the 3D grid
     ${REPO_ROOT}/src/browser/TouchScroller.cpp
     browser/AndroidMediaProvider.cpp
+    stereo_grid.cpp                               # the 3D grid's projection pass
     neighbour_stills.cpp
     still_image.cpp
     ${MP_IMGUI_SOURCES}

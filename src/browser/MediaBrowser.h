@@ -11,8 +11,10 @@
 #include "browser/MediaLibrary.h"
 #include "browser/MediaProvider.h"
 #include "browser/StereoClassifier.h"
+#include "browser/StereoGrid.h"
 #include "browser/ThumbnailAtlas.h"
 #include "browser/ThumbnailCache.h"
+#include "browser/ThumbnailDepth.h"
 #include "browser/TouchScroller.h"
 
 #include <vulkan/vulkan.h>
@@ -73,6 +75,15 @@ public:
     bool CanGoBack() const;
     bool Back();
 
+    // The 3D grid (#180, StereoGrid.h). The "3D only" filter is on: the caller takes the
+    // panel to 3D for it.
+    bool WantsStereo() const { return depth_ == DepthFilter::Only3D; }
+    // The panel is in 3D and the caller draws Stereo() into the projection layer, so
+    // Build() leaves the tiles' pictures and the background behind them out of the HUD.
+    void SetStereo(bool on) { stereo_ = on; }
+    // The tiles Build() laid out this frame, at this frame's rects; inactive unless set.
+    const StereoFrame& Stereo() const { return stereoFrame_; }
+
 private:
     static constexpr uint32_t kTile = 512;  // thumbnail edge, px
     static constexpr uint32_t kSlots = 64;  // thumbnails on the GPU: a screen and a few rows
@@ -124,6 +135,10 @@ private:
     ImVec2 gridPress_, sidebarPress_;
     int columns_ = 0;   // the last frame's, to keep the top row on a reflow
     float step_ = 0.0f;
+
+    bool stereo_ = false;        // SetStereo
+    StereoFrame stereoFrame_;    // this frame's tiles, when stereo_
+    ThumbnailDepth thumbDepth_;  // per-thumbnail convergence for the 3D grid
 };
 
 } // namespace mp::browser
