@@ -2,6 +2,7 @@
 #include "pro/DeckLinkSource.h"
 
 #include "Log.h"
+#include "pro/ConvertPool.h"
 #include "pro/DeckLinkFormat.h"
 #include "pro/TimecodePairer.h"
 
@@ -408,23 +409,26 @@ int SignalBits(BMDDetectedVideoInputFormatFlags d) {
     return 0;
 }
 
-// One eye's copied pixels -> P016 at column x0 of dst (10-bit kept; 8-bit widened).
-// hasMatrix / matrix: the signal's colorimetry, if the card reported it. An r210 (RGB)
-// frame is encoded with it, so the tag the caller sets afterwards is the one the pixels
-// were encoded with.
-void ConvertEye(const RawPixels& p, livepix::P016& dst, int x0, bool hasMatrix, ColorMatrix matrix) {
+// One eye's copied pixels as a conversion to P016 at column x0 of dst (10-bit kept; 8-bit
+// widened), for livepix::ToP016Banded. hasMatrix / matrix: the signal's colorimetry, if the
+// card reported it. An r210 (RGB) frame is encoded with it, so the tag the caller sets
+// afterwards is the one the pixels were encoded with.
+livepix::EyeJob ConvertJob(const RawPixels& p, livepix::P016& dst, int x0, bool hasMatrix, ColorMatrix matrix) {
     const bool deep = p.pf == bmdFormat10BitYUV || p.pf == bmdFormat10BitRGB;
     g_lastBitDepth.store(deep ? 10 : 8, std::memory_order_relaxed);
-    const int w = p.w & ~1, h = p.h & ~1;
-    if (p.pf == bmdFormat10BitYUV)
-        livepix::V210ToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
-    else if (p.pf == bmdFormat10BitRGB)
-        livepix::R210ToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0,
-                            hasMatrix ? matrix : DefaultMatrixForHeight(h));
-    else if (p.pf == bmdFormat8BitBGRA)
-        livepix::BgraToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
-    else
-        livepix::UyvyToP016(p.bytes.data(), p.rowBytes, w, h, dst, x0);
+    livepix::EyeJob j;
+    j.fmt = p.pf == bmdFormat10BitYUV   ? livepix::RawFormat::V210
+            : p.pf == bmdFormat10BitRGB ? livepix::RawFormat::R210
+            : p.pf == bmdFormat8BitBGRA ? livepix::RawFormat::Bgra
+                                        : livepix::RawFormat::Uyvy;
+    j.src = p.bytes.data();
+    j.srcRowBytes = p.rowBytes;
+    j.w = p.w & ~1;
+    j.h = p.h & ~1;
+    j.dst = &dst;
+    j.x0 = x0;
+    j.rgbMatrix = hasMatrix ? matrix : DefaultMatrixForHeight(j.h);
+    return j;
 }
 
 // The frame's timecode as text and as a frame count at the full frame rate (-1 when it
@@ -594,6 +598,9 @@ struct DeckLinkCapture {
     // frame's metadata, and each input's own lane thread converts, pairs and publishes.
     // A lane holds one pending frame: if the next arrives first, the pending one is
     // replaced (newest wins) and counted in LiveStats::lateFrames.
+    // The convert is split into row bands over the lane's ConvertPool: on one thread a
+    // station's two 2160p59.94 inputs reached ~40 fps, and a dual-stream input converts two
+    // eyes per frame on its one lane (MEDIAPLAYER_DECKLINK_CONVERT_THREADS, pro/ConvertPool.h).
     struct RawFrame {
         RawPixels px, right;  // right: dual-stream 3D's right eye
         bool dual = false;
@@ -613,12 +620,23 @@ struct DeckLinkCapture {
         int pending = -1, busy = -1;
         bool quit = false;
         std::thread th;
+        std::unique_ptr<livepix::ConvertPool> pool;  // the convert's threads (th runs band 0)
     };
     Lane lanes[2];
     std::atomic<uint32_t> generation{0};  // bumped on a format change: queued frames are stale
 
-    void StartLanes(int n) {
-        for (int e = 0; e < n; ++e) lanes[e].th = std::thread([this, e] { LaneLoop(e); });
+    // n lanes, each carrying up to inputEyes eyes per frame (2: a dual-stream input, or
+    // Auto, which switches to dual-stream when the card detects it).
+    void StartLanes(int n, int inputEyes) {
+        if (n <= 0) return;
+        const int threads = livepix::ConvertThreads(n * inputEyes, inputEyes);
+        for (int e = 0; e < n; ++e) {
+            lanes[e].pool = std::make_unique<livepix::ConvertPool>(threads);
+            lanes[e].th = std::thread([this, e] { LaneLoop(e); });
+        }
+        LOG_INFO("decklink: converting on %d thread(s) per input%s%s", lanes[0].pool->Threads(),
+                 inputEyes > 1 ? " (shared by the two eyes in dual-stream 3D)" : "",
+                 std::getenv("MEDIAPLAYER_DECKLINK_CONVERT_THREADS") ? " (MEDIAPLAYER_DECKLINK_CONVERT_THREADS)" : "");
     }
     void StopLanes() {
         for (Lane& l : lanes) {
@@ -628,6 +646,7 @@ struct DeckLinkCapture {
             }
             l.cv.notify_all();
             if (l.th.joinable()) l.th.join();
+            l.pool.reset();  // after the lane: it is the pool's only caller
         }
     }
 
@@ -704,12 +723,17 @@ struct DeckLinkCapture {
     void Process(int eye, const RawFrame& r) {
         if (!alive) return;
         const int w = r.px.w & ~1, h = r.px.h & ~1;
+        livepix::ConvertPool* pool = lanes[eye].pool.get();
         if (!pair) {
             // one input: only this lane touches `out`; the lock keeps Stop() simple
             std::lock_guard<std::mutex> lk(m);
             out.Resize(r.dual ? 2 * w : w, h);
-            ConvertEye(r.px, out, 0, r.hasMatrix, r.matrix);
-            if (r.dual) ConvertEye(r.right, out, w, r.hasMatrix, r.matrix);
+            // dual-stream: both eyes in one go, their bands side by side on the pool
+            livepix::EyeJob jobs[2];
+            int n = 0;
+            jobs[n++] = ConvertJob(r.px, out, 0, r.hasMatrix, r.matrix);
+            if (r.dual) jobs[n++] = ConvertJob(r.right, out, w, r.hasMatrix, r.matrix);
+            livepix::ToP016Banded(pool, jobs, n);
             if (r.hasMatrix) out.matrix = r.matrix;
             out.transfer = r.transfer;
             if (alive) src->Publish(out, /*fullRange=*/false, r.now, r.tc[0] ? r.tc : nullptr, r.dual ? 0 : -1);
@@ -725,7 +749,8 @@ struct DeckLinkCapture {
         }
         EyeFrame& ef = hist[eye][slot];
         ef.px.Resize(w, h);
-        ConvertEye(r.px, ef.px, 0, r.hasMatrix, r.matrix);
+        const livepix::EyeJob job = ConvertJob(r.px, ef.px, 0, r.hasMatrix, r.matrix);
+        livepix::ToP016Banded(pool, &job, 1);
         if (r.hasMatrix) ef.px.matrix = r.matrix;
         ef.px.transfer = r.transfer;
         ef.arrived = r.now;
@@ -1027,7 +1052,10 @@ void DeckLinkSource::Worker() {
     cap.src = this;
     cap.pair = pair;
     cap.dual = cfg_.stereo == DeckLinkConfig::Stereo::Dual;
-    cap.StartLanes(nInputs);  // before any input streams: the callbacks hand frames to these
+    // One input carries two eyes per frame in dual-stream 3D, which Auto switches to when
+    // the card detects it: its lane's pool is sized for both.
+    const bool twoEyeInput = !pair && (cap.dual || cfg_.stereo == DeckLinkConfig::Stereo::Auto);
+    cap.StartLanes(nInputs, twoEyeInput ? 2 : 1);  // before any input streams: the callbacks hand frames to these
 
     IDeckLinkInput* inputs[2] = {nullptr, nullptr};
     Callback* callbacks[2] = {nullptr, nullptr};
