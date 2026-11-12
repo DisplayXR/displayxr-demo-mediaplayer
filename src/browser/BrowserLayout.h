@@ -24,6 +24,19 @@ int GridColumns(float widthDp);
 // more; anywhere else they are a drawer over it.
 bool UseRail(float widthDp, float heightDp);
 
+// A source row in the rail or the drawer: the label starts at `labelX`, the count is
+// right-aligned to `right`, and the label may run only to `gap` before the count (it is cut
+// with an ellipsis there), so the two never overlap. `labelMax` is never negative.
+struct SourceRowLayout {
+    float countX = 0.0f;
+    float labelMax = 0.0f;
+};
+SourceRowLayout SourceRow(float labelX, float right, float countWidth, float gap);
+
+// The rail's width: what its widest row needs (`content`), at least `minWidth`, at most
+// `maxFraction` of the screen.
+float RailWidth(float content, float screenWidth, float minWidth, float maxFraction);
+
 // The view options behind the overflow menu (sort, show unsupported) are as they start.
 // The filters in the chip row show their own state, so they are not counted.
 bool ViewOptionsAreDefault(const ViewOptions& options, bool showUnsupported);

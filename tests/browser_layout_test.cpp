@@ -48,6 +48,26 @@ void TestRail() {
     CHECK(UseRail(840.0f, 600.0f), "840 dp is enough");
 }
 
+void TestSourceRow() {
+    std::printf("[a source row: the label stops before the count]\n");
+    SourceRowLayout r = SourceRow(100.0f, 800.0f, 60.0f, 40.0f);
+    CHECK(Near(r.countX, 740.0f), "the count is right-aligned");
+    CHECK(Near(r.labelMax, 600.0f), "the label runs to a gap before it");
+    CHECK(100.0f + r.labelMax + 40.0f <= r.countX + 0.01f, "label + gap never reach the count");
+    r = SourceRow(100.0f, 180.0f, 60.0f, 40.0f);
+    CHECK(Near(r.labelMax, 0.0f), "no room: an empty label, never negative");
+    CHECK(Near(SourceRow(10.0f, 200.0f, 0.0f, 16.0f).labelMax, 174.0f), "no count: the whole row");
+}
+
+void TestRailWidth() {
+    std::printf("[the rail fits its rows within its limits]\n");
+    CHECK(Near(RailWidth(500.0f, 2400.0f, 720.0f, 0.4f), 720.0f), "at least the minimum");
+    CHECK(Near(RailWidth(800.0f, 2400.0f, 720.0f, 0.4f), 800.0f), "as wide as the rows need");
+    CHECK(Near(RailWidth(1200.0f, 2400.0f, 720.0f, 0.4f), 960.0f), "at most 40% of the screen");
+    CHECK(Near(RailWidth(1200.0f, 1000.0f, 720.0f, 0.4f), 720.0f), "the minimum wins over the fraction");
+    CHECK(RailWidth(1200.0f, 500.0f, 720.0f, 0.4f) <= 500.0f, "never wider than the screen");
+}
+
 void TestOptions() {
     std::printf("[the overflow menu's options and the type chip]\n");
     ViewOptions o;
@@ -134,6 +154,8 @@ void TestGridSections() {
 int main() {
     TestColumns();
     TestRail();
+    TestSourceRow();
+    TestRailWidth();
     TestOptions();
     TestDates();
     TestGridPlain();

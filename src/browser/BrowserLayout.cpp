@@ -35,6 +35,18 @@ int GridColumns(float widthDp) {
 
 bool UseRail(float widthDp, float heightDp) { return widthDp >= heightDp && widthDp >= kRailMinDp; }
 
+SourceRowLayout SourceRow(float labelX, float right, float countWidth, float gap) {
+    SourceRowLayout r;
+    r.countX = right - std::max(0.0f, countWidth);
+    r.labelMax = std::max(0.0f, r.countX - gap - labelX);
+    return r;
+}
+
+float RailWidth(float content, float screenWidth, float minWidth, float maxFraction) {
+    const float most = std::max(0.0f, screenWidth * maxFraction);
+    return std::min(std::max(content, minWidth), std::max(most, std::min(minWidth, screenWidth)));
+}
+
 bool ViewOptionsAreDefault(const ViewOptions& options, bool showUnsupported) {
     return options.order == ViewOptions().order && !showUnsupported;
 }

@@ -346,18 +346,30 @@ int MediaBrowser::SourceRows() const {
 }
 
 float MediaBrowser::SidebarWidth(float screenW) const {
-    // Wide enough for the longest row, within 11 font sizes and 30% of the screen.
+    // The rail: wide enough for the longest row as Sidebar() draws it (names in the Row size,
+    // counts in the Small size), at least 240 dp and at most 40% of the screen.
     const ImGuiStyle& style = ImGui::GetStyle();
-    float widest = ImGui::CalcTextSize("Other files...").x;
     const std::vector<Source>& sources = library_.Sources();
-    for (int r = 0, rows = SourceRows(); r < rows; ++r) {
-        const Source& s = sources[(size_t)r];
-        char count[16];
-        std::snprintf(count, sizeof(count), "%d", s.count);
-        widest = std::max(widest, ImGui::CalcTextSize(s.name.c_str()).x + style.ItemSpacing.x + ImGui::CalcTextSize(count).x);
+    const int rows = SourceRows();
+    std::vector<float> names((size_t)rows + 1), counts((size_t)rows + 1, 0.0f);
+    {
+        FontScope row(TextStyle::Row);
+        names[(size_t)rows] = ImGui::CalcTextSize("Other files...").x;
+        for (int r = 0; r < rows; ++r) names[(size_t)r] = ImGui::CalcTextSize(sources[(size_t)r].name.c_str()).x;
     }
-    const float row = style.WindowPadding.x * 2.0f + ImGui::GetFrameHeight() + style.ItemSpacing.x + widest;
-    return Round(std::min(std::max(row, ImGui::GetFontSize() * 11.0f), screenW * 0.3f));
+    {
+        FontScope small(TextStyle::Small);
+        for (int r = 0; r < rows; ++r) {
+            char count[16];
+            std::snprintf(count, sizeof(count), "%d", sources[(size_t)r].count);
+            counts[(size_t)r] = ImGui::CalcTextSize(count).x;
+        }
+    }
+    float widest = 0.0f;
+    for (size_t r = 0; r < names.size(); ++r)
+        widest = std::max(widest, names[r] + (counts[r] > 0.0f ? Dp(16.0f) + counts[r] : 0.0f));
+    const float content = style.WindowPadding.x * 2.0f + ImGui::GetFrameHeight() + style.ItemSpacing.x + widest;
+    return Round(RailWidth(content, screenW, Dp(240.0f), 0.4f));
 }
 
 const Source& MediaBrowser::CurrentSource() const { return library_.Sources()[(size_t)sourceKind_]; }
@@ -673,13 +685,14 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
         }
         char count[16];
         std::snprintf(count, sizeof(count), "%d", s->count);
-        float countX = right;
+        // The label up to a gap before the count, cut with an ellipsis there: never over it.
+        SourceRowLayout row;
         {
             FontScope small(TextStyle::Small);
-            countX = right - Round(ImGui::CalcTextSize(count).x);
-            dl->AddText(ImVec2(countX, y + Round((rowH - ImGui::GetFontSize()) * 0.5f)), dim, count);
+            row = SourceRow(textX, right, Round(ImGui::CalcTextSize(count).x), Round(Dp(16.0f)));
+            dl->AddText(ImVec2(row.countX, y + Round((rowH - ImGui::GetFontSize()) * 0.5f)), dim, count);
         }
-        dl->AddText(ImVec2(textX, textY), text, ui::FitText(s->name, countX - Round(style.ItemSpacing.x) - textX).c_str());
+        dl->AddText(ImVec2(textX, textY), text, ui::FitText(s->name, row.labelMax).c_str());
     }
     dl->PopClipRect();
 

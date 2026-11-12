@@ -9,6 +9,7 @@ std::string FitText(const std::string& text, float width) {
     if (ImGui::CalcTextSize(text.c_str()).x <= width) return text;
     const char* kEllipsis = "\xE2\x80\xA6";
     const float ellipsis = ImGui::CalcTextSize(kEllipsis).x;
+    if (ellipsis > width) return std::string();  // not even the ellipsis fits: nothing
     size_t n = text.size();
     while (n > 0 && ImGui::CalcTextSize(text.c_str(), text.c_str() + n).x + ellipsis > width) {
         --n;
