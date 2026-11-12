@@ -1540,9 +1540,6 @@ browser_showing()
 	return g_browser_ready.load(std::memory_order_relaxed) && g_browsing;
 }
 
-// Create the SINGLE tiled-atlas swapchain, sized worst-case over all modes AND
-// both orientations (the swapchain is never recreated on rotation, so it must
-// hold either orientation's largest tile layout; each frame renders a
 // The format a file's name says it is, for a message ("HEIC"), or "" when it has none.
 static std::string
 name_format(const std::string &name)
@@ -1896,6 +1893,9 @@ hud_init()
 	return true;
 }
 
+// Create the SINGLE tiled-atlas swapchain, sized worst-case over all modes AND
+// both orientations (the swapchain is never recreated on rotation, so it must
+// hold either orientation's largest tile layout; each frame renders a
 // per-orientation sub-rect via active_tile_dims). Mirrors
 // cube_handle_vk_android::create_swapchains.
 bool
@@ -2262,9 +2262,18 @@ run_slide()
 	} else if (!g_slide.Busy()) {
 		g_zoom.Reset();
 	}
+	// A press that begins on the chrome is the chrome's: tapping the 2D | 3D switch or the (i)
+	// twice must not also double-tap zoom the picture. The zoom gets a cancel instead, so a
+	// tap on the picture just before cannot pair with it.
+	static bool zoom_press = true;
 	for (const TouchEvent &e : touches) {
+		if (e.action == 0) zoom_press = !(g_taps.Shown(e.t) && chrome_at(e.x, e.y));
 		route_touch(e, in_player);
-		if (can_zoom) g_zoom.Touch(e.action, e.x, e.y, e.pointers, e.x1, e.y1, e.t);
+		if (!can_zoom) continue;
+		if (zoom_press)
+			g_zoom.Touch(e.action, e.x, e.y, e.pointers, e.x1, e.y1, e.t);
+		else if (e.action == 0)
+			g_zoom.Touch(3, e.x, e.y, e.pointers, e.x1, e.y1, e.t);
 	}
 	if (in_player && can_zoom && (g_zoom.Zoomed() || g_zoom.Active())) {
 		// Zoomed, a finger pans: no swipe.
