@@ -778,6 +778,12 @@ if(MP_BUILD_TESTS)
     target_include_directories(touch_scroller_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME touch_scroller COMMAND touch_scroller_test)
 
+    # The browser's layout (#180): columns by width, rail or drawer, date sections, the
+    # sectioned grid. Pure.
+    add_executable(browser_layout_test tests/browser_layout_test.cpp src/browser/BrowserLayout.cpp)
+    target_include_directories(browser_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME browser_layout COMMAND browser_layout_test)
+
     # Media browser (#160): swiping to the next or previous file in the player. Pure.
     add_executable(slide_gesture_test tests/slide_gesture_test.cpp src/browser/SlideGesture.cpp)
     target_include_directories(slide_gesture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
