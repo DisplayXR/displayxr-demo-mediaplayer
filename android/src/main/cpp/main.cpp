@@ -65,6 +65,7 @@
 #include "video_decoder.h"
 #include "audio_player.h"
 #include "ColorPolicy.h"  // swapchain encoding policy, shared with the desktop leg (#78)
+#include "ui/Icons.h"
 #include "ui/ImGuiLayer.h"
 #include "ui/TapHandler.h"
 #include "ui/TransportUI.h"
@@ -1752,6 +1753,7 @@ hud_init()
 	// The touch UI was tuned on the 320 dpi NP02J through a 1920x1200 HUD stretched to the
 	// 2560x1600 panel (x1.33). dpi / 240 keeps that size there and follows density elsewhere.
 	if (g_density_dpi > 0) g_imgui.SetUiScale((float)g_density_dpi / 240.0f);
+	mp::ui::g_iconStroke = mp::ui::Dp(2.0f);  // one 2 dp stroke for every outline icon (#180)
 	if (!g_imgui.Init(nullptr, g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
 	                  g_vk_queue_family, g_hud_format, g_hud_w, g_hud_h, g_hud_vk_images,
 	                  frames_in_flight())) {

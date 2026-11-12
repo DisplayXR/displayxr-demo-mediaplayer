@@ -51,8 +51,8 @@ struct TransportCaps {
     // The touch player's 2D/3D switch (#180), in place of `mode`'s cycle button. DEFAULT
     // FALSE; Android sets it while media plays and the runtime has a 2D and a 3D mode.
     bool modeSwitch = false;
-    // The touch player's gallery button (#180): a grid icon in place of the "Open" text
-    // button. DEFAULT FALSE; Android sets it.
+    // The touch player's way back to the gallery (#180): a back arrow (the browser's own)
+    // in place of the "Open" text button. DEFAULT FALSE; Android sets it.
     bool gallery = false;
 };
 

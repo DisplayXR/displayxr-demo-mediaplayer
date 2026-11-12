@@ -22,6 +22,8 @@ gallery cannot list them; "Other files..." reaches them.
 ## Structure
 
 ```
+src/ui/Icons.{h,cpp}            every icon, the player's and the browser's (one set)
+
 src/browser/                    namespace mp::browser, platform-neutral
   MediaItem.h                   one media entry: id, name, kind, size, duration, date, folder
   MediaLibrary.{h,cpp}          the item list, sources, filter and sort
@@ -33,7 +35,6 @@ src/browser/                    namespace mp::browser, platform-neutral
   TouchScroller.{h,cpp}         drag, inertia, tap vs drag
   SlideGesture.{h,cpp}          swiping to the next or previous file in the player
   MediaBrowser.{h,cpp}          the ImGui view: sidebar, top bar, grid, view options, empty states
-  Icons.{h,cpp}                 hand-drawn icons
 
 android/src/main/cpp/browser/
   AndroidMediaProvider.{h,cpp}  MediaProvider over JNI, plus the swipe's stills; its JNI

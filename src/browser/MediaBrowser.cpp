@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "browser/MediaBrowser.h"
 
-#include "browser/Icons.h"
+#include "ui/Icons.h"
 #include "ui/UiScale.h"
 
 #include <algorithm>
@@ -15,6 +15,7 @@ namespace mp::browser {
 
 namespace {
 
+using ui::Glyph;
 using ui::Px;
 
 constexpr float kGutter = 4.0f;    // between tiles, design units
@@ -55,16 +56,16 @@ std::string Fit(const std::string& text, float width) {
     return text.substr(0, n) + kEllipsis;
 }
 
-Icon SourceIcon(SourceKind kind) {
+Glyph SourceIcon(SourceKind kind) {
     switch (kind) {
-        case SourceKind::All: return Icon::AllMedia;
-        case SourceKind::Camera: return Icon::Camera;
-        case SourceKind::Downloads: return Icon::Download;
-        case SourceKind::Pictures: return Icon::Image;
-        case SourceKind::Movies: return Icon::Video;
-        case SourceKind::Unsupported: return Icon::Unsupported;
+        case SourceKind::All: return Glyph::AllMedia;
+        case SourceKind::Camera: return Glyph::Camera;
+        case SourceKind::Downloads: return Glyph::Download;
+        case SourceKind::Pictures: return Glyph::Image;
+        case SourceKind::Movies: return Glyph::Video;
+        case SourceKind::Unsupported: return Glyph::Unsupported;
     }
-    return Icon::Unsupported;
+    return Glyph::Unsupported;
 }
 
 // A file's format as its badge shows it, e.g. "BMP" for "scan.bmp", or "" if it has none.
@@ -136,7 +137,7 @@ float Badge(ImDrawList* dl, float right, float top, const char* text) {
 void FolderTile(ImDrawList* dl, const Folder& folder, ImVec2 a, ImVec2 b, float margin) {
     const float tile = b.x - a.x, font = ImGui::GetFontSize();
     dl->AddRectFilled(a, b, kTileEmpty);
-    DrawIcon(dl, Icon::Folder, ImVec2(a.x + tile * 0.5f, a.y + Round((tile - font) * 0.45f)), tile * 0.5f, kFolder);
+    ui::DrawGlyph(dl, Glyph::Folder, ImVec2(a.x + tile * 0.5f, a.y + Round((tile - font) * 0.45f)), tile * 0.5f, kFolder);
     const std::string name = Fit(folder.name, tile - margin * 2.0f);
     const float w = Round(ImGui::CalcTextSize(name.c_str()).x);
     dl->AddText(ImVec2(Round(a.x + (tile - w) * 0.5f), b.y - margin - font), ImGui::GetColorU32(ImGuiCol_Text),
@@ -162,13 +163,13 @@ void CheckBox(ImDrawList* dl, ImVec2 min, float size, bool on) {
     dl->AddPolyline(tick, 3, kBadgeText, 0, th * 1.5f);
 }
 
-bool IconButton(const char* id, Icon icon, ImVec2 pos, float size) {
+bool IconButton(const char* id, Glyph icon, ImVec2 pos, float size) {
     ImGui::SetCursorScreenPos(pos);
     const bool clicked = ImGui::InvisibleButton(id, ImVec2(size, size));
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 c(pos.x + size * 0.5f, pos.y + size * 0.5f);
     if (ImGui::IsItemActive()) dl->AddCircleFilled(c, size * 0.5f, ImGui::GetColorU32(ImGuiCol_FrameBgActive));
-    DrawIcon(dl, icon, c, size, ImGui::GetColorU32(ImGuiCol_Text));
+    ui::DrawGlyph(dl, icon, c, size, ImGui::GetColorU32(ImGuiCol_Text));
     return clicked;
 }
 
@@ -368,19 +369,19 @@ void MediaBrowser::TopBar(float width, float height) {
     dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(width, top + height), kPanel);
     if (selecting_) {
         // As the stock tablet player's: a cross, the count, and the bin.
-        if (IconButton("##cancel", Icon::Close, ImVec2(pad, y), icon)) EndSelection();
+        if (IconButton("##cancel", Glyph::Close, ImVec2(pad, y), icon)) EndSelection();
         char count[32];
         std::snprintf(count, sizeof(count), "%d selected", (int)selected_.size());
         dl->AddText(ImVec2(pad + icon + Round(style.ItemSpacing.x), top + Round((height - ImGui::GetFontSize()) * 0.5f)),
                     ImGui::GetColorU32(ImGuiCol_Text), count);
-        if (IconButton("##delete", Icon::Delete, ImVec2(width - pad - icon, y), icon))
+        if (IconButton("##delete", Glyph::Delete, ImVec2(width - pad - icon, y), icon))
             provider_->Delete(std::vector<int64_t>(selected_.begin(), selected_.end()));
         return;
     }
-    if (IconButton("##menu", Icon::Menu, ImVec2(pad, y), icon)) sidebar_ = !sidebar_;
-    if (IconButton("##options", Icon::More, ImVec2(width - pad - icon, y), icon)) ImGui::OpenPopup("##view_options");
+    if (IconButton("##menu", Glyph::Menu, ImVec2(pad, y), icon)) sidebar_ = !sidebar_;
+    if (IconButton("##options", Glyph::More, ImVec2(width - pad - icon, y), icon)) ImGui::OpenPopup("##view_options");
     if (folder_ != CurrentSource().folder &&
-        IconButton("##up", Icon::Up, ImVec2(pad + icon + Round(style.ItemSpacing.x), y), icon))
+        IconButton("##up", Glyph::Back, ImVec2(pad + icon + Round(style.ItemSpacing.x), y), icon))
         Up();
 
     // The current source and the folder in it, "Downloads / MEDIA / ZTEPics", in a pill in
@@ -444,8 +445,8 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
         const Source* s = r < files ? &sources[r] : nullptr;
         if (s && s->kind == sourceKind_) dl->AddRectFilled(a, b, kSelected);
         if (r == pressed) dl->AddRectFilled(a, b, kPressed);
-        DrawIcon(dl, s ? SourceIcon(s->kind) : Icon::Files, ImVec2(min.x + pad + icon * 0.5f, y + rowH * 0.5f), icon,
-                 text);
+        ui::DrawGlyph(dl, s ? SourceIcon(s->kind) : Glyph::Files, ImVec2(min.x + pad + icon * 0.5f, y + rowH * 0.5f),
+                      icon, text, s && s->kind == sourceKind_);
         const float textY = y + Round((rowH - ImGui::GetFontSize()) * 0.5f);
         if (!s) {
             dl->AddText(ImVec2(textX, textY), text, Fit("Other files...", right - textX).c_str());
@@ -621,7 +622,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, bool landscape, 
         } else {
             dl->AddRectFilled(a, b, kTileEmpty);
             if (noThumbnail_.count(item.id)) {
-                DrawIcon(dl, item.type == MediaType::Video ? Icon::Video : Icon::Image,
+                ui::DrawGlyph(dl, item.type == MediaType::Video ? Glyph::Video : Glyph::Image,
                          ImVec2(a.x + tile * 0.5f, a.y + tile * 0.5f), tile * 0.3f,
                          ImGui::GetColorU32(ImGuiCol_TextDisabled));
             }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ui/TransportUI.h"
+#include "ui/Icons.h"
 #include "ui/UiScale.h"
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
@@ -121,17 +122,14 @@ ImFont* StyleFont(TextStyle style) {
 }
 
 namespace {
-constexpr float kPi = 3.14159265358979f;  // IM_PI lives in imgui_internal.h; keep our own
-enum class Icon { Play, Pause, Loop, Slideshow, Speaker, SpeakerMuted, Gallery };
-
 // A borderless icon button: an invisible hit-target with a hand-drawn glyph centered
-// in it (no icon font needed). `active` tints it with the accent color (toggle-on);
-// hover brightens. Returns true on click. Glyph colors go through GetColorU32 so the
-// surrounding ImGui Alpha (the auto-hide fade) applies for free.
+// in it (ui/Icons.h, no icon font needed). `active` tints it with the accent color
+// (toggle-on); hover brightens. Returns true on click. Glyph colors go through
+// GetColorU32 so the surrounding ImGui Alpha (the auto-hide fade) applies for free.
 //
 // `hitScale` grows the invisible hit target WITHOUT changing the drawn glyph, so a
 // touch leg gets finger-sized targets while looking identical to the desktop.
-bool IconButton(const char* id, Icon kind, float size, bool active = false,
+bool IconButton(const char* id, Glyph kind, float size, bool active = false,
                 float hitScale = 1.0f) {
     const float hit = size * (hitScale > 1.0f ? hitScale : 1.0f);
     const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -150,83 +148,7 @@ bool IconButton(const char* id, Icon kind, float size, bool active = false,
     if (held) col = active ? ImVec4(0.55f, 0.85f, 1.00f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
     else if (hovered) col = active ? ImVec4(0.42f, 0.78f, 1.00f, 1.0f)
                                    : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
-    const ImU32 u = ImGui::GetColorU32(col);
-    const float r = size * 0.30f;
-    const float th = size * 0.11f;
-
-    switch (kind) {
-        case Icon::Play: {
-            const float h = size * 0.30f;
-            dl->AddTriangleFilled(ImVec2(c.x - h * 0.7f, c.y - h),
-                                  ImVec2(c.x - h * 0.7f, c.y + h),
-                                  ImVec2(c.x + h, c.y), u);
-            break;
-        }
-        case Icon::Pause: {
-            const float bw = size * 0.13f, bh = size * 0.30f, gap = size * 0.10f;
-            dl->AddRectFilled(ImVec2(c.x - gap - bw, c.y - bh), ImVec2(c.x - gap, c.y + bh), u,
-                              th * 0.4f);
-            dl->AddRectFilled(ImVec2(c.x + gap, c.y - bh), ImVec2(c.x + gap + bw, c.y + bh), u,
-                              th * 0.4f);
-            break;
-        }
-        case Icon::Loop: {
-            // Two arcs forming a near-circle, with a small arrowhead at each open end.
-            dl->PathArcTo(c, r, kPi * 0.30f, kPi * 0.95f);
-            dl->PathStroke(u, 0, th);
-            dl->PathArcTo(c, r, kPi * 1.30f, kPi * 1.95f);
-            dl->PathStroke(u, 0, th);
-            const float ah = size * 0.13f;
-            const ImVec2 e1(c.x + r * std::cos(kPi * 0.95f), c.y + r * std::sin(kPi * 0.95f));
-            dl->AddTriangleFilled(ImVec2(e1.x - ah, e1.y), ImVec2(e1.x + ah * 0.4f, e1.y - ah),
-                                  ImVec2(e1.x + ah * 0.4f, e1.y + ah), u);
-            const ImVec2 e2(c.x + r * std::cos(kPi * 1.95f), c.y + r * std::sin(kPi * 1.95f));
-            dl->AddTriangleFilled(ImVec2(e2.x + ah, e2.y), ImVec2(e2.x - ah * 0.4f, e2.y - ah),
-                                  ImVec2(e2.x - ah * 0.4f, e2.y + ah), u);
-            break;
-        }
-        case Icon::Slideshow: {
-            // A photo frame with a small play triangle inside (auto-advancing stills).
-            dl->AddRect(ImVec2(c.x - r, c.y - r * 0.78f), ImVec2(c.x + r, c.y + r * 0.78f), u,
-                        size * 0.10f, 0, th * 0.8f);
-            const float h = size * 0.16f;
-            dl->AddTriangleFilled(ImVec2(c.x - h * 0.5f, c.y - h), ImVec2(c.x - h * 0.5f, c.y + h),
-                                  ImVec2(c.x + h, c.y), u);
-            break;
-        }
-        case Icon::Speaker:
-        case Icon::SpeakerMuted: {
-            // Body box + cone (triangle pointing right).
-            const float bx = -r * 0.35f;
-            dl->AddRectFilled(ImVec2(c.x - r * 0.95f, c.y - r * 0.30f),
-                              ImVec2(c.x + bx, c.y + r * 0.30f), u);
-            dl->AddTriangleFilled(ImVec2(c.x + bx, c.y - r * 0.62f),
-                                  ImVec2(c.x + bx, c.y + r * 0.62f), ImVec2(c.x + r * 0.25f, c.y), u);
-            if (kind == Icon::Speaker) {  // two sound-wave arcs
-                dl->PathArcTo(ImVec2(c.x + r * 0.1f, c.y), r * 0.58f, -kPi * 0.28f, kPi * 0.28f);
-                dl->PathStroke(u, 0, th * 0.7f);
-                dl->PathArcTo(ImVec2(c.x + r * 0.1f, c.y), r * 0.92f, -kPi * 0.28f, kPi * 0.28f);
-                dl->PathStroke(u, 0, th * 0.7f);
-            } else {                      // muted: a small X
-                const float xc = c.x + r * 0.72f, d = r * 0.26f;
-                dl->AddLine(ImVec2(xc - d, c.y - d), ImVec2(xc + d, c.y + d), u, th * 0.9f);
-                dl->AddLine(ImVec2(xc - d, c.y + d), ImVec2(xc + d, c.y - d), u, th * 0.9f);
-            }
-            break;
-        }
-        case Icon::Gallery: {
-            // A 3x3 grid of tiles, corners on whole pixels so the small gaps stay sharp.
-            const float cell = r * 2.0f / 3.0f, half = cell * 0.36f;
-            for (int j = -1; j <= 1; ++j)
-                for (int i = -1; i <= 1; ++i) {
-                    const ImVec2 m(c.x + i * cell, c.y + j * cell);
-                    dl->AddRectFilled(ImVec2(std::round(m.x - half), std::round(m.y - half)),
-                                      ImVec2(std::round(m.x + half), std::round(m.y + half)), u,
-                                      size * 0.02f);
-                }
-            break;
-        }
-    }
+    DrawGlyph(dl, kind, c, size, ImGui::GetColorU32(col));
     return ImGui::IsItemClicked();
 }
 
@@ -496,7 +418,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);  // flat bar, flush to edges
         if (!s.stripOnly && ImGui::Begin("##wsui_top", nullptr, topbar)) {
             ImGui::BeginDisabled(s.openFilePending);
-            if (s.caps.gallery ? IconButton("##gallery", Icon::Gallery, iconSz)
+            if (s.caps.gallery ? IconButton("##gallery", Glyph::Back, iconSz)
                                : ImGui::Button("Open"))
                 Fire(a.Open);
             ImGui::EndDisabled();
@@ -651,7 +573,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             if (s.caps.slideshow) {
                 ImGui::SameLine(ImGui::GetWindowWidth() - iconSz -
                                 ImGui::GetStyle().WindowPadding.x);
-                if (IconButton("##slideshow", Icon::Slideshow, iconSz, s.slideshowActive,
+                if (IconButton("##slideshow", Glyph::Slideshow, iconSz, s.slideshowActive,
                                s.hitTargetScale))
                     Fire(a.ToggleSlideshow);
             }
@@ -704,7 +626,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     std::snprintf(frm, sizeof(frm), "f %lld",
                                   (long long)std::llround(s.scrubValue * s.frameRate));
 
-                if (IconButton("##playpause", s.paused ? Icon::Play : Icon::Pause, iconSz, false,
+                if (IconButton("##playpause", s.paused ? Glyph::Play : Glyph::Pause, iconSz, false,
                                s.hitTargetScale))
                     Fire(a.TogglePlayback);
                 // A touch leg's icon hit boxes are taller than a frame: drop the frame-high
@@ -801,13 +723,13 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 ImGui::Text("%s", tot);
                 if (s.caps.mute) {
                     ImGui::SameLine();
-                    if (IconButton("##mute", s.muted ? Icon::SpeakerMuted : Icon::Speaker, iconSz,
+                    if (IconButton("##mute", s.muted ? Glyph::SpeakerMuted : Glyph::Speaker, iconSz,
                                    s.muted, s.hitTargetScale))
                         Fire(a.ToggleMute);
                 }
                 if (s.caps.loop) {
                     ImGui::SameLine();
-                    if (IconButton("##loop", Icon::Loop, iconSz, s.loop, s.hitTargetScale))
+                    if (IconButton("##loop", Glyph::Loop, iconSz, s.loop, s.hitTargetScale))
                         Fire(a.ToggleLoop);
                 }
                 if (s.panelsButton) {
