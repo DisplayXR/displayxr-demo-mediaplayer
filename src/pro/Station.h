@@ -158,6 +158,7 @@ private:
     char dlgMode_[8] = "";            // starting format FourCC; empty = 1080p25 (auto-detect follows)
     std::string pendingDeckLinkSpec_;  // "0+1,sdi": the "DeckLink" input's spec, opened in Tick()
     bool OpenDeckLinkSpec(const std::string& spec);
+    void FillDeckLinkDialogFromInput();  // the dlg* fields from the DeckLink input set up now
     int testFrames_ = 0, testSnapshotFrame_ = -1, testQcExportFrame_ = -1;
     std::string timecode_;
     target::Screen target_;

@@ -474,6 +474,7 @@ function(mp_add_player tgt is_pro)
             src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)
             src/pro/TimecodePairer.cpp   # two-input stereo pairing by SMPTE timecode
             src/pro/DeckLinkSource.cpp   # Blackmagic DeckLink SDI / HDMI input
+            src/pro/DeckLinkSpec.cpp     # the DeckLink input spec + setup dialog fields (no SDK)
             src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
             src/pro/Station.cpp          # inputs, timecode / delay, rig UI, snapshots
             src/pro/QcReport.cpp         # the session's QC report: HTML + marker EDL / CSV
@@ -856,6 +857,9 @@ if(MP_BUILD_TESTS)
     target_include_directories(resolve_link_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(resolve_link_test PRIVATE nlohmann_json::nlohmann_json)
     add_test(NAME resolve_link COMMAND resolve_link_test)
+    add_executable(decklink_spec_test tests/decklink_spec_test.cpp src/pro/DeckLinkSpec.cpp)
+    target_include_directories(decklink_spec_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME decklink_spec COMMAND decklink_spec_test)
     add_executable(thumbnail_test tests/thumbnail_test.cpp src/pro/Thumbnail.cpp)
     target_include_directories(thumbnail_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME thumbnail COMMAND thumbnail_test)
