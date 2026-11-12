@@ -247,6 +247,20 @@ void TestOneViewDisparity() {
     CHECK(Reddish(PixelAt(r.image, w + 394, h / 2)) && !Reddish(PixelAt(r.image, w + 402, h / 2)),
           "disp: the bar moves left in the right view");
 
+    // inv_z_map min < max: 255 is the far end. The same scene with the map flipped and
+    // min/max swapped must give the same pair.
+    for (uint8_t& d : disp) d = 255 - d;
+    std::vector<uint8_t> flippedPng;
+    stbi_write_png_to_func(&JpegSink, &flippedPng, w, h, 1, disp.data(), w);
+    const std::string flippedJson =
+        R"({"stereo_render_data":{"baseline":1},"views":[{"image":{"blob_id":-1},)"
+        R"("focal_px":800,"width_px":800,"height_px":8,)"
+        R"("inv_z_map":{"blob_id":1000001,"min":0,"max":0.25}}]})";
+    const LifResult f = LoadFromBytes(
+        BuildLif(jpg, {{8, JsonBytes(flippedJson)}, {1000001, flippedPng}}), "mp_lif_dispf.lif");
+    CHECK(f.ok && f.stereo && f.image.pixels == r.image.pixels,
+          "disp: min < max gives the same pair");
+
     // Classic Leia schema: "disparityId" names the map, "gain" sets the parallax.
     const std::string classic =
         R"({"gain":0.25,"convergence":null,"views":[{"albedoId":-1,"disparityId":1000001}]})";
