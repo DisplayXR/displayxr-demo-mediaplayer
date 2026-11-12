@@ -236,7 +236,8 @@ private:
     // burst being collected (render thread only)
     std::vector<EyePair> burst_;
     int64_t burstLastSerial_ = 0;
-    double burstStart_ = -1.0;
+    double burstStart_ = -1.0;  // start of the current 0.5 s collection window (-1 = none)
+    bool burstBroken_ = false;  // a gap or change in this window: measure one frame at its end
     bool burstSwap_ = false;
     StereoLayout burstLayout_ = StereoLayout::Mono;
     int pendingEyeOffset_ = -1;
