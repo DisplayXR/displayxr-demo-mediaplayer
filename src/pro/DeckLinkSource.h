@@ -80,6 +80,14 @@ public:
                                       // so without timecode only the newest frames pair
         bool strict = false;          // matched pairs only (one card; MEDIAPLAYER_DECKLINK_STRICT_PAIRS)
         uint64_t mismatchRefused = 0; // strict: pairs NOT shown because the eyes were not one instant
+        // Direct pairing (pro/DirectPair.h; MEDIAPLAYER_DECKLINK_DIRECT_PAIR): each eye converted
+        // straight into its half of the ring frame, and a pair of two such halves published
+        // whole. `pairs` = directPairs + composedPairs.
+        bool directPair = false;      // on for this capture (the switch, and a queue-mode ring)
+        uint64_t directPairs = 0;     // published whole: no compose copy
+        uint64_t composedPairs = 0;   // composed from two eyes, the old path (all of them when off)
+        uint64_t directNoFrame = 0;   // frames with a key that found no ring frame to spare
+        uint64_t directSkipped = 0;   // decisions not shown: an eye's pixels had already gone out whole
     };
     PairStats GetPairStats() const;
     bool IsPair() const { return cfg_.stereo == DeckLinkConfig::Stereo::Pair && GetState() != LiveState::Closed; }

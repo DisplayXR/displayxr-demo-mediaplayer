@@ -57,6 +57,17 @@ void BgraToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, in
 void R210ToP016(const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0, ColorMatrix matrix);
 void CopyEye(P016& dst, int x0, int x1, int w);
 
+// A P016 frame's planes where the converters write, in memory they do not own: a P016's
+// own (Planes()), or a ring frame's (DeckLink direct pairing: each eye converted straight
+// into its half of the side-by-side frame). `width` is the row stride in samples and the
+// bound, `height` the rows, as P016::width / height; uv has height/2 rows.
+struct P016Planes {
+    uint16_t* y = nullptr;
+    uint16_t* uv = nullptr;
+    int width = 0, height = 0;
+};
+inline P016Planes Planes(P016& f) { return {f.y.data(), f.uv.data(), f.width, f.height}; }
+
 // ---- The four P016 converters above as one, and in row bands (a 4K60 eye split across
 // threads: pro/ConvertPool.h). Each converter is ToP016 with its format; ToP016 is the
 // tag plus ToP016Rows over [0, h).
@@ -70,6 +81,7 @@ void ToP016(RawFormat fmt, const uint8_t* src, int srcRowBytes, int w, int h, P0
 ColorMatrix P016Matrix(RawFormat fmt, int h, ColorMatrix rgbMatrix);
 // Whether the converters take this eye (they write nothing otherwise).
 bool EyeFits(const uint8_t* src, int w, int h, const P016& dst, int x0);
+bool EyeFits(const uint8_t* src, int w, int h, const P016Planes& dst, int x0);
 // Rows [r0, r1) of the eye only: luma rows r0..r1-1 and chroma rows r0/2..r1/2-1 of columns
 // [x0, x0 + w), never dst's tags. r0 must be even (a 4:2:0 chroma row is made from rows 2k
 // and 2k + 1) and r1 even or h; false (nothing written) otherwise or when the eye does not
@@ -77,5 +89,8 @@ bool EyeFits(const uint8_t* src, int w, int h, const P016& dst, int x0);
 // and together they write what ToP016 writes, bit for bit: it is this over [0, h).
 bool ToP016Rows(RawFormat fmt, const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0, int r0,
                 int r1, ColorMatrix rgbMatrix);
+// The same into raw planes: every sample the same as into a P016 of that width and height.
+bool ToP016Rows(RawFormat fmt, const uint8_t* src, int srcRowBytes, int w, int h, const P016Planes& dst, int x0,
+                int r0, int r1, ColorMatrix rgbMatrix);
 
 }  // namespace mp::livepix

@@ -14,6 +14,7 @@
 
 namespace mp::livepix {
 class ConvertPool;  // pro/ConvertPool.h
+struct EyeView;     // pro/ConvertPool.h
 }
 
 namespace mp {
@@ -45,6 +46,24 @@ protected:
     // used. The left eye's colour tags stand for the pair.
     void PublishPair(const livepix::P016& l, const livepix::P016& r, bool fullRange, double captureSec,
                      const char* timecode, int eyeOffsetFrames, livepix::ConvertPool* pool = nullptr);
+    // The same from eye views (the left eye's tags given): the P016 one is this.
+    void PublishPair(const livepix::EyeView& l, const livepix::EyeView& r, ColorMatrix matrix,
+                     ColorTransfer transfer, bool fullRange, double captureSec, const char* timecode,
+                     int eyeOffsetFrames, livepix::ConvertPool* pool = nullptr);
+
+    // ---- Direct pairing (DeckLink two inputs): each eye converted straight into its half.
+    // A ring frame for two eyes of eyeW x eyeH side by side, its planes sized as PublishPair
+    // sizes them for that pair (2*eyeW x eyeH, eyeH even). Each eye's lane writes its half
+    // (livepix::PairHalf), then PublishPairFrame. It is FrameRing::ReserveBuffer's: in no
+    // queue until published, so the renderer and the upload thread never see it half done.
+    // nullptr when the ring has none to spare (kMaxReserved out, or latest-wins).
+    FrameRing::Frame* ReservePairFrame(int eyeW, int eyeH);
+    // A reserved pair frame back to the ring, unpublished.
+    void CancelPairFrame(FrameRing::Frame* f);
+    // Publishes a reserved pair frame whose two halves are written, tagged exactly as
+    // PublishPair tags a pair of two eyeW x eyeH eyes (the left eye's matrix and transfer).
+    void PublishPairFrame(FrameRing::Frame* f, int eyeW, int eyeH, ColorMatrix matrix, ColorTransfer transfer,
+                          bool fullRange, double captureSec, const char* timecode, int eyeOffsetFrames);
     // A frame the source had to skip before converting it (LiveStats::lateFrames).
     void CountLate();
     // Streaming (or Opening) -> Stalled when nothing was published for stallSec since
@@ -60,6 +79,10 @@ protected:
 
 private:
     void Published(int w, int h, bool fullRange, int eyeOffsetFrames, bool dropped);
+    // A two-eye frame's planes (w = both eyes, h even) and tags, one copy for the two paths.
+    static void SizePairPlanes(FrameRing::Frame& f, int w, int h);
+    static void TagPair(FrameRing::Frame& f, int w, int h, ColorMatrix matrix, ColorTransfer transfer,
+                        bool fullRange, double captureSec, const char* timecode);
     mutable FrameRing ring_;  // mutable: GetStats reads its queue counters
     mutable std::mutex statsMutex_;
     LiveStats stats_;

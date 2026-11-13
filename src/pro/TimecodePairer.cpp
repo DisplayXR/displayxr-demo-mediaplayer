@@ -39,12 +39,16 @@ void FormatTimecode(const TimecodeFields& t, int fpsNominal, char* out, size_t n
 
 void TimecodePairer::Reset() {
     const bool strict = strict_;
+    const uint32_t epoch = epoch_ + 1;  // a key from before the reset never matches one after it
     *this = TimecodePairer{};
     strict_ = strict;
+    epoch_ = epoch;
 }
 
 void TimecodePairer::UseClock(bool on) {
     byClock_ = on;
+    keyed_ = false;  // the keys mean something else now
+    ++epoch_;
     for (int e = 0; e < 2; ++e)
         for (int a = 0; a < kHistory; ++a) key_[e][a] = on ? clock_[e][a] : tc_[e][a];
     // The last shown frame, in the new domain, so the switch never shows a frame again.
@@ -73,6 +77,8 @@ TimecodePairer::Decision TimecodePairer::Add(int eye, int slot, int key, double 
         const int other = 1 - eye;
         if (newest_[other] >= 0 && !valid_[other][newest_[other]]) newest_[other] = -1;
         lastKey_ = -1;
+        keyed_ = false;
+        ++epoch_;
     }
     if (newest_[0] < 0 || newest_[1] < 0) return d;
 
@@ -123,6 +129,7 @@ void TimecodePairer::Match(int eye, double period, Decision& d) {
         d.slot[1] = newest_[1];
         d.unsynced = unsynced;
         sincePublish_ = 0;
+        keyed_ = false;
     };
 
     if (n0 >= 0 && n1 >= 0) {
@@ -136,6 +143,8 @@ void TimecodePairer::Match(int eye, double period, Decision& d) {
                 return;
             }
             lastKey_ = -1;
+            keyed_ = false;
+            ++epoch_;
         }
         // The newest instant both eyes have, newer than the last one shown.
         int best = -1, s0 = -1, s1 = -1;
@@ -154,6 +163,7 @@ void TimecodePairer::Match(int eye, double period, Decision& d) {
             d.slot[1] = s1;
             lastKey_ = best;
             sincePublish_ = 0;
+            keyed_ = true;
             return;
         }
         // No common instant yet. Wait only while the lagging eye's NEXT frame can still find

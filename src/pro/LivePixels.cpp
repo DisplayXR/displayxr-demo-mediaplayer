@@ -46,11 +46,11 @@ struct BgraEncode {
 // has checked the arguments: r0 even, r1 even or h). Luma rows r0..r1-1, chroma rows
 // r0/2..r1/2-1; a band ending at an odd h also has the last row's luma.
 
-void UyvyRows(const uint8_t* src, int rb, int w, P016& dst, int x0, int r0, int r1) {
+void UyvyRows(const uint8_t* src, int rb, int w, const P016Planes& dst, int x0, int r0, int r1) {
     const int pairs = w / 2;
     for (int row = r0; row < r1; ++row) {
         const uint8_t* s = src + (size_t)row * rb;
-        uint16_t* yo = dst.y.data() + (size_t)row * dst.width + x0;
+        uint16_t* yo = dst.y + (size_t)row * dst.width + x0;
         for (int i = 0; i < pairs; ++i) {
             yo[2 * i] = (uint16_t)(s[4 * i + 1] << 8);
             yo[2 * i + 1] = (uint16_t)(s[4 * i + 3] << 8);
@@ -60,7 +60,7 @@ void UyvyRows(const uint8_t* src, int rb, int w, P016& dst, int x0, int r0, int 
     for (int row = r0 / 2; row < r1 / 2; ++row) {
         const uint8_t* a = src + (size_t)(2 * row) * rb;
         const uint8_t* b = a + rb;
-        uint16_t* uvo = dst.uv.data() + (size_t)row * dst.width + x0;
+        uint16_t* uvo = dst.uv + (size_t)row * dst.width + x0;
         for (int i = 0; i < pairs; ++i) {
             uvo[2 * i] = (uint16_t)(((a[4 * i] + b[4 * i] + 1) >> 1) << 8);              // Cb
             uvo[2 * i + 1] = (uint16_t)(((a[4 * i + 2] + b[4 * i + 2] + 1) >> 1) << 8);  // Cr
@@ -69,17 +69,17 @@ void UyvyRows(const uint8_t* src, int rb, int w, P016& dst, int x0, int r0, int 
     }
 }
 
-void BgraRows(const uint8_t* src, int rb, int w, int h, P016& dst, int x0, int r0, int r1) {
+void BgraRows(const uint8_t* src, int rb, int w, int h, const P016Planes& dst, int x0, int r0, int r1) {
     const BgraEncode enc(h);
     for (int row = r0; row < r1; ++row) {
         const uint8_t* s = src + (size_t)row * rb;
-        uint16_t* yo = dst.y.data() + (size_t)row * dst.width + x0;
+        uint16_t* yo = dst.y + (size_t)row * dst.width + x0;
         for (int x = 0; x < w; ++x) yo[x] = (uint16_t)(enc.Luma(s + 4 * x) << 8);
     }
     for (int row = r0 / 2; row < r1 / 2; ++row) {
         const uint8_t* a = src + (size_t)(2 * row) * rb;
         const uint8_t* b = a + rb;
-        uint16_t* uvo = dst.uv.data() + (size_t)row * dst.width + x0;
+        uint16_t* uvo = dst.uv + (size_t)row * dst.width + x0;
         for (int i = 0; i < w / 2; ++i) {
             int cb, cr;
             enc.Chroma(a + 8 * i, b + 8 * i, cb, cr);
@@ -91,7 +91,7 @@ void BgraRows(const uint8_t* src, int rb, int w, int h, P016& dst, int x0, int r
 }
 
 // w even.
-void V210Rows(const uint8_t* src, int rb, int w, P016& dst, int x0, int r0, int r1) {
+void V210Rows(const uint8_t* src, int rb, int w, const P016Planes& dst, int x0, int r0, int r1) {
     // One pass per row pair, straight into dst: a 4K60 eye has ~16 ms, and the
     // unpack-to-scratch-then-copy version this replaced took 15.6 ms of it (#141).
     // Group = 6 pixels in 4 words: Cb0 Y0 Cr0 | Y1 Cb2 Y2 | Cr2 Y3 Cb4 | Y4 Cr4 Y5.
@@ -115,10 +115,10 @@ void V210Rows(const uint8_t* src, int rb, int w, P016& dst, int x0, int r0, int 
     for (int row = r0; row + 1 < r1; row += 2) {
         const uint32_t* a = reinterpret_cast<const uint32_t*>(src + (size_t)row * rb);
         const uint32_t* b = reinterpret_cast<const uint32_t*>(src + (size_t)(row + 1) * rb);
-        rowY(a, dst.y.data() + (size_t)row * dst.width + x0);
-        rowY(b, dst.y.data() + (size_t)(row + 1) * dst.width + x0);
+        rowY(a, dst.y + (size_t)row * dst.width + x0);
+        rowY(b, dst.y + (size_t)(row + 1) * dst.width + x0);
         // 4:2:2 -> 4:2:0: average the two rows' chroma
-        uint16_t* uvo = dst.uv.data() + (size_t)(row / 2) * dst.width + x0;
+        uint16_t* uvo = dst.uv + (size_t)(row / 2) * dst.width + x0;
         for (int g = 0, pair = 0; pair < w / 2; ++g, pair += 3) {
             const uint32_t* p = a + 4 * g;
             const uint32_t* q = b + 4 * g;
@@ -131,11 +131,11 @@ void V210Rows(const uint8_t* src, int rb, int w, P016& dst, int x0, int r0, int 
     }
     if (r1 & 1)  // the band ends at an odd h: the last row's luma (no chroma row to pair with)
         rowY(reinterpret_cast<const uint32_t*>(src + (size_t)(r1 - 1) * rb),
-             dst.y.data() + (size_t)(r1 - 1) * dst.width + x0);
+             dst.y + (size_t)(r1 - 1) * dst.width + x0);
 }
 
 // w even.
-void R210Rows(const uint8_t* src, int rb, int w, P016& dst, int x0, int r0, int r1, ColorMatrix matrix) {
+void R210Rows(const uint8_t* src, int rb, int w, const P016Planes& dst, int x0, int r0, int r1, ColorMatrix matrix) {
     const float kr = matrix == ColorMatrix::BT601 ? 0.299f : matrix == ColorMatrix::BT2020 ? 0.2627f : 0.2126f;
     const float kb = matrix == ColorMatrix::BT601 ? 0.114f : matrix == ColorMatrix::BT2020 ? 0.0593f : 0.0722f;
     const float kg = 1.0f - kr - kb;
@@ -153,9 +153,9 @@ void R210Rows(const uint8_t* src, int rb, int w, P016& dst, int x0, int r0, int 
     for (int row = r0; row + 1 < r1; row += 2) {
         const uint8_t* a = src + (size_t)row * rb;
         const uint8_t* b = a + rb;
-        uint16_t* ya = dst.y.data() + (size_t)row * dst.width + x0;
+        uint16_t* ya = dst.y + (size_t)row * dst.width + x0;
         uint16_t* yb = ya + dst.width;
-        uint16_t* uvo = dst.uv.data() + (size_t)(row / 2) * dst.width + x0;
+        uint16_t* uvo = dst.uv + (size_t)(row / 2) * dst.width + x0;
         for (int x = 0; x < w; x += 2) {
             float r[4], g[4], bl[4];
             px(a + 4 * x, r[0], g[0], bl[0]);
@@ -175,7 +175,7 @@ void R210Rows(const uint8_t* src, int rb, int w, P016& dst, int x0, int r0, int 
     }
     if (r1 & 1) {  // the band ends at an odd h: the last row's luma (no chroma row to pair with)
         const uint8_t* a = src + (size_t)(r1 - 1) * rb;
-        uint16_t* yo = dst.y.data() + (size_t)(r1 - 1) * dst.width + x0;
+        uint16_t* yo = dst.y + (size_t)(r1 - 1) * dst.width + x0;
         for (int x = 0; x < w; ++x) {
             float r, g, bl;
             px(a + 4 * x, r, g, bl);
@@ -247,6 +247,10 @@ void P016::Resize(int w, int h) {
     if (uv.size() != uvs) uv.resize(uvs);
 }
 
+bool EyeFits(const uint8_t* src, int w, int h, const P016Planes& dst, int x0) {
+    return src && w > 0 && h > 1 && x0 >= 0 && x0 + w <= dst.width && h <= dst.height;
+}
+
 bool EyeFits(const uint8_t* src, int w, int h, const P016& dst, int x0) {
     return src && w > 0 && h > 1 && x0 >= 0 && x0 + w <= dst.width && h <= dst.height;
 }
@@ -261,8 +265,8 @@ ColorMatrix P016Matrix(RawFormat fmt, int h, ColorMatrix rgbMatrix) {
     return DefaultMatrixForHeight(h);  // YUV passes through: the SDI rule
 }
 
-bool ToP016Rows(RawFormat fmt, const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0, int r0,
-                int r1, ColorMatrix rgbMatrix) {
+bool ToP016Rows(RawFormat fmt, const uint8_t* src, int srcRowBytes, int w, int h, const P016Planes& dst, int x0,
+                int r0, int r1, ColorMatrix rgbMatrix) {
     if (!EyeFits(src, w, h, dst, x0) || r0 < 0 || r0 > r1 || r1 > h || (r0 & 1) || ((r1 & 1) && r1 != h))
         return false;
     switch (fmt) {
@@ -272,6 +276,11 @@ bool ToP016Rows(RawFormat fmt, const uint8_t* src, int srcRowBytes, int w, int h
         case RawFormat::R210: R210Rows(src, srcRowBytes, w & ~1, dst, x0, r0, r1, rgbMatrix); break;
     }
     return true;
+}
+
+bool ToP016Rows(RawFormat fmt, const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0, int r0,
+                int r1, ColorMatrix rgbMatrix) {
+    return ToP016Rows(fmt, src, srcRowBytes, w, h, Planes(dst), x0, r0, r1, rgbMatrix);
 }
 
 void ToP016(RawFormat fmt, const uint8_t* src, int srcRowBytes, int w, int h, P016& dst, int x0,

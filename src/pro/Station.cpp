@@ -731,6 +731,12 @@ std::string Station::RigStatusJson() const {
             dl["max_skew_ms"] = ps.maxAbsSkewMs;  // shown pairs only
             dl["strict_pairs"] = ps.strict;
             dl["mismatch_refused"] = ps.mismatchRefused;
+            // which path built the pairs (direct pairing, pro/DirectPair.h): pairs = direct + composed
+            dl["pair_path"] = ps.directPair ? "direct" : "compose";
+            dl["direct_pairs"] = ps.directPairs;
+            dl["composed_pairs"] = ps.composedPairs;
+            dl["direct_no_frame"] = ps.directNoFrame;
+            dl["direct_skipped"] = ps.directSkipped;
         }
         out["decklink"] = dl;
     } else if (testSignal_.GetState() != LiveState::Closed) {
@@ -1073,6 +1079,9 @@ void Station::BuildSignalLines(bool live) {
         if (ps.strict)
             ImGui::TextDisabled("matched pairs only (%llu mismatched held back)",
                                 (unsigned long long)ps.mismatchRefused);
+        if (ps.directPair)
+            ImGui::TextDisabled("pairs: %llu direct, %llu composed", (unsigned long long)ps.directPairs,
+                                (unsigned long long)ps.composedPairs);
         if (ps.timecode) ImGui::TextDisabled("paired by SMPTE timecode");
         else if (ps.hwClockPairing) ImGui::TextDisabled("paired by the card's clock (no matching timecode)");
         else if (ps.separateCards) ImGui::TextColored(kWarn, "no timecode, two cards: newest frames paired - jam-sync both inputs");

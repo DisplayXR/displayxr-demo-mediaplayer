@@ -90,14 +90,17 @@ void ToP016Banded(ConvertPool* pool, const EyeJob* eyes, int n) {
     }
     const int threads = pool ? pool->Threads() : 1;
     int bands[kMax], first[kMax + 1];
+    P016Planes out[kMax];  // where each eye goes: its dst's planes, or its raw planes
     first[0] = 0;
     for (int e = 0; e < n; ++e) {
         const EyeJob& j = eyes[e];
-        const bool fits = j.dst && EyeFits(j.src, j.w, j.h, *j.dst, j.x0);
+        out[e] = j.dst ? Planes(*j.dst) : j.planes;
+        ColorMatrix* tag = j.dst ? &j.dst->matrix : j.matrixOut;
+        const bool fits = (j.dst || j.planes.y) && EyeFits(j.src, j.w, j.h, out[e], j.x0);
         // the threads shared out between the eyes: 7 for two eyes = 4 + 3
         const int share = threads / n + (e < threads % n ? 1 : 0);
         bands[e] = fits ? BandsFor(j.h, share) : 0;
-        if (fits) j.dst->matrix = P016Matrix(j.fmt, j.h, j.rgbMatrix);  // before any band runs
+        if (fits && tag) *tag = P016Matrix(j.fmt, j.h, j.rgbMatrix);  // before any band runs
         first[e + 1] = first[e] + bands[e];
     }
     const int total = first[n];
@@ -107,7 +110,7 @@ void ToP016Banded(ConvertPool* pool, const EyeJob* eyes, int n) {
         const EyeJob& j = eyes[e];
         int r0 = 0, r1 = 0;
         BandRows(j.h, bands[e], b - first[e], r0, r1);
-        ToP016Rows(j.fmt, j.src, j.srcRowBytes, j.w, j.h, *j.dst, j.x0, r0, r1, j.rgbMatrix);
+        ToP016Rows(j.fmt, j.src, j.srcRowBytes, j.w, j.h, out[e], j.x0, r0, r1, j.rgbMatrix);
     };
     if (!pool) {
         for (int b = 0; b < total; ++b) band(b);
@@ -131,6 +134,11 @@ void ToP016Banded(ConvertPool* pool, RawFormat fmt, const uint8_t* src, int srcR
 }
 
 void ComposePairBanded(ConvertPool* pool, const P016& l, const P016& r, int cw, int ch, uint16_t* y, uint16_t* uv) {
+    ComposePairBanded(pool, EyeOf(l), EyeOf(r), cw, ch, y, uv);
+}
+
+void ComposePairBanded(ConvertPool* pool, const EyeView& l, const EyeView& r, int cw, int ch, uint16_t* y,
+                       uint16_t* uv) {
     if (cw <= 0 || ch <= 0 || !y || !uv) return;
     const size_t w = 2 * (size_t)cw;
     const size_t eyeBytes = (size_t)cw * sizeof(uint16_t);
@@ -140,12 +148,12 @@ void ComposePairBanded(ConvertPool* pool, const P016& l, const P016& r, int cw, 
         int r0 = 0, r1 = 0;
         BandRows(ch, bands, b, r0, r1);
         for (size_t row = (size_t)r0; row < (size_t)r1; ++row) {
-            std::memcpy(y + row * w, l.y.data() + row * (size_t)l.width, eyeBytes);
-            std::memcpy(y + row * w + cw, r.y.data() + row * (size_t)r.width, eyeBytes);
+            std::memcpy(y + row * w, l.y + row * (size_t)l.stride, eyeBytes);
+            std::memcpy(y + row * w + cw, r.y + row * (size_t)r.stride, eyeBytes);
         }
         for (size_t row = (size_t)r0 / 2; row < (size_t)r1 / 2; ++row) {
-            std::memcpy(uv + row * w, l.uv.data() + row * (size_t)l.width, eyeBytes);
-            std::memcpy(uv + row * w + cw, r.uv.data() + row * (size_t)r.width, eyeBytes);
+            std::memcpy(uv + row * w, l.uv + row * (size_t)l.stride, eyeBytes);
+            std::memcpy(uv + row * w + cw, r.uv + row * (size_t)r.stride, eyeBytes);
         }
     };
     if (!pool) {
