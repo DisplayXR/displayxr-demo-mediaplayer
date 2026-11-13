@@ -245,6 +245,7 @@ private:
     bool quit_ = false;
     bool running_ = false;
     std::atomic<bool> v210_{false};
+    int pinGroup_ = -1;  // MEDIAPLAYER_UPLOAD_PIN, the upload thread's own (set in Loop, read by Copy)
     std::thread thread_;
 };
 

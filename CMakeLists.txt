@@ -481,6 +481,7 @@ function(mp_add_player tgt is_pro)
             src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)
             src/pro/TimecodePairer.cpp   # two-input stereo pairing by SMPTE timecode
             src/pro/DirectPair.cpp       # ... each eye converted straight into its half of the ring frame
+            src/pro/ProEnvFile.cpp       # pro.env: per-machine settings that survive a reinstall
             src/pro/DeckLinkSource.cpp   # Blackmagic DeckLink SDI / HDMI input
             src/pro/DeckLinkSpec.cpp     # the DeckLink input spec + setup dialog fields (no SDK)
             src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
@@ -948,6 +949,14 @@ if(MP_BUILD_TESTS)
     target_include_directories(direct_pair_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(direct_pair_test PRIVATE Threads::Threads)
     add_test(NAME direct_pair COMMAND direct_pair_test)
+    # The capture path's A/B levers (docs/CAPTURE-LEVERS.md): pro.env parsing and precedence,
+    # the lever table, the pin lists, and LiveSourceBase::PublishV210 (raw v210 moved, not
+    # copied, into the ring: byte for byte, the renderer's shape, refused shapes untouched).
+    add_executable(capture_levers_test tests/capture_levers_test.cpp src/pro/LiveSourceBase.cpp
+        src/pro/ConvertPool.cpp src/pro/LivePixels.cpp)
+    target_include_directories(capture_levers_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(capture_levers_test PRIVATE Threads::Threads)
+    add_test(NAME capture_levers COMMAND capture_levers_test)
     add_executable(resolve_link_test tests/resolve_link_test.cpp src/pro/ResolveLink.cpp)
     target_include_directories(resolve_link_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(resolve_link_test PRIVATE nlohmann_json::nlohmann_json)
