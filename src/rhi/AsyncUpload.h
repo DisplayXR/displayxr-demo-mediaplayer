@@ -43,6 +43,7 @@
 #include "rhi/BandCopy.h"
 #include "rhi/RenderPerf.h"  // AsyncUploadTally
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -66,19 +67,21 @@ int SlotCount(uint32_t framesInFlight);
 // Where a frame's planes go in a slot: rows packed, each plane at a kPlaneAlign offset.
 constexpr size_t kPlaneAlign = 256;
 struct Layout {
-    int format = -1;  // VulkanRenderer::UploadYUV's: 0 I420, 1 NV12, 2 P016
-    int planes = 0;
-    uint32_t w[3] = {}, h[3] = {};
-    uint32_t bpt[3] = {};  // bytes per texel
+    int format = -1;  // VulkanRenderer::UploadYUV's: 0 I420, 1 NV12, 2 P016; 3 raw v210 (#238)
+    int planes = 0;   // v210: one per eye, each eye's rows as they are (media/V210.h)
+    uint32_t w[3] = {}, h[3] = {};  // v210: the eye's width in pixels
+    uint32_t bpt[3] = {};  // bytes per texel (v210: 0, rows are RowBytes(w))
     size_t rowBytes[3] = {}, offset[3] = {};
     size_t total = 0;      // bytes the slot needs
 };
 // UploadYUV's chroma: (w+1)/2 x (h+1)/2. False for an unknown format or an empty frame.
 bool LayoutFor(int format, uint32_t w, uint32_t h, Layout& out);
 // A ring frame. False for a zero-copy (gpu) frame, an RGBA one, or planes shorter than the
-// layout: the render thread uploads those itself, as before.
-bool LayoutFor(const FrameRing::Frame& f, Layout& out);
-// UploadYUV's format number for a ring frame (-1: not a YUV frame).
+// layout: the render thread uploads those itself, as before. A v210 frame (format 3) only with
+// `v210`, i.e. when the renderer decodes it on the GPU: else its rows are no use in staging
+// (the CPU fallback reads the ring frame, not write-combined staging).
+bool LayoutFor(const FrameRing::Frame& f, Layout& out, bool v210 = true);
+// UploadYUV's format number for a ring frame (-1: not a YUV frame; 3: raw v210).
 int UploadFormat(PixFormat f);
 
 enum class SlotState : uint8_t { Free, Filling, Ready, InFlight };
@@ -165,6 +168,9 @@ public:
     Uploader& operator=(const Uploader&) = delete;
 
     bool Running() const { return running_; }  // false: the thread did not start
+    // Stage v210 frames (the renderer's GPU decode is up, #238). Off by default: before any
+    // source is set.
+    void SetV210(bool on) { v210_ = on; }
     int Slots() const { return table_.Count(); }
     int CopyThreads() const { return copyThreads_; }
 
@@ -238,6 +244,7 @@ private:
     uint64_t wakeSeq_ = 0;
     bool quit_ = false;
     bool running_ = false;
+    std::atomic<bool> v210_{false};
     std::thread thread_;
 };
 

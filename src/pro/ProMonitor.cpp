@@ -83,7 +83,10 @@ void ProController::OnFrame(const FrameRing::Frame& f, StereoLayout layout) {
         std::snprintf(tag, sizeof(tag), "RGB 8-bit");
     else
         std::snprintf(tag, sizeof(tag), "%s %s %s %s", MatrixName(f.matrix), TransferName(f.transfer),
-                      f.format == PixFormat::P016 ? "10/16-bit" : "8-bit", f.fullRange ? "full" : "legal");
+                      f.format == PixFormat::P016   ? "10/16-bit"
+                      : f.format == PixFormat::V210 ? "10-bit v210"
+                                                    : "8-bit",
+                      f.fullRange ? "full" : "legal");
     colourTag_ = tag;
     if (scopeIsStill_ || (!scopesOn_ && !probeOn_)) return;
     const double now = NowSec();

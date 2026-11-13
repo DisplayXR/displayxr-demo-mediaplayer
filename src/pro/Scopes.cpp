@@ -194,7 +194,8 @@ void Measure16(const std::vector<uint16_t>& rgba, int w, int h, const Grade& g, 
 }
 
 bool Gather(const FrameRing::Frame& f, StereoLayout layout, int analysisW, FrameRing::Frame& mini, int& w, int& h) {
-    if (f.gpu || f.width < 2 || f.height < 2 || f.plane[0].empty()) return false;
+    // Raw v210 (#238 phase 1): no CPU scopes yet (phase 2 reads the card rows).
+    if (f.gpu || f.format == PixFormat::V210 || f.width < 2 || f.height < 2 || f.plane[0].empty()) return false;
     const double aspect = EyeAspect(layout, f.width, f.height);
     AnalysisSize(aspect, analysisW, w, h);
     const bool sbs = layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf;

@@ -2,6 +2,7 @@
 #include "pro/TestSignalSource.h"
 
 #include "Log.h"
+#include "media/V210.h"
 
 #include <algorithm>
 #include <chrono>
@@ -124,6 +125,27 @@ bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
         }
     }
     cfg_ = cfg;
+    // The wire format (#238, see the header): raw v210 only when the renderer decodes it.
+    wire_ = Wire::Nv12;
+    if (v210::Requested(std::getenv("MEDIAPLAYER_TEST_SIGNAL_V210")))
+        wire_ = v210::GpuDecodeActive() ? Wire::V210Raw : Wire::V210Cpu;
+    still_ = v210::Requested(std::getenv("MEDIAPLAYER_TEST_STILL"));
+    if (wire_ == Wire::V210Raw) {
+        if (!rawRing_.QueueMode()) {  // as LiveSourceBase's ring: queue mode, MEDIAPLAYER_LIVE_QUEUE
+            int depth = 3;
+            if (const char* q = std::getenv("MEDIAPLAYER_LIVE_QUEUE")) depth = std::atoi(q);
+            rawRing_.SetQueueDepth(depth);
+        }
+        std::lock_guard<std::mutex> lk(rawMutex_);
+        rawStats_ = LiveStats{};
+        rawStats_.fpsReq = (int)(cfg.fps + 0.5);
+        rawStats_.fps = cfg.fps;
+        rawTrimmed0_ = rawRing_.TrimmedFrames();
+        rawRepeated0_ = rawRing_.RepeatedFrames();
+        rawWindowStart_ = NowSeconds();
+        rawWindowCount_ = 0;
+    }
+    raw_ = wire_ == Wire::V210Raw;
     char n[160];
     if (cfg.plate) {
         const size_t slash = cfg.image.find_last_of("/\\");
@@ -137,8 +159,8 @@ bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
     SetState(LiveState::Opening);
     stop_ = false;
     worker_ = std::thread([this] { Worker(); });
-    LOG_INFO("test signal: %s, vshift %.1f px, eye delay %d, right gain %.2f, roll %.2f deg", name_.c_str(),
-             cfg.vShiftPx, cfg.eyeDelay, cfg.gainR, cfg.rollDeg);
+    LOG_INFO("test signal: %s, vshift %.1f px, eye delay %d, right gain %.2f, roll %.2f deg, wire %s%s", name_.c_str(),
+             cfg.vShiftPx, cfg.eyeDelay, cfg.gainR, cfg.rollDeg, WireName(), still_ ? ", still (frame 0)" : "");
     return true;
 }
 
@@ -328,11 +350,111 @@ void TestSignalSource::Worker() {
     for (int64_t n = 0; !stop_; ++n) {
         std::this_thread::sleep_until(start + std::chrono::duration_cast<clock::duration>(period * (double)n));
         if (stop_) break;
-        Render(cfg_, n, frame);
+        Render(cfg_, still_ ? 0 : n, frame);
         char tc[16];
         FormatTc(tc0 + (int)n, fpsInt, tc, sizeof(tc));
-        Publish(frame, /*fullRange=*/false, NowSeconds(), tc, cfg_.eyeDelay);
+        if (wire_ == Wire::Nv12) {
+            Publish(frame, /*fullRange=*/false, NowSeconds(), tc, cfg_.eyeDelay);
+        } else if (wire_ == Wire::V210Raw) {
+            PublishV210(frame, NowSeconds(), tc);
+        } else {  // v210 converted on the CPU, as the DeckLink path does (the A/B arm)
+            const size_t rb = v210::RowBytes(w);
+            p016_.Resize(2 * w, h);
+            for (int e = 0; e < 2; ++e) {
+                v210Eye_[e].resize(rb * (size_t)h);
+                PackEyeV210(frame, e * w, w, h, v210Eye_[e].data());
+                livepix::ToP016(livepix::RawFormat::V210, v210Eye_[e].data(), (int)rb, w, h, p016_, e * w,
+                                ColorMatrix::BT709);
+            }
+            Publish(p016_, /*fullRange=*/false, NowSeconds(), tc, cfg_.eyeDelay);
+        }
     }
+}
+
+// ---- v210 wire (#238) ------------------------------------------------------------------
+
+const char* TestSignalSource::WireName() const {
+    return wire_ == Wire::V210Raw ? "v210 (raw, decoded on the GPU)"
+           : wire_ == Wire::V210Cpu ? "v210 -> P016 (CPU)"
+                                    : "nv12";
+}
+
+void TestSignalSource::PackEyeV210(const livepix::Nv12& src, int x0, int w, int h, uint8_t* dst) {
+    const size_t rb = v210::RowBytes(w);
+    for (int row = 0; row < h; ++row) {
+        const uint8_t* y = src.y.data() + (size_t)row * src.width + x0;
+        const uint8_t* uv = src.uv.data() + (size_t)(row / 2) * src.width + x0;
+        v210::PackRow(
+            dst + (size_t)row * rb, w, [&](int x) { return (y[x] << 2) | ((x + 2 * row) & 3); },
+            [&](int i) { return (uv[2 * i] << 2) | ((i + row) & 3); },
+            [&](int i) { return (uv[2 * i + 1] << 2) | ((i + 3 * row + 1) & 3); });
+    }
+}
+
+void TestSignalSource::PublishV210(const livepix::Nv12& frame, double captureSec, const char* tc) {
+    const int w = cfg_.eyeW, h = cfg_.eyeH;
+    const size_t bytes = v210::RowBytes(w) * (size_t)h;
+    FrameRing::Frame& f = rawRing_.WriteBuffer();
+    for (int e = 0; e < 2; ++e) {
+        f.plane[e].resize(bytes);  // same size after warm-up: no allocation
+        PackEyeV210(frame, e * w, w, h, f.plane[e].data());
+    }
+    f.plane[2].clear();
+    f.width = 2 * w;
+    f.height = h;
+    f.format = PixFormat::V210;
+    f.eyes = 2;
+    f.fullRange = false;
+    f.matrix = DefaultMatrixForHeight(h);  // the SDI rule, as livepix::ToP016 tags it
+    f.transfer = ColorTransfer::SDR;
+    f.primaries2020 = false;
+    f.peakNits = 0.0f;
+    f.gpu = false;
+    f.gpuSharedTexture = nullptr;
+    f.gpuSharedHandle = nullptr;
+    f.captureSec = captureSec;
+    std::memset(f.timecode, 0, sizeof(f.timecode));
+    if (tc) std::strncpy(f.timecode, tc, sizeof(f.timecode) - 1);
+    const bool dropped = rawRing_.Publish();
+    const double now = NowSeconds();
+    {
+        std::lock_guard<std::mutex> lk(rawMutex_);
+        ++rawStats_.published;
+        if (dropped) ++rawStats_.dropped;
+        rawStats_.lastPublishSec = now;
+        rawStats_.w = 2 * w;
+        rawStats_.h = h;
+        rawStats_.eyeOffsetFrames = cfg_.eyeDelay;
+        ++rawWindowCount_;
+        if (now - rawWindowStart_ >= 1.0) {
+            rawStats_.deliveredFps = (float)((double)rawWindowCount_ / (now - rawWindowStart_));
+            rawWindowCount_ = 0;
+            rawWindowStart_ = now;
+        }
+    }
+    if (GetState() == LiveState::Opening || GetState() == LiveState::Stalled) SetState(LiveState::Streaming);
+}
+
+FrameRing& TestSignalSource::Ring() { return raw_ ? rawRing_ : LiveSourceBase::Ring(); }
+
+LiveStats TestSignalSource::GetStats() const {
+    LiveStats s = LiveSourceBase::GetStats();
+    if (!raw_) return s;
+    std::lock_guard<std::mutex> lk(rawMutex_);
+    const LiveStats& r = rawStats_;
+    s.deliveredFps = r.deliveredFps;
+    s.published = r.published;
+    s.dropped = r.dropped + (rawRing_.TrimmedFrames() - rawTrimmed0_);
+    s.repeated = rawRing_.RepeatedFrames() - rawRepeated0_;
+    s.liveQueue = rawRing_.QueueMode();
+    s.lastPublishSec = r.lastPublishSec;
+    s.w = r.w;
+    s.h = r.h;
+    s.fullRange = false;
+    s.eyeOffsetFrames = r.eyeOffsetFrames;
+    s.fps = r.fps;
+    s.fpsReq = r.fpsReq;
+    return s;
 }
 
 }  // namespace mp
