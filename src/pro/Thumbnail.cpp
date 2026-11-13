@@ -29,7 +29,10 @@ Coeffs CoeffsFor(ColorMatrix m) {
 template <class T, class Put>
 bool ThumbnailCore(const FrameRing::Frame& f, StereoLayout layout, int outW, int outH, std::vector<T>& rgba, T opaque,
                    Put put) {
-    if (f.gpu || f.width < 2 || f.height < 2 || outW < 1 || outH < 1 || f.plane[0].empty()) return false;
+    // Raw v210 (#238 phase 1): no CPU thumbnail yet (phase 2 reads the card rows).
+    if (f.gpu || f.format == PixFormat::V210 || f.width < 2 || f.height < 2 || outW < 1 || outH < 1 ||
+        f.plane[0].empty())
+        return false;
     const int w = f.width, h = f.height;
     const bool sbs = layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf;
     const int eyeW = sbs ? w / 2 : w;

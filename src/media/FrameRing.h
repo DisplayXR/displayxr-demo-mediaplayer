@@ -23,7 +23,10 @@ namespace mp {
 
 // P016: NV12 layout with 16-bit samples, MSB-aligned (P010 is the 10-bit case). Pro's
 // 10-bit capture (DeckLink v210) publishes it; the base player never does.
-enum class PixFormat { I420, NV12, RGBA, P016 };  // 3-plane, 2-plane, packed RGBA (zero-copy #28), 16-bit 2-plane
+// V210: a capture card's raw 10-bit 4:2:2 rows, one eye per plane, decoded on the GPU (#238,
+// opt-in MEDIAPLAYER_GPU_V210; layout in media/V210.h). Only a producer that saw
+// v210::GpuDecodeActive() publishes it.
+enum class PixFormat { I420, NV12, RGBA, P016, V210 };  // 3-plane, 2-plane, packed RGBA (zero-copy #28), 16-bit 2-plane, raw v210
 
 // Y'CbCr -> R'G'B' matrix of a YUV frame. The value is what the renderer pushes to the
 // MP_GRADE shader (`yuvMatrix`), so BT709 must stay 0: every producer that never sets it
@@ -58,6 +61,7 @@ public:
         int width = 0;                // luma width/height (full frame, both eyes for SBS)
         int height = 0;
         PixFormat format = PixFormat::I420;
+        int eyes = 1;                 // V210 only: eye planes side by side (plane[0] left, plane[1] right)
         bool fullRange = false;       // JPEG/full vs MPEG/limited range
         ColorMatrix matrix = ColorMatrix::BT709;      // YUV matrix (ignored for RGBA)
         ColorTransfer transfer = ColorTransfer::SDR;  // Pro tone-maps HDR (#134)

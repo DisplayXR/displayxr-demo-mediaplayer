@@ -187,6 +187,17 @@ public:
                    uint32_t width, uint32_t height, int format, bool fullRange, int matrix = 0);
     int SourceMatrix() const { return sourceMatrix_; }  // last YUV upload's matrix (UI)
 
+    // A raw v210 frame (#238, FrameRing PixFormat::V210, layout in media/V210.h), the
+    // synchronous path (the off-thread one is StageFrame / CommitUpload, as for YUV): each
+    // eye's rows go into staging as they are, and a compute pass (shaders/v210_to_p016.comp)
+    // writes the P016 planes UploadYUV(format 2) would have made, which the MP_GRADE shader
+    // samples with the frame's matrix and range as before. Without the pass (MEDIAPLAYER_GPU_V210
+    // off, or the device refused it) the frame is decoded on the CPU and uploaded as P016, with
+    // one WARN. False: not a v210 frame the renderer takes (v210::Shape).
+    bool UploadV210(const FrameRing::Frame& f);
+    // The decode pass is up (MEDIAPLAYER_GPU_V210 and the device took it).
+    bool GpuV210() const { return v210_.pipeline != VK_NULL_HANDLE; }
+
     // Off-thread upload (rhi/AsyncUpload.h; MEDIAPLAYER_ASYNC_UPLOAD, on by default). Every
     // render-loop iteration: SetUploadSource(the ring the source frames come from, or nullptr),
     // then for a frame just taken from it StageFrame(ring, frame) in place of UploadYUV
@@ -337,6 +348,9 @@ private:
     // only path before persistent staging). Null on failure.
     void* OneOffStaging(VkDeviceSize bytes, VkBuffer& buffer);
     bool CreateStaging(Staging& s, VkDeviceSize bytes);  // any thread (the upload thread too)
+    // Staging buffers' usage: TRANSFER_SRC, plus STORAGE_BUFFER while the v210 decode pass reads
+    // its rows straight from staging (#238). Set at Initialize, before any staging exists.
+    VkBufferUsageFlags stagingUsage_ = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     std::atomic<bool> stagingTypeLogged_{false};  // the staging memory type, logged at the first creation
     void ReleaseStaging(Staging& s, bool deferred);
     void TrimIdleStaging();  // releases buffers no frame copied from in the last perf window
@@ -391,6 +405,42 @@ private:
     static constexpr uint32_t kMaxSlots = dxr::detail::kMaxFramesInFlight;
     VkDescriptorSet descSets_[kMaxSlots] = {};
     VkSampler sampler_ = VK_NULL_HANDLE;
+
+    // The v210 decode pass (#238): a compute pipeline reading each eye's v210 rows from
+    // staging (storage buffers) and writing P016 into `out` (device-local), which is then
+    // copied into planes_[0] / [1] like a P016 upload. Descriptor sets per ring slot (at most
+    // kV210Sets decodes a frame), written when recorded, like descSets_.
+    static constexpr int kV210Sets = 2;
+    struct V210Pass {
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet sets[kMaxSlots][kV210Sets] = {};
+        uint64_t setSerial[kMaxSlots] = {};  // frameSerial_ of the sets' last use in that slot
+        int setsUsed[kMaxSlots] = {};
+        VkBuffer out = VK_NULL_HANDLE;
+        VkDeviceMemory outMemory = VK_NULL_HANDLE;
+        VkDeviceSize outSize = 0;
+        VkDeviceSize maxRange = 0;  // maxStorageBufferRange
+        bool rangeWarned = false;
+    } v210_;
+    std::vector<uint32_t> v210Cpu_;  // the CPU fallback's P016 (V210.h OutLayout)
+    bool v210CpuWarned_ = false;
+    bool CreateV210Pass();
+    void DestroyV210Pass();
+    // Record the decode of `eyes` eyes (eyeW x h each; eye e's rows at src[e] + off[e]) into
+    // planes_[0] (Y) and planes_[1] (CbCr). Records nothing and returns false when it cannot
+    // (sizes over the device's storage-buffer range, no memory, no descriptor set left).
+    bool RecordV210Decode(VkCommandBuffer cmd, const VkBuffer src[2], const VkDeviceSize off[2], int eyes, int eyeW,
+                          int h);
+    bool UploadV210Cpu(const FrameRing::Frame& f, int eyes, int eyeW);
+    // MEDIAPLAYER_GPU_V210_VERIFY=1 (debug, once): after the first GPU decode, read its output
+    // back and compare it with the CPU decode of the same frame; one WARN with the result.
+    // Blocking (submits the open frame early, drains the ring), like DumpImage.
+    int v210Verify_ = -1;  // -1 not read yet, 0 off / done, 1 pending
+    void VerifyV210Once(const FrameRing::Frame& f);
+    void SetV210Source(bool fullRange, int matrix);  // the source state after a decode
 
     // Up to three source planes. RGBA images use plane 0 only (mode 0); video uses Y +
     // chroma (mode 1 = I420, mode 2 = NV12). Each is reused across frames, reallocated

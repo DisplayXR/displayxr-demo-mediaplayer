@@ -910,6 +910,17 @@ if(MP_BUILD_TESTS)
     target_include_directories(live_convert_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(live_convert_test PRIVATE Threads::Threads)
     add_test(NAME live_convert COMMAND live_convert_test)
+    # The GPU v210 decode (#238): the compute shader's own arithmetic (shaders/v210_decode.inc,
+    # compiled as C++ by media/V210.h) against the CPU v210 -> P016 convert, bit for bit, at
+    # widths with and without the 48-px row padding; the frame's staging layout; the test
+    # signal's v210 arms.
+    add_executable(v210_test tests/v210_test.cpp src/rhi/AsyncUpload.cpp src/rhi/BandCopy.cpp src/pro/LivePixels.cpp
+        src/pro/ConvertPool.cpp src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp
+        src/Log.cpp)
+    target_include_directories(v210_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_link_libraries(v210_test PRIVATE Threads::Threads)
+    add_test(NAME v210 COMMAND v210_test)
     add_executable(qc_report_test tests/qc_report_test.cpp src/pro/QcReport.cpp)
     target_include_directories(qc_report_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME qc_report COMMAND qc_report_test)

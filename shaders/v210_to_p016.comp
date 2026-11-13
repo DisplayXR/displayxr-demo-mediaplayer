@@ -1,0 +1,39 @@
+#version 450
+// SPDX-License-Identifier: Apache-2.0
+//
+// v210 -> P016 on the GPU (#238, MEDIAPLAYER_GPU_V210). A capture card's raw rows go into
+// staging as they are (no CPU convert); this pass turns them into the P016 planes the MP_GRADE
+// shader already samples, in a device-local buffer the renderer then copies into the source
+// images. One invocation = one 6-pixel group of one row pair of one eye; the arithmetic is
+// shaders/v210_decode.inc, shared with the C++ reference in src/media/V210.h.
+//
+// Dispatch: x = groups per eye row / 64 (rounded up), y = row pairs, z = eyes (1 or 2).
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Each eye's v210 rows (the same buffer twice for a mono frame), and the P016 output.
+layout(std430, set = 0, binding = 0) readonly buffer Src0 { uint w[]; } src0;
+layout(std430, set = 0, binding = 1) readonly buffer Src1 { uint w[]; } src1;
+layout(std430, set = 0, binding = 2) writeonly buffer Dst { uint w[]; } dst;
+
+layout(push_constant) uniform Push {
+    uint eyeW;        // pixels per eye (even)
+    uint rowPairs;    // height / 2
+    uint pitchWords;  // one v210 row, in 32-bit words
+    uint outW;        // the output frame's width (eyes * eyeW)
+    uint uvBase;      // the CbCr plane's first word in dst
+    uint eyes;        // 1 or 2
+} pc;
+
+#define V210_LOAD(eye, i) ((eye) == 0u ? src0.w[(i)] : src1.w[(i)])
+#define V210_STORE(i, v) dst.w[(i)] = (v)
+#include "v210_decode.inc"
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint r = gl_GlobalInvocationID.y;
+    uint eye = gl_GlobalInvocationID.z;
+    if (r >= pc.rowPairs || eye >= pc.eyes) return;
+    v210DecodeGroup(eye, g, r, pc.eyeW, pc.pitchWords, eye * pc.eyeW, pc.outW, pc.uvBase);
+}
