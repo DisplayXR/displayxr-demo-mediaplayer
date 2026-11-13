@@ -173,7 +173,15 @@ eye in the left-eye views, its right eye in the others. Android only.
   its JPEG header), both eyes are decoded from the file at the view's aspect. The
   pair is kept in memory (24 MB, by id and modified time). LIFs carry no embedded thumbnail
   or preview to use instead (checked on the phone's: base JPEG + one view blob, no EXIF
-  thumbnail). Still flat: a one-view LIF (depth map only) and two-track videos.
+  thumbnail).
+- A one-view LIF (one picture and its disparity map: every 2D-to-3D conversion) gets its
+  pair the way the player makes one (`LifLoader::FindDepthView`, then
+  `DepthWarp::MakeSbs` at the parallax `LifLoader::Load` uses: the classic `gain`, or the
+  5.x `inv_z_map` range, capped at 2 % and flipped when the map's far end is 255), on the
+  same worker: the map decoded at the eye size (the platform decoder scales it while
+  decoding), the picture from the system's thumbnail (or decoded small when that is a
+  crop), both eyes warped on one thread. The grid then places it like any pair (Depth per
+  tile below). Still flat: two-track videos.
 - Leaving the grid for the player stops the thumbnail requests, so they do not compete
   with opening the file and its neighbours.
 - Depth per tile (`StereoGrid.h` `TileShift`): `ThumbnailDepth` measures each stereo

@@ -7,7 +7,11 @@
 //     gives the right view's embedded JPEG; it is read and decoded SCALED to the eye size.
 //     The LIFs seen so far carry no thumbnail or preview of their own (classic schema:
 //     the base JPEG plus one view blob, no EXIF thumbnail in either), so a scaled decode is
-//     the cheapest source. A one-view LIF (a depth map, no second image) stays flat.
+//     the cheapest source.
+//   - LIF (one view + a disparity map: what a 2D->3D conversion writes): LifLoader::
+//     FindDepthView gives the image and the map; the map is decoded at the eye size and
+//     both eyes come from DepthWarp::MakeSbs at the parallax the player uses for the file
+//     (LifLoader::Load's one-view path), so the tile's depth matches the player's.
 //   - MPO: MpoLoader::FindSecondView reads the MP index from the file's head and gives the
 //     second view's JPEG, decoded scaled the same way.
 // The left eye is the system's thumbnail when the left view is the file's base JPEG (it
@@ -22,6 +26,7 @@
 #pragma once
 
 #include "browser/MediaProvider.h"
+#include "media/LifLoader.h"
 
 #include <condition_variable>
 #include <cstddef>
@@ -37,7 +42,8 @@
 
 namespace mp::browser {
 
-// Decode a JPEG to exactly w x h RGBA8, scaling while decoding (never at full size).
+// Decode a JPEG (or a PNG: a one-view LIF's disparity map) to exactly w x h RGBA8,
+// unpremultiplied, scaling while decoding (never at full size).
 // Called on the worker thread. False if it cannot.
 using ScaledJpegDecoder =
     std::function<bool(const uint8_t* data, size_t size, uint32_t w, uint32_t h, std::vector<uint8_t>& rgba)>;
@@ -122,6 +128,7 @@ private:
 
     void Work();
     bool MakeOne(const Job& job, Thumbnail& out);
+    bool MakeFromDepth(const Job& job, const LifLoader::DepthViewSpan& one, Thumbnail& out);
     void Keep(int64_t id, int64_t modified, const Thumbnail& sbs);
 
     ScaledJpegDecoder decode_;

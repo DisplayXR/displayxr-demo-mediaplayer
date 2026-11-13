@@ -209,6 +209,17 @@ float OneViewParallax(const json& root, const json& view) {
     return kDefaultParallax;
 }
 
+// The parallax DepthWarp::MakeSbs gets for a one-view LIF, and whether its map must be
+// flipped first: inv_z_map min < max puts the far end at 255, where DepthWarp's occlusion
+// takes 255 as the nearest. Shared by the player (LoadOneView) and the 3D grid's thumbnail
+// pairs (FindDepthView), so both show the same depth.
+void ResolveParallax(const json& root, const json& view, float& parallax, bool& invert) {
+    parallax = OneViewParallax(root, view);
+    invert = parallax < 0;
+    if (invert) parallax = -parallax;
+    parallax = std::min(parallax, kMaxParallax);
+}
+
 // One byte every `step` of an sw x sh plane, at w x h: sampled nearest when the sizes differ.
 std::vector<uint8_t> DepthPlane(const uint8_t* src, int step, int sw, int sh, int w, int h) {
     std::vector<uint8_t> d((size_t)w * h);
@@ -248,14 +259,11 @@ LifResult LoadOneView(const json& root, const std::vector<uint8_t>& buf,
     }
     if (mw != base.width || mh != base.height)
         depth = DepthPlane(depth.data(), 1, mw, mh, base.width, base.height);
-    float parallax = OneViewParallax(root, view);
-    // inv_z_map min < max puts the far end at 255, where DepthWarp's occlusion takes 255 as
-    // the nearest.
-    if (parallax < 0) {
+    float parallax = 0.0f;
+    bool invert = false;
+    ResolveParallax(root, view, parallax, invert);
+    if (invert)
         for (uint8_t& d : depth) d = 255 - d;
-        parallax = -parallax;
-    }
-    parallax = std::min(parallax, kMaxParallax);
     LifResult r;
     r.image = DepthWarp::MakeSbs(base, depth, parallax);
     r.layout = StereoLayout::SbsFull;
@@ -280,7 +288,27 @@ bool LifLoader::IsLif(const std::string& path) {
     return (bool)f && tail[0] == 0x1E && tail[1] == 0x1A;
 }
 
-bool LifLoader::FindViews(const ReadAtFn& readAt, uint64_t fileSize, ViewSpan& left, ViewSpan& right) {
+namespace {
+
+// A LIF's field table and JSON read through `readAt`: the trailer, the field headers and the
+// JSON only (a few KB of a 20 MB file). For FindViews and FindDepthView.
+struct MetaSpan {
+    uint32_t type = 0;
+    uint64_t offset = 0;
+    uint32_t size = 0;
+};
+struct Meta {
+    uint64_t region = 0;  // where the metadata region starts: the base JPEG ends here
+    std::vector<MetaSpan> fields;
+    json root;
+    const MetaSpan* Find(uint32_t type) const {
+        for (const MetaSpan& f : fields)
+            if (f.type == type) return &f;
+        return nullptr;
+    }
+};
+
+bool ReadMeta(const LifLoader::ReadAtFn& readAt, uint64_t fileSize, Meta& meta) {
     constexpr uint32_t kMaxFields = 256;
     constexpr uint32_t kMaxJson = 1u << 20;
     auto u32 = [&](uint64_t at, uint32_t& v) {
@@ -293,65 +321,84 @@ bool LifLoader::FindViews(const ReadAtFn& readAt, uint64_t fileSize, ViewSpan& l
     if (fileSize < 6 || !readAt(fileSize - 2, tail, 2) || tail[0] != 0x1E || tail[1] != 0x1A) return false;
     uint32_t regionOffset = 0, count = 0;
     if (!u32(fileSize - 6, regionOffset) || regionOffset == 0 || regionOffset > fileSize) return false;
-    const uint64_t region = fileSize - regionOffset;
-    if (!u32(region, count) || count > kMaxFields) return false;
-    struct Span { uint32_t type; uint64_t offset; uint32_t size; };
-    std::vector<Span> fields;
-    uint64_t cur = region + 4;
+    meta.region = fileSize - regionOffset;
+    if (!u32(meta.region, count) || count > kMaxFields) return false;
+    uint64_t cur = meta.region + 4;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t type = 0, size = 0;
         if (!u32(cur, type) || !u32(cur + 4, size)) return false;
         cur += 8;
         if (cur + size > fileSize) return false;
-        fields.push_back(Span{type, cur, size});
+        meta.fields.push_back(MetaSpan{type, cur, size});
         cur += size;
     }
-    auto find = [&](uint32_t type) -> const Span* {
-        for (const Span& f : fields)
-            if (f.type == type) return &f;
-        return nullptr;
-    };
-    const Span* meta = find(kJsonMetaNew);
-    if (!meta) meta = find(kJsonMetaOld);
-    if (!meta || meta->size == 0 || meta->size > kMaxJson) return false;
-    std::vector<uint8_t> text(meta->size);
-    if (!readAt(meta->offset, text.data(), text.size())) return false;
-    json root;
+    const MetaSpan* m = meta.Find(kJsonMetaNew);
+    if (!m) m = meta.Find(kJsonMetaOld);
+    if (!m || m->size == 0 || m->size > kMaxJson) return false;
+    std::vector<uint8_t> text(m->size);
+    if (!readAt(m->offset, text.data(), text.size())) return false;
     try {
-        root = json::parse(text.begin(), text.end());
+        meta.root = json::parse(text.begin(), text.end());
     } catch (const std::exception&) {
         return false;
     }
-    if (!root.contains("views") || !root["views"].is_array() || root["views"].size() < 2) return false;
-    // The same blob-id rules as ResolveView: 5.x image/albedo.blob_id, classic albedoId;
-    // -1 is the base JPEG.
-    auto resolve = [&](const json& view, ViewSpan& out, float& posX) {
-        const json* img = nullptr;
-        if (view.contains("image") && view["image"].is_object()) img = &view["image"];
-        else if (view.contains("albedo") && view["albedo"].is_object()) img = &view["albedo"];
-        int64_t blobId = 0;
-        if (img && img->contains("blob_id") && (*img)["blob_id"].is_number_integer()) {
-            blobId = (*img)["blob_id"].get<int64_t>();
-        } else if (view.contains("albedoId") && view["albedoId"].is_number_integer()) {
-            blobId = view["albedoId"].get<int64_t>();
-        } else {
-            return false;
-        }
-        if (blobId == -1) {
-            out = ViewSpan{0, region, true};
-        } else {
-            const Span* f = blobId >= 0 ? find((uint32_t)blobId) : nullptr;
-            if (!f) return false;
-            out = ViewSpan{f->offset, f->size, false};
-        }
-        posX = ViewPosX(view);
+    return meta.root.contains("views") && meta.root["views"].is_array() && !meta.root["views"].empty();
+}
+
+// A view's RGB image span, by the same blob-id rules as ResolveView: 5.x
+// image/albedo.blob_id, classic albedoId; -1 is the base JPEG.
+bool ResolveSpan(const Meta& meta, const json& view, LifLoader::ViewSpan& out) {
+    const json* img = nullptr;
+    if (view.contains("image") && view["image"].is_object()) img = &view["image"];
+    else if (view.contains("albedo") && view["albedo"].is_object()) img = &view["albedo"];
+    int64_t blobId = 0;
+    if (img && img->contains("blob_id") && (*img)["blob_id"].is_number_integer()) {
+        blobId = (*img)["blob_id"].get<int64_t>();
+    } else if (view.contains("albedoId") && view["albedoId"].is_number_integer()) {
+        blobId = view["albedoId"].get<int64_t>();
+    } else {
+        return false;
+    }
+    if (blobId == -1) {
+        out = LifLoader::ViewSpan{0, meta.region, true};
         return true;
-    };
+    }
+    const MetaSpan* f = blobId >= 0 ? meta.Find((uint32_t)blobId) : nullptr;
+    if (!f) return false;
+    out = LifLoader::ViewSpan{f->offset, f->size, false};
+    return true;
+}
+
+} // namespace
+
+bool LifLoader::FindViews(const ReadAtFn& readAt, uint64_t fileSize, ViewSpan& left, ViewSpan& right) {
+    Meta meta;
+    if (!ReadMeta(readAt, fileSize, meta) || meta.root["views"].size() < 2) return false;
     ViewSpan a, b;
-    float ax = 0.0f, bx = 0.0f;
-    if (!resolve(root["views"][0], a, ax) || !resolve(root["views"][1], b, bx)) return false;
+    const json& va = meta.root["views"][0];
+    const json& vb = meta.root["views"][1];
+    if (!ResolveSpan(meta, va, a) || !ResolveSpan(meta, vb, b)) return false;
+    const float ax = ViewPosX(va), bx = ViewPosX(vb);
     left = ax <= bx ? a : b;
     right = ax <= bx ? b : a;
+    return true;
+}
+
+bool LifLoader::FindDepthView(const ReadAtFn& readAt, uint64_t fileSize, DepthViewSpan& out) {
+    Meta meta;
+    if (!ReadMeta(readAt, fileSize, meta) || meta.root["views"].size() != 1) return false;
+    const json& view = meta.root["views"][0];
+    if (!ResolveSpan(meta, view, out.image)) return false;
+    // The disparity map blob, as DisparityField: 5.x inv_z_map.blob_id, classic disparityId.
+    const json* m = InvZMap(view);
+    const json* id = (m && m->contains("blob_id")) ? &(*m)["blob_id"]
+                     : view.contains("disparityId") ? &view["disparityId"] : nullptr;
+    if (!id || !id->is_number_integer() || id->get<int64_t>() < 0) return false;
+    const MetaSpan* map = meta.Find((uint32_t)id->get<int64_t>());
+    if (!map || map->size == 0) return false;
+    out.mapOffset = map->offset;
+    out.mapSize = map->size;
+    ResolveParallax(meta.root, view, out.parallax, out.invert);
     return true;
 }
 
