@@ -514,7 +514,7 @@ void TestOneViewPair() {
     stbi_write_jpg_to_func(&JpegSink, &base, W, H, 3, rgb.data(), 98);
     stbi_write_png_to_func(&PngSink, &png, W, H, 3, mapRgb.data(), W * 3);
     stbi_write_png_to_func(&PngSink, &invPng, W, H, 3, invRgb.data(), W * 3);
-    // Classic (Leia app): gain 0.25 -> 1.5 % parallax. LIF 5.x: inv_z_map min < max (the map's
+    // Classic schema: gain 0.25 -> 1.5 % parallax. LIF 5.x: inv_z_map min < max (the map's
     // far end at 255, flipped), 1500 * 0.02 * (0.1 - 0.4) / 640 = -1.4 % -> 1.4 %.
     const std::vector<uint8_t> classic = OneViewLif(
         base, png, R"({"gain":0.25,"views":[{"albedoId":-1,"xLocation":0,"disparityId":1000001}]})");
