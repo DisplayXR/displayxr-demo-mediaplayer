@@ -651,6 +651,7 @@ nlohmann::json CaptureJson(const DeckLinkSource::CaptureStats& c) {
               {"allocator", c.allocator},
               {"alloc_node", c.allocNode},
               {"hold", c.hold},
+              {"zero_copy", c.zeroCopy},
               {"pin_group", {c.pinGroup[0], c.pinGroup[1]}},
               {"pinned", {c.pinned[0], c.pinned[1]}},
               {"cache_groups", c.cacheGroups},
@@ -660,6 +661,8 @@ nlohmann::json CaptureJson(const DeckLinkSource::CaptureStats& c) {
             {"raw_published", c.rawPublished},
             {"raw_skipped", c.rawSkipped},
             {"raw_fallback", c.rawFallback},
+            {"zero_copy_published", c.zeroCopyPublished},
+            {"zero_copy_fallback", c.zeroCopyFallback},
             {"alloc", {{"buffers", c.allocBuffers}, {"mb", c.allocMB}, {"calls", c.allocCalls}, {"refused", c.allocRefused}}},
             {"held", {{"now", c.heldNow}, {"peak", c.heldPeak}}},
             {"stages_window_s", DeckLinkSource::StageClock::kWindowSec},
@@ -718,13 +721,15 @@ void Station::LogPerf(bool live) {
     // which levers are in effect: what scripts/capture_matrix.ps1 compares between arms.
     if (decklink_.GetState() != LiveState::Closed) {
         const DeckLinkSource::CaptureStats c = decklink_.GetCaptureStats();
-        LOG_INFO("capture: %s%s%s%s | callback %.2f/%.2f ms, convert %.2f/%.2f ms, claim wait %.2f/%.2f ms, publish "
-                 "%.2f/%.2f ms (avg/max) | raw published %llu, skipped %llu, fallback %llu | held %d (peak %d), alloc "
-                 "%llu buffers %llu MB, refused %llu",
+        LOG_INFO("capture: %s%s%s%s%s | callback %.2f/%.2f ms, convert %.2f/%.2f ms, claim wait %.2f/%.2f ms, publish "
+                 "%.2f/%.2f ms (avg/max) | raw published %llu, skipped %llu, fallback %llu | zero-copy %llu, fallback "
+                 "%llu | held %d (peak %d), alloc %llu buffers %llu MB, refused %llu",
                  c.rawV210 ? "raw_v210 " : "convert ", c.allocator ? "allocator " : "", c.hold ? "hold " : "",
+                 c.zeroCopy ? "zero_copy " : "",
                  c.pinned[0] || c.pinned[1] ? "pinned" : "unpinned", c.callback.avgMs, c.callback.maxMs, c.convert.avgMs,
                  c.convert.maxMs, c.claimWait.avgMs, c.claimWait.maxMs, c.publish.avgMs, c.publish.maxMs,
                  (unsigned long long)c.rawPublished, (unsigned long long)c.rawSkipped, (unsigned long long)c.rawFallback,
+                 (unsigned long long)c.zeroCopyPublished, (unsigned long long)c.zeroCopyFallback,
                  c.heldNow, c.heldPeak, (unsigned long long)c.allocBuffers, (unsigned long long)c.allocMB,
                  (unsigned long long)c.allocRefused);
     }

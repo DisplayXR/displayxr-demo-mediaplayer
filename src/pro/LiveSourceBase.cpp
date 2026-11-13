@@ -203,6 +203,37 @@ bool LiveSourceBase::PublishV210(std::vector<uint8_t>* const eye[2], int eyes, i
     return true;
 }
 
+bool LiveSourceBase::PublishV210Ext(const FrameRing::Frame::ExtPlane* const eye[2], int eyes, int eyeW, int h,
+                                    ColorMatrix matrix, ColorTransfer transfer, bool fullRange, double captureSec,
+                                    const char* timecode, int eyeOffsetFrames) {
+    if ((eyes != 1 && eyes != 2) || eyeW <= 0 || (eyeW & 1) || h <= 0 || (h & 1)) return false;
+    const size_t bytes = v210::RowBytes(eyeW) * (size_t)h;
+    for (int e = 0; e < eyes; ++e)
+        if (!eye[e] || !eye[e]->data || eye[e]->bytes < bytes || !eye[e]->block || !eye[e]->hold) return false;
+    FrameRing::Frame& f = ring_.WriteBuffer();
+    f.ClearExt();
+    for (int e = 0; e < eyes; ++e) {
+        f.ext[e] = *eye[e];
+        f.plane[e].clear();  // (capacity kept for a later plane[] publish)
+    }
+    f.plane[2].clear();
+    f.width = eyes * eyeW;
+    f.height = h;
+    f.format = PixFormat::V210;
+    f.eyes = eyes;
+    f.fullRange = fullRange;
+    f.gpu = false;
+    f.gpuSharedTexture = nullptr;
+    f.gpuSharedHandle = nullptr;
+    f.captureSec = captureSec;
+    f.matrix = matrix;
+    f.transfer = transfer;
+    std::memset(f.timecode, 0, sizeof(f.timecode));
+    if (timecode) std::strncpy(f.timecode, timecode, sizeof(f.timecode) - 1);
+    Published(eyes * eyeW, h, fullRange, eyeOffsetFrames, ring_.Publish());
+    return true;
+}
+
 void LiveSourceBase::CountLate() {
     std::lock_guard<std::mutex> lk(statsMutex_);
     ++stats_.lateFrames;

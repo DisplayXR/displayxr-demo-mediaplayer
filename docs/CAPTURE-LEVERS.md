@@ -23,12 +23,12 @@ writes the frame.
 | 2 | the card callback copies it out (R+W 22 MB) | always | `HOLD` (needs `ALLOCATOR`): the frame is kept, nothing is copied, and the lane reads the card's buffer |
 | 3 | the lane converts v210 to P016 (R 22 + W 25 MB) | in row bands, into its half of the ring frame (0.9.8 direct pair) | `RAW_V210` (needs `GPU_V210`): no convert. The rows are moved into the ring by swapping vectors, and the GPU decodes them (#240) |
 | 4 | compose the side-by-side pair (R+W 50 MB) | removed by 0.9.8's direct pair | (`DIRECT_PAIR=0` brings it back, for comparison) |
-| 5 | the upload copy into staging (R+W 47-50 MB) | on the upload thread (0.9.6) | `UPLOAD_THREADS`, `UPLOAD_PIN` |
+| 5 | the upload copy into staging (R+W 47-50 MB) | on the upload thread (0.9.6) | `ZERO_COPY_UPLOAD` (with RAW + HOLD): none, the GPU reads the card's buffers in place. Else `UPLOAD_THREADS`, `UPLOAD_PIN` |
 | 6 | the GPU reads staging over PCIe | | |
 
-With `RAW_V210` + `HOLD`, the CPU still copies each frame twice (the lane's copy out of the
-held buffer, and the upload copy). Removing both, so that the GPU reads the card's buffer
-directly, is #238 phase 3. It is **not** in this change; see *Next* below.
+With `RAW_V210` + `HOLD`, the CPU still copies each frame twice: the lane's copy out of the
+held buffer, and the upload copy. Adding `ZERO_COPY_UPLOAD` removes both (#238 phase 3, see
+*Zero-copy* below). The card writes each frame once, and the GPU reads it once over PCIe.
 
 Where the threads run is a lever too. `CAPTURE_PIN` puts lane N and its convert threads on
 last-level-cache group N; `UPLOAD_PIN` does the same for the upload thread. On a Threadripper
@@ -49,6 +49,7 @@ full table, with defaults, is `src/pro/CaptureLevers.h`.
 | `MEDIAPLAYER_DECKLINK_HOLD` | 0 | the callback keeps the frame (AddRef) instead of copying it out. Only with `ALLOCATOR`: holding the driver's few buffers would starve the card |
 | `MEDIAPLAYER_CAPTURE_PIN` | off | `auto` = lane 0 on group 0, lane 1 on group 1; or a list such as `0,2` |
 | `MEDIAPLAYER_UPLOAD_PIN` | off | `auto` = group 2; or a number |
+| `MEDIAPLAYER_ZERO_COPY_UPLOAD` | 0 | the GPU reads the card's buffers in place (`VK_EXT_external_memory_host`). Needs `RAW_V210` + `ALLOCATOR` + `HOLD`, and a device with the extension; otherwise rows are copied as before, and the reason is in `capture-config:` |
 | `MEDIAPLAYER_DECKLINK_CONVERT_THREADS` | auto | threads per input lane (convert, or the held-buffer copy) |
 | `MEDIAPLAYER_UPLOAD_THREADS` | auto | upload copy threads (the station uses 4) |
 | `MEDIAPLAYER_DECKLINK_DIRECT_PAIR` | 1 | 0.9.8's direct pair; 0 = compose as in 0.9.7 |
@@ -148,16 +149,48 @@ need interop to use it.
 something the DeckLink SDK offers.
 
 The same result is available in Vulkan without DVP: `VK_EXT_external_memory_host` imports the
-allocator's buffers (this change's `ALLOCATOR`) as Vulkan memory, and the GPU copies from them
-directly. That is #238 phase 3. `ALLOCATOR` + `HOLD` are the capture half of it. The render
-half (the upload slot reads an imported card buffer instead of copying, and the buffer goes
-back to the pool when its GPU frame retires) is the next change. With it, the per-frame CPU
-copies at 2 x 2160p drop from about 5 to 0.
+allocator's buffers as Vulkan memory, and the GPU reads them directly. That is
+`ZERO_COPY_UPLOAD`, below.
+
+## Zero-copy (`MEDIAPLAYER_ZERO_COPY_UPLOAD`, #238 phase 3)
+
+- **Blocks.** The allocator's buffers are host blocks (`src/media/HostBlocks.h`): page-aligned
+  and 64 KB-rounded. Each has an id that is never reused.
+- **Lanes.** With `RAW_V210` + `HOLD`, a lane does not copy a held frame out. It passes the
+  card's buffer on as the ring frame's eye plane (`FrameRing::Frame::ext`), with a lease that
+  gives the frame back to the card when the last holder lets go.
+- **Renderer.** The renderer imports each block once, keyed by its id. The import holds the
+  block, because imported memory must outlive the Vulkan memory made from it. The v210 decode
+  pass reads the block in place, and the renderer keeps the frame's lease until that GPU frame
+  has passed its fence. So the card never refills a buffer the GPU is still reading.
+- **Upload thread.** It never stages these frames.
+- **Fallbacks.**
+  - The device has no extension: the switch logs why, and rows are copied as before.
+  - A frame whose bytes are not one of our blocks (the card refused the allocator): copied
+    out, counted in `zero_copy_fallback`.
+  - One eye zero-copy and the other not: the held eye is copied out, and the pair is published.
+- **Pool.** Frames stay out of the pool longer: the pairing history, the ring and the frames in
+  flight, for both eyes. So the allocator now allows up to 96 buffers per size, about 2 GB at
+  2160p. They are made only as needed: about 50 in steady state.
+
+Measured on the dev laptop (RTX 4070, test signal 2 x 3840x2160, `MEDIAPLAYER_TEST_SIGNAL_V210=1`,
+runs alternating with and without zero-copy, two each):
+- GPU decode of the in-place rows against a CPU decode: 0 of 24,883,200 samples differ.
+- The 42.2 MB per-frame upload copy (2.0-2.1 ms on 4 threads) is gone.
+- Render fps unchanged (60.0).
+- Process CPU about 9% lower.
+
+The test signal itself tops out at about 20 fps on that laptop, so the capture-rate effect needs
+the station: the `raw_alloc_hold_zc` arm.
+
+**Risk to watch on the card.** A held frame can now go back to the card from the render thread
+(when its GPU frame retires), and after the input has stopped (the last ring frames). The
+DeckLink objects are free-threaded COM, so this should be fine, but it has not run on a card.
 
 ## Next
 
 1. Run the default matrix on the station and post the zip.
 2. If `raw` / `raw_alloc_hold` reach the signal rate: make the v210 CPU consumers work (#240
    phase 2), then consider making raw the default.
-3. If they do not: #238 phase 3, the GPU reading the card's buffers directly
-   (`VK_EXT_external_memory_host`), and check `system.json` for empty memory channels first.
+3. If they do not: compare `raw_alloc_hold_zc` (no CPU copies at all). If that does not reach
+   it either, check `system.json` for empty memory channels and the DeckLink's PCIe link.

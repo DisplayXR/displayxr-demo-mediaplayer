@@ -185,7 +185,48 @@ public:
     void Stop() override {}
     const char* Kind() const override { return "test"; }
     using LiveSourceBase::Publish;
+    using LiveSourceBase::PublishV210Ext;
 };
+
+// LiveSourceBase::PublishV210Ext (the DeckLink zero-copy publish): the ring frame takes COPIES of
+// the leases, the caller's go away, and the block stays out of the pool until the ring buffer is
+// reused (and, in the renderer, until the GPU frame retires: HoldRule).
+void PublishExt() {
+    Src src;
+    const int eyeW = 1920, h = 1080;
+    const size_t bytes = v210::RowBytes(eyeW) * (size_t)h;
+    auto pool = hostmem::Pool::Create(bytes, 16);
+    uint64_t firstId = 0;
+    for (int i = 0; i < 6; ++i) {
+        FrameRing::Frame::ExtPlane ex[2];
+        for (int e = 0; e < 2; ++e) {
+            hostmem::Lease l = pool->Take();
+            l.block->p[0] = (uint8_t)(i * 2 + e);
+            ex[e] = FrameRing::Frame::ExtPlane{l.block->p, bytes, l.block->id, l.block, l.hold};
+            if (i == 0 && e == 0) firstId = l.block->id;
+        }
+        const FrameRing::Frame::ExtPlane* eyes[2] = {&ex[0], &ex[1]};
+        CHECK(src.PublishV210Ext(eyes, 2, eyeW, h, ColorMatrix::BT709, ColorTransfer::SDR, false, 1.0, "00:00:00:01", 0),
+              "published");
+        for (auto& x : ex) x = FrameRing::Frame::ExtPlane{};  // the lane drops its own
+        const FrameRing::Frame* f = src.Ring().AcquireLatest();
+        int eyes2 = 0, w = 0;
+        CHECK(f && f->HasExt() && v210::Shape(*f, eyes2, w) && eyes2 == 2 && w == eyeW, "an external-plane v210 frame");
+        CHECK(f && f->ext[0].data[0] == (uint8_t)(i * 2) && f->ext[1].data[0] == (uint8_t)(i * 2 + 1),
+              "each eye's own block");
+        CHECK(f && f->plane[0].empty() && f->plane[1].empty(), "no pixels copied into plane[]");
+    }
+    CHECK(pool->Out() <= 2 * FrameRing::kBufferCount, "only the ring's buffers still hold blocks");
+    CHECK(pool->Made() <= 2 * (FrameRing::kBufferCount + 1), "blocks reused as the ring recycles");
+    (void)firstId;
+    // A refused shape publishes nothing.
+    FrameRing::Frame::ExtPlane bad;
+    const FrameRing::Frame::ExtPlane* none[2] = {&bad, &bad};
+    const uint64_t before = src.GetStats().published;
+    CHECK(!src.PublishV210Ext(none, 2, eyeW, h, ColorMatrix::BT709, ColorTransfer::SDR, false, 0, nullptr, 0),
+          "an empty plane is refused");
+    CHECK(src.GetStats().published == before, "and not counted");
+}
 
 void PublishClears() {
     Src src;
@@ -215,6 +256,7 @@ int main() {
     ExtFrames();
     HoldRule();
     PublishClears();
+    PublishExt();
     if (g_failures) {
         std::fprintf(stderr, "zero_copy_test: %d failure(s)\n", g_failures);
         return 1;
