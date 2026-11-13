@@ -181,14 +181,12 @@ struct ImageDecoderApi {
     using Decode = int (*)(void*, void*, size_t, size_t);
     using Delete = void (*)(void*);
     using SetFormat = int (*)(void*, int32_t);
-    using SetUnpremul = int (*)(void*, bool);
     Create create = nullptr;
     SetTarget setTarget = nullptr;
     Stride stride = nullptr;
     Decode decode = nullptr;
     Delete del = nullptr;
     SetFormat setFormat = nullptr;      // optional: RGBA_8888, so a grayscale PNG is not A_8
-    SetUnpremul setUnpremul = nullptr;  // optional: a depth map's channel is not scaled by alpha
     bool ok = false;
 
     ImageDecoderApi() {
@@ -200,7 +198,6 @@ struct ImageDecoderApi {
         decode = (Decode)dlsym(lib, "AImageDecoder_decodeImage");
         del = (Delete)dlsym(lib, "AImageDecoder_delete");
         setFormat = (SetFormat)dlsym(lib, "AImageDecoder_setAndroidBitmapFormat");
-        setUnpremul = (SetUnpremul)dlsym(lib, "AImageDecoder_setUnpremultipliedRequired");
         ok = create && setTarget && stride && decode && del;
     }
 };
@@ -214,9 +211,10 @@ bool AndroidMediaProvider::DecodeJpegScaled(const uint8_t* data, size_t size, ui
     void* dec = nullptr;
     if (api.create(data, size, &dec) != 0 || !dec) return false;  // ANDROID_IMAGE_DECODER_SUCCESS == 0
     // A one-view LIF's disparity map (#180) can be a grayscale PNG, which would decode to
-    // A_8 by default, or carry alpha: ask for RGBA_8888, unpremultiplied (before the size).
+    // A_8 by default: ask for RGBA_8888. NOT unpremultiplied: AImageDecoder refuses to scale
+    // an image with an alpha channel unpremultiplied (INVALID_SCALE), and the NP02J's maps
+    // are RGBA PNGs whose alpha is all 255, so premultiplying leaves the depth as it is.
     if (api.setFormat) api.setFormat(dec, 1);  // ANDROID_BITMAP_FORMAT_RGBA_8888
-    if (api.setUnpremul) api.setUnpremul(dec, true);
     bool ok = api.setTarget(dec, (int32_t)w, (int32_t)h) == 0;
     if (ok) {
         const size_t stride = api.stride(dec);
