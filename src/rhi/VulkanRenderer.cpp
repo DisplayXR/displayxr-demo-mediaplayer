@@ -20,6 +20,7 @@
 #include "color/CubeLut.h"  // PackRgba16f for the 3D LUT
 #include "color/ToneMap.h"  // HLG display-peak range (#169)
 #include "Log.h"
+#include "media/V210.h"  // raw v210 frames, decoded on the GPU (#238)
 #include "rhi/Shaders.h"
 
 #include <algorithm>  // std::max / std::min (scissor clamp)
@@ -181,6 +182,25 @@ bool VulkanRenderer::Initialize(VkPhysicalDevice physicalDevice, VkDevice device
 
     if (!CreatePipeline()) return false;
 
+    // Raw v210 sources (#238, phase 1 opt-in): decoded on the GPU when MEDIAPLAYER_GPU_V210 is on
+    // and the device takes the pass. Producers read the result (v210::GpuDecodeActive) to choose
+    // between publishing the card's rows as they are and converting them on the CPU. One line.
+    if (v210::Requested()) {
+        if (CreateV210Pass()) {
+            stagingUsage_ |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;  // the pass reads the rows from staging
+            LOG_INFO("VulkanRenderer: v210 sources: GPU decode ON (MEDIAPLAYER_GPU_V210): raw rows uploaded, "
+                     "compute pass v210 -> P016 (storage range %llu MB)",
+                     (unsigned long long)(v210_.maxRange >> 20));
+        } else {
+            DestroyV210Pass();
+            LOG_WARN("VulkanRenderer: MEDIAPLAYER_GPU_V210 is set but the v210 decode pass could not be built; "
+                     "v210 sources are converted on the CPU");
+        }
+    } else {
+        LOG_INFO("VulkanRenderer: v210 sources: CPU convert (GPU decode off; MEDIAPLAYER_GPU_V210=1 turns it on)");
+    }
+    v210::SetGpuDecodeActive(GpuV210());
+
     // Upload copies into staging: this many threads, the render thread included (the pool
     // itself is made at the first copy big enough to split).
     copyThreads_ = bandcopy::UploadThreads();
@@ -193,6 +213,7 @@ bool VulkanRenderer::Initialize(VkPhysicalDevice physicalDevice, VkDevice device
         auto up = std::make_unique<asyncup::Uploader>(
             asyncup::SlotCount(ring_.framesInFlight()), copyThreads_,
             [this](int slot, size_t bytes) { return EnsureAsyncSlot(slot, bytes); });
+        up->SetV210(GpuV210());  // stage v210 rows only when the GPU decodes them
         if (up->Running()) uploader_ = std::move(up);
         else LOG_WARN("VulkanRenderer: the upload thread did not start; upload copies stay on the render thread");
     } else {
@@ -238,7 +259,7 @@ bool VulkanRenderer::CreateStaging(Staging& s, VkDeviceSize bytes) {
     s = Staging{};
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.usage = stagingUsage_;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (vkCreateBuffer(device_, &bci, nullptr, &s.buffer) != VK_SUCCESS) {
         s.buffer = VK_NULL_HANDLE;
@@ -864,6 +885,10 @@ void VulkanRenderer::CommitUpload() {
         // still holds the frame (it has not acquired since StageFrame).
         uploader_->Cancel(p.ticket);
         const FrameRing::Frame& f = *p.frame;
+        if (f.format == PixFormat::V210) {
+            UploadV210(f);
+            return;
+        }
         const int format = asyncup::UploadFormat(f.format);
         UploadYUV(f.plane[0].data(), f.plane[1].data(), format == 0 ? f.plane[2].data() : nullptr,
                   (uint32_t)f.width, (uint32_t)f.height, format, p.fullRange, p.matrix);
@@ -873,6 +898,24 @@ void VulkanRenderer::CommitUpload() {
     sharedActive_ = false;  // CPU-plane upload -> leave the zero-copy path
 #endif
     const asyncup::Layout& L = d.layout;
+    if (L.format == 3) {  // raw v210 (#238): the GPU decodes the slot's rows into the P016 planes
+        VkCommandBuffer cmd = EnsureDummy() ? FrameCmd() : VK_NULL_HANDLE;
+        const VkBuffer slotBuf = asyncSlots_[p.ticket.slot].buffer;
+        const VkBuffer bufs[2] = {slotBuf, slotBuf};
+        const VkDeviceSize offs[2] = {(VkDeviceSize)L.offset[0], (VkDeviceSize)L.offset[L.planes > 1 ? 1 : 0]};
+        if (cmd == VK_NULL_HANDLE || !RecordV210Decode(cmd, bufs, offs, L.planes, (int)L.w[0], (int)L.h[0])) {
+            uploader_->Cancel(p.ticket);  // nothing recorded: the GPU never reads this fill
+            LOG_ERROR("VulkanRenderer: could not record the staged v210 frame (decode pass / command buffer)");
+            return;
+        }
+        uploader_->Record(p.ticket, frameSerial_);
+        SetV210Source(p.fullRange, p.matrix);
+        VerifyV210Once(*p.frame);  // (debug: MEDIAPLAYER_GPU_V210_VERIFY)
+        perf_.Upload(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), 0.0,
+                     (double)L.total, d.threads);
+        perf_.AsyncTaken(d.waitMs);
+        return;
+    }
     PlaneSpec specs[3];
     int mode = 1;
     const int count = YuvPlaneSpecs(L.format, L.w[0], L.h[0], nullptr, nullptr, nullptr, specs, mode);
@@ -905,6 +948,351 @@ void VulkanRenderer::CommitUpload() {
     if (rec[0])
         LOG_INFO("VulkanRenderer: YUV source %ux%u mode=%d (copied into staging off the render thread)", L.w[0],
                  L.h[0], mode);
+}
+
+// ---------------------------------------------------------------------------
+// Raw v210 frames, decoded on the GPU (#238, media/V210.h, shaders/v210_to_p016.comp)
+// ---------------------------------------------------------------------------
+//
+// Why a compute pass into the P016 planes (not a decode inside the MP_GRADE fragment
+// shader): the draw samples its source with bilinear filtering at any scale, and its chroma
+// at half resolution; a v210 group packs 6 pixels into 4 words, so a fragment-side decode
+// would have to re-implement the filtering by hand (12+ texel fetches per sample, per tap, in
+// every view, every QC mode and the compare wipe). The pass instead makes exactly the images a
+// P016 upload makes, so everything after it (the matrix and range, the grade, scopes on the
+// GPU side, the Pro views) is unchanged, and the decode is checked bit for bit against the CPU
+// convert (tests/v210_test.cpp runs the pass's own source, v210_decode.inc, as C++).
+//
+// The pass reads the rows straight from host-visible staging (storage buffers), so the frame
+// crosses PCIe once, as before, and writes the P016 into a device-local buffer; two
+// buffer-to-image copies (VRAM to VRAM) put it into planes_[0] / [1]. Storage images would
+// skip that copy but R16 / R16G16 storage is an optional format feature.
+
+namespace {
+struct V210Push {
+    uint32_t eyeW, rowPairs, pitchWords, outW, uvBase, eyes;
+};
+}  // namespace
+
+bool VulkanRenderer::CreateV210Pass() {
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(physicalDevice_, &props);
+    v210_.maxRange = props.limits.maxStorageBufferRange;
+    // Staging slot planes sit at 256-byte offsets (asyncup::kPlaneAlign); the spec caps this
+    // alignment at 256, so this only guards a broken driver.
+    if (props.limits.minStorageBufferOffsetAlignment > asyncup::kPlaneAlign) return false;
+
+    VkDescriptorSetLayoutBinding b[3] = {};
+    for (uint32_t i = 0; i < 3; ++i) {
+        b[i].binding = i;
+        b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslci.bindingCount = 3;
+    dslci.pBindings = b;
+    if (vkCreateDescriptorSetLayout(device_, &dslci, nullptr, &v210_.setLayout) != VK_SUCCESS) return false;
+
+    VkPushConstantRange pc = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(V210Push)};
+    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &v210_.setLayout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pc;
+    if (vkCreatePipelineLayout(device_, &plci, nullptr, &v210_.layout) != VK_SUCCESS) return false;
+
+    VkShaderModule mod = MakeShaderModule(device_, g_v210ToP016CompSpv, sizeof(g_v210ToP016CompSpv));
+    if (mod == VK_NULL_HANDLE) return false;
+    VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = mod;
+    cpci.stage.pName = "main";
+    cpci.layout = v210_.layout;
+    const VkResult r = vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci, nullptr, &v210_.pipeline);
+    vkDestroyShaderModule(device_, mod, nullptr);
+    if (r != VK_SUCCESS) {
+        v210_.pipeline = VK_NULL_HANDLE;
+        return false;
+    }
+
+    const uint32_t nSlots = ring_.framesInFlight();
+    const uint32_t nSets = nSlots * (uint32_t)kV210Sets;
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * nSets};
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = nSets;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(device_, &dpci, nullptr, &v210_.pool) != VK_SUCCESS) return false;
+    for (uint32_t slot = 0; slot < nSlots; ++slot) {
+        VkDescriptorSetLayout layouts[kV210Sets];
+        for (int i = 0; i < kV210Sets; ++i) layouts[i] = v210_.setLayout;
+        VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dsai.descriptorPool = v210_.pool;
+        dsai.descriptorSetCount = kV210Sets;
+        dsai.pSetLayouts = layouts;
+        if (vkAllocateDescriptorSets(device_, &dsai, v210_.sets[slot]) != VK_SUCCESS) return false;
+    }
+    return true;
+}
+
+void VulkanRenderer::DestroyV210Pass() {
+    if (device_ == VK_NULL_HANDLE) return;
+    if (v210_.out) vkDestroyBuffer(device_, v210_.out, nullptr);
+    if (v210_.outMemory) vkFreeMemory(device_, v210_.outMemory, nullptr);
+    if (v210_.pool) vkDestroyDescriptorPool(device_, v210_.pool, nullptr);  // frees the sets
+    if (v210_.pipeline) vkDestroyPipeline(device_, v210_.pipeline, nullptr);
+    if (v210_.layout) vkDestroyPipelineLayout(device_, v210_.layout, nullptr);
+    if (v210_.setLayout) vkDestroyDescriptorSetLayout(device_, v210_.setLayout, nullptr);
+    v210_ = V210Pass{};
+}
+
+void VulkanRenderer::SetV210Source(bool fullRange, int matrix) {
+    sourceMode_ = 2;  // sampled as NV12 / P016
+    sourceFullRange_ = fullRange ? 1.0f : 0.0f;
+    source16_ = true;  // P016 levels: the MP_GRADE shader's 10-bit limited range
+    sourceMatrix_ = (matrix == 1 || matrix == 2) ? matrix : 0;  // anything else -> BT.709
+}
+
+bool VulkanRenderer::RecordV210Decode(VkCommandBuffer cmd, const VkBuffer src[2], const VkDeviceSize off[2],
+                                      int eyes, int eyeW, int h) {
+    if (!GpuV210() || cmd == VK_NULL_HANDLE || eyes < 1 || eyes > 2 || eyeW <= 0 || h <= 0) return false;
+    const v210::OutLayout L = v210::OutLayoutFor(eyes, eyeW, h);
+    const VkDeviceSize eyeBytes = (VkDeviceSize)v210::RowBytes(eyeW) * (VkDeviceSize)h;
+    if (eyeBytes > v210_.maxRange || (VkDeviceSize)L.totalBytes > v210_.maxRange) {
+        if (!v210_.rangeWarned) {
+            v210_.rangeWarned = true;
+            LOG_WARN("VulkanRenderer: v210 frame %dx%d is over the device's storage-buffer range (%llu bytes): "
+                     "decoded on the CPU",
+                     eyes * eyeW, h, (unsigned long long)v210_.maxRange);
+        }
+        return false;
+    }
+    // Everything that can fail comes before the first command: a false return records nothing.
+    const uint32_t slot = ring_.slotIndex();
+    if (slot >= kMaxSlots) return false;
+    if (v210_.setSerial[slot] != frameSerial_) {
+        v210_.setSerial[slot] = frameSerial_;
+        v210_.setsUsed[slot] = 0;
+    }
+    if (v210_.setsUsed[slot] >= kV210Sets) return false;
+    // The P016 output: reused frame after frame (queue order + the barriers below), reallocated
+    // only when the size changes; a queued frame may still copy from the old one.
+    const VkDeviceSize outBytes = (VkDeviceSize)L.totalBytes;
+    if (!v210_.out || outBytes > v210_.outSize || outBytes < v210_.outSize / 2) {
+        if (v210_.out || v210_.outMemory) {
+            VkDevice dev = device_;
+            const VkBuffer ob = v210_.out;
+            const VkDeviceMemory om = v210_.outMemory;
+            ring_.deferDestroy([dev, ob, om]() {
+                if (ob) vkDestroyBuffer(dev, ob, nullptr);
+                if (om) vkFreeMemory(dev, om, nullptr);
+            });
+            v210_.out = VK_NULL_HANDLE;
+            v210_.outMemory = VK_NULL_HANDLE;
+            v210_.outSize = 0;
+        }
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = outBytes;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(device_, &bci, nullptr, &v210_.out) != VK_SUCCESS) {
+            v210_.out = VK_NULL_HANDLE;
+            return false;
+        }
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(device_, v210_.out, &req);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &ai, nullptr, &v210_.outMemory) != VK_SUCCESS ||
+            vkBindBufferMemory(device_, v210_.out, v210_.outMemory, 0) != VK_SUCCESS) {
+            if (v210_.outMemory) vkFreeMemory(device_, v210_.outMemory, nullptr);
+            vkDestroyBuffer(device_, v210_.out, nullptr);
+            v210_.out = VK_NULL_HANDLE;
+            v210_.outMemory = VK_NULL_HANDLE;
+            return false;
+        }
+        v210_.outSize = outBytes;
+        LOG_INFO("VulkanRenderer: v210 decode output %ux%u P016 (%.1f MB, device-local)", L.outW, L.h,
+                 (double)outBytes / (1024.0 * 1024.0));
+    }
+    bool rec0 = false, rec1 = false;
+    if (!EnsurePlane(0, L.outW, L.h, VK_FORMAT_R16_UNORM, rec0) ||
+        !EnsurePlane(1, L.outW / 2, L.h / 2, VK_FORMAT_R16G16_UNORM, rec1))
+        return false;
+    if (rec0) LOG_INFO("VulkanRenderer: YUV source %ux%u mode=2 (raw v210, %d eye plane(s), decoded on the GPU)", L.outW,
+                       L.h, eyes);
+
+    const VkDescriptorSet set = v210_.sets[slot][v210_.setsUsed[slot]++];
+    const VkDescriptorBufferInfo bi[3] = {
+        {src[0], off[0], eyeBytes},
+        {eyes > 1 ? src[1] : src[0], eyes > 1 ? off[1] : off[0], eyeBytes},
+        {v210_.out, 0, outBytes},
+    };
+    VkWriteDescriptorSet w[3] = {};
+    for (uint32_t i = 0; i < 3; ++i) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[i].dstSet = set;
+        w[i].dstBinding = i;
+        w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[i].pBufferInfo = &bi[i];
+    }
+    vkUpdateDescriptorSets(device_, 3, w, 0, nullptr);
+
+    // The output was last read by an earlier frame's copy into the planes: write after read.
+    // (The rows in staging were written by the CPU before this frame's submit, which makes
+    // host writes to coherent memory visible.)
+    VkBufferMemoryBarrier toWrite = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    toWrite.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toWrite.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    toWrite.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toWrite.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toWrite.buffer = v210_.out;
+    toWrite.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1,
+                         &toWrite, 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v210_.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v210_.layout, 0, 1, &set, 0, nullptr);
+    const V210Push push = {(uint32_t)eyeW, (uint32_t)h / 2, (uint32_t)(v210::RowBytes(eyeW) / 4), L.outW,
+                           (uint32_t)L.uvBase, (uint32_t)eyes};
+    vkCmdPushConstants(cmd, v210_.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    const uint32_t groups = (uint32_t)(eyeW + 5) / 6;
+    vkCmdDispatch(cmd, (groups + 63) / 64, (uint32_t)h / 2, (uint32_t)eyes);
+
+    VkBufferMemoryBarrier toRead = toWrite;
+    toRead.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    toRead.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
+                         &toRead, 0, nullptr);
+    RecordPlaneCopy(cmd, 0, v210_.out, 0);
+    RecordPlaneCopy(cmd, 1, v210_.out, (VkDeviceSize)L.uvBase * 4);
+    return true;
+}
+
+bool VulkanRenderer::UploadV210Cpu(const FrameRing::Frame& f, int eyes, int eyeW) {
+    // No decode pass: the same arithmetic on this thread (V210.h runs the shader's source),
+    // then a P016 upload. Only reached when a producer published v210 without the pass (it
+    // should not) or a frame is over the device's limits.
+    if (!v210CpuWarned_) {
+        v210CpuWarned_ = true;
+        LOG_WARN("VulkanRenderer: v210 frames decoded on the CPU (no GPU decode pass): slow at 4K and up");
+    }
+    const v210::OutLayout L = v210::OutLayoutFor(eyes, eyeW, f.height);
+    v210Cpu_.resize(L.totalBytes / 4);
+    const uint8_t* eye[2] = {f.plane[0].data(), eyes > 1 ? f.plane[1].data() : f.plane[0].data()};
+    v210::DecodeToP016(eye, eyes, eyeW, f.height, v210Cpu_.data());
+    return UploadYUV(reinterpret_cast<const uint8_t*>(v210Cpu_.data()),
+                     reinterpret_cast<const uint8_t*>(v210Cpu_.data() + L.uvBase), nullptr, L.outW, L.h, 2,
+                     f.fullRange, (int)f.matrix);
+}
+
+bool VulkanRenderer::UploadV210(const FrameRing::Frame& f) {
+    int eyes = 0, eyeW = 0;
+    if (!v210::Shape(f, eyes, eyeW)) return false;
+#if defined(_WIN32)
+    sharedActive_ = false;  // CPU-plane upload -> leave the zero-copy path
+#endif
+    if (!EnsureDummy()) return false;
+    if (!GpuV210()) return UploadV210Cpu(f, eyes, eyeW);
+    VkCommandBuffer cmd = FrameCmd();
+    if (cmd == VK_NULL_HANDLE) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    UploadTally tally;
+    const size_t rb = v210::RowBytes(eyeW);
+    const VkDeviceSize bytes = (VkDeviceSize)rb * (VkDeviceSize)f.height;
+    VkBuffer bufs[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    const VkDeviceSize offs[2] = {0, 0};
+    for (int e = 0; e < eyes; ++e) {
+        // Staging users 0 / 1: planes 0 / 1 take their pixels from the decode, not staging.
+        void* mapped = AcquireStaging(e, bytes, bufs[e]);
+        if (!mapped) mapped = OneOffStaging(bytes, bufs[e]);
+        if (!mapped) return UploadV210Cpu(f, eyes, eyeW);
+        const auto c0 = std::chrono::steady_clock::now();
+        tally.threads = std::max(tally.threads, CopyToStaging(mapped, f.plane[e].data(), rb, (size_t)f.height));
+        tally.copyMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+        tally.bytes += (double)bytes;
+    }
+    if (eyes == 1) bufs[1] = bufs[0];
+    if (!RecordV210Decode(cmd, bufs, offs, eyes, eyeW, f.height)) return UploadV210Cpu(f, eyes, eyeW);
+    NoteUpload(t0, tally);
+    CancelPendingUpload();  // this frame replaces one staged earlier in this iteration
+    SetV210Source(f.fullRange, (int)f.matrix);
+    VerifyV210Once(f);  // (debug: MEDIAPLAYER_GPU_V210_VERIFY)
+    return true;
+}
+
+void VulkanRenderer::VerifyV210Once(const FrameRing::Frame& f) {
+    if (v210Verify_ < 0) v210Verify_ = v210::Requested(std::getenv("MEDIAPLAYER_GPU_V210_VERIFY")) ? 1 : 0;
+    if (v210Verify_ != 1 || !v210_.out) return;
+    v210Verify_ = 0;
+    int eyes = 0, eyeW = 0;
+    if (!v210::Shape(f, eyes, eyeW)) return;
+    const v210::OutLayout L = v210::OutLayoutFor(eyes, eyeW, f.height);
+    const VkDeviceSize bytes = (VkDeviceSize)L.totalBytes;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(device_, &bci, nullptr, &buf) != VK_SUCCESS) return;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device_, buf, &req);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    void* mapped = nullptr;
+    if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &ai, nullptr, &mem) != VK_SUCCESS ||
+        vkBindBufferMemory(device_, buf, mem, 0) != VK_SUCCESS) {
+        if (mem) vkFreeMemory(device_, mem, nullptr);
+        vkDestroyBuffer(device_, buf, nullptr);
+        return;
+    }
+    // This frame's decode is recorded: submit it, wait, copy the output back.
+    SubmitFrame();
+    ring_.waitAll();
+    const VkBuffer out = v210_.out;
+    ring_.submitImmediate([&](VkCommandBuffer cmd) {
+        VkBufferCopy c = {0, 0, bytes};
+        vkCmdCopyBuffer(cmd, out, buf, 1, &c);
+        VkBufferMemoryBarrier toHost = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        toHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toHost.buffer = buf;
+        toHost.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                             &toHost, 0, nullptr);
+    });
+    std::vector<uint32_t> cpu(L.totalBytes / 4);
+    const uint8_t* eye[2] = {f.plane[0].data(), eyes > 1 ? f.plane[1].data() : f.plane[0].data()};
+    v210::DecodeToP016(eye, eyes, eyeW, f.height, cpu.data());
+    size_t differ = 0;
+    int maxDiff = 0;
+    if (vkMapMemory(device_, mem, 0, bytes, 0, &mapped) == VK_SUCCESS && mapped) {
+        const uint16_t* g = static_cast<const uint16_t*>(mapped);
+        const uint16_t* c = reinterpret_cast<const uint16_t*>(cpu.data());
+        const auto cmp = [&](size_t from, size_t n) {
+            for (size_t i = from; i < from + n; ++i) {
+                const int d = std::abs((int)g[i] - (int)c[i]);
+                if (d) ++differ;
+                maxDiff = std::max(maxDiff, d);
+            }
+        };
+        cmp(0, L.yWords * 2);
+        cmp(L.uvBase * 2, L.uvWords * 2);
+        vkUnmapMemory(device_, mem);
+        LOG_WARN("VulkanRenderer: MEDIAPLAYER_GPU_V210_VERIFY: GPU decode of a %dx%d v210 frame vs the CPU decode: "
+                 "%zu of %zu samples differ, max |diff| %d (16-bit code values)",
+                 eyes * eyeW, f.height, differ, (size_t)(L.yWords + L.uvWords) * 2, maxDiff);
+    }
+    vkFreeMemory(device_, mem, nullptr);
+    vkDestroyBuffer(device_, buf, nullptr);
 }
 
 void* VulkanRenderer::EnsureAsyncSlot(int slot, size_t bytes) {
@@ -1732,6 +2120,8 @@ void VulkanRenderer::Shutdown() {
     DestroyLut(lut_, false);
     DestroyLut(cal_, false);
     DestroyLut(lutDummy_, false);
+    DestroyV210Pass();  // the device is idle (above)
+    v210::SetGpuDecodeActive(false);
     ring_.destroy();  // waits its fences, runs the deferred releases, frees cmds/fences
     for (auto& user : staging_)  // the device is idle (above): release now
         for (Staging& s : user) ReleaseStaging(s, /*deferred=*/false);

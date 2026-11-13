@@ -134,6 +134,19 @@ jobs:
             libwayland-dev libxkbcommon-dev libdbus-1-dev libegl-dev libgl-dev libasound2-dev \
             libxxf86vm-dev libxcb-glx0-dev
 
+      # The desktop shaders are embedded pre-compiled (src/rhi/Shaders.h, scripts/gen_shaders.sh),
+      # so nothing else compiles their GLSL. Compile every one here, as gen_shaders.sh does
+      # (incl. the v210 decode pass and its shared include, #238), so a shader edit that does
+      # not compile fails the PR even if Shaders.h was not regenerated.
+      - name: Shaders compile (glslangValidator)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          glslangValidator --version | head -1
+          glslangValidator -V shaders/fullscreen.vert -o /tmp/_v.spv
+          glslangValidator -V -DMP_GRADE shaders/sbs.frag -o /tmp/_f.spv
+          glslangValidator -V shaders/sbs.frag -o /tmp/_fa.spv
+          glslangValidator -V shaders/v210_to_p016.comp -o /tmp/_c.spv
+
       - name: Build (build-green; app is not run — no display on CI)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: MP_BUILD_PRO=ON ./scripts/build_linux.sh

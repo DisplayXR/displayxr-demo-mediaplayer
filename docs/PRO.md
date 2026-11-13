@@ -360,3 +360,35 @@ layer over the same HUD image, so inside it the runtime shows crisp 2D instead o
 (the panel becomes an opaque card; the picture under it is not shown). Unpinned panels stay
 in the woven HUD layer while they fade, so a half-faded card never cuts a hole in the
 picture. `MEDIAPLAYER_PRO_PANELS_3D=1` keeps pinned panels woven too.
+
+## GPU v210 decode (#238, phase 1, opt-in)
+
+At two 2160p59.94 eyes the limit is system-memory bandwidth on the capture side (~18 GB/s of
+copies, #238). The first step removes the CPU v210 -> P016 convert: the card's rows go into
+the ring and into staging as they are, and the GPU converts them.
+
+- **Ring format.** `PixFormat::V210` (`media/FrameRing.h`, layout in `media/V210.h`): one
+  plane per eye (`plane[0]` left, `plane[1]` right, `eyes` 1 or 2), each eye in the card's own
+  row layout (width rounded up to 48 px, 128 bytes per 48), `width` the side-by-side width,
+  the usual `matrix` / `transfer` / `fullRange` tags. Eye width and height are even.
+- **Renderer.** The upload thread copies each eye's rows into its staging slot unchanged
+  (2 x 22.1 MB for two UHD eyes, against 47.5 MB of P016). A compute pass
+  (`shaders/v210_to_p016.comp`) reads them straight from staging and writes the P016 planes
+  the MP_GRADE shader already samples; two VRAM-to-VRAM copies put them into the source
+  images. Matrix, range, grade and QC views are unchanged, because the images are the ones a
+  P016 upload makes. The decode is bit-identical to `livepix::V210ToP016`: its arithmetic is
+  one file (`shaders/v210_decode.inc`) that the shader and the C++ reference both include, and
+  `tests/v210_test.cpp` checks that reference against the CPU convert.
+- **Switches.** `MEDIAPLAYER_GPU_V210=1` builds the pass (default off; the log says which path
+  is on: `v210 sources: GPU decode ON` / `CPU convert`). Producers publish raw v210 only when
+  the pass is up. Without it a v210 frame is still shown (decoded on the CPU, one WARN).
+  `MEDIAPLAYER_GPU_V210_VERIFY=1` reads the first GPU decode back and logs how many samples
+  differ from the CPU decode (one WARN; blocking, debug only).
+- **Producer (phase 1).** Only the test signal: `MEDIAPLAYER_TEST_SIGNAL_V210=1` packs each eye
+  into v210 (the low 2 bits dithered, so all 10 bits matter) and publishes it raw when the GPU
+  decode is on, else converts it to P016 on the CPU first, as DeckLink does. That gives a
+  CPU-vs-GPU A/B on one build. `MEDIAPLAYER_TEST_STILL=1` repeats frame 0, so two runs' atlas
+  dumps can be compared pixel for pixel. DeckLink is unchanged in this phase.
+- **CPU consumers.** The rig check, thumbnails, scopes, auto-convergence and Convert to 3D do
+  not read v210 yet. On a v210 source they show nothing or hold their last value. Phase 2
+  gives them the card rows.
