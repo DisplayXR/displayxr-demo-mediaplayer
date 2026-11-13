@@ -36,6 +36,8 @@ src/browser/                    namespace mp::browser, platform-neutral
   StereoGrid.{h,cpp}            the 3D grid: eye crops, per-tile convergence, per-view quads,
                                 the rendering-mode borrow
   ThumbnailDepth.{h,cpp}        the 3D grid: each stereo thumbnail's depth, on a worker
+  StereoPairs.{h,cpp}           the 3D grid: pairs for photos whose thumbnail is one view
+  PairDiskCache.{h,cpp}         ... and those pairs kept in the app's cache dir
   TouchScroller.{h,cpp}         drag, inertia, tap vs drag
   SlideGesture.{h,cpp}          swiping to the next or previous file in the player
   BrowserLayout.{h,cpp}         pure layout: columns by width, rail or drawer, date sections,
@@ -171,9 +173,24 @@ eye in the left-eye views, its right eye in the others. Android only.
   512 x 512 EXIF thumbnail, a centre crop of the 16:10 view, and MediaStore returns it, so the right view decoded at its size came out squeezed.
   When the thumbnail's aspect is not the view's (`ThumbnailIsWholeView`, the view's size from
   its JPEG header), both eyes are decoded from the file at the view's aspect. The
-  pair is kept in memory (24 MB, by id and modified time). LIFs carry no embedded thumbnail
+  pair is kept in memory (24 MB, by id and modified time) and on disk (`PairDiskCache.h`):
+  `Context.getCacheDir()/stereo_thumbs`, one JPEG (q85) of the whole pair per file version,
+  named by a hash of the media id, modified time, size, thumbnail size, view scale and
+  `kPairFormatVersion` (bump it whenever a pair would come out different). Lookup is memory,
+  then disk, then made and stored, all disk I/O on the pair worker; 96 MB, least recently
+  used first (a hit touches the file's mtime), written to a temp file and renamed, and a
+  stored pair that does not decode is deleted and made again. The worker logs the cache's
+  size once when it opens, and disk hits vs pairs made in its every-4-pairs cost line. LIFs carry no embedded thumbnail
   or preview to use instead (checked on the phone's: base JPEG + one view blob, no EXIF
-  thumbnail). Still flat: a one-view LIF (depth map only) and two-track videos.
+  thumbnail).
+- A one-view LIF (one picture and its disparity map: every 2D-to-3D conversion) gets its
+  pair the way the player makes one (`LifLoader::FindDepthView`, then
+  `DepthWarp::MakeSbs` at the parallax `LifLoader::Load` uses: the classic `gain`, or the
+  5.x `inv_z_map` range, capped at 2 % and flipped when the map's far end is 255), on the
+  same worker: the map decoded at the eye size (the platform decoder scales it while
+  decoding), the picture from the system's thumbnail (or decoded small when that is a
+  crop), both eyes warped on one thread. The grid then places it like any pair (Depth per
+  tile below). Still flat: two-track videos.
 - Leaving the grid for the player stops the thumbnail requests, so they do not compete
   with opening the file and its neighbours.
 - Depth per tile (`StereoGrid.h` `TileShift`): `ThumbnailDepth` measures each stereo

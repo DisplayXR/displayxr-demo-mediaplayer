@@ -3224,10 +3224,17 @@ bring_up(struct android_app *app)
 			                         g_vk_device, frames_in_flight(),
 			                         std::string(app->activity->internalDataPath) + "/stereo_verdicts.txt"),
 			    std::memory_order_relaxed);
-			if (g_browser_ready.load(std::memory_order_relaxed))  // the 3D grid's photo pairs (#180)
+			if (g_browser_ready.load(std::memory_order_relaxed)) {  // the 3D grid's photo pairs (#180)
+				// Kept between launches in Context.getCacheDir()/stereo_thumbs: the files dir's
+				// sibling "cache" (both under the app's data dir), which the OS may clear.
+				std::string files = app->activity->internalDataPath ? app->activity->internalDataPath : "";
+				const size_t slash = files.find_last_of('/');
+				const std::string pairDir =
+				    slash == std::string::npos ? std::string() : files.substr(0, slash) + "/cache/stereo_thumbs";
 				g_browser.SetPairMaker(&mp::browser::AndroidMediaProvider::DecodeJpegScaled,
 				                       &mp::browser::AndroidMediaProvider::ReadFileAt,
-				                       &mp::browser::AndroidMediaProvider::CloseFile);
+				                       &mp::browser::AndroidMediaProvider::CloseFile, pairDir);
+			}
 			if (g_browser_ready.load(std::memory_order_relaxed))
 				g_stills.Initialize(&mp::browser::AndroidMediaProvider::Instance(), &g_sbs,
 				                    std::string(app->activity->internalDataPath) + "/still_image",

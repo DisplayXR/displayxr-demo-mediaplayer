@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "browser/StereoPairs.h"
 
+#include "media/DepthWarp.h"
 #include "media/LifLoader.h"
 #include "media/MpoLoader.h"
 #include "Log.h"
@@ -20,6 +21,7 @@ namespace mp::browser {
 namespace {
 
 constexpr uint64_t kMaxViewBytes = 64u << 20;  // a view's JPEG larger than this is not read
+constexpr size_t kHeadBytes = 256u << 10;      // enough of a JPEG's head for its SOF (past EXIF)
 
 } // namespace
 
@@ -113,11 +115,14 @@ void ComposePair(const std::vector<uint8_t>& left, const std::vector<uint8_t>& r
 
 StereoPairs::~StereoPairs() { Shutdown(); }
 
-bool StereoPairs::Initialize(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close) {
+bool StereoPairs::Initialize(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close,
+                             const std::string& diskDir, uint64_t diskBytes) {
     if (worker_.joinable() || !decode || !read || !close) return false;
     decode_ = std::move(decode);
     read_ = std::move(read);
     close_ = std::move(close);
+    diskDir_ = diskDir;
+    diskBytes_ = diskBytes;
     stop_ = false;
     worker_ = std::thread([this] { Work(); });
     return true;
@@ -131,6 +136,7 @@ void StereoPairs::Shutdown() {
     }
     wake_.notify_all();
     worker_.join();
+    disk_.Shutdown();  // the worker is gone: safe here
     for (Job& j : jobs_) close_(j.fd);
     jobs_.clear();
     done_.clear();
@@ -228,6 +234,16 @@ void StereoPairs::Work() {
 #if defined(__ANDROID__)
     setpriority(PRIO_PROCESS, (id_t)gettid(), 19);  // the lowest: behind opening and the stills
 #endif
+    if (!diskDir_.empty()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (disk_.Initialize(diskDir_, diskBytes_))
+            LOG_INFO("3D grid: pair disk cache %s: %zu pairs, %.1f MB of %.0f MB (opened in %.0f ms)",
+                     diskDir_.c_str(), disk_.Count(), (double)disk_.Bytes() / 1048576.0,
+                     (double)disk_.MaxBytes() / 1048576.0,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        else
+            LOG_WARN("3D grid: pair disk cache %s cannot be used: pairs kept in memory only", diskDir_.c_str());
+    }
     for (;;) {
         Job job;
         {
@@ -241,14 +257,28 @@ void StereoPairs::Work() {
         done.id = job.id;
         done.modified = job.modified;
         const auto t0 = std::chrono::steady_clock::now();
-        done.ok = MakeOne(job, done.sbs);
+        const std::string key = disk_.Ready()
+                                    ? PairDiskCache::Key(job.id, job.modified, job.size, job.w, job.h, job.scale)
+                                    : std::string();
+        done.ok = disk_.Ready() && FromDisk(job, key, done.sbs);
+        if (done.ok) {
+            ++statDisk_;
+        } else {
+            done.ok = MakeOne(job, done.sbs);
+            if (done.ok) {
+                ++statMade_;
+                if (disk_.Ready()) disk_.Store(key, done.sbs.rgba.data(), done.sbs.width, done.sbs.height);
+            }
+        }
         close_(job.fd);
         statMs_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         statOk_ += done.ok ? 1 : 0;
         if (++statCount_ == 4) {
-            LOG_INFO("3D grid: 4 photo pairs, %d made, %.0f ms each on average (eye %ux%u)", statOk_,
-                     statMs_ / 4.0, done.sbs.width / 2, done.sbs.height);
-            statCount_ = statOk_ = 0;
+            LOG_INFO("3D grid: 4 photo pairs, %d ok (%d from disk, %d made), %.0f ms each on average (eye %ux%u); "
+                     "disk %zu pairs, %.1f MB",
+                     statOk_, statDisk_, statMade_, statMs_ / 4.0, done.sbs.width / 2, done.sbs.height,
+                     disk_.Count(), (double)disk_.Bytes() / 1048576.0);
+            statCount_ = statOk_ = statDisk_ = statMade_ = 0;
             statMs_ = 0.0;
         }
         std::lock_guard<std::mutex> lock(mutex_);
@@ -263,6 +293,10 @@ bool StereoPairs::MakeOne(const Job& job, Thumbnail& out) {
     };
     LifLoader::ViewSpan left, right;
     bool found = LifLoader::FindViews(readAt, job.size, left, right);
+    if (!found) {
+        LifLoader::DepthViewSpan one;
+        if (LifLoader::FindDepthView(readAt, job.size, one)) return MakeFromDepth(job, one, out);
+    }
     if (!found) {
         std::vector<uint8_t> head((size_t)std::min<uint64_t>(job.size, MpoLoader::SniffBytes()));
         uint64_t offset = 0, size = 0;
@@ -305,6 +339,79 @@ bool StereoPairs::MakeOne(const Job& job, Thumbnail& out) {
     out.width = ew * 2;
     out.height = eh;
     ComposePair(l, r, ew, eh, out.rgba);
+    return true;
+}
+
+bool StereoPairs::FromDisk(const Job& job, const std::string& key, Thumbnail& out) {
+    std::vector<uint8_t> jpeg;
+    if (!disk_.Load(key, jpeg)) return false;
+    uint32_t w = 0, h = 0;
+    out = Thumbnail{};
+    if (!JpegSize(jpeg.data(), jpeg.size(), w, h) || (w & 1) != 0 ||
+        !decode_(jpeg.data(), jpeg.size(), w, h, out.rgba) || out.rgba.size() < (size_t)w * h * 4) {
+        disk_.Remove(key);  // partial or corrupt: made again below
+        out = Thumbnail{};
+        return false;
+    }
+    out.id = job.id;
+    out.width = w;
+    out.height = h;
+    return true;
+}
+
+bool StereoPairs::MakeFromDepth(const Job& job, const LifLoader::DepthViewSpan& one, Thumbnail& out) {
+    auto readAt = [&](uint64_t offset, void* dst, size_t size) {
+        return offset + size <= job.size && read_(job.fd, offset, dst, size);
+    };
+    if (one.image.size == 0 || one.image.size > kMaxViewBytes || one.mapSize > kMaxViewBytes) return false;
+    // The view's size from its JPEG header: the base JPEG's head only, unless the image is a
+    // blob, which is then read whole (it is decoded below anyway).
+    std::vector<uint8_t> imageBytes;
+    std::vector<uint8_t> head((size_t)std::min<uint64_t>(one.image.size, one.image.base ? kHeadBytes : kMaxViewBytes));
+    if (!readAt(one.image.offset, head.data(), head.size())) return false;
+    uint32_t vw = 0, vh = 0;
+    JpegSize(head.data(), head.size(), vw, vh);
+    if (head.size() == one.image.size) imageBytes.swap(head);
+    const bool whole = ThumbnailIsWholeView(job.w, job.h, vw, vh);
+    uint32_t ew = 0, eh = 0;
+    if (whole)
+        PairEyeSize(job.w, job.h, job.scale, ew, eh);
+    else
+        PairEyeSizeOfView(job.w, job.h, vw, vh, job.scale, ew, eh);
+
+    // The disparity map (a PNG or a JPEG, at the view's size on the NP02J's conversions),
+    // decoded straight to the eye size: its first channel is the depth.
+    std::vector<uint8_t> mapBytes((size_t)one.mapSize), map;
+    if (!readAt(one.mapOffset, mapBytes.data(), mapBytes.size())) return false;
+    if (!decode_(mapBytes.data(), mapBytes.size(), ew, eh, map) || map.size() < (size_t)ew * eh * 4) return false;
+    std::vector<uint8_t> depth((size_t)ew * eh);
+    for (size_t i = 0; i < depth.size(); ++i) depth[i] = one.invert ? (uint8_t)(255 - map[i * 4]) : map[i * 4];
+
+    // The picture: the system's thumbnail when it is the whole view, else decoded small.
+    DecodedImage image;
+    image.width = (int)ew;
+    image.height = (int)eh;
+    if (one.image.base && whole) {
+        ResizeRgba(job.left.data(), job.w, job.h, ew, eh, image.pixels);
+    } else {
+        if (imageBytes.empty()) {
+            imageBytes.resize((size_t)one.image.size);
+            if (!readAt(one.image.offset, imageBytes.data(), imageBytes.size())) return false;
+        }
+        if (!decode_(imageBytes.data(), imageBytes.size(), ew, eh, image.pixels) ||
+            image.pixels.size() < (size_t)ew * eh * 4)
+            return false;
+    }
+    // Both eyes from the picture, by the player's warp at the player's parallax (LifLoader's
+    // one-view path), so the tile has the depth the file shows when opened. One thread: this
+    // is already the low-priority worker.
+    DecodedImage sbs = DepthWarp::MakeSbs(image, depth, one.parallax, 1);
+    if (!sbs.Valid()) return false;
+    out = Thumbnail{};
+    out.id = job.id;
+    out.width = (uint32_t)sbs.width;
+    out.height = (uint32_t)sbs.height;
+    out.rgba = std::move(sbs.pixels);
     return true;
 }
 

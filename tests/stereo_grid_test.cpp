@@ -6,19 +6,25 @@
 // rendering-mode borrow that takes the panel to 3D under the "3D only" filter and hands it
 // back, and the pairs made for one-view 3D photos (a two-view LIF, an MPO) at small size.
 
+#include "browser/PairDiskCache.h"
 #include "browser/StereoGrid.h"
 #include "browser/StereoPairs.h"
 #include "browser/ThumbnailDepth.h"
 #include "media/ImageDecoder.h"
+#include "media/LifLoader.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <string>
@@ -453,6 +459,265 @@ void TestPairAspect() {
     pairs.Shutdown();
 }
 
+// A one-view LIF (one picture + a disparity map, what a 2D->3D conversion writes): the pair
+// comes from the player's depth warp at the player's parallax. The picture is a grey field
+// with two soft bright bars, one where the map says far (left half, 0) and one where it says
+// near (right half, 255). The near bar must be crossed (left eye right of the right eye),
+// the far bar uncrossed, each by half the parallax, and the edge between leaves no holes.
+void PngSink(void* ctx, void* data, int size) { JpegSink(ctx, data, size); }
+
+std::vector<uint8_t> OneViewLif(const std::vector<uint8_t>& base, const std::vector<uint8_t>& map,
+                                const std::string& json) {
+    std::vector<uint8_t> lif = base;
+    const size_t region = lif.size();
+    PutU32BE(lif, 2);
+    PutU32BE(lif, 7);
+    PutU32BE(lif, (uint32_t)json.size());
+    lif.insert(lif.end(), json.begin(), json.end());
+    PutU32BE(lif, 1000001);
+    PutU32BE(lif, (uint32_t)map.size());
+    lif.insert(lif.end(), map.begin(), map.end());
+    PutU32BE(lif, (uint32_t)(lif.size() + 6 - region));
+    lif.push_back(0x1E);
+    lif.push_back(0x1A);
+    return lif;
+}
+
+// The brightness-weighted centre of the bar around `x0` in row `y` of eye `eye` (0 / 1).
+float BarCentre(const Thumbnail& t, int eye, int y, int x0, int half) {
+    const int ew = (int)t.width / 2;
+    double sum = 0, wsum = 0;
+    for (int x = std::max(0, x0 - half); x < std::min(ew, x0 + half); ++x) {
+        const double v = std::max(0, (int)t.rgba[((size_t)y * t.width + (size_t)(eye * ew + x)) * 4] - 100);
+        sum += v * x;
+        wsum += v;
+    }
+    return wsum > 0 ? (float)(sum / wsum) : -1.0f;
+}
+
+void TestOneViewPair() {
+    const int W = 640, H = 400, farX = 160, nearX = 480;
+    std::vector<uint8_t> rgb((size_t)W * H * 3), mapRgb((size_t)W * H * 3), invRgb((size_t)W * H * 3);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const float df = (float)(x - farX), dn = (float)(x - nearX);
+            const float bar = 150.0f * (std::exp(-df * df / 18.0f) + std::exp(-dn * dn / 18.0f));
+            uint8_t* p = &rgb[((size_t)y * W + x) * 3];
+            p[0] = p[1] = p[2] = (uint8_t)std::min(255.0f, 100.0f + bar);
+            const uint8_t d = x < W / 2 ? 0 : 255;
+            uint8_t* m = &mapRgb[((size_t)y * W + x) * 3];
+            m[0] = m[1] = m[2] = d;
+            uint8_t* n = &invRgb[((size_t)y * W + x) * 3];
+            n[0] = n[1] = n[2] = (uint8_t)(255 - d);
+        }
+    std::vector<uint8_t> base, png, invPng;
+    stbi_write_jpg_to_func(&JpegSink, &base, W, H, 3, rgb.data(), 98);
+    stbi_write_png_to_func(&PngSink, &png, W, H, 3, mapRgb.data(), W * 3);
+    stbi_write_png_to_func(&PngSink, &invPng, W, H, 3, invRgb.data(), W * 3);
+    // Classic schema: gain 0.25 -> 1.5 % parallax. LIF 5.x: inv_z_map min < max (the map's
+    // far end at 255, flipped), 1500 * 0.02 * (0.1 - 0.4) / 640 = -1.4 % -> 1.4 %.
+    const std::vector<uint8_t> classic = OneViewLif(
+        base, png, R"({"gain":0.25,"views":[{"albedoId":-1,"xLocation":0,"disparityId":1000001}]})");
+    const std::vector<uint8_t> v5 = OneViewLif(
+        base, invPng,
+        R"({"stereo_render_data":{"baseline":0.02},"views":[{"image":{"blob_id":-1},"focal_px":1500,)"
+        R"("width_px":640,"inv_z_map":{"blob_id":1000001,"min":0.1,"max":0.4}}]})");
+    const std::vector<uint8_t> twoView = TwoViewLif(SolidJpeg(64, 40, 1, 2, 3), SolidJpeg(64, 40, 3, 2, 1));
+
+    // Where things are, without decoding anything.
+    {
+        auto reader = [](const std::vector<uint8_t>& f) {
+            return [&f](uint64_t off, void* dst, size_t n) {
+                if (off + n > f.size()) return false;
+                std::memcpy(dst, f.data() + off, n);
+                return true;
+            };
+        };
+        mp::LifLoader::DepthViewSpan one;
+        CHECK(mp::LifLoader::FindDepthView(reader(classic), classic.size(), one), "classic one-view LIF found");
+        CHECK(one.image.base && one.image.offset == 0 && one.image.size == base.size(), "image = the base JPEG");
+        CHECK(one.mapSize == png.size() && !one.invert && Near(one.parallax, 0.015f, 1e-5f),
+              "classic: gain 0.25 -> 1.5 %% (%.4f), map as is", one.parallax);
+        CHECK(mp::LifLoader::FindDepthView(reader(v5), v5.size(), one), "5.x one-view LIF found");
+        CHECK(one.invert && Near(one.parallax, 0.0140625f, 1e-5f), "5.x: min < max flips the map, %.4f",
+              one.parallax);
+        mp::LifLoader::ViewSpan l, r;
+        CHECK(!mp::LifLoader::FindViews(reader(classic), classic.size(), l, r), "one view: no second view");
+        CHECK(!mp::LifLoader::FindDepthView(reader(twoView), twoView.size(), one), "two views: not a depth view");
+    }
+
+    std::map<int, const std::vector<uint8_t>*> files{{11, &classic}, {12, &v5}};
+    int decodes = 0;
+    StereoPairs pairs;
+    CHECK(pairs.Initialize(
+              [&](const uint8_t* d, size_t n, uint32_t dw, uint32_t dh, std::vector<uint8_t>& out) {
+                  ++decodes;
+                  const mp::DecodedImage img = mp::ImageDecoder::LoadFromMemory(d, n, "pair");
+                  if (!img.Valid()) return false;
+                  ResizeRgba(img.pixels.data(), (uint32_t)img.width, (uint32_t)img.height, dw, dh, out);
+                  return true;
+              },
+              [&](int fd, uint64_t off, void* dst, size_t n) {
+                  auto it = files.find(fd);
+                  if (it == files.end() || off + n > it->second->size()) return false;
+                  std::memcpy(dst, it->second->data() + off, n);
+                  return true;
+              },
+              [](int) {}),
+          "pair maker starts");
+    // The system's thumbnail: the picture itself (the whole view), at full size.
+    const mp::DecodedImage thumb = mp::ImageDecoder::LoadFromMemory(base.data(), base.size(), "thumb");
+    struct Case { int fd; float parallax; const char* name; };
+    for (const Case& c : {Case{11, 0.015f, "classic"}, Case{12, 0.0140625f, "5.x"}}) {
+        decodes = 0;
+        pairs.Make(60 + c.fd, 1, c.fd, files[c.fd]->size(), thumb.pixels.data(), W, H, 1.0f);
+        std::vector<Thumbnail> made;
+        std::vector<int64_t> failed;
+        for (int i = 0; i < 400 && made.empty() && failed.empty(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            pairs.TakeResults(made, failed);
+        }
+        CHECK(made.size() == 1 && failed.empty(), "%s: a pair is made from the depth map", c.name);
+        if (made.size() != 1) continue;
+        const Thumbnail& t = made[0];
+        CHECK(t.width == 2u * W && t.height == (uint32_t)H, "%s: eyes at the thumbnail's size %ux%u", c.name, t.width,
+              t.height);
+        CHECK(decodes == 1, "%s: only the map is decoded, the thumbnail is the left picture (%d)", c.name, decodes);
+        // Disparity = left-eye x - right-eye x. DepthWarp: +parallax * W for the nearest
+        // (255, crossed: in front), -parallax * W for the farthest, 0 at mid depth.
+        const float want = c.parallax * (float)W;  // 9.6 / 9.0 px
+        const int y = H / 2;
+        const float nearD = BarCentre(t, 0, y, nearX, 16) - BarCentre(t, 1, y, nearX, 16);
+        const float farD = BarCentre(t, 0, y, farX, 16) - BarCentre(t, 1, y, farX, 16);
+        CHECK(Near(nearD, 0.5f * want, 0.35f), "%s: near bar crossed by %.2f px (want %.2f)", c.name, nearD,
+              0.5f * want);
+        CHECK(Near(farD, -0.5f * want, 0.35f), "%s: far bar uncrossed by %.2f px (want %.2f)", c.name, farD,
+              -0.5f * want);
+        // The right eye's near bar moved left of the picture's, its far bar right.
+        CHECK(BarCentre(t, 1, y, nearX, 16) < (float)nearX && BarCentre(t, 1, y, farX, 16) > (float)farX,
+              "%s: right eye shifted the right way", c.name);
+        // No holes: the disocclusion at the depth edge and the rows' ends are filled from
+        // the picture (grey >= ~100), never left black or transparent.
+        bool filled = true;
+        for (size_t i = 0; i < t.rgba.size(); i += 4)
+            if (t.rgba[i + 3] != 255 || t.rgba[i] < 90) filled = false;
+        CHECK(filled, "%s: holes filled", c.name);
+    }
+    pairs.Shutdown();
+}
+
+// --- the pairs kept on disk (PairDiskCache.h) ---------------------------------------------
+
+std::string TempDir(const char* name) {
+    std::error_code ec;
+    const std::filesystem::path p = std::filesystem::temp_directory_path(ec) / name;
+    std::filesystem::remove_all(p, ec);
+    return p.string();
+}
+
+void TestPairDiskKey() {
+    const std::string k = PairDiskCache::Key(42, 1000, 5000, 512, 320, 0.75f);
+    CHECK(k.size() == 16 && k.find_first_not_of("0123456789abcdef") == std::string::npos, "16 hex digits: %s",
+          k.c_str());
+    CHECK(k == PairDiskCache::Key(42, 1000, 5000, 512, 320, 0.75f), "stable");
+    CHECK(k != PairDiskCache::Key(43, 1000, 5000, 512, 320, 0.75f), "another file");
+    CHECK(k != PairDiskCache::Key(42, 1001, 5000, 512, 320, 0.75f), "modified time changed");
+    CHECK(k != PairDiskCache::Key(42, 1000, 5001, 512, 320, 0.75f), "size changed");
+    CHECK(k != PairDiskCache::Key(42, 1000, 5000, 512, 512, 0.75f), "another thumbnail size");
+    CHECK(k != PairDiskCache::Key(42, 1000, 5000, 512, 320, 0.5f), "another eye scale");
+    CHECK(k != PairDiskCache::Key(42, 1000, 5000, 512, 320, 0.75f, PairDiskCache::kPairFormatVersion + 1),
+          "pair format version bumped");
+}
+
+void TestPairDiskLru() {
+    const std::string dir = TempDir("mp_pair_disk_lru");
+    std::vector<uint8_t> img((size_t)64 * 32 * 4);
+    for (size_t i = 0; i < img.size(); ++i) img[i] = (uint8_t)((i * 37) % 251);  // noise: ~4+ KB each
+    PairDiskCache c;
+    CHECK(c.Initialize(dir, 1u << 20), "opens (creates) the directory");
+    CHECK(c.Store("a", img.data(), 64, 32) && c.Store("b", img.data(), 64, 32) && c.Store("c", img.data(), 64, 32),
+          "stores");
+    const uint64_t one = c.Bytes() / 3;
+    CHECK(c.Count() == 3 && one > 0, "three kept (%zu, %llu bytes each)", c.Count(), (unsigned long long)one);
+    std::vector<uint8_t> jpeg;
+    CHECK(c.Load("a", jpeg) && jpeg.size() > 2 && jpeg[0] == 0xFF && jpeg[1] == 0xD8, "a JPEG comes back");
+    CHECK(!c.Load("zz", jpeg), "not stored: a miss");
+    // Room for about three: storing a fourth trims to 90 %, the least recently used first.
+    // "a" was just used, so "b" goes.
+    c.Shutdown();
+    CHECK(c.Initialize(dir, one * 3 + one / 2), "reopened: the index comes from the files");
+    CHECK(c.Count() == 3, "three found on disk (%zu)", c.Count());
+    CHECK(c.Load("a", jpeg), "a used");
+    CHECK(c.Store("d", img.data(), 64, 32), "a fourth");
+    CHECK(c.Bytes() <= one * 3 + one / 2, "within the budget");
+    CHECK(c.Load("a", jpeg) && c.Load("d", jpeg), "the recently used stay");
+    CHECK(!c.Load("b", jpeg), "the least recently used went");
+    CHECK(!std::filesystem::exists(dir + "/b.jpg"), "its file too");
+    // A write cut short (a temp file) is dropped when the cache opens.
+    { std::ofstream(dir + "/x.tmp") << "partial"; }
+    c.Shutdown();
+    CHECK(c.Initialize(dir, 1u << 20) && !std::filesystem::exists(dir + "/x.tmp"), "stray temp file removed");
+    c.Shutdown();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// End to end: a pair made once is read back from disk by the next launch (the file is not
+// read again), and a corrupt stored pair is made again.
+void TestPairDiskReuse() {
+    const std::string dir = TempDir("mp_pair_disk_reuse");
+    const std::vector<uint8_t> lif = TwoViewLif(SolidJpeg(320, 200, 220, 30, 30), SolidJpeg(320, 200, 30, 30, 220));
+    std::atomic<int> reads{0};
+    std::vector<uint8_t> thumb((size_t)160 * 100 * 4);
+    for (size_t i = 0; i < thumb.size(); i += 4) thumb[i] = 220, thumb[i + 1] = 30, thumb[i + 2] = 30, thumb[i + 3] = 255;
+    auto run = [&](Thumbnail& out) {
+        StereoPairs pairs;
+        pairs.Initialize(
+            [](const uint8_t* d, size_t n, uint32_t w, uint32_t h, std::vector<uint8_t>& rgba) {
+                const mp::DecodedImage img = mp::ImageDecoder::LoadFromMemory(d, n, "pair");
+                if (!img.Valid()) return false;
+                ResizeRgba(img.pixels.data(), (uint32_t)img.width, (uint32_t)img.height, w, h, rgba);
+                return true;
+            },
+            [&](int, uint64_t off, void* dst, size_t n) {
+                ++reads;
+                if (off + n > lif.size()) return false;
+                std::memcpy(dst, lif.data() + off, n);
+                return true;
+            },
+            [](int) {}, dir);
+        pairs.Make(77, 5, 3, lif.size(), thumb.data(), 160, 100, 0.75f);
+        std::vector<Thumbnail> made;
+        std::vector<int64_t> failed;
+        for (int i = 0; i < 400 && made.empty() && failed.empty(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            pairs.TakeResults(made, failed);
+        }
+        pairs.Shutdown();
+        if (made.size() != 1) return false;
+        out = std::move(made[0]);
+        return true;
+    };
+    Thumbnail first, second, third;
+    CHECK(run(first) && reads > 0, "first launch: made from the file");
+    const std::string path = dir + "/" + PairDiskCache::Key(77, 5, lif.size(), 160, 100, 0.75f) + ".jpg";
+    CHECK(std::filesystem::exists(path), "stored under its key");
+    reads = 0;
+    CHECK(run(second) && reads == 0, "second launch: from disk, the file not read (%d reads)", reads.load());
+    CHECK(second.id == 77 && second.width == first.width && second.height == first.height, "same size %ux%u",
+          second.width, second.height);
+    if (second.rgba.size() == first.rgba.size() && !second.rgba.empty()) {
+        const size_t mid = ((size_t)(second.height / 2) * second.width + second.width * 3 / 4) * 4;
+        CHECK(second.rgba[mid + 2] > 150 && second.rgba[mid] < 100, "the right eye survived the JPEG (blue)");
+    }
+    { std::ofstream(path, std::ios::binary | std::ios::trunc) << "not a jpeg"; }
+    reads = 0;
+    CHECK(run(third) && reads > 0 && third.width == first.width, "corrupt on disk: made again");
+    CHECK(std::filesystem::file_size(path) > 100, "and stored again");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 void TestThumbnailDepth() {
     const int E = 256, H = 256, W = 2 * E, d = 8;
     std::vector<uint8_t> rgba((size_t)W * H * 4, 255);
@@ -501,6 +766,10 @@ int main() {
     TestPairHelpers();
     TestStereoPairs();
     TestPairAspect();
+    TestOneViewPair();
+    TestPairDiskKey();
+    TestPairDiskLru();
+    TestPairDiskReuse();
     if (g_failures) {
         std::fprintf(stderr, "stereo_grid_test: %d failure(s)\n", g_failures);
         return 1;

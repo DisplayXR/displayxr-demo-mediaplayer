@@ -7,7 +7,11 @@
 //     gives the right view's embedded JPEG; it is read and decoded SCALED to the eye size.
 //     The LIFs seen so far carry no thumbnail or preview of their own (classic schema:
 //     the base JPEG plus one view blob, no EXIF thumbnail in either), so a scaled decode is
-//     the cheapest source. A one-view LIF (a depth map, no second image) stays flat.
+//     the cheapest source.
+//   - LIF (one view + a disparity map: what a 2D->3D conversion writes): LifLoader::
+//     FindDepthView gives the image and the map; the map is decoded at the eye size and
+//     both eyes come from DepthWarp::MakeSbs at the parallax the player uses for the file
+//     (LifLoader::Load's one-view path), so the tile's depth matches the player's.
 //   - MPO: MpoLoader::FindSecondView reads the MP index from the file's head and gives the
 //     second view's JPEG, decoded scaled the same way.
 // The left eye is the system's thumbnail when the left view is the file's base JPEG (it
@@ -18,10 +22,14 @@
 //
 // One low-priority worker thread, separate from the provider's thumbnail threads and the
 // player's stills thread, so it never starves opening a file or the swipe's neighbours.
-// Results are kept in memory, bounded, by id and modified time. Render thread API.
+// Results are kept in memory, bounded, by id and modified time, and on disk when given a
+// directory (PairDiskCache.h): memory, then disk (on the worker), then made and stored.
+// Render thread API.
 #pragma once
 
 #include "browser/MediaProvider.h"
+#include "browser/PairDiskCache.h"
+#include "media/LifLoader.h"
 
 #include <condition_variable>
 #include <cstddef>
@@ -30,6 +38,7 @@
 #include <functional>
 #include <list>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,7 +46,8 @@
 
 namespace mp::browser {
 
-// Decode a JPEG to exactly w x h RGBA8, scaling while decoding (never at full size).
+// Decode a JPEG (or a PNG: a one-view LIF's disparity map, whose first channel is read) to
+// exactly w x h RGBA8, scaling while decoding (never at full size).
 // Called on the worker thread. False if it cannot.
 using ScaledJpegDecoder =
     std::function<bool(const uint8_t* data, size_t size, uint32_t w, uint32_t h, std::vector<uint8_t>& rgba)>;
@@ -79,7 +89,11 @@ public:
     StereoPairs& operator=(const StereoPairs&) = delete;
 
     // `read` and `close` work on the descriptors Make() takes (tests pass fakes).
-    bool Initialize(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close);
+    // `diskDir`: where pairs are kept between launches (empty: memory only). The worker opens
+    // it, so no disk I/O happens here.
+    bool Initialize(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close,
+                    const std::string& diskDir = std::string(),
+                    uint64_t diskBytes = PairDiskCache::kMaxBytes);
     void Shutdown();
     bool Ready() const { return worker_.joinable(); }
 
@@ -122,6 +136,8 @@ private:
 
     void Work();
     bool MakeOne(const Job& job, Thumbnail& out);
+    bool MakeFromDepth(const Job& job, const LifLoader::DepthViewSpan& one, Thumbnail& out);
+    bool FromDisk(const Job& job, const std::string& key, Thumbnail& out);
     void Keep(int64_t id, int64_t modified, const Thumbnail& sbs);
 
     ScaledJpegDecoder decode_;
@@ -139,7 +155,11 @@ private:
     std::deque<Done> done_;
     bool stop_ = false;
     std::thread worker_;
+    std::string diskDir_;                    // set before the worker starts
+    uint64_t diskBytes_ = PairDiskCache::kMaxBytes;
+    PairDiskCache disk_;                     // worker
     int statCount_ = 0, statOk_ = 0;  // worker: the cost log, every 4 pairs
+    int statDisk_ = 0, statMade_ = 0;  // worker: of those, from disk / made (then stored)
     double statMs_ = 0.0;
 };
 

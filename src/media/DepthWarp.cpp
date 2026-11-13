@@ -60,9 +60,10 @@ void WarpRow(const uint8_t* src, const uint8_t* depth, int w, float halfShift, u
 } // namespace
 
 DecodedImage DepthWarp::MakeSbs(const DecodedImage& image, const std::vector<uint8_t>& depth,
-                                float parallax) {
+                                float parallax, int threads) {
     DecodedImage out;
     const int w = image.width, h = image.height;
+    if (w <= 0 || h <= 0 || image.pixels.size() < (size_t)w * h * 4 || depth.size() < (size_t)w * h) return out;
     out.width = 2 * w;
     out.height = h;
     out.pixels.resize((size_t)out.width * h * 4);
@@ -82,7 +83,7 @@ DecodedImage DepthWarp::MakeSbs(const DecodedImage& image, const std::vector<uin
             }
         }
     };
-    const int n = (int)std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
+    const int n = threads > 0 ? threads : (int)std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
     std::vector<std::thread> pool;
     for (int i = 1; i < n; ++i) pool.emplace_back(work);
     work();

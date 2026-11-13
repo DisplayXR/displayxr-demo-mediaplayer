@@ -18,8 +18,10 @@ public:
     // `depth` holds one byte per pixel of `image`, 255 = nearest. `parallax` is the total
     // left-right parallax between depth 0 and 255, as a fraction of the image width; the
     // middle depth stays at zero parallax. Returns the full-SBS pair (left half, right half).
+    // `threads` 0 = up to 8 (the player's full-size picture); the media browser's thumbnail
+    // pairs pass 1, already on their own low-priority worker.
     static DecodedImage MakeSbs(const DecodedImage& image, const std::vector<uint8_t>& depth,
-                                float parallax);
+                                float parallax, int threads = 0);
 };
 
 } // namespace mp
