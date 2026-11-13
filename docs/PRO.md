@@ -363,6 +363,9 @@ picture. `MEDIAPLAYER_PRO_PANELS_3D=1` keeps pinned panels woven too.
 
 ## GPU v210 decode (#238, phase 1, opt-in)
 
+The levers that build on it (DeckLink raw v210, the card writing into this app's buffers,
+thread pinning), how to measure them on the station, and `pro.env`: [CAPTURE-LEVERS.md](CAPTURE-LEVERS.md).
+
 At two 2160p59.94 eyes the limit is system-memory bandwidth on the capture side (~18 GB/s of
 copies, #238). The first step removes the CPU v210 -> P016 convert: the card's rows go into
 the ring and into staging as they are, and the GPU converts them.
