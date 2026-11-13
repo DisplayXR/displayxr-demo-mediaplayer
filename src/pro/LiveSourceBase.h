@@ -75,6 +75,13 @@ protected:
     bool PublishV210(std::vector<uint8_t>* const eye[2], int eyes, int eyeW, int h, ColorMatrix matrix,
                      ColorTransfer transfer, bool fullRange, double captureSec, const char* timecode,
                      int eyeOffsetFrames);
+    // The same with the rows left where they are (zero-copy, #238 phase 3): eye[e] is the host
+    // block holding eye e's rows (FrameRing::Frame::ExtPlane: the block, and a hold on its
+    // contents); the ring frame takes copies of both, and the renderer reads the block in place.
+    // False (nothing published) for a shape the renderer would refuse.
+    bool PublishV210Ext(const FrameRing::Frame::ExtPlane* const eye[2], int eyes, int eyeW, int h, ColorMatrix matrix,
+                        ColorTransfer transfer, bool fullRange, double captureSec, const char* timecode,
+                        int eyeOffsetFrames);
     // A frame the source had to skip before converting it (LiveStats::lateFrames).
     void CountLate();
     // Streaming (or Opening) -> Stalled when nothing was published for stallSec since

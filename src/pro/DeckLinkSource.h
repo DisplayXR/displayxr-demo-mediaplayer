@@ -140,6 +140,7 @@ public:
         bool rawV210 = false;     // MEDIAPLAYER_DECKLINK_RAW_V210 (+ the GPU decode up)
         bool allocator = false;   // MEDIAPLAYER_DECKLINK_ALLOCATOR (the card took it)
         bool hold = false;        // MEDIAPLAYER_DECKLINK_HOLD
+        bool zeroCopy = false;    // MEDIAPLAYER_ZERO_COPY_UPLOAD (+ raw, hold, the renderer's import)
         int allocNode = -1;       // MEDIAPLAYER_DECKLINK_ALLOC_NODE
         int pinGroup[2] = {-1, -1};  // MEDIAPLAYER_CAPTURE_PIN: lane e's L3 group (-1 = not pinned)
         bool pinned[2] = {false, false};
@@ -150,6 +151,8 @@ public:
         uint64_t rawPublished = 0;  // frames / pairs published as raw v210
         uint64_t rawSkipped = 0;    // pairs not shown: an eye's rows had already gone out
         uint64_t rawFallback = 0;   // frames converted on the CPU although raw was on (not v210)
+        uint64_t zeroCopyPublished = 0;  // frames / pairs whose rows went to the GPU in the card's buffers
+        uint64_t zeroCopyFallback = 0;   // eyes copied out although zero-copy was on (no held block)
         uint64_t allocBuffers = 0, allocMB = 0, allocCalls = 0, allocRefused = 0;
         int heldNow = 0, heldPeak = 0;
         // the last ~10 s window, per eye unless said: the card callback's copy (or hold), the

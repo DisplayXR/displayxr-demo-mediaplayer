@@ -91,6 +91,7 @@ $raw = @{ "MEDIAPLAYER_GPU_V210" = "1"; "MEDIAPLAYER_DECKLINK_RAW_V210" = "1" }
 $alloc = @{ "MEDIAPLAYER_DECKLINK_ALLOCATOR" = "1" }
 $hold = @{ "MEDIAPLAYER_DECKLINK_ALLOCATOR" = "1"; "MEDIAPLAYER_DECKLINK_HOLD" = "1" }
 $pin = @{ "MEDIAPLAYER_CAPTURE_PIN" = "auto"; "MEDIAPLAYER_UPLOAD_PIN" = "auto" }
+$zc = @{ "MEDIAPLAYER_ZERO_COPY_UPLOAD" = "1" }
 function Merge([hashtable[]]$hs) { $r = @{}; foreach ($h in $hs) { foreach ($k in $h.Keys) { $r[$k] = $h[$k] } }; return $r }
 $catalog = [ordered]@{
     # default set: the ladder
@@ -100,11 +101,13 @@ $catalog = [ordered]@{
     "alloc_hold"         = @{ set = "default"; env = $hold; why = "no callback copy: the convert reads the card's buffer" }
     "raw"                = @{ set = "default"; env = $raw; why = "no CPU convert, no compose: v210 rows to the GPU" }
     "raw_alloc_hold"     = @{ set = "default"; env = (Merge @($raw, $hold)); why = "raw + no callback copy" }
-    "raw_alloc_hold_pin" = @{ set = "default"; env = (Merge @($raw, $hold, $pin)); why = "everything" }
+    "raw_alloc_hold_zc"  = @{ set = "default"; env = (Merge @($raw, $hold, $zc)); why = "zero-copy: the GPU reads the card's buffers in place (no CPU copy at all)" }
+    "raw_alloc_hold_pin" = @{ set = "default"; env = (Merge @($raw, $hold, $pin)); why = "raw + no callback copy + pinned" }
     # pin set: where the threads run
     "pin"                = @{ set = "pin"; env = $pin; why = "lanes on L3 groups 0/1, upload on 2" }
     "raw_pin"            = @{ set = "pin"; env = (Merge @($raw, $pin)); why = "raw + pinned" }
     "alloc_node0_hold"   = @{ set = "pin"; env = (Merge @($hold, @{ "MEDIAPLAYER_DECKLINK_ALLOC_NODE" = "0" })); why = "buffers on NUMA node 0" }
+    "raw_alloc_hold_zc_pin" = @{ set = "pin"; env = (Merge @($raw, $hold, $zc, $pin)); why = "everything: zero-copy + pinned" }
     # upload set: the copy's threads, on the raw path
     "raw_upload2"        = @{ set = "upload"; env = (Merge @($raw, @{ "MEDIAPLAYER_UPLOAD_THREADS" = "2" })); why = "raw, 2 upload threads" }
     "raw_upload8"        = @{ set = "upload"; env = (Merge @($raw, @{ "MEDIAPLAYER_UPLOAD_THREADS" = "8" })); why = "raw, 8 upload threads" }
