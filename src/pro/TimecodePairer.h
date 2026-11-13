@@ -91,9 +91,16 @@ public:
         bool unsynced = false;   // paired without a matching timecode or clock (newest of each)
         bool byClock = false;    // paired by the card's clock (clock keys), not by timecode
         int tcOffsetFrames = -1; // the eyes' newest timecodes apart, frames (-1 = not both)
+        bool refused = false;    // strict: a newest-of-each pair was due and was NOT shown
     };
 
-    void Reset();
+    void Reset();  // keeps the strict setting
+    // Strict: matched pairs only. When both eyes have keys but no common one can arrive in
+    // time, nothing is published (the picture holds the last matched pair) instead of the
+    // newest frame of each eye, which shows a left and a right from different instants.
+    // On for two inputs on one card (the clock always matches eventually); see DeckLinkSource.
+    void SetStrict(bool on) { strict_ = on; }
+    bool Strict() const { return strict_; }
     // The slot the next frame of `eye` goes into (the oldest). Mark it busy first, fill it,
     // then call Add.
     int NextSlot(int eye) const { return next_[eye]; }
@@ -110,6 +117,7 @@ private:
     int tc_[2][kHistory] = {};
     int clock_[2][kHistory] = {};
     bool byClock_ = false;
+    bool strict_ = false;
     int tcAgree_ = 0;
     int lastShownTc_ = -1, lastShownClock_ = -1;  // the last shown left frame's keys
     int key_[2][kHistory] = {};  // the active domain's key: tc_ or clock_

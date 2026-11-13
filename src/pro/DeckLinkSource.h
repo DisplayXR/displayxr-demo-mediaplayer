@@ -78,6 +78,8 @@ public:
         bool timecode = false;        // paired by SMPTE timecode
         bool separateCards = false;   // the two inputs are on different cards: two clocks,
                                       // so without timecode only the newest frames pair
+        bool strict = false;          // matched pairs only (one card; MEDIAPLAYER_DECKLINK_STRICT_PAIRS)
+        uint64_t mismatchRefused = 0; // strict: pairs NOT shown because the eyes were not one instant
     };
     PairStats GetPairStats() const;
     bool IsPair() const { return cfg_.stereo == DeckLinkConfig::Stereo::Pair && GetState() != LiveState::Closed; }

@@ -497,6 +497,41 @@ void UnsyncedTwoCards() {
 
 }  // namespace
 
+// Matched pairs only (strict, one card): the right eye's lane falls 12 frames behind (it
+// skips frames 100..111, as a busy lane does: newest wins), then resumes. Without strict
+// the pairer showed the newest of each eye meanwhile: a left and a right from different
+// instants (seen on the 8K station as eye sync 1-3 frames, max skew 133 ms). With strict
+// every shown pair is one frame on both eyes, and the picture resumes once they match.
+void StrictMatchedPairsOnly() {
+    for (int strict = 0; strict <= 1; ++strict) {
+        ClockSim c;
+        c.p.SetStrict(strict != 0);
+        const int resumeAt = 112;
+        for (int i = 0; i < 300; ++i) {
+            if (i >= 100 && i < resumeAt) {  // right lane behind: only the left eye lands
+                c.Frame(0, i, 409672 + i);
+                continue;
+            }
+            c.Frame(1, i, 0);  // Resolve: no usable timecode on the right eye
+            c.Frame(0, i, 409672 + i);
+        }
+        std::printf("  right lane 12 frames behind, strict=%d: %d shown, %d mismatched, %d repeats\n", strict, c.shown,
+                    c.mismatched, c.repeats);
+        if (strict) {
+            CHECK(c.mismatched == 0, "strict: no pair with a left and right from different instants, ever");
+            CHECK(c.repeats == 0, "strict: nothing shown twice");
+            CHECK(c.shown >= 280, "strict: pairs resume once the lagging eye catches up");
+        } else {
+            CHECK(c.mismatched > 0, "sanity: without strict, newest-of-each shows mismatched pairs (the bug)");
+        }
+    }
+    // Strict survives Reset (a format change resets the pairing, not the policy).
+    TimecodePairer p;
+    p.SetStrict(true);
+    p.Reset();
+    CHECK(p.Strict(), "Reset keeps strict");
+}
+
 int main() {
     FullRateTimecode();
     for (int lag = 0; lag < TimecodePairer::kHistory; ++lag) {
@@ -517,6 +552,7 @@ int main() {
     HighRateTimecodeKeys();
     HardwareClockKeys();
     ResolveDualOutput();
+    StrictMatchedPairsOnly();
     NoTimecodeSameCard();
     MatchingTimecodeSameCard();
     TimecodeTrustedAgain();

@@ -37,7 +37,11 @@ void FormatTimecode(const TimecodeFields& t, int fpsNominal, char* out, size_t n
     std::snprintf(out, n, "%02d:%02d:%02d%c%02d", t.hh, t.mm, t.ss, t.dropFrame ? ';' : ':', FullRateFrame(t, fps));
 }
 
-void TimecodePairer::Reset() { *this = TimecodePairer{}; }
+void TimecodePairer::Reset() {
+    const bool strict = strict_;
+    *this = TimecodePairer{};
+    strict_ = strict;
+}
 
 void TimecodePairer::UseClock(bool on) {
     byClock_ = on;
@@ -85,6 +89,15 @@ TimecodePairer::Decision TimecodePairer::Add(int eye, int slot, int key, double 
         UseClock(true);
         d = Decision{};
         Match(eye, period, d);
+    }
+    if (strict_ && d.unsynced) {
+        // Matched pairs only: the eyes' newest frames are from different instants (one
+        // input's lane fell behind past the history). Show nothing new; the last matched
+        // pair stays up until the lagging eye catches up and a common key forms again.
+        const int offset = d.offsetFrames;
+        d = Decision{};
+        d.refused = true;
+        d.offsetFrames = offset;
     }
     d.byClock = byClock_;
     d.tcOffsetFrames = tcOffset;
