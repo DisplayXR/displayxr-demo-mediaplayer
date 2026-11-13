@@ -277,8 +277,8 @@ bool StereoPairs::MakeOne(const Job& job, Thumbnail& out) {
 
     std::vector<uint8_t> rightBytes((size_t)right.size);
     if (!readAt(right.offset, rightBytes.data(), rightBytes.size())) return false;
-    // The system's thumbnail stands in for the left view only if it is the whole view: some
-    // platforms centre-crop it (the NP02J's is a square), and the whole right view decoded at
+    // The system's thumbnail stands in for the left view only if it is the whole view: a
+    // file's own EXIF thumbnail can be a centre crop (the NP02J camera's is square), and the whole right view decoded at
     // its size would come out squeezed. Then both eyes are decoded at the view's aspect.
     uint32_t vw = 0, vh = 0;
     JpegSize(rightBytes.data(), rightBytes.size(), vw, vh);

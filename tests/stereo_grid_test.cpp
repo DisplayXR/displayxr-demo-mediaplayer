@@ -381,9 +381,10 @@ void TestStereoPairs() {
     CHECK(closed.size() == 2, "every descriptor closed (%zu)", closed.size());
 }
 
-// A platform whose MediaStore thumbnail is NOT the whole view (the NP02J's: a 512 x 512
-// centre crop of a 16:10 photo) must not get the whole right view squeezed into the crop's
-// size. The phone's thumbnails keep the aspect, and take the old path unchanged.
+// A LIF whose system thumbnail is NOT the whole view (the NP02J camera's, since 2026-07: a
+// 512 x 512 EXIF thumbnail, a centre crop of the 16:10 view) must not get the whole right
+// view squeezed into the crop's size. Thumbnails that keep the aspect (older LIFs, MPOs) take
+// the old path unchanged.
 void TestPairAspect() {
     const std::vector<uint8_t> jpeg = SolidJpeg(320, 200, 1, 2, 3);
     uint32_t w = 0, h = 0;
@@ -391,15 +392,16 @@ void TestPairAspect() {
     const uint8_t notJpeg[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     CHECK(!JpegSize(notJpeg, sizeof(notJpeg), w, h), "not a JPEG");
 
-    // The phone (LPD-20W) shapes: the thumbnail keeps the view's aspect, to rounding.
+    // Older LIFs (no EXIF thumbnail): MediaStore keeps the view's aspect, to rounding.
     CHECK(ThumbnailIsWholeView(160, 100, 320, 200), "same aspect");
     CHECK(ThumbnailIsWholeView(512, 320, 4656, 2910), "16:10 photo, aspect kept");
     CHECK(ThumbnailIsWholeView(512, 288, 4656, 2619), "16:9 photo, aspect kept");
     CHECK(ThumbnailIsWholeView(288, 512, 2619, 4656), "portrait photo, aspect kept");
     CHECK(ThumbnailIsWholeView(512, 320, 0, 0), "view size unknown: as before");
-    // The tablet (NP02J): a square thumbnail of a 16:10 or 16:9 view.
+    // The camera's square EXIF thumbnail of its 16:10 views (3264x2040, 4208x2630), and others.
     CHECK(!ThumbnailIsWholeView(512, 512, 4656, 2910), "square crop of 16:10");
-    CHECK(!ThumbnailIsWholeView(512, 512, 4208, 2630), "square crop of the tablet camera's 16:10");
+    CHECK(!ThumbnailIsWholeView(512, 512, 4208, 2630), "camera 4208x2630, square EXIF thumbnail");
+    CHECK(!ThumbnailIsWholeView(512, 512, 3264, 2040), "camera 3264x2040, square EXIF thumbnail");
     CHECK(!ThumbnailIsWholeView(512, 512, 2560, 1600), "square crop of 2560x1600");
 
     uint32_t ew = 0, eh = 0;

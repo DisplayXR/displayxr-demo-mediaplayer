@@ -12,8 +12,8 @@
 //     second view's JPEG, decoded scaled the same way.
 // The left eye is the system's thumbnail when the left view is the file's base JPEG (it
 // always is for an MPO, and for the LIFs seen so far) and the thumbnail is the whole view,
-// else it is decoded too. A thumbnail of another aspect than the right view (a platform
-// that centre-crops its thumbnails) would otherwise put the whole right view, squeezed, next
+// else it is decoded too. A thumbnail of another aspect than the right view (a centre
+// crop: the file's own square EXIF thumbnail) would otherwise put the whole right view, squeezed, next
 // to a crop of the left: both eyes are then decoded at the view's own aspect.
 //
 // One low-priority worker thread, separate from the provider's thumbnail threads and the
@@ -53,9 +53,9 @@ void PairEyeSize(uint32_t w, uint32_t h, float scale, uint32_t& ew, uint32_t& eh
 bool JpegSize(const uint8_t* data, size_t size, uint32_t& w, uint32_t& h);
 
 // Whether a w x h one-view thumbnail is the whole of a viewW x viewH view (the same aspect,
-// to rounding). Not every platform's is: the NP02J's MediaStore makes a 16:10 photo's
-// thumbnail a 512 x 512 centre crop, while the phone's keeps the aspect. True when the
-// view's size is unknown (0).
+// to rounding). Not every file's is: the NP02J camera's LIFs (since 2026-07) carry a
+// 512 x 512 EXIF thumbnail, a centre crop of the 16:10 view, and MediaStore hands that back.
+// True when the view's size is unknown (0).
 bool ThumbnailIsWholeView(uint32_t w, uint32_t h, uint32_t viewW, uint32_t viewH);
 
 // The eye size when the thumbnail is not the whole view: the view's own aspect, just
