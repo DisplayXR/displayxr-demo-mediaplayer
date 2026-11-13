@@ -71,6 +71,7 @@ void LiveSourceBase::Publish(const livepix::Nv12& src, bool fullRange, double ca
     f.height = src.height;
     f.format = PixFormat::NV12;
     f.eyes = 1;
+    f.ClearExt();
     f.fullRange = fullRange;
     f.gpu = false;
     f.gpuSharedTexture = nullptr;
@@ -96,6 +97,7 @@ void LiveSourceBase::Publish(const livepix::P016& src, bool fullRange, double ca
     f.height = src.height;
     f.format = PixFormat::P016;
     f.eyes = 1;
+    f.ClearExt();
     f.fullRange = fullRange;
     f.gpu = false;
     f.gpuSharedTexture = nullptr;
@@ -119,6 +121,7 @@ void LiveSourceBase::TagPair(FrameRing::Frame& f, int w, int h, ColorMatrix matr
     f.height = h;
     f.format = PixFormat::P016;
     f.eyes = 1;
+    f.ClearExt();
     f.fullRange = fullRange;
     f.gpu = false;
     f.gpuSharedTexture = nullptr;
@@ -186,6 +189,7 @@ bool LiveSourceBase::PublishV210(std::vector<uint8_t>* const eye[2], int eyes, i
     f.height = h;
     f.format = PixFormat::V210;
     f.eyes = eyes;
+    f.ClearExt();
     f.fullRange = fullRange;
     f.gpu = false;
     f.gpuSharedTexture = nullptr;

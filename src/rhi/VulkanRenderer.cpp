@@ -20,6 +20,7 @@
 #include "color/CubeLut.h"  // PackRgba16f for the 3D LUT
 #include "color/ToneMap.h"  // HLG display-peak range (#169)
 #include "Log.h"
+#include "media/HostBlocks.h"  // zero-copy: host blocks the GPU reads in place (#238 phase 3)
 #include "media/V210.h"  // raw v210 frames, decoded on the GPU (#238)
 #include "rhi/Shaders.h"
 
@@ -200,6 +201,7 @@ bool VulkanRenderer::Initialize(VkPhysicalDevice physicalDevice, VkDevice device
         LOG_INFO("VulkanRenderer: v210 sources: CPU convert (GPU decode off; MEDIAPLAYER_GPU_V210=1 turns it on)");
     }
     v210::SetGpuDecodeActive(GpuV210());
+    InitZeroCopy();  // after the decode pass: zero-copy feeds it
 
     // Upload copies into staging: this many threads, the render thread included (the pool
     // itself is made at the first copy big enough to split).
@@ -247,6 +249,12 @@ VkCommandBuffer VulkanRenderer::OpenFrame() {
     if (uploader_ && cmd != VK_NULL_HANDLE) {
         const uint64_t n = ring_.framesInFlight();
         if (frameSerial_ > n) uploader_->Retire(frameSerial_ - n);
+    }
+    // The same fence covers the producer's host blocks those frames read in place (zero-copy):
+    // their contents may be refilled now.
+    if (cmd != VK_NULL_HANDLE && !hostHolds_.empty()) {
+        const uint64_t n = ring_.framesInFlight();
+        if (frameSerial_ > n) RetireHostHolds(frameSerial_ - n);
     }
     return cmd;
 }
@@ -1183,7 +1191,7 @@ bool VulkanRenderer::UploadV210Cpu(const FrameRing::Frame& f, int eyes, int eyeW
     }
     const v210::OutLayout L = v210::OutLayoutFor(eyes, eyeW, f.height);
     v210Cpu_.resize(L.totalBytes / 4);
-    const uint8_t* eye[2] = {f.plane[0].data(), eyes > 1 ? f.plane[1].data() : f.plane[0].data()};
+    const uint8_t* eye[2] = {v210::EyeRows(f, 0), v210::EyeRows(f, eyes > 1 ? 1 : 0)};
     v210::DecodeToP016(eye, eyes, eyeW, f.height, v210Cpu_.data());
     return UploadYUV(reinterpret_cast<const uint8_t*>(v210Cpu_.data()),
                      reinterpret_cast<const uint8_t*>(v210Cpu_.data() + L.uvBase), nullptr, L.outW, L.h, 2,
@@ -1206,13 +1214,41 @@ bool VulkanRenderer::UploadV210(const FrameRing::Frame& f) {
     const VkDeviceSize bytes = (VkDeviceSize)rb * (VkDeviceSize)f.height;
     VkBuffer bufs[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     const VkDeviceSize offs[2] = {0, 0};
+    if (f.HasExt() && zeroCopy_) {
+        // Zero-copy (#238 phase 3): the decode pass reads the producer's host blocks in place; the
+        // GPU reads them as it read staging (host memory either way), and no CPU copy is made.
+        bool ok = true;
+        for (int e = 0; e < eyes && ok; ++e) ok = ImportHostBlock(f.ext[e], bufs[e]);
+        if (eyes == 1) bufs[1] = bufs[0];
+        if (ok && RecordV210Decode(cmd, bufs, offs, eyes, eyeW, f.height)) {
+            for (int e = 0; e < eyes; ++e) hostHolds_.emplace_back(frameSerial_, f.ext[e].hold);
+            ++zcFrames_;
+            if (!zcLogged_) {
+                zcLogged_ = true;
+                LOG_INFO("VulkanRenderer: zero-copy upload: v210 rows read in place from the producer's host blocks "
+                         "(%dx%d x %d eye(s), no staging copy)", eyeW, f.height, eyes);
+            }
+            NoteUpload(t0, tally);
+            CancelPendingUpload();
+            SetV210Source(f.fullRange, (int)f.matrix);
+            VerifyV210Once(f);
+            return true;
+        }
+        ++zcFallback_;
+        if (!zcWarned_) {
+            zcWarned_ = true;
+            LOG_WARN("VulkanRenderer: zero-copy upload: could not import the frame's host blocks; copying into "
+                     "staging instead (counted)");
+        }
+        bufs[0] = bufs[1] = VK_NULL_HANDLE;
+    }
     for (int e = 0; e < eyes; ++e) {
         // Staging users 0 / 1: planes 0 / 1 take their pixels from the decode, not staging.
         void* mapped = AcquireStaging(e, bytes, bufs[e]);
         if (!mapped) mapped = OneOffStaging(bytes, bufs[e]);
         if (!mapped) return UploadV210Cpu(f, eyes, eyeW);
         const auto c0 = std::chrono::steady_clock::now();
-        tally.threads = std::max(tally.threads, CopyToStaging(mapped, f.plane[e].data(), rb, (size_t)f.height));
+        tally.threads = std::max(tally.threads, CopyToStaging(mapped, v210::EyeRows(f, e), rb, (size_t)f.height));
         tally.copyMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
         tally.bytes += (double)bytes;
     }
@@ -1223,6 +1259,118 @@ bool VulkanRenderer::UploadV210(const FrameRing::Frame& f) {
     SetV210Source(f.fullRange, (int)f.matrix);
     VerifyV210Once(f);  // (debug: MEDIAPLAYER_GPU_V210_VERIFY)
     return true;
+}
+
+void VulkanRenderer::InitZeroCopy() {
+    zeroCopy_ = false;
+    if (v210::Requested(std::getenv("MEDIAPLAYER_ZERO_COPY_UPLOAD"))) {
+        pfnHostPtrProps_ = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+            vkGetDeviceProcAddr(device_, "vkGetMemoryHostPointerPropertiesEXT"));
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &hp;
+        vkGetPhysicalDeviceProperties2(physicalDevice_, &p2);
+        hostImportAlign_ = hp.minImportedHostPointerAlignment;
+        const char* why = !GpuV210() ? "needs the GPU v210 decode (MEDIAPLAYER_GPU_V210=1)"
+                          : !pfnHostPtrProps_ ? "the device has no VK_EXT_external_memory_host"
+                          : (hostImportAlign_ == 0 || hostImportAlign_ > hostmem::kGranule ||
+                             hostmem::kGranule % hostImportAlign_ != 0)
+                              ? "the device's host-import alignment is not one the host blocks meet"
+                              : nullptr;
+        zeroCopy_ = why == nullptr;
+        if (zeroCopy_)
+            LOG_INFO("VulkanRenderer: zero-copy upload ON (MEDIAPLAYER_ZERO_COPY_UPLOAD): v210 producers publish host "
+                     "blocks the decode pass reads in place (VK_EXT_external_memory_host, alignment %llu)",
+                     (unsigned long long)hostImportAlign_);
+        else
+            LOG_WARN("VulkanRenderer: MEDIAPLAYER_ZERO_COPY_UPLOAD is set but %s: rows are copied into staging", why);
+    }
+    v210::SetZeroCopyActive(zeroCopy_);
+}
+
+bool VulkanRenderer::ImportHostBlock(const FrameRing::Frame::ExtPlane& p, VkBuffer& out) {
+    out = VK_NULL_HANDLE;
+    auto it = hostImports_.find(p.id);
+    if (it != hostImports_.end()) {
+        it->second.lastSerial = frameSerial_;
+        out = it->second.buffer;
+        return true;
+    }
+    const auto* blk = static_cast<const hostmem::Block*>(p.block.get());
+    if (!blk || !pfnHostPtrProps_ || hostImportAlign_ == 0 || p.data < blk->p || p.data + p.bytes > blk->p + blk->size ||
+        (reinterpret_cast<uintptr_t>(blk->p) % hostImportAlign_) != 0 || (blk->size % hostImportAlign_) != 0)
+        return false;
+    if (p.data != blk->p) return false;  // the decode reads from offset 0 of the block
+    VkMemoryHostPointerPropertiesEXT hpp = {VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (pfnHostPtrProps_(device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, blk->p, &hpp) != VK_SUCCESS)
+        return false;
+    VkExternalMemoryBufferCreateInfo ebci = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    ebci.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.pNext = &ebci;
+    bci.size = (VkDeviceSize)blk->size;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (vkCreateBuffer(device_, &bci, nullptr, &buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device_, buf, &req);
+    const uint32_t bits = req.memoryTypeBits & hpp.memoryTypeBits;
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < 32 && type == UINT32_MAX; ++i)
+        if (bits & (1u << i)) type = i;
+    VkImportMemoryHostPointerInfoEXT imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+    imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    imp.pHostPointer = blk->p;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &imp;
+    ai.allocationSize = (VkDeviceSize)blk->size;
+    ai.memoryTypeIndex = type;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (type == UINT32_MAX || req.size > (VkDeviceSize)blk->size ||
+        vkAllocateMemory(device_, &ai, nullptr, &mem) != VK_SUCCESS) {
+        vkDestroyBuffer(device_, buf, nullptr);
+        return false;
+    }
+    if (vkBindBufferMemory(device_, buf, mem, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(device_, buf, nullptr);
+        vkFreeMemory(device_, mem, nullptr);
+        return false;
+    }
+    hostImports_[p.id] = HostImport{buf, mem, p.block, frameSerial_};
+    out = buf;
+    return true;
+}
+
+void VulkanRenderer::RetireHostHolds(uint64_t completedFrame) {
+    size_t keep = 0;
+    for (size_t i = 0; i < hostHolds_.size(); ++i)
+        if (hostHolds_[i].first > completedFrame) hostHolds_[keep++] = std::move(hostHolds_[i]);
+    hostHolds_.resize(keep);  // the dropped holds give their blocks back to the producer's pool
+    // Imports nothing has read for a while (the producer's pool shrank, or the source changed):
+    // released once no frame in flight can read them. A live pool reuses its blocks every few
+    // frames, so this only trims what is gone.
+    if (hostImports_.size() > 16) {
+        for (auto it = hostImports_.begin(); it != hostImports_.end();) {
+            if (it->second.lastSerial <= completedFrame && frameSerial_ - it->second.lastSerial > 600) {
+                vkDestroyBuffer(device_, it->second.buffer, nullptr);
+                vkFreeMemory(device_, it->second.memory, nullptr);  // before the block: the memory outlives the import
+                it = hostImports_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
+void VulkanRenderer::DestroyHostImports() {
+    hostHolds_.clear();
+    for (auto& kv : hostImports_) {
+        vkDestroyBuffer(device_, kv.second.buffer, nullptr);
+        vkFreeMemory(device_, kv.second.memory, nullptr);
+    }
+    hostImports_.clear();  // drops the blocks after their imports
 }
 
 void VulkanRenderer::VerifyV210Once(const FrameRing::Frame& f) {
@@ -1270,7 +1418,7 @@ void VulkanRenderer::VerifyV210Once(const FrameRing::Frame& f) {
                              &toHost, 0, nullptr);
     });
     std::vector<uint32_t> cpu(L.totalBytes / 4);
-    const uint8_t* eye[2] = {f.plane[0].data(), eyes > 1 ? f.plane[1].data() : f.plane[0].data()};
+    const uint8_t* eye[2] = {v210::EyeRows(f, 0), v210::EyeRows(f, eyes > 1 ? 1 : 0)};
     v210::DecodeToP016(eye, eyes, eyeW, f.height, cpu.data());
     size_t differ = 0;
     int maxDiff = 0;
@@ -2122,6 +2270,8 @@ void VulkanRenderer::Shutdown() {
     DestroyLut(lutDummy_, false);
     DestroyV210Pass();  // the device is idle (above)
     v210::SetGpuDecodeActive(false);
+    DestroyHostImports();  // idle too: no frame reads a host block any more
+    v210::SetZeroCopyActive(false);
     ring_.destroy();  // waits its fences, runs the deferred releases, frees cmds/fences
     for (auto& user : staging_)  // the device is idle (above): release now
         for (Staging& s : user) ReleaseStaging(s, /*deferred=*/false);
