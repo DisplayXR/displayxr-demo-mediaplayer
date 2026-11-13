@@ -115,11 +115,14 @@ void ComposePair(const std::vector<uint8_t>& left, const std::vector<uint8_t>& r
 
 StereoPairs::~StereoPairs() { Shutdown(); }
 
-bool StereoPairs::Initialize(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close) {
+bool StereoPairs::Initialize(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close,
+                             const std::string& diskDir, uint64_t diskBytes) {
     if (worker_.joinable() || !decode || !read || !close) return false;
     decode_ = std::move(decode);
     read_ = std::move(read);
     close_ = std::move(close);
+    diskDir_ = diskDir;
+    diskBytes_ = diskBytes;
     stop_ = false;
     worker_ = std::thread([this] { Work(); });
     return true;
@@ -133,6 +136,7 @@ void StereoPairs::Shutdown() {
     }
     wake_.notify_all();
     worker_.join();
+    disk_.Shutdown();  // the worker is gone: safe here
     for (Job& j : jobs_) close_(j.fd);
     jobs_.clear();
     done_.clear();
@@ -230,6 +234,16 @@ void StereoPairs::Work() {
 #if defined(__ANDROID__)
     setpriority(PRIO_PROCESS, (id_t)gettid(), 19);  // the lowest: behind opening and the stills
 #endif
+    if (!diskDir_.empty()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (disk_.Initialize(diskDir_, diskBytes_))
+            LOG_INFO("3D grid: pair disk cache %s: %zu pairs, %.1f MB of %.0f MB (opened in %.0f ms)",
+                     diskDir_.c_str(), disk_.Count(), (double)disk_.Bytes() / 1048576.0,
+                     (double)disk_.MaxBytes() / 1048576.0,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        else
+            LOG_WARN("3D grid: pair disk cache %s cannot be used: pairs kept in memory only", diskDir_.c_str());
+    }
     for (;;) {
         Job job;
         {
@@ -243,14 +257,28 @@ void StereoPairs::Work() {
         done.id = job.id;
         done.modified = job.modified;
         const auto t0 = std::chrono::steady_clock::now();
-        done.ok = MakeOne(job, done.sbs);
+        const std::string key = disk_.Ready()
+                                    ? PairDiskCache::Key(job.id, job.modified, job.size, job.w, job.h, job.scale)
+                                    : std::string();
+        done.ok = disk_.Ready() && FromDisk(job, key, done.sbs);
+        if (done.ok) {
+            ++statDisk_;
+        } else {
+            done.ok = MakeOne(job, done.sbs);
+            if (done.ok) {
+                ++statMade_;
+                if (disk_.Ready()) disk_.Store(key, done.sbs.rgba.data(), done.sbs.width, done.sbs.height);
+            }
+        }
         close_(job.fd);
         statMs_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         statOk_ += done.ok ? 1 : 0;
         if (++statCount_ == 4) {
-            LOG_INFO("3D grid: 4 photo pairs, %d made, %.0f ms each on average (eye %ux%u)", statOk_,
-                     statMs_ / 4.0, done.sbs.width / 2, done.sbs.height);
-            statCount_ = statOk_ = 0;
+            LOG_INFO("3D grid: 4 photo pairs, %d ok (%d from disk, %d made), %.0f ms each on average (eye %ux%u); "
+                     "disk %zu pairs, %.1f MB",
+                     statOk_, statDisk_, statMade_, statMs_ / 4.0, done.sbs.width / 2, done.sbs.height,
+                     disk_.Count(), (double)disk_.Bytes() / 1048576.0);
+            statCount_ = statOk_ = statDisk_ = statMade_ = 0;
             statMs_ = 0.0;
         }
         std::lock_guard<std::mutex> lock(mutex_);
@@ -311,6 +339,23 @@ bool StereoPairs::MakeOne(const Job& job, Thumbnail& out) {
     out.width = ew * 2;
     out.height = eh;
     ComposePair(l, r, ew, eh, out.rgba);
+    return true;
+}
+
+bool StereoPairs::FromDisk(const Job& job, const std::string& key, Thumbnail& out) {
+    std::vector<uint8_t> jpeg;
+    if (!disk_.Load(key, jpeg)) return false;
+    uint32_t w = 0, h = 0;
+    out = Thumbnail{};
+    if (!JpegSize(jpeg.data(), jpeg.size(), w, h) || (w & 1) != 0 ||
+        !decode_(jpeg.data(), jpeg.size(), w, h, out.rgba) || out.rgba.size() < (size_t)w * h * 4) {
+        disk_.Remove(key);  // partial or corrupt: made again below
+        out = Thumbnail{};
+        return false;
+    }
+    out.id = job.id;
+    out.width = w;
+    out.height = h;
     return true;
 }
 

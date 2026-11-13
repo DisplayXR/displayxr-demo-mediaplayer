@@ -169,6 +169,7 @@ add_library(mediaplayer_vk_android SHARED
     ${REPO_ROOT}/src/browser/StereoClassifier.cpp
     ${REPO_ROOT}/src/browser/StereoGrid.cpp       # the 3D grid's pure logic (#180)
     ${REPO_ROOT}/src/browser/StereoPairs.cpp      # the 3D grid's pairs for LIF / MPO photos
+    ${REPO_ROOT}/src/browser/PairDiskCache.cpp    # ... kept in the app's cache dir between launches
     ${REPO_ROOT}/src/browser/ThumbnailAtlas.cpp
     ${REPO_ROOT}/src/browser/ThumbnailCache.cpp
     ${REPO_ROOT}/src/browser/ThumbnailDepth.cpp   # per-tile convergence for the 3D grid
@@ -185,6 +186,7 @@ target_include_directories(mediaplayer_vk_android PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}                 # generated *.vert.h / *.frag.h
     ${CMAKE_CURRENT_SOURCE_DIR}/stb             # vendored stb_image.h (SBS image decode)
+    ${REPO_ROOT}/third_party/stb                # stb_image_write.h (PairDiskCache); after the above
     ${REPO_ROOT}/src                            # Log.h (impl = lif_log_android.cpp)
     ${REPO_ROOT}/src/media                      # LifLoader.h, ImageDecoder.h, MediaSource.h
     ${REPO_ROOT}/third_party/displayxr-openxr  # DisplayXR XR_EXT_* headers
