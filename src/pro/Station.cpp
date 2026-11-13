@@ -3,6 +3,7 @@
 
 #include "Log.h"
 #include "media/ImageDecoder.h"
+#include "pro/CaptureLevers.h"
 #include "pro/DeckLinkSpec.h"
 #include "pro/QcReport.h"
 #include "pro/Thumbnail.h"
@@ -633,6 +634,43 @@ static nlohmann::json RenderPerfJson(const RenderPerfWindow& w, const PerfSwitch
             {"switched_off", off}};
 }
 
+namespace {
+// The capture path's levers and stage timings (pro/CaptureLevers.h, docs/CAPTURE-LEVERS.md):
+// get_rig_status / station_status.json "decklink.capture", read by scripts/capture_matrix.ps1.
+nlohmann::json CaptureJson(const DeckLinkSource::CaptureStats& c) {
+    using json = nlohmann::json;
+    const auto r2 = [](double v) { return std::round(v * 100.0) / 100.0; };
+    const auto stage = [&](const DeckLinkSource::Stage& st) {
+        return json{{"n", st.count}, {"avg_ms", r2(st.avgMs)}, {"max_ms", r2(st.maxMs)}};
+    };
+    json levers = json::object();
+    for (const pro::Lever& l : pro::ReadCaptureLevers())
+        levers[l.name] = {{"set", l.Set() ? json(l.value) : json(nullptr)}, {"effective", l.Effective()}};
+    return {{"in_effect",
+             {{"raw_v210", c.rawV210},
+              {"allocator", c.allocator},
+              {"alloc_node", c.allocNode},
+              {"hold", c.hold},
+              {"pin_group", {c.pinGroup[0], c.pinGroup[1]}},
+              {"pinned", {c.pinned[0], c.pinned[1]}},
+              {"cache_groups", c.cacheGroups},
+              {"convert_threads", c.convertThreads}}},
+            {"notes", c.notes},
+            {"levers", levers},
+            {"raw_published", c.rawPublished},
+            {"raw_skipped", c.rawSkipped},
+            {"raw_fallback", c.rawFallback},
+            {"alloc", {{"buffers", c.allocBuffers}, {"mb", c.allocMB}, {"calls", c.allocCalls}, {"refused", c.allocRefused}}},
+            {"held", {{"now", c.heldNow}, {"peak", c.heldPeak}}},
+            {"stages_window_s", DeckLinkSource::StageClock::kWindowSec},
+            {"stages",
+             {{"callback", stage(c.callback)},
+              {"convert", stage(c.convert)},
+              {"claim_wait", stage(c.claimWait)},
+              {"publish", stage(c.publish)}}}};
+}
+}  // namespace
+
 void Station::LogPerf(bool live) {
     if (!host_.renderPerf) return;
     const RenderPerfWindow w = host_.renderPerf();
@@ -676,6 +714,20 @@ void Station::LogPerf(bool live) {
              w.frameOpenMaxMs, w.uploadAvgMs, w.uploadMaxMs, w.copyAvgMs, w.copyMaxMs, w.uploadMB, w.copyThreads,
              (unsigned long long)w.stagingAllocs, (unsigned long long)w.stagingOneOff, async.c_str(), stages.c_str(),
              off.empty() ? "" : " | off: ", off.c_str(), cap);
+    // The capture side's stages (the last ~10 s window; ms per eye, publish per frame shown) and
+    // which levers are in effect: what scripts/capture_matrix.ps1 compares between arms.
+    if (decklink_.GetState() != LiveState::Closed) {
+        const DeckLinkSource::CaptureStats c = decklink_.GetCaptureStats();
+        LOG_INFO("capture: %s%s%s%s | callback %.2f/%.2f ms, convert %.2f/%.2f ms, claim wait %.2f/%.2f ms, publish "
+                 "%.2f/%.2f ms (avg/max) | raw published %llu, skipped %llu, fallback %llu | held %d (peak %d), alloc "
+                 "%llu buffers %llu MB, refused %llu",
+                 c.rawV210 ? "raw_v210 " : "convert ", c.allocator ? "allocator " : "", c.hold ? "hold " : "",
+                 c.pinned[0] || c.pinned[1] ? "pinned" : "unpinned", c.callback.avgMs, c.callback.maxMs, c.convert.avgMs,
+                 c.convert.maxMs, c.claimWait.avgMs, c.claimWait.maxMs, c.publish.avgMs, c.publish.maxMs,
+                 (unsigned long long)c.rawPublished, (unsigned long long)c.rawSkipped, (unsigned long long)c.rawFallback,
+                 c.heldNow, c.heldPeak, (unsigned long long)c.allocBuffers, (unsigned long long)c.allocMB,
+                 (unsigned long long)c.allocRefused);
+    }
 }
 
 std::string Station::RigStatusJson() const {
@@ -738,6 +790,7 @@ std::string Station::RigStatusJson() const {
             dl["direct_no_frame"] = ps.directNoFrame;
             dl["direct_skipped"] = ps.directSkipped;
         }
+        dl["capture"] = CaptureJson(decklink_.GetCaptureStats());
         out["decklink"] = dl;
     } else if (testSignal_.GetState() != LiveState::Closed) {
         // the synthetic rig: the same frame health, so a soak can run the live path without a card

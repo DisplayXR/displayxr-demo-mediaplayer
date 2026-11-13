@@ -6,14 +6,19 @@
 #include <cstring>
 #include <system_error>
 
+#include "platform/ThreadPin.h"
+
 namespace mp::bandcopy {
 
-Pool::Pool(int threads) {
+Pool::Pool(int threads, int pinGroup) {
     const int workers = std::clamp(threads, 1, 64) - 1;
     workers_.reserve((size_t)workers);
     for (int i = 1; i <= workers; ++i) {
         try {
-            workers_.emplace_back([this, i] { Loop(i); });
+            workers_.emplace_back([this, i, pinGroup] {
+                pin::PinCurrentThread(pinGroup);  // -1: not pinned (platform/ThreadPin.h)
+                Loop(i);
+            });
         } catch (const std::system_error&) {
             break;  // the system will not start more: run on the ones there are
         }

@@ -82,7 +82,7 @@ public:
         uint64_t mismatchRefused = 0; // strict: pairs NOT shown because the eyes were not one instant
         // Direct pairing (pro/DirectPair.h; MEDIAPLAYER_DECKLINK_DIRECT_PAIR): each eye converted
         // straight into its half of the ring frame, and a pair of two such halves published
-        // whole. `pairs` = directPairs + composedPairs.
+        // whole. `pairs` = directPairs + composedPairs + raw v210 pairs (CaptureStats::rawPublished).
         bool directPair = false;      // on for this capture (the switch, and a queue-mode ring)
         uint64_t directPairs = 0;     // published whole: no compose copy
         uint64_t composedPairs = 0;   // composed from two eyes, the old path (all of them when off)
@@ -90,6 +90,74 @@ public:
         uint64_t directSkipped = 0;   // decisions not shown: an eye's pixels had already gone out whole
     };
     PairStats GetPairStats() const;
+
+    // ---- The capture path's levers and stage timings (pro/CaptureLevers.h,
+    // docs/CAPTURE-LEVERS.md): what this capture actually runs, and where its time goes.
+    struct Stage {
+        uint64_t count = 0;            // samples in the last full window
+        double avgMs = 0.0, maxMs = 0.0;
+    };
+    // A stage's timings, in windows of ~10 s: the last full window is what is reported (a
+    // window is closed by the first sample after it ends). Thread-safe.
+    class StageClock {
+    public:
+        void Add(double ms, double now) {
+            std::lock_guard<std::mutex> lk(m_);
+            if (start_ <= 0.0) start_ = now;
+            if (now - start_ >= kWindowSec) {
+                last_ = {cur_.n, cur_.n ? cur_.sum / (double)cur_.n : 0.0, cur_.max};
+                cur_ = {};
+                start_ = now;
+            }
+            ++cur_.n;
+            cur_.sum += ms;
+            if (ms > cur_.max) cur_.max = ms;
+        }
+        Stage Last() const {
+            std::lock_guard<std::mutex> lk(m_);
+            return last_;
+        }
+        void Reset() {
+            std::lock_guard<std::mutex> lk(m_);
+            cur_ = {};
+            last_ = {};
+            start_ = 0.0;
+        }
+        static constexpr double kWindowSec = 10.0;
+
+    private:
+        struct Acc {
+            uint64_t n = 0;
+            double sum = 0.0, max = 0.0;
+        };
+        mutable std::mutex m_;
+        Acc cur_;
+        Stage last_;
+        double start_ = 0.0;
+    };
+    struct CaptureStats {
+        // in effect for this capture (a lever asked for but not in effect says why in `notes`)
+        bool rawV210 = false;     // MEDIAPLAYER_DECKLINK_RAW_V210 (+ the GPU decode up)
+        bool allocator = false;   // MEDIAPLAYER_DECKLINK_ALLOCATOR (the card took it)
+        bool hold = false;        // MEDIAPLAYER_DECKLINK_HOLD
+        int allocNode = -1;       // MEDIAPLAYER_DECKLINK_ALLOC_NODE
+        int pinGroup[2] = {-1, -1};  // MEDIAPLAYER_CAPTURE_PIN: lane e's L3 group (-1 = not pinned)
+        bool pinned[2] = {false, false};
+        int cacheGroups = 0;      // the CPU's last-level-cache groups (platform/ThreadPin.h)
+        int convertThreads = 0;   // per input
+        std::string notes;
+        // since the capture opened
+        uint64_t rawPublished = 0;  // frames / pairs published as raw v210
+        uint64_t rawSkipped = 0;    // pairs not shown: an eye's rows had already gone out
+        uint64_t rawFallback = 0;   // frames converted on the CPU although raw was on (not v210)
+        uint64_t allocBuffers = 0, allocMB = 0, allocCalls = 0, allocRefused = 0;
+        int heldNow = 0, heldPeak = 0;
+        // the last ~10 s window, per eye unless said: the card callback's copy (or hold), the
+        // lane's convert (or raw move), the wait to claim a pairing slot, the publish (per frame
+        // shown)
+        Stage callback, convert, claimWait, publish;
+    };
+    CaptureStats GetCaptureStats() const;
     bool IsPair() const { return cfg_.stereo == DeckLinkConfig::Stereo::Pair && GetState() != LiveState::Closed; }
     static void PrintDeviceList(FILE* out);
 
@@ -113,6 +181,9 @@ private:
     std::string formatWarning_[2];  // per input
     mutable std::mutex pairMutex_;
     PairStats pairStats_;
+    mutable std::mutex captureMutex_;
+    CaptureStats captureStats_;  // config + counters (the stage clocks below hold the timings)
+    StageClock clockCallback_, clockConvert_, clockClaim_, clockPublish_;
     DeckLinkConfig cfg_;
     std::thread worker_;
     std::mutex stopMutex_;

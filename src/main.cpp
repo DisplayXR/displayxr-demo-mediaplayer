@@ -6,6 +6,7 @@
 #include "App.h"
 #if MEDIAPLAYER_PRO
 #include "pro/DeckLinkSource.h"
+#include "pro/ProEnvFile.h"
 #endif
 #include "Log.h"
 #include "media/CameraSource.h"
@@ -173,6 +174,12 @@ int PrintCameraList() {
 
 int main(int argc, char* argv[]) {
     std::vector<std::string> args(argv + 1, argv + argc);
+#if MEDIAPLAYER_PRO
+    // pro.env first: its variables must be in the environment before anything reads them
+    // (the capture levers, MEDIAPLAYER_PRO_10BIT below, the runtime's DXR_* at the first
+    // OpenXR call). docs/CAPTURE-LEVERS.md.
+    mp::pro::LoadProEnvFile();
+#endif
 #if defined(__linux__) && !defined(__ANDROID__)
     // --platform=x11|wayland|auto (default auto, a capability probe). Taken out
     // of the argument list first: the media path is the first argument left.

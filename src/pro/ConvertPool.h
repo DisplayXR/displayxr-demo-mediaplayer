@@ -23,7 +23,9 @@ class ConvertPool {
 public:
     // `threads` in all, the calling thread included: 1 = no workers, everything on the
     // caller. Fewer if the system will not start them (Threads() says).
-    explicit ConvertPool(int threads);
+    // `pinGroup` >= 0: each worker is pinned to that last-level-cache group (platform/ThreadPin.h;
+    // the caller pins itself). -1, the default: not pinned.
+    explicit ConvertPool(int threads, int pinGroup = -1);
     ~ConvertPool();  // joins the workers; no Run() may be in progress
     ConvertPool(const ConvertPool&) = delete;
     ConvertPool& operator=(const ConvertPool&) = delete;

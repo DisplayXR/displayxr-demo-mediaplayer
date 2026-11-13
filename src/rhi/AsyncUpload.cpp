@@ -10,6 +10,8 @@
 #include <string>
 #include <system_error>
 
+#include "platform/ThreadPin.h"
+
 namespace mp::asyncup {
 
 namespace {
@@ -429,7 +431,7 @@ void Uploader::Copy(const Work& w, bool& ok, double& ms, int& threads) {
     ok = dst != nullptr;
     if (ok) {
         if (!pool_ && copyThreads_ > 1 && bandcopy::BandsFor(w.layout.total, copyThreads_) > 1)
-            pool_ = std::make_unique<bandcopy::Pool>(copyThreads_);
+            pool_ = std::make_unique<bandcopy::Pool>(copyThreads_, pinGroup_);
         for (int p = 0; p < w.layout.planes; ++p) {
             const size_t rb = w.layout.rowBytes[p];
             threads = std::max(threads, bandcopy::CopyRows(pool_.get(), dst + w.layout.offset[p], rb,
@@ -440,6 +442,11 @@ void Uploader::Copy(const Work& w, bool& ok, double& ms, int& threads) {
 }
 
 void Uploader::Loop() {
+    // MEDIAPLAYER_UPLOAD_PIN (a capture-path A/B lever, docs/CAPTURE-LEVERS.md): the upload
+    // thread and its copy threads on one last-level-cache group; "auto" = group 2, clear of
+    // the two DeckLink lanes' default groups (0 and 1, MEDIAPLAYER_CAPTURE_PIN). Unset: not pinned.
+    pinGroup_ = pin::GroupFromEnv(std::getenv("MEDIAPLAYER_UPLOAD_PIN"), 0, 2);
+    pin::PinCurrentThread(pinGroup_);
     uint64_t seen = 0;
     for (;;) {
         {
