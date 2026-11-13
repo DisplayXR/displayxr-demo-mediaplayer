@@ -2,6 +2,7 @@
 #include "pro/DeckLinkSource.h"
 
 #include "Log.h"
+#include "media/HostBlocks.h"
 #include "media/V210.h"
 #include "platform/ThreadPin.h"
 #include "pro/CaptureLevers.h"
@@ -21,6 +22,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #if defined(MEDIAPLAYER_WITH_DECKLINK)
 // The Desktop Video SDK is one C++ API on three platforms with three different COM
@@ -428,57 +430,51 @@ struct AllocCounters {
 };
 AllocCounters g_alloc;
 
+// The card's buffers are host blocks (media/HostBlocks.h): the zero-copy path hands a held
+// frame's block to the renderer, which imports it and reads the rows in place. A frame's bytes are
+// found back to their block by address (the SDK may hand the frame's pixels through a wrapper of
+// our buffer, so the buffer object itself is not used).
+std::mutex g_blockMapM;
+std::unordered_map<const void*, std::weak_ptr<const hostmem::Block>> g_blockMap;
+std::shared_ptr<const hostmem::Block> FindBlock(const void* p) {
+    std::lock_guard<std::mutex> lk(g_blockMapM);
+    auto it = g_blockMap.find(p);
+    return it == g_blockMap.end() ? nullptr : it->second.lock();
+}
+
 class HostPool {
 public:
-    static constexpr int kMaxBuffers = 48;  // per size: ~1 GB of 2160p v210 eyes at most
-    HostPool(size_t size, int node) : size_(RoundUp(size)), node_(node) {}
-    ~HostPool() {
-        for (void* p : free_) FreeBlock(p);
-    }
+    // Per size. Zero-copy keeps frames out of the pool for longer (the pairing history, the ring,
+    // the frames in flight, both eyes): ~50 at 2160p, so the cap leaves room. Allocated on demand.
+    static constexpr int kMaxBuffers = 96;
+    HostPool(size_t size, int node) : size_(hostmem::RoundUp(size)), node_(node) {}
     size_t Size() const { return size_; }
-    void* Take() {
+    std::shared_ptr<const hostmem::Block> Take() {
         std::lock_guard<std::mutex> lk(m_);
         if (!free_.empty()) {
-            void* p = free_.back();
+            std::shared_ptr<const hostmem::Block> b = std::move(free_.back());
             free_.pop_back();
-            return p;
+            return b;
         }
         if (made_ >= kMaxBuffers) return nullptr;
-        void* p = AllocBlock();
-        if (p) {
+        std::shared_ptr<const hostmem::Block> b = hostmem::NewBlock(size_, node_);
+        if (b) {
             ++made_;
             g_alloc.buffers.fetch_add(1);
             g_alloc.bytes.fetch_add(size_);
+            std::lock_guard<std::mutex> mk(g_blockMapM);
+            g_blockMap[b->p] = b;
         }
-        return p;
+        return b;
     }
-    void Give(void* p) {
+    void Give(std::shared_ptr<const hostmem::Block> b) {
         std::lock_guard<std::mutex> lk(m_);
-        free_.push_back(p);
+        free_.push_back(std::move(b));
     }
 
 private:
-    static size_t RoundUp(size_t n) { return (n + 65535) & ~(size_t)65535; }
-    void* AllocBlock() {
-#if defined(_WIN32)
-        if (node_ >= 0)
-            return VirtualAllocExNuma(GetCurrentProcess(), nullptr, size_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE,
-                                      (DWORD)node_);
-        return VirtualAlloc(nullptr, size_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-#else
-        void* p = nullptr;
-        return posix_memalign(&p, 4096, size_) == 0 ? p : nullptr;
-#endif
-    }
-    static void FreeBlock(void* p) {
-#if defined(_WIN32)
-        VirtualFree(p, 0, MEM_RELEASE);
-#else
-        std::free(p);
-#endif
-    }
     std::mutex m_;
-    std::vector<void*> free_;
+    std::vector<std::shared_ptr<const hostmem::Block>> free_;  // freed with the pool unless imported (the renderer holds those)
     size_t size_;
     int node_;
     int made_ = 0;
@@ -508,10 +504,11 @@ struct ComRef : Iface {
 class HostBuffer final : public ComRef<HostBuffer, IDeckLinkVideoBuffer> {
 public:
     static REFIID Iid() { return IID_IDeckLinkVideoBuffer; }
-    HostBuffer(std::shared_ptr<HostPool> pool, void* p) : pool_(std::move(pool)), p_(p) {}
-    ~HostBuffer() override { pool_->Give(p_); }  // back to the pool, not freed
+    HostBuffer(std::shared_ptr<HostPool> pool, std::shared_ptr<const hostmem::Block> b)
+        : pool_(std::move(pool)), block_(std::move(b)) {}
+    ~HostBuffer() override { pool_->Give(std::move(block_)); }  // back to the pool, not freed
     HRESULT STDMETHODCALLTYPE GetBytes(void** buffer) override {
-        *buffer = p_;
+        *buffer = block_->p;
         return S_OK;
     }
 #if defined(_WIN32)
@@ -527,7 +524,7 @@ public:
 
 private:
     std::shared_ptr<HostPool> pool_;  // outlives every buffer it handed out
-    void* p_;
+    std::shared_ptr<const hostmem::Block> block_;
 };
 
 class HostAllocator final : public ComRef<HostAllocator, IDeckLinkVideoBufferAllocator> {
@@ -536,13 +533,13 @@ public:
     explicit HostAllocator(std::shared_ptr<HostPool> pool) : pool_(std::move(pool)) {}
     HRESULT STDMETHODCALLTYPE AllocateVideoBuffer(IDeckLinkVideoBuffer** out) override {
         g_alloc.calls.fetch_add(1);
-        void* p = pool_->Take();
-        if (!p) {
+        std::shared_ptr<const hostmem::Block> b = pool_->Take();
+        if (!b) {
             g_alloc.refused.fetch_add(1);
             *out = nullptr;
             return E_OUTOFMEMORY;
         }
-        *out = new HostBuffer(pool_, p);
+        *out = new HostBuffer(pool_, std::move(b));
         return S_OK;
     }
 
@@ -578,6 +575,45 @@ private:
     int node_;
 };
 #endif  // MP_DL_SDK_HAS_VIDEO_BUFFER
+
+#if MP_DL_SDK_HAS_VIDEO_BUFFER
+// A held frame whose bytes are one of this app's host blocks (the allocator's), as is: what the
+// zero-copy path can hand to the renderer.
+bool ExtEligible(const RawPixels& p) {
+    if (!p.held || !p.heldFrame) return false;
+    const std::shared_ptr<const hostmem::Block> b = FindBlock(p.held);
+    return b && b->p == p.held && p.Size() <= b->size;
+}
+// Moves the held card frame into a lease (FrameRing::Frame::ExtPlane::hold): the frame goes back
+// to the card when the last copy of the lease goes: the pairing history's, the ring frame's, and
+// the renderer's, which it drops once the GPU frame that read the rows has passed its fence.
+bool TakeHeldAsExt(RawPixels& p, FrameRing::Frame::ExtPlane& out) {
+    if (!ExtEligible(p)) return false;
+    std::shared_ptr<const hostmem::Block> b = FindBlock(p.held);
+    struct Held {
+        IDeckLinkVideoFrame* frame;
+        IDeckLinkVideoBuffer* buffer;
+    };
+    Held* h = new Held{p.heldFrame, p.heldBuffer};
+    std::shared_ptr<void> hold(h, [](Held* x) {
+        if (x->buffer) {
+            x->buffer->EndAccess(bmdBufferAccessRead);
+            x->buffer->Release();
+        }
+        x->frame->Release();
+        g_heldNow.fetch_sub(1);
+        delete x;
+    });
+    out = FrameRing::Frame::ExtPlane{p.held, p.Size(), b->id, b, std::move(hold)};
+    p.heldFrame = nullptr;  // the lease owns the references now
+    p.heldBuffer = nullptr;
+    p.held = nullptr;
+    return true;
+}
+#else
+bool ExtEligible(const RawPixels&) { return false; }
+bool TakeHeldAsExt(RawPixels&, FrameRing::Frame::ExtPlane&) { return false; }
+#endif
 
 // False when the frame's pixels cannot be read.
 bool CopyPixels(IDeckLinkVideoFrame* f, RawPixels& out) {
@@ -782,6 +818,9 @@ struct DeckLinkCapture {
         // the vector now holds a recycled ring plane.
         std::vector<uint8_t> raw;
         bool isRaw = false, moved = false;
+        // Zero-copy (MEDIAPLAYER_ZERO_COPY_UPLOAD): the rows stay in the held card buffer; `ext` holds it.
+        FrameRing::Frame::ExtPlane ext;
+        bool isExt = false;
     };
     // No timecode, one card: its hardware clock stands in (#108's pairing). Frame index =
     // round((t - t0) / duration) with t0 from the first frame and the duration the card
@@ -814,6 +853,7 @@ struct DeckLinkCapture {
     std::atomic<bool> allocOn{false};
 #endif
     int pinGroup[2] = {-1, -1};      // MEDIAPLAYER_CAPTURE_PIN
+    bool zeroCopy = false;           // MEDIAPLAYER_ZERO_COPY_UPLOAD: raw + hold + the renderer imports host blocks
     bool warnedRawSize = false;
     enum PairPath { kComposed, kDirect, kRaw };
     struct RingFrames final : DirectPairTable::Frames {
@@ -1097,6 +1137,23 @@ struct DeckLinkCapture {
             std::lock_guard<std::mutex> lk(m);
             const double t0 = LiveProducer::NowSeconds();
             if (rawV210 && RawEligible(r.px, w, h) && (!r.dual || RawEligible(r.right, w, h))) {
+                const ColorMatrix zcMtx = r.hasMatrix ? r.matrix : DefaultMatrixForHeight(h);
+                if (zeroCopy && ExtEligible(r.px) && (!r.dual || ExtEligible(r.right))) {
+                    // Zero-copy: the card's buffers themselves go to the ring; the GPU reads them in place.
+                    FrameRing::Frame::ExtPlane ex[2];
+                    TakeHeldAsExt(r.px, ex[0]);
+                    if (r.dual) TakeHeldAsExt(r.right, ex[1]);
+                    const FrameRing::Frame::ExtPlane* eyes[2] = {&ex[0], r.dual ? &ex[1] : nullptr};
+                    const double t1 = LiveProducer::NowSeconds();
+                    src->clockConvert_.Add(Ms(t0, t1), t1);
+                    if (alive && src->PublishV210Ext(eyes, r.dual ? 2 : 1, w, h, zcMtx, r.transfer, /*fullRange=*/false,
+                                                     r.now, r.tc[0] ? r.tc : nullptr, r.dual ? 0 : -1))
+                        CountCapture(&DeckLinkSource::CaptureStats::zeroCopyPublished);
+                    const double t2 = LiveProducer::NowSeconds();
+                    src->clockPublish_.Add(Ms(t1, t2), t2);
+                    return;
+                }
+                if (zeroCopy) CountCapture(&DeckLinkSource::CaptureStats::zeroCopyFallback);
                 // Raw v210: the rows go to the ring as they are (moved, not copied); the GPU decodes them.
                 std::vector<uint8_t>* eyes[2] = {&OwnedBytes(r.px, pool), r.dual ? &OwnedBytes(r.right, pool) : nullptr};
                 const double t1 = LiveProducer::NowSeconds();
@@ -1147,8 +1204,15 @@ struct DeckLinkCapture {
         src->clockClaim_.Add(Ms(c0, t0), t0);
         EyeFrame& ef = hist[eye][slot];
         if (rawV210 && RawEligible(r.px, w, h)) {
-            // Raw v210: the lane's rows move into the history slot (a swap), then into the ring.
-            ef.raw.swap(OwnedBytes(r.px, pool));
+            ef.ext = FrameRing::Frame::ExtPlane{};  // (a lease left in this slot goes back to the card)
+            ef.isExt = false;
+            if (zeroCopy && TakeHeldAsExt(r.px, ef.ext)) {
+                ef.isExt = true;  // zero-copy: the slot holds the card's buffer, no copy at all
+            } else {
+                if (zeroCopy) CountCapture(&DeckLinkSource::CaptureStats::zeroCopyFallback);
+                // Raw v210: the lane's rows move into the history slot (a swap), then into the ring.
+                ef.raw.swap(OwnedBytes(r.px, pool));
+            }
             ef.isRaw = true;
             ef.moved = false;
             ef.matrix = r.hasMatrix ? r.matrix : DefaultMatrixForHeight(h);
@@ -1156,6 +1220,8 @@ struct DeckLinkCapture {
         } else {
             if (rawV210) CountCapture(&DeckLinkSource::CaptureStats::rawFallback);
             ef.isRaw = false;
+            ef.isExt = false;
+            ef.ext = FrameRing::Frame::ExtPlane{};
             ef.px.Resize(w, h);
             const livepix::EyeJob job = ConvertJob(r.px, ef.px, 0, r.hasMatrix, r.matrix);
             livepix::ToP016Banded(pool, &job, 1);
@@ -1237,7 +1303,32 @@ struct DeckLinkCapture {
         WarnPair(d, l.w, l.h, rt.w, rt.h);
         char tc[sizeof(l.tc)];
         std::memcpy(tc, l.tc, sizeof(tc));
+        // One eye in a card buffer, the other copied out (zero-copy fell back for one eye): copy
+        // the held one out too (rare: a 22 MB copy under m), then publish as a plain raw pair.
+        if (l.isExt != rt.isExt) {
+            EyeFrame& x = l.isExt ? l : rt;
+            x.raw.assign(x.ext.data, x.ext.data + x.ext.bytes);
+            x.ext = FrameRing::Frame::ExtPlane{};
+            x.isExt = false;
+            CountCapture(&DeckLinkSource::CaptureStats::zeroCopyFallback);
+        }
         std::lock_guard<std::mutex> pub(publishM);  // after m, as every publisher
+        if (l.isExt) {
+            // Zero-copy: the ring frame takes the two card buffers' leases; the GPU reads them in place.
+            const FrameRing::Frame::ExtPlane* ex[2] = {&l.ext, &rt.ext};
+            const double p0 = LiveProducer::NowSeconds();
+            const bool ok = alive && src->PublishV210Ext(ex, 2, l.w, l.h, l.matrix, l.transfer, /*fullRange=*/false,
+                                                         std::min(l.arrived, rt.arrived), tc[0] ? tc : nullptr,
+                                                         d.offsetFrames);
+            const double p1 = LiveProducer::NowSeconds();
+            src->clockPublish_.Add(Ms(p0, p1), p1);
+            if (ok) {
+                l.moved = rt.moved = true;
+                l.ext = rt.ext = FrameRing::Frame::ExtPlane{};  // the ring frame (and then the renderer) hold them now
+                CountCapture(&DeckLinkSource::CaptureStats::zeroCopyPublished);
+            }
+            return;
+        }
         std::vector<uint8_t>* eyes[2] = {&l.raw, &rt.raw};
         const double p0 = LiveProducer::NowSeconds();
         const bool ok = alive && src->PublishV210(eyes, 2, l.w, l.h, l.matrix, l.transfer, /*fullRange=*/false,
@@ -1375,6 +1466,8 @@ struct DeckLinkCapture {
         src->clockClaim_.Add(Ms(c0, t0), t0);
         EyeFrame& ef = hist[eye][slot];
         ef.isRaw = false;
+        ef.isExt = false;
+        ef.ext = FrameRing::Frame::ExtPlane{};
         if (frame) {
             // Our half alone, without m: the other lane writes only the other half, and the
             // frame is in no ring queue until both halves are Done (pro/DirectPair.h).
@@ -1779,6 +1872,14 @@ void DeckLinkSource::Worker() {
     if (allocAsked) notes += "ALLOCATOR needs a DeckLink SDK 14.3+ build; ";
 #endif
     if (holdAsked && !cap.hold) notes += "HOLD needs ALLOCATOR: copying frames out; ";
+    // Zero-copy (#238 phase 3): the held card buffers go to the GPU as they are. Needs raw (rows the
+    // GPU decodes), hold (frames kept, not copied) and the renderer's host import.
+    const bool zcAsked = v210::Requested(std::getenv("MEDIAPLAYER_ZERO_COPY_UPLOAD"));
+    cap.zeroCopy = zcAsked && cap.rawV210 && cap.hold && v210::ZeroCopyActive();
+    if (zcAsked && !cap.zeroCopy)
+        notes += !cap.rawV210 ? "ZERO_COPY needs RAW_V210; "
+                 : !cap.hold  ? "ZERO_COPY needs ALLOCATOR + HOLD; "
+                              : "ZERO_COPY: the renderer cannot import host memory (see its log); ";
     if (pair) {
         // Direct pairing (pro/DirectPair.h): each eye converted straight into its half of the
         // ring frame. Needs the ring's queue mode (reserved frames); set before the lanes start.
@@ -1917,16 +2018,18 @@ void DeckLinkSource::Worker() {
         captureStats_.allocator = cap.allocOn;
 #endif
         captureStats_.hold = cap.hold;
+        captureStats_.zeroCopy = cap.zeroCopy;
         captureStats_.allocNode = allocNode;
         captureStats_.cacheGroups = (int)pin::CacheGroups().size();
         captureStats_.convertThreads = cap.lanes[0].pool ? cap.lanes[0].pool->Threads() : 0;
         captureStats_.notes += notes;
         const std::vector<pro::Lever> levers = pro::ReadCaptureLevers();
         const std::string set = pro::SetLeversText(levers);
-        LOG_INFO("capture-config: %s | in effect: raw_v210 %s, allocator %s (node %d), hold %s, direct_pair %s, "
+        LOG_INFO("capture-config: %s | in effect: raw_v210 %s, allocator %s (node %d), hold %s, zero_copy %s, direct_pair %s, "
                  "strict %s, pin %d,%d, convert %d thread(s)/input, gpu_v210 %s, L3 groups %d%s%s",
                  set.empty() ? "(all defaults)" : set.c_str(), captureStats_.rawV210 ? "on" : "off",
                  captureStats_.allocator ? "on" : "off", allocNode, captureStats_.hold ? "on" : "off",
+                 captureStats_.zeroCopy ? "on" : "off",
                  cap.directPair ? "on" : "off", cap.strictPairs ? "on" : "off", cap.pinGroup[0], cap.pinGroup[1],
                  captureStats_.convertThreads, v210::GpuDecodeActive() ? "on" : "off", captureStats_.cacheGroups,
                  captureStats_.notes.empty() ? "" : " | notes: ", captureStats_.notes.c_str());
@@ -1966,6 +2069,10 @@ void DeckLinkSource::Worker() {
         // capture: the next Open reserves from it again). No lane runs now, no compose.
         std::lock_guard<std::mutex> lk(cap.m);
         cap.table.ReleaseAll();
+        // Zero-copy: card frames the pairing history still holds go back now, while the inputs
+        // still exist (frames already in the ring, or with the renderer, go when those let go).
+        for (auto& eyeHist : cap.hist)
+            for (auto& ef : eyeHist) ef.ext = FrameRing::Frame::ExtPlane{};
     }
     for (int e = 0; e < 2; ++e) {
         Release(callbacks[e]);
