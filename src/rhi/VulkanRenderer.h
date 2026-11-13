@@ -47,6 +47,7 @@
 #include "rhi/BandCopy.h"
 #include "rhi/PushPack.h"
 #include "rhi/RenderPerf.h"
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -197,6 +198,13 @@ public:
     bool UploadV210(const FrameRing::Frame& f);
     // The decode pass is up (MEDIAPLAYER_GPU_V210 and the device took it).
     bool GpuV210() const { return v210_.pipeline != VK_NULL_HANDLE; }
+    // Zero-copy upload (#238 phase 3, MEDIAPLAYER_ZERO_COPY_UPLOAD): v210 frames whose rows are in
+    // the producer's host blocks (FrameRing::Frame::ext) are read in place by the decode pass,
+    // through VK_EXT_external_memory_host, with no copy into staging. Frames read in place, and
+    // frames that fell back to the staging copy, since start.
+    bool ZeroCopyUpload() const { return zeroCopy_; }
+    uint64_t ZeroCopyFrames() const { return zcFrames_; }
+    uint64_t ZeroCopyFallbacks() const { return zcFallback_; }
 
     // Off-thread upload (rhi/AsyncUpload.h; MEDIAPLAYER_ASYNC_UPLOAD, on by default). Every
     // render-loop iteration: SetUploadSource(the ring the source frames come from, or nullptr),
@@ -441,6 +449,27 @@ private:
     int v210Verify_ = -1;  // -1 not read yet, 0 off / done, 1 pending
     void VerifyV210Once(const FrameRing::Frame& f);
     void SetV210Source(bool fullRange, int matrix);  // the source state after a decode
+
+    // ---- zero-copy upload (#238 phase 3; media/HostBlocks.h). A host block is imported once (keyed
+    // by its id, holding the block so its memory outlives the import) and reused; each GPU frame
+    // that reads a block keeps the frame's `hold` until it has passed its fence (OpenFrame).
+    struct HostImport {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::shared_ptr<const void> block;
+        uint64_t lastSerial = 0;
+    };
+    std::unordered_map<uint64_t, HostImport> hostImports_;
+    std::vector<std::pair<uint64_t, std::shared_ptr<void>>> hostHolds_;  // (frameSerial_, contents)
+    PFN_vkGetMemoryHostPointerPropertiesEXT pfnHostPtrProps_ = nullptr;
+    VkDeviceSize hostImportAlign_ = 0;
+    bool zeroCopy_ = false;
+    uint64_t zcFrames_ = 0, zcFallback_ = 0;
+    bool zcLogged_ = false, zcWarned_ = false;
+    void InitZeroCopy();
+    bool ImportHostBlock(const FrameRing::Frame::ExtPlane& p, VkBuffer& out);
+    void RetireHostHolds(uint64_t completedFrame);
+    void DestroyHostImports();
 
     // Up to three source planes. RGBA images use plane 0 only (mode 0); video uses Y +
     // chroma (mode 1 = I420, mode 2 = NV12). Each is reused across frames, reallocated

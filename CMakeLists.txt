@@ -957,6 +957,14 @@ if(MP_BUILD_TESTS)
     target_include_directories(capture_levers_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(capture_levers_test PRIVATE Threads::Threads)
     add_test(NAME capture_levers COMMAND capture_levers_test)
+    # Zero-copy upload (#238 phase 3, media/HostBlocks.h): block pool lifetimes and caps,
+    # external-plane v210 frames (Shape / EyeRows / never staged by the upload thread), the
+    # renderer's hold-until-the-fence rule, and publishes clearing leftover external planes.
+    add_executable(zero_copy_test tests/zero_copy_test.cpp src/pro/LiveSourceBase.cpp
+        src/pro/ConvertPool.cpp src/pro/LivePixels.cpp src/rhi/AsyncUpload.cpp src/rhi/BandCopy.cpp)
+    target_include_directories(zero_copy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(zero_copy_test PRIVATE Threads::Threads)
+    add_test(NAME zero_copy COMMAND zero_copy_test)
     add_executable(resolve_link_test tests/resolve_link_test.cpp src/pro/ResolveLink.cpp)
     target_include_directories(resolve_link_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(resolve_link_test PRIVATE nlohmann_json::nlohmann_json)

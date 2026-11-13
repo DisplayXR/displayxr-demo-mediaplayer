@@ -62,10 +62,26 @@ inline bool Shape(const FrameRing::Frame& f, int& eyes, int& eyeW) {
         eyeW <= 0 || (eyeW & 1) || eyeW * eyes != f.width)
         return false;
     const size_t bytes = RowBytes(eyeW) * (size_t)f.height;
-    for (int e = 0; e < eyes; ++e)
-        if (f.plane[e].size() < bytes) return false;
+    for (int e = 0; e < eyes; ++e) {
+        const size_t have = f.HasExt() ? (f.ext[e].data ? f.ext[e].bytes : 0) : f.plane[e].size();
+        if (have < bytes) return false;
+    }
     return true;
 }
+
+// Eye e's rows, wherever they are: the producer's host block (zero-copy) or plane[e].
+inline const uint8_t* EyeRows(const FrameRing::Frame& f, int e) {
+    return f.HasExt() ? f.ext[e].data : f.plane[e].data();
+}
+
+// MEDIAPLAYER_ZERO_COPY_UPLOAD (#238 phase 3): producers publish v210 rows in host blocks the GPU
+// reads in place. Set by the renderer once it can import host memory (and the GPU decode is up).
+inline std::atomic<bool>& ZeroCopyFlag() {
+    static std::atomic<bool> on{false};
+    return on;
+}
+inline bool ZeroCopyActive() { return ZeroCopyFlag().load(); }
+inline void SetZeroCopyActive(bool on) { ZeroCopyFlag().store(on); }
 
 // Pack one row: y(x) for x < w, cb(i) / cr(i) for the chroma pair i < w / 2 (pixels 2i,
 // 2i + 1), all 10-bit. `row` gets RowBytes(w) bytes; the padding (and a last group's missing

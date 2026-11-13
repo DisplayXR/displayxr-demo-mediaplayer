@@ -81,6 +81,9 @@ bool LayoutFor(const FrameRing::Frame& f, Layout& out, bool v210) {
     out = Layout{};
     if (f.gpu || f.width <= 0 || f.height <= 0) return false;
     if (f.format == PixFormat::V210) {  // each eye's rows, raw: the GPU decodes them (#238)
+        // Rows in the producer's host blocks (zero-copy, #238 phase 3): nothing to copy, the render
+        // thread records the GPU's read of them in place.
+        if (f.HasExt()) return false;
         int eyes = 0, eyeW = 0;
         if (!v210 || !v210::Shape(f, eyes, eyeW)) return false;
         out.format = 3;

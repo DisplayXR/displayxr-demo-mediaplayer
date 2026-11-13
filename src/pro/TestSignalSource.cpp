@@ -146,6 +146,8 @@ bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
         rawWindowCount_ = 0;
     }
     raw_ = wire_ == Wire::V210Raw;
+    ext_ = raw_ && v210::ZeroCopyActive();
+    extNoBlock_ = 0;
     char n[160];
     if (cfg.plate) {
         const size_t slash = cfg.image.find_last_of("/\\");
@@ -374,7 +376,8 @@ void TestSignalSource::Worker() {
 // ---- v210 wire (#238) ------------------------------------------------------------------
 
 const char* TestSignalSource::WireName() const {
-    return wire_ == Wire::V210Raw ? "v210 (raw, decoded on the GPU)"
+    return wire_ == Wire::V210Raw ? (ext_ ? "v210 (raw, host blocks read in place by the GPU: zero-copy)"
+                                          : "v210 (raw, decoded on the GPU)")
            : wire_ == Wire::V210Cpu ? "v210 -> P016 (CPU)"
                                     : "nv12";
 }
@@ -395,9 +398,30 @@ void TestSignalSource::PublishV210(const livepix::Nv12& frame, double captureSec
     const int w = cfg_.eyeW, h = cfg_.eyeH;
     const size_t bytes = v210::RowBytes(w) * (size_t)h;
     FrameRing::Frame& f = rawRing_.WriteBuffer();
-    for (int e = 0; e < 2; ++e) {
-        f.plane[e].resize(bytes);  // same size after warm-up: no allocation
-        PackEyeV210(frame, e * w, w, h, f.plane[e].data());
+    bool packed = false;
+    if (ext_) {
+        // Zero-copy: each eye into a host block of the pool; the ring frame and then the renderer
+        // hold its lease until the GPU frame that read it has finished. Enough blocks for every
+        // ring buffer and every frame in flight, two eyes each.
+        if (!extPool_ || extPool_->BlockBytes() < hostmem::RoundUp(bytes)) extPool_ = hostmem::Pool::Create(bytes, 40);
+        hostmem::Lease l[2] = {extPool_->Take(), extPool_->Take()};
+        if (l[0] && l[1]) {
+            for (int e = 0; e < 2; ++e) {
+                PackEyeV210(frame, e * w, w, h, l[e].block->p);
+                f.ext[e] = FrameRing::Frame::ExtPlane{l[e].block->p, bytes, l[e].block->id, l[e].block, l[e].hold};
+                f.plane[e].clear();
+            }
+            packed = true;
+        } else if (extNoBlock_++ == 0) {
+            LOG_WARN("test signal: zero-copy pool empty (%d blocks out); packing into the ring frame instead", extPool_->Out());
+        }
+    }
+    if (!packed) {
+        f.ClearExt();
+        for (int e = 0; e < 2; ++e) {
+            f.plane[e].resize(bytes);  // same size after warm-up: no allocation
+            PackEyeV210(frame, e * w, w, h, f.plane[e].data());
+        }
     }
     f.plane[2].clear();
     f.width = 2 * w;

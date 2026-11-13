@@ -29,6 +29,7 @@
 // yet; phase 2 adds it with the DeckLink lanes, after the 0.9.7 direct-pair work).
 #pragma once
 
+#include "media/HostBlocks.h"
 #include "pro/LiveSourceBase.h"
 
 #include <atomic>
@@ -99,6 +100,11 @@ private:
     Wire wire_ = Wire::Nv12;
     bool still_ = false;
     std::atomic<bool> raw_{false};  // Ring() is rawRing_ (the render thread reads it)
+    // Zero-copy (#238 phase 3): the raw arm packs each eye into a pooled host block the renderer
+    // reads in place (media/HostBlocks.h), when the renderer said it can (v210::ZeroCopyActive).
+    bool ext_ = false;
+    std::shared_ptr<hostmem::Pool> extPool_;
+    uint64_t extNoBlock_ = 0;  // frames packed into plane[] instead: the pool was empty
     // The raw v210 arm's ring and stats (see the file comment).
     mutable FrameRing rawRing_;
     mutable std::mutex rawMutex_;
