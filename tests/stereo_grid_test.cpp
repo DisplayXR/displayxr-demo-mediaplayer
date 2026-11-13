@@ -6,6 +6,7 @@
 // rendering-mode borrow that takes the panel to 3D under the "3D only" filter and hands it
 // back, and the pairs made for one-view 3D photos (a two-view LIF, an MPO) at small size.
 
+#include "browser/PairDiskCache.h"
 #include "browser/StereoGrid.h"
 #include "browser/StereoPairs.h"
 #include "browser/ThumbnailDepth.h"
@@ -16,11 +17,14 @@
 #include <stb_image_write.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <string>
@@ -602,6 +606,118 @@ void TestOneViewPair() {
     pairs.Shutdown();
 }
 
+// --- the pairs kept on disk (PairDiskCache.h) ---------------------------------------------
+
+std::string TempDir(const char* name) {
+    std::error_code ec;
+    const std::filesystem::path p = std::filesystem::temp_directory_path(ec) / name;
+    std::filesystem::remove_all(p, ec);
+    return p.string();
+}
+
+void TestPairDiskKey() {
+    const std::string k = PairDiskCache::Key(42, 1000, 5000, 512, 320, 0.75f);
+    CHECK(k.size() == 16 && k.find_first_not_of("0123456789abcdef") == std::string::npos, "16 hex digits: %s",
+          k.c_str());
+    CHECK(k == PairDiskCache::Key(42, 1000, 5000, 512, 320, 0.75f), "stable");
+    CHECK(k != PairDiskCache::Key(43, 1000, 5000, 512, 320, 0.75f), "another file");
+    CHECK(k != PairDiskCache::Key(42, 1001, 5000, 512, 320, 0.75f), "modified time changed");
+    CHECK(k != PairDiskCache::Key(42, 1000, 5001, 512, 320, 0.75f), "size changed");
+    CHECK(k != PairDiskCache::Key(42, 1000, 5000, 512, 512, 0.75f), "another thumbnail size");
+    CHECK(k != PairDiskCache::Key(42, 1000, 5000, 512, 320, 0.5f), "another eye scale");
+    CHECK(k != PairDiskCache::Key(42, 1000, 5000, 512, 320, 0.75f, PairDiskCache::kPairFormatVersion + 1),
+          "pair format version bumped");
+}
+
+void TestPairDiskLru() {
+    const std::string dir = TempDir("mp_pair_disk_lru");
+    std::vector<uint8_t> img((size_t)64 * 32 * 4);
+    for (size_t i = 0; i < img.size(); ++i) img[i] = (uint8_t)((i * 37) % 251);  // noise: ~4+ KB each
+    PairDiskCache c;
+    CHECK(c.Initialize(dir, 1u << 20), "opens (creates) the directory");
+    CHECK(c.Store("a", img.data(), 64, 32) && c.Store("b", img.data(), 64, 32) && c.Store("c", img.data(), 64, 32),
+          "stores");
+    const uint64_t one = c.Bytes() / 3;
+    CHECK(c.Count() == 3 && one > 0, "three kept (%zu, %llu bytes each)", c.Count(), (unsigned long long)one);
+    std::vector<uint8_t> jpeg;
+    CHECK(c.Load("a", jpeg) && jpeg.size() > 2 && jpeg[0] == 0xFF && jpeg[1] == 0xD8, "a JPEG comes back");
+    CHECK(!c.Load("zz", jpeg), "not stored: a miss");
+    // Room for about three: storing a fourth trims to 90 %, the least recently used first.
+    // "a" was just used, so "b" goes.
+    c.Shutdown();
+    CHECK(c.Initialize(dir, one * 3 + one / 2), "reopened: the index comes from the files");
+    CHECK(c.Count() == 3, "three found on disk (%zu)", c.Count());
+    CHECK(c.Load("a", jpeg), "a used");
+    CHECK(c.Store("d", img.data(), 64, 32), "a fourth");
+    CHECK(c.Bytes() <= one * 3 + one / 2, "within the budget");
+    CHECK(c.Load("a", jpeg) && c.Load("d", jpeg), "the recently used stay");
+    CHECK(!c.Load("b", jpeg), "the least recently used went");
+    CHECK(!std::filesystem::exists(dir + "/b.jpg"), "its file too");
+    // A write cut short (a temp file) is dropped when the cache opens.
+    { std::ofstream(dir + "/x.tmp") << "partial"; }
+    c.Shutdown();
+    CHECK(c.Initialize(dir, 1u << 20) && !std::filesystem::exists(dir + "/x.tmp"), "stray temp file removed");
+    c.Shutdown();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// End to end: a pair made once is read back from disk by the next launch (the file is not
+// read again), and a corrupt stored pair is made again.
+void TestPairDiskReuse() {
+    const std::string dir = TempDir("mp_pair_disk_reuse");
+    const std::vector<uint8_t> lif = TwoViewLif(SolidJpeg(320, 200, 220, 30, 30), SolidJpeg(320, 200, 30, 30, 220));
+    std::atomic<int> reads{0};
+    std::vector<uint8_t> thumb((size_t)160 * 100 * 4);
+    for (size_t i = 0; i < thumb.size(); i += 4) thumb[i] = 220, thumb[i + 1] = 30, thumb[i + 2] = 30, thumb[i + 3] = 255;
+    auto run = [&](Thumbnail& out) {
+        StereoPairs pairs;
+        pairs.Initialize(
+            [](const uint8_t* d, size_t n, uint32_t w, uint32_t h, std::vector<uint8_t>& rgba) {
+                const mp::DecodedImage img = mp::ImageDecoder::LoadFromMemory(d, n, "pair");
+                if (!img.Valid()) return false;
+                ResizeRgba(img.pixels.data(), (uint32_t)img.width, (uint32_t)img.height, w, h, rgba);
+                return true;
+            },
+            [&](int, uint64_t off, void* dst, size_t n) {
+                ++reads;
+                if (off + n > lif.size()) return false;
+                std::memcpy(dst, lif.data() + off, n);
+                return true;
+            },
+            [](int) {}, dir);
+        pairs.Make(77, 5, 3, lif.size(), thumb.data(), 160, 100, 0.75f);
+        std::vector<Thumbnail> made;
+        std::vector<int64_t> failed;
+        for (int i = 0; i < 400 && made.empty() && failed.empty(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            pairs.TakeResults(made, failed);
+        }
+        pairs.Shutdown();
+        if (made.size() != 1) return false;
+        out = std::move(made[0]);
+        return true;
+    };
+    Thumbnail first, second, third;
+    CHECK(run(first) && reads > 0, "first launch: made from the file");
+    const std::string path = dir + "/" + PairDiskCache::Key(77, 5, lif.size(), 160, 100, 0.75f) + ".jpg";
+    CHECK(std::filesystem::exists(path), "stored under its key");
+    reads = 0;
+    CHECK(run(second) && reads == 0, "second launch: from disk, the file not read (%d reads)", reads.load());
+    CHECK(second.id == 77 && second.width == first.width && second.height == first.height, "same size %ux%u",
+          second.width, second.height);
+    if (second.rgba.size() == first.rgba.size() && !second.rgba.empty()) {
+        const size_t mid = ((size_t)(second.height / 2) * second.width + second.width * 3 / 4) * 4;
+        CHECK(second.rgba[mid + 2] > 150 && second.rgba[mid] < 100, "the right eye survived the JPEG (blue)");
+    }
+    { std::ofstream(path, std::ios::binary | std::ios::trunc) << "not a jpeg"; }
+    reads = 0;
+    CHECK(run(third) && reads > 0 && third.width == first.width, "corrupt on disk: made again");
+    CHECK(std::filesystem::file_size(path) > 100, "and stored again");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 void TestThumbnailDepth() {
     const int E = 256, H = 256, W = 2 * E, d = 8;
     std::vector<uint8_t> rgba((size_t)W * H * 4, 255);
@@ -651,6 +767,9 @@ int main() {
     TestStereoPairs();
     TestPairAspect();
     TestOneViewPair();
+    TestPairDiskKey();
+    TestPairDiskLru();
+    TestPairDiskReuse();
     if (g_failures) {
         std::fprintf(stderr, "stereo_grid_test: %d failure(s)\n", g_failures);
         return 1;

@@ -96,8 +96,10 @@ public:
     }
     // Make pairs for 3D photos whose thumbnail is one view (LIF, MPO: StereoPairs.h).
     // `read` / `close` work on the file descriptors the provider hands over. Call after
-    // Initialize; without it those tiles stay flat.
-    void SetPairMaker(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close);
+    // Initialize; without it those tiles stay flat. `diskDir`: where the pairs are kept
+    // between launches (PairDiskCache.h; empty = memory only).
+    void SetPairMaker(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close,
+                      const std::string& diskDir = std::string());
     // The tiles Build() laid out this frame, at this frame's rects; inactive unless set.
     const StereoFrame& Stereo() const { return stereoFrame_; }
 

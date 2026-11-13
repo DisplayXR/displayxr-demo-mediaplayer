@@ -248,9 +248,10 @@ bool MediaBrowser::Initialize(MediaProvider* provider, VkPhysicalDevice physical
     return true;
 }
 
-void MediaBrowser::SetPairMaker(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close) {
+void MediaBrowser::SetPairMaker(ScaledJpegDecoder decode, FileReader read, std::function<void(int)> close,
+                                const std::string& diskDir) {
     closeFile_ = close;
-    pairs_.Initialize(std::move(decode), std::move(read), std::move(close));
+    pairs_.Initialize(std::move(decode), std::move(read), std::move(close), diskDir);
 }
 
 void MediaBrowser::Shutdown() {

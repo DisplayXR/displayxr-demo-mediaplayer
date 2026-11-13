@@ -814,6 +814,7 @@ if(MP_BUILD_TESTS)
         tests/stereo_grid_test.cpp
         src/browser/StereoGrid.cpp
         src/browser/StereoPairs.cpp
+        src/browser/PairDiskCache.cpp
         src/browser/ThumbnailDepth.cpp
         src/media/AutoConvergence.cpp
         src/media/LifLoader.cpp
