@@ -46,8 +46,8 @@
 
 namespace mp::browser {
 
-// Decode a JPEG (or a PNG: a one-view LIF's disparity map) to exactly w x h RGBA8,
-// unpremultiplied, scaling while decoding (never at full size).
+// Decode a JPEG (or a PNG: a one-view LIF's disparity map, whose first channel is read) to
+// exactly w x h RGBA8, scaling while decoding (never at full size).
 // Called on the worker thread. False if it cannot.
 using ScaledJpegDecoder =
     std::function<bool(const uint8_t* data, size_t size, uint32_t w, uint32_t h, std::vector<uint8_t>& rgba)>;
