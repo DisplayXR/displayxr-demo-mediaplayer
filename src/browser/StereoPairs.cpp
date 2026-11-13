@@ -29,6 +29,54 @@ void PairEyeSize(uint32_t w, uint32_t h, float scale, uint32_t& ew, uint32_t& eh
     eh = std::min(h, std::max(16u, (uint32_t)std::lround((double)h * scale)));
 }
 
+bool JpegSize(const uint8_t* data, size_t size, uint32_t& w, uint32_t& h) {
+    w = h = 0;
+    if (!data || size < 4 || data[0] != 0xFF || data[1] != 0xD8) return false;
+    size_t p = 2;
+    while (p + 4 <= size) {
+        if (data[p] != 0xFF) return false;
+        const uint8_t m = data[p + 1];
+        if (m == 0xFF) {  // fill byte
+            ++p;
+            continue;
+        }
+        if (m == 0x01 || (m >= 0xD0 && m <= 0xD8)) {  // no length
+            p += 2;
+            continue;
+        }
+        const size_t len = ((size_t)data[p + 2] << 8) | data[p + 3];
+        if (len < 2) return false;
+        // SOF0..SOF15, except DHT (C4), JPG (C8) and DAC (CC).
+        if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+            if (len < 7 || p + 9 > size) return false;
+            h = ((uint32_t)data[p + 5] << 8) | data[p + 6];
+            w = ((uint32_t)data[p + 7] << 8) | data[p + 8];
+            return w > 0 && h > 0;
+        }
+        if (m == 0xDA || m == 0xD9) return false;  // scan or end before a frame header
+        p += 2 + len;
+    }
+    return false;
+}
+
+bool ThumbnailIsWholeView(uint32_t w, uint32_t h, uint32_t viewW, uint32_t viewH) {
+    if (viewW == 0 || viewH == 0 || w == 0 || h == 0) return true;
+    // Aspects equal to the thumbnail's rounding: a pixel either way on its shorter side, and 2 %.
+    const double a = (double)w / h, v = (double)viewW / viewH;
+    const double slack = std::max(0.02, 1.0 / (double)std::min(w, h));
+    return std::fabs(a / v - 1.0) <= slack;
+}
+
+void PairEyeSizeOfView(uint32_t w, uint32_t h, uint32_t viewW, uint32_t viewH, float scale, uint32_t& ew,
+                       uint32_t& eh) {
+    PairEyeSize(w, h, scale, ew, eh);
+    if (viewW == 0 || viewH == 0) return;
+    double s = std::max((double)ew / viewW, (double)eh / viewH);  // cover
+    s = std::min(s, 1.0);                                          // never above the view
+    ew = std::max(1u, (uint32_t)std::lround(viewW * s));
+    eh = std::max(1u, (uint32_t)std::lround(viewH * s));
+}
+
 void ResizeRgba(const uint8_t* src, uint32_t w, uint32_t h, uint32_t ew, uint32_t eh, std::vector<uint8_t>& out) {
     out.assign((size_t)ew * eh * 4, 0);
     if (!src || w == 0 || h == 0 || ew == 0 || eh == 0) return;
@@ -227,19 +275,30 @@ bool StereoPairs::MakeOne(const Job& job, Thumbnail& out) {
     }
     if (!found || right.size == 0 || right.size > kMaxViewBytes || left.size > kMaxViewBytes) return false;
 
+    std::vector<uint8_t> rightBytes((size_t)right.size);
+    if (!readAt(right.offset, rightBytes.data(), rightBytes.size())) return false;
+    // The system's thumbnail stands in for the left view only if it is the whole view: a
+    // file's own EXIF thumbnail can be a centre crop (the NP02J camera's is square), and the whole right view decoded at
+    // its size would come out squeezed. Then both eyes are decoded at the view's aspect.
+    uint32_t vw = 0, vh = 0;
+    JpegSize(rightBytes.data(), rightBytes.size(), vw, vh);
+    const bool whole = ThumbnailIsWholeView(job.w, job.h, vw, vh);
+    const bool thumbIsView = left.base && whole;
     uint32_t ew = 0, eh = 0;
-    PairEyeSize(job.w, job.h, job.scale, ew, eh);
-    auto decodeSpan = [&](const LifLoader::ViewSpan& s, std::vector<uint8_t>& rgba) {
-        std::vector<uint8_t> bytes((size_t)s.size);
-        return readAt(s.offset, bytes.data(), bytes.size()) && decode_(bytes.data(), bytes.size(), ew, eh, rgba) &&
-               rgba.size() >= (size_t)ew * eh * 4;
+    if (whole)
+        PairEyeSize(job.w, job.h, job.scale, ew, eh);
+    else
+        PairEyeSizeOfView(job.w, job.h, vw, vh, job.scale, ew, eh);
+    auto decodeBytes = [&](const std::vector<uint8_t>& bytes, std::vector<uint8_t>& rgba) {
+        return decode_(bytes.data(), bytes.size(), ew, eh, rgba) && rgba.size() >= (size_t)ew * eh * 4;
     };
     std::vector<uint8_t> l, r;
-    if (!decodeSpan(right, r)) return false;
-    if (left.base) {
+    if (!decodeBytes(rightBytes, r)) return false;
+    if (thumbIsView) {
         ResizeRgba(job.left.data(), job.w, job.h, ew, eh, l);  // the system's thumbnail is this view
-    } else if (!decodeSpan(left, l)) {
-        return false;
+    } else {
+        std::vector<uint8_t> leftBytes((size_t)left.size);
+        if (!readAt(left.offset, leftBytes.data(), leftBytes.size()) || !decodeBytes(leftBytes, l)) return false;
     }
     out = Thumbnail{};
     out.id = job.id;
