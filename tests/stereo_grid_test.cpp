@@ -381,6 +381,76 @@ void TestStereoPairs() {
     CHECK(closed.size() == 2, "every descriptor closed (%zu)", closed.size());
 }
 
+// A platform whose MediaStore thumbnail is NOT the whole view (the NP02J's: a 512 x 512
+// centre crop of a 16:10 photo) must not get the whole right view squeezed into the crop's
+// size. The phone's thumbnails keep the aspect, and take the old path unchanged.
+void TestPairAspect() {
+    const std::vector<uint8_t> jpeg = SolidJpeg(320, 200, 1, 2, 3);
+    uint32_t w = 0, h = 0;
+    CHECK(JpegSize(jpeg.data(), jpeg.size(), w, h) && w == 320 && h == 200, "JPEG size %ux%u", w, h);
+    const uint8_t notJpeg[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    CHECK(!JpegSize(notJpeg, sizeof(notJpeg), w, h), "not a JPEG");
+
+    // The phone (LPD-20W) shapes: the thumbnail keeps the view's aspect, to rounding.
+    CHECK(ThumbnailIsWholeView(160, 100, 320, 200), "same aspect");
+    CHECK(ThumbnailIsWholeView(512, 320, 4656, 2910), "16:10 photo, aspect kept");
+    CHECK(ThumbnailIsWholeView(512, 288, 4656, 2619), "16:9 photo, aspect kept");
+    CHECK(ThumbnailIsWholeView(288, 512, 2619, 4656), "portrait photo, aspect kept");
+    CHECK(ThumbnailIsWholeView(512, 320, 0, 0), "view size unknown: as before");
+    // The tablet (NP02J): a square thumbnail of a 16:10 or 16:9 view.
+    CHECK(!ThumbnailIsWholeView(512, 512, 4656, 2910), "square crop of 16:10");
+    CHECK(!ThumbnailIsWholeView(512, 512, 4208, 2630), "square crop of the tablet camera's 16:10");
+    CHECK(!ThumbnailIsWholeView(512, 512, 2560, 1600), "square crop of 2560x1600");
+
+    uint32_t ew = 0, eh = 0;
+    PairEyeSizeOfView(512, 512, 4656, 2910, 0.75f, ew, eh);
+    CHECK(ew == 614 && eh == 384, "eye at the view's aspect, covering 384 x 384: %ux%u", ew, eh);
+    PairEyeSizeOfView(512, 512, 300, 200, 0.75f, ew, eh);
+    CHECK(ew == 300 && eh == 200, "never above the view: %ux%u", ew, eh);
+
+    // End to end: a two-view LIF (320 x 200 views, left red, right blue) whose thumbnail is a
+    // 100 x 100 crop. Both eyes come from the file at the view's aspect.
+    const std::vector<uint8_t> lif = TwoViewLif(SolidJpeg(320, 200, 220, 30, 30), SolidJpeg(320, 200, 30, 30, 220));
+    int decodes = 0;
+    StereoPairs pairs;
+    CHECK(pairs.Initialize(
+              [&](const uint8_t* d, size_t n, uint32_t dw, uint32_t dh, std::vector<uint8_t>& rgba) {
+                  ++decodes;
+                  const mp::DecodedImage img = mp::ImageDecoder::LoadFromMemory(d, n, "pair");
+                  if (!img.Valid()) return false;
+                  ResizeRgba(img.pixels.data(), (uint32_t)img.width, (uint32_t)img.height, dw, dh, rgba);
+                  return true;
+              },
+              [&](int fd, uint64_t off, void* dst, size_t n) {
+                  if (fd != 9 || off + n > lif.size()) return false;
+                  std::memcpy(dst, lif.data() + off, n);
+                  return true;
+              },
+              [](int) {}),
+          "pair maker starts");
+    std::vector<uint8_t> thumb((size_t)100 * 100 * 4);
+    for (size_t i = 0; i < thumb.size(); i += 4) thumb[i] = 220, thumb[i + 1] = 30, thumb[i + 2] = 30, thumb[i + 3] = 255;
+    pairs.Make(50, 1, 9, lif.size(), thumb.data(), 100, 100, 0.75f);
+    std::vector<Thumbnail> made;
+    std::vector<int64_t> failed;
+    for (int i = 0; i < 400 && made.empty() && failed.empty(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        pairs.TakeResults(made, failed);
+    }
+    CHECK(made.size() == 1 && failed.empty(), "a pair is made");
+    if (made.size() == 1) {
+        const Thumbnail& t = made[0];
+        // PairEyeSize(100, 100, 0.75) = 75 x 75, covered at 16:10: 120 x 75 per eye.
+        CHECK(t.width == 240 && t.height == 75, "eyes at the view's aspect: %ux%u", t.width, t.height);
+        const uint8_t* lp = &t.rgba[((size_t)37 * t.width + 60) * 4];
+        const uint8_t* rp = &t.rgba[((size_t)37 * t.width + 180) * 4];
+        CHECK(lp[0] > 150 && lp[2] < 100, "left eye: the LIF's first view (red)");
+        CHECK(rp[2] > 150 && rp[0] < 100, "right eye: the LIF's second view (blue)");
+    }
+    CHECK(decodes == 2, "both views decoded when the thumbnail is a crop (%d)", decodes);
+    pairs.Shutdown();
+}
+
 void TestThumbnailDepth() {
     const int E = 256, H = 256, W = 2 * E, d = 8;
     std::vector<uint8_t> rgba((size_t)W * H * 4, 255);
@@ -428,6 +498,7 @@ int main() {
     TestThumbnailDepth();
     TestPairHelpers();
     TestStereoPairs();
+    TestPairAspect();
     if (g_failures) {
         std::fprintf(stderr, "stereo_grid_test: %d failure(s)\n", g_failures);
         return 1;

@@ -166,7 +166,11 @@ eye in the left-eye views, its right eye in the others. Android only.
   low-priority worker reads where the second view is (`LifLoader::FindViews`: trailer and
   JSON only; `MpoLoader::FindSecondView`: the MP index in the head) and decodes just that
   JPEG at the eye size (the thumbnail times the 3D mode's view scale) with the platform's
-  scaled decoder (AImageDecoder, Android 11+). The left eye is the system's thumbnail. The
+  scaled decoder (AImageDecoder, Android 11+). The left eye is the system's thumbnail when
+  that is the whole view. Some devices' is not: the NP02J's MediaStore makes a 16:10 photo's
+  thumbnail a 512 x 512 centre crop, so the right view decoded at its size came out squeezed.
+  When the thumbnail's aspect is not the view's (`ThumbnailIsWholeView`, the view's size from
+  its JPEG header), both eyes are decoded from the file at the view's aspect. The
   pair is kept in memory (24 MB, by id and modified time). LIFs carry no embedded thumbnail
   or preview to use instead (checked on the phone's: base JPEG + one view blob, no EXIF
   thumbnail). Still flat: a one-view LIF (depth map only) and two-track videos.
