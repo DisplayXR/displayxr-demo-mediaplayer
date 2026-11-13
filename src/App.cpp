@@ -898,7 +898,9 @@ void App::RenderOneFrame() {
                 // on), recorded at CommitUpload; else (MEDIAPLAYER_ASYNC_UPLOAD=0, no free slot,
                 // a frame not staged above) staged now or copied here.
                 const bool i420 = (vf->format == PixFormat::I420);
-                if (!staged && (stageNow || !renderer_.StageFrame(ring, *vf)))
+                if (!staged && vf->format == PixFormat::V210) {  // raw v210 (#238): decoded on the GPU
+                    if (stageNow || !renderer_.StageFrame(ring, *vf)) renderer_.UploadV210(*vf);
+                } else if (!staged && (stageNow || !renderer_.StageFrame(ring, *vf)))
                     renderer_.UploadYUV(vf->plane[0].data(), vf->plane[1].data(),
                                         i420 ? vf->plane[2].data() : nullptr, (uint32_t)vf->width,
                                         (uint32_t)vf->height,
@@ -2359,7 +2361,11 @@ void App::SettleLiveLayout(const FrameRing::Frame& f, const char* tag) {
     contentAspect_ = PerEyeAspect(layout_, mediaW_, mediaH_);
     if (firstFrame) ResolveVr("", -1, 0.0f, mediaW_, mediaH_);  // no detection live; `P` pins (#155)
     LOG_INFO("%s: %dx%d %s frames, %s, per-eye aspect %.3f", tag, mediaW_, mediaH_,
-             f.format == PixFormat::NV12 ? "NV12" : "I420", LayoutLabel().c_str(),
+             f.format == PixFormat::NV12   ? "NV12"
+             : f.format == PixFormat::P016 ? "P016"
+             : f.format == PixFormat::V210 ? "v210"
+                                           : "I420",
+             LayoutLabel().c_str(),
              contentAspect_);
 }
 
@@ -2914,7 +2920,9 @@ void App::SampleAutoConv(const FrameRing::Frame& f) {
     // step or a seek lands here as a new frame and is picked up there, unthrottled).
     if (isVideo_ && (video_.Paused() || video_.Ended())) return;
     // Zero-copy (#28) frames carry no CPU pixels: not measured (the CPU path is the default).
-    if (f.gpu || f.plane[0].empty() || f.width < 64 || f.height < 32) return;
+    // Raw v210 (#238 phase 1) has no 8-bit luma plane to measure yet (phase 2: a decimated
+    // decode of the card rows).
+    if (f.gpu || f.format == PixFormat::V210 || f.plane[0].empty() || f.width < 64 || f.height < 32) return;
     const double nowMs = CameraSource::NowSeconds() * 1000.0;
     if (nowMs - autoConvLastSubmitMs_ < 200.0) return;  // ~5 Hz
     SubmitAutoConv(AutoConvLuma8(f), f.width, f.height, nowMs);
@@ -3579,7 +3587,8 @@ void App::ResetConvertStream() {
 void App::SubmitConvertFrame(const FrameRing::Frame& f, double nowSec) {
     // Latest-wins: only when nothing is in flight, never every decoded frame. A zero-copy
     // GPU frame (#28, Windows opt-in) carries no CPU planes, so it cannot be submitted here.
-    if (!lift_.WantsFrame(nowSec) || f.gpu || f.width <= 0 || f.height <= 0) return;
+    // Raw v210 (#238 phase 1): not a format the converter takes yet.
+    if (!lift_.WantsFrame(nowSec) || f.gpu || f.format == PixFormat::V210 || f.width <= 0 || f.height <= 0) return;
     const int fmt = f.format == PixFormat::I420   ? 0
                     : f.format == PixFormat::NV12 ? 1
                     : f.format == PixFormat::P016 ? 2

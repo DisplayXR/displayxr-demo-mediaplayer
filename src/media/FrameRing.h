@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -29,7 +30,10 @@ namespace mp {
 
 // P016: NV12 layout with 16-bit samples, MSB-aligned (P010 is the 10-bit case). Pro's
 // 10-bit capture (DeckLink v210) publishes it; the base player never does.
-enum class PixFormat { I420, NV12, RGBA, P016 };  // 3-plane, 2-plane, packed RGBA (zero-copy #28), 16-bit 2-plane
+// V210: a capture card's raw 10-bit 4:2:2 rows, one eye per plane, decoded on the GPU (#238,
+// opt-in MEDIAPLAYER_GPU_V210; layout in media/V210.h). Only a producer that saw
+// v210::GpuDecodeActive() publishes it.
+enum class PixFormat { I420, NV12, RGBA, P016, V210 };  // 3-plane, 2-plane, packed RGBA (zero-copy #28), 16-bit 2-plane, raw v210
 
 // Y'CbCr -> R'G'B' matrix of a YUV frame. The value is what the renderer pushes to the
 // MP_GRADE shader (`yuvMatrix`), so BT709 must stay 0: every producer that never sets it
@@ -64,6 +68,26 @@ public:
         int width = 0;                // luma width/height (full frame, both eyes for SBS)
         int height = 0;
         PixFormat format = PixFormat::I420;
+        int eyes = 1;                 // V210 only: eye planes side by side (plane[0] left, plane[1] right)
+        // V210 only, zero-copy (#238 phase 3, MEDIAPLAYER_ZERO_COPY_UPLOAD; media/HostBlocks.h): eye
+        // e's rows live in host memory the producer owns, not in plane[e] (left empty). `block`
+        // keeps the memory (the renderer imports it once, keyed by `id`); `hold` keeps the
+        // contents: the renderer copies it for each GPU frame that reads them and drops it once
+        // that frame has passed its fence, so the producer never refills rows the GPU still
+        // reads. A producer that publishes anything else into this buffer clears them (ClearExt).
+        struct ExtPlane {
+            const uint8_t* data = nullptr;
+            size_t bytes = 0;
+            uint64_t id = 0;
+            std::shared_ptr<const void> block;
+            std::shared_ptr<void> hold;
+        };
+        ExtPlane ext[2];
+        bool HasExt() const { return ext[0].data != nullptr; }
+        void ClearExt() {
+            ext[0] = ExtPlane{};
+            ext[1] = ExtPlane{};
+        }
         bool fullRange = false;       // JPEG/full vs MPEG/limited range
         ColorMatrix matrix = ColorMatrix::BT709;      // YUV matrix (ignored for RGBA)
         ColorTransfer transfer = ColorTransfer::SDR;  // Pro tone-maps HDR (#134)

@@ -13,6 +13,8 @@
 #include "dxr_weave_snap.h"    // ...and the drag's phase snap (XR_DXR_weave)
 #endif
 
+#include "media/V210.h"  // v210::Requested (MEDIAPLAYER_ZERO_COPY_UPLOAD)
+
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -502,6 +504,16 @@ bool XrSession::CreateVulkanDevice() {
     zeroCopyCapable_ = deviceHas("VK_KHR_external_memory_win32") &&
                        deviceHas("VK_KHR_win32_keyed_mutex");
 #endif
+
+    // Zero-copy upload of capture rows (#238 phase 3, MEDIAPLAYER_ZERO_COPY_UPLOAD): a producer's host
+    // blocks imported as buffers and read in place. Only when the switch is on, so the default
+    // device is unchanged (VulkanRenderer::InitZeroCopy decides whether it is used).
+    if (v210::Requested(std::getenv("MEDIAPLAYER_ZERO_COPY_UPLOAD")) && deviceHas("VK_EXT_external_memory_host")) {
+        bool haveExtMem = false;
+        for (const char* n : devExtPtrs) haveExtMem = haveExtMem || strcmp(n, "VK_KHR_external_memory") == 0;
+        if (!haveExtMem && deviceHas("VK_KHR_external_memory")) devExtPtrs.push_back("VK_KHR_external_memory");
+        devExtPtrs.push_back("VK_EXT_external_memory_host");
+    }
 
     for (const char* n : devExtPtrs) LOG_INFO("  VkDevice ext (app): %s", n);
 

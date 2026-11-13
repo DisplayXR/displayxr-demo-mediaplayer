@@ -481,6 +481,7 @@ function(mp_add_player tgt is_pro)
             src/pro/TestSignalSource.cpp # synthetic stereo rig (no hardware)
             src/pro/TimecodePairer.cpp   # two-input stereo pairing by SMPTE timecode
             src/pro/DirectPair.cpp       # ... each eye converted straight into its half of the ring frame
+            src/pro/ProEnvFile.cpp       # pro.env: per-machine settings that survive a reinstall
             src/pro/DeckLinkSource.cpp   # Blackmagic DeckLink SDI / HDMI input
             src/pro/DeckLinkSpec.cpp     # the DeckLink input spec + setup dialog fields (no SDK)
             src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
@@ -911,6 +912,17 @@ if(MP_BUILD_TESTS)
     target_include_directories(live_convert_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(live_convert_test PRIVATE Threads::Threads)
     add_test(NAME live_convert COMMAND live_convert_test)
+    # The GPU v210 decode (#238): the compute shader's own arithmetic (shaders/v210_decode.inc,
+    # compiled as C++ by media/V210.h) against the CPU v210 -> P016 convert, bit for bit, at
+    # widths with and without the 48-px row padding; the frame's staging layout; the test
+    # signal's v210 arms.
+    add_executable(v210_test tests/v210_test.cpp src/rhi/AsyncUpload.cpp src/rhi/BandCopy.cpp src/pro/LivePixels.cpp
+        src/pro/ConvertPool.cpp src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp
+        src/Log.cpp)
+    target_include_directories(v210_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_link_libraries(v210_test PRIVATE Threads::Threads)
+    add_test(NAME v210 COMMAND v210_test)
     add_executable(qc_report_test tests/qc_report_test.cpp src/pro/QcReport.cpp)
     target_include_directories(qc_report_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME qc_report COMMAND qc_report_test)
@@ -937,6 +949,22 @@ if(MP_BUILD_TESTS)
     target_include_directories(direct_pair_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(direct_pair_test PRIVATE Threads::Threads)
     add_test(NAME direct_pair COMMAND direct_pair_test)
+    # The capture path's A/B levers (docs/CAPTURE-LEVERS.md): pro.env parsing and precedence,
+    # the lever table, the pin lists, and LiveSourceBase::PublishV210 (raw v210 moved, not
+    # copied, into the ring: byte for byte, the renderer's shape, refused shapes untouched).
+    add_executable(capture_levers_test tests/capture_levers_test.cpp src/pro/LiveSourceBase.cpp
+        src/pro/ConvertPool.cpp src/pro/LivePixels.cpp)
+    target_include_directories(capture_levers_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(capture_levers_test PRIVATE Threads::Threads)
+    add_test(NAME capture_levers COMMAND capture_levers_test)
+    # Zero-copy upload (#238 phase 3, media/HostBlocks.h): block pool lifetimes and caps,
+    # external-plane v210 frames (Shape / EyeRows / never staged by the upload thread), the
+    # renderer's hold-until-the-fence rule, and publishes clearing leftover external planes.
+    add_executable(zero_copy_test tests/zero_copy_test.cpp src/pro/LiveSourceBase.cpp
+        src/pro/ConvertPool.cpp src/pro/LivePixels.cpp src/rhi/AsyncUpload.cpp src/rhi/BandCopy.cpp)
+    target_include_directories(zero_copy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(zero_copy_test PRIVATE Threads::Threads)
+    add_test(NAME zero_copy COMMAND zero_copy_test)
     add_executable(resolve_link_test tests/resolve_link_test.cpp src/pro/ResolveLink.cpp)
     target_include_directories(resolve_link_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(resolve_link_test PRIVATE nlohmann_json::nlohmann_json)

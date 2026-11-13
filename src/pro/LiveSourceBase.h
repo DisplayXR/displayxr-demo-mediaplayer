@@ -11,6 +11,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace mp::livepix {
 class ConvertPool;  // pro/ConvertPool.h
@@ -64,6 +65,23 @@ protected:
     // PublishPair tags a pair of two eyeW x eyeH eyes (the left eye's matrix and transfer).
     void PublishPairFrame(FrameRing::Frame* f, int eyeW, int eyeH, ColorMatrix matrix, ColorTransfer transfer,
                           bool fullRange, double captureSec, const char* timecode, int eyeOffsetFrames);
+    // ---- Raw v210 (#238 phase 2, MEDIAPLAYER_DECKLINK_RAW_V210; media/V210.h): the card's rows
+    // as they are, decoded on the GPU. eye[e] (e < eyes, 1 or 2) holds eye e's rows,
+    // v210::RowBytes(eyeW) bytes each, h rows (at least that many bytes). They are MOVED into
+    // the ring frame by swapping vectors, not copied: each eye[e] comes back holding the ring
+    // buffer's previous plane, to refill (the same size after warm-up, so no allocation).
+    // eyeW and h even. False (nothing published, nothing swapped) for a shape the renderer
+    // would refuse. Only while v210::GpuDecodeActive().
+    bool PublishV210(std::vector<uint8_t>* const eye[2], int eyes, int eyeW, int h, ColorMatrix matrix,
+                     ColorTransfer transfer, bool fullRange, double captureSec, const char* timecode,
+                     int eyeOffsetFrames);
+    // The same with the rows left where they are (zero-copy, #238 phase 3): eye[e] is the host
+    // block holding eye e's rows (FrameRing::Frame::ExtPlane: the block, and a hold on its
+    // contents); the ring frame takes copies of both, and the renderer reads the block in place.
+    // False (nothing published) for a shape the renderer would refuse.
+    bool PublishV210Ext(const FrameRing::Frame::ExtPlane* const eye[2], int eyes, int eyeW, int h, ColorMatrix matrix,
+                        ColorTransfer transfer, bool fullRange, double captureSec, const char* timecode,
+                        int eyeOffsetFrames);
     // A frame the source had to skip before converting it (LiveStats::lateFrames).
     void CountLate();
     // Streaming (or Opening) -> Stalled when nothing was published for stallSec since

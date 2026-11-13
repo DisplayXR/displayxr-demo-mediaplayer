@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pro/LiveSourceBase.h"
 
+#include "media/V210.h"
 #include "pro/ConvertPool.h"
 
 #include <algorithm>
@@ -69,6 +70,8 @@ void LiveSourceBase::Publish(const livepix::Nv12& src, bool fullRange, double ca
     f.width = src.width;
     f.height = src.height;
     f.format = PixFormat::NV12;
+    f.eyes = 1;
+    f.ClearExt();
     f.fullRange = fullRange;
     f.gpu = false;
     f.gpuSharedTexture = nullptr;
@@ -93,6 +96,8 @@ void LiveSourceBase::Publish(const livepix::P016& src, bool fullRange, double ca
     f.width = src.width;
     f.height = src.height;
     f.format = PixFormat::P016;
+    f.eyes = 1;
+    f.ClearExt();
     f.fullRange = fullRange;
     f.gpu = false;
     f.gpuSharedTexture = nullptr;
@@ -115,6 +120,8 @@ void LiveSourceBase::TagPair(FrameRing::Frame& f, int w, int h, ColorMatrix matr
     f.width = w;
     f.height = h;
     f.format = PixFormat::P016;
+    f.eyes = 1;
+    f.ClearExt();
     f.fullRange = fullRange;
     f.gpu = false;
     f.gpuSharedTexture = nullptr;
@@ -166,6 +173,65 @@ void LiveSourceBase::PublishPairFrame(FrameRing::Frame* f, int eyeW, int eyeH, C
     const int w = 2 * eyeW;
     TagPair(*f, w, eyeH, matrix, transfer, fullRange, captureSec, timecode);
     Published(w, eyeH, fullRange, eyeOffsetFrames, ring_.PublishReserved(f));
+}
+
+bool LiveSourceBase::PublishV210(std::vector<uint8_t>* const eye[2], int eyes, int eyeW, int h, ColorMatrix matrix,
+                                 ColorTransfer transfer, bool fullRange, double captureSec, const char* timecode,
+                                 int eyeOffsetFrames) {
+    if ((eyes != 1 && eyes != 2) || eyeW <= 0 || (eyeW & 1) || h <= 0 || (h & 1)) return false;
+    const size_t bytes = v210::RowBytes(eyeW) * (size_t)h;
+    for (int e = 0; e < eyes; ++e)
+        if (!eye[e] || eye[e]->size() < bytes) return false;
+    FrameRing::Frame& f = ring_.WriteBuffer();
+    for (int e = 0; e < eyes; ++e) f.plane[e].swap(*eye[e]);  // a move: no pixel copy
+    for (int e = eyes; e < 3; ++e) f.plane[e].clear();
+    f.width = eyes * eyeW;
+    f.height = h;
+    f.format = PixFormat::V210;
+    f.eyes = eyes;
+    f.ClearExt();
+    f.fullRange = fullRange;
+    f.gpu = false;
+    f.gpuSharedTexture = nullptr;
+    f.gpuSharedHandle = nullptr;
+    f.captureSec = captureSec;
+    f.matrix = matrix;
+    f.transfer = transfer;
+    std::memset(f.timecode, 0, sizeof(f.timecode));
+    if (timecode) std::strncpy(f.timecode, timecode, sizeof(f.timecode) - 1);
+    Published(eyes * eyeW, h, fullRange, eyeOffsetFrames, ring_.Publish());
+    return true;
+}
+
+bool LiveSourceBase::PublishV210Ext(const FrameRing::Frame::ExtPlane* const eye[2], int eyes, int eyeW, int h,
+                                    ColorMatrix matrix, ColorTransfer transfer, bool fullRange, double captureSec,
+                                    const char* timecode, int eyeOffsetFrames) {
+    if ((eyes != 1 && eyes != 2) || eyeW <= 0 || (eyeW & 1) || h <= 0 || (h & 1)) return false;
+    const size_t bytes = v210::RowBytes(eyeW) * (size_t)h;
+    for (int e = 0; e < eyes; ++e)
+        if (!eye[e] || !eye[e]->data || eye[e]->bytes < bytes || !eye[e]->block || !eye[e]->hold) return false;
+    FrameRing::Frame& f = ring_.WriteBuffer();
+    f.ClearExt();
+    for (int e = 0; e < eyes; ++e) {
+        f.ext[e] = *eye[e];
+        f.plane[e].clear();  // (capacity kept for a later plane[] publish)
+    }
+    f.plane[2].clear();
+    f.width = eyes * eyeW;
+    f.height = h;
+    f.format = PixFormat::V210;
+    f.eyes = eyes;
+    f.fullRange = fullRange;
+    f.gpu = false;
+    f.gpuSharedTexture = nullptr;
+    f.gpuSharedHandle = nullptr;
+    f.captureSec = captureSec;
+    f.matrix = matrix;
+    f.transfer = transfer;
+    std::memset(f.timecode, 0, sizeof(f.timecode));
+    if (timecode) std::strncpy(f.timecode, timecode, sizeof(f.timecode) - 1);
+    Published(eyes * eyeW, h, fullRange, eyeOffsetFrames, ring_.Publish());
+    return true;
 }
 
 void LiveSourceBase::CountLate() {

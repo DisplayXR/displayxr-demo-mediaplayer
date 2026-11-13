@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "rhi/AsyncUpload.h"
 
+#include "media/V210.h"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <string>
 #include <system_error>
+
+#include "platform/ThreadPin.h"
 
 namespace mp::asyncup {
 
@@ -36,6 +40,7 @@ int UploadFormat(PixFormat f) {
         case PixFormat::I420: return 0;
         case PixFormat::NV12: return 1;
         case PixFormat::P016: return 2;
+        case PixFormat::V210: return 3;
         default: return -1;  // RGBA: not a planar YUV frame
     }
 }
@@ -72,9 +77,28 @@ bool LayoutFor(int format, uint32_t w, uint32_t h, Layout& out) {
     return true;
 }
 
-bool LayoutFor(const FrameRing::Frame& f, Layout& out) {
+bool LayoutFor(const FrameRing::Frame& f, Layout& out, bool v210) {
     out = Layout{};
     if (f.gpu || f.width <= 0 || f.height <= 0) return false;
+    if (f.format == PixFormat::V210) {  // each eye's rows, raw: the GPU decodes them (#238)
+        // Rows in the producer's host blocks (zero-copy, #238 phase 3): nothing to copy, the render
+        // thread records the GPU's read of them in place.
+        if (f.HasExt()) return false;
+        int eyes = 0, eyeW = 0;
+        if (!v210 || !v210::Shape(f, eyes, eyeW)) return false;
+        out.format = 3;
+        size_t off = 0;
+        for (int e = 0; e < eyes; ++e) {
+            out.w[e] = (uint32_t)eyeW;
+            out.h[e] = (uint32_t)f.height;
+            out.rowBytes[e] = v210::RowBytes(eyeW);
+            out.offset[e] = off;
+            off = AlignUp(off + out.rowBytes[e] * out.h[e], kPlaneAlign);
+        }
+        out.planes = eyes;
+        out.total = off;
+        return true;
+    }
     if (!LayoutFor(UploadFormat(f.format), (uint32_t)f.width, (uint32_t)f.height, out)) return false;
     for (int p = 0; p < out.planes; ++p)
         if (f.plane[p].size() < out.rowBytes[p] * out.h[p]) {
@@ -291,7 +315,7 @@ Ticket Uploader::Claim(const FrameRing* ring, const FrameRing::Frame& f) {
             Layout layout;
             // Not a staged format, or (never: the render thread waits for each on-demand copy
             // before its next take) one still pending: the render thread copies it itself.
-            if (!LayoutFor(f, layout) || job_.t.Valid()) {
+            if (!LayoutFor(f, layout, v210_) || job_.t.Valid()) {
                 t = Ticket{};
             } else {
                 t = table_.Reserve(ring, f.serial, /*ahead=*/false);
@@ -387,7 +411,7 @@ bool Uploader::NextWorkLocked(Work& w) {
         if (!f) return false;
         lastAhead_ = f->serial;
         Layout layout;
-        if (!LayoutFor(*f, layout)) {  // not a frame the renderer stages: the render thread uploads it
+        if (!LayoutFor(*f, layout, v210_)) {  // not a frame the renderer stages: the render thread uploads it
             src_->Unpin(f);
             continue;
         }
@@ -410,7 +434,7 @@ void Uploader::Copy(const Work& w, bool& ok, double& ms, int& threads) {
     ok = dst != nullptr;
     if (ok) {
         if (!pool_ && copyThreads_ > 1 && bandcopy::BandsFor(w.layout.total, copyThreads_) > 1)
-            pool_ = std::make_unique<bandcopy::Pool>(copyThreads_);
+            pool_ = std::make_unique<bandcopy::Pool>(copyThreads_, pinGroup_);
         for (int p = 0; p < w.layout.planes; ++p) {
             const size_t rb = w.layout.rowBytes[p];
             threads = std::max(threads, bandcopy::CopyRows(pool_.get(), dst + w.layout.offset[p], rb,
@@ -421,6 +445,11 @@ void Uploader::Copy(const Work& w, bool& ok, double& ms, int& threads) {
 }
 
 void Uploader::Loop() {
+    // MEDIAPLAYER_UPLOAD_PIN (a capture-path A/B lever, docs/CAPTURE-LEVERS.md): the upload
+    // thread and its copy threads on one last-level-cache group; "auto" = group 2, clear of
+    // the two DeckLink lanes' default groups (0 and 1, MEDIAPLAYER_CAPTURE_PIN). Unset: not pinned.
+    pinGroup_ = pin::GroupFromEnv(std::getenv("MEDIAPLAYER_UPLOAD_PIN"), 0, 2);
+    pin::PinCurrentThread(pinGroup_);
     uint64_t seen = 0;
     for (;;) {
         {
