@@ -111,6 +111,28 @@ public:
     Decision Add(int eye, int slot, int key, double arrived, double period, int clockKey = -1);
     bool ByClock() const { return byClock_; }
 
+    // ---- Direct pairing (DeckLinkSource, pro/DirectPair.h): a lane converts a frame straight
+    // into its half of the side-by-side ring frame when it knows, BEFORE converting, the key
+    // the frame will pair by. Read-only views of the state above; they never change a decision.
+    // The key a frame with timecode key `tcKey` and clock key `clockKey` (Add's arguments) will
+    // be paired by, in the domain in use: -1 when it can only go the old way - the pairer is
+    // not matching by key right now (no pair matched yet, or the last one shown was newest of
+    // each / refused, or it just changed domain or jumped), the frame has no key in this domain,
+    // or its key is not newer than the last one shown (timecode held still, a rewind).
+    int DirectKey(int tcKey, int clockKey) const {
+        if (!keyed_) return -1;
+        const int k = byClock_ ? clockKey : tcKey;
+        return k >= 0 && k > lastKey_ ? k : -1;
+    }
+    // The last pair shown was matched by key (a common timecode or clock instant) in the
+    // domain in use, and no domain change or jump has happened since.
+    bool Keyed() const { return keyed_; }
+    // The key of the last pair shown, in the domain in use (-1: none yet, or after a jump).
+    int LastKey() const { return lastKey_; }
+    // Bumped whenever remembered keys stop meaning what they meant: a change of domain
+    // (UseClock), a rewind or jump back, Reset. Direct entries are good for one epoch.
+    uint32_t Epoch() const { return epoch_; }
+
 private:
     void Match(int eye, double period, Decision& d);
     void UseClock(bool on);  // re-key every remembered frame in the other domain
@@ -127,6 +149,8 @@ private:
     int newest_[2] = {-1, -1};
     int lastKey_ = -1;
     int sincePublish_ = 0;  // left-eye frames since the last publish (safety valve)
+    bool keyed_ = false;    // Keyed()
+    uint32_t epoch_ = 0;    // Epoch()
 };
 
 }  // namespace mp

@@ -12,6 +12,12 @@
 // In queue mode the renderer's upload thread may pin the next waiting frame and copy it into
 // GPU staging before the consumer takes it (PinNextQueued, rhi/AsyncUpload.h); a pinned
 // buffer is never handed back to the producer until it is unpinned.
+//
+// Also in queue mode, a producer may RESERVE free buffers and fill them outside the
+// WriteBuffer()/Publish() pair (Media Player Pro's DeckLink direct pairing: each eye's lane
+// converts straight into its half of the side-by-side frame), then publish or cancel each.
+// A reserved buffer is in no queue until published, so the consumer and the upload thread
+// never see it half-written; nobody else uses the ring this way.
 #pragma once
 
 #include <algorithm>
@@ -81,6 +87,8 @@ public:
     };
 
     static constexpr int kBufferCount = 3;  // slots the latest-wins mode uses (the decoder's GPU slots)
+    static constexpr int kMaxQueueDepth = 4;  // queue mode's deepest queue (SetQueueDepth clamps)
+    static constexpr int kMaxReserved = 3;    // reserved buffers out at once (ReserveBuffer)
     Frame& BufferSlot(int i) { return buffers_[i]; }  // producer-side GPU resource mgmt
 
     // Queue mode (live sources): instead of latest-wins, published frames wait in a short
@@ -93,14 +101,14 @@ public:
     // Call before the producer starts; 0 = latest-wins (the default).
     void SetQueueDepth(int depth) {
         std::lock_guard<std::mutex> lk(mutex_);
-        // At most kMaxBuffers - 3: the producer's, the consumer's and a pinned one (below)
-        // must fit beside a full queue.
-        queueDepth_ = depth <= 0 ? 0 : std::min(std::max(depth, 2), kMaxBuffers - 3);
+        // At most kMaxQueueDepth: the producer's, the consumer's, a pinned one (below) and
+        // kMaxReserved reserved ones must fit beside a full queue.
+        queueDepth_ = depth <= 0 ? 0 : std::min(std::max(depth, 2), kMaxQueueDepth);
         queueLen_ = 0;
         queueHead_ = 0;
         freeCount_ = 0;
         for (int i = 0; i < kMaxBuffers; ++i)
-            if (i != producer_ && i != consumer_ && i != pinned_) free_[freeCount_++] = i;
+            if (i != producer_ && i != consumer_ && i != pinned_ && !reserved_[i]) free_[freeCount_++] = i;
         // A pin held across this goes to the free list at Unpin, unless it is the consumer's
         // (that one is released when the consumer moves on, as any other).
         pinnedParked_ = pinned_ >= 0 && pinned_ != consumer_;
@@ -138,7 +146,8 @@ public:
             }
             queue_[(queueHead_ + queueLen_) % kMaxBuffers] = producer_;
             ++queueLen_;
-            producer_ = free_[--freeCount_];  // never the pinned buffer (ReleaseLocked parks it)
+            // never the pinned buffer (ReleaseLocked parks it) nor a reserved one (not free)
+            producer_ = free_[--freeCount_];
             everPublished_ = true;
         } else {
             std::swap(producer_, middle_);
@@ -147,6 +156,62 @@ public:
         }
         if (publishHook_) publishHook_(publishHookCtx_);
         return dropped;
+    }
+
+    // --- Reserved buffers (queue mode; Pro's DeckLink direct pairing) ---
+    // A free buffer the producer fills itself, possibly from several threads (each writing
+    // its own part), then hands over with PublishReserved() or gives back with
+    // CancelReserved(). It was free when taken, so neither the consumer nor a pin holds it,
+    // and until it is published it is in no queue: AcquireLatest() never returns it and
+    // PinNextQueued() never pins it. nullptr in latest-wins mode or with kMaxReserved out.
+    // Never so many that Publish() could find no free buffer: kMaxBuffers counts the
+    // producer's, the consumer's, a full queue (kMaxQueueDepth), a parked pin and
+    // kMaxReserved, so a free one is always left for Publish().
+    Frame* ReserveBuffer() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (queueDepth_ <= 0 || reservedCount_ >= kMaxReserved || freeCount_ <= 0) return nullptr;
+        const int b = free_[--freeCount_];
+        reserved_[b] = true;
+        ++reservedCount_;
+        return &buffers_[b];
+    }
+    // Publishes a reserved buffer as Publish() publishes WriteBuffer(): a new serial, the
+    // oldest waiting frame dropped when the queue is full (returns true then), the publish
+    // hook. WriteBuffer() is unchanged. The caller keeps all publishes (this and Publish())
+    // on one thread at a time, as for Publish(). Nothing for a buffer that is not reserved.
+    bool PublishReserved(Frame* f) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        const int b = ReservedIndexLocked(f);
+        if (b < 0) return false;
+        reserved_[b] = false;
+        --reservedCount_;
+        if (queueDepth_ <= 0) return false;  // (latest-wins since the reserve: SetQueueDepth's caller's error)
+        buffers_[b].serial = ++serial_;
+        bool dropped = false;
+        if (queueLen_ == queueDepth_) {  // full: drop the oldest waiting frame
+            ReleaseLocked(queue_[queueHead_]);
+            queueHead_ = (queueHead_ + 1) % kMaxBuffers;
+            --queueLen_;
+            dropped = true;
+        }
+        queue_[(queueHead_ + queueLen_) % kMaxBuffers] = b;
+        ++queueLen_;
+        everPublished_ = true;
+        if (publishHook_) publishHook_(publishHookCtx_);
+        return dropped;
+    }
+    // A reserved buffer back to the free list, unpublished (it was never anyone else's).
+    void CancelReserved(Frame* f) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        const int b = ReservedIndexLocked(f);
+        if (b < 0) return;
+        reserved_[b] = false;
+        --reservedCount_;
+        if (queueDepth_ > 0) free_[freeCount_++] = b;
+    }
+    int ReservedCount() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return reservedCount_;
     }
 
     // --- Pre-staging (the renderer's upload thread, rhi/AsyncUpload.h) ---
@@ -204,7 +269,15 @@ public:
     }
 
 private:
-    static constexpr int kMaxBuffers = 7;  // producer + consumer + up to 4 waiting + 1 pinned
+    // producer + consumer + up to 4 waiting + 1 pinned + up to 3 reserved. A buffer's planes
+    // are allocated on its first use, so the ones a source never reaches cost nothing.
+    static constexpr int kMaxBuffers = 3 + kMaxQueueDepth + kMaxReserved;
+
+    int ReservedIndexLocked(const Frame* f) const {
+        for (int b = 0; b < kMaxBuffers; ++b)
+            if (f == &buffers_[b]) return reserved_[b] ? b : -1;
+        return -1;
+    }
 
     // A queue-mode buffer the ring is done with: back to the free list, or parked until
     // Unpin() when it is pinned (the upload thread is still copying it).
@@ -265,6 +338,9 @@ private:
     // pinned (it goes to the free list at Unpin).
     int pinned_ = -1;
     bool pinnedParked_ = false;
+    // Reserved buffers (queue mode): out of the free list, in no queue.
+    bool reserved_[kMaxBuffers] = {};
+    int reservedCount_ = 0;
     PublishHook publishHook_ = nullptr;
     void* publishHookCtx_ = nullptr;
 };

@@ -135,6 +135,127 @@ int main() {
         CHECK(ring.AcquireLatest() == nullptr);
         CHECK(ring.RepeatedFrames() == 0);
     }
+    // 7. Reserved buffers (Pro's DeckLink direct pairing). Latest-wins has none; queue mode
+    //    hands out at most kMaxReserved, never one the consumer, a pin or the queue holds,
+    //    and never so many that Publish() finds no free buffer.
+    {
+        FrameRing lw;
+        CHECK(lw.ReserveBuffer() == nullptr);
+
+        FrameRing ring;
+        ring.SetQueueDepth(FrameRing::kMaxQueueDepth);  // the deepest queue: the tightest count
+        for (int k = 0; k < FrameRing::kMaxQueueDepth; ++k) {  // fill the queue
+            ring.WriteBuffer().plane[0].assign(1, (uint8_t)(10 + k));
+            ring.Publish();
+        }
+        const FrameRing::Frame* taken = ring.AcquireLatest();  // the consumer holds one
+        const FrameRing::Frame* pin = ring.PinNextQueued(taken->serial);  // the upload thread pins one
+        CHECK(taken && pin);
+        FrameRing::Frame* res[FrameRing::kMaxReserved + 1] = {};
+        for (int i = 0; i <= FrameRing::kMaxReserved; ++i) res[i] = ring.ReserveBuffer();
+        for (int i = 0; i < FrameRing::kMaxReserved; ++i) {
+            CHECK(res[i] != nullptr);
+            CHECK(res[i] != taken && res[i] != pin && res[i] != &ring.WriteBuffer());
+            for (int j = 0; j < i; ++j) CHECK(res[i] != res[j]);
+        }
+        CHECK(res[FrameRing::kMaxReserved] == nullptr);  // kMaxReserved at most
+        CHECK(ring.ReservedCount() == FrameRing::kMaxReserved);
+        // A reserved buffer is in no queue: the consumer and the pin never see it.
+        for (int i = 0; i < FrameRing::kMaxReserved; ++i) res[i]->plane[0].assign(1, (uint8_t)(100 + i));
+        int seen = 0;
+        while (const FrameRing::Frame* f = ring.AcquireLatest()) {
+            for (int i = 0; i < FrameRing::kMaxReserved; ++i) CHECK(f != res[i]);
+            ++seen;
+        }
+        CHECK(seen == FrameRing::kMaxQueueDepth - 1);
+        // With every reservation out, a full queue and a parked pin, Publish() still has a
+        // free buffer, every time (the count kMaxBuffers is built from).
+        ring.Unpin(pin);
+        for (int k = 0; k < FrameRing::kMaxQueueDepth; ++k) {
+            ring.WriteBuffer();
+            ring.Publish();
+        }
+        const FrameRing::Frame* pin2 = ring.PinNextQueued(0);  // pinned at the head of a full queue...
+        CHECK(pin2 != nullptr);
+        for (int k = 0; k < 50; ++k) {  // ...dropped and parked by the publishes that follow
+            FrameRing::Frame& w = ring.WriteBuffer();
+            for (int i = 0; i < FrameRing::kMaxReserved; ++i) CHECK(&w != res[i]);
+            CHECK(&w != pin2);
+            ring.Publish();
+        }
+        for (int i = 0; i < FrameRing::kMaxReserved; ++i) CHECK(res[i]->plane[0][0] == (uint8_t)(100 + i));
+        // Publishing a reserved buffer: a new serial, drop-oldest on a full queue, in order.
+        const bool dropped = ring.PublishReserved(res[0]);
+        CHECK(dropped);  // the queue was full
+        CHECK(ring.ReservedCount() == FrameRing::kMaxReserved - 1);
+        CHECK(!ring.PublishReserved(res[0]));  // not reserved any more: nothing
+        const FrameRing::Frame* last = nullptr;
+        while (const FrameRing::Frame* f = ring.AcquireLatest()) last = f;
+        CHECK(last == res[0] && last->plane[0][0] == 100);  // the newest, taken last
+        // Cancel: back to the free list, never queued.
+        ring.CancelReserved(res[1]);
+        ring.CancelReserved(res[1]);  // twice: nothing
+        CHECK(ring.ReservedCount() == FrameRing::kMaxReserved - 2);
+        CHECK(ring.AcquireLatest() == nullptr);
+        ring.Unpin(pin2);
+        ring.CancelReserved(res[2]);
+        CHECK(ring.ReservedCount() == 0);
+    }
+    // 8. A ring that publishes reserved buffers and its twin that publishes WriteBuffer() see
+    //    the same cadence: drops, trims, repeats and the frames taken, under a pin.
+    {
+        std::mt19937 rng(99);
+        FrameRing a, b;
+        a.SetQueueDepth(3);
+        b.SetQueueDepth(3);
+        long dropsA = 0, dropsB = 0, k = 0;
+        // reservations kept out meanwhile (a lane's half still converting): up to all but one
+        FrameRing::Frame* held[FrameRing::kMaxReserved - 1] = {};
+        const FrameRing::Frame* pin = nullptr;
+        for (int step = 0; step < 40000; ++step) {
+            const unsigned r = rng() % 100;
+            if (r < 47) {  // a frame: through a reserved buffer on a, the old way on b
+                ++k;
+                FrameRing::Frame* f = a.ReserveBuffer();
+                CHECK(f != nullptr);
+                if (!f) break;
+                f->plane[0].assign(1, (uint8_t)k);
+                b.WriteBuffer().plane[0].assign(1, (uint8_t)k);
+                dropsA += a.PublishReserved(f) ? 1 : 0;
+                dropsB += b.Publish() ? 1 : 0;
+                for (FrameRing::Frame*& h : held)
+                    if (!h && rng() % 4 == 0) {
+                        h = a.ReserveBuffer();
+                        CHECK(h != nullptr);
+                        break;
+                    }
+            } else if (r < 94) {
+                const FrameRing::Frame* fa = a.AcquireLatest();
+                const FrameRing::Frame* fb = b.AcquireLatest();
+                CHECK((fa == nullptr) == (fb == nullptr));
+                if (fa && fb) CHECK(fa->serial == fb->serial && fa->plane[0][0] == fb->plane[0][0]);
+                for (FrameRing::Frame* h : held) CHECK(!h || fa != h);
+            } else if (r < 97) {
+                if (!pin) pin = a.PinNextQueued(0);
+                else {
+                    a.Unpin(pin);
+                    pin = nullptr;
+                }
+            } else {
+                for (FrameRing::Frame*& h : held)
+                    if (h) {
+                        a.CancelReserved(h);
+                        h = nullptr;
+                    }
+            }
+        }
+        if (pin) a.Unpin(pin);
+        CHECK(dropsA == dropsB);
+        CHECK(a.TrimmedFrames() == b.TrimmedFrames());
+        CHECK(a.RepeatedFrames() == b.RepeatedFrames());
+        std::printf("reserved twin: %ld frames, drops %ld, trims %llu, repeats %llu (same on both)\n", k, dropsA,
+                    (unsigned long long)a.TrimmedFrames(), (unsigned long long)a.RepeatedFrames());
+    }
     if (g_fail) {
         std::printf("%d check(s) failed\n", g_fail);
         return 1;

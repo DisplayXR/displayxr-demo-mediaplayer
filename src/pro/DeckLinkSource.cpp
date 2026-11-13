@@ -4,6 +4,8 @@
 #include "Log.h"
 #include "pro/ConvertPool.h"
 #include "pro/DeckLinkFormat.h"
+#include "pro/DirectPair.h"
+#include "pro/PerfSwitches.h"
 #include "pro/TimecodePairer.h"
 
 #include <algorithm>
@@ -394,7 +396,7 @@ int SignalBits(BMDDetectedVideoInputFormatFlags d) {
 // widened), for livepix::ToP016Banded. hasMatrix / matrix: the signal's colorimetry, if the
 // card reported it. An r210 (RGB) frame is encoded with it, so the tag the caller sets
 // afterwards is the one the pixels were encoded with.
-livepix::EyeJob ConvertJob(const RawPixels& p, livepix::P016& dst, int x0, bool hasMatrix, ColorMatrix matrix) {
+livepix::EyeJob RawJob(const RawPixels& p, int x0, bool hasMatrix, ColorMatrix matrix) {
     const bool deep = p.pf == bmdFormat10BitYUV || p.pf == bmdFormat10BitRGB;
     g_lastBitDepth.store(deep ? 10 : 8, std::memory_order_relaxed);
     livepix::EyeJob j;
@@ -406,9 +408,22 @@ livepix::EyeJob ConvertJob(const RawPixels& p, livepix::P016& dst, int x0, bool 
     j.srcRowBytes = p.rowBytes;
     j.w = p.w & ~1;
     j.h = p.h & ~1;
-    j.dst = &dst;
     j.x0 = x0;
     j.rgbMatrix = hasMatrix ? matrix : DefaultMatrixForHeight(j.h);
+    return j;
+}
+livepix::EyeJob ConvertJob(const RawPixels& p, livepix::P016& dst, int x0, bool hasMatrix, ColorMatrix matrix) {
+    livepix::EyeJob j = RawJob(p, x0, hasMatrix, matrix);
+    j.dst = &dst;
+    return j;
+}
+// The same into eye `eye`'s half of a reserved pair frame (direct pairing), the matrix tag
+// into *matrixOut: what ConvertJob would leave on a P016 of the eye's own.
+livepix::EyeJob HalfJob(const RawPixels& p, FrameRing::Frame& frame, int eye, int eyeW, int eyeH, bool hasMatrix,
+                        ColorMatrix matrix, ColorMatrix* matrixOut) {
+    livepix::EyeJob j = RawJob(p, eye * eyeW, hasMatrix, matrix);
+    j.planes = livepix::PairPlanes(frame, eyeW, eyeH);
+    j.matrixOut = matrixOut;
     return j;
 }
 
@@ -520,10 +535,14 @@ struct DeckLinkCapture {
     // Pair: the last few frames of each eye; TimecodePairer decides which two to show.
     TimecodePairer pairer;
     struct EyeFrame {
-        livepix::P016 px;
+        livepix::P016 px;   // the eye's pixels, unless direct pairing put them in a ring frame's half
         double arrived = 0.0;
         int64_t hwNs = -1;  // the card's hardware reference clock, nanoseconds (-1 unknown)
         char tc[16] = {0};
+        // Direct pairing: the eye's tags and size wherever its pixels are (px's own otherwise)
+        ColorMatrix matrix = ColorMatrix::BT709;
+        ColorTransfer transfer = ColorTransfer::SDR;
+        int w = 0, h = 0;
     };
     // No timecode, one card: its hardware clock stands in (#108's pairing). Frame index =
     // round((t - t0) / duration) with t0 from the first frame and the duration the card
@@ -539,6 +558,21 @@ struct DeckLinkCapture {
     // slot it is due to fill is normally the oldest, and the pair shown the newest).
     int pins[2][TimecodePairer::kHistory] = {};
     std::condition_variable pinCv;
+    // Direct pairing (pro/DirectPair.h, Pro 0.9.8): a frame whose pairing key is known before
+    // it is converted goes straight into its half of a reserved ring frame, and a pair of two
+    // such halves is published without the compose. MEDIAPLAYER_DECKLINK_DIRECT_PAIR=0 (or a
+    // latest-wins ring, MEDIAPLAYER_LIVE_QUEUE=0) composes every pair as before. m guards the
+    // table; a lane writes its claimed half without m (the table's file comment has the rules).
+    bool directPair = false;
+    struct RingFrames final : DirectPairTable::Frames {
+        explicit RingFrames(DeckLinkCapture* c) : cap(c) {}
+        DeckLinkCapture* cap;
+        void* Reserve(int eyeW, int eyeH) override { return cap->ReserveFrame(eyeW, eyeH); }
+        void Cancel(void* frame) override { cap->CancelFrame(frame); }
+    } ringFrames{this};
+    DirectPairTable table{&ringFrames};
+    void* ReserveFrame(int eyeW, int eyeH) { return src->ReservePairFrame(eyeW, eyeH); }
+    void CancelFrame(void* frame) { src->CancelPairFrame(static_cast<FrameRing::Frame*>(frame)); }
     bool warnedUnsynced = false;
     bool warnedTcByClock = false;  // said once: timecodes disagree, paired by the card's clock
     bool warnedSize = false;
@@ -557,6 +591,9 @@ struct DeckLinkCapture {
         pairer.Reset();
         hwT0 = INT64_MIN;
         framesIn[0] = framesIn[1] = 0;
+        // Direct entries are for the old signal: retired (a lane still writing one finishes,
+        // and its frame can still be composed); the rest go back to the ring.
+        if (directPair) table.Sweep(pairer.LastKey(), pairer.Epoch(), generation.load());
     }
 
     // The card's dual-stream state, mirrored into the source for LayoutHint(). m held.
@@ -736,6 +773,10 @@ struct DeckLinkCapture {
                 src->Publish(out, /*fullRange=*/false, r.now, r.tc[0] ? r.tc : nullptr, r.dual ? 0 : -1, pool);
             return;
         }
+        if (directPair) {
+            ProcessPairDirect(eye, r, w, h, pool);
+            return;
+        }
         // Pair: claim this eye's oldest slot, convert into it WITHOUT the lock (the two
         // lanes convert in parallel; a busy slot is never chosen, nor one the other lane is
         // still composing into the ring), then decide.
@@ -754,85 +795,19 @@ struct DeckLinkCapture {
         ef.px.transfer = r.transfer;
         ef.arrived = r.now;
         ef.hwNs = r.hwNs;
-        // Two keys: the frame's timecode, and (both inputs on one card) its frame on the
-        // card's clock. The pairer uses the clock when the timecode is missing or the two
-        // inputs' timecodes don't belong together (Resolve's dual SDI output).
-        int clockKey = -1;
-        if (r.hwNs >= 0 && sameCard) {
-            int64_t t0 = hwT0.load();
-            if (t0 == INT64_MIN) {
-                hwT0.compare_exchange_strong(t0, r.hwNs);
-                t0 = hwT0.load();
-            }
-            const int64_t period = r.durNs > 0 ? r.durNs : (int64_t)std::llround(1e9 / std::max(1.0, fpsExact.load()));
-            clockKey = HwClockKey(r.hwNs, t0, period);
-        }
+        const int clockKey = ClockKey(r);
         std::memcpy(ef.tc, r.tc, sizeof(r.tc));
         std::unique_lock<std::mutex> lk(m);
         ++framesIn[eye];
         const TimecodePairer::Decision d =
             pairer.Add(eye, slot, r.key, r.now, 1.0 / std::max(1.0, fpsExact.load()), clockKey);
-        if (d.byClock && d.tcOffsetFrames > 0 && !warnedTcByClock) {
-            LOG_WARN("decklink: the two inputs' timecodes are %d frames apart (not jam-synced; e.g. Resolve's dual "
-                     "SDI output times only its first output) - pairing by the card's clock instead",
-                     d.tcOffsetFrames);
-            warnedTcByClock = true;
-        }
-        if (d.refused && alive) {
-            std::lock_guard<std::mutex> ps(src->pairMutex_);
-            ++src->pairStats_.mismatchRefused;
-            src->pairStats_.strict = true;
-            if (!warnedRefused) {
-                LOG_WARN("decklink: matched pairs only: the eyes are %d frame(s) apart (an input fell behind) - "
-                         "holding the last matched pair instead of showing them (counted in mismatch_refused)",
-                         d.offsetFrames);
-                warnedRefused = true;
-            }
-        }
+        NoteDecision(d);
         if (!d.publish || !alive) return;
         if (noSignal[1 - eye]) return;  // the other eye is dark: never fuse it with a stale frame
-        {
-            const EyeFrame& lf = hist[0][d.slot[0]];
-            const EyeFrame& rf = hist[1][d.slot[1]];
-            std::lock_guard<std::mutex> ps(src->pairMutex_);
-            DeckLinkSource::PairStats& st = src->pairStats_;
-            st.strict = strictPairs;
-            // Last line of defence: on one card both eyes of a true pair carry the same
-            // capture instant on the card's clock. More than half a frame apart is not a
-            // pair, whatever the pairing decided: never show it.
-            if (strictPairs && lf.hwNs >= 0 && rf.hwNs >= 0) {
-                const double halfFrameMs = 500.0 / std::max(1.0, fpsExact.load());
-                if (std::fabs((double)(rf.hwNs - lf.hwNs) / 1e6) > halfFrameMs) {
-                    ++st.mismatchRefused;
-                    return;
-                }
-            }
-            ++st.pairs;
-            const uint64_t in = framesIn[0] + framesIn[1];
-            st.unpaired = in > 2 * st.pairs ? in - 2 * st.pairs : 0;
-            st.hwClockPairing = d.byClock;
-            st.separateCards = !sameCard;
-            st.timecode = !d.byClock && !d.unsynced && r.key >= 0;
-            if (lf.hwNs >= 0 && rf.hwNs >= 0 && sameCard) {
-                st.lastSkewMs = (double)(rf.hwNs - lf.hwNs) / 1e6;
-                st.maxAbsSkewMs = std::max(st.maxAbsSkewMs, std::fabs(st.lastSkewMs));
-            } else {
-                st.lastSkewMs = (rf.arrived - lf.arrived) * 1000.0;  // arrival times: coarser
-                st.maxAbsSkewMs = std::max(st.maxAbsSkewMs, std::fabs(st.lastSkewMs));
-            }
-        }
-        if (d.unsynced && !warnedUnsynced) {
-            LOG_WARN("decklink: the two inputs' timecodes are %d frames apart - not jam-synced; "
-                     "pairing the newest frames instead", d.offsetFrames);
-            warnedUnsynced = true;
-        }
+        if (!CountPair(d, r.key, /*direct=*/false)) return;
         const EyeFrame& l = hist[0][d.slot[0]];
         const EyeFrame& rt = hist[1][d.slot[1]];
-        if ((l.px.width != rt.px.width || l.px.height != rt.px.height) && !warnedSize) {
-            LOG_WARN("decklink: the two inputs differ in size (%dx%d vs %dx%d)", l.px.width, l.px.height,
-                     rt.px.width, rt.px.height);
-            warnedSize = true;
-        }
+        WarnPair(d, l.px.width, l.px.height, rt.px.width, rt.px.height);
         // The pair is composed straight into the ring (no intermediate side-by-side frame),
         // in row bands on this lane's pool, and outside m: ~50 MB at 4K, which held the
         // other eye's lane off its next frame for the whole copy. The two slots are pinned
@@ -855,6 +830,226 @@ struct DeckLinkCapture {
         --pins[1][s1];
         lk.unlock();
         pinCv.notify_all();
+    }
+
+    // Two keys: the frame's timecode, and (both inputs on one card) its frame on the card's
+    // clock. The pairer uses the clock when the timecode is missing or the two inputs'
+    // timecodes don't belong together (Resolve's dual SDI output). -1: not on one card.
+    int ClockKey(const RawFrame& r) {
+        int clockKey = -1;
+        if (r.hwNs >= 0 && sameCard) {
+            int64_t t0 = hwT0.load();
+            if (t0 == INT64_MIN) {
+                hwT0.compare_exchange_strong(t0, r.hwNs);
+                t0 = hwT0.load();
+            }
+            const int64_t period = r.durNs > 0 ? r.durNs : (int64_t)std::llround(1e9 / std::max(1.0, fpsExact.load()));
+            clockKey = HwClockKey(r.hwNs, t0, period);
+        }
+        return clockKey;
+    }
+
+    // The decision's warnings and the strict refusal count. m held.
+    void NoteDecision(const TimecodePairer::Decision& d) {
+        if (d.byClock && d.tcOffsetFrames > 0 && !warnedTcByClock) {
+            LOG_WARN("decklink: the two inputs' timecodes are %d frames apart (not jam-synced; e.g. Resolve's dual "
+                     "SDI output times only its first output) - pairing by the card's clock instead",
+                     d.tcOffsetFrames);
+            warnedTcByClock = true;
+        }
+        if (d.refused && alive) {
+            std::lock_guard<std::mutex> ps(src->pairMutex_);
+            ++src->pairStats_.mismatchRefused;
+            src->pairStats_.strict = true;
+            if (!warnedRefused) {
+                LOG_WARN("decklink: matched pairs only: the eyes are %d frame(s) apart (an input fell behind) - "
+                         "holding the last matched pair instead of showing them (counted in mismatch_refused)",
+                         d.offsetFrames);
+                warnedRefused = true;
+            }
+        }
+    }
+
+    // A pair about to be shown: the strict guard, then the counts. False (counted in
+    // mismatch_refused) when the eyes are not one instant on the card's clock: never show it.
+    // `direct`: published whole (direct pairing), else composed. m held.
+    bool CountPair(const TimecodePairer::Decision& d, int key, bool direct) {
+        const EyeFrame& lf = hist[0][d.slot[0]];
+        const EyeFrame& rf = hist[1][d.slot[1]];
+        std::lock_guard<std::mutex> ps(src->pairMutex_);
+        DeckLinkSource::PairStats& st = src->pairStats_;
+        st.strict = strictPairs;
+        // Last line of defence: on one card both eyes of a true pair carry the same
+        // capture instant on the card's clock. More than half a frame apart is not a
+        // pair, whatever the pairing decided: never show it.
+        if (strictPairs && lf.hwNs >= 0 && rf.hwNs >= 0) {
+            const double halfFrameMs = 500.0 / std::max(1.0, fpsExact.load());
+            if (std::fabs((double)(rf.hwNs - lf.hwNs) / 1e6) > halfFrameMs) {
+                ++st.mismatchRefused;
+                return false;
+            }
+        }
+        ++st.pairs;
+        if (direct) ++st.directPairs;
+        else ++st.composedPairs;
+        const uint64_t in = framesIn[0] + framesIn[1];
+        st.unpaired = in > 2 * st.pairs ? in - 2 * st.pairs : 0;
+        st.hwClockPairing = d.byClock;
+        st.separateCards = !sameCard;
+        st.timecode = !d.byClock && !d.unsynced && key >= 0;
+        if (lf.hwNs >= 0 && rf.hwNs >= 0 && sameCard) {
+            st.lastSkewMs = (double)(rf.hwNs - lf.hwNs) / 1e6;
+            st.maxAbsSkewMs = std::max(st.maxAbsSkewMs, std::fabs(st.lastSkewMs));
+        } else {
+            st.lastSkewMs = (rf.arrived - lf.arrived) * 1000.0;  // arrival times: coarser
+            st.maxAbsSkewMs = std::max(st.maxAbsSkewMs, std::fabs(st.lastSkewMs));
+        }
+        return true;
+    }
+
+    void WarnPair(const TimecodePairer::Decision& d, int lw, int lh, int rw, int rh) {  // m held
+        if (d.unsynced && !warnedUnsynced) {
+            LOG_WARN("decklink: the two inputs' timecodes are %d frames apart - not jam-synced; "
+                     "pairing the newest frames instead", d.offsetFrames);
+            warnedUnsynced = true;
+        }
+        if ((lw != rw || lh != rh) && !warnedSize) {
+            LOG_WARN("decklink: the two inputs differ in size (%dx%d vs %dx%d)", lw, lh, rw, rh);
+            warnedSize = true;
+        }
+    }
+
+    // Direct pairing (pro/DirectPair.h): the same claim, convert, decide and publish as above,
+    // but a frame whose pairing key is known before it is converted goes straight into its
+    // half of a reserved ring frame, and a decision that pairs the two halves of one entry
+    // publishes that frame whole: no compose. Every other decision is composed as above, from
+    // wherever each eye's pixels are.
+    void ProcessPairDirect(int eye, const RawFrame& r, int w, int h, livepix::ConvertPool* pool) {
+        // Before the claim: the pairer may pair this frame by it (DirectKey).
+        const int clockKey = ClockKey(r);
+        // Only a frame the converters take whole (they write every sample of a fitting eye,
+        // so the half is exactly what the eye's own P016 would hold).
+        const bool fits = !r.px.bytes.empty() && w > 0 && h > 1;
+        int slot, entry = -1;
+        FrameRing::Frame* frame = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(m);
+            pinCv.wait(lk, [&] { return pins[eye][pairer.NextSlot(eye)] == 0; });
+            slot = pairer.NextSlot(eye);
+            pairer.MarkBusy(eye, slot);
+            table.SlotReused(eye, slot);
+            table.NoteSize(eye, w, h);
+            const int key = fits ? pairer.DirectKey(r.key, clockKey) : -1;
+            if (key >= 0) {
+                DirectPairTable::Refused why = DirectPairTable::Refused::None;
+                entry = table.Claim(eye, slot, key, pairer.Epoch(), generation.load(), w, h, &why);
+                if (entry >= 0) {
+                    frame = static_cast<FrameRing::Frame*>(table.Frame(entry));
+                } else if (why == DirectPairTable::Refused::NoFrame && alive) {
+                    std::lock_guard<std::mutex> ps(src->pairMutex_);
+                    ++src->pairStats_.directNoFrame;  // no ring frame to spare: converted the old way
+                }
+            }
+        }
+        EyeFrame& ef = hist[eye][slot];
+        if (frame) {
+            // Our half alone, without m: the other lane writes only the other half, and the
+            // frame is in no ring queue until both halves are Done (pro/DirectPair.h).
+            const livepix::EyeJob job = HalfJob(r.px, *frame, eye, w, h, r.hasMatrix, r.matrix, &ef.matrix);
+            livepix::ToP016Banded(pool, &job, 1);
+            if (r.hasMatrix) ef.matrix = r.matrix;
+            ef.transfer = r.transfer;
+        } else {
+            ef.px.Resize(w, h);
+            const livepix::EyeJob job = ConvertJob(r.px, ef.px, 0, r.hasMatrix, r.matrix);
+            livepix::ToP016Banded(pool, &job, 1);
+            if (r.hasMatrix) ef.px.matrix = r.matrix;
+            ef.px.transfer = r.transfer;
+            ef.matrix = ef.px.matrix;
+            ef.transfer = ef.px.transfer;
+        }
+        ef.w = w;
+        ef.h = h;
+        ef.arrived = r.now;
+        ef.hwNs = r.hwNs;
+        std::memcpy(ef.tc, r.tc, sizeof(r.tc));
+        std::unique_lock<std::mutex> lk(m);
+        if (entry >= 0) table.Done(entry, eye);
+        ++framesIn[eye];
+        const TimecodePairer::Decision d =
+            pairer.Add(eye, slot, r.key, r.now, 1.0 / std::max(1.0, fpsExact.load()), clockKey);
+        NoteDecision(d);
+        PublishDirect(eye, d, r.key, pool, lk);
+        // After every decision: retire what can no longer be published whole, release what
+        // nothing needs (m held again; PublishDirect may have dropped it for a compose).
+        table.Sweep(pairer.LastKey(), pairer.Epoch(), generation.load());
+        lk.unlock();
+        pinCv.notify_all();
+    }
+
+    // The decision, shown: whole when it pairs the two halves of one entry, else composed from
+    // wherever each eye is. Returns with m held.
+    void PublishDirect(int eye, const TimecodePairer::Decision& d, int key, livepix::ConvertPool* pool,
+                       std::unique_lock<std::mutex>& lk) {
+        if (!d.publish || !alive) return;
+        if (noSignal[1 - eye]) return;  // the other eye is dark: never fuse it with a stale frame
+        const int s0 = d.slot[0], s1 = d.slot[1];
+        int ent[2] = {-1, -1};
+        const DirectPairTable::Where where[2] = {table.Locate(0, s0, &ent[0]), table.Locate(1, s1, &ent[1])};
+        if (where[0] == DirectPairTable::Where::Gone || where[1] == DirectPairTable::Where::Gone) {
+            // An eye whose pixels already went to the screen in a whole pair (or were recycled):
+            // the old path would have shown that eye again; nothing new is shown instead.
+            std::lock_guard<std::mutex> ps(src->pairMutex_);
+            ++src->pairStats_.directSkipped;
+            return;
+        }
+        const int whole = table.Whole(s0, s1);
+        if (!CountPair(d, key, whole >= 0)) return;
+        const EyeFrame& l = hist[0][s0];
+        const EyeFrame& rt = hist[1][s1];
+        WarnPair(d, l.w, l.h, rt.w, rt.h);
+        const double captureSec = std::min(l.arrived, rt.arrived);
+        char tc[sizeof(l.tc)];
+        std::memcpy(tc, l.tc, sizeof(tc));
+        const ColorMatrix matrix = l.matrix;  // the left eye's tags stand for the pair (PublishPair)
+        const ColorTransfer transfer = l.transfer;
+        if (whole >= 0) {
+            // Both halves of one instant, written: the frame goes to the ring as it is. publishM
+            // (taken with m held, as for a compose) keeps the publishes in decision order behind
+            // a compose still running.
+            const int ew = table.EyeW(whole), eh = table.EyeH(whole);
+            FrameRing::Frame* f = static_cast<FrameRing::Frame*>(table.TakeForPublish(whole));
+            std::lock_guard<std::mutex> pub(publishM);
+            src->PublishPairFrame(f, ew, eh, matrix, transfer, /*fullRange=*/false, captureSec, tc[0] ? tc : nullptr,
+                                  d.offsetFrames);
+            return;
+        }
+        // Composed, outside m, as the old path: a history slot's P016 is pinned (no lane
+        // converts into it), an entry's half is pinned in the table (not published, released
+        // or recycled; the other half may still be written meanwhile, which is other memory).
+        livepix::EyeView view[2];
+        const int slots[2] = {s0, s1};
+        for (int e = 0; e < 2; ++e) {
+            if (where[e] == DirectPairTable::Where::Half) {
+                const FrameRing::Frame* f = static_cast<const FrameRing::Frame*>(table.Frame(ent[e]));
+                view[e] = livepix::PairHalf(*f, e, table.EyeW(ent[e]), table.EyeH(ent[e]));
+                table.Pin(ent[e]);
+            } else {
+                view[e] = livepix::EyeOf(hist[e][slots[e]].px);
+                ++pins[e][slots[e]];
+            }
+        }
+        std::unique_lock<std::mutex> pub(publishM);
+        lk.unlock();
+        if (alive)
+            src->PublishPair(view[0], view[1], matrix, transfer, /*fullRange=*/false, captureSec, tc[0] ? tc : nullptr,
+                             d.offsetFrames, pool);
+        pub.unlock();  // before m: the next publisher may be holding m while it waits for publishM
+        lk.lock();
+        for (int e = 0; e < 2; ++e) {
+            if (where[e] == DirectPairTable::Where::Half) table.Unpin(ent[e]);
+            else --pins[e][slots[e]];
+        }
     }
 };
 
@@ -1100,6 +1295,21 @@ void DeckLinkSource::Worker() {
     cap.src = this;
     cap.pair = pair;
     cap.dual = cfg_.stereo == DeckLinkConfig::Stereo::Dual;
+    if (pair) {
+        // Direct pairing (pro/DirectPair.h): each eye converted straight into its half of the
+        // ring frame. Needs the ring's queue mode (reserved frames); set before the lanes start.
+        const bool on = pro::PerfSwitchOn(std::getenv("MEDIAPLAYER_DECKLINK_DIRECT_PAIR"));
+        cap.directPair = on && Ring().QueueMode();
+        {
+            std::lock_guard<std::mutex> lk(pairMutex_);
+            pairStats_.directPair = cap.directPair;
+        }
+        LOG_INFO("decklink: two-input pairs: %s",
+                 cap.directPair ? "each eye converted straight into its half of the ring frame (direct pairing; "
+                                  "MEDIAPLAYER_DECKLINK_DIRECT_PAIR=0 composes them as before)"
+                 : on ? "composed from the two eyes (direct pairing needs the live queue; MEDIAPLAYER_LIVE_QUEUE=0)"
+                      : "composed from the two eyes (MEDIAPLAYER_DECKLINK_DIRECT_PAIR=0)");
+    }
     // One input carries two eyes per frame in dual-stream 3D, which Auto switches to when
     // the card detects it: its lane's pool is sized for both.
     const bool twoEyeInput = !pair && (cap.dual || cfg_.stereo == DeckLinkConfig::Stereo::Auto);
@@ -1243,6 +1453,12 @@ void DeckLinkSource::Worker() {
     // give one in flight time to see `alive` and return before our references go.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     cap.StopLanes();  // `alive` is clear: a lane mid-frame publishes nothing and returns
+    {
+        // Direct pairing: the ring frames still reserved go back to the ring (it outlives this
+        // capture: the next Open reserves from it again). No lane runs now, no compose.
+        std::lock_guard<std::mutex> lk(cap.m);
+        cap.table.ReleaseAll();
+    }
     for (int e = 0; e < 2; ++e) {
         Release(callbacks[e]);
         Release(inputs[e]);

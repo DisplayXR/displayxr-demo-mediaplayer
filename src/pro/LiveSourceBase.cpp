@@ -105,31 +105,67 @@ void LiveSourceBase::Publish(const livepix::P016& src, bool fullRange, double ca
     Published(src.width, src.height, fullRange, eyeOffsetFrames, ring_.Publish());
 }
 
-void LiveSourceBase::PublishPair(const livepix::P016& l, const livepix::P016& r, bool fullRange,
-                                 double captureSec, const char* timecode, int eyeOffsetFrames,
-                                 livepix::ConvertPool* pool) {
-    const int cw = std::min(l.width, r.width), ch = std::min(l.height, r.height) & ~1;
-    if (cw <= 0 || ch <= 0) return;
-    const int w = 2 * cw;
-    FrameRing::Frame& f = ring_.WriteBuffer();
-    f.plane[0].resize((size_t)w * ch * 2);  // same size after warm-up: no allocation
-    f.plane[1].resize((size_t)w * (ch / 2) * 2);
-    // Row bands on the caller's convert threads: ~10 ms for a 4K pair on one thread.
-    livepix::ComposePairBanded(pool, l, r, cw, ch, reinterpret_cast<uint16_t*>(f.plane[0].data()),
-                               reinterpret_cast<uint16_t*>(f.plane[1].data()));
+void LiveSourceBase::SizePairPlanes(FrameRing::Frame& f, int w, int h) {
+    f.plane[0].resize((size_t)w * h * 2);  // same size after warm-up: no allocation
+    f.plane[1].resize((size_t)w * (h / 2) * 2);
+}
+
+void LiveSourceBase::TagPair(FrameRing::Frame& f, int w, int h, ColorMatrix matrix, ColorTransfer transfer,
+                             bool fullRange, double captureSec, const char* timecode) {
     f.width = w;
-    f.height = ch;
+    f.height = h;
     f.format = PixFormat::P016;
     f.fullRange = fullRange;
     f.gpu = false;
     f.gpuSharedTexture = nullptr;
     f.gpuSharedHandle = nullptr;
     f.captureSec = captureSec;
-    f.matrix = l.matrix;
-    f.transfer = l.transfer;
+    f.matrix = matrix;
+    f.transfer = transfer;
     std::memset(f.timecode, 0, sizeof(f.timecode));
     if (timecode) std::strncpy(f.timecode, timecode, sizeof(f.timecode) - 1);
+}
+
+void LiveSourceBase::PublishPair(const livepix::P016& l, const livepix::P016& r, bool fullRange,
+                                 double captureSec, const char* timecode, int eyeOffsetFrames,
+                                 livepix::ConvertPool* pool) {
+    PublishPair(livepix::EyeOf(l), livepix::EyeOf(r), l.matrix, l.transfer, fullRange, captureSec, timecode,
+                eyeOffsetFrames, pool);
+}
+
+void LiveSourceBase::PublishPair(const livepix::EyeView& l, const livepix::EyeView& r, ColorMatrix matrix,
+                                 ColorTransfer transfer, bool fullRange, double captureSec, const char* timecode,
+                                 int eyeOffsetFrames, livepix::ConvertPool* pool) {
+    const int cw = std::min(l.width, r.width), ch = std::min(l.height, r.height) & ~1;
+    if (cw <= 0 || ch <= 0) return;
+    const int w = 2 * cw;
+    FrameRing::Frame& f = ring_.WriteBuffer();
+    SizePairPlanes(f, w, ch);
+    // Row bands on the caller's convert threads: ~10 ms for a 4K pair on one thread.
+    livepix::ComposePairBanded(pool, l, r, cw, ch, reinterpret_cast<uint16_t*>(f.plane[0].data()),
+                               reinterpret_cast<uint16_t*>(f.plane[1].data()));
+    TagPair(f, w, ch, matrix, transfer, fullRange, captureSec, timecode);
     Published(w, ch, fullRange, eyeOffsetFrames, ring_.Publish());
+}
+
+FrameRing::Frame* LiveSourceBase::ReservePairFrame(int eyeW, int eyeH) {
+    if (eyeW <= 0 || eyeH <= 0 || (eyeH & 1)) return nullptr;
+    FrameRing::Frame* f = ring_.ReserveBuffer();
+    if (f) SizePairPlanes(*f, 2 * eyeW, eyeH);  // a reused buffer: no allocation after warm-up
+    return f;
+}
+
+void LiveSourceBase::CancelPairFrame(FrameRing::Frame* f) {
+    if (f) ring_.CancelReserved(f);
+}
+
+void LiveSourceBase::PublishPairFrame(FrameRing::Frame* f, int eyeW, int eyeH, ColorMatrix matrix,
+                                      ColorTransfer transfer, bool fullRange, double captureSec,
+                                      const char* timecode, int eyeOffsetFrames) {
+    if (!f) return;
+    const int w = 2 * eyeW;
+    TagPair(*f, w, eyeH, matrix, transfer, fullRange, captureSec, timecode);
+    Published(w, eyeH, fullRange, eyeOffsetFrames, ring_.PublishReserved(f));
 }
 
 void LiveSourceBase::CountLate() {

@@ -62,12 +62,16 @@ void BandRows(int h, int bands, int band, int& r0, int& r1);
 constexpr int kMinBandRows = 64;
 int BandsFor(int h, int threads);
 
-// One eye to convert: `fmt` pixels w x h (rows srcRowBytes apart) into *dst at column x0.
+// One eye to convert: `fmt` pixels w x h (rows srcRowBytes apart) into *dst at column x0,
+// or, with no dst, into `planes` at column x0 with the matrix tag into *matrixOut (DeckLink
+// direct pairing: an eye straight into its half of a ring frame).
 struct EyeJob {
     RawFormat fmt = RawFormat::Uyvy;
     const uint8_t* src = nullptr;
     int srcRowBytes = 0, w = 0, h = 0;
     P016* dst = nullptr;
+    P016Planes planes;                    // used when dst is null
+    ColorMatrix* matrixOut = nullptr;     // ...and the tag goes here (may be null)
     int x0 = 0;
     ColorMatrix rgbMatrix = ColorMatrix::BT709;  // r210: the matrix to encode with
 };
@@ -89,6 +93,18 @@ void ToP016Banded(ConvertPool* pool, RawFormat fmt, const uint8_t* src, int srcR
 // Two eyes side by side, each cropped to cw x ch (ch even, each eye at least that big):
 // y and uv are 2*cw samples wide (DeckLink two-input stereo, LiveSourceBase::PublishPair).
 void ComposePairBanded(ConvertPool* pool, const P016& l, const P016& r, int cw, int ch, uint16_t* y, uint16_t* uv);
+// One eye to read for the compose: a P016's planes (EyeOf), or one half of a side-by-side
+// frame (DeckLink direct pairing's fallback reads an eye where its lane converted it).
+// Rows are `stride` samples apart; the eye is width x height.
+struct EyeView {
+    const uint16_t* y = nullptr;
+    const uint16_t* uv = nullptr;
+    int stride = 0, width = 0, height = 0;
+};
+inline EyeView EyeOf(const P016& f) { return {f.y.data(), f.uv.data(), f.width, f.width, f.height}; }
+// The same compose from views: the P016 one is this over EyeOf(l), EyeOf(r).
+void ComposePairBanded(ConvertPool* pool, const EyeView& l, const EyeView& r, int cw, int ch, uint16_t* y,
+                       uint16_t* uv);
 // One frame as it is: y gets src.y, uv gets src.uv (LiveSourceBase::Publish).
 void CopyFrameBanded(ConvertPool* pool, const P016& src, uint16_t* y, uint16_t* uv);
 

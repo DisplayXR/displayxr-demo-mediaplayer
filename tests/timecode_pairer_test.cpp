@@ -532,6 +532,151 @@ void StrictMatchedPairsOnly() {
     CHECK(p.Strict(), "Reset keeps strict");
 }
 
+// Direct pairing (pro/DirectPair.h) asks the pairer, before a frame is converted, which key
+// it will pair by (DirectKey), and puts the two eyes' frames with the same key, in the same
+// Epoch, into one ring frame. Whatever the arrival order: a shown pair whose two frames both
+// had a direct key in one epoch has the same key on both, and is the same frame on both eyes
+// (so a ring frame filled that way is a matched pair); the views never change a decision.
+struct DirectSim {
+    TimecodePairer p;
+    int trueFrame[2][TimecodePairer::kHistory] = {};
+    int dkey[2][TimecodePairer::kHistory] = {};
+    uint32_t depoch[2][TimecodePairer::kHistory] = {};
+    int shown = 0, bothDirect = 0, sameEntry = 0, entryMismatch = 0, mismatched = 0;
+    void Frame(int eye, int i, int tc, int clock) {
+        const int s = p.NextSlot(eye);
+        p.MarkBusy(eye, s);
+        // the claim: before the convert (the other lane may add frames meanwhile in DeckLink;
+        // here the key is asked at the same point, which is the case the rules must hold for)
+        dkey[eye][s] = p.DirectKey(tc, clock);
+        depoch[eye][s] = p.Epoch();
+        trueFrame[eye][s] = i;
+        const TimecodePairer::Decision d = p.Add(eye, s, tc, i / 59.94, 1.0 / 59.94, clock);
+        if (!d.publish) return;
+        ++shown;
+        const int a = d.slot[0], b = d.slot[1];
+        if (trueFrame[0][a] != trueFrame[1][b]) ++mismatched;
+        if (dkey[0][a] >= 0 && dkey[1][b] >= 0) {
+            ++bothDirect;
+            if (dkey[0][a] == dkey[1][b] && depoch[0][a] == depoch[1][b]) {
+                ++sameEntry;  // one ring frame: published whole
+                if (trueFrame[0][a] != trueFrame[1][b]) ++entryMismatch;
+            }
+        }
+    }
+    template <class TcOf>
+    void Run(int n, TcOf tcOf, bool clock, uint32_t seed) {
+        uint32_t rng = seed;
+        auto next = [&] { return (rng = rng * 1664525u + 1013904223u) >> 16; };
+        int li = 0, ri = 0;
+        while (li < n || ri < n) {
+            bool left = (next() & 1) != 0;
+            if (li >= n || li - ri >= 2) left = false;
+            if (ri >= n || ri - li >= 2) left = true;
+            const int eye = left ? 0 : 1;
+            int& i = left ? li : ri;
+            Frame(eye, i, tcOf(eye, i), clock ? i : -1);
+            ++i;
+        }
+    }
+};
+
+void DirectKeys() {
+    {  // the views on a fresh pairer
+        TimecodePairer p;
+        CHECK(!p.Keyed() && p.DirectKey(100, 100) == -1, "nothing matched yet: no direct key");
+        const uint32_t e0 = p.Epoch();
+        p.Reset();
+        CHECK(p.Epoch() != e0, "Reset starts a new epoch");
+    }
+    {  // Resolve dual output (timecode on the left only): by the clock, nearly all direct
+        DirectSim s;
+        s.Run(600, [](int eye, int i) { return eye == 0 ? 409672 + i : 0; }, true, 777);
+        std::printf("  direct keys, Resolve dual output: %d shown, %d both direct, %d one entry, %d mismatched\n",
+                    s.shown, s.bothDirect, s.sameEntry, s.entryMismatch);
+        CHECK(s.entryMismatch == 0, "an entry's two halves are always the same frame");
+        CHECK(s.sameEntry >= s.shown - 5, "...and nearly every pair is one entry (published whole)");
+        CHECK(s.p.ByClock() && s.p.Keyed(), "by the clock, matching by key");
+    }
+    {  // jam-synced timecode on one card: by timecode, all direct
+        DirectSim s;
+        s.Run(600, [](int, int i) { return 5000 + i; }, true, 4242);
+        CHECK(s.entryMismatch == 0 && s.mismatched == 0, "jam-synced: matched, and entries are matched");
+        CHECK(s.sameEntry >= s.shown - 2, "jam-synced: nearly every pair whole");
+        CHECK(!s.p.ByClock(), "...by timecode");
+    }
+    {  // two cards (no clock), unrelated timecodes: newest of each, never a direct key
+        DirectSim s;
+        s.Run(200, [](int eye, int i) { return eye == 0 ? 1000 + i : 70000 + i; }, false, 99);
+        CHECK(s.bothDirect == 0, "unsynced two cards: never direct (today's path)");
+        CHECK(!s.p.Keyed(), "...the pairer is not matching by key");
+    }
+    {  // no timecode, two cards: newest of each, never direct
+        DirectSim s;
+        s.Run(100, [](int, int) { return -1; }, false, 5);
+        CHECK(s.bothDirect == 0, "no key at all: never direct");
+    }
+    {  // the right eye's timecode is fixed mid-run: clock -> timecode, a new epoch, still matched
+        DirectSim s;
+        s.Run(500, [](int eye, int i) { return eye == 0 || i >= 200 ? 7000 + i : 0; }, true, 31337);
+        CHECK(s.entryMismatch == 0 && s.mismatched == 0, "a change of domain never fills an entry with two instants");
+        CHECK(!s.p.ByClock(), "back on timecode");
+        CHECK(s.sameEntry >= s.shown - 10, "...and back to whole pairs after the switch");
+    }
+    {  // timecode held still (camera not rolling), then rolling again: no direct key while it holds
+        TimecodePairer p;
+        int keyedAfterRoll = 0, directWhileHeld = 0;
+        for (int i = 0; i < 40; ++i) {
+            const int tc = i < 10 ? 100 + i : i < 25 ? 109 : 100 + i;  // holds at 109 for frames 10..24
+            for (int eye = 0; eye < 2; ++eye) {
+                const int s = p.NextSlot(eye);
+                p.MarkBusy(eye, s);
+                const int k = p.DirectKey(tc, -1);
+                if (i >= 11 && i < 25 && k >= 0) ++directWhileHeld;
+                p.Add(eye, s, tc, i / 25.0, 0.04, -1);
+            }
+            if (i >= 30 && p.Keyed()) ++keyedAfterRoll;
+        }
+        CHECK(directWhileHeld == 0, "held timecode: no direct key (the old path shows it)");
+        CHECK(keyedAfterRoll == 10, "rolling again: matching by key again");
+    }
+    {  // a rewind starts a new epoch: no entry from before it can join one after it
+        TimecodePairer p;
+        uint32_t before = 0;
+        for (int i = 0; i < 8; ++i) {
+            const int tc = i < 5 ? 100 + i : 50 + i;  // jumps back at frame 5
+            if (i == 5) before = p.Epoch();
+            for (int eye = 0; eye < 2; ++eye) {
+                const int s = p.NextSlot(eye);
+                p.MarkBusy(eye, s);
+                p.Add(eye, s, tc, 0.0, 0.04, -1);
+            }
+        }
+        CHECK(p.Epoch() != before, "a rewind starts a new epoch");
+    }
+    {  // strict, an eye far behind: refused, not matching by key, until a common key forms
+        TimecodePairer p;
+        p.SetStrict(true);
+        bool refusedSeen = false, keyedDuringRefusal = false;
+        for (int i = 0; i < 60; ++i) {
+            const int s0 = p.NextSlot(0);
+            p.MarkBusy(0, s0);
+            const TimecodePairer::Decision d = p.Add(0, s0, 409672 + i, i / 59.94, 1.0 / 59.94, i);
+            if (d.refused) {
+                refusedSeen = true;
+                if (p.Keyed()) keyedDuringRefusal = true;
+            }
+            if (i < 10 || i >= 30) {  // the right eye skips frames 10..29
+                const int s1 = p.NextSlot(1);
+                p.MarkBusy(1, s1);
+                p.Add(1, s1, 0, i / 59.94, 1.0 / 59.94, i);
+            }
+        }
+        CHECK(refusedSeen && !keyedDuringRefusal, "strict refusal: no direct keys while refusing");
+        CHECK(p.Keyed(), "...and keyed again once the eyes match");
+    }
+}
+
 int main() {
     FullRateTimecode();
     for (int lag = 0; lag < TimecodePairer::kHistory; ++lag) {
@@ -553,6 +698,7 @@ int main() {
     HardwareClockKeys();
     ResolveDualOutput();
     StrictMatchedPairsOnly();
+    DirectKeys();
     NoTimecodeSameCard();
     MatchingTimecodeSameCard();
     TimecodeTrustedAgain();
