@@ -59,6 +59,20 @@ public:
     };
     static bool FindViews(const ReadAtFn& readAt, uint64_t fileSize, ViewSpan& left, ViewSpan& right);
 
+    // Where a one-view LIF's image and its disparity map are, and the pair the player makes
+    // from them (#180): the same metadata reads as FindViews. `parallax` (> 0, capped) and
+    // `invert` (the map's far end is at 255: flip it so 255 is nearest) are exactly what
+    // Load() passes DepthWarp::MakeSbs, so the media browser's 3D grid thumbnail of a 2D->3D
+    // conversion has the depth the player shows. False for anything else (two views, no
+    // map, no trailer).
+    struct DepthViewSpan {
+        ViewSpan image;
+        uint64_t mapOffset = 0, mapSize = 0;
+        float parallax = 0.0f;
+        bool invert = false;
+    };
+    static bool FindDepthView(const ReadAtFn& readAt, uint64_t fileSize, DepthViewSpan& out);
+
     // Parse `path` and produce a renderable image:
     //   * 2+ views  -> compose left|right into a full-SBS RGBA buffer (SbsFull, stereo=true)
     //   * 1 view + disparity map -> generate left|right the same way (SbsFull, stereo=true)

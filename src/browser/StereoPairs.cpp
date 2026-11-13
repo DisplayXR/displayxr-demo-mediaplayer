@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "browser/StereoPairs.h"
 
+#include "media/DepthWarp.h"
 #include "media/LifLoader.h"
 #include "media/MpoLoader.h"
 #include "Log.h"
@@ -20,6 +21,7 @@ namespace mp::browser {
 namespace {
 
 constexpr uint64_t kMaxViewBytes = 64u << 20;  // a view's JPEG larger than this is not read
+constexpr size_t kHeadBytes = 256u << 10;      // enough of a JPEG's head for its SOF (past EXIF)
 
 } // namespace
 
@@ -264,6 +266,10 @@ bool StereoPairs::MakeOne(const Job& job, Thumbnail& out) {
     LifLoader::ViewSpan left, right;
     bool found = LifLoader::FindViews(readAt, job.size, left, right);
     if (!found) {
+        LifLoader::DepthViewSpan one;
+        if (LifLoader::FindDepthView(readAt, job.size, one)) return MakeFromDepth(job, one, out);
+    }
+    if (!found) {
         std::vector<uint8_t> head((size_t)std::min<uint64_t>(job.size, MpoLoader::SniffBytes()));
         uint64_t offset = 0, size = 0;
         if (!head.empty() && readAt(0, head.data(), head.size()) &&
@@ -305,6 +311,62 @@ bool StereoPairs::MakeOne(const Job& job, Thumbnail& out) {
     out.width = ew * 2;
     out.height = eh;
     ComposePair(l, r, ew, eh, out.rgba);
+    return true;
+}
+
+bool StereoPairs::MakeFromDepth(const Job& job, const LifLoader::DepthViewSpan& one, Thumbnail& out) {
+    auto readAt = [&](uint64_t offset, void* dst, size_t size) {
+        return offset + size <= job.size && read_(job.fd, offset, dst, size);
+    };
+    if (one.image.size == 0 || one.image.size > kMaxViewBytes || one.mapSize > kMaxViewBytes) return false;
+    // The view's size from its JPEG header: the base JPEG's head only, unless the image is a
+    // blob, which is then read whole (it is decoded below anyway).
+    std::vector<uint8_t> imageBytes;
+    std::vector<uint8_t> head((size_t)std::min<uint64_t>(one.image.size, one.image.base ? kHeadBytes : kMaxViewBytes));
+    if (!readAt(one.image.offset, head.data(), head.size())) return false;
+    uint32_t vw = 0, vh = 0;
+    JpegSize(head.data(), head.size(), vw, vh);
+    if (head.size() == one.image.size) imageBytes.swap(head);
+    const bool whole = ThumbnailIsWholeView(job.w, job.h, vw, vh);
+    uint32_t ew = 0, eh = 0;
+    if (whole)
+        PairEyeSize(job.w, job.h, job.scale, ew, eh);
+    else
+        PairEyeSizeOfView(job.w, job.h, vw, vh, job.scale, ew, eh);
+
+    // The disparity map (a PNG or a JPEG, at the view's size on the NP02J's conversions),
+    // decoded straight to the eye size: its first channel is the depth.
+    std::vector<uint8_t> mapBytes((size_t)one.mapSize), map;
+    if (!readAt(one.mapOffset, mapBytes.data(), mapBytes.size())) return false;
+    if (!decode_(mapBytes.data(), mapBytes.size(), ew, eh, map) || map.size() < (size_t)ew * eh * 4) return false;
+    std::vector<uint8_t> depth((size_t)ew * eh);
+    for (size_t i = 0; i < depth.size(); ++i) depth[i] = one.invert ? (uint8_t)(255 - map[i * 4]) : map[i * 4];
+
+    // The picture: the system's thumbnail when it is the whole view, else decoded small.
+    DecodedImage image;
+    image.width = (int)ew;
+    image.height = (int)eh;
+    if (one.image.base && whole) {
+        ResizeRgba(job.left.data(), job.w, job.h, ew, eh, image.pixels);
+    } else {
+        if (imageBytes.empty()) {
+            imageBytes.resize((size_t)one.image.size);
+            if (!readAt(one.image.offset, imageBytes.data(), imageBytes.size())) return false;
+        }
+        if (!decode_(imageBytes.data(), imageBytes.size(), ew, eh, image.pixels) ||
+            image.pixels.size() < (size_t)ew * eh * 4)
+            return false;
+    }
+    // Both eyes from the picture, by the player's warp at the player's parallax (LifLoader's
+    // one-view path), so the tile has the depth the file shows when opened. One thread: this
+    // is already the low-priority worker.
+    DecodedImage sbs = DepthWarp::MakeSbs(image, depth, one.parallax, 1);
+    if (!sbs.Valid()) return false;
+    out = Thumbnail{};
+    out.id = job.id;
+    out.width = (uint32_t)sbs.width;
+    out.height = (uint32_t)sbs.height;
+    out.rgba = std::move(sbs.pixels);
     return true;
 }
 
