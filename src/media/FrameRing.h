@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -68,6 +69,25 @@ public:
         int height = 0;
         PixFormat format = PixFormat::I420;
         int eyes = 1;                 // V210 only: eye planes side by side (plane[0] left, plane[1] right)
+        // V210 only, zero-copy (#238 phase 3, MEDIAPLAYER_ZERO_COPY_UPLOAD; media/HostBlocks.h): eye
+        // e's rows live in host memory the producer owns, not in plane[e] (left empty). `block`
+        // keeps the memory (the renderer imports it once, keyed by `id`); `hold` keeps the
+        // contents: the renderer copies it for each GPU frame that reads them and drops it once
+        // that frame has passed its fence, so the producer never refills rows the GPU still
+        // reads. A producer that publishes anything else into this buffer clears them (ClearExt).
+        struct ExtPlane {
+            const uint8_t* data = nullptr;
+            size_t bytes = 0;
+            uint64_t id = 0;
+            std::shared_ptr<const void> block;
+            std::shared_ptr<void> hold;
+        };
+        ExtPlane ext[2];
+        bool HasExt() const { return ext[0].data != nullptr; }
+        void ClearExt() {
+            ext[0] = ExtPlane{};
+            ext[1] = ExtPlane{};
+        }
         bool fullRange = false;       // JPEG/full vs MPEG/limited range
         ColorMatrix matrix = ColorMatrix::BT709;      // YUV matrix (ignored for RGBA)
         ColorTransfer transfer = ColorTransfer::SDR;  // Pro tone-maps HDR (#134)
