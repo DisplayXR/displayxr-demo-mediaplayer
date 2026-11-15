@@ -363,6 +363,11 @@ bool App::Initialize(const char* mediaPath) {
     // Audio is the A/V master: the video decoder paces frames to the audio clock when a
     // clip has sound (else it falls back to its own wall clock).
     video_.SetMasterClock([this]() { return audio_.ClockSeconds(); });
+    // The video owns Loop (#216): at each wrap it restarts the audio, which never loops by
+    // itself, so the two always start a pass together. Called on the decode thread;
+    // AudioPlayer::Seek is an atomic store, and the decoder is always stopped before the
+    // audio player (ReloadMedia / Shutdown), so audio_ outlives every call.
+    video_.SetLoopCallback([this]() { audio_.Seek(0.0); });
 
     // Load a stereo image or video if one was given; otherwise the loop falls back
     // to the RED|BLUE L/R test pattern (and the user can Open one at runtime). The
@@ -1502,10 +1507,7 @@ void App::BuildTransportUI() {
     actions.ToggleSlideshow = [this] { ToggleSlideshow(); };
     actions.TogglePlayback = [this] { TogglePlayback(); };
     actions.ToggleMute = [this] { ToggleMute(); };
-    actions.ToggleLoop = [this] {
-        video_.ToggleLoop();
-        audio_.SetLoop(video_.Loop());
-    };
+    actions.ToggleLoop = [this] { video_.ToggleLoop(); };  // the audio follows the video's wraps
     actions.Seek = [this](float sec, bool preview) {
         video_.Seek(sec, preview);
         AutoConvNewPicture(/*newMedia=*/false);  // a jump: snap, never glide across it
@@ -1820,10 +1822,10 @@ bool App::LoadMediaFile(const std::string& path) {
         // In slideshow, force play-once so the clip can end and advance, regardless of
         // the user's manual loop preference.
         if (uiState_.slideshowActive) video_.SetLoop(false);
-        // Audio (optional — silent if the clip has none). Match mute + loop state.
+        // Audio (optional — silent if the clip has none). Match mute state; Loop is the
+        // video's alone (it restarts the audio at each wrap, SetLoopCallback above).
         audio_.Open(path);
         audio_.SetMuted(muted_);
-        audio_.SetLoop(video_.Loop());
         LOG_INFO("Playing %s video (%s), per-eye aspect %.3f",
                  LayoutLabel().c_str(), path.c_str(), contentAspect_);
         currentMediaPath_ = path;

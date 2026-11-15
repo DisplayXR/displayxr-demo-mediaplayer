@@ -3,7 +3,9 @@
 // AudioPlayer — decode a file's audio stream on its own thread (FFmpeg + swresample)
 // and play it through SDL3. Independent of VideoDecoder (its own AVFormatContext over
 // the same file), but it exposes a playback clock so the video can sync to it (audio is
-// the A/V master). Supports pause, seek, loop, and mute.
+// the A/V master). Supports pause, seek and mute. It does not loop by itself: at EOF it
+// drains, lets the queued audio play out and idles; with Loop on, the video owns the wrap
+// and restarts the audio with Seek(0) (VideoDecoder::SetLoopCallback, #216).
 //
 // FFmpeg/SDL types are hidden behind a pimpl. Built without FFmpeg, Open() returns false
 // (the player just runs silent).
@@ -33,12 +35,11 @@ public:
     void SetPaused(bool p);            // pauses/resumes the device + decode
     void SetMuted(bool m);             // gain 0 (keeps playing, just silent)
     bool Muted() const { return muted_.load(); }
-    void SetLoop(bool v) { loopEnabled_.store(v); }
-    void Seek(double seconds);
+    void Seek(double seconds);         // thread-safe (an atomic store; the audio thread seeks)
 
     // Position currently being played, in seconds — the A/V master clock. Returns -1
-    // when unavailable (no audio / nothing decoded yet), so the video falls back to its
-    // own wall clock.
+    // when unavailable (no audio / nothing decoded yet / ended and played out), so the
+    // video falls back to its own wall clock.
     double ClockSeconds() const;
 
 private:
@@ -50,7 +51,6 @@ private:
     std::atomic<bool> stop_{false};
     std::atomic<bool> paused_{false};
     std::atomic<bool> muted_{false};
-    std::atomic<bool> loopEnabled_{false};
     std::atomic<double> seekRequest_{-1.0};
     bool open_ = false;
 };
