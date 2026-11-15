@@ -251,8 +251,10 @@ VkCommandBuffer VulkanRenderer::OpenFrame() {
         if (frameSerial_ > n) uploader_->Retire(frameSerial_ - n);
     }
     // The same fence covers the producer's host blocks those frames read in place (zero-copy):
-    // their contents may be refilled now.
-    if (cmd != VK_NULL_HANDLE && !hostHolds_.empty()) {
+    // their contents may be refilled now, and imports nothing can still read may be freed.
+    // Every frame while any import exists, not only while holds are out: after the zero-copy
+    // source stops there are no holds, and its imports (~1 GB at 2160p) must still go.
+    if (cmd != VK_NULL_HANDLE && (!hostHolds_.empty() || !hostImports_.empty())) {
         const uint64_t n = ring_.framesInFlight();
         if (frameSerial_ > n) RetireHostHolds(frameSerial_ - n);
     }
@@ -1357,18 +1359,21 @@ void VulkanRenderer::RetireHostHolds(uint64_t completedFrame) {
     for (size_t i = 0; i < hostHolds_.size(); ++i)
         if (hostHolds_[i].first > completedFrame) hostHolds_[keep++] = std::move(hostHolds_[i]);
     hostHolds_.resize(keep);  // the dropped holds give their blocks back to the producer's pool
-    // Imports nothing has read for a while (the producer's pool shrank, or the source changed):
-    // released once no frame in flight can read them. A live pool reuses its blocks every few
-    // frames, so this only trims what is gone.
-    if (hostImports_.size() > 16) {
-        for (auto it = hostImports_.begin(); it != hostImports_.end();) {
-            if (it->second.lastSerial <= completedFrame && frameSerial_ - it->second.lastSerial > 600) {
-                vkDestroyBuffer(device_, it->second.buffer, nullptr);
-                vkFreeMemory(device_, it->second.memory, nullptr);  // before the block: the memory outlives the import
-                it = hostImports_.erase(it);
-            } else {
-                ++it;
-            }
+    // Imports are released once no frame in flight can read them (lastSerial <= completedFrame) and
+    //  - the import holds the block's last reference: its pool is gone (the source stopped or
+    //    changed size) and no ring frame or lease has it, so nothing can publish it again; or
+    //  - (a cache of more than 16) nothing has read it for ~600 frames: a pool that shrank.
+    // A live pool keeps its blocks (free list or leases), so they stay imported and are reused.
+    // (hostmem::ImportRetirable; tests/zero_copy_test.cpp.)
+    const size_t cacheSize = hostImports_.size();
+    for (auto it = hostImports_.begin(); it != hostImports_.end();) {
+        const HostImport& im = it->second;
+        if (hostmem::ImportRetirable(im.lastSerial, completedFrame, frameSerial_, im.block.use_count(), cacheSize)) {
+            vkDestroyBuffer(device_, im.buffer, nullptr);
+            vkFreeMemory(device_, im.memory, nullptr);  // before the block: the memory outlives the import
+            it = hostImports_.erase(it);
+        } else {
+            ++it;
         }
     }
 }

@@ -137,4 +137,19 @@ private:
     int made_ = 0, out_ = 0;
 };
 
+// The renderer's rule for releasing an import of a block (VulkanRenderer::RetireHostHolds), run
+// every frame while any import exists. Only once no frame in flight can read it
+// (lastSerial <= completedFrame), and then when either
+//  - the import holds the block's LAST reference (blockUseCount == 1): its pool is gone and no
+//    ring frame or lease has it, so nothing can publish it again; or
+//  - the cache holds more than 16 imports and this one has not been read for over 600 frames
+//    (a pool that shrank).
+// A live pool keeps its blocks (free list or leases), so their imports stay and are reused.
+inline bool ImportRetirable(uint64_t lastSerial, uint64_t completedFrame, uint64_t frameSerial, long blockUseCount,
+                            size_t cacheSize) {
+    if (lastSerial > completedFrame) return false;
+    if (blockUseCount <= 1) return true;
+    return cacheSize > 16 && frameSerial - lastSerial > 600;
+}
+
 }  // namespace mp::hostmem
