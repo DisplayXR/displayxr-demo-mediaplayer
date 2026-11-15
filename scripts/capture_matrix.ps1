@@ -341,12 +341,54 @@ Write-Host "Capture matrix: $($names.Count) arm(s) x $Rounds round(s) x $Minutes
 Write-Host "  arms: $($names -join ', ')" -ForegroundColor Gray
 Write-Host "  base env: $(EnvText $BaseEnv); pro.env is off for these runs" -ForegroundColor Gray
 
+# A station player already running would fight the matrix's player for the inputs. Close
+# it (politely, then by force), and start it again the way it was started once the
+# matrix ends, even when the matrix is interrupted.
+$playerName = [IO.Path]::GetFileNameWithoutExtension($Exe)
+$stopped = @()
+foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name = '$playerName.exe'" -ErrorAction SilentlyContinue)) {
+    $stopped += , [pscustomobject]@{ pid = $p.ProcessId; path = $p.ExecutablePath; cmd = $p.CommandLine }
+}
+if ($stopped.Count) {
+    Write-Host "  A station player is running (pid $(($stopped | ForEach-Object { $_.pid }) -join ', ')): closing it for the matrix; it is started again at the end." -ForegroundColor DarkYellow
+    foreach ($s0 in $stopped) {
+        $proc = Get-Process -Id $s0.pid -ErrorAction SilentlyContinue
+        if (-not $proc) { continue }
+        [void]$proc.CloseMainWindow()
+        if (-not $proc.WaitForExit(15000)) { Stop-Process -Id $s0.pid -Force -ErrorAction SilentlyContinue; [void]$proc.WaitForExit(5000) }
+    }
+    if (@(Get-Process -Name $playerName -ErrorAction SilentlyContinue).Count) {
+        Write-Host "  Could not close the running player; stop it and run the matrix again." -ForegroundColor Red
+        exit 2
+    }
+    $stopped | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $Out "stopped_player.json") -Encoding ascii
+}
+function Restore-Player {
+    foreach ($s0 in $stopped) {
+        if (-not $s0.path -or -not (Test-Path $s0.path)) { continue }
+        # The command line minus the executable: the arguments it was started with.
+        $args0 = ""
+        if ($s0.cmd) {
+            $c = $s0.cmd.Trim()
+            if ($c.StartsWith('"')) { $e = $c.IndexOf('"', 1); $args0 = if ($e -gt 0) { $c.Substring($e + 1).Trim() } else { "" } }
+            else { $sp = $c.IndexOf(' '); $args0 = if ($sp -gt 0) { $c.Substring($sp + 1).Trim() } else { "" } }
+        }
+        try {
+            $sp0 = @{ FilePath = $s0.path; WorkingDirectory = (Split-Path $s0.path) }
+            if ($args0) { $sp0.ArgumentList = $args0 }
+            Start-Process @sp0
+            Write-Host "Started the station player again: $($s0.path) $args0" -ForegroundColor Cyan
+        } catch { Write-Host "Could not start the station player again ($($s0.path)): $_" -ForegroundColor Red }
+    }
+}
+
 $sys = System-Facts
 $sys | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $Out "system.json") -Encoding ascii
 if ($sys.memory) { Write-Host ("  memory: {0} DIMM(s) in {1} slot(s), {2} GB" -f $sys.memory.dimm_count, $sys.memory.slots, $sys.memory.total_gb) -ForegroundColor Gray }
 
 $results = @()
 $i = 0
+try {
 for ($round = 1; $round -le $Rounds; $round++) {
     $order = if ($round % 2 -eq 0) { @($names[($names.Count - 1)..0]) } else { $names }
     foreach ($arm in $order) {
@@ -370,6 +412,8 @@ for ($round = 1; $round -le $Rounds; $round++) {
         Start-Sleep -Seconds 3   # let the card and the runtime settle between runs
     }
 }
+
+} finally { Restore-Player }
 
 Write-Summary $results
 $zip = Join-Path (Split-Path $Out) ("{0}.zip" -f (Split-Path $Out -Leaf))
