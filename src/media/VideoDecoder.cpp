@@ -195,6 +195,7 @@ struct VideoDecoder::Impl {
     SegmentIoHook segIo;                        // DASH live segment retry (#197)
     AVCodecParameters* switchPar = nullptr;     // ABR (#205): the new rendition's parameters
     int swsW = 0, swsH = 0, swsFmt = -1;        // cached sws source params (fallback)
+    bool swsWarned = false;                     // fallback conversion failure logged once per open
     // Pro float (EXR) path: -> GBRPF32 (when needed), then sRGB-encoded BT.709 P016.
     SwsContext* swsF = nullptr;
     AVFrame* f32Frame = nullptr;
@@ -809,6 +810,27 @@ void VideoDecoder::DecodeLoop() {
     double firstPtsSec = -1.0;
     bool audioGiveUp = false;  // latched when the audio clock ends/stalls -> wall-clock pacing
 
+    // Wait for wallStart + due in short steps: a stop or a seek cuts it short, and a pause
+    // holds it (moving the wall clock on by the paused time, as the main loop does). Never one
+    // long sleep: Stop() joins this thread, so a frame due far ahead (a low-frame-rate clip, a
+    // PTS jump) must not hold up quit or the next open. Returns how far past its due time it
+    // returned, in seconds (negative when cut short).
+    auto waitWallDue = [&](clock::duration due) -> double {
+        while (!stop_.load() && seekRequest_.load() < 0.0) {
+            if (paused_.load()) {
+                const auto pauseBegin = clock::now();
+                while (paused_.load() && seekRequest_.load() < 0.0 && !stop_.load())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(8));
+                wallStart += clock::now() - pauseBegin;
+                continue;
+            }
+            const auto left = wallStart + due - clock::now();
+            if (left <= clock::duration::zero()) break;
+            std::this_thread::sleep_for(std::min<clock::duration>(left, std::chrono::milliseconds(8)));
+        }
+        return std::chrono::duration<double>(clock::now() - (wallStart + due)).count();
+    };
+
     // Copy one plane (stride-aware) into a tightly packed buffer.
     auto copyPlane = [](std::vector<uint8_t>& d, const uint8_t* s, int stride, int wBytes, int h) {
         d.resize((size_t)wBytes * h);
@@ -1077,10 +1099,30 @@ void VideoDecoder::DecodeLoop() {
                 impl_->convFrame->format = AV_PIX_FMT_YUV420P;
                 impl_->convFrame->width = src->width;
                 impl_->convFrame->height = src->height;
-                av_frame_get_buffer(impl_->convFrame, 32);
+                // Same checks as the Pro branch above: no context or no buffer drops the
+                // frame, and the cache key is cleared so the next frame tries again. Logged
+                // once per open, not per dropped frame.
+                if (!impl_->sws || av_frame_get_buffer(impl_->convFrame, 32) < 0) {
+                    if (impl_->sws) sws_freeContext(impl_->sws);
+                    impl_->sws = nullptr;
+                    impl_->swsFmt = -1;
+                    if (!impl_->swsWarned) {
+                        impl_->swsWarned = true;
+                        LOG_ERROR("VideoDecoder: cannot convert %s to I420; dropping frames",
+                                  av_get_pix_fmt_name(sf));
+                    }
+                    return -2.0;
+                }
             }
-            sws_scale(impl_->sws, src->data, src->linesize, 0, src->height, impl_->convFrame->data,
-                      impl_->convFrame->linesize);
+            if (sws_scale(impl_->sws, src->data, src->linesize, 0, src->height, impl_->convFrame->data,
+                          impl_->convFrame->linesize) <= 0) {
+                if (!impl_->swsWarned) {
+                    impl_->swsWarned = true;
+                    LOG_ERROR("VideoDecoder: swscale failed converting %s to I420; dropping frames",
+                              av_get_pix_fmt_name(sf));
+                }
+                return -2.0;
+            }
             yuv = impl_->convFrame;
             outFmt = PixFormat::I420;
         }
@@ -1112,14 +1154,16 @@ void VideoDecoder::DecodeLoop() {
             dst.primaries2020 = false;               // OpenEXR's default (linear Rec.709 / sRGB)
         }
         const int cw = (yuv->width + 1) / 2, ch = (yuv->height + 1) / 2;
-        copyPlane(dst.plane[0], yuv->data[0], yuv->linesize[0], yuv->width, yuv->height);
+        // Luma once per format: 16-bit samples (2 bytes) for P016, 8-bit for I420 / NV12.
         if (outFmt == PixFormat::P016) {
             copyPlane(dst.plane[0], yuv->data[0], yuv->linesize[0], yuv->width * 2, yuv->height);
             copyPlane(dst.plane[1], yuv->data[1], yuv->linesize[1], cw * 4, ch);
         } else if (outFmt == PixFormat::I420) {
+            copyPlane(dst.plane[0], yuv->data[0], yuv->linesize[0], yuv->width, yuv->height);
             copyPlane(dst.plane[1], yuv->data[1], yuv->linesize[1], cw, ch);
             copyPlane(dst.plane[2], yuv->data[2], yuv->linesize[2], cw, ch);
         } else {  // NV12: a single interleaved chroma plane, cw*2 bytes per row
+            copyPlane(dst.plane[0], yuv->data[0], yuv->linesize[0], yuv->width, yuv->height);
             copyPlane(dst.plane[1], yuv->data[1], yuv->linesize[1], cw * 2, ch);
             dst.plane[2].clear();
         }
@@ -1262,23 +1306,8 @@ void VideoDecoder::DecodeLoop() {
                 if (ptsSec >= 0.0) {
                     positionSec_.store(ptsSec);
                     if (firstPtsSec < 0.0) { firstPtsSec = ptsSec; wallStart = clock::now(); }
-                    // Wait for the frame's time in short steps: a stop or seek cuts it short,
-                    // and a pause holds it (moving the wall clock on, as the main loop does).
-                    const auto due = std::chrono::duration_cast<clock::duration>(
-                        std::chrono::duration<double>(ptsSec - firstPtsSec));
-                    while (!stop_.load() && seekRequest_.load() < 0.0) {
-                        if (paused_.load()) {
-                            const auto pauseBegin = clock::now();
-                            while (paused_.load() && seekRequest_.load() < 0.0 && !stop_.load())
-                                std::this_thread::sleep_for(std::chrono::milliseconds(8));
-                            wallStart += clock::now() - pauseBegin;
-                            continue;
-                        }
-                        const auto left = wallStart + due - clock::now();
-                        if (left <= clock::duration::zero()) break;
-                        std::this_thread::sleep_for(std::min<clock::duration>(left, std::chrono::milliseconds(8)));
-                    }
-                    drainLate = std::chrono::duration<double>(clock::now() - (wallStart + due)).count();
+                    drainLate = waitWallDue(std::chrono::duration_cast<clock::duration>(
+                        std::chrono::duration<double>(ptsSec - firstPtsSec)));
                 }
                 PublishPaced(drainLate);
             }
@@ -1343,10 +1372,9 @@ void VideoDecoder::DecodeLoop() {
                     }
                     if (wall) {
                         if (firstPtsSec < 0.0) { firstPtsSec = ptsSec; wallStart = clock::now(); }
-                        auto target = wallStart + std::chrono::duration_cast<clock::duration>(
-                                                      std::chrono::duration<double>(ptsSec - firstPtsSec));
-                        std::this_thread::sleep_until(target);
-                        lateSec = std::chrono::duration<double>(clock::now() - target).count();
+                        // Stepped, not one sleep_until: a large PTS gap must not block Stop().
+                        lateSec = waitWallDue(std::chrono::duration_cast<clock::duration>(
+                            std::chrono::duration<double>(ptsSec - firstPtsSec)));
                     } else if (!paused_.load() && seekRequest_.load() < 0.0) {
                         const double now = masterClock_();
                         if (now >= 0.0) lateSec = now - ptsSec;
