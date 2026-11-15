@@ -82,6 +82,36 @@ void EnvFile() {
     CHECK(env["MEDIAPLAYER_GPU_V210"] == "0" && !a[0].fromFile && a[0].value == "0", "environment kept");
     CHECK(env["MEDIAPLAYER_DECKLINK_RAW_V210"] == "on" && a[1].fromFile, "file value set");
     CHECK(env["LAST"] == "x", "last applied");
+
+    // Inline comments: '#' after whitespace (or first in the value), outside quotes.
+    const std::vector<EnvEntry> c = ParseEnvText(
+        "MEDIAPLAYER_GPU_V210=1 # on\n"
+        "A=a#b\n"
+        "B=\"x # y\" # note\n"
+        "C='z' #\n"
+        "D=#all comment\n"
+        "E=\"open\n");
+    CHECK(c.size() == 6, "six inline-comment entries");
+    if (c.size() == 6) {
+        CHECK(c[0].value == "1", "inline comment stripped (GPU_V210=1 # on reads 1)");
+        CHECK(c[1].value == "a#b", "a '#' inside a word is kept");
+        CHECK(c[2].value == "x # y", "a '#' inside quotes is kept; the comment after them dropped");
+        CHECK(c[3].value == "z", "single-quoted value then a comment");
+        CHECK(c[4].value.empty(), "a value that is all comment is empty");
+        CHECK(c[5].value == "\"open", "an unclosed quote is kept as written");
+    }
+
+    // A variable set to an empty value counts as set: the file does not override it.
+    std::map<std::string, std::string> env2 = {{"MEDIAPLAYER_DECKLINK_DIRECT_PAIR", ""}};
+    const auto get2 = [&](const char* k) -> const char* {
+        auto it = env2.find(k);
+        return it == env2.end() ? nullptr : it->second.c_str();
+    };
+    const auto set2 = [&](const std::string& k, const std::string& v) { env2[k] = v; };
+    const std::vector<EnvApplied> a2 =
+        ApplyEnvEntries(ParseEnvText("MEDIAPLAYER_DECKLINK_DIRECT_PAIR=0\n"), get2, set2);
+    CHECK(a2.size() == 1 && !a2[0].fromFile && env2["MEDIAPLAYER_DECKLINK_DIRECT_PAIR"].empty(),
+          "an empty environment value wins over the file");
 }
 
 void LeverTable() {

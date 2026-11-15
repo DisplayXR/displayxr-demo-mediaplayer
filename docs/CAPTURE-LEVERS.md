@@ -117,7 +117,9 @@ How to read it:
 Media Player Pro reads `KEY=VALUE` lines from a settings file at start, before anything else
 reads the environment. This works for any variable: the levers, `MEDIAPLAYER_PRO_10BIT`, and
 the runtime's `DXR_*`, which the runtime reads when it loads. A variable already set in the
-environment wins over the file. The installer rewrites the Start-menu shortcut on every
+environment wins over the file, even when it is set to an empty value. A `#` at the start
+of a line, or after a space in a value, starts a comment (`MEDIAPLAYER_GPU_V210=1 # on` reads
+`1`). The installer rewrites the Start-menu shortcut on every
 upgrade, but it never touches this file.
 
 - Windows: `%APPDATA%\DisplayXR\MediaPlayerPro\pro.env`
