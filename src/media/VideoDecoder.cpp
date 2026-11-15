@@ -1162,32 +1162,66 @@ void VideoDecoder::DecodeLoop() {
             // atomic seekRequest_ coalesces — each finished seek immediately re-targets the
             // latest cursor position. The net effect is frame-exact previews that track the
             // cursor at decode rate, instead of jumping between keyframes.
-            bool reached = false, filled = false;
+            bool reached = false, filled = false, eof = false;
             double lastPts = sk;
+            // The latest frame decoded short of the target, held by reference (no copy, no
+            // download). A seek past the last frame's PTS (the end of the file, or a
+            // duration that overstates the video) never reaches the target; it shows this.
+            AVFrame* fallback = av_frame_alloc();
+            bool haveFallback = false;
+            // One decoded frame: display it if it reaches the target, else keep it as the
+            // fallback. True once the seek has landed.
+            auto takeSeekFrame = [&]() -> bool {
+                // Read the PTS off the raw decoded frame — cheap, no GPU download. Only
+                // the frame we actually display is downloaded/converted (fillFrame);
+                // decoding past intermediate frames is fast, downloading them is not.
+                const int64_t ticks = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                                          ? frame->best_effort_timestamp : frame->pts;
+                const double pts = (ticks != AV_NOPTS_VALUE) ? (double)ticks * timeBase : -1.0;
+                // Preview: take the first frame (the keyframe) — no forward decode.
+                // Exact: decode forward until we reach the target frame.
+                if (preview || pts < 0.0 || pts + 1e-3 >= sk) {
+                    const double fpts = fillFrame(frame);  // copy this one to the ring
+                    if (fpts > -2.0) { filled = true; lastPts = (fpts >= 0.0) ? fpts : sk; }
+                    return true;
+                }
+                // earlier than target → keep only the latest by reference, keep decoding
+                if (fallback) {
+                    av_frame_unref(fallback);
+                    av_frame_move_ref(fallback, frame);
+                    haveFallback = true;
+                }
+                return false;
+            };
             while (!stop_.load() && !reached) {
-                if (av_read_frame(impl_->fmt, pkt) < 0) break;  // EOF before target
+                if (av_read_frame(impl_->fmt, pkt) < 0) { eof = true; break; }  // EOF before target
                 if (pkt->stream_index != impl_->videoStream) { av_packet_unref(pkt); continue; }
                 const int sent = avcodec_send_packet(impl_->codec, pkt);
                 av_packet_unref(pkt);
                 if (sent != 0) continue;
                 while (!stop_.load() && ReceiveFrame(frame) == 0) {
-                    // Read the PTS off the raw decoded frame — cheap, no GPU download. Only
-                    // the frame we actually display is downloaded/converted (fillFrame);
-                    // decoding past intermediate frames is fast, downloading them is not.
-                    const int64_t ticks = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
-                                              ? frame->best_effort_timestamp : frame->pts;
-                    const double pts = (ticks != AV_NOPTS_VALUE) ? (double)ticks * timeBase : -1.0;
-                    // Preview: take the first frame (the keyframe) — no forward decode.
-                    // Exact: decode forward until we reach the target frame.
-                    if (preview || pts < 0.0 || pts + 1e-3 >= sk) {
-                        const double fpts = fillFrame(frame);  // copy this one to the ring
-                        if (fpts > -2.0) { filled = true; lastPts = (fpts >= 0.0) ? fpts : sk; }
-                        reached = true;
-                        break;
-                    }
-                    // earlier than target → discard cheaply (no copy), keep decoding
+                    if (takeSeekFrame()) { reached = true; break; }
                 }
             }
+            if (eof && !reached && !stop_.load()) {
+                // Demuxer EOF before the target: the frames at or after it may still be inside
+                // the decoder (a frame-threaded software decoder holds threads-1 frames plus its
+                // reorder delay, more than Seek()'s 0.1 s headroom). Drain it, as the playback
+                // EOF path does, and if nothing reaches the target show the last frame decoded.
+                avcodec_send_packet(impl_->codec, nullptr);
+                while (!stop_.load() && ReceiveFrame(frame) == 0) {
+                    if (takeSeekFrame()) { reached = true; break; }
+                }
+                if (!reached && haveFallback) {
+                    const double fpts = fillFrame(fallback);
+                    if (fpts > -2.0) { filled = true; lastPts = (fpts >= 0.0) ? fpts : sk; }
+                }
+                // The drained decoder only accepts packets again after a flush. The demuxer
+                // stays at EOF, so playback from here takes the normal EOF path (loop / end).
+                avcodec_flush_buffers(impl_->codec);
+                MvReset();
+            }
+            av_frame_free(&fallback);
             // Always publish the frame we landed on — during a drag this is the preview
             // keyframe; when settled it's the exact target. The knob is held steady by
             // the UI until the decoded position catches up (no snap-back on release).
@@ -1403,8 +1437,10 @@ int VideoDecoder::ReceiveFrame(AVFrame* out) {
 void VideoDecoder::Seek(double seconds, bool preview) {
     if (live_) return;  // a live stream has no timeline (#93)
     if (seconds < 0.0) seconds = 0.0;
-    // Leave a little headroom before EOF so the forward-decode always finds a frame at
-    // or after the target (otherwise a seek to the very end lands nothing to display).
+    // Leave a little headroom before EOF so the forward-decode usually finds a frame at or
+    // after the target. Not a guarantee on its own (a frame-threaded decoder can hold more
+    // than 0.1 s): the seek loop drains the decoder at EOF and falls back to the last
+    // decoded frame, so a seek to the very end always lands one (#217).
     if (durationSec_ > 0.0 && seconds > durationSec_ - 0.1) seconds = durationSec_ - 0.1;
     if (seconds < 0.0) seconds = 0.0;
     LOG_DEBUG("VideoDecoder: seek request -> %.2fs (paused=%d)", seconds, (int)paused_.load());
