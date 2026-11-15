@@ -95,8 +95,10 @@ inline std::string SetLeversText(const std::vector<Lever>& t) {
 }
 
 // ---- pro.env: KEY=VALUE lines. '#' starts a comment line; blank lines are skipped; spaces
-// around the key and value are trimmed; a value may be quoted ("..." or '...'). Lines that
-// are not KEY=VALUE are returned in `bad` (1-based line numbers) and otherwise ignored.
+// around the key and value are trimmed; a value may be quoted ("..." or '...'). A '#' after
+// whitespace (or first in the value) outside quotes starts an inline comment, so
+// `GPU_V210=1 # on` reads 1, while `X=a#b` keeps its '#'. Lines that are not KEY=VALUE are
+// returned in `bad` (1-based line numbers) and otherwise ignored.
 struct EnvEntry {
     std::string key, value;
     int line = 0;
@@ -134,8 +136,19 @@ inline std::vector<EnvEntry> ParseEnvText(const std::string& text, std::vector<i
             if (bad) bad->push_back(lineNo);
         } else {
             std::string v = TrimSpaces(t.substr(eq + 1));
-            if (v.size() >= 2 && ((v.front() == '"' && v.back() == '"') || (v.front() == '\'' && v.back() == '\'')))
-                v = v.substr(1, v.size() - 2);
+            if (!v.empty() && (v.front() == '"' || v.front() == '\'')) {
+                // Quoted: the value is up to the matching quote; anything after it (an inline
+                // comment) is dropped. No closing quote: kept as written.
+                const size_t close = v.find(v.front(), 1);
+                if (close != std::string::npos) v = v.substr(1, close - 1);
+            } else {
+                for (size_t i = 0; i < v.size(); ++i) {
+                    if (v[i] == '#' && (i == 0 || std::isspace((unsigned char)v[i - 1]))) {
+                        v = TrimSpaces(v.substr(0, i));
+                        break;
+                    }
+                }
+            }
             out.push_back({key, v, lineNo});
         }
         if (q == text.size()) break;
@@ -144,7 +157,8 @@ inline std::vector<EnvEntry> ParseEnvText(const std::string& text, std::vector<i
 }
 
 // What applying a file did, per entry: set from the file, or kept because the process
-// environment already had the variable (the environment wins).
+// environment already had the variable (the environment wins). A variable set to an empty
+// value counts as set: the file does not override it.
 struct EnvApplied {
     std::string key, value;
     bool fromFile = false;  // false: the environment's value was kept
@@ -155,7 +169,7 @@ std::vector<EnvApplied> ApplyEnvEntries(const std::vector<EnvEntry>& entries, Ge
     std::vector<EnvApplied> out;
     for (const EnvEntry& e : entries) {
         const char* cur = get(e.key.c_str());
-        if (cur && *cur) {
+        if (cur) {
             out.push_back({e.key, cur, false});
         } else {
             set(e.key, e.value);
