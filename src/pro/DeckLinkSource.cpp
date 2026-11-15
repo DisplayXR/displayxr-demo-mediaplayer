@@ -576,6 +576,29 @@ private:
 };
 #endif  // MP_DL_SDK_HAS_VIDEO_BUFFER
 
+// A zero-copy capture's SDK objects, kept for its leases (TakeHeldAsExt): its own references to
+// the inputs and devices and, on Windows, a usage count on COM's multithreaded apartment so COM
+// is not torn down (nor the DeckLink DLL freed) while a card frame is still out. Released with
+// the last lease, or with the worker's reference when no lease is left.
+struct LeaseKeep {
+    IDeckLinkInput* inputs[2] = {nullptr, nullptr};  // written by the worker before that input streams
+    std::vector<IDeckLink*> devices;
+#if defined(_WIN32)
+    CO_MTA_USAGE_COOKIE mta = nullptr;
+#endif
+    LeaseKeep() = default;
+    LeaseKeep(const LeaseKeep&) = delete;
+    LeaseKeep& operator=(const LeaseKeep&) = delete;
+    ~LeaseKeep() {
+        for (IDeckLinkInput*& in : inputs)
+            if (in) in->Release();
+        for (IDeckLink* d : devices) d->Release();
+#if defined(_WIN32)
+        if (mta) CoDecrementMTAUsage(mta);
+#endif
+    }
+};
+
 #if MP_DL_SDK_HAS_VIDEO_BUFFER
 // A held frame whose bytes are one of this app's host blocks (the allocator's), as is: what the
 // zero-copy path can hand to the renderer.
@@ -587,14 +610,19 @@ bool ExtEligible(const RawPixels& p) {
 // Moves the held card frame into a lease (FrameRing::Frame::ExtPlane::hold): the frame goes back
 // to the card when the last copy of the lease goes: the pairing history's, the ring frame's, and
 // the renderer's, which it drops once the GPU frame that read the rows has passed its fence.
-bool TakeHeldAsExt(RawPixels& p, FrameRing::Frame::ExtPlane& out) {
+// Each lease also holds the capture's LeaseKeep, so the inputs, the devices and (Windows) COM's
+// multithreaded apartment outlive the capture's teardown until the last frame has gone back:
+// the last release can run on the render thread, after the worker has released its own
+// references and left COM, even at app exit.
+bool TakeHeldAsExt(RawPixels& p, FrameRing::Frame::ExtPlane& out, const std::shared_ptr<LeaseKeep>& keep) {
     if (!ExtEligible(p)) return false;
     std::shared_ptr<const hostmem::Block> b = FindBlock(p.held);
     struct Held {
         IDeckLinkVideoFrame* frame;
         IDeckLinkVideoBuffer* buffer;
+        std::shared_ptr<LeaseKeep> keep;  // dropped after the frame: the SDK objects go last
     };
-    Held* h = new Held{p.heldFrame, p.heldBuffer};
+    Held* h = new Held{p.heldFrame, p.heldBuffer, keep};
     std::shared_ptr<void> hold(h, [](Held* x) {
         if (x->buffer) {
             x->buffer->EndAccess(bmdBufferAccessRead);
@@ -602,7 +630,7 @@ bool TakeHeldAsExt(RawPixels& p, FrameRing::Frame::ExtPlane& out) {
         }
         x->frame->Release();
         g_heldNow.fetch_sub(1);
-        delete x;
+        delete x;  // (may release the capture's inputs and devices, if it was the last lease)
     });
     out = FrameRing::Frame::ExtPlane{p.held, p.Size(), b->id, b, std::move(hold)};
     p.heldFrame = nullptr;  // the lease owns the references now
@@ -612,7 +640,7 @@ bool TakeHeldAsExt(RawPixels& p, FrameRing::Frame::ExtPlane& out) {
 }
 #else
 bool ExtEligible(const RawPixels&) { return false; }
-bool TakeHeldAsExt(RawPixels&, FrameRing::Frame::ExtPlane&) { return false; }
+bool TakeHeldAsExt(RawPixels&, FrameRing::Frame::ExtPlane&, const std::shared_ptr<LeaseKeep>&) { return false; }
 #endif
 
 // False when the frame's pixels cannot be read.
@@ -854,6 +882,7 @@ struct DeckLinkCapture {
 #endif
     int pinGroup[2] = {-1, -1};      // MEDIAPLAYER_CAPTURE_PIN
     bool zeroCopy = false;           // MEDIAPLAYER_ZERO_COPY_UPLOAD: raw + hold + the renderer imports host blocks
+    std::shared_ptr<LeaseKeep> leaseKeep;  // zero-copy: what every lease keeps alive (TakeHeldAsExt)
     bool warnedRawSize = false;
     enum PairPath { kComposed, kDirect, kRaw };
     struct RingFrames final : DirectPairTable::Frames {
@@ -1141,8 +1170,8 @@ struct DeckLinkCapture {
                 if (zeroCopy && ExtEligible(r.px) && (!r.dual || ExtEligible(r.right))) {
                     // Zero-copy: the card's buffers themselves go to the ring; the GPU reads them in place.
                     FrameRing::Frame::ExtPlane ex[2];
-                    TakeHeldAsExt(r.px, ex[0]);
-                    if (r.dual) TakeHeldAsExt(r.right, ex[1]);
+                    TakeHeldAsExt(r.px, ex[0], leaseKeep);
+                    if (r.dual) TakeHeldAsExt(r.right, ex[1], leaseKeep);
                     const FrameRing::Frame::ExtPlane* eyes[2] = {&ex[0], r.dual ? &ex[1] : nullptr};
                     const double t1 = LiveProducer::NowSeconds();
                     src->clockConvert_.Add(Ms(t0, t1), t1);
@@ -1206,7 +1235,7 @@ struct DeckLinkCapture {
         if (rawV210 && RawEligible(r.px, w, h)) {
             ef.ext = FrameRing::Frame::ExtPlane{};  // (a lease left in this slot goes back to the card)
             ef.isExt = false;
-            if (zeroCopy && TakeHeldAsExt(r.px, ef.ext)) {
+            if (zeroCopy && TakeHeldAsExt(r.px, ef.ext, leaseKeep)) {
                 ef.isExt = true;  // zero-copy: the slot holds the card's buffer, no copy at all
             } else {
                 if (zeroCopy) CountCapture(&DeckLinkSource::CaptureStats::zeroCopyFallback);
@@ -1876,6 +1905,16 @@ void DeckLinkSource::Worker() {
     // GPU decodes), hold (frames kept, not copied) and the renderer's host import.
     const bool zcAsked = v210::Requested(std::getenv("MEDIAPLAYER_ZERO_COPY_UPLOAD"));
     cap.zeroCopy = zcAsked && cap.rawV210 && cap.hold && v210::ZeroCopyActive();
+    if (cap.zeroCopy) {
+        cap.leaseKeep = std::make_shared<LeaseKeep>();
+        for (IDeckLink* d : devices) {
+            d->AddRef();
+            cap.leaseKeep->devices.push_back(d);
+        }
+#if defined(_WIN32)
+        if (FAILED(CoIncrementMTAUsage(&cap.leaseKeep->mta))) cap.leaseKeep->mta = nullptr;
+#endif
+    }
     if (zcAsked && !cap.zeroCopy)
         notes += !cap.rawV210 ? "ZERO_COPY needs RAW_V210; "
                  : !cap.hold  ? "ZERO_COPY needs ALLOCATOR + HOLD; "
@@ -1974,6 +2013,10 @@ void DeckLinkSource::Worker() {
                     Release(dm);
                     const bool autoDual = cfg_.stereo == DeckLinkConfig::Stereo::Auto && !pair;
                     callbacks[e] = new Callback(capPtr, e, inputs[e], flags, autoDual, yuvFmt);
+                    if (cap.leaseKeep && !cap.leaseKeep->inputs[e]) {  // before it streams: no lease reads it
+                        inputs[e]->AddRef();
+                        cap.leaseKeep->inputs[e] = inputs[e];
+                    }
                     inputs[e]->SetCallback(callbacks[e]);
                     if (FAILED(inputs[e]->StartStreams())) {
                         err = names[(size_t)idx] + ": cannot start capture";
@@ -2082,6 +2125,15 @@ void DeckLinkSource::Worker() {
     Release(cap.provider);  // its pools live on in any buffer still out, and go with the last one
 #endif
     for (IDeckLink* d : devices) d->Release();
+    if (cap.leaseKeep) {
+        // Zero-copy: frames still in the ring or with the renderer keep the inputs, devices and
+        // COM alive (LeaseKeep) and go back to the card when those let go; nothing here waits.
+        const long out = cap.leaseKeep.use_count() - 1;
+        cap.leaseKeep.reset();
+        if (out > 0)
+            LOG_INFO("decklink: %ld zero-copy frame(s) still with the ring or the renderer: the capture's "
+                     "SDK objects stay alive until the last goes back", out);
+    }
 }
 
 #else  // no DeckLink SDK in this build
