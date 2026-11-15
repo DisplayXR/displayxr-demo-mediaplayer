@@ -302,7 +302,13 @@ if ($Analyze) {
 
 # ------------------------------------------------------------------ run
 if (-not $Exe) {
-    foreach ($c in @("C:\Program Files\DisplayXR\MediaPlayerPro\mediaplayer_pro_handle_vk_win.exe", (Join-Path $PSScriptRoot "..\build_pro\mediaplayer_pro_handle_vk_win.exe"))) {
+    # Same lookup as soak_stress.ps1: the installer records InstallPath under
+    # HKLM\Software\DisplayXR\Apps\MediaPlayerPro (default ...\DisplayXR\Apps\MediaPlayerPro);
+    # a dev tree's build_pro is the last resort.
+    $dir = $null
+    try { $dir = (Get-ItemProperty "HKLM:\Software\DisplayXR\Apps\MediaPlayerPro" -ErrorAction Stop).InstallPath } catch {}
+    if (-not $dir) { $dir = "$env:ProgramFiles\DisplayXR\Apps\MediaPlayerPro" }
+    foreach ($c in @((Join-Path $dir "mediaplayer_pro_handle_vk_win.exe"), (Join-Path $PSScriptRoot "..\build_pro\mediaplayer_pro_handle_vk_win.exe"))) {
         if (Test-Path $c) { $Exe = (Resolve-Path $c).Path; break }
     }
 }
