@@ -1275,7 +1275,7 @@ struct DeckLinkCapture {
         if (!d.publish || !alive) return;
         if (noSignal[1 - eye]) return;  // the other eye is dark: never fuse it with a stale frame
         if (hist[0][d.slot[0]].isRaw || hist[1][d.slot[1]].isRaw) {
-            PublishRaw(d, r.key);  // m held
+            PublishRaw(d, r.key, lk);  // m held (a mixed pair releases it for its copy)
             return;
         }
         if (!CountPair(d, r.key, kComposed)) return;
@@ -1315,8 +1315,8 @@ struct DeckLinkCapture {
     // move into one ring frame (swaps under m and publishM, no pixel copy). Not shown, and
     // counted in rawSkipped: an eye whose rows already went out in an earlier pair (the old
     // path would have shown that eye again), an eye that is not raw (a format change between
-    // the two), or two eye sizes. m held.
-    void PublishRaw(const TimecodePairer::Decision& d, int key) {
+    // the two), or two eye sizes. m held on entry (lk); a mixed pair releases it while it copies.
+    void PublishRaw(const TimecodePairer::Decision& d, int key, std::unique_lock<std::mutex>& lk) {
         EyeFrame& l = hist[0][d.slot[0]];
         EyeFrame& rt = hist[1][d.slot[1]];
         if (!l.isRaw || !rt.isRaw || l.moved || rt.moved || l.w != rt.w || l.h != rt.h) {
@@ -1333,13 +1333,48 @@ struct DeckLinkCapture {
         char tc[sizeof(l.tc)];
         std::memcpy(tc, l.tc, sizeof(tc));
         // One eye in a card buffer, the other copied out (zero-copy fell back for one eye): copy
-        // the held one out too (rare: a 22 MB copy under m), then publish as a plain raw pair.
+        // the held one out too, then publish as a plain raw pair. The copy (22 MB at 2160p) runs
+        // outside m, as the composed path's does, so the other eye's lane is not held off its next
+        // frame: both slots pinned (no lane converts into them), publishM taken before m is
+        // released (publishes stay in decision order), and both eyes marked moved first, so a
+        // later decision on either slot skips it instead of swapping rows this copy is using.
         if (l.isExt != rt.isExt) {
             EyeFrame& x = l.isExt ? l : rt;
-            x.raw.assign(x.ext.data, x.ext.data + x.ext.bytes);
+            FrameRing::Frame::ExtPlane held = std::move(x.ext);  // keeps the card buffer until copied
             x.ext = FrameRing::Frame::ExtPlane{};
             x.isExt = false;
             CountCapture(&DeckLinkSource::CaptureStats::zeroCopyFallback);
+            const int s0 = d.slot[0], s1 = d.slot[1];
+            const int w = l.w, h = l.h;
+            const ColorMatrix mtx = l.matrix;
+            const ColorTransfer transfer = l.transfer;
+            const double captureSec = std::min(l.arrived, rt.arrived);
+            const int offsetFrames = d.offsetFrames;
+            l.moved = rt.moved = true;
+            std::unique_lock<std::mutex> pub(publishM);  // after m, as every publisher
+            ++pins[0][s0];
+            ++pins[1][s1];
+            lk.unlock();
+            x.raw.assign(held.data, held.data + held.bytes);
+            held = FrameRing::Frame::ExtPlane{};  // the card buffer goes back now
+            std::vector<uint8_t>* eyes[2] = {&l.raw, &rt.raw};
+            const double p0 = LiveProducer::NowSeconds();
+            const bool ok = alive && src->PublishV210(eyes, 2, w, h, mtx, transfer, /*fullRange=*/false, captureSec,
+                                                      tc[0] ? tc : nullptr, offsetFrames);
+            const double p1 = LiveProducer::NowSeconds();
+            src->clockPublish_.Add(Ms(p0, p1), p1);
+            pub.unlock();  // before m: the next publisher may be holding m while it waits for publishM
+            lk.lock();
+            if (ok) {
+                CountCapture(&DeckLinkSource::CaptureStats::rawPublished);
+            } else {
+                l.moved = rt.moved = false;  // not published: the rows are still theirs
+            }
+            --pins[0][s0];
+            --pins[1][s1];
+            lk.unlock();
+            pinCv.notify_all();
+            return;
         }
         std::lock_guard<std::mutex> pub(publishM);  // after m, as every publisher
         if (l.isExt) {
