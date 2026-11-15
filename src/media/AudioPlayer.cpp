@@ -36,6 +36,7 @@ struct AudioPlayer::Impl {
     double timeBase = 0.0;
     std::atomic<double> firstPts{-1.0};        // PTS of the first sample since open/seek
     std::atomic<long long> pushedSamples{0};   // per-channel sample frames pushed to SDL
+    std::atomic<bool> ended{false};            // EOF reached and the decoder drained (until a seek)
 
     ~Impl() {
         if (stream) SDL_DestroyAudioStream(stream);
@@ -183,6 +184,26 @@ void AudioPlayer::DecodeLoop() {
         if (impl_->stream) SDL_ClearAudioStream(impl_->stream);
         impl_->firstPts.store(-1.0);
         impl_->pushedSamples.store(0);
+        impl_->ended.store(false);
+    };
+
+    // Resample one decoded frame and queue it on the device stream.
+    auto pushFrame = [&]() {
+        if (impl_->firstPts.load() < 0.0) {
+            const int64_t t = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                                  ? frame->best_effort_timestamp : frame->pts;
+            if (t != AV_NOPTS_VALUE) impl_->firstPts.store((double)t * impl_->timeBase);
+        }
+        const int maxOut = swr_get_out_samples(impl_->swr, frame->nb_samples);
+        if (maxOut <= 0) return;
+        outBuf.resize((size_t)maxOut * bytesPerFrame);
+        uint8_t* outPtr = outBuf.data();
+        const int got = swr_convert(impl_->swr, &outPtr, maxOut,
+                                    (const uint8_t**)frame->extended_data, frame->nb_samples);
+        if (got > 0) {
+            SDL_PutAudioStreamData(impl_->stream, outBuf.data(), got * bytesPerFrame);
+            impl_->pushedSamples.fetch_add(got);
+        }
     };
 
     while (!stop_.load()) {
@@ -202,15 +223,22 @@ void AudioPlayer::DecodeLoop() {
             continue;
         }
 
+        // At EOF: idle until a seek (the video's loop wrap, a user seek) or stop.
+        if (impl_->ended.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
         const int r = av_read_frame(impl_->fmt, pkt);
         if (r < 0) {  // EOF
-            if (loopEnabled_.load()) {
-                av_seek_frame(impl_->fmt, impl_->audioStream, 0, AVSEEK_FLAG_BACKWARD);
-                avcodec_flush_buffers(impl_->codec);
-                resetClock();
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));  // idle at end
-            }
+            // The audio never loops by itself: with Loop on, the video owns the wrap and
+            // restarts the audio through Seek(0) (VideoDecoder::SetLoopCallback, #216). So
+            // drain what the decoder still holds and let the queued tail play out (no
+            // SDL_ClearAudioStream here), then idle at the end.
+            avcodec_send_packet(impl_->codec, nullptr);
+            while (!stop_.load() && avcodec_receive_frame(impl_->codec, frame) == 0) pushFrame();
+            avcodec_flush_buffers(impl_->codec);  // accepts packets again after a seek
+            impl_->ended.store(true);
             continue;
         }
         if (pkt->stream_index != impl_->audioStream) {
@@ -218,23 +246,7 @@ void AudioPlayer::DecodeLoop() {
             continue;
         }
         if (avcodec_send_packet(impl_->codec, pkt) == 0) {
-            while (!stop_.load() && avcodec_receive_frame(impl_->codec, frame) == 0) {
-                if (impl_->firstPts.load() < 0.0) {
-                    const int64_t t = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
-                                          ? frame->best_effort_timestamp : frame->pts;
-                    if (t != AV_NOPTS_VALUE) impl_->firstPts.store((double)t * impl_->timeBase);
-                }
-                const int maxOut = swr_get_out_samples(impl_->swr, frame->nb_samples);
-                if (maxOut <= 0) continue;
-                outBuf.resize((size_t)maxOut * bytesPerFrame);
-                uint8_t* outPtr = outBuf.data();
-                const int got = swr_convert(impl_->swr, &outPtr, maxOut,
-                                            (const uint8_t**)frame->extended_data, frame->nb_samples);
-                if (got > 0) {
-                    SDL_PutAudioStreamData(impl_->stream, outBuf.data(), got * bytesPerFrame);
-                    impl_->pushedSamples.fetch_add(got);
-                }
-            }
+            while (!stop_.load() && avcodec_receive_frame(impl_->codec, frame) == 0) pushFrame();
         }
         av_packet_unref(pkt);
     }
@@ -272,6 +284,10 @@ double AudioPlayer::ClockSeconds() const {
     const double fp = impl_->firstPts.load();
     if (fp < 0.0) return -1.0;  // nothing decoded yet
     const int queuedBytes = SDL_GetAudioStreamQueued(impl_->stream);
+    // Ended and played out: the audio is over (shorter than the video, or the video is
+    // still draining its last frames). Say so, so the video hands pacing to its wall clock
+    // at once instead of waiting a second for a clock that has stopped advancing.
+    if (impl_->ended.load() && queuedBytes <= 0) return -1.0;
     const int bytesPerFrame = impl_->outChannels * (int)sizeof(float);
     const double queued = (queuedBytes > 0 ? queuedBytes : 0) / (double)bytesPerFrame;
     double consumed = (double)impl_->pushedSamples.load() - queued;

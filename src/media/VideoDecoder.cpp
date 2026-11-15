@@ -1257,6 +1257,9 @@ void VideoDecoder::DecodeLoop() {
                 MvReset();
                 firstPtsSec = -1.0;
                 audioGiveUp = false;  // re-arm audio sync after looping to the start
+                // The video owns the loop (#216): restart the audio now, at this wrap, so
+                // the master clock restarts with the picture instead of on its own EOF.
+                if (onLoop_) onLoop_();
                 wallStart = clock::now();
             } else {
                 // Loop off: mark ended and pause, holding the last published frame. A

@@ -137,6 +137,13 @@ public:
     // its PTS instead of using its own wall clock. Set once before Open().
     void SetMasterClock(std::function<double()> fn) { masterClock_ = std::move(fn); }
 
+    // Optional loop-wrap notification. With Loop on, the video OWNS the loop: each time its
+    // EOF sends the file back to the start, the decode thread calls this (after the seek,
+    // before the first frame of the new pass), and the App restarts the audio from it. The
+    // audio player never loops by itself, so the two cannot wrap at different moments
+    // (#216). Runs ON THE DECODE THREAD: keep it cheap and thread-safe. Set once before Open().
+    void SetLoopCallback(std::function<void()> fn) { onLoop_ = std::move(fn); }
+
 #if defined(_WIN32)
     // Pin the D3D11VA decode device to a specific adapter — the Vulkan physical device's
     // LUID — so decoded surfaces can be shared into Vulkan without a CPU round trip
@@ -200,6 +207,7 @@ private:
 
     FrameRing ring_;
     std::function<double()> masterClock_;   // audio clock for A/V sync (null = wall clock)
+    std::function<void()> onLoop_;          // loop wrap notification (null = none)
 #if defined(_WIN32)
     uint8_t interopLUID_[8] = {};   // target adapter for zero-copy D3D11VA decode (#28)
     bool haveInteropLUID_ = false;
