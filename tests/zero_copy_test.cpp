@@ -14,6 +14,8 @@
 //     frames in flight after the producer reused the ring buffer, is never handed out again
 //     until the hold for its frame is dropped.
 //  4. LiveSourceBase's publishes clear external planes left in a reused ring buffer.
+//  5. The renderer's import-release rule (hostmem::ImportRetirable): a dead pool's imports go
+//     as soon as no frame in flight reads them, whatever the cache size; a live pool's stay.
 // Pure: no GPU, no SDK.
 
 #include "media/FrameRing.h"
@@ -249,6 +251,37 @@ void PublishClears() {
     CHECK(pool->Out() < 2 * FrameRing::kBufferCount, "and gives their blocks back");
 }
 
+// 5. After a zero-copy source stops (its pool and leases gone), the renderer's imports hold the
+// blocks' last references and are released once past the fence, even with fewer than 17 of
+// them; while the pool lives they stay (no re-import churn).
+void ImportRelease() {
+    using hostmem::ImportRetirable;
+    std::vector<std::shared_ptr<const void>> imports;  // the renderer's references
+    {
+        auto pool = hostmem::Pool::Create(1 << 20, 8);
+        std::vector<hostmem::Lease> out;
+        for (int i = 0; i < 4; ++i) out.push_back(pool->Take());
+        for (auto& l : out) imports.push_back(l.block);
+        out.clear();  // back to the pool's free list: the pool still holds them
+        for (auto& b : imports)
+            CHECK(!ImportRetirable(10, 20, 30, b.use_count(), imports.size()), "import: a live pool's blocks stay");
+        CHECK(ImportRetirable(10, 20, 700, imports[0].use_count(), 17), "import: a big cache drops one idle 600 frames");
+    }  // the source stops: pool gone
+    for (auto& b : imports) {
+        CHECK(b.use_count() == 1, "import: the import holds the last reference");
+        CHECK(!ImportRetirable(25, 20, 26, b.use_count(), imports.size()), "import: not while a frame in flight reads it");
+        CHECK(ImportRetirable(20, 20, 26, b.use_count(), imports.size()), "import: a dead pool's block goes, cache of 4");
+    }
+    // A block a ring frame still holds (a lease left in a buffer) is not the import's last reference.
+    auto pool = hostmem::Pool::Create(1 << 20, 2);
+    hostmem::Lease l = pool->Take();
+    std::shared_ptr<const void> imp = l.block;
+    pool.reset();
+    CHECK(!ImportRetirable(1, 5, 6, imp.use_count(), 1), "import: a lease still out keeps it");
+    l = hostmem::Lease{};
+    CHECK(ImportRetirable(1, 5, 6, imp.use_count(), 1), "import: then it goes");
+}
+
 }  // namespace
 
 int main() {
@@ -257,6 +290,7 @@ int main() {
     HoldRule();
     PublishClears();
     PublishExt();
+    ImportRelease();
     if (g_failures) {
         std::fprintf(stderr, "zero_copy_test: %d failure(s)\n", g_failures);
         return 1;
