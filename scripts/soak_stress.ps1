@@ -60,6 +60,7 @@ param(
     [switch]$Fullscreen,
     [string]$Out,
     [hashtable]$Env,
+    [string[]]$ClearEnv,              # names removed from the child's environment before -Env (removed, not set to "")
     [switch]$Analyze,
     # Limits (growth per hour after warm-up, by least squares)
     [double]$MaxPrivateMBph = 50,
@@ -333,6 +334,7 @@ $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
 $psi.WorkingDirectory = $ExeDir
 $psi.Arguments = ($argv | ForEach-Object { '"' + $_ + '"' }) -join ' '
+if ($ClearEnv) { foreach ($k in $ClearEnv) { if ($psi.EnvironmentVariables.ContainsKey($k)) { $psi.EnvironmentVariables.Remove($k) } } }
 $psi.EnvironmentVariables["MEDIAPLAYER_HUD"] = "0"
 $psi.EnvironmentVariables["MEDIAPLAYER_LOOP"] = "1"
 if ($Fullscreen) { $psi.EnvironmentVariables["MEDIAPLAYER_FULLSCREEN"] = "1" }

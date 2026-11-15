@@ -110,6 +110,21 @@ $catalog = [ordered]@{
     "raw_upload8"        = @{ set = "upload"; env = (Merge @($raw, @{ "MEDIAPLAYER_UPLOAD_THREADS" = "8" })); why = "raw, 8 upload threads" }
     "raw_convert4"       = @{ set = "upload"; env = (Merge @($raw, @{ "MEDIAPLAYER_DECKLINK_CONVERT_THREADS" = "4" })); why = "raw, 4 lane threads (only the held-buffer copy uses them)" }
 }
+# Every lever name an arm could be judged by. Each run REMOVES all of them from the
+# player's environment before applying its own, so a lever already set for the user,
+# the machine or this shell cannot leak into an arm (baseline included). Removed, never
+# set to "": an empty value can read differently from unset (DIRECT_PAIR, for one).
+# MEDIAPLAYER_PRO_10BIT is not a lever and stays as the station has it (same for every arm).
+$LeverNames = @(
+    "DXR_VK_HUB_DEFER_COMPOSE_WAIT", "MEDIAPLAYER_ASYNC_UPLOAD", "MEDIAPLAYER_UPLOAD_THREADS",
+    "MEDIAPLAYER_CAPTURE_PIN", "MEDIAPLAYER_UPLOAD_PIN", "MEDIAPLAYER_GPU_V210",
+    "MEDIAPLAYER_DECKLINK_RAW_V210", "MEDIAPLAYER_DECKLINK_ALLOCATOR", "MEDIAPLAYER_DECKLINK_ALLOC_NODE",
+    "MEDIAPLAYER_DECKLINK_HOLD", "MEDIAPLAYER_DECKLINK_DIRECT_PAIR", "MEDIAPLAYER_DECKLINK_CONVERT_THREADS",
+    "MEDIAPLAYER_DECKLINK_STRICT_PAIRS", "MEDIAPLAYER_LIVE_QUEUE",
+    "MEDIAPLAYER_PRO_ENV_FILE"
+)
+foreach ($a in $catalog.Values) { foreach ($k in $a.env.Keys) { if ($LeverNames -notcontains $k) { $LeverNames += $k } } }
+foreach ($k in $BaseEnv.Keys) { if ($LeverNames -notcontains $k) { $LeverNames += $k } }
 function EnvText([hashtable]$h) {
     if (-not $h -or $h.Count -eq 0) { return "(none)" }
     return (($h.Keys | Sort-Object | ForEach-Object { "$_=$($h[$_])" }) -join " ")
@@ -117,6 +132,7 @@ function EnvText([hashtable]$h) {
 
 if ($List) {
     Write-Host "Base env (every arm): $(EnvText $BaseEnv)" -ForegroundColor Cyan
+    Write-Host "Cleared from the player's environment before each arm: $($LeverNames -join ' ')" -ForegroundColor DarkGray
     foreach ($k in $catalog.Keys) {
         $a = $catalog[$k]
         Write-Host ("  {0,-20} [{1,-7}] {2}" -f $k, $a.set, $a.why)
@@ -339,7 +355,7 @@ for ($round = 1; $round -le $Rounds; $round++) {
         $dir = Join-Path $Out ("r{0}_{1:D2}_{2}" -f $round, $i, $arm)
         Write-Host ""
         Write-Host ("[{0}/{1}] round {2}, arm {3}: {4}" -f $i, ($names.Count * $Rounds), $round, $arm, (EnvText $catalog[$arm].env)) -ForegroundColor Cyan
-        $soakArgs = @{ Exe = $Exe; Minutes = $Minutes; SampleSec = 5; WarmupMinutes = [math]::Min($WarmupSec / 60, $Minutes / 3); Out = $dir; Env = $armEnv }
+        $soakArgs = @{ Exe = $Exe; Minutes = $Minutes; SampleSec = 5; WarmupMinutes = [math]::Min($WarmupSec / 60, $Minutes / 3); Out = $dir; Env = $armEnv; ClearEnv = $LeverNames }
         if ($TestSignal) { $soakArgs.TestSignal = $TestSignal } else { $soakArgs.DeckLink = $true; $soakArgs.Left = $Left; $soakArgs.Right = $Right; $soakArgs.Connection = $Connection }
         if ($Fullscreen) { $soakArgs.Fullscreen = $true }
         try { & $Soak @soakArgs | Out-Host } catch { Write-Host "  run failed: $_" -ForegroundColor Red }
