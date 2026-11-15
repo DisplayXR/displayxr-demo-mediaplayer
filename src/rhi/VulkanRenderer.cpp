@@ -905,7 +905,16 @@ void VulkanRenderer::CommitUpload() {
         const VkDeviceSize offs[2] = {(VkDeviceSize)L.offset[0], (VkDeviceSize)L.offset[L.planes > 1 ? 1 : 0]};
         if (cmd == VK_NULL_HANDLE || !RecordV210Decode(cmd, bufs, offs, L.planes, (int)L.w[0], (int)L.h[0])) {
             uploader_->Cancel(p.ticket);  // nothing recorded: the GPU never reads this fill
-            LOG_ERROR("VulkanRenderer: could not record the staged v210 frame (decode pass / command buffer)");
+            // The decode pass refused (storage-buffer limit, descriptor sets, memory): decode
+            // on the CPU, as the direct path does, instead of dropping the frame. The caller
+            // still holds the frame (it has not acquired since StageFrame). Logged once.
+            if (!v210StagedFallbackWarned_) {
+                v210StagedFallbackWarned_ = true;
+                LOG_WARN("VulkanRenderer: could not record the staged v210 frame (decode pass / command buffer): "
+                         "decoding on the CPU instead");
+            }
+            int eyes = 0, eyeW = 0;
+            if (v210::Shape(*p.frame, eyes, eyeW)) UploadV210Cpu(*p.frame, eyes, eyeW);
             return;
         }
         uploader_->Record(p.ticket, frameSerial_);
