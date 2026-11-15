@@ -427,6 +427,7 @@ private:
     } v210_;
     std::vector<uint32_t> v210Cpu_;  // the CPU fallback's P016 (V210.h OutLayout)
     bool v210CpuWarned_ = false;
+    bool v210StagedFallbackWarned_ = false;  // CommitUpload: decode pass refused a staged frame
     bool CreateV210Pass();
     void DestroyV210Pass();
     // Record the decode of `eyes` eyes (eyeW x h each; eye e's rows at src[e] + off[e]) into
