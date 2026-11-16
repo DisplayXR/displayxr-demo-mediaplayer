@@ -27,6 +27,9 @@ hides or shows all the UI. **`F`** or **`F11`** is full screen with only the pic
 - **A file**: click **Open** (or `Ctrl+O`), or drag the file onto the window. Movies (ProRes,
   DNxHR, H.264 / H.265, MXF), stills (JPEG, PNG, TIFF, MPO, LIF) and image sequences (EXR,
   DPX, TIFF: open any frame of the sequence).
+- **A folder**: the arrow beside **Open**, then **Open folder...** (or `Ctrl+Shift+O`). Its first
+  file opens and `Down` / `Up` walk the folder. The same menu lists the **Recent** files and
+  folders (kept in `%APPDATA%\DisplayXR\MediaPlayerPro\recent.txt`).
 - **The next or previous file** in the same folder: **`Down`** / **`Up`**.
 - **A live input**: **Live...** in the top bar, or the Station panel's inputs list (**`J`**
   switches to the next input). Capture cards are set up with **DeckLink setup...** in the
@@ -382,7 +385,7 @@ or use the **Clip A | B** wipe (`8`) to see both at once, split by the line.
 |---|---|
 | `Tab` / `Shift+Tab` | pin the panels / hide or show all UI |
 | `F` / `F11`, `Esc` | full screen, leave full screen |
-| `Ctrl+O`, `Ctrl+U` | open a file, open a stream URL |
+| `Ctrl+O`, `Ctrl+Shift+O`, `Ctrl+U` | open a file, open a folder, open a stream URL |
 | `Up` / `Down` | previous / next file in the folder |
 | `Space`, `Left` / `Right`, `Shift+Left` / `Shift+Right`, `[` / `]` | play / pause, frame step, 5 frames, frame step |
 | `1`..`6` | 3D, left, right, difference, anaglyph, false colour |

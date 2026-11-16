@@ -290,6 +290,7 @@ function(mp_add_player tgt is_pro)
         src/media/HeifLoader.cpp     # stereo HEIC (#154): HEIF `ster` pair via FFmpeg's HEIF demuxer
         src/media/SpatialMedia.cpp   # MV-HEVC / HEIC eye order + HEIF box walk (#154), pure
         src/media/MediaSource.cpp
+        src/media/RecentList.cpp     # desktop Recent menu (#252 phase 0)
         src/media/StereoCompose.cpp
         src/media/StereoDetect.cpp
         src/media/VideoStereoProbe.cpp
@@ -753,6 +754,14 @@ if(MP_BUILD_TESTS)
         src/media/StreamUrl.cpp)
     target_include_directories(stream_url_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME stream_url COMMAND stream_url_test)
+
+    # Desktop Recent menu (#252 phase 0): order, dedupe, capacity, file round trip. Pure.
+    add_executable(recent_list_test tests/recent_list_test.cpp src/media/RecentList.cpp)
+    target_include_directories(recent_list_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(recent_list_test PRIVATE shell32 ole32)
+    endif()
+    add_test(NAME recent_list COMMAND recent_list_test)
 
     # Media browser (#160): the library's supported set, sources, filter and sort. Pure.
     add_executable(media_library_test

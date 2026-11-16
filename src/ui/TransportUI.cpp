@@ -709,7 +709,32 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             if (s.caps.gallery ? IconButton("##gallery", Glyph::Back, iconSz)
                                : ImGui::Button("Open"))
                 Fire(a.Open);
+            // The Open menu (#252 phase 0): an arrow glued to "Open" with Open file, Open
+            // folder and the Recent list. Disabled with Open while a picker is up.
+            if (s.caps.openMenu && !s.caps.gallery) {
+                ImGui::SameLine(0.0f, 1.0f);
+                if (ImGui::ArrowButton("##open_menu_btn", ImGuiDir_Down)) ImGui::OpenPopup("##open_menu");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open file, Open folder, Recent");
+            }
             ImGui::EndDisabled();
+            if (s.caps.openMenu && !s.caps.gallery && ImGui::BeginPopup("##open_menu")) {
+                if (ImGui::MenuItem("Open file...", "Ctrl+O")) Fire(a.Open);
+                if (ImGui::MenuItem("Open folder...", "Ctrl+Shift+O")) Fire(a.OpenFolder);
+                ImGui::Separator();
+                if (s.recentLabels.empty()) {
+                    ImGui::TextDisabled("No recent files");
+                } else {
+                    ImGui::TextDisabled("Recent");
+                    for (int i = 0; i < (int)s.recentLabels.size(); ++i) {
+                        ImGui::PushID(i);
+                        if (ImGui::MenuItem(s.recentLabels[i].c_str()) && a.OpenRecent) a.OpenRecent(i);
+                        ImGui::PopID();
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Clear recent")) Fire(a.ClearRecent);
+                }
+                ImGui::EndPopup();
+            }
             if (s.caps.camera || s.caps.url) {
                 ImGui::SameLine();
                 CameraCombo(s, a);

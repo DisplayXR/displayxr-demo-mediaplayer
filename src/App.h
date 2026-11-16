@@ -6,6 +6,7 @@
 #pragma once
 
 #include "media/AudioPlayer.h"
+#include "media/RecentList.h"
 #include "media/AutoConvergence.h"
 #include "media/CameraSource.h"
 #include "media/InputProviderClient.h"
@@ -84,6 +85,14 @@ private:
     // Open-file. RequestOpenFile tries the workspace picker, else a native dialog.
     // LoadMedia opens a path fresh; ReloadMedia tears down current media first.
     void RequestOpenFile();
+    // Open folder (#252 phase 0): a native folder dialog; the folder becomes the arrow-key list.
+    void RequestOpenFolder();
+    // A path the user chose (a picker, a Recent row): a file opens as is, a folder opens
+    // its first supported file. Either is recorded in Recent when it loads.
+    void OpenChosenPath(const std::string& path);
+    void OpenRecent(int row);
+    void NoteRecent(const std::string& path);
+    void RefreshRecentLabels();
     bool LoadMedia(const std::string& path);  // LoadMediaFile + the VR projection (#155)
     bool LoadMediaFile(const std::string& path);
     int loadSphKind_ = -1;           // the video probe's spherical metadata for this load (#155)
@@ -389,6 +398,10 @@ private:
     std::mutex nativePathMutex_;
     std::string nativePath_;
     bool hasNativePath_ = false;
+    // Recent menu (#252 phase 0): what the user opened on purpose, kept in recentFile_
+    // (empty = not kept). Arrow-key walks and the slideshow do not add to it.
+    RecentList recent_;
+    std::string recentFile_;
 
     // Folder navigation / slideshow. folderFiles_ holds the supported assets in the
     // current media's directory (sorted); folderIndex_ points at the loaded one.

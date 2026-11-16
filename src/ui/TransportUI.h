@@ -55,6 +55,9 @@ struct TransportCaps {
     // The touch player's way back to the gallery (#180): a back arrow (the browser's own)
     // in place of the "Open" text button. DEFAULT FALSE; Android sets it.
     bool gallery = false;
+    // The desktop Open menu (#252 phase 0): a drop-down arrow beside "Open" with Open file,
+    // Open folder and the Recent list. DEFAULT FALSE; the desktop owner sets it.
+    bool openMenu = false;
     // The touch player's layout (#180). DEFAULT FALSE; Android sets it. Instead of the flat
     // bars: gradient scrims at the top and bottom, the back arrow then the file's name left
     // aligned (and its place in the list under it), and the 2D/3D switch as a labelled
@@ -112,6 +115,8 @@ struct TransportState {
     bool muted = false;
     bool loop = false;
     bool openFilePending = false;  // gates the Open button while a picker is up
+    // The Open menu's Recent rows (caps.openMenu), newest first: the label shown per row.
+    std::vector<std::string> recentLabels;
     bool slideshowActive = false;
     float transitionAlpha = 0.0f;  // dip-to-black; owned by the caller's nav machine
     // Live camera (#90) - only read when caps.camera.
@@ -197,6 +202,9 @@ struct TransportState {
 // control inert (but Caps is the right way to remove a control).
 struct TransportActions {
     std::function<void()> Open;
+    std::function<void()> OpenFolder;           // caps.openMenu: "Open folder..."
+    std::function<void(int row)> OpenRecent;    // caps.openMenu: a Recent row, 0 = newest
+    std::function<void()> ClearRecent;          // caps.openMenu: "Clear recent"
     std::function<void()> NextMode;  // the Mode button, or a flip of the 2D/3D switch
     std::function<void()> CycleLayout;
     std::function<void()> ToggleSlideshow;
