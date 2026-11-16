@@ -263,7 +263,7 @@ std::string MakeHtml(const Session& s) {
          Num(s.budgetDeltaE, 1) + "; nothing nearer than " + Num(s.budgetEdgePct, 1) + "% at the frame edges.</p>\n";
     if (!s.calibration.state.empty())
         o += "<p>Display calibration at export: " + Html(CalibrationText(s.calibration)) +
-             ". Snapshots show the picture as graded <i>and</i> calibrated for this panel; each lists its own.</p>\n";
+             ". Each snapshot lists the calibration that was in its capture.</p>\n";
     const int untimed = RowsWithoutTimecode(s);
     if (untimed)
         o += "<p class=mute>" + std::to_string(untimed) +
