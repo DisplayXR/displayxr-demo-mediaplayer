@@ -140,6 +140,7 @@ public:
     bool TakeCaptureRequest();     // `I` — snapshot the composed atlas to a PNG
     bool TakeTogglePauseRequest(); // Space — play/pause
     bool TakeOpenFileRequest();    // Ctrl+O — open the file picker
+    bool TakeOpenFolderRequest();  // Ctrl+Shift+O — open a folder (#252)
 
     // --- Drag and drop (#44) ---
     // Paths dropped on the window since the last read, in drop order; moved into `out`
@@ -233,6 +234,7 @@ private:
     bool captureRequested_ = false;
     bool togglePauseRequested_ = false;
     bool openFileRequested_ = false;
+    bool openFolderRequested_ = false;
     bool prevMediaRequested_ = false;
     bool nextMediaRequested_ = false;
     bool toggleSlideshowRequested_ = false;

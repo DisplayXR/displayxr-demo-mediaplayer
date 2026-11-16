@@ -96,6 +96,13 @@ loads the first and makes the dropped set the list Up / Down and the slideshow w
 Dropping a **folder** opens its first asset and starts the slideshow, with the folder as
 that list — the same thing as passing the folder on the command line, plus playback.
 
+The arrow beside **Open** opens a menu: **Open file...** (`Ctrl+O`), **Open folder...**
+(`Ctrl+Shift+O`: the folder's first file opens and the folder becomes the Up / Down list) and
+**Recent**, the last 12 files and folders you opened (with Open, Open folder, a drop or the
+command line; walking a folder does not add to it). The list is kept in
+`%APPDATA%\DisplayXR\MediaPlayer\recent.txt` (macOS: `~/Library/Application Support/DisplayXR/MediaPlayer/`,
+Linux: `~/.config/displayxr/mediaplayer/`); `MEDIAPLAYER_RECENT_FILE` moves it (`off` keeps none).
+
 ## VR180 / VR360 viewer (#155)
 
 VR180 and stereo VR360 files play as a **window into the scene**, steered with the mouse,

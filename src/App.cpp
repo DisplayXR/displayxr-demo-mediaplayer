@@ -386,6 +386,12 @@ bool App::Initialize(const char* mediaPath) {
     // Live camera (#90). The command line (main.cpp) wins over the env vars. The picker
     // and 'C' key are desktop-only: Android's TransportCaps leave caps.camera false.
     uiState_.caps.camera = true;
+    // The Open menu (#252 phase 0): Open file / Open folder / Recent. Desktop only.
+    uiState_.caps.openMenu = true;
+    recentFile_ = RecentListPath(MEDIAPLAYER_PRO ? "MediaPlayerPro" : "MediaPlayer");
+    if (recent_.Load(recentFile_))
+        LOG_INFO("Recent: %zu item(s) from '%s'", recent_.Items().size(), recentFile_.c_str());
+    RefreshRecentLabels();
     if (!launch_.camera) {
         if (const char* e = std::getenv("MEDIAPLAYER_CAMERA")) {
             launch_.camera = true;          // "auto" / "" = default pick; "0" = index 0
@@ -467,12 +473,12 @@ bool App::Initialize(const char* mediaPath) {
             std::sort(files.begin(), files.end());
             if (!files.empty()) {
                 LOG_INFO("Folder '%s': %zu asset(s), opening first", mediaPath, files.size());
-                LoadMedia(files.front());
+                if (LoadMedia(files.front())) NoteRecent(mediaPath);
             } else {
                 LOG_WARN("No supported media in folder '%s'", mediaPath);
             }
-        } else {
-            LoadMedia(mediaPath);
+        } else if (LoadMedia(mediaPath)) {
+            NoteRecent(mediaPath);
         }
     }
     if (!hasMedia_) {
@@ -678,6 +684,7 @@ int App::Run() {
             activity = true;
         }
         if (window_.TakeOpenFileRequest()) { RequestOpenFile(); activity = true; }     // Ctrl+O
+        if (window_.TakeOpenFolderRequest()) { RequestOpenFolder(); activity = true; } // Ctrl+Shift+O
         // Dropped files (#44). Loading happens HERE, on the app thread — not in the SDL
         // event handler — matching the discipline the native dialog already follows.
         if (std::vector<std::string> dropped; window_.TakeDroppedPaths(dropped)) {
@@ -740,7 +747,7 @@ int App::Run() {
         std::string picked;
         if (xr_.TakePickedFile(picked)) {
             openFilePending_ = false;
-            if (!picked.empty()) { playlistFromDrop_ = false; ReloadMedia(picked); }
+            if (!picked.empty()) OpenChosenPath(picked);
         }
         bool gotNative = false;
         {
@@ -749,7 +756,7 @@ int App::Run() {
         }
         if (gotNative) {
             openFilePending_ = false;
-            if (!picked.empty()) { playlistFromDrop_ = false; ReloadMedia(picked); }  // outside the lock
+            if (!picked.empty()) OpenChosenPath(picked);  // outside the lock
         }
         // Test hook: exercise the media-swap path without a dialog.
         if (openAfterPath_ && !openedAfter_ && frames_ > 150) {
@@ -1502,6 +1509,13 @@ void App::BuildTransportUI() {
 
     ui::TransportActions actions;
     actions.Open = [this] { RequestOpenFile(); };
+    actions.OpenFolder = [this] { RequestOpenFolder(); };
+    actions.OpenRecent = [this](int row) { OpenRecent(row); };
+    actions.ClearRecent = [this] {
+        recent_.Clear();
+        recent_.Save(recentFile_);
+        RefreshRecentLabels();
+    };
     actions.NextMode = [this] { CycleRenderingMode(); };
     actions.CycleLayout = [this] { CycleLayoutOverride(); };
     actions.ToggleSlideshow = [this] { ToggleSlideshow(); };
@@ -3118,6 +3132,7 @@ void App::HandleDroppedPaths(std::vector<std::string> paths) {
         playlistFromDrop_ = false;
         LOG_INFO("Drop: folder '%s', %zu asset(s), opening first", paths[0].c_str(), good.size());
         ReloadMedia(good.front());
+        if (currentMediaPath_ == good.front()) NoteRecent(paths[0]);
         // Dropping a folder means "play this folder" — so it starts the slideshow, unlike
         // dropping a single file. SetSlideshow (not ToggleSlideshow) so a second folder
         // drop during a running slideshow keeps it running instead of stopping it, and it
@@ -3140,6 +3155,7 @@ void App::HandleDroppedPaths(std::vector<std::string> paths) {
             ShowToast(t);
         }
         ReloadMedia(good[0]);
+        if (currentMediaPath_ == good[0]) NoteRecent(good[0]);
         return;
     }
 
@@ -4375,6 +4391,101 @@ void App::NativeFileCallback(void* userdata, const char* const* filelist, int /*
     std::lock_guard<std::mutex> lk(self->nativePathMutex_);
     self->nativePath_ = picked;   // empty = cancel/error → main loop just clears pending
     self->hasNativePath_ = true;
+}
+
+void App::RequestOpenFolder() {
+    if (openFilePending_) return;
+    openFilePending_ = true;
+    // The workspace picker chooses files only, so a folder always takes the native dialog.
+    // It starts in the folder above the current file's, where its siblings are.
+    namespace fs = std::filesystem;
+    std::string start;
+    if (!currentMediaPath_.empty()) {
+        const fs::path dir = fs::path(currentMediaPath_).parent_path();
+        start = (dir.has_parent_path() ? dir.parent_path() : dir).string();
+    }
+    LOG_INFO("Open folder: native dialog");
+    // Same result slot as Open file: the main loop sees a directory and opens its first file.
+    SDL_ShowOpenFolderDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this, window_.SdlWindow(),
+                             start.empty() ? nullptr : start.c_str(), false);
+}
+
+void App::OpenChosenPath(const std::string& path) {
+    namespace fs = std::filesystem;
+    playlistFromDrop_ = false;  // an explicit pick retires a drop's playlist (#44)
+    std::error_code ec;
+    if (fs::is_directory(fs::path(path), ec) && !ec) {
+        // The command-line folder gesture: open the first supported file (sorted) and let
+        // the directory scan make the folder the arrow-key list.
+        std::vector<std::string> files;
+        for (fs::directory_iterator it(fs::path(path), ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code fe;
+            if (!it->is_regular_file(fe) || fe) continue;
+            const std::string s = it->path().string();
+            if (MediaSource::IsSupported(s)) files.push_back(s);
+        }
+        std::sort(files.begin(), files.end());
+        if (files.empty()) {
+            LOG_WARN("Open folder: no supported media in '%s'", path.c_str());
+            ShowToast("No supported media in folder");
+            return;
+        }
+        LOG_INFO("Open folder '%s': %zu asset(s), opening first", path.c_str(), files.size());
+        ReloadMedia(files.front());
+        if (currentMediaPath_ == files.front()) {
+            NoteRecent(path);
+            char t[64];
+            std::snprintf(t, sizeof(t), "Folder: %zu items", files.size());
+            ShowToast(t);
+        }
+        return;
+    }
+    ReloadMedia(path);
+    if (currentMediaPath_ == path) NoteRecent(path);
+}
+
+void App::OpenRecent(int row) {
+    if (row < 0 || row >= (int)recent_.Items().size()) return;
+    const std::string path = recent_.Items()[row];  // a copy: opening it reorders the list
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    // Metadata only: this does not download a cloud placeholder.
+    if (!fs::exists(fs::path(path), ec)) {
+        LOG_WARN("Recent: '%s' no longer exists - removed from the list", path.c_str());
+        ShowToast("Not found - removed from Recent");
+        recent_.Remove(path);
+        recent_.Save(recentFile_);
+        RefreshRecentLabels();
+        return;
+    }
+    OpenChosenPath(path);
+}
+
+void App::NoteRecent(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path p = fs::absolute(fs::path(path), ec);
+    if (ec) p = fs::path(path);
+    std::string s = p.lexically_normal().string();
+    // "D:\Media\" -> "D:\Media", but keep a root ("D:\", "/").
+    while (s.size() > 3 && (s.back() == '/' || s.back() == '\\')) s.pop_back();
+    if (!recent_.Add(s)) return;
+    if (!recent_.Save(recentFile_) && !recentFile_.empty())
+        LOG_WARN("Recent: could not write '%s'", recentFile_.c_str());
+    RefreshRecentLabels();
+}
+
+void App::RefreshRecentLabels() {
+    namespace fs = std::filesystem;
+    uiState_.recentLabels.clear();
+    for (const std::string& p : recent_.Items()) {
+        std::error_code ec;
+        std::string label = RecentLabel(p, fs::is_directory(fs::path(p), ec) && !ec);
+        // ImGui reads "##" in a label as the start of its id: keep a literal one visible.
+        for (size_t at = label.find("##"); at != std::string::npos; at = label.find("##", at + 3))
+            label.replace(at, 2, "# #");
+        uiState_.recentLabels.push_back(std::move(label));
+    }
 }
 
 #if MEDIAPLAYER_PRO

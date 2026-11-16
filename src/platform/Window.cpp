@@ -256,7 +256,10 @@ bool Window::PumpEvents() {
                     if (e.key.mod & SDL_KMOD_SHIFT) cycleAutoConvPolicyRequested_ = true;
                     else toggleAutoConvRequested_ = true;
                 }
-                if (e.key.key == SDLK_O && (e.key.mod & SDL_KMOD_CTRL)) openFileRequested_ = true; // Ctrl+O — open
+                if (e.key.key == SDLK_O && (e.key.mod & SDL_KMOD_CTRL)) {
+                    if (e.key.mod & SDL_KMOD_SHIFT) openFolderRequested_ = true;  // Ctrl+Shift+O — open folder (#252)
+                    else openFileRequested_ = true;                               // Ctrl+O — open
+                }
                 if (e.key.key == SDLK_U && (e.key.mod & SDL_KMOD_CTRL)) openUrlRequested_ = true;  // Ctrl+U — stream URL (#93)
                 if (e.key.key == SDLK_F || e.key.key == SDLK_F11) ToggleFullscreen();
             }
@@ -335,6 +338,12 @@ bool Window::TakeTogglePauseRequest() {
 bool Window::TakeOpenFileRequest() {
     bool v = openFileRequested_;
     openFileRequested_ = false;
+    return v;
+}
+
+bool Window::TakeOpenFolderRequest() {
+    bool v = openFolderRequested_;
+    openFolderRequested_ = false;
     return v;
 }
 
