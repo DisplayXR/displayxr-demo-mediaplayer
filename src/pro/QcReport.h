@@ -15,6 +15,7 @@
 // ';' (or '.') before the frames for drop-frame. tests/qc_report_test.cpp.
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,35 @@ struct Rig {  // the rig numbers with a snapshot (measured = false: none)
     bool edgeMeasured[2] = {false, false};
     float edgePct[2] = {0, 0};  // left, right frame edge
 };
+
+// The display calibration (#133) in effect: snapshots and the report show the picture with
+// it baked in, so each records which one (#169 / David's call 2). Recorded with every
+// snapshot (what that capture has in it) and once for the session (what was on at export).
+struct Calibration {
+    std::string state;        // "on", "bypassed" or "none"; "" = not recorded
+    std::string name;         // the LUT's TITLE, else its file name
+    std::string panel;        // the panel key it is keyed by (pro/DisplayCalibration.h)
+    std::string panelSource;  // "runtime" (stable key) or "device_name" (older runtime)
+    std::string file;         // the .cube it was loaded from
+    bool kept = false;        // the panel's kept file; false = this run only
+    int lutSize = 0;          // N of the N^3 LUT
+    std::string modified;     // the file's last change, "YYYY-MM-DD HH:MM:SS" local ("" unknown)
+    std::string fingerprint;  // 16 hex digits over the LUT's values: the same LUT reads the same
+
+    bool operator==(const Calibration& o) const {
+        return state == o.state && name == o.name && panel == o.panel && panelSource == o.panelSource &&
+               file == o.file && kept == o.kept && lutSize == o.lutSize && modified == o.modified &&
+               fingerprint == o.fingerprint;
+    }
+    bool operator!=(const Calibration& o) const { return !(*this == o); }
+};
+
+// One line for a person: "PanelCal v3 (33^3, on, fingerprint 0123abcd4567ef89, file ...,
+// changed ...)", "bypassed: ..." or "none". "" when not recorded.
+std::string CalibrationText(const Calibration& c);
+
+// FNV-1a 64 over `n` floats as bytes, as 16 lower-case hex digits: Calibration::fingerprint.
+std::string LutFingerprint(const float* values, size_t n);
 
 struct Alert {
     std::string what;         // "Foreground at -2.1% for 3 s"
@@ -44,6 +74,7 @@ struct Snapshot {
     int tcFps = 0;
     int eyeSyncFrames = -1;   // -1 = not measured
     Rig rig;
+    Calibration calibration;  // the display calibration in this capture
 };
 
 struct Session {
@@ -51,6 +82,7 @@ struct Session {
     std::string input;        // the live input / file name
     std::string started, exported;  // wall clock
     int tcFps = 0;            // the signal's rate (0 = unknown): the EDL's rate when rows have none
+    Calibration calibration;  // the display calibration when the report was made
     float budgetNearPct = 0, budgetFarPct = 0, budgetVerticalPx = 0, budgetDeltaE = 0, budgetEdgePct = 0;
     std::vector<Alert> alerts;
     std::vector<Snapshot> snapshots;
