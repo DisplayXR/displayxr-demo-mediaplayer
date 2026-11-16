@@ -31,6 +31,8 @@
 
   No card? -TestSignal 3840x2160@59.94 runs the same matrix on the synthetic rig: it proves the
   script and the switches, not the card's numbers (the DeckLink-only levers are inert there).
+  The rig loops -Preroll frames drawn once at open (MEDIAPLAYER_TEST_PREROLL, default 16), so
+  pairs/s measures the player, not the CPU drawing the signal; -Preroll 0 draws live as before.
 
 .EXAMPLE
   # The default ladder, 5 min per arm, two rounds (about 2 hours): station loopback inputs
@@ -54,6 +56,7 @@ param(
     [string]$Right = "1",
     [string]$Connection = "sdi",
     [string]$TestSignal,                 # e.g. 3840x2160@59.94: no card needed
+    [int]$Preroll = 16,                  # -TestSignal: frames drawn once and looped (0 = draw live)
     [string[]]$Arms,                     # names from -List; default: all of the default set
     [ValidateSet("default", "upload", "pin", "all")][string]$Set = "default",
     [double]$Minutes = 5,
@@ -93,6 +96,9 @@ $hold = @{ "MEDIAPLAYER_DECKLINK_ALLOCATOR" = "1"; "MEDIAPLAYER_DECKLINK_HOLD" =
 $pin = @{ "MEDIAPLAYER_CAPTURE_PIN" = "auto"; "MEDIAPLAYER_UPLOAD_PIN" = "auto" }
 $zc = @{ "MEDIAPLAYER_ZERO_COPY_UPLOAD" = "1" }
 function Merge([hashtable[]]$hs) { $r = @{}; foreach ($h in $hs) { foreach ($k in $h.Keys) { $r[$k] = $h[$k] } }; return $r }
+if ($TestSignal -and $Preroll -gt 0 -and -not $BaseEnv.ContainsKey("MEDIAPLAYER_TEST_PREROLL")) {
+    $BaseEnv = Merge @($BaseEnv, @{ "MEDIAPLAYER_TEST_PREROLL" = "$Preroll" })   # the source must not be the limit
+}
 $catalog = [ordered]@{
     # default set: the ladder
     "baseline"           = @{ set = "default"; env = @{}; why = "0.9.8 as shipped (direct pair on)" }

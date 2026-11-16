@@ -182,8 +182,11 @@ runs alternating with and without zero-copy, two each):
 - Render fps unchanged (60.0).
 - Process CPU about 9% lower.
 
-The test signal itself tops out at about 20 fps on that laptop, so the capture-rate effect needs
-the station: the `raw_alloc_hold_zc` arm.
+The test signal itself tops out at about 20 fps on that laptop when it draws every frame, so
+`capture_matrix.ps1 -TestSignal` now loops 16 pre-drawn frames (`MEDIAPLAYER_TEST_PREROLL`,
+`-Preroll 0` to draw live): pairs/s then measures the player's side of the capture path on any
+box. The card's own costs (DMA, PCIe, the SDK callback) still need the station: the
+`raw_alloc_hold_zc` arm.
 
 **Risk to watch on the card.** A held frame can now go back to the card from the render thread
 (when its GPU frame retires), and after the input has stopped (the last ring frames). The

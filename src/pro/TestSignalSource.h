@@ -25,6 +25,13 @@
 //                                   on the CPU first, as the DeckLink path does today.
 //   MEDIAPLAYER_TEST_STILL=1        every frame is frame 0 (the timecode still runs), so two
 //                                   runs can be compared pixel for pixel (atlas dumps).
+//   MEDIAPLAYER_TEST_PREROLL=N      draw (and pack) N frames once at open and loop them, so the
+//                                   source no longer limits the rate: drawing a 2 x 4K frame on
+//                                   the CPU tops out at ~8-20 fps, below any card. Each frame then
+//                                   costs what a card delivery costs (the v210 rows are copied into
+//                                   the frame, standing in for the card's DMA write), and the CPU
+//                                   convert arm still converts every frame. The motion jumps back
+//                                   every N frames. 0 = draw live (the default); capped at 240.
 // Raw v210 frames go through a ring of this class's own (LiveSourceBase has no v210 publish
 // yet; phase 2 adds it with the DeckLink lanes, after the 0.9.7 direct-pair work).
 #pragma once
@@ -95,10 +102,12 @@ public:
 private:
     enum class Wire { Nv12, V210Cpu, V210Raw };
     void Worker();
-    void PublishV210(const livepix::Nv12& frame, double captureSec, const char* tc);
+    // Pack each eye of frame into the raw ring, or copy pre-packed rows (preroll) when pre is set.
+    void PublishV210(const livepix::Nv12& frame, const std::vector<uint8_t>* pre, double captureSec, const char* tc);
     TestSignalConfig cfg_;
     Wire wire_ = Wire::Nv12;
     bool still_ = false;
+    int preroll_ = 0;  // MEDIAPLAYER_TEST_PREROLL: frames drawn once and looped (0 = draw live)
     std::atomic<bool> raw_{false};  // Ring() is rawRing_ (the render thread reads it)
     // Zero-copy (#238 phase 3): the raw arm packs each eye into a pooled host block the renderer
     // reads in place (media/HostBlocks.h), when the renderer said it can (v210::ZeroCopyActive).
