@@ -313,6 +313,23 @@ function(mp_add_player tgt is_pro)
         src/ui/Icons.cpp  # every icon the chrome draws, shared with the browser (#180)
         src/ui/UiText.cpp  # fitting and wrapping text (#180)
         src/media/FrameRing.h  # header-only triple buffer
+        # The media browser (#160 Android, #252 desktop; docs/BROWSER.md). Mirrors the
+        # Android list; the Windows provider lists media through the shell.
+        src/media/Letterbox.cpp       # black bars off a grid thumbnail (#180)
+        src/browser/BrowserLayout.cpp
+        src/browser/MediaBrowser.cpp
+        src/browser/MediaLibrary.cpp
+        src/browser/SlideGesture.cpp
+        src/browser/StereoClassifier.cpp
+        src/browser/StereoGrid.cpp
+        src/browser/StereoPairs.cpp
+        src/browser/PairDiskCache.cpp
+        src/browser/ThumbnailAtlas.cpp
+        src/browser/ThumbnailCache.cpp
+        src/browser/ThumbnailDepth.cpp
+        src/browser/TileCrop.cpp
+        src/browser/TouchScroller.cpp
+        $<$<PLATFORM_ID:Windows>:src/browser/WinShellMedia.cpp>
         ${MP_IMGUI_SOURCES}
     )
 
@@ -394,7 +411,7 @@ function(mp_add_player tgt is_pro)
     # atlas-capture output path under the user's Pictures folder.
     # d3d11 + dxgi: zero-copy D3D11VA->Vulkan decode interop (issue #28).
     if(WIN32)
-        target_link_libraries(${tgt} PRIVATE shell32 ole32 d3d11 dxgi d3dcompiler)
+        target_link_libraries(${tgt} PRIVATE shell32 ole32 oleaut32 uuid d3d11 dxgi d3dcompiler)
     endif()
 
     # macOS: displayxr-common's Cocoa adapter for dxr::CursorDepth hides the OS pointer
