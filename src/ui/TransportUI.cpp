@@ -736,21 +736,40 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 }
                 ImGui::EndPopup();
             }
-            if (s.caps.camera || s.caps.url) {
+            // A narrow window: the buttons that no longer fit before the slideshow icon are
+            // left out, from the right. The bar stays one row.
+            const ImGuiStyle& bst = ImGui::GetStyle();
+            const float barLimit = ImGui::GetWindowWidth() - bst.WindowPadding.x -
+                                   (s.caps.slideshow ? iconSz + bst.ItemSpacing.x : 0.0f);
+            bool barFull = false;
+            auto fits = [&](float w) {
+                if (barFull) return false;
+                const float x = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + bst.ItemSpacing.x;
+                if (x + w <= barLimit) return true;
+                barFull = true;  // and everything after it: the order never changes
+                return false;
+            };
+            auto buttonW = [&](const char* label) {
+                return ImGui::CalcTextSize(label, nullptr, true).x + bst.FramePadding.x * 2.0f;
+            };
+            if ((s.caps.camera || s.caps.url) &&
+                fits(ImGui::CalcTextSize("Live...").x + bst.FramePadding.x * 2.0f + ImGui::GetFrameHeight())) {
                 ImGui::SameLine();
                 CameraCombo(s, a);
             }
             if (s.caps.mode) {
-                ImGui::SameLine();
                 char modeLabel[96];
                 std::snprintf(modeLabel, sizeof(modeLabel), "Mode: %s", s.modeName.c_str());
-                if (ImGui::Button(modeLabel)) Fire(a.NextMode);
+                if (fits(buttonW(modeLabel))) {
+                    ImGui::SameLine();
+                    if (ImGui::Button(modeLabel)) Fire(a.NextMode);
+                }
             }
             // Stereo layout + override (#45). The trailing '*' marks a manual pin.
-            if (s.caps.layout && s.hasMedia) {
-                char layoutBtn[64];
-                std::snprintf(layoutBtn, sizeof(layoutBtn), "Layout: %s%s", s.layoutName.c_str(),
-                              s.layoutPinned ? "*" : "");
+            char layoutBtn[64];
+            std::snprintf(layoutBtn, sizeof(layoutBtn), "Layout: %s%s", s.layoutName.c_str(),
+                          s.layoutPinned ? "*" : "");
+            if (s.caps.layout && s.hasMedia && fits(buttonW(layoutBtn))) {
                 ImGui::SameLine();
                 if (ImGui::Button(layoutBtn)) Fire(a.CycleLayout);
                 if (ImGui::IsItemHovered() && !s.layoutTooltip.empty()) {
@@ -761,11 +780,12 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             // Convert to 3D: mono content only (caps). Highlighted while on; greyed with
             // the reason while the conversion cannot serve (a temporary state). The "###"
             // keeps one widget id across the label changes.
-            if (s.caps.convert && s.hasMedia) {
+            const char* convertLabel = "Convert to 3D###convert3d";
+            if (s.convertWarming) convertLabel = "Convert to 3D (warming)###convert3d";
+            if (s.convertUnavailable) convertLabel = "Convert to 3D (unavailable)###convert3d";
+            if (s.caps.convert && s.hasMedia && fits(buttonW(convertLabel))) {
                 ImGui::SameLine();
-                const char* label = "Convert to 3D###convert3d";
-                if (s.convertWarming) label = "Convert to 3D (warming)###convert3d";
-                if (s.convertUnavailable) label = "Convert to 3D (unavailable)###convert3d";
+                const char* label = convertLabel;
                 ImGui::BeginDisabled(!s.convertEnabled);
                 if (s.convertOn)
                     ImGui::PushStyleColor(ImGuiCol_Button,
@@ -783,13 +803,16 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     const bool valid = cur >= 0 && cur < (int)s.convertProviders.size();
                     const char* preview =
                         valid ? s.convertProviders[cur].preview.c_str() : "Default";
-                    ImGui::SameLine();
                     const ImGuiStyle& st = ImGui::GetStyle();
-                    ImGui::SetNextItemWidth(std::min(ImGui::CalcTextSize(preview).x +
-                                                         ImGui::GetFrameHeight() +
-                                                         st.FramePadding.x * 2.0f,
-                                                     Px(280.0f)));
-                    if (ImGui::BeginCombo("##convert3d_provider", preview)) {
+                    const float comboW = std::min(ImGui::CalcTextSize(preview).x + ImGui::GetFrameHeight() +
+                                                      st.FramePadding.x * 2.0f,
+                                                  Px(280.0f));
+                    const bool comboFits = fits(comboW);
+                    if (comboFits) {
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(comboW);
+                    }
+                    if (comboFits && ImGui::BeginCombo("##convert3d_provider", preview)) {
                         for (int i = 0; i < (int)s.convertProviders.size(); ++i) {
                             const ConvertProviderRow& row = s.convertProviders[i];
                             ImGui::PushID(i);
@@ -802,7 +825,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                         }
                         ImGui::EndCombo();
                     }
-                    if (ImGui::IsItemHovered())
+                    if (comboFits && ImGui::IsItemHovered())
                         ImGui::SetTooltip(
                             "2D->3D provider for this session\n"
                             "(the default is set in DisplayXR's settings)");
@@ -810,7 +833,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             }
             // Input providers: one button, a small popup with a combo per role family and the
             // "Remember for this app" checkbox. Names are the runtime's, verbatim.
-            if (s.caps.input) {
+            if (s.caps.input && fits(buttonW("Input"))) {
                 ImGui::SameLine();
                 if (ImGui::Button("Input")) ImGui::OpenPopup("##input_providers");
                 if (ImGui::IsItemHovered())
@@ -856,7 +879,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             }
             // Auto-convergence (#92): live, or a stereo file. Highlighted while on.
             if (((s.caps.camera && s.isLive) || (s.caps.url && s.isStream) || s.autoConvFile) &&
-                !s.autoConvLabel.empty()) {
+                !s.autoConvLabel.empty() && fits(buttonW(s.autoConvLabel.c_str()))) {
                 ImGui::SameLine();
                 if (s.autoConvOn)
                     ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
@@ -892,22 +915,17 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 }
             }
             // Right-align the slideshow toggle. (Close the app via ESC or the window's
-            // own close button — no in-UI X needed.) When the buttons already reach that
-            // spot it takes a second row, right-aligned, instead of drawing over them.
+            // own close button — no in-UI X needed.) The buttons left of it never reach it:
+            // the ones that do not fit are left out above.
             if (s.caps.slideshow) {
-                const float slideX = ImGui::GetWindowWidth() - iconSz - ImGui::GetStyle().WindowPadding.x;
-                const float usedX = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x +
-                                    ImGui::GetStyle().ItemSpacing.x;
-                if (usedX <= slideX) ImGui::SameLine(slideX);
-                else ImGui::SetCursorPosX(slideX);
+                ImGui::SameLine(ImGui::GetWindowWidth() - iconSz - ImGui::GetStyle().WindowPadding.x);
                 if (IconButton("##slideshow", Glyph::Slideshow, iconSz, s.slideshowActive,
                                s.hitTargetScale))
                     Fire(a.ToggleSlideshow);
             }
         }
         if (!s.stripOnly) {
-            // The bar wraps to a second row on a narrow window: the toast reads its real
-            // bottom edge so it is never drawn under the bar.
+            // The toast reads the bar's real bottom edge so it is never drawn under it.
             g_topBarBottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
             ImGui::End();
         } else {
