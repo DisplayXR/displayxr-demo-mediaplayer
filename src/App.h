@@ -30,6 +30,7 @@
 #define MEDIAPLAYER_BROWSER 1
 #include "browser/MediaBrowser.h"
 #include "browser/WindowsMediaProvider.h"
+#include "rhi/StereoGridRenderer.h"
 #include <memory>
 #else
 #define MEDIAPLAYER_BROWSER 0
@@ -103,7 +104,13 @@ private:
     void CloseBrowser();
     void BuildBrowser();
     bool BrowserNext(int delta, std::string& path) const;
-    void ApplyFolderRequests();  // the browser's Add folder / pin / unpin / hide
+    void ApplyFolderRequests();
+    // The browser's rendering mode (#252 phase 2): flat, or 3D under its "3D only" filter,
+    // borrowed while it shows. End: hand it back, or (`keep`) leave the panel as it is.
+    void RequestBrowserMode();
+    void EndBrowserMode(bool keep);
+    // The 3D grid draws this frame: the "3D only" filter, and the panel already in 3D.
+    bool GridStereo(uint32_t viewCount) const;  // the browser's Add folder / pin / unpin / hide
     // Open folder (#252 phase 0): a native folder dialog; the folder becomes the arrow-key list.
     void RequestOpenFolder();
     // A path the user chose (a picker, a Recent row): a file opens as is, a folder opens
@@ -425,6 +432,11 @@ private:
 #if MEDIAPLAYER_BROWSER
     std::unique_ptr<browser::WindowsMediaProvider> browserProvider_;
     std::unique_ptr<browser::MediaBrowser> browser_;
+    // The 3D grid (#252 phase 2, docs/BROWSER.md "3D grid"): draws the tiles into the
+    // projection atlas, each eye's crop into its views, under the "3D only" filter.
+    StereoGridRenderer grid_;
+    bool gridReady_ = false;
+    browser::ModeBorrow browserMode_;
 #endif
     bool browsing_ = false;          // the browser covers the player
     bool browserNav_ = false;        // up/down walk the browser's grid, not folderFiles_

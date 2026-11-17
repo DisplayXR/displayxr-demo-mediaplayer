@@ -283,6 +283,7 @@ function(mp_add_player tgt is_pro)
         src/rhi/VulkanRenderer.cpp
         src/rhi/BandCopy.cpp         # upload copies into staging in row bands (8K live frames)
         src/rhi/AsyncUpload.cpp      # ...on an upload thread, off the render thread (MEDIAPLAYER_ASYNC_UPLOAD)
+        src/rhi/StereoGridRenderer.cpp  # the browser's 3D grid (#252 phase 2), shared with Android
         src/media/ImageDecoder.cpp
         src/media/LifLoader.cpp
         src/media/DepthWarp.cpp      # one-view LIF -> stereo pair (#180)

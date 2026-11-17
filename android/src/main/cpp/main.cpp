@@ -62,7 +62,7 @@
 #include <unistd.h>
 
 #include "sbs_renderer.h"
-#include "stereo_grid.h"
+#include "rhi/StereoGridRenderer.h"
 #include "video_decoder.h"
 #include "audio_player.h"
 #include "ColorPolicy.h"  // swapchain encoding policy, shared with the desktop leg (#78)

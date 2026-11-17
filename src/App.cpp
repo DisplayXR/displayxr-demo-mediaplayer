@@ -507,6 +507,12 @@ bool App::Initialize(const char* mediaPath) {
             if (browser_->Initialize(browserProvider_.get(), xr_.PhysicalDevice(), xr_.Device(),
                                      renderer_.FramesInFlight(), verdicts.string())) {
                 browser_->SetDesktop(true);
+                gridReady_ = grid_.init(xr_.PhysicalDevice(), xr_.Device(), (VkFormat)xr_.SwapchainFormat(),
+                                        renderer_.FramesInFlight());
+                if (!gridReady_) {
+                    LOG_WARN("browser: the 3D grid could not start - it stays flat");
+                    grid_.cleanup();
+                }
                 if (!recentFile_.empty()) {
                     const fs::path dir = fs::path(recentFile_).parent_path();
                     pinnedFile_ = (dir / "pinned.txt").string();
@@ -549,7 +555,13 @@ int App::Run() {
     if (const char* f = std::getenv("MEDIAPLAYER_DUMP_FRAME")) dumpFrame_ = std::max(1, std::atoi(f));
     openAfterPath_ = std::getenv("MEDIAPLAYER_OPEN_AFTER");  // test: swap media mid-run
     // Test (#252): show the media browser at launch, without a click.
-    if (const char* b = std::getenv("MEDIAPLAYER_SHOW_BROWSER"); b && *b && std::string(b) != "0") ShowBrowser();
+    if (const char* b = std::getenv("MEDIAPLAYER_SHOW_BROWSER"); b && *b && std::string(b) != "0") {
+        ShowBrowser();
+#if MEDIAPLAYER_BROWSER
+        // Test: "3d" starts on the 3D grid (the "3D only" filter).
+        if (browser_ && std::string(b) == "3d") browser_->SetDepthFilter(browser::DepthFilter::Only3D);
+#endif
+    }
     // Test: switch "Convert to 3D" on without a keystroke (headless runs). Retried until it
     // takes, because an in-process session may only learn the conversion task a moment
     // after start. Never set by the player itself.
@@ -1019,6 +1031,7 @@ void App::RenderOneFrame() {
     if (!begun) return;
 
     XrSession::ViewRect rects[XrSession::kMaxViews];          // full per-view tiles (submitted)
+    bool gridPending = false;  // the browser's 3D grid draws the atlas, after the HUD (#252)
     XrSession::ViewRect contentRects[XrSession::kMaxViews];   // aspect-fit content within each tile
 
     if (frame.shouldRender) {
@@ -1098,7 +1111,18 @@ void App::RenderOneFrame() {
                      mode, frame.viewCount, centerX, canvasW, canvasH, rects[0].w, rects[0].h);
         }
 
-        if (renderer_.HasTexture()) {
+#if MEDIAPLAYER_BROWSER
+        // The browser: its mode, and whether the 3D grid draws the atlas this frame. It
+        // does so after the HUD is laid out (below), at the rects of THIS frame's tiles.
+        if (browsing_) {
+            RequestBrowserMode();
+            if (browser_) browser_->SetStereo(GridStereo(frame.viewCount), xr_.ActiveViewScaleX());
+            gridPending = GridStereo(frame.viewCount);
+        }
+#endif
+        if (gridPending) {
+            // drawn after the HUD
+        } else if (renderer_.HasTexture()) {
             // Match the content's shorter side to the tile's shorter side (crop the
             // longer axis), then scale into each tile (handles non-uniform modes).
             const float sx = xr_.ActiveViewScaleX();
@@ -1347,6 +1371,13 @@ void App::RenderOneFrame() {
                 const StageClock::time_point uiRender0 = StageClock::now();
                 renderer_.NoteStage(RenderStage::UiBuild, StageMs(uiBuild0, uiRender0));
                 imgui_.RenderToHud(hudIdx, renderer_.FrameCmd());  // joins the frame's command buffer
+#if MEDIAPLAYER_BROWSER
+                if (gridPending && browser_ &&
+                    grid_.draw(renderer_.FrameCmd(), xr_.SwapchainImages()[frame.imageIndex], xr_.SwapchainWidth(),
+                               xr_.SwapchainHeight(), rects[0].w, rects[0].h, xr_.ActiveTileColumns(),
+                               frame.viewCount, browser_->Stereo()))
+                    gridPending = false;
+#endif
                 // Desktop Linux: the pointer shape ImGui wants (I-beam over the URL
                 // field, ...). The SDL backend does this itself elsewhere.
                 window_.SetImGuiCursor(imgui_.MouseCursor());
@@ -1428,6 +1459,11 @@ void App::RenderOneFrame() {
         }
     }
 
+    if (gridPending) {
+        // The 3D grid did not draw (no HUD this frame): the atlas still needs its pixels.
+        const ClearColor black[XrSession::kMaxViews] = {};
+        renderer_.ClearViews(frame.imageIndex, black, rects, frame.viewCount);
+    }
     // No HUD this frame: the same single submit, before EndFrame releases the atlas image.
     const StageClock::time_point submit0 = StageClock::now();
     renderer_.SubmitFrame();
@@ -1722,6 +1758,11 @@ void App::Shutdown() {
     video_.Stop();        // join the decode thread (reads the audio clock) before audio,
     audio_.Stop();        // and before tearing down the GPU
 #if MEDIAPLAYER_BROWSER
+    if (gridReady_) {
+        vkDeviceWaitIdle(xr_.Device());
+        grid_.cleanup();
+        gridReady_ = false;
+    }
     browser_.reset();          // its thumbnail atlas holds ImGui descriptors
     browserProvider_.reset();  // joins its list and thumbnail threads
 #endif
@@ -4589,6 +4630,7 @@ void App::ShowBrowser() {
 void App::CloseBrowser() {
     if (!browsing_) return;
     browsing_ = false;
+    EndBrowserMode(false);
     if (resumeAfterBrowse_ && isVideo_ && video_.Paused()) TogglePlayback();
     resumeAfterBrowse_ = false;
 }
@@ -4624,6 +4666,42 @@ void App::ApplyFolderRequests() {
     browserProvider_->SetPinned(pinned_.Items());
     browserProvider_->SetHidden(hiddenFolders_.Items());
     browser_->Refresh();
+#endif
+}
+
+void App::RequestBrowserMode() {
+#if MEDIAPLAYER_BROWSER
+    if (startMode_ >= 0 || !xr_.HasRenderingModes()) return;  // a test pin owns the mode
+    const bool only3D = browser_ && browser_->WantsStereo() && gridReady_;
+    const int32_t want = browser::BrowserMode(only3D, xr_.FindFlatMode(), xr_.FindStereoMode());
+    const int32_t req = browserMode_.Borrow(want, (int32_t)xr_.CurrentModeIndex());
+    if (req < 0) return;
+    pendingModeRequest_ = req;
+    silentModeTarget_ = req;  // no mode chip for the borrow
+    LOG_INFO("browser: borrowing %s mode %d (active %u)", only3D ? "3D" : "flat", req, xr_.CurrentModeIndex());
+#endif
+}
+
+void App::EndBrowserMode(bool keep) {
+#if MEDIAPLAYER_BROWSER
+    const int32_t back = keep ? -1 : browserMode_.Return((int32_t)xr_.CurrentModeIndex());
+    browserMode_ = browser::ModeBorrow();
+    if (browser_) browser_->SetStereo(false, 0.0f);
+    if (back < 0) return;
+    pendingModeRequest_ = back;
+    silentModeTarget_ = back;
+    LOG_INFO("browser: handing back mode %d", back);
+#else
+    (void)keep;
+#endif
+}
+
+bool App::GridStereo(uint32_t viewCount) const {
+#if MEDIAPLAYER_BROWSER
+    return gridReady_ && browser_ && browser_->WantsStereo() && !xr_.CurrentModeIsFlat() && viewCount >= 2;
+#else
+    (void)viewCount;
+    return false;
 #endif
 }
 
@@ -4668,6 +4746,8 @@ void App::BuildBrowser() {
             std::string path;
             if (!browserProvider_->TakeOpen(path)) break;
             browsing_ = false;
+            // Opened from the 3D grid: a 3D file, so the panel stays in 3D for it.
+            EndBrowserMode(browser_->WantsStereo());
             resumeAfterBrowse_ = false;  // a new file plays from its start
             LOG_INFO("browser: open '%s'", path.c_str());
             ReloadMedia(path);

@@ -105,6 +105,8 @@ public:
     // The 3D grid (#180, StereoGrid.h). The "3D only" filter is on: the caller takes the
     // panel to 3D for it.
     bool WantsStereo() const { return depth_ == DepthFilter::Only3D; }
+    // The 2D / 3D filter, as the chip sets it (tests start on "3D only").
+    void SetDepthFilter(DepthFilter depth) { SetDepth(depth); }
     // The panel is in 3D and the caller draws Stereo() into the projection layer, so
     // Build() leaves the tiles' pictures and the background behind them out of the HUD.
     // `viewScale` is the 3D mode's (the useful size of an eye is a tile times it).
