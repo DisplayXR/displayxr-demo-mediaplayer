@@ -392,6 +392,10 @@ the ring and into staging as they are, and the GPU converts them.
   decode is on, else converts it to P016 on the CPU first, as DeckLink does. That gives a
   CPU-vs-GPU A/B on one build. `MEDIAPLAYER_TEST_STILL=1` repeats frame 0, so two runs' atlas
   dumps can be compared pixel for pixel. DeckLink is unchanged in this phase.
+  `MEDIAPLAYER_TEST_PREROLL=N` draws N frames once at open and loops them: drawing a 2 x 4K
+  frame on the CPU tops out at about 8-20 fps, so without it the test signal, not the player,
+  sets pairs/s. Each looped frame is copied into the ring (v210 rows: as the card's DMA write),
+  and the CPU arm still converts every frame. `capture_matrix.ps1 -TestSignal` sets 16.
 - **CPU consumers.** The rig check, thumbnails, scopes, auto-convergence and Convert to 3D do
   not read v210 yet. On a v210 source they show nothing or hold their last value. Phase 2
   gives them the card rows.

@@ -130,6 +130,9 @@ bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
     if (v210::Requested(std::getenv("MEDIAPLAYER_TEST_SIGNAL_V210")))
         wire_ = v210::GpuDecodeActive() ? Wire::V210Raw : Wire::V210Cpu;
     still_ = v210::Requested(std::getenv("MEDIAPLAYER_TEST_STILL"));
+    preroll_ = 0;
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_PREROLL")) preroll_ = std::clamp(std::atoi(e), 0, 240);
+    if (still_ && preroll_ > 1) preroll_ = 1;  // a still is one frame
     if (wire_ == Wire::V210Raw) {
         if (!rawRing_.QueueMode()) {  // as LiveSourceBase's ring: queue mode, MEDIAPLAYER_LIVE_QUEUE
             int depth = 3;
@@ -161,8 +164,8 @@ bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
     SetState(LiveState::Opening);
     stop_ = false;
     worker_ = std::thread([this] { Worker(); });
-    LOG_INFO("test signal: %s, vshift %.1f px, eye delay %d, right gain %.2f, roll %.2f deg, wire %s%s", name_.c_str(),
-             cfg.vShiftPx, cfg.eyeDelay, cfg.gainR, cfg.rollDeg, WireName(), still_ ? ", still (frame 0)" : "");
+    LOG_INFO("test signal: %s, vshift %.1f px, eye delay %d, right gain %.2f, roll %.2f deg, wire %s%s, preroll %d", name_.c_str(),
+             cfg.vShiftPx, cfg.eyeDelay, cfg.gainR, cfg.rollDeg, WireName(), still_ ? ", still (frame 0)" : "", preroll_);
     return true;
 }
 
@@ -345,28 +348,60 @@ void TestSignalSource::Worker() {
     const int w = cfg_.eyeW, h = cfg_.eyeH;
     const int fpsInt = std::max(1, (int)std::lround(cfg_.fps));
     const auto period = std::chrono::duration<double>(1.0 / cfg_.fps);
+    const size_t rb = v210::RowBytes(w);
     livepix::Nv12 frame;
     frame.Resize(2 * w, h);
+    // Preroll: draw the first N frames once, in the form the wire publishes (NV12, or each
+    // eye's v210 rows), and loop them, so the CPU drawing no longer limits the rate.
+    struct Cached {
+        livepix::Nv12 nv12;
+        std::vector<uint8_t> v210[2];
+    };
+    std::vector<Cached> cache((size_t)preroll_);
+    if (preroll_ > 0) {
+        const double t0 = NowSeconds();
+        size_t bytes = 0;
+        for (int k = 0; k < preroll_ && !stop_; ++k) {
+            Render(cfg_, still_ ? 0 : k, frame);
+            if (wire_ == Wire::Nv12) {
+                cache[k].nv12 = frame;
+                bytes += frame.y.size() + frame.uv.size();
+            } else {
+                for (int e = 0; e < 2; ++e) {
+                    cache[k].v210[e].resize(rb * (size_t)h);
+                    PackEyeV210(frame, e * w, w, h, cache[k].v210[e].data());
+                    bytes += cache[k].v210[e].size();
+                }
+            }
+        }
+        LOG_INFO("test signal: pre-rendered %d frame(s) (%.0f MB) in %.2f s; looping them", preroll_,
+                 bytes / 1048576.0, NowSeconds() - t0);
+    }
     const int tc0 = ParseTc(cfg_.startTimecode, fpsInt);
     const auto start = clock::now();
     for (int64_t n = 0; !stop_; ++n) {
         std::this_thread::sleep_until(start + std::chrono::duration_cast<clock::duration>(period * (double)n));
         if (stop_) break;
-        Render(cfg_, still_ ? 0 : n, frame);
+        const Cached* c = preroll_ > 0 ? &cache[(size_t)(n % preroll_)] : nullptr;
+        if (!c) Render(cfg_, still_ ? 0 : n, frame);
         char tc[16];
         FormatTc(tc0 + (int)n, fpsInt, tc, sizeof(tc));
         if (wire_ == Wire::Nv12) {
-            Publish(frame, /*fullRange=*/false, NowSeconds(), tc, cfg_.eyeDelay);
+            Publish(c ? c->nv12 : frame, /*fullRange=*/false, NowSeconds(), tc, cfg_.eyeDelay);
         } else if (wire_ == Wire::V210Raw) {
-            PublishV210(frame, NowSeconds(), tc);
+            PublishV210(frame, c ? c->v210 : nullptr, NowSeconds(), tc);
         } else {  // v210 converted on the CPU, as the DeckLink path does (the A/B arm)
-            const size_t rb = v210::RowBytes(w);
             p016_.Resize(2 * w, h);
             for (int e = 0; e < 2; ++e) {
-                v210Eye_[e].resize(rb * (size_t)h);
-                PackEyeV210(frame, e * w, w, h, v210Eye_[e].data());
-                livepix::ToP016(livepix::RawFormat::V210, v210Eye_[e].data(), (int)rb, w, h, p016_, e * w,
-                                ColorMatrix::BT709);
+                const uint8_t* rows = nullptr;
+                if (c) {
+                    rows = c->v210[e].data();
+                } else {
+                    v210Eye_[e].resize(rb * (size_t)h);
+                    PackEyeV210(frame, e * w, w, h, v210Eye_[e].data());
+                    rows = v210Eye_[e].data();
+                }
+                livepix::ToP016(livepix::RawFormat::V210, rows, (int)rb, w, h, p016_, e * w, ColorMatrix::BT709);
             }
             Publish(p016_, /*fullRange=*/false, NowSeconds(), tc, cfg_.eyeDelay);
         }
@@ -394,7 +429,8 @@ void TestSignalSource::PackEyeV210(const livepix::Nv12& src, int x0, int w, int 
     }
 }
 
-void TestSignalSource::PublishV210(const livepix::Nv12& frame, double captureSec, const char* tc) {
+void TestSignalSource::PublishV210(const livepix::Nv12& frame, const std::vector<uint8_t>* pre, double captureSec,
+                                   const char* tc) {
     const int w = cfg_.eyeW, h = cfg_.eyeH;
     const size_t bytes = v210::RowBytes(w) * (size_t)h;
     FrameRing::Frame& f = rawRing_.WriteBuffer();
@@ -407,7 +443,10 @@ void TestSignalSource::PublishV210(const livepix::Nv12& frame, double captureSec
         hostmem::Lease l[2] = {extPool_->Take(), extPool_->Take()};
         if (l[0] && l[1]) {
             for (int e = 0; e < 2; ++e) {
-                PackEyeV210(frame, e * w, w, h, l[e].block->p);
+                if (pre)
+                    std::memcpy(l[e].block->p, pre[e].data(), bytes);  // as the card's DMA write
+                else
+                    PackEyeV210(frame, e * w, w, h, l[e].block->p);
                 f.ext[e] = FrameRing::Frame::ExtPlane{l[e].block->p, bytes, l[e].block->id, l[e].block, l[e].hold};
                 f.plane[e].clear();
             }
@@ -420,7 +459,10 @@ void TestSignalSource::PublishV210(const livepix::Nv12& frame, double captureSec
         f.ClearExt();
         for (int e = 0; e < 2; ++e) {
             f.plane[e].resize(bytes);  // same size after warm-up: no allocation
-            PackEyeV210(frame, e * w, w, h, f.plane[e].data());
+            if (pre)
+                std::memcpy(f.plane[e].data(), pre[e].data(), bytes);  // as the card's DMA write
+            else
+                PackEyeV210(frame, e * w, w, h, f.plane[e].data());
         }
     }
     f.plane[2].clear();
