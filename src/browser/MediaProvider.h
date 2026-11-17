@@ -7,6 +7,9 @@
 #pragma once
 
 #include "browser/MediaItem.h"
+#include "browser/MediaLibrary.h"
+
+#include <string>
 
 #include <cstdint>
 #include <vector>
@@ -76,6 +79,14 @@ public:
     virtual void Delete(const std::vector<int64_t>& ids) = 0;
     // A short haptic tick, e.g. a long press starting select mode. Optional.
     virtual void Haptic() {}
+    // Desktop (#252): the sources the provider declares (MediaLibrary::SetSources), if new
+    // ones arrived; taken just before TakeItems(). Default: none, the built-in sources.
+    virtual bool TakeSources(std::vector<Source>& out) {
+        (void)out;
+        return false;
+    }
+    // A line the browser shows over the grid, e.g. that the Search index is off. Optional.
+    virtual std::string Notice() const { return std::string(); }
 };
 
 } // namespace mp::browser

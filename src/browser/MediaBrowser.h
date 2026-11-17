@@ -42,6 +42,7 @@ public:
         None,
         Opened,      // an item, already handed to MediaProvider::Open
         OtherFiles,  // "Other files...": the caller opens the system picker
+        Closed,      // desktop: the close button; the caller goes back to the player
     };
 
     MediaBrowser() = default;
@@ -56,6 +57,10 @@ public:
     bool Initialize(MediaProvider* provider, VkPhysicalDevice physicalDevice, VkDevice device,
                     uint32_t framesInFlight, const std::string& cachePath);
     void Shutdown();
+
+    // Desktop (#252): a close button in the top bar, mouse-wheel scrolling and a hover
+    // highlight. Off on Android.
+    void SetDesktop(bool on) { desktop_ = on; }
 
     // Read the library again, e.g. each time the browser is shown.
     void Refresh();
@@ -127,6 +132,8 @@ private:
     void EndSelection();
 
     MediaProvider* provider_ = nullptr;
+    bool desktop_ = false;         // SetDesktop
+    bool closeRequested_ = false;  // the close button, this frame
     MediaLibrary library_;
     StereoClassifier classifier_;
     ThumbnailAtlas atlas_;

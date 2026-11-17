@@ -494,6 +494,25 @@ bool App::Initialize(const char* mediaPath) {
                         (VkFormat)xr_.HudFormat(), xr_.HudWidth(), xr_.HudHeight(),
                         xr_.HudImages(), renderer_.FramesInFlight())) {
             window_.SetEventHook([this](void* ev) { imgui_.ProcessEvent(ev); });
+#if MEDIAPLAYER_BROWSER
+            // The media browser (#252): its 3D verdicts are kept beside the Recent list.
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            fs::path verdicts = recentFile_.empty() ? fs::temp_directory_path(ec) / "DisplayXR-MediaPlayer"
+                                                    : fs::path(recentFile_).parent_path();
+            fs::create_directories(verdicts, ec);
+            verdicts /= "stereo_verdicts.txt";
+            browserProvider_ = std::make_unique<browser::WindowsMediaProvider>();
+            browser_ = std::make_unique<browser::MediaBrowser>();
+            if (browser_->Initialize(browserProvider_.get(), xr_.PhysicalDevice(), xr_.Device(),
+                                     renderer_.FramesInFlight(), verdicts.string())) {
+                browser_->SetDesktop(true);
+            } else {
+                LOG_WARN("browser: could not start - Open uses the system dialog");
+                browser_.reset();
+                browserProvider_.reset();
+            }
+#endif
         } else {
             LOG_WARN("ImGui unavailable — using the text HUD");
         }
@@ -522,6 +541,8 @@ int App::Run() {
     dumpHudPath_ = std::getenv("MEDIAPLAYER_DUMP_HUD");
     if (const char* f = std::getenv("MEDIAPLAYER_DUMP_FRAME")) dumpFrame_ = std::max(1, std::atoi(f));
     openAfterPath_ = std::getenv("MEDIAPLAYER_OPEN_AFTER");  // test: swap media mid-run
+    // Test (#252): show the media browser at launch, without a click.
+    if (const char* b = std::getenv("MEDIAPLAYER_SHOW_BROWSER"); b && *b && std::string(b) != "0") ShowBrowser();
     // Test: switch "Convert to 3D" on without a keystroke (headless runs). Retried until it
     // takes, because an in-process session may only learn the conversion task a moment
     // after start. Never set by the player itself.
@@ -1233,7 +1254,7 @@ void App::RenderOneFrame() {
 #endif
     const bool wantHud =
         frame.shouldRender && xr_.HasHud() && uiAllowed &&
-        (imguiReady ? (showHud_ || uiState_.fadeAlpha > 0.001f || uiState_.toastAlpha > 0.001f ||
+        (imguiReady ? (browsing_ || showHud_ || uiState_.fadeAlpha > 0.001f || uiState_.toastAlpha > 0.001f ||
                        uiState_.transitionAlpha > 0.001f
 #if MEDIAPLAYER_PRO
                        || pro_.KeepHudAwake()
@@ -1284,7 +1305,10 @@ void App::RenderOneFrame() {
                 uint32_t pw = 0, phh = 0;
                 window_.PointSize(pw, phh);
                 imgui_.BeginFrame((float)pw, (float)phh, hud.x, hud.y, hud.width, hud.height);
-                BuildTransportUI();
+                if (browsing_)
+                    BuildBrowser();  // over the whole HUD, instead of the transport (#252)
+                else
+                    BuildTransportUI();
 #if MEDIAPLAYER_PRO
                 // Pinned panels go out flat as well (Local2D layers over the same HUD image).
                 for (const pro::ProController::FlatRect& r : pro_.FlatRects()) {
@@ -1588,9 +1612,9 @@ void App::ApplyCursorHidden() {
     // the idle hide goes through SDL here.
     const bool hide = idle;
 #else
-    const bool hide = depthCursorShown_ || idle;
+    const bool hide = (depthCursorShown_ && !browsing_) || idle;
 #endif
-    imgui_.SetCursorLocked(depthCursorShown_ || idle);
+    imgui_.SetCursorLocked((depthCursorShown_ && !browsing_) || idle);
     if (hide != cursorHiddenApplied_) {
         cursorHiddenApplied_ = hide;
         window_.SetOsCursorHidden(hide);
@@ -1676,6 +1700,10 @@ void App::Shutdown() {
     camera_.Stop();       // join the camera worker + SDL_CloseCamera before SDL_Quit
     video_.Stop();        // join the decode thread (reads the audio clock) before audio,
     audio_.Stop();        // and before tearing down the GPU
+#if MEDIAPLAYER_BROWSER
+    browser_.reset();          // its thumbnail atlas holds ImGui descriptors
+    browserProvider_.reset();  // joins its list and thumbnail threads
+#endif
     imgui_.Shutdown();    // before xr_ destroys the Vulkan device ImGui borrows
     renderer_.Shutdown();
     lift_.Detach();       // destroy the conversion stream before its session
@@ -3081,6 +3109,7 @@ std::string App::AutoConvHudText() const {
 }
 
 void App::HandleDroppedPaths(std::vector<std::string> paths) {
+    browserNav_ = false;
     namespace fs = std::filesystem;
 
     const size_t dropped = paths.size();
@@ -3232,6 +3261,15 @@ void App::RebuildFolderList(std::string path) {
 }
 
 void App::NavigateMedia(int delta) {
+    std::string next;
+    if (browserNav_ && BrowserNext(delta, next)) {
+        // Opened from the browser: walk its grid as shown (no wrap; #252).
+        ReloadMedia(next);
+#if MEDIAPLAYER_BROWSER
+        if (currentMediaPath_ == next) browser_->StepTo(delta);
+#endif
+        return;
+    }
     const size_t n = folderFiles_.size();
     if (n < 2) return;  // nothing to step to (LoadMedia rebuilt folderIndex_)
     const int wrapped = ((delta % (int)n) + (int)n) % (int)n;
@@ -3241,7 +3279,8 @@ void App::NavigateMedia(int delta) {
 }
 
 void App::RequestNavTransition(int delta) {
-    if (folderFiles_.size() < 2) return;
+    std::string next;
+    if (browserNav_ ? !BrowserNext(delta, next) : folderFiles_.size() < 2) return;
     if (transition_ != Transition::Playing) return;  // already mid-transition — ignore
     pendingNavDelta_ = delta;
     transition_ = Transition::FadeOut;
@@ -4368,11 +4407,27 @@ void App::RequestOpenFile() {
         LOG_INFO("Open: workspace file picker requested");
         return;
     }
+#if MEDIAPLAYER_BROWSER
+    if (browser_) {
+        LOG_INFO("Open: workspace picker unavailable (status=%d) - media browser", (int)st);
+        openFilePending_ = false;  // the browser is not a pending pick
+        ShowBrowser();
+        return;
+    }
+#endif
     LOG_INFO("Open: workspace picker unavailable (status=%d) — native dialog", (int)st);
+    ShowNativeOpenDialog();
+}
+
+void App::ShowNativeOpenDialog() {
+    openFilePending_ = true;
     // The native dialog is a desktop window — useful for standalone/dev runs, but inside a
     // fullscreen workspace it opens behind the compositor and looks like a dead button. Toast
-    // so the fallback is never a silent no-op.
-    ShowToast("File picker unavailable — opening desktop dialog");
+    // so the fallback is never a silent no-op. (The browser's "Other files..." asked for it.)
+#if MEDIAPLAYER_BROWSER
+    if (!browser_)
+#endif
+        ShowToast("File picker unavailable — opening desktop dialog");
 
     static const SDL_DialogFileFilter kFilters[] = {
         // Keep in sync with MediaSource::IsSupported — SDL wants its own filter string.
@@ -4412,6 +4467,7 @@ void App::RequestOpenFolder() {
 
 void App::OpenChosenPath(const std::string& path) {
     namespace fs = std::filesystem;
+    browserNav_ = false;  // a pick outside the browser walks its own folder
     playlistFromDrop_ = false;  // an explicit pick retires a drop's playlist (#44)
     std::error_code ec;
     if (fs::is_directory(fs::path(path), ec) && !ec) {
@@ -4486,6 +4542,94 @@ void App::RefreshRecentLabels() {
             label.replace(at, 2, "# #");
         uiState_.recentLabels.push_back(std::move(label));
     }
+}
+
+// ---------------------------------------------------------------------------
+// The media browser (#252): Open shows it where there is no workspace picker. It covers
+// the HUD; the player keeps its state behind it, paused.
+// ---------------------------------------------------------------------------
+
+void App::ShowBrowser() {
+#if MEDIAPLAYER_BROWSER
+    if (!browser_ || browsing_) return;
+    browsing_ = true;
+    if (uiState_.slideshowActive) SetSlideshow(false);
+    resumeAfterBrowse_ = isVideo_ && !video_.Paused() && !video_.Ended();
+    if (resumeAfterBrowse_) TogglePlayback();
+    browserProvider_->SetRecents(recent_.Items());
+    browser_->Refresh();
+    window_.SetKeyboardCaptured(true);  // the browser's keys from the next event on
+    LOG_INFO("browser: shown");
+#endif
+}
+
+void App::CloseBrowser() {
+    if (!browsing_) return;
+    browsing_ = false;
+    if (resumeAfterBrowse_ && isVideo_ && video_.Paused()) TogglePlayback();
+    resumeAfterBrowse_ = false;
+}
+
+bool App::BrowserNext(int delta, std::string& path) const {
+#if MEDIAPLAYER_BROWSER
+    int64_t id = 0;
+    if (!browser_ || !browser_->NextId(delta, id)) return false;
+    path = browserProvider_->PathOf(id);
+    return !path.empty();
+#else
+    (void)delta;
+    (void)path;
+    return false;
+#endif
+}
+
+void App::BuildBrowser() {
+#if MEDIAPLAYER_BROWSER
+    if (!browser_) {
+        browsing_ = false;
+        BuildTransportUI();
+        return;
+    }
+    const browser::MediaBrowser::Action action = browser_->Build();
+    ui::BuildTransportToast(uiState_);
+    browser_->RecordUploads(renderer_.FrameCmd());
+    // The browser has the keyboard: no player hotkeys. Esc backs out (a sheet, a folder),
+    // then closes; Backspace and Alt+Left back out.
+    window_.SetKeyboardCaptured(true);
+    const ImGuiIO& io = ImGui::GetIO();
+    if (action == browser::MediaBrowser::Action::None && !io.WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            if (!browser_->Back()) CloseBrowser();
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false) ||
+                   (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))) {
+            browser_->Back();
+        }
+    }
+    switch (action) {
+        case browser::MediaBrowser::Action::Opened: {
+            std::string path;
+            if (!browserProvider_->TakeOpen(path)) break;
+            browsing_ = false;
+            resumeAfterBrowse_ = false;  // a new file plays from its start
+            LOG_INFO("browser: open '%s'", path.c_str());
+            ReloadMedia(path);
+            if (currentMediaPath_ == path) {
+                NoteRecent(path);
+                browserNav_ = true;  // up/down walk the grid it came from
+            }
+            break;
+        }
+        case browser::MediaBrowser::Action::OtherFiles:
+            CloseBrowser();
+            ShowNativeOpenDialog();
+            break;
+        case browser::MediaBrowser::Action::Closed:
+            CloseBrowser();
+            break;
+        case browser::MediaBrowser::Action::None:
+            break;
+    }
+#endif
 }
 
 #if MEDIAPLAYER_PRO

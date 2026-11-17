@@ -330,6 +330,7 @@ function(mp_add_player tgt is_pro)
         src/browser/TileCrop.cpp
         src/browser/TouchScroller.cpp
         $<$<PLATFORM_ID:Windows>:src/browser/WinShellMedia.cpp>
+        $<$<PLATFORM_ID:Windows>:src/browser/WindowsMediaProvider.cpp>
         ${MP_IMGUI_SOURCES}
     )
 

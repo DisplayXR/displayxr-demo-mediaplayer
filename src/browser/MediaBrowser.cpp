@@ -19,8 +19,13 @@ namespace mp::browser {
 
 namespace {
 
-using ui::Dp;
 using ui::Glyph;
+
+// Android's dp is 1.5 design units (ui::Dp). On desktop (SetDesktop) a dp is one design
+// unit: the browser is drawn at the size of the rest of the desktop UI (#252).
+float g_dpUnits = 1.5f;
+float Dp(float v) { return ui::Px(v * g_dpUnits); }
+constexpr float kDesktopRailMinDp = 600.0f;  // desktop: the sources stay as a rail from here
 using ui::Px;
 using ui::TextStyle;
 
@@ -38,6 +43,7 @@ const ImVec4 kBackground(0.05f, 0.06f, 0.08f, 1.0f);    // the UI's window colou
 const ImU32 kPanel = IM_COL32(23, 26, 33, 255);         // top bar and sidebar
 const ImU32 kTileEmpty = IM_COL32(255, 255, 255, 16);
 const ImU32 kPressed = IM_COL32(255, 255, 255, 40);
+const ImU32 kHover = IM_COL32(255, 255, 255, 150);      // desktop: an outline on the tile under the pointer
 const ImU32 kSelected = IM_COL32(51, 166, 255, 72);     // the UI's accent
 const ImU32 kAccent = IM_COL32(51, 166, 255, 255);
 const ImU32 kPicked = IM_COL32(0, 0, 0, 110);           // over a tile picked in select mode
@@ -290,6 +296,20 @@ void MediaBrowser::Refresh() {
 
 void MediaBrowser::TakeResults() {
     std::vector<MediaItem> items;
+    std::vector<Source> sources;
+    if (provider_->TakeSources(sources)) {
+        // Keep the source shown when it is still there (by kind and name), else the first.
+        const Source current = CurrentSource();
+        library_.SetSources(sources);
+        size_t keep = 0;
+        for (size_t i = 0; i < sources.size(); ++i)
+            if (sources[i].kind == current.kind && sources[i].name == current.name) keep = i;
+        if (keep != source_) {
+            source_ = keep;
+            folder_ = sources.empty() ? std::string() : sources[keep].folder;
+        }
+        dirty_ = true;
+    }
     if (provider_->TakeItems(items)) {
         // An edited file keeps its id: forget its old thumbnail.
         for (const MediaItem& item : items) {
@@ -306,6 +326,17 @@ void MediaBrowser::TakeResults() {
             }
         }
         library_.SetItems(std::move(items));
+        // An empty source at its top (Recents before anything was opened): show the first
+        // one that holds something instead.
+        if (CurrentSource().count == 0 && folder_ == CurrentSource().folder) {
+            const std::vector<Source>& all = library_.Sources();
+            for (size_t i = 0; i < all.size(); ++i) {
+                if (all[i].count == 0 || all[i].kind == SourceKind::Unsupported) continue;
+                source_ = i;
+                folder_ = all[i].folder;
+                break;
+            }
+        }
         listed_ = true;
         dirty_ = true;
         // Deleted items leave the selection, and with the last one select mode ends. A
@@ -448,6 +479,7 @@ MediaBrowser::Action MediaBrowser::Build() {
     if (dirty_) Rebuild();
     cache_.NextFrame();
 
+    g_dpUnits = desktop_ ? 1.0f : 1.5f;
     const ImGuiIO& io = ImGui::GetIO();
     const ImGuiStyle& style = ImGui::GetStyle();
     const double now = ImGui::GetTime();
@@ -455,7 +487,7 @@ MediaBrowser::Action MediaBrowser::Build() {
     const float bar = Round(ImGui::GetFrameHeight() + style.WindowPadding.y * 2.0f);
     const float chips = Round(Dp(56.0f));
     // Landscape and wide: the sources are a rail that stays; anywhere else a drawer (#180).
-    rail_ = UseRail(w / Dp(1.0f), h / Dp(1.0f));
+    rail_ = desktop_ ? w / Dp(1.0f) >= kDesktopRailMinDp : UseRail(w / Dp(1.0f), h / Dp(1.0f));
     if (rail_) drawer_ = false;
     const float sidebarW = SidebarWidth(w);
     std::vector<StereoTile> tiles = std::move(stereoFrame_.tiles);  // keep the capacity
@@ -503,6 +535,8 @@ MediaBrowser::Action MediaBrowser::Build() {
         const Action picked = Drawer(w, h, now);
         if (picked != Action::None) action = picked;
     }
+    if (closeRequested_ && action == Action::None) action = Action::Closed;
+    closeRequested_ = false;
     if (action == Action::Opened) classifier_.Save();  // the app may be stopped while playing
     if (action != Action::None && !wanted_.empty()) {
         // The grid is going away: stop the thumbnail work, so it does not compete with
@@ -559,7 +593,9 @@ void MediaBrowser::TopBar(float width, float height) {
             drawer_ = true;
         }
     }
-    const float more = width - pad - icon;
+    // Desktop: a close button at the far right, back to the player (#252).
+    if (desktop_ && IconButton("##close", Glyph::Close, ImVec2(width - pad - icon, y), icon)) closeRequested_ = true;
+    const float more = width - pad - icon - (desktop_ ? icon + gap : 0.0f);
     if (IconButton("##options", Glyph::More, ImVec2(more, y), icon)) ImGui::OpenPopup("##view_options");
     // An accent dot on the menu when an option in it is not as it starts.
     if (!ViewOptionsAreDefault(options_, showUnsupported_))
@@ -729,7 +765,10 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
     sidebarScroll_.SetLimit((files + 1) * rowH + gap * 4.0f - size.y);
     ImGui::SetCursorScreenPos(min);
     ImGui::InvisibleButton("##sidebar", size);
+    const bool sidebarHovered = ImGui::IsItemHovered();
     const bool tap = Track(sidebarScroll_, sidebarPress_, now);
+    if (desktop_ && sidebarHovered && ImGui::GetIO().MouseWheel != 0.0f)
+        sidebarScroll_.SetOffset(sidebarScroll_.Offset() - ImGui::GetIO().MouseWheel * Dp(52.0f));
     const float offset = Round(sidebarScroll_.Offset());
 
     auto rowTop = [&](int r) { return top + r * rowH + (r == files ? gap * 2.0f : 0.0f) - offset; };
@@ -829,6 +868,16 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         Message(min, max, nullptr, "Loading...", nullptr);
         return Action::None;
     }
+    // The provider's notice (desktop: the Search index is off), as a strip over the grid.
+    const std::string notice = provider_->Notice();
+    if (!notice.empty()) {
+        const float h = Round(std::max(Dp(40.0f), ImGui::GetFrameHeight() + style.ItemSpacing.y * 2.0f));
+        const float pad = Round(style.WindowPadding.x);
+        dl->AddRectFilled(min, ImVec2(max.x, min.y + h), kPanel);
+        dl->AddText(ImVec2(min.x + pad, min.y + Round((h - ImGui::GetFontSize()) * 0.5f)), kDim,
+                    ui::FitText(notice, max.x - min.x - pad * 2.0f).c_str());
+        min.y += h;
+    }
 
     // Square tiles, about one column per 180 dp of the grid's width (#180): beside the rail
     // that is one fewer. The drawer lies over the grid and leaves it as it is.
@@ -876,10 +925,15 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         }
     }
     bool tap = false;
+    bool gridHovered = false;
     if (n > 0) {
         ImGui::SetCursorScreenPos(min);
         ImGui::InvisibleButton("##grid", size);
+        gridHovered = ImGui::IsItemHovered();
         tap = Track(gridScroll_, gridPress_, now);
+        // Desktop: the wheel scrolls by about half a row a notch.
+        if (desktop_ && gridHovered && ImGui::GetIO().MouseWheel != 0.0f)
+            gridScroll_.SetOffset(gridScroll_.Offset() - ImGui::GetIO().MouseWheel * step * 0.5f);
     }
     const float offset = Round(gridScroll_.Offset());
 
@@ -962,6 +1016,9 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     };
     size_t pressed = n;
     if (gridScroll_.Pressed() && !gridScroll_.Dragging() && !itemAt(gridPress_, pressed)) pressed = n;
+    // Desktop: the tile under the pointer, lightly lit.
+    size_t hovered = n;
+    if (desktop_ && gridHovered && !gridScroll_.Pressed() && !itemAt(ImGui::GetIO().MousePos, hovered)) hovered = n;
     // A long press on an item starts select mode with it. In select mode it is a tap.
     if (pressed >= nf && pressed < n && !selecting_ && provider_->CanDelete() && gridScroll_.TakeLongPress(now)) {
         selecting_ = true;
@@ -988,6 +1045,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         if (p < nf) {
             FolderTile(dl, folders_[p], a, b, margin);
             if (p == pressed) dl->AddRectFilled(a, b, kPressed);
+            if (p == hovered) dl->AddRect(a, b, kHover, 0.0f, 0, Round(Px(2.0f)));
             continue;
         }
         const MediaItem& item = items[shown_[p - nf]];
@@ -1051,6 +1109,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
             CheckBox(dl, ImVec2(a.x + margin, a.y + margin), box, on);
         }
         if (p == pressed) dl->AddRectFilled(a, b, kPressed);
+        if (p == hovered) dl->AddRect(a, b, kHover, 0.0f, 0, Round(Px(2.0f)));
     }
     // The date sections' headers.
     if (headers) {

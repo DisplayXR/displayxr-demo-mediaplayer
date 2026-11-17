@@ -24,6 +24,17 @@
 #include "pro/ProController.h"
 #endif
 
+// The in-app media browser (#252): the consumer player on Windows. Pro keeps its station
+// panels; macOS / Linux keep the system dialog until they get a provider.
+#if defined(_WIN32) && !MEDIAPLAYER_PRO
+#define MEDIAPLAYER_BROWSER 1
+#include "browser/MediaBrowser.h"
+#include "browser/WindowsMediaProvider.h"
+#include <memory>
+#else
+#define MEDIAPLAYER_BROWSER 0
+#endif
+
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -85,6 +96,13 @@ private:
     // Open-file. RequestOpenFile tries the workspace picker, else a native dialog.
     // LoadMedia opens a path fresh; ReloadMedia tears down current media first.
     void RequestOpenFile();
+    // The system file dialog (Open's fallback, and the browser's "Other files...").
+    void ShowNativeOpenDialog();
+    // The media browser (#252): shown by Open where there is no workspace picker.
+    void ShowBrowser();
+    void CloseBrowser();
+    void BuildBrowser();
+    bool BrowserNext(int delta, std::string& path) const;
     // Open folder (#252 phase 0): a native folder dialog; the folder becomes the arrow-key list.
     void RequestOpenFolder();
     // A path the user chose (a picker, a Recent row): a file opens as is, a folder opens
@@ -402,6 +420,14 @@ private:
     // (empty = not kept). Arrow-key walks and the slideshow do not add to it.
     RecentList recent_;
     std::string recentFile_;
+
+#if MEDIAPLAYER_BROWSER
+    std::unique_ptr<browser::WindowsMediaProvider> browserProvider_;
+    std::unique_ptr<browser::MediaBrowser> browser_;
+#endif
+    bool browsing_ = false;          // the browser covers the player
+    bool browserNav_ = false;        // up/down walk the browser's grid, not folderFiles_
+    bool resumeAfterBrowse_ = false;  // a video was playing when the browser opened
 
     // Folder navigation / slideshow. folderFiles_ holds the supported assets in the
     // current media's directory (sorted); folderIndex_ points at the loaded one.
