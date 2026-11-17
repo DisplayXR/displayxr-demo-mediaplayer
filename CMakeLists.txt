@@ -332,6 +332,7 @@ function(mp_add_player tgt is_pro)
         src/browser/TileCrop.cpp
         src/browser/TouchScroller.cpp
         $<$<PLATFORM_ID:Windows>:src/browser/WinShellMedia.cpp>
+        $<$<PLATFORM_ID:Windows>:src/browser/CloudFetch.cpp>  # a cloud file downloads before it opens
         $<$<PLATFORM_ID:Windows>:src/browser/WindowsMediaProvider.cpp>
         ${MP_IMGUI_SOURCES}
     )
@@ -414,7 +415,7 @@ function(mp_add_player tgt is_pro)
     # atlas-capture output path under the user's Pictures folder.
     # d3d11 + dxgi: zero-copy D3D11VA->Vulkan decode interop (issue #28).
     if(WIN32)
-        target_link_libraries(${tgt} PRIVATE shell32 ole32 oleaut32 uuid d3d11 dxgi d3dcompiler)
+        target_link_libraries(${tgt} PRIVATE shell32 ole32 oleaut32 uuid cldapi d3d11 dxgi d3dcompiler)
     endif()
 
     # macOS: displayxr-common's Cocoa adapter for dxr::CursorDepth hides the OS pointer

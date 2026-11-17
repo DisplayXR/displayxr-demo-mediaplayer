@@ -477,7 +477,16 @@ bool App::Initialize(const char* mediaPath) {
             } else {
                 LOG_WARN("No supported media in folder '%s'", mediaPath);
             }
-        } else if (LoadMedia(mediaPath)) {
+        }
+#if defined(_WIN32)
+        else if (browser::win::IsCloudOnlyPath(mediaPath)) {
+            // In the cloud (#252): download it first; the idle screen shows meanwhile.
+            openIntent_ = OpenIntent::User;
+            ReloadMedia(mediaPath);
+            openIntent_ = OpenIntent::Other;
+        }
+#endif
+        else if (LoadMedia(mediaPath)) {
             NoteRecent(mediaPath);
         }
     }
@@ -862,6 +871,7 @@ void App::RenderOneFrame() {
 
     // Advance UI fades + the slideshow machine (may swap media at a fade's mid-black).
     TickUi();
+    PollCloudFetch();  // a cloud download finished: open the file (#252)
 
     // Mode chip at start-up: name the mode the session came up in, once. Skipped when a
     // request is about to change it anyway (MEDIAPLAYER_START_MODE, Pro's auto-3D) - the
@@ -1299,7 +1309,7 @@ void App::RenderOneFrame() {
 #endif
     const bool wantHud =
         frame.shouldRender && xr_.HasHud() && uiAllowed &&
-        (imguiReady ? (browsing_ || showHud_ || uiState_.fadeAlpha > 0.001f || uiState_.toastAlpha > 0.001f ||
+        (imguiReady ? (browsing_ || showHud_ || CloudFetchBusy() || uiState_.fadeAlpha > 0.001f || uiState_.toastAlpha > 0.001f ||
                        uiState_.transitionAlpha > 0.001f
 #if MEDIAPLAYER_PRO
                        || pro_.KeepHudAwake()
@@ -1354,6 +1364,7 @@ void App::RenderOneFrame() {
                     BuildBrowser();  // over the whole HUD, instead of the transport (#252)
                 else
                     BuildTransportUI();
+                BuildCloudFetchPanel();  // a cloud file downloading before it opens (#252)
 #if MEDIAPLAYER_PRO
                 // Pinned panels go out flat as well (Local2D layers over the same HUD image).
                 for (const pro::ProController::FlatRect& r : pro_.FlatRects()) {
@@ -2222,6 +2233,18 @@ void App::CycleLayoutOverride() {
 }
 
 void App::ReloadMedia(const std::string& path) {
+#if defined(_WIN32)
+    // A cloud-only file (#252): opening it would wait for the whole download on this, the
+    // render thread. Download it in the background first; PollCloudFetch opens it.
+    if (browser::win::IsCloudOnlyPath(path)) {
+        cloudIntent_ = openIntent_;
+        if (cloudFetch_.Start(path))
+            LOG_INFO("cloud: '%s' is in the cloud - downloading it before it opens", path.c_str());
+        else
+            ShowToast("Could not open this file");
+        return;
+    }
+#endif
     // Every file path (Open, drop, open_file, navigation) lands here, so this is the one
     // place a file replaces the live camera.
     const bool wasLive = isLive_ || isStream_;
@@ -4558,7 +4581,9 @@ void App::OpenChosenPath(const std::string& path) {
         }
         return;
     }
+    openIntent_ = OpenIntent::User;
     ReloadMedia(path);
+    openIntent_ = OpenIntent::Other;
     if (currentMediaPath_ == path) NoteRecent(path);
 }
 
@@ -4669,6 +4694,72 @@ void App::ApplyFolderRequests() {
 #endif
 }
 
+void App::PollCloudFetch() {
+#if defined(_WIN32)
+    std::string path;
+    float progress = 0.0f;
+    using State = browser::win::CloudFetch::State;
+    const State s = cloudFetch_.Poll(path, progress);
+    if (s == State::Idle || s == State::Running) return;
+    cloudFetch_.Clear();
+    const OpenIntent intent = cloudIntent_;
+    cloudIntent_ = OpenIntent::Other;
+    const std::string name = std::filesystem::u8path(path).filename().u8string();
+    if (s == State::Cancelled) {
+        ShowToast("Download cancelled");
+        return;
+    }
+    if (s == State::Failed || browser::win::IsCloudOnlyPath(path)) {
+        ShowToast("Could not download " + name);
+        return;
+    }
+    ReloadMedia(path);
+    if (currentMediaPath_ != path) return;
+    if (intent != OpenIntent::Other) NoteRecent(path);
+    if (intent == OpenIntent::Browser) browserNav_ = true;
+#endif
+}
+
+void App::BuildCloudFetchPanel() {
+#if defined(_WIN32)
+    std::string path;
+    float progress = 0.0f;
+    if (cloudFetch_.Poll(path, progress) != browser::win::CloudFetch::State::Running) return;
+    const std::string name = std::filesystem::u8path(path).filename().u8string();
+    const ImGuiIO& io = ImGui::GetIO();
+    const float em = ImGui::GetFontSize();
+    const float w = std::min(io.DisplaySize.x - 2.0f * em, 28.0f * em);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0.0f));
+    ImGui::SetNextWindowFocus();
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em, em));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.5f * em);
+    if (ImGui::Begin("##cloud_fetch", nullptr, flags)) {
+        ImGui::TextUnformatted("Downloading from the cloud");
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%s", name.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        char label[32];
+        if (progress >= 0.0f)
+            std::snprintf(label, sizeof(label), "%.0f%%", 100.0f * progress);
+        else
+            std::snprintf(label, sizeof(label), "...");
+        // A negative fraction is ImGui's indeterminate bar.
+        ImGui::ProgressBar(progress >= 0.0f ? progress : -1.0f * (float)ImGui::GetTime(), ImVec2(-1.0f, 0.0f),
+                           label);
+        ImGui::Spacing();
+        if (ImGui::Button("Cancel", ImVec2(-1.0f, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+            cloudFetch_.Cancel();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+#endif
+}
+
 void App::RequestBrowserMode() {
 #if MEDIAPLAYER_BROWSER
     if (startMode_ >= 0 || !xr_.HasRenderingModes()) return;  // a test pin owns the mode
@@ -4750,7 +4841,9 @@ void App::BuildBrowser() {
             EndBrowserMode(browser_->WantsStereo());
             resumeAfterBrowse_ = false;  // a new file plays from its start
             LOG_INFO("browser: open '%s'", path.c_str());
+            openIntent_ = OpenIntent::Browser;
             ReloadMedia(path);
+            openIntent_ = OpenIntent::Other;
             if (currentMediaPath_ == path) {
                 NoteRecent(path);
                 browserNav_ = true;  // up/down walk the grid it came from

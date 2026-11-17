@@ -19,6 +19,9 @@
 #include "ui/ImGuiLayer.h"
 #include "ui/TransportUI.h"
 #include "xr/XrSession.h"
+#if defined(_WIN32)
+#include "browser/CloudFetch.h"
+#endif
 #if MEDIAPLAYER_PRO
 #include "pro/PerfSwitches.h"
 #include "pro/ProController.h"
@@ -105,6 +108,17 @@ private:
     void BuildBrowser();
     bool BrowserNext(int delta, std::string& path) const;
     void ApplyFolderRequests();
+    // A cloud-only file is downloaded in the background before it opens (#252): the
+    // download's end, and its progress panel (Cancel).
+    void PollCloudFetch();
+    void BuildCloudFetchPanel();
+    bool CloudFetchBusy() const {
+#if defined(_WIN32)
+        return cloudFetch_.Busy();
+#else
+        return false;
+#endif
+    }
     // The browser's rendering mode (#252 phase 2): flat, or 3D under its "3D only" filter,
     // borrowed while it shows. End: hand it back, or (`keep`) leave the panel as it is.
     void RequestBrowserMode();
@@ -438,6 +452,14 @@ private:
     bool gridReady_ = false;
     browser::ModeBorrow browserMode_;
 #endif
+#if defined(_WIN32)
+    browser::win::CloudFetch cloudFetch_;
+#endif
+    // What asked for the open a cloud download is for: a user open adds the file to Recent,
+    // the browser also makes up/down walk its grid. Set around those ReloadMedia calls.
+    enum class OpenIntent { Other, User, Browser };
+    OpenIntent openIntent_ = OpenIntent::Other;
+    OpenIntent cloudIntent_ = OpenIntent::Other;
     bool browsing_ = false;          // the browser covers the player
     bool browserNav_ = false;        // up/down walk the browser's grid, not folderFiles_
     bool resumeAfterBrowse_ = false;  // a video was playing when the browser opened
