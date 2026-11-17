@@ -715,6 +715,10 @@ bool VideoDecoder::Open(const std::string& path) {
     positionSec_.store(0.0);
     seekRequest_.store(-1.0);
     ended_.store(false);
+    // A new file plays: a pause (or the end-of-clip hold) on the previous one must not carry
+    // over. Its audio starts fresh, so a held decoder left the picture frozen at the first
+    // frame while the sound ran on (as OpenLive already resets it).
+    paused_.store(false);
     open_ = true;
     LOG_INFO("VideoDecoder: '%s' %dx%d codec=%s backend=%s dur=%.1fs%s", path.c_str(), width_,
              height_, codecName_, hwName_, durationSec_, impl_->mv ? " MV-HEVC (both views, SBS)" : "");
