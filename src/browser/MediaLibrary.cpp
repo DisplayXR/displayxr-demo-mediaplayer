@@ -48,7 +48,7 @@ std::string UpOne(const std::string& folder) {
 }
 
 bool ListsFolders(const Source& s) {
-    return s.mode == SourceMode::Grouped || (s.mode == SourceMode::Tree && s.roots.size() > 1);
+    return s.mode == SourceMode::Grouped || (s.mode == SourceMode::Tree && !s.roots.empty());
 }
 
 } // namespace
@@ -161,12 +161,13 @@ std::vector<Folder> MediaLibrary::Folders(const Source& source, const ViewOption
         }
         return out;
     }
-    if (folder.empty() && source.mode == SourceMode::Tree && source.roots.size() > 1) {
+    if (folder.empty() && source.mode == SourceMode::Tree && !source.roots.empty()) {
         for (const std::string& root : source.roots) {
             int count = 0;
             for (size_t i = 0; i < items_.size(); ++i)
                 if (Under(items_[i], root) && Holds(source, options, i)) ++count;
-            if (count) out.push_back(Folder{LastPart(root), root, count, LastPart(UpOne(root))});
+            // A root with nothing in it still shows (a pinned folder emptied meanwhile).
+            out.push_back(Folder{LastPart(root), root, count, LastPart(UpOne(root))});
         }
         return out;
     }
@@ -185,8 +186,7 @@ std::vector<Folder> MediaLibrary::Folders(const Source& source, const ViewOption
 std::string MediaLibrary::Parent(const Source& source, const std::string& folder) const {
     if (folder == source.folder) return folder;
     if (source.mode == SourceMode::Grouped) return source.folder;
-    if (source.roots.size() > 1 &&
-        std::find(source.roots.begin(), source.roots.end(), folder) != source.roots.end())
+    if (std::find(source.roots.begin(), source.roots.end(), folder) != source.roots.end())
         return source.folder;
     return UpOne(folder);
 }
@@ -199,7 +199,7 @@ std::vector<std::string> MediaLibrary::Breadcrumb(const Source& source, const st
         return out;
     }
     size_t i = source.folder.size();
-    if (source.roots.size() > 1) {
+    if (!source.roots.empty()) {
         for (const std::string& root : source.roots) {
             if (folder.compare(0, root.size(), root) != 0) continue;
             out.push_back(LastPart(root));

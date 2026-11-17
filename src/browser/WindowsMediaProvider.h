@@ -32,6 +32,8 @@ public:
     // keeps them. Used by the next Refresh().
     void SetRecents(std::vector<std::string> paths);
     void SetPinned(std::vector<std::string> folders);
+    // Folders left out of Media folders (with what is under them): "Hide from Media folders".
+    void SetHidden(std::vector<std::string> folders);
 
     // The path of an item, or empty.
     std::string PathOf(int64_t id) const;
@@ -60,7 +62,7 @@ private:
     bool refresh_ = false;
 
     // Inputs (under mutex_).
-    std::vector<std::string> recents_, pinned_;
+    std::vector<std::string> recents_, pinned_, hidden_;
 
     // Results (under mutex_).
     bool haveList_ = false;

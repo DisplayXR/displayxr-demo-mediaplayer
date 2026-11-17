@@ -507,6 +507,13 @@ bool App::Initialize(const char* mediaPath) {
             if (browser_->Initialize(browserProvider_.get(), xr_.PhysicalDevice(), xr_.Device(),
                                      renderer_.FramesInFlight(), verdicts.string())) {
                 browser_->SetDesktop(true);
+                if (!recentFile_.empty()) {
+                    const fs::path dir = fs::path(recentFile_).parent_path();
+                    pinnedFile_ = (dir / "pinned.txt").string();
+                    hiddenFile_ = (dir / "hidden_folders.txt").string();
+                    pinned_.Load(pinnedFile_);
+                    hiddenFolders_.Load(hiddenFile_);
+                }
             } else {
                 LOG_WARN("browser: could not start - Open uses the system dialog");
                 browser_.reset();
@@ -777,7 +784,21 @@ int App::Run() {
         }
         if (gotNative) {
             openFilePending_ = false;
-            if (!picked.empty()) OpenChosenPath(picked);  // outside the lock
+            if (pinPickPending_) {
+                // The browser's "Add folder...": pin it, and the browser shows it (#252).
+                pinPickPending_ = false;
+#if MEDIAPLAYER_BROWSER
+                if (!picked.empty() && browser_) {
+                    pinned_.Add(picked);
+                    if (!pinnedFile_.empty()) pinned_.Save(pinnedFile_);
+                    browserProvider_->SetPinned(pinned_.Items());
+                    browser_->Refresh();
+                    ShowToast("Pinned");
+                }
+#endif
+            } else if (!picked.empty()) {
+                OpenChosenPath(picked);  // outside the lock
+            }
         }
         // Test hook: exercise the media-swap path without a dialog.
         if (openAfterPath_ && !openedAfter_ && frames_ > 150) {
@@ -4557,6 +4578,8 @@ void App::ShowBrowser() {
     resumeAfterBrowse_ = isVideo_ && !video_.Paused() && !video_.Ended();
     if (resumeAfterBrowse_) TogglePlayback();
     browserProvider_->SetRecents(recent_.Items());
+    browserProvider_->SetPinned(pinned_.Items());
+    browserProvider_->SetHidden(hiddenFolders_.Items());
     browser_->Refresh();
     window_.SetKeyboardCaptured(true);  // the browser's keys from the next event on
     LOG_INFO("browser: shown");
@@ -4568,6 +4591,40 @@ void App::CloseBrowser() {
     browsing_ = false;
     if (resumeAfterBrowse_ && isVideo_ && video_.Paused()) TogglePlayback();
     resumeAfterBrowse_ = false;
+}
+
+void App::ApplyFolderRequests() {
+#if MEDIAPLAYER_BROWSER
+    browser::MediaBrowser::FolderRequest r;
+    if (!browser_ || !browser_->TakeFolderRequest(r)) return;
+    // The browser's paths are '/'-separated with a trailing '/': back to a Windows folder.
+    std::string path = r.path;
+    std::replace(path.begin(), path.end(), '/', '\\');
+    while (path.size() > 3 && path.back() == '\\') path.pop_back();
+    using Verb = browser::MediaBrowser::FolderRequest::Verb;
+    switch (r.verb) {
+        case Verb::Pin:
+            pinned_.Add(path);
+            if (!pinnedFile_.empty()) pinned_.Save(pinnedFile_);
+            ShowToast("Pinned");
+            break;
+        case Verb::Unpin:
+            pinned_.Remove(path);
+            if (!pinnedFile_.empty()) pinned_.Save(pinnedFile_);
+            ShowToast("Removed from Pinned");
+            break;
+        case Verb::Hide:
+            hiddenFolders_.Add(path);
+            if (!hiddenFile_.empty()) hiddenFolders_.Save(hiddenFile_);
+            ShowToast("Hidden from Media folders");
+            break;
+    }
+    LOG_INFO("browser: folder %s '%s'", r.verb == Verb::Pin ? "pinned" : r.verb == Verb::Unpin ? "unpinned" : "hidden",
+             path.c_str());
+    browserProvider_->SetPinned(pinned_.Items());
+    browserProvider_->SetHidden(hiddenFolders_.Items());
+    browser_->Refresh();
+#endif
 }
 
 bool App::BrowserNext(int delta, std::string& path) const {
@@ -4591,6 +4648,7 @@ void App::BuildBrowser() {
         return;
     }
     const browser::MediaBrowser::Action action = browser_->Build();
+    ApplyFolderRequests();
     ui::BuildTransportToast(uiState_);
     browser_->RecordUploads(renderer_.FrameCmd());
     // The browser has the keyboard: no player hotkeys. Esc backs out (a sheet, a folder),
@@ -4625,6 +4683,13 @@ void App::BuildBrowser() {
             break;
         case browser::MediaBrowser::Action::Closed:
             CloseBrowser();
+            break;
+        case browser::MediaBrowser::Action::AddFolder:
+            if (!openFilePending_ && !pinPickPending_) {
+                pinPickPending_ = true;
+                SDL_ShowOpenFolderDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this, window_.SdlWindow(),
+                                         nullptr, false);
+            }
             break;
         case browser::MediaBrowser::Action::None:
             break;

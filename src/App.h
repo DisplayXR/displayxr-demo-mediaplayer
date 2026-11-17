@@ -103,6 +103,7 @@ private:
     void CloseBrowser();
     void BuildBrowser();
     bool BrowserNext(int delta, std::string& path) const;
+    void ApplyFolderRequests();  // the browser's Add folder / pin / unpin / hide
     // Open folder (#252 phase 0): a native folder dialog; the folder becomes the arrow-key list.
     void RequestOpenFolder();
     // A path the user chose (a picker, a Recent row): a file opens as is, a folder opens
@@ -428,6 +429,10 @@ private:
     bool browsing_ = false;          // the browser covers the player
     bool browserNav_ = false;        // up/down walk the browser's grid, not folderFiles_
     bool resumeAfterBrowse_ = false;  // a video was playing when the browser opened
+    // Pinned folders and folders hidden from Media folders, kept beside the Recent list.
+    RecentList pinned_{64}, hiddenFolders_{256};
+    std::string pinnedFile_, hiddenFile_;
+    bool pinPickPending_ = false;  // the folder dialog is choosing a folder to pin
 
     // Folder navigation / slideshow. folderFiles_ holds the supported assets in the
     // current media's directory (sorted); folderIndex_ points at the loaded one.

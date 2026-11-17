@@ -110,6 +110,11 @@ void WindowsMediaProvider::SetPinned(std::vector<std::string> folders) {
     pinned_ = std::move(folders);
 }
 
+void WindowsMediaProvider::SetHidden(std::vector<std::string> folders) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    hidden_ = std::move(folders);
+}
+
 std::string WindowsMediaProvider::PathOf(int64_t id) const {
     std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex_));
     const auto it = paths_.find(id);
@@ -179,7 +184,7 @@ std::string WindowsMediaProvider::Notice() const {
 void WindowsMediaProvider::ListWorker() {
     win::ScopedCom com;
     for (;;) {
-        std::vector<std::string> recents, pinned;
+        std::vector<std::string> recents, pinned, hidden;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             listWake_.wait(lock, [this] { return stop_ || refresh_; });
@@ -187,6 +192,11 @@ void WindowsMediaProvider::ListWorker() {
             refresh_ = false;
             recents = recents_;
             pinned = pinned_;
+            for (const std::string& h : hidden_) {
+                std::string k = Slashes(h, true);
+                for (char& c : k) c = (char)std::tolower((unsigned char)c);
+                hidden.push_back(std::move(k));
+            }
         }
         const double t0 = win::NowMs();
 
@@ -237,8 +247,15 @@ void WindowsMediaProvider::ListWorker() {
         std::vector<win::FoundFile> indexed;
         std::string error;
         const bool indexOk = win::QueryIndex(win::IndexQuery{}, indexed, error);
+        auto isHidden = [&](const std::string& folder) {
+            std::string k = Slashes(folder, true);
+            for (char& c : k) c = (char)std::tolower((unsigned char)c);
+            for (const std::string& h : hidden)
+                if (k.compare(0, h.size(), h) == 0) return true;
+            return false;
+        };
         for (win::FoundFile& f : indexed)
-            if (MediaSource::IsSupported(f.path)) add(std::move(f), kIndex, 0);
+            if (MediaSource::IsSupported(f.path) && !isHidden(f.folder)) add(std::move(f), kIndex, 0);
 
         // The sources: a tree source with one root is browsed from inside it.
         auto tree = [](Source& s, const std::vector<std::string>& roots) {
@@ -265,7 +282,12 @@ void WindowsMediaProvider::ListWorker() {
         Source& folders = source(SourceKind::Folders, "Media folders", kIndex);
         folders.mode = SourceMode::Grouped;
         folders.newest = kNewest;
-        if (!pinned.empty()) tree(source(SourceKind::Pinned, "Pinned", kPinned), pinned);
+        if (!pinned.empty()) {
+            // Pinned lists its folders first even when there is one, so each can be unpinned.
+            Source& s = source(SourceKind::Pinned, "Pinned", kPinned);
+            s.mode = SourceMode::Tree;
+            for (const std::string& r : pinned) s.roots.push_back(Slashes(r, true));
+        }
 
         std::vector<MediaItem> items;
         std::unordered_map<int64_t, std::string> paths;

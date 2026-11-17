@@ -760,9 +760,10 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
     const float rowH = Round(std::max(Dp(52.0f), ImGui::GetFrameHeight() + style.ItemSpacing.y));
     const float gap = Round(style.ItemSpacing.y);  // around the line above "Other files..."
     const int files = SourceRows();                // the row of "Other files..."
+    const int last = files + (desktop_ ? 1 : 0);   // desktop: then "Add folder..."
     const float top = min.y + gap;
     sidebarScroll_.SetSlop(Px(kSlop));
-    sidebarScroll_.SetLimit((files + 1) * rowH + gap * 4.0f - size.y);
+    sidebarScroll_.SetLimit((last + 1) * rowH + gap * 4.0f - size.y);
     ImGui::SetCursorScreenPos(min);
     ImGui::InvisibleButton("##sidebar", size);
     const bool sidebarHovered = ImGui::IsItemHovered();
@@ -771,9 +772,9 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
         sidebarScroll_.SetOffset(sidebarScroll_.Offset() - ImGui::GetIO().MouseWheel * Dp(52.0f));
     const float offset = Round(sidebarScroll_.Offset());
 
-    auto rowTop = [&](int r) { return top + r * rowH + (r == files ? gap * 2.0f : 0.0f) - offset; };
+    auto rowTop = [&](int r) { return top + r * rowH + (r >= files ? gap * 2.0f : 0.0f) - offset; };
     auto rowAt = [&](ImVec2 p) {
-        for (int r = 0; r <= files; ++r) {
+        for (int r = 0; r <= last; ++r) {
             if (p.y >= rowTop(r) && p.y < rowTop(r) + rowH) return r;
         }
         return -1;
@@ -787,7 +788,7 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
     const ImU32 text = ImGui::GetColorU32(ImGuiCol_Text);
     const ImU32 dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
     dl->PushClipRect(min, max, true);
-    for (int r = 0; r <= files; ++r) {
+    for (int r = 0; r <= last; ++r) {
         const float y = rowTop(r);
         if (r == files) {
             const float line = y - gap;
@@ -798,11 +799,12 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
         const Source* s = r < files ? &sources[r] : nullptr;
         if (s && (size_t)r == source_) dl->AddRectFilled(a, b, kSelected);
         if (r == pressed) dl->AddRectFilled(a, b, kPressed);
-        ui::DrawGlyph(dl, s ? SourceIcon(s->kind) : Glyph::Files, ImVec2(min.x + pad + icon * 0.5f, y + rowH * 0.5f),
-                      icon, text, s && (size_t)r == source_);
+        ui::DrawGlyph(dl, s ? SourceIcon(s->kind) : r == files ? Glyph::Files : Glyph::Pin,
+                      ImVec2(min.x + pad + icon * 0.5f, y + rowH * 0.5f), icon, text, s && (size_t)r == source_);
         const float textY = y + Round((rowH - ImGui::GetFontSize()) * 0.5f);
         if (!s) {
-            dl->AddText(ImVec2(textX, textY), text, ui::FitText("Other files...", right - textX).c_str());
+            const char* label = r == files ? "Other files..." : "Add folder...";
+            dl->AddText(ImVec2(textX, textY), text, ui::FitText(label, right - textX).c_str());
             continue;
         }
         char count[16];
@@ -824,6 +826,7 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
         openedId_ = -1;
         return Action::OtherFiles;
     }
+    if (r > files) return Action::AddFolder;
     source_ = (size_t)r;
     folder_ = sources[r].folder;
     EndSelection();
@@ -1164,6 +1167,15 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         }
     }
 
+    // Desktop: right click a folder tile for its menu (pin, unpin, hide).
+    size_t clicked = n;
+    if (desktop_ && gridHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
+        itemAt(ImGui::GetIO().MousePos, clicked) && clicked < nf && folders_[clicked].path != kNewestFolder) {
+        menuFolder_ = folders_[clicked].path;
+        ImGui::OpenPopup("##folder_menu");
+    }
+    FolderMenu();
+
     size_t picked = 0;
     if (!tap || !itemAt(gridPress_, picked)) return Action::None;
     if (picked < nf) {
@@ -1179,6 +1191,27 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     openedId_ = id;
     provider_->Open(openedId_);
     return Action::Opened;
+}
+
+void MediaBrowser::FolderMenu() {
+    if (!ImGui::BeginPopup("##folder_menu")) return;
+    const Source& s = CurrentSource();
+    const bool top = folder_ == s.folder;
+    auto ask = [&](FolderRequest::Verb verb) {
+        folderRequest_ = FolderRequest{verb, menuFolder_};
+        folderRequestPending_ = true;
+    };
+    {
+        FontScope row(TextStyle::Row);
+        if (s.kind == SourceKind::Pinned && top) {
+            if (ImGui::MenuItem("Remove from Pinned")) ask(FolderRequest::Verb::Unpin);
+        } else if (ImGui::MenuItem("Pin this folder")) {
+            ask(FolderRequest::Verb::Pin);
+        }
+        if (s.mode == SourceMode::Grouped && top && ImGui::MenuItem("Hide from Media folders"))
+            ask(FolderRequest::Verb::Hide);
+    }
+    ImGui::EndPopup();
 }
 
 void MediaBrowser::GoTo(const std::string& folder) {

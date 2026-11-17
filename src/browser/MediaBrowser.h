@@ -43,7 +43,20 @@ public:
         Opened,      // an item, already handed to MediaProvider::Open
         OtherFiles,  // "Other files...": the caller opens the system picker
         Closed,      // desktop: the close button; the caller goes back to the player
+        AddFolder,   // desktop: "Add folder...": the caller asks for a folder to pin
     };
+
+    // Desktop: what the user asked of a folder tile's menu (right click).
+    struct FolderRequest {
+        enum class Verb { Pin, Unpin, Hide } verb = Verb::Pin;
+        std::string path;  // as the provider reported it ('/'-separated, trailing '/')
+    };
+    bool TakeFolderRequest(FolderRequest& out) {
+        if (!folderRequestPending_) return false;
+        folderRequestPending_ = false;
+        out = folderRequest_;
+        return true;
+    }
 
     MediaBrowser() = default;
     ~MediaBrowser();
@@ -128,12 +141,16 @@ private:
     void SetType(TypeFilter type);
     void UploadReady(const std::unordered_set<int64_t>& window, uint32_t need);
     void GoTo(const std::string& folder);
+    void FolderMenu();
     void Up();
     void EndSelection();
 
     MediaProvider* provider_ = nullptr;
     bool desktop_ = false;         // SetDesktop
     bool closeRequested_ = false;  // the close button, this frame
+    FolderRequest folderRequest_;
+    bool folderRequestPending_ = false;
+    std::string menuFolder_;       // the folder tile whose menu is open
     MediaLibrary library_;
     StereoClassifier classifier_;
     ThumbnailAtlas atlas_;

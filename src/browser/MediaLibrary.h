@@ -28,7 +28,7 @@ enum class SourceKind { All, Camera, Downloads, Pictures, Movies, Unsupported, R
 // How a declared source is browsed.
 enum class SourceMode {
     Flat,     // one list
-    Tree,     // folders under `folder` (one root) or under `roots` (several: listed first)
+    Tree,     // folders under `folder` (one root, browsed from inside), or under `roots` (listed first)
     Grouped,  // one tile per folder that holds something, no nesting; a "Newest" tile first
 };
 
