@@ -6,6 +6,7 @@
 #include "media/LifLoader.h"
 #include "media/MediaSource.h"
 #include "media/MpoLoader.h"
+#include "media/VideoThumbnail.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -354,11 +355,16 @@ void WindowsMediaProvider::ThumbWorker() {
         // A cloud placeholder: only what the thumbnail cache has, so it is never downloaded.
         if (!path.empty())
             win::ShellThumbnail(path, req.maxEdge ? req.maxEdge : 512, cloudOnly, t.width, t.height, t.rgba);
+        // Windows has none for many local videos (HEVC without its codec pack, MKV, large
+        // files): decode a frame ourselves. Never for a cloud file, which this would download.
+        bool video = false;
+        const bool known = !path.empty() && Accept(path, video);
+        if (t.width == 0 && known && video && !cloudOnly)
+            VideoThumbnail(path, req.maxEdge ? req.maxEdge : 512, t.width, t.height, t.rgba);
         // Is the file itself 3D (a LIF, an MPO)? Only a local still: a cloud file would be
         // downloaded to answer, and a two-track video needs a demuxer (both left 2D, marked
         // not checked by the classifier).
-        bool video = false;
-        if (req.checkFile && !cloudOnly && !path.empty() && Accept(path, video) && !video) {
+        if (req.checkFile && !cloudOnly && known && !video) {
             t.fileChecked = true;
             t.file3D = LifLoader::IsLif(path) || MpoLoader::IsMpo(path);
         }

@@ -294,6 +294,7 @@ function(mp_add_player tgt is_pro)
         src/media/StereoCompose.cpp
         src/media/StereoDetect.cpp
         src/media/VideoStereoProbe.cpp
+        src/media/VideoThumbnail.cpp  # browser grid: a still when the system has none (#252)
         src/media/VideoDecoder.cpp
         src/media/AudioPlayer.cpp
         src/media/CameraSelect.cpp
