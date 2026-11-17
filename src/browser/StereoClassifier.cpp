@@ -84,6 +84,7 @@ bool StereoClassifier::TakeResult(Thumbnail& thumbnail, StereoVerdict& verdict) 
     const bool cached =
         it != verdicts_.end() && it->second.modified == job.item.modified && it->second.bytes == job.item.bytes;
     if (!cached) {
+        job.verdict.unchecked = job.unchecked && !job.verdict.stereo;
         const bool save = job.verdict.stereo || !job.unchecked;
         verdicts_[job.item.id] = Entry{job.item.modified, job.item.bytes, job.verdict, save};
         dirty_ = dirty_ || save;

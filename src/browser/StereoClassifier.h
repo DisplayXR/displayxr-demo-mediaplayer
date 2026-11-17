@@ -35,6 +35,9 @@ struct StereoVerdict {
     // How the thumbnail is packed: Sbs*/Tb* show the left/top eye; Mono and Dual (a LIF or
     // two-track video, whose thumbnail is one view) show it whole.
     StereoLayout layout = StereoLayout::Mono;
+    // 2D only because the file could not be looked at (a cloud placeholder on desktop,
+    // #252): it may be a LIF or MPO. Not saved, so a later run looks again.
+    bool unchecked = false;
 };
 
 class StereoClassifier {

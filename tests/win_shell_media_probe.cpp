@@ -40,8 +40,24 @@ static bool AcceptMedia(const std::string& path, bool& video) {
 
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
-    const std::string outDir = argc > 1 ? argv[1] : "";
     ScopedCom com;
+    // --thumb <path> <cacheOnly 0|1> [out.png]: one thumbnail, and whether the file is still
+    // a cloud placeholder afterwards.
+    if (argc >= 4 && std::string(argv[1]) == "--thumb") {
+        const std::string path = argv[2];
+        const bool cacheOnly = std::string(argv[3]) == "1";
+        const DWORD before = GetFileAttributesW(W(path).c_str());
+        uint32_t w = 0, h = 0;
+        std::vector<uint8_t> rgba;
+        const double t = NowMs();
+        const bool got = ShellThumbnail(path, 512, cacheOnly, w, h, rgba);
+        const DWORD after = GetFileAttributesW(W(path).c_str());
+        std::printf("thumb %s %ux%u in %.0f ms; cloud before=%d after=%d\n", got ? "ok" : "none", w, h, NowMs() - t,
+                    IsCloudOnly(before), IsCloudOnly(after));
+        if (got && argc >= 5) stbi_write_png(argv[4], (int)w, (int)h, 4, rgba.data(), (int)w * 4);
+        return 0;
+    }
+    const std::string outDir = argc > 1 ? argv[1] : "";
     std::printf("COM: %s\n", com.Ok() ? "ok" : "FAILED");
 
     for (Library lib : {Library::Pictures, Library::Videos}) {

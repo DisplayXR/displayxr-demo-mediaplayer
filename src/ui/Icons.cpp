@@ -213,6 +213,22 @@ void DrawGlyph(ImDrawList* dl, Glyph glyph, ImVec2 c, float size, ImU32 u, bool 
             dl->AddPolyline(hands, 3, u, 0, T(1.0f));
             break;
         }
+        case Glyph::Cloud: {
+            // Three bumps on a flat base.
+            const float r1 = size * 0.13f, r2 = size * 0.18f, r3 = size * 0.12f;
+            if (filled) {
+                dl->AddCircleFilled(P(-0.18f, 0.04f), r1, u);
+                dl->AddCircleFilled(P(0.0f, -0.04f), r2, u);
+                dl->AddCircleFilled(P(0.19f, 0.05f), r3, u);
+                dl->AddRectFilled(P(-0.18f, 0.04f), P(0.19f, 0.17f), u);
+                break;
+            }
+            dl->PathArcTo(P(-0.18f, 0.04f), r1, 3.14159f * 0.5f, 3.14159f * 1.5f);
+            dl->PathArcTo(P(0.0f, -0.04f), r2, 3.14159f * 1.15f, 3.14159f * 1.95f);
+            dl->PathArcTo(P(0.19f, 0.05f), r3, 3.14159f * 1.5f, 3.14159f * 2.5f);
+            dl->PathStroke(u, ImDrawFlags_Closed, T(1.0f));
+            break;
+        }
         case Glyph::Pin: {
             // A pushpin: head, body widening to a bar, and the needle.
             const ImVec2 body[] = {P(-0.10f, -0.32f), P(0.10f, -0.32f), P(0.10f, -0.08f), P(0.22f, 0.06f),

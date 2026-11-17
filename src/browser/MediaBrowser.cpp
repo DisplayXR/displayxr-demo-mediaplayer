@@ -1090,6 +1090,23 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         // then to its left the format of a file the player cannot open.
         if (verdict.known && verdict.stereo && !stereo_) {  // the 3D grid: every tile is 3D
             LeftBadge(dl, a.x + margin + (selecting_ ? box + badgeGap : 0.0f), a.y + margin, "3D");
+        } else if (verdict.known && verdict.unchecked && item.cloudOnly && !stereo_) {
+            // A cloud file whose 3D-ness needs the file: not looked at, so not downloaded (#252).
+            LeftBadge(dl, a.x + margin, a.y + margin, "3D?");
+        }
+        if (item.cloudOnly) {
+            // Bottom left: a cloud, kept online only (desktop, #252).
+            const float s = Round(ImGui::GetFontSize() * 1.25f);
+            const ImVec2 c0(a.x + margin, b.y - margin - s), c1(c0.x + Round(s * 1.5f), b.y - margin);
+            dl->AddRectFilled(c0, c1, kBadge, s * 0.5f);
+            ui::DrawGlyph(dl, Glyph::Cloud, ImVec2((c0.x + c1.x) * 0.5f, (c0.y + c1.y) * 0.5f), s * 1.4f,
+                          kBadgeText, true);
+        }
+        if (p == hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            if (item.cloudOnly)
+                ImGui::SetTooltip("%s\nIn the cloud: opening it downloads it", item.name.c_str());
+            else
+                ImGui::SetTooltip("%s", item.name.c_str());
         }
         float right = b.x - margin;
         if (item.type == MediaType::Video && item.durationMs > 0) {

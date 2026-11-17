@@ -3,7 +3,9 @@
 
 #include "Log.h"
 #include "browser/WinShellMedia.h"
+#include "media/LifLoader.h"
 #include "media/MediaSource.h"
+#include "media/MpoLoader.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -330,6 +332,14 @@ void WindowsMediaProvider::ThumbWorker() {
         // A cloud placeholder: only what the thumbnail cache has, so it is never downloaded.
         if (!path.empty())
             win::ShellThumbnail(path, req.maxEdge ? req.maxEdge : 512, cloudOnly, t.width, t.height, t.rgba);
+        // Is the file itself 3D (a LIF, an MPO)? Only a local still: a cloud file would be
+        // downloaded to answer, and a two-track video needs a demuxer (both left 2D, marked
+        // not checked by the classifier).
+        bool video = false;
+        if (req.checkFile && !cloudOnly && !path.empty() && Accept(path, video) && !video) {
+            t.fileChecked = true;
+            t.file3D = LifLoader::IsLif(path) || MpoLoader::IsMpo(path);
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         done_.push_back(std::move(t));
     }

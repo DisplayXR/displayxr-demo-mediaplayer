@@ -43,6 +43,7 @@ enum class Glyph {
     Folder,
     Recent,       // a clock: Recents (desktop, #252)
     Pin,          // a pushpin: pinned folders (desktop, #252)
+    Cloud,        // a file kept in the cloud: opening it downloads it (desktop, #252)
 };
 
 // One stroke width for every outline, HUD pixels; 0 = the desktop's proportional strokes.
