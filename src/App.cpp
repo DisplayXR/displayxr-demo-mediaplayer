@@ -15,6 +15,8 @@
 #include "media/StreamUrl.h"
 #include "media/VideoStereoProbe.h"
 #include "ui/Hud.h"
+#include "ui/UiScale.h"
+#include "ui/UiText.h"
 
 // The product name in the window title. Media Player Pro is the same trunk built with
 // MEDIAPLAYER_PRO=1 (docs/PRO.md).
@@ -569,6 +571,8 @@ int App::Run() {
 #if MEDIAPLAYER_BROWSER
         // Test: "3d" starts on the 3D grid (the "3D only" filter).
         if (browser_ && std::string(b) == "3d") browser_->SetDepthFilter(browser::DepthFilter::Only3D);
+        if (const char* src = std::getenv("MEDIAPLAYER_BROWSER_SOURCE"); browser_ && src && *src)
+            browser_->SetStartSource(src);
 #endif
     }
     // Test: switch "Convert to 3D" on without a keystroke (headless runs). Retried until it
@@ -4730,38 +4734,72 @@ void App::BuildCloudFetchPanel() {
     std::string path;
     float progress = 0.0f;
     if (cloudFetch_.Poll(path, progress) != browser::win::CloudFetch::State::Running) return;
+    // A card in the bottom right corner (#252 desktop design): the player and the browser
+    // stay usable under it. Cancel, or Esc, stops the download.
     const std::string name = std::filesystem::u8path(path).filename().u8string();
     const ImGuiIO& io = ImGui::GetIO();
-    const float em = ImGui::GetFontSize();
-    const float w = std::min(io.DisplaySize.x - 2.0f * em, 28.0f * em);
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
-                            ImVec2(0.5f, 0.5f));
+    const float margin = ui::Px(16.0f);
+    const float w = std::min(io.DisplaySize.x - 2.0f * margin, ui::Px(360.0f));
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - margin, io.DisplaySize.y - margin), ImGuiCond_Always,
+                            ImVec2(1.0f, 1.0f));
     ImGui::SetNextWindowSize(ImVec2(w, 0.0f));
-    ImGui::SetNextWindowFocus();
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em, em));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.5f * em);
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+                                   ImGuiWindowFlags_NoFocusOnAppearing;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui::Px(14.0f), ui::Px(12.0f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::Px(10.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, ui::Px(1.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.118f, 0.133f, 0.169f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 1.0f, 1.0f, 0.16f));
     if (ImGui::Begin("##cloud_fetch", nullptr, flags)) {
-        ImGui::TextUnformatted("Downloading from the cloud");
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("%s", name.c_str());
-        ImGui::PopTextWrapPos();
-        ImGui::Spacing();
-        char label[32];
-        if (progress >= 0.0f)
-            std::snprintf(label, sizeof(label), "%.0f%%", 100.0f * progress);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float inner = ImGui::GetContentRegionAvail().x;
+        const char* cancel = "Cancel";
+        const float cancelW = ImGui::CalcTextSize(cancel).x + ui::Px(24.0f);
+        const float textW = inner - cancelW - ui::Px(12.0f);
+        ImGui::BeginGroup();
+        ImGui::PushFont(ui::DeskFont(ui::DeskText::Label));
+        ImGui::TextUnformatted(ui::FitText("Downloading \"" + name + "\"", textW).c_str());
+        ImGui::PopFont();
+        ImGui::PushFont(ui::DeskFont(ui::DeskText::Meta));
+        char sub[96];
+        const int64_t size = cloudFetch_.Size();
+        if (size > 0 && progress >= 0.0f)
+            std::snprintf(sub, sizeof(sub), "%.0f MB of %.0f MB  \xC2\xB7  opens when done",
+                          (double)size * progress / 1e6, (double)size / 1e6);
         else
-            std::snprintf(label, sizeof(label), "...");
-        // A negative fraction is ImGui's indeterminate bar.
-        ImGui::ProgressBar(progress >= 0.0f ? progress : -1.0f * (float)ImGui::GetTime(), ImVec2(-1.0f, 0.0f),
-                           label);
-        ImGui::Spacing();
-        if (ImGui::Button("Cancel", ImVec2(-1.0f, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+            std::snprintf(sub, sizeof(sub), "Downloading...  \xC2\xB7  opens when done");
+        ImGui::TextDisabled("%s", ui::FitText(sub, textW).c_str());
+        ImGui::PopFont();
+        ImGui::EndGroup();
+        const float groupBottom = ImGui::GetItemRectMax().y;
+        ImGui::SameLine(inner - cancelW + ImGui::GetStyle().WindowPadding.x);
+        ImGui::PushFont(ui::DeskFont(ui::DeskText::Label));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::Px(6.0f));
+        if (ImGui::Button(cancel, ImVec2(cancelW, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
             cloudFetch_.Cancel();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stop the download (Esc)");
+        ImGui::PopStyleVar();
+        ImGui::PopFont();
+        // A 4 px bar along the bottom; a sliding one while the size is not known.
+        const ImVec2 wp = ImGui::GetWindowPos();
+        const float x0 = wp.x + ImGui::GetStyle().WindowPadding.x, x1 = x0 + inner;
+        const float y0 = std::max(groupBottom, ImGui::GetItemRectMax().y) + ui::Px(10.0f), y1 = y0 + ui::Px(4.0f);
+        dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(255, 255, 255, 41), ui::Px(2.0f));
+        if (progress >= 0.0f) {
+            dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + (x1 - x0) * std::min(1.0f, progress), y1),
+                              IM_COL32(51, 166, 255, 255), ui::Px(2.0f));
+        } else {
+            const float t = (float)std::fmod(ImGui::GetTime() * 0.6, 1.0);
+            const float a = x0 + (x1 - x0) * t * 0.75f;
+            dl->AddRectFilled(ImVec2(a, y0), ImVec2(a + (x1 - x0) * 0.25f, y1), IM_COL32(51, 166, 255, 255),
+                              ui::Px(2.0f));
+        }
+        ImGui::Dummy(ImVec2(inner, y1 - ImGui::GetCursorScreenPos().y));
     }
     ImGui::End();
-    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(3);
 #endif
 }
 
@@ -4830,8 +4868,16 @@ void App::BuildBrowser() {
     window_.SetKeyboardCaptured(true);
     const ImGuiIO& io = ImGui::GetIO();
     if (action == browser::MediaBrowser::Action::None && !io.WantTextInput) {
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-            if (!browser_->Back()) CloseBrowser();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+            // Ctrl+O: the Windows file dialog, always one key away (#252 desktop design).
+            CloseBrowser();
+            ShowNativeOpenDialog();
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            if (CloudFetchBusy()) {
+                // The download card's Cancel has Esc.
+            } else if (!browser_->Back()) {
+                CloseBrowser();
+            }
         } else if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false) ||
                    (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))) {
             browser_->Back();

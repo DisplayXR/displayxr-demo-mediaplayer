@@ -320,6 +320,7 @@ function(mp_add_player tgt is_pro)
         src/media/Letterbox.cpp       # black bars off a grid thumbnail (#180)
         src/browser/BrowserLayout.cpp
         src/browser/MediaBrowser.cpp
+        src/browser/MediaBrowserDesktop.cpp  # its desktop look (#252)
         src/browser/MediaLibrary.cpp
         src/browser/SlideGesture.cpp
         src/browser/StereoClassifier.cpp

@@ -284,6 +284,13 @@ void ImGuiLayer::AddUiFont() {
         ui::g_rowFont = add(ui::TextStyle::Row);
         ui::g_smallFont = add(ui::TextStyle::Small);
     }
+    // The desktop browser's type scale (#252), beside the UI font (which keeps its size).
+    for (ImFont*& f : ui::g_deskFonts) f = nullptr;
+    if (!(metricScale_ > 1.0f)) {
+        for (int i = 0; i < (int)ui::DeskText::Count; ++i)
+            ui::g_deskFonts[i] = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(
+                (void*)kUiFontTtf, (int)sizeof(kUiFontTtf), ui::DeskTextPx((ui::DeskText)i), &fontCfg, kGlyphs);
+    }
 }
 
 void ImGuiLayer::SetFontScale(float scale) {

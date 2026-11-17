@@ -477,6 +477,16 @@ const Source& MediaBrowser::CurrentSource() const {
 MediaBrowser::Action MediaBrowser::Build() {
     if (!provider_) return Action::None;
     TakeResults();
+    if (!startSource_.empty() && listed_) {
+        const std::vector<Source>& s = library_.Sources();
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i].name != startSource_) continue;
+            source_ = i;
+            folder_ = s[i].folder;
+            dirty_ = true;
+        }
+        startSource_.clear();
+    }
     if (dirty_) Rebuild();
     cache_.NextFrame();
 
@@ -512,7 +522,25 @@ MediaBrowser::Action MediaBrowser::Build() {
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
     Action action = Action::None;
-    if (open) {
+    if (open && desktop_) {
+        // The desktop look (#252): a header, a toolbar over the grid, a compact sidebar.
+        ImGui::PushFont(ui::DeskFont(ui::DeskText::Body));
+        const float headerH = Round(Px(44.0f)), toolbarH = Round(Px(40.0f));
+        rail_ = w >= Px(kDesktopRailMinDp);
+        if (rail_) drawer_ = false;
+        const float sideW = rail_ ? Round(std::min(Px(220.0f), w * 0.34f)) : 0.0f;
+        action = Grid(ImVec2(sideW, headerH + toolbarH), ImVec2(w, h), now);
+        DeskToolbar(ImVec2(sideW, headerH), ImVec2(w, headerH + toolbarH));
+        if (rail_) {
+            const Action picked = DeskSidebar(ImVec2(0.0f, headerH), ImVec2(sideW, h));
+            if (picked != Action::None) action = picked;
+        }
+        DeskHeader(w, headerH);
+        DeskSortMenu();
+        closeSheets_ = false;
+        sheetOpen_ = ImGui::IsPopupOpen("##sort_menu") || ImGui::IsPopupOpen("##folder_menu");
+        ImGui::PopFont();
+    } else if (open) {
         const bool railShown = rail_ && sidebar_;
         const float left = railShown ? sidebarW : 0.0f;
         const float top = ui::g_systemBarTop + bar, bottom = h - ui::g_systemBarBottom;
@@ -742,7 +770,13 @@ MediaBrowser::Action MediaBrowser::Drawer(float width, float height, double now)
         if (width > w && ImGui::InvisibleButton("##scrim", ImVec2(width - w, height))) drawer_ = false;
         dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(w, height), kPanel);
         sourcePicked_ = false;
-        action = Sidebar(ImVec2(0.0f, ui::g_systemBarTop + Dp(8.0f)), ImVec2(w, height - ui::g_systemBarBottom), now);
+        if (desktop_) {
+            ImGui::PushFont(ui::DeskFont(ui::DeskText::Body));
+            action = DeskSidebar(ImVec2(0.0f, 0.0f), ImVec2(w, height));
+            ImGui::PopFont();
+        } else {
+            action = Sidebar(ImVec2(0.0f, ui::g_systemBarTop + Dp(8.0f)), ImVec2(w, height - ui::g_systemBarBottom), now);
+        }
         if (action != Action::None || sourcePicked_) drawer_ = false;
     }
     ImGui::End();
@@ -884,21 +918,29 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     }
 
     // Square tiles, about one column per 180 dp of the grid's width (#180): beside the rail
-    // that is one fewer. The drawer lies over the grid and leaves it as it is.
+    // that is one fewer. The drawer lies over the grid and leaves it as it is. Desktop
+    // (#252): cards about 176 px wide, a picture with a caption under it.
+    const bool desk = desktop_;
+    if (desk) min.y += Round(Px(8.0f));
     const ImVec2 size(max.x - min.x, max.y - min.y);
-    const int cols = GridColumns(size.x / Dp(1.0f));
-    const float gutter = Round(Px(stereo_ ? kStereoGutter : kGutter));
-    const float tile = std::floor((size.x - gutter * (cols - 1)) / cols);
-    if (tile <= 0.0f || size.y <= 0.0f) return Action::None;
-    const float step = tile + gutter;
-    const float x0 = min.x + Round((size.x - (cols * step - gutter)) * 0.5f);
+    const float deskPad = desk ? Round(Px(4.0f)) : 0.0f;
+    const float usableW = size.x - (desk ? Round(Px(12.0f)) * 2.0f : 0.0f);
+    const float gutter = Round(desk ? Px(stereo_ ? 16.0f : 8.0f) : Px(stereo_ ? kStereoGutter : kGutter));
+    const int cols = desk ? std::max(2, (int)((usableW + gutter) / (Px(176.0f) + gutter))) : GridColumns(size.x / Dp(1.0f));
+    const float tile = std::floor((usableW - gutter * (cols - 1)) / cols);
+    if (tile <= deskPad * 2.0f || size.y <= 0.0f) return Action::None;
+    const float pic = tile - deskPad * 2.0f;  // the picture's edge (the tile's, on touch)
+    const float tileH = desk ? deskPad + pic + DeskCaptionHeight() : tile;
+    const float step = tileH + gutter;  // the row pitch
+    const float x0 = min.x + Round((size.x - (cols * (tile + gutter) - gutter)) * 0.5f);
     const size_t nf = folders_.size();
     const size_t n = nf + shown_.size();  // tiles: the folders, then the items
     // The tiles in sections: the date sections, or one with the folders then the items.
     const bool headers = !sectionSizes_.empty();
-    const float headerH = Round(Dp(44.0f));
+    const float headerH = Round(desk ? Px(30.0f) : Dp(44.0f));
     const size_t topTile = layout_.TileAtOffset(gridScroll_.Offset());  // before the rebuild
-    layout_.Build(headers ? sectionSizes_ : std::vector<size_t>{n}, headers, cols, tile, gutter, headerH);
+    layout_.Build(headers ? sectionSizes_ : std::vector<size_t>{n}, headers, cols, tile, gutter, headerH,
+                  desk ? tileH : -1.0f);
     if (cols != columns_ && columns_ > 0) {
         // A reflow (rotation, the rail): keep the top row's first item in the top row.
         gridScroll_.SetLimit(layout_.Height() - size.y);
@@ -911,13 +953,15 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
 
     // A fast-scroll thumb on the right edge of a long grid, submitted before the grid so it
     // wins the press.
-    const bool fast = n > kFastScrollItems && limit > 0.0f;
-    const float trackTop = min.y + Dp(8.0f), trackH = size.y - Dp(16.0f), thumbH = Round(Dp(48.0f));
+    const bool fast = desk ? limit > 0.0f : n > kFastScrollItems && limit > 0.0f;
+    const float trackTop = min.y + Dp(8.0f), trackH = size.y - Dp(16.0f);
+    const float thumbH = desk ? Round(std::max(Px(32.0f), trackH * size.y / std::max(1.0f, layout_.Height())))
+                              : Round(Dp(48.0f));
     bool thumbHeld = false;
     if (fast && n > 0) {
         const float frac = std::min(1.0f, std::max(0.0f, gridScroll_.Offset() / limit));
         const float ty = trackTop + frac * (trackH - thumbH);
-        const float hitW = Round(Dp(40.0f));
+        const float hitW = Round(desk ? Px(14.0f) : Dp(40.0f));
         ImGui::SetCursorScreenPos(ImVec2(max.x - hitW, ty));
         ImGui::InvisibleButton("##fast_scroll", ImVec2(hitW, thumbH));
         const float mouseY = ImGui::GetIO().MousePos.y;
@@ -964,7 +1008,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     }
     // A thumbnail big enough that the part a tile shows covers it pixel for pixel, as far as
     // an atlas slot holds.
-    const uint32_t need = std::min(atlas_.Tile(), (uint32_t)tile);
+    const uint32_t need = std::min(atlas_.Tile(), (uint32_t)pic);
     UploadReady(window, need);
 
     // Ask for what the window lacks: the visible rows, then those below, then above. Under a
@@ -1048,7 +1092,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
             float tx = 0.0f, ty = 0.0f;
             if (layout_.TilePos(cursor_, tx, ty)) {
                 if (ty < offset) gridScroll_.SetOffset(ty);
-                else if (ty + tile > offset + size.y) gridScroll_.SetOffset(ty + tile - size.y);
+                else if (ty + tileH > offset + size.y) gridScroll_.SetOffset(ty + tileH - size.y);
             }
         }
         keyOpen = cursor_ < n && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
@@ -1076,7 +1120,11 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         float tx = 0.0f, ty = 0.0f;
         if (!layout_.TilePos(p, tx, ty)) continue;
         const ImVec2 a(x0 + tx, min.y + ty - offset);
-        const ImVec2 b(a.x + tile, a.y + tile);
+        const ImVec2 b(a.x + tile, a.y + tileH);
+        if (desk && p < nf) {
+            DeskFolderCard(dl, folders_[p], a, b, pic, p == hovered, p == pressed, p == cursor_);
+            continue;
+        }
         if (p < nf) {
             FolderTile(dl, folders_[p], a, b, margin);
             if (p == pressed) dl->AddRectFilled(a, b, kPressed);
@@ -1089,11 +1137,17 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         int slot = 0;
         ThumbnailAtlas::Thumb thumb;
         const bool shown = cache_.Use(item.id, slot) && atlas_.Get(slot, thumb);
+        // The picture's square: the tile on touch, inside the card on desktop.
+        const ImVec2 pa(a.x + deskPad, a.y + deskPad), pb(pa.x + pic, pa.y + pic);
+        const bool supported = library_.Supported(shown_[p - nf]);
+        if (desk)
+            DeskItemCard(dl, item, supported, verdict, a, b, pic, p == hovered, p == pressed, p == cursor_, shown,
+                         /*behind=*/true);
         if (shown && stereo_) {
             // Drawn into the views by the caller, at this rect: the left eye's square from
             // this slot, the right eye's from its own slot (flat until it has one).
             StereoTile t;
-            t.x0 = a.x, t.y0 = a.y, t.x1 = b.x, t.y1 = b.y;
+            t.x0 = pa.x, t.y0 = pa.y, t.x1 = pb.x, t.y1 = pb.y;
             ThumbnailAtlas::Thumb right = thumb;
             int rslot = 0;
             const StereoLayout layout = SlotLayout(item, verdict);
@@ -1112,15 +1166,28 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
             const bool wantsPair = Packed(layout) || (NeedsPair(item, verdict) && !pairs_.Busy(item.id));
             if (wantsPair && !pair && !pending_.count(item.id) && refetched_.insert(item.id).second)
                 cache_.Remove(item.id);
+        } else if (shown && desk) {
+            dl->AddImageRounded(thumb.texture, pa, pb, thumb.uv0, thumb.uv1, IM_COL32_WHITE, Px(4.0f));
         } else if (shown) {
             dl->AddImage(thumb.texture, a, b, thumb.uv0, thumb.uv1);  // the slot holds what the tile shows
-        } else {
+        } else if (!desk) {
             dl->AddRectFilled(a, b, kTileEmpty);
             if (noThumbnail_.count(item.id)) {
                 ui::DrawGlyph(dl, item.type == MediaType::Video ? Glyph::Video : Glyph::Image,
                          ImVec2(a.x + tile * 0.5f, a.y + tile * 0.5f), tile * 0.3f,
                          ImGui::GetColorU32(ImGuiCol_TextDisabled));
             }
+        }
+        if (desk) {
+            DeskItemCard(dl, item, supported, verdict, a, b, pic, p == hovered, p == pressed, p == cursor_, shown,
+                         /*behind=*/false);
+            if (p == hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                if (item.cloudOnly)
+                    ImGui::SetTooltip("%s\nOnline only: opening it downloads it", item.name.c_str());
+                else
+                    ImGui::SetTooltip("%s", item.name.c_str());
+            }
+            continue;
         }
         // Badges. Top left "3D", beside select mode's box. Top right the length of a video,
         // then to its left the format of a file the player cannot open.
@@ -1166,7 +1233,23 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         if (p == cursor_) dl->AddRect(a, b, kAccent, 0.0f, 0, Round(Px(3.0f)));
     }
     // The date sections' headers.
-    if (headers) {
+    if (headers && desk) {
+        // Desktop: the label, then how many it holds, faint.
+        ImGui::PushFont(ui::DeskFont(ui::DeskText::Meta));
+        for (size_t h = 0; h < layout_.Headers() && h < sectionLabels_.size(); ++h) {
+            const float y = min.y + layout_.HeaderY(h) - offset;
+            if (y + headerH < min.y || y > max.y) continue;
+            const float ty = y + Round((headerH - ImGui::GetFontSize()) * 0.5f);
+            const float lx = x0 + Round(Px(6.0f));
+            dl->AddText(ImVec2(lx, ty), kDim, sectionLabels_[h].c_str());
+            char count[32];
+            const size_t c = h < sectionSizes_.size() ? sectionSizes_[h] : 0;
+            std::snprintf(count, sizeof(count), "%zu item%s", c, c == 1 ? "" : "s");
+            dl->AddText(ImVec2(lx + ImGui::CalcTextSize(sectionLabels_[h].c_str()).x + Px(8.0f), ty),
+                        IM_COL32(110, 117, 129, 255), count);
+        }
+        ImGui::PopFont();
+    } else if (headers) {
         FontScope row(TextStyle::Row);
         for (size_t h = 0; h < layout_.Headers() && h < sectionLabels_.size(); ++h) {
             const float y = min.y + layout_.HeaderY(h) - offset;
@@ -1181,10 +1264,10 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     if (fast) {
         const float frac = std::min(1.0f, std::max(0.0f, offset / limit));
         const float ty = trackTop + frac * (trackH - thumbH);
-        const float tw = Round(Dp(thumbHeld ? 8.0f : 6.0f));
-        const float tx = max.x - Round(Dp(6.0f)) - tw;
+        const float tw = Round(desk ? Px(thumbHeld ? 10.0f : 6.0f) : Dp(thumbHeld ? 8.0f : 6.0f));
+        const float tx = max.x - Round(desk ? Px(3.0f) : Dp(6.0f)) - tw;
         dl->AddRectFilled(ImVec2(tx, ty), ImVec2(tx + tw, ty + thumbH),
-                          thumbHeld ? kAccent : IM_COL32(255, 255, 255, 150), tw * 0.5f);
+                          thumbHeld ? kAccent : IM_COL32(255, 255, 255, desk ? 70 : 150), tw * 0.5f);
         if (thumbHeld && headers) {
             // The section of the tile at the top: count the sections' sizes up to it.
             const size_t top = layout_.TileAtOffset(offset);

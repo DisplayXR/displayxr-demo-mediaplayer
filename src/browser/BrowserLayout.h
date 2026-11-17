@@ -59,9 +59,10 @@ DateSection DateBucket(int64_t dateMs, int64_t nowMs, int64_t utcOffsetSeconds);
 class GridLayout {
 public:
     // `sections`: the tiles in each section, in order. With `headers`, each section has a
-    // header `headerHeight` tall above its first row.
+    // header `headerHeight` tall above its first row. Tiles are `tile` wide and `tileHeight`
+    // tall (< 0: square; the desktop's have a caption under the picture).
     void Build(const std::vector<size_t>& sections, bool headers, int columns, float tile, float gutter,
-               float headerHeight);
+               float headerHeight, float tileHeight = -1.0f);
 
     size_t Tiles() const { return tiles_; }
     float Height() const { return height_; }
@@ -93,6 +94,7 @@ private:
     std::vector<float> headerY_;
     int columns_ = 1;
     float tile_ = 0.0f, step_ = 0.0f, header_ = 0.0f;
+    float tileH_ = 0.0f, stepY_ = 0.0f;  // rows: the tile's height and the row pitch
     size_t tiles_ = 0;
     float height_ = 0.0f;
 };

@@ -69,6 +69,7 @@ bool CloudFetch::Start(const std::string& path) {
     }
     cancel_.store(false);
     progress_.store(-1.0f);
+    size_.store(0);
     state_.store(State::Running);
     thread_ = std::thread([this, path] { Run(path); });
     return true;
@@ -108,6 +109,7 @@ void CloudFetch::Run(std::string path) {
     }
     LARGE_INTEGER size{};
     GetFileSizeEx(h, &size);
+    size_.store(size.QuadPart);
     const double t0 = NowMs();
     OVERLAPPED ov{};
     ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);

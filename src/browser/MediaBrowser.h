@@ -107,6 +107,8 @@ public:
     bool WantsStereo() const { return depth_ == DepthFilter::Only3D; }
     // The 2D / 3D filter, as the chip sets it (tests start on "3D only").
     void SetDepthFilter(DepthFilter depth) { SetDepth(depth); }
+    // Show the source named `name` once the list arrives (tests: MEDIAPLAYER_BROWSER_SOURCE).
+    void SetStartSource(std::string name) { startSource_ = std::move(name); }
     // The panel is in 3D and the caller draws Stereo() into the projection layer, so
     // Build() leaves the tiles' pictures and the background behind them out of the HUD.
     // `viewScale` is the 3D mode's (the useful size of an eye is a tile times it).
@@ -146,6 +148,16 @@ private:
     void FolderMenu();
     void Up();
     void EndSelection();
+    // The desktop look (MediaBrowserDesktop.cpp, #252).
+    void DeskHeader(float width, float height);
+    void DeskToolbar(ImVec2 min, ImVec2 max);
+    void DeskSortMenu();
+    Action DeskSidebar(ImVec2 min, ImVec2 max);
+    void DeskFolderCard(ImDrawList* dl, const Folder& folder, ImVec2 a, ImVec2 b, float pic, bool hovered, bool pressed,
+                        bool focus);
+    void DeskItemCard(ImDrawList* dl, const MediaItem& item, bool supported, const StereoVerdict& verdict, ImVec2 a,
+                      ImVec2 b, float pic, bool hovered, bool pressed, bool focus, bool picture, bool behind);
+    static float DeskCaptionHeight();
 
     MediaProvider* provider_ = nullptr;
     bool desktop_ = false;         // SetDesktop
@@ -173,6 +185,8 @@ private:
     bool sheetOpen_ = false;     // the view options sheet or the type menu is open
     bool closeSheets_ = false;   // Back: close them in the next Build()
     ImVec2 typeChip_;       // where the type chip's menu opens, its bottom left
+    ImVec2 sortMenuAt_;     // desktop: where the sort menu opens
+    std::string startSource_;  // SetStartSource, until the list arrives
 
     bool selecting_ = false;  // select mode: a tap picks an item, the bin deletes the picked
     std::unordered_set<int64_t> selected_;

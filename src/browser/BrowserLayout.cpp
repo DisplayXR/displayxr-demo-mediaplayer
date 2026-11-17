@@ -81,12 +81,14 @@ DateSection DateBucket(int64_t dateMs, int64_t nowMs, int64_t utcOffsetSeconds) 
 }
 
 void GridLayout::Build(const std::vector<size_t>& sections, bool headers, int columns, float tile, float gutter,
-                       float headerHeight) {
+                       float headerHeight, float tileHeight) {
     rows_.clear();
     headerY_.clear();
     columns_ = std::max(1, columns);
     tile_ = tile;
     step_ = tile + gutter;
+    tileH_ = tileHeight < 0.0f ? tile : tileHeight;
+    stepY_ = tileH_ + gutter;
     header_ = headers ? headerHeight : 0.0f;
     tiles_ = 0;
     float y = 0.0f;
@@ -103,7 +105,7 @@ void GridLayout::Build(const std::vector<size_t>& sections, bool headers, int co
             row.count = std::min((size_t)columns_, count - done);
             row.sectionStart = done == 0;
             rows_.push_back(row);
-            y += step_;
+            y += stepY_;
         }
         tiles_ += count;
     }
@@ -130,7 +132,7 @@ bool GridLayout::TileAt(float x, float y, size_t& p) const {
     auto it = std::upper_bound(rows_.begin(), rows_.end(), y, [](float v, const Row& r) { return v < r.y; });
     if (it == rows_.begin()) return false;
     const Row& row = *(it - 1);
-    if (y - row.y > tile_) return false;  // the gutter below it, or a header
+    if (y - row.y > tileH_) return false;  // the gutter below it, or a header
     const int c = (int)(x / step_);
     if (c >= columns_ || x - (float)c * step_ > tile_ || (size_t)c >= row.count) return false;
     p = row.first + (size_t)c;
@@ -141,7 +143,7 @@ void GridLayout::Range(float y0, float y1, size_t& first, size_t& end) const {
     first = end = 0;
     if (rows_.empty() || y1 <= y0) return;
     // The first row ending below y0, and the first row starting at or below y1.
-    auto lo = std::upper_bound(rows_.begin(), rows_.end(), y0 - step_, [](float v, const Row& r) { return v < r.y; });
+    auto lo = std::upper_bound(rows_.begin(), rows_.end(), y0 - stepY_, [](float v, const Row& r) { return v < r.y; });
     auto hi = std::lower_bound(rows_.begin(), rows_.end(), y1, [](const Row& r, float v) { return r.y < v; });
     if (lo >= hi) return;
     first = lo->first;
@@ -151,7 +153,7 @@ void GridLayout::Range(float y0, float y1, size_t& first, size_t& end) const {
 
 size_t GridLayout::TileAtOffset(float offset) const {
     if (rows_.empty()) return 0;
-    auto it = std::upper_bound(rows_.begin(), rows_.end(), offset + step_ * 0.5f,
+    auto it = std::upper_bound(rows_.begin(), rows_.end(), offset + stepY_ * 0.5f,
                                [](float v, const Row& r) { return v < r.y; });
     if (it == rows_.begin()) return 0;
     return (it - 1)->first;

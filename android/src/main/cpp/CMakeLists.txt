@@ -164,6 +164,7 @@ add_library(mediaplayer_vk_android SHARED
     # The media browser (#160, docs/BROWSER.md).
     ${REPO_ROOT}/src/browser/BrowserLayout.cpp
     ${REPO_ROOT}/src/browser/MediaBrowser.cpp
+    ${REPO_ROOT}/src/browser/MediaBrowserDesktop.cpp  # the desktop look (unused here)
     ${REPO_ROOT}/src/browser/MediaLibrary.cpp
     ${REPO_ROOT}/src/browser/SlideGesture.cpp
     ${REPO_ROOT}/src/browser/StereoClassifier.cpp

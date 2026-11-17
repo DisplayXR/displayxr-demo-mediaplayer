@@ -114,6 +114,11 @@ float TextStylePx(TextStyle style, float k) {
     return std::ceil(Dp(dp) * g_fontScale - 0.001f);
 }
 
+float DeskTextPx(DeskText style) {
+    static const float kPx[] = {15.0f, 14.0f, 13.0f, 12.0f, 11.0f};
+    return std::ceil(kPx[(int)style] * g_uiScale - 0.001f);
+}
+
 ImFont* StyleFont(TextStyle style) {
     switch (style) {
         case TextStyle::Title: return g_titleFont;

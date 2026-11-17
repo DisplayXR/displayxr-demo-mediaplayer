@@ -41,6 +41,8 @@ public:
     // Back to Idle after a finished, failed or cancelled download.
     void Clear();
     bool Busy() const { return state_.load() == State::Running; }
+    // The file's size, bytes (0 until known).
+    int64_t Size() const { return size_.load(); }
 
 private:
     void Run(std::string path);
@@ -50,6 +52,7 @@ private:
     std::atomic<State> state_{State::Idle};
     std::atomic<bool> cancel_{false};
     std::atomic<float> progress_{-1.0f};
+    std::atomic<int64_t> size_{0};
     mutable std::mutex mutex_;
     std::string path_;
     void* handle_ = nullptr;      // the file, while the download runs (under mutex_)

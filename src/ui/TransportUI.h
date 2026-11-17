@@ -271,6 +271,14 @@ inline ImFont* g_smallFont = nullptr;
 // The font for `style`: null (the UI font) where the type scale is not built.
 ImFont* StyleFont(TextStyle style);
 
+// The desktop browser's type scale (#252): Title 15, Body 14, Label 13, Meta 12 and Badge 11
+// design units. ImGuiLayer rasterizes them only on desktop (metricScale <= 1), beside the UI
+// font, which keeps its size: the player's own UI draws as before. Null on touch.
+enum class DeskText { Title, Body, Label, Meta, Badge, Count };
+float DeskTextPx(DeskText style);
+inline ImFont* g_deskFonts[(int)DeskText::Count] = {};
+inline ImFont* DeskFont(DeskText style) { return g_deskFonts[(int)style]; }
+
 // Advance the purely-visual timers: the auto-hide fade and the toast fade.
 // `uiAwake` is the caller's "should the chrome be visible" verdict (master
 // toggle AND not idle) — the caller owns what counts as activity, because that
