@@ -917,8 +917,12 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             // Right-align the slideshow toggle. (Close the app via ESC or the window's
             // own close button — no in-UI X needed.) The buttons left of it never reach it:
             // the ones that do not fit are left out above.
-            if (s.caps.slideshow) {
-                ImGui::SameLine(ImGui::GetWindowWidth() - iconSz - ImGui::GetStyle().WindowPadding.x);
+            // A window too narrow for even Open beside it leaves the icon out (it would draw
+            // over Open's menu arrow).
+            const float slideX = ImGui::GetWindowWidth() - iconSz - ImGui::GetStyle().WindowPadding.x;
+            if (s.caps.slideshow &&
+                ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetStyle().ItemSpacing.x <= slideX) {
+                ImGui::SameLine(slideX);
                 if (IconButton("##slideshow", Glyph::Slideshow, iconSz, s.slideshowActive,
                                s.hitTargetScale))
                     Fire(a.ToggleSlideshow);
@@ -1011,49 +1015,74 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     frameSlotW = std::max(slotW(lastFrm), ImGui::CalcTextSize(frm).x);
                 }
                 const float labelGap = ImGui::CalcTextSize("  ").x;
+                // A narrow window: what does not fit beside a usable scrubber is left out,
+                // least needed first (frame number, loop, mute, Panels, the total time, then
+                // the current time), instead of running off the bar's right edge.
+                const ImGuiStyle& tst = ImGui::GetStyle();
+                const float iconW = iconSz * s.hitTargetScale;
+                const float panelsBtnW = ImGui::CalcTextSize("Panels").x + tst.FramePadding.x * 2.0f;
+                const float minScrubW = iconSz;  // the scrubber, at its smallest
+                bool showFrameNo = showFrame, showTot = true, showMute = s.caps.mute, showLoop = s.caps.loop,
+                     showPanels = s.panelsButton, showTime = true;
+                auto rowNeed = [&] {
+                    float w = (showTime ? timeSlotW + tst.ItemSpacing.x : 0.0f) +
+                              (showFrameNo ? labelGap + frameSlotW : 0.0f) + minScrubW;
+                    if (showTot) w += tst.ItemSpacing.x + ImGui::CalcTextSize(tot).x;
+                    if (showMute) w += tst.ItemSpacing.x + iconW;
+                    if (showLoop) w += tst.ItemSpacing.x + iconW;
+                    if (showPanels) w += tst.ItemSpacing.x + panelsBtnW;
+                    return w;
+                };
+                const float rowRoom = ImGui::GetContentRegionAvail().x;
+                for (bool* drop : {&showFrameNo, &showLoop, &showMute, &showPanels, &showTot, &showTime})
+                    if (rowNeed() > rowRoom) *drop = false;
                 const float curX = ImGui::GetCursorPosX();
-                ImGui::SetCursorPosX(curX + timeSlotW - ImGui::CalcTextSize(cur).x);
-                ImGui::AlignTextToFramePadding();
-                ImGui::Text("%s", cur);
-                float labelW = timeSlotW;
-                if (showFrame) {
+                float labelW = 0.0f;
+                if (showTime) {
+                    ImGui::SetCursorPosX(curX + timeSlotW - ImGui::CalcTextSize(cur).x);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("%s", cur);
+                    labelW = timeSlotW;
+                }
+                if (showTime && showFrameNo) {
                     ImGui::SameLine(curX + timeSlotW + labelGap);
                     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
                     ImGui::AlignTextToFramePadding();
                     ImGui::Text("%s", frm);
                     labelW += labelGap + frameSlotW;
                 }
-                ImGui::SameLine(curX + labelW + ImGui::GetStyle().ItemSpacing.x);
-                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
+                if (showTime) {
+                    ImGui::SameLine(curX + labelW + ImGui::GetStyle().ItemSpacing.x);
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
+                }
                 // Leave room on the right for the total-time label + mute + loop icons.
                 // Derived from the live style rather than a magic constant, so the
                 // touch build spaces correctly instead of crowding the total time.
                 const ImGuiStyle& st = ImGui::GetStyle();
-                const int rightIcons = (s.caps.mute ? 1 : 0) + (s.caps.loop ? 1 : 0);
-                const float panelsW = s.panelsButton ? ImGui::CalcTextSize("Panels").x +
-                                                           st.FramePadding.x * 2.0f + st.ItemSpacing.x
-                                                     : 0.0f;
-                const float rightW = ImGui::CalcTextSize(tot).x +
-                                     (float)rightIcons * (iconSz * s.hitTargetScale) +
-                                     (float)(rightIcons + 2) * st.ItemSpacing.x +
+                const int rightIcons = (showMute ? 1 : 0) + (showLoop ? 1 : 0);
+                const float panelsW = showPanels ? panelsBtnW + st.ItemSpacing.x : 0.0f;
+                const float rightW = (showTot ? ImGui::CalcTextSize(tot).x + st.ItemSpacing.x : 0.0f) +
+                                     (float)rightIcons * iconW + (float)(rightIcons + 1) * st.ItemSpacing.x +
                                      st.WindowPadding.x + panelsW;
-                DriveScrub(s, a, dur, ImGui::GetContentRegionAvail().x - rightW);
-                ImGui::SameLine();
-                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
-                ImGui::AlignTextToFramePadding();
-                ImGui::Text("%s", tot);
-                if (s.caps.mute) {
+                DriveScrub(s, a, dur, std::max(minScrubW, ImGui::GetContentRegionAvail().x - rightW));
+                if (showTot) {
+                    ImGui::SameLine();
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("%s", tot);
+                }
+                if (showMute) {
                     ImGui::SameLine();
                     if (IconButton("##mute", s.muted ? Glyph::SpeakerMuted : Glyph::Speaker, iconSz,
                                    s.muted, s.hitTargetScale))
                         Fire(a.ToggleMute);
                 }
-                if (s.caps.loop) {
+                if (showLoop) {
                     ImGui::SameLine();
                     if (IconButton("##loop", Glyph::Loop, iconSz, s.loop, s.hitTargetScale))
                         Fire(a.ToggleLoop);
                 }
-                if (s.panelsButton) {
+                if (showPanels) {
                     ImGui::SameLine();
                     if (s.panelsOn)
                         ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));

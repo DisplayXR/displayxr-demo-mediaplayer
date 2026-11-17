@@ -825,6 +825,11 @@ int App::Run() {
         if (openAfterPath_ && !openedAfter_ && frames_ > 150) {
             openedAfter_ = true;
             playlistFromDrop_ = false;
+            // Test: pause the playing video first (a pause must not carry over to the new file).
+            if (const char* p = std::getenv("MEDIAPLAYER_OPEN_AFTER_PAUSED"); p && *p && *p != '0' && isVideo_ &&
+                !video_.Paused()) {
+                TogglePlayback();
+            }
             ReloadMedia(openAfterPath_);
         }
 
