@@ -763,6 +763,15 @@ if(MP_BUILD_TESTS)
     endif()
     add_test(NAME recent_list COMMAND recent_list_test)
 
+    # Desktop browser (#252 phase 1): a MANUAL probe of the Search index, libraries and
+    # shell thumbnails on a real box. Not a ctest test: its results depend on the machine.
+    if(WIN32)
+        add_executable(win_shell_media_probe tests/win_shell_media_probe.cpp src/browser/WinShellMedia.cpp)
+        target_include_directories(win_shell_media_probe PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+        target_link_libraries(win_shell_media_probe PRIVATE shell32 ole32 oleaut32 uuid)
+    endif()
+
     # Media browser (#160): the library's supported set, sources, filter and sort. Pure.
     add_executable(media_library_test
         tests/media_library_test.cpp
