@@ -20,6 +20,7 @@ namespace {
 constexpr double kFadeSeconds = 0.20;       // UI fade in/out duration
 constexpr double kToastFadeSeconds = 0.30;  // toast fade in/out duration
 constexpr double kToastSeconds = 1.5;       // how long a toast stays fully lit
+float g_topBarBottom = 0.0f;  // the desktop top bar's bottom edge, from the last frame
 // Scrub velocity threshold: a sweep faster than this (in seconds of media per
 // frame) previews keyframes instead of decoding exact frames.
 constexpr float kFastScrubSeconds = 1.0f;
@@ -871,27 +872,47 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             } else if (s.caps.url && s.isStream) {
                 StreamPill(s, a);
             } else if (!s.mediaFilename.empty()) {
-                const float tw = ImGui::CalcTextSize(s.mediaFilename.c_str()).x;
                 ImGui::SameLine();
-                // Clamp, don't set: with a third button on the left the centred position
-                // can fall BEHIND the cursor, and SetCursorPosX would happily back-track
-                // and overlap the buttons. The filename may only ever slide right.
-                ImGui::SetCursorPosX(
-                    std::max(ImGui::GetCursorPosX(), (ImGui::GetWindowWidth() - tw) * 0.5f));
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextUnformatted(s.mediaFilename.c_str());
+                // The room left before the slideshow icon: on a narrow window the name is
+                // shortened to fit rather than run under the icon (#252 phase 0 review).
+                const ImGuiStyle& st = ImGui::GetStyle();
+                const float right = ImGui::GetWindowWidth() - st.WindowPadding.x -
+                                    (s.caps.slideshow ? iconSz + st.ItemSpacing.x : 0.0f);
+                const float room = right - ImGui::GetCursorPosX();
+                if (room > ImGui::CalcTextSize("...").x) {
+                    const std::string name = FitText(s.mediaFilename, room);
+                    const float tw = ImGui::CalcTextSize(name.c_str()).x;
+                    // Clamp, don't set: with a third button on the left the centred position
+                    // can fall BEHIND the cursor, and SetCursorPosX would happily back-track
+                    // and overlap the buttons. The filename may only ever slide right.
+                    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
+                                                  (ImGui::GetWindowWidth() - tw) * 0.5f));
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(name.c_str());
+                }
             }
             // Right-align the slideshow toggle. (Close the app via ESC or the window's
-            // own close button — no in-UI X needed.)
+            // own close button — no in-UI X needed.) When the buttons already reach that
+            // spot it takes a second row, right-aligned, instead of drawing over them.
             if (s.caps.slideshow) {
-                ImGui::SameLine(ImGui::GetWindowWidth() - iconSz -
-                                ImGui::GetStyle().WindowPadding.x);
+                const float slideX = ImGui::GetWindowWidth() - iconSz - ImGui::GetStyle().WindowPadding.x;
+                const float usedX = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x +
+                                    ImGui::GetStyle().ItemSpacing.x;
+                if (usedX <= slideX) ImGui::SameLine(slideX);
+                else ImGui::SetCursorPosX(slideX);
                 if (IconButton("##slideshow", Glyph::Slideshow, iconSz, s.slideshowActive,
                                s.hitTargetScale))
                     Fire(a.ToggleSlideshow);
             }
         }
-        if (!s.stripOnly) ImGui::End();
+        if (!s.stripOnly) {
+            // The bar wraps to a second row on a narrow window: the toast reads its real
+            // bottom edge so it is never drawn under the bar.
+            g_topBarBottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
+            ImGui::End();
+        } else {
+            g_topBarBottom = g_systemBarTop;
+        }
         ImGui::PopStyleVar();
 
         // --- Bottom transport: play/pause + scrubber + loop (video only) ---
@@ -1072,7 +1093,10 @@ void BuildTransportToast(const TransportState& s) {
             ImGui::TextUnformatted(FitText(s.toastText, W - margin * 2.0f - pad).c_str());
         }
     } else {
-        ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.14f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        // Centred at 14% of the height, but always clear of the top bar.
+        const float halfH = ImGui::GetFrameHeight() * 0.5f + ImGui::GetStyle().WindowPadding.y;
+        const float y = std::max(H * 0.14f, g_topBarBottom + Dp(12.0f) + halfH);
+        ImGui::SetNextWindowPos(ImVec2(W * 0.5f, y), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         if (ImGui::Begin("##toast", nullptr, pill)) {
             ImGui::TextUnformatted(s.toastText.c_str());
         }
