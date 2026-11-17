@@ -68,6 +68,9 @@ Glyph SourceIcon(SourceKind kind) {
         case SourceKind::Pictures: return Glyph::Image;
         case SourceKind::Movies: return Glyph::Video;
         case SourceKind::Unsupported: return Glyph::Unsupported;
+        case SourceKind::Recents: return Glyph::Recent;
+        case SourceKind::Folders: return Glyph::Folder;
+        case SourceKind::Pinned: return Glyph::Pin;
     }
     return Glyph::Unsupported;
 }
@@ -127,6 +130,14 @@ void FolderTile(ImDrawList* dl, const Folder& folder, ImVec2 a, ImVec2 b, float 
     const float w = Round(ImGui::CalcTextSize(name.c_str()).x);
     dl->AddText(ImVec2(Round(a.x + (tile - w) * 0.5f), b.y - margin - font), ImGui::GetColorU32(ImGuiCol_Text),
                 name.c_str());
+    if (!folder.detail.empty()) {
+        // Where it is, above the name: two grouped folders may share one (#252).
+        FontScope small(TextStyle::Small);
+        const std::string where = ui::FitText(folder.detail, tile - margin * 2.0f);
+        const float dw = Round(ImGui::CalcTextSize(where.c_str()).x);
+        dl->AddText(ImVec2(Round(a.x + (tile - dw) * 0.5f), b.y - margin - font - ImGui::GetFontSize()), kDim,
+                    where.c_str());
+    }
     char count[16];
     std::snprintf(count, sizeof(count), "%d", folder.count);
     Badge(dl, b.x - margin, a.y + margin, count);
@@ -355,7 +366,9 @@ void MediaBrowser::Rebuild() {
     shown_.clear();
     unknown_.clear();
     const std::vector<MediaItem>& items = library_.Items();
-    folders_ = folder_.empty() ? std::vector<Folder>() : library_.Folders(CurrentSource(), options_, folder_);
+    folders_ = folder_.empty() && CurrentSource().mode == SourceMode::Flat
+                   ? std::vector<Folder>()
+                   : library_.Folders(CurrentSource(), options_, folder_);
     for (size_t i : library_.Query(CurrentSource(), options_, folder_)) {
         if (depth_ == DepthFilter::Both) {
             shown_.push_back(i);
@@ -373,7 +386,7 @@ void MediaBrowser::Rebuild() {
     // so a section is a run of items with one key.
     sectionSizes_.clear();
     sectionLabels_.clear();
-    if ((sourceKind_ == SourceKind::All || sourceKind_ == SourceKind::Camera) && folders_.empty()) {
+    if (CurrentSource().dateSections && folders_.empty()) {
         const std::time_t now = std::time(nullptr);
         const int64_t nowMs = (int64_t)now * 1000, offset = UtcOffsetSeconds(now);
         int64_t key = 0;
@@ -391,7 +404,9 @@ void MediaBrowser::Rebuild() {
 
 // The sources the sidebar lists: Unsupported, the last, only when the view options show it.
 int MediaBrowser::SourceRows() const {
-    return (int)library_.Sources().size() - (showUnsupported_ ? 0 : 1);
+    const std::vector<Source>& s = library_.Sources();
+    const bool hide = !showUnsupported_ && !s.empty() && s.back().kind == SourceKind::Unsupported;
+    return (int)s.size() - (hide ? 1 : 0);
 }
 
 float MediaBrowser::SidebarWidth(float screenW) const {
@@ -421,7 +436,11 @@ float MediaBrowser::SidebarWidth(float screenW) const {
     return Round(RailWidth(content, screenW, Dp(240.0f), 0.4f));
 }
 
-const Source& MediaBrowser::CurrentSource() const { return library_.Sources()[(size_t)sourceKind_]; }
+const Source& MediaBrowser::CurrentSource() const {
+    static const Source kNone;
+    const std::vector<Source>& s = library_.Sources();
+    return source_ < s.size() ? s[source_] : (s.empty() ? kNone : s.front());
+}
 
 MediaBrowser::Action MediaBrowser::Build() {
     if (!provider_) return Action::None;
@@ -555,9 +574,7 @@ void MediaBrowser::TopBar(float width, float height) {
     // left-aligned, not a pill that looks like a button and does nothing. The sources are
     // the menu's.
     std::string title = CurrentSource().name;
-    size_t i = CurrentSource().folder.size();
-    for (size_t slash; (slash = folder_.find('/', i)) != std::string::npos; i = slash + 1)
-        title += " / " + folder_.substr(i, slash - i);
+    for (const std::string& part : library_.Breadcrumb(CurrentSource(), folder_)) title += " / " + part;
     FontScope font(TextStyle::Title);
     const std::string name = ui::FitText(title, more - gap - x);
     dl->AddText(ImVec2(x, top + Round((height - ImGui::GetFontSize()) * 0.5f)), ImGui::GetColorU32(ImGuiCol_Text),
@@ -740,10 +757,10 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
         if (y + rowH < min.y || y > max.y) continue;
         const ImVec2 a(min.x, y), b(max.x, y + rowH);
         const Source* s = r < files ? &sources[r] : nullptr;
-        if (s && s->kind == sourceKind_) dl->AddRectFilled(a, b, kSelected);
+        if (s && (size_t)r == source_) dl->AddRectFilled(a, b, kSelected);
         if (r == pressed) dl->AddRectFilled(a, b, kPressed);
         ui::DrawGlyph(dl, s ? SourceIcon(s->kind) : Glyph::Files, ImVec2(min.x + pad + icon * 0.5f, y + rowH * 0.5f),
-                      icon, text, s && s->kind == sourceKind_);
+                      icon, text, s && (size_t)r == source_);
         const float textY = y + Round((rowH - ImGui::GetFontSize()) * 0.5f);
         if (!s) {
             dl->AddText(ImVec2(textX, textY), text, ui::FitText("Other files...", right - textX).c_str());
@@ -768,7 +785,7 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
         openedId_ = -1;
         return Action::OtherFiles;
     }
-    sourceKind_ = sources[r].kind;
+    source_ = (size_t)r;
     folder_ = sources[r].folder;
     EndSelection();
     sourcePicked_ = true;  // closes the drawer; the rail stays (#180)
@@ -1022,7 +1039,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
             Duration(item.durationMs, length, sizeof(length));
             right = Badge(dl, right, a.y + margin, length, stereo_ ? kBadgeOpaque : kBadge) - badgeGap;
         }
-        const std::string format = library_.Kind(shown_[p - nf]) == SourceKind::Unsupported ? Format(item.name) : "";
+        const std::string format = library_.Supported(shown_[p - nf]) ? "" : Format(item.name);
         if (!format.empty()) Badge(dl, right, a.y + margin, format.c_str());
         if (selecting_) {
             // As the stock tablet player's: a box on every tile; a picked one dimmed, ticked and outlined.
@@ -1094,7 +1111,7 @@ void MediaBrowser::GoTo(const std::string& folder) {
     gridScroll_.SetOffset(0.0f);
 }
 
-void MediaBrowser::Up() { GoTo(folder_.substr(0, folder_.rfind('/', folder_.size() - 2) + 1)); }
+void MediaBrowser::Up() { GoTo(library_.Parent(CurrentSource(), folder_)); }
 
 void MediaBrowser::EndSelection() {
     selecting_ = false;
@@ -1120,7 +1137,7 @@ bool MediaBrowser::Back() {
 }
 
 bool MediaBrowser::NextId(int step, int64_t& id) const {
-    if (openedId_ < 0 || sourceKind_ == SourceKind::Unsupported) return false;
+    if (openedId_ < 0 || CurrentSource().kind == SourceKind::Unsupported) return false;
     const std::vector<MediaItem>& items = library_.Items();
     for (size_t p = 0; p < shown_.size(); ++p) {
         if (items[shown_[p]].id != openedId_) continue;
@@ -1294,8 +1311,8 @@ void MediaBrowser::ViewOptionsSheet(float width, float top, float bottom) {
     heading("Files");
     if (option("Show unsupported files", showUnsupported_)) {
         showUnsupported_ = !showUnsupported_;
-        if (!showUnsupported_ && sourceKind_ == SourceKind::Unsupported) {
-            sourceKind_ = SourceKind::All;
+        if (!showUnsupported_ && CurrentSource().kind == SourceKind::Unsupported) {
+            source_ = 0;
             GoTo(CurrentSource().folder);
             EndSelection();
         }

@@ -134,7 +134,7 @@ private:
 
     bool listed_ = false;  // an item list has arrived
 
-    SourceKind sourceKind_ = SourceKind::All;
+    size_t source_ = 0;   // index into the library's sources
     std::string folder_;  // the folder shown, in a source browsed as folders
     ViewOptions options_;
     DepthFilter depth_ = DepthFilter::Both;

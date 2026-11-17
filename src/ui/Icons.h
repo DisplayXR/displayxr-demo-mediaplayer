@@ -41,6 +41,8 @@ enum class Glyph {
     Image,        // Pictures, and a tile with no thumbnail
     Video,        // Movies, and a video tile with no thumbnail
     Folder,
+    Recent,       // a clock: Recents (desktop, #252)
+    Pin,          // a pushpin: pinned folders (desktop, #252)
 };
 
 // One stroke width for every outline, HUD pixels; 0 = the desktop's proportional strokes.

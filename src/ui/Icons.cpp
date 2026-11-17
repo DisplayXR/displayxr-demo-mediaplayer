@@ -207,6 +207,23 @@ void DrawGlyph(ImDrawList* dl, Glyph glyph, ImVec2 c, float size, ImU32 u, bool 
             dl->AddPolyline(outline, 6, u, ImDrawFlags_Closed, T(1.0f));
             break;
         }
+        case Glyph::Recent: {
+            dl->AddCircle(P(0.0f, 0.0f), size * 0.32f, u, 0, T(1.0f));
+            const ImVec2 hands[] = {P(0.0f, -0.19f), P(0.0f, 0.0f), P(0.13f, 0.09f)};
+            dl->AddPolyline(hands, 3, u, 0, T(1.0f));
+            break;
+        }
+        case Glyph::Pin: {
+            // A pushpin: head, body widening to a bar, and the needle.
+            const ImVec2 body[] = {P(-0.10f, -0.32f), P(0.10f, -0.32f), P(0.10f, -0.08f), P(0.22f, 0.06f),
+                                   P(-0.22f, 0.06f), P(-0.10f, -0.08f)};
+            if (filled)
+                dl->AddConvexPolyFilled(body, 6, u);
+            else
+                dl->AddPolyline(body, 6, u, ImDrawFlags_Closed, T(1.0f));
+            dl->AddLine(P(0.0f, 0.06f), P(0.0f, 0.34f), u, T(1.0f));
+            break;
+        }
     }
 }
 
