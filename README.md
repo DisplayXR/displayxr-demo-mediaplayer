@@ -103,6 +103,12 @@ command line; walking a folder does not add to it). The list is kept in
 `%APPDATA%\DisplayXR\MediaPlayer\recent.txt` (macOS: `~/Library/Application Support/DisplayXR/MediaPlayer/`,
 Linux: `~/.config/displayxr/mediaplayer/`); `MEDIAPLAYER_RECENT_FILE` moves it (`off` keeps none).
 
+On **Windows**, **Open** (and `Ctrl+O`) shows the **media browser** outside a workspace: Recents,
+Pictures, Videos, Downloads, **Media folders** (every folder Windows Search knows holds photos
+or videos) and folders you pin, with thumbnails, 3D badges and an All / 3D / 2D filter. Files
+kept online only (OneDrive) show a cloud and are not downloaded until you open one.
+**Other files...** opens the system dialog. Details: [docs/BROWSER.md](docs/BROWSER.md#desktop-windows).
+
 ## VR180 / VR360 viewer (#155)
 
 VR180 and stereo VR360 files play as a **window into the scene**, steered with the mouse,

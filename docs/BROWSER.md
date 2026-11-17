@@ -1,8 +1,8 @@
 # Media browser
 
 The in-app gallery (#160): pick a photo or video from the device's library without
-leaving the 3D session, with 3D badges, durations and filters. Android comes first. The
-browser code is platform-neutral, so a desktop browser can follow by adding a provider.
+leaving the 3D session, with 3D badges, durations and filters. Android came first; the
+Windows consumer player has it too (#252, see [Desktop (Windows)](#desktop-windows)).
 
 This is the developer reference.
 
@@ -212,6 +212,59 @@ eye in the left-eye views, its right eye in the others. Android only.
 - Only the browser's grid: the pass runs only while the browser shows, under the filter,
   with the panel in 3D. The player's frames (and the swipe's pages) always take the atlas
   pass as before.
+
+## Desktop (Windows)
+
+Phase 1 of #252: the 2D browser in the consumer player on Windows. Pro keeps its station
+panels, and macOS / Linux keep the system dialog until they get a provider.
+
+**When it shows.** Open and Ctrl+O show it when there is no workspace picker (inside a
+workspace the shell's picker keeps Open). "Other files..." opens the system dialog. It
+covers the HUD and pauses a playing video; the close button, or Esc at the top of a source,
+goes back to the player.
+
+**Sources** (`WindowsMediaProvider`, declared through `MediaLibrary::SetSources`):
+
+| Source | From | Browsed |
+|---|---|---|
+| Recents | the Recent list (files only) | flat, in the order opened |
+| Pictures, Videos | the Windows libraries (OneDrive Pictures and added folders included), walked | folder tree; several roots are listed first |
+| Downloads | the known folder, walked | folder tree |
+| Media folders | the Windows Search index: pictures with a long side of at least 1024 px, videos of at least 1 MB, nothing under AppData, Program Files, Windows or a hidden folder | one tile per folder, a Newest tile (50) first |
+| Pinned | folders added with "Add folder...", walked | its folders first, then a tree |
+
+A walk reads directory entries only, at most 6 folders deep and 3 s per tree. One index
+query takes about 0.15 s for ~1,400 items on the 8K dev box; the whole list about 0.2-0.3 s.
+If the index cannot be queried, Media folders is empty and a strip over the grid says so.
+
+**Cloud files** (OneDrive / SharePoint placeholders) are never read while browsing:
+- thumbnails come from the shell's thumbnail cache only; a file Windows has none for shows
+  the image icon until it has been opened once;
+- a cloud tile shows a cloud bottom left, and its tooltip says opening it downloads it;
+- the file check for 3D (LIF, MPO) is skipped, so a cloud file the name does not settle
+  shows "3D?" (`StereoVerdict::unchecked`) and is 2D for the filters.
+Local stills get the file check (`LifLoader::IsLif`, `MpoLoader::IsMpo`); two-track videos
+are not probed on desktop yet.
+
+**Folder menu** (right click a folder tile): Pin this folder; Remove from Pinned (top of
+Pinned); Hide from Media folders (top of Media folders, for junk the size filter keeps).
+Pinned and hidden folders are kept beside the Recent list (`pinned.txt`,
+`hidden_folders.txt` in `%APPDATA%\DisplayXR\MediaPlayer\`).
+
+**Input.** Mouse: click, wheel scrolling, a hover outline and a name tooltip. Keyboard:
+arrows, Page Up / Down, Home / End move a focus ring, Enter opens, Backspace or Alt+Left go
+up a folder, Esc backs out then closes. Player hotkeys are off while it shows. A file opened
+from the grid makes Up / Down in the player walk the grid as shown (no wrap).
+
+**Sizing.** A dp is one design unit on desktop (1.5 on Android), so the browser matches the
+rest of the desktop UI; the sources stay a rail from 600 dp of window width.
+
+**Testing.** `MEDIAPLAYER_SHOW_BROWSER=1` shows it at launch; with `MEDIAPLAYER_DUMP_HUD`
+the HUD dump shows it. `win_shell_media_probe` (built on Windows, not a ctest test) prints
+the index query and thumbnail timings on a real box; `--thumb <path> <cacheOnly>` checks one
+file and whether it stayed a cloud placeholder.
+
+Phase 2 (the 3D-only grid with per-eye thumbnails) is planned in #252.
 
 ## Android behaviour
 

@@ -151,6 +151,7 @@ private:
     FolderRequest folderRequest_;
     bool folderRequestPending_ = false;
     std::string menuFolder_;       // the folder tile whose menu is open
+    size_t cursor_ = SIZE_MAX;     // desktop: the keyboard's tile (SIZE_MAX: none yet)
     MediaLibrary library_;
     StereoClassifier classifier_;
     ThumbnailAtlas atlas_;

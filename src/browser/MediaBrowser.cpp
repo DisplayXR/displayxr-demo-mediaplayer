@@ -394,6 +394,7 @@ void MediaBrowser::TakeResults() {
 
 void MediaBrowser::Rebuild() {
     dirty_ = false;
+    cursor_ = SIZE_MAX;  // a new list: the keyboard starts again from the first tile
     shown_.clear();
     unknown_.clear();
     const std::vector<MediaItem>& items = library_.Items();
@@ -1022,6 +1023,37 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     // Desktop: the tile under the pointer, lightly lit.
     size_t hovered = n;
     if (desktop_ && gridHovered && !gridScroll_.Pressed() && !itemAt(ImGui::GetIO().MousePos, hovered)) hovered = n;
+    // Desktop keyboard: arrows, Page Up / Down, Home / End move a focus ring; Enter opens.
+    // The first key shows the ring on the first visible tile. The view follows the ring.
+    bool keyOpen = false;
+    if (desktop_ && !sheetOpen_ && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
+        !ImGui::GetIO().KeyAlt && !ImGui::GetIO().KeyCtrl) {
+        const int page = std::max(1, (int)(size.y / step)) * cols;
+        long move = 0;
+        bool jump = false;
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) move = 1;
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) move = -1;
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) move = cols;
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) move = -cols;
+        if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) move = page;
+        if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) move = -page;
+        if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) jump = true, move = -(long)n;
+        if (ImGui::IsKeyPressed(ImGuiKey_End, false)) jump = true, move = (long)n;
+        if (move != 0) {
+            if (cursor_ >= n) {
+                cursor_ = jump ? (move < 0 ? 0 : n - 1) : std::min(n - 1, visFirst);
+            } else {
+                cursor_ = (size_t)std::max(0L, std::min((long)n - 1, (long)cursor_ + move));
+            }
+            float tx = 0.0f, ty = 0.0f;
+            if (layout_.TilePos(cursor_, tx, ty)) {
+                if (ty < offset) gridScroll_.SetOffset(ty);
+                else if (ty + tile > offset + size.y) gridScroll_.SetOffset(ty + tile - size.y);
+            }
+        }
+        keyOpen = cursor_ < n && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                                  ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
+    }
     // A long press on an item starts select mode with it. In select mode it is a tap.
     if (pressed >= nf && pressed < n && !selecting_ && provider_->CanDelete() && gridScroll_.TakeLongPress(now)) {
         selecting_ = true;
@@ -1049,6 +1081,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
             FolderTile(dl, folders_[p], a, b, margin);
             if (p == pressed) dl->AddRectFilled(a, b, kPressed);
             if (p == hovered) dl->AddRect(a, b, kHover, 0.0f, 0, Round(Px(2.0f)));
+            if (p == cursor_) dl->AddRect(a, b, kAccent, 0.0f, 0, Round(Px(3.0f)));
             continue;
         }
         const MediaItem& item = items[shown_[p - nf]];
@@ -1130,6 +1163,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         }
         if (p == pressed) dl->AddRectFilled(a, b, kPressed);
         if (p == hovered) dl->AddRect(a, b, kHover, 0.0f, 0, Round(Px(2.0f)));
+        if (p == cursor_) dl->AddRect(a, b, kAccent, 0.0f, 0, Round(Px(3.0f)));
     }
     // The date sections' headers.
     if (headers) {
@@ -1177,7 +1211,11 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     FolderMenu();
 
     size_t picked = 0;
-    if (!tap || !itemAt(gridPress_, picked)) return Action::None;
+    if (keyOpen) {
+        picked = cursor_;
+    } else if (!tap || !itemAt(gridPress_, picked)) {
+        return Action::None;
+    }
     if (picked < nf) {
         if (!selecting_) GoTo(folders_[picked].path);
         return Action::None;
