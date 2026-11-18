@@ -486,15 +486,17 @@ bool LiftClient::Submit(const uint8_t* rgba, uint32_t width, uint32_t height, ui
     images.images = &img;
 
     // The viewpoints (sticky per stream, sent with every frame anyway): the tracked viewer's
-    // eyes, horizontally and vertically, without the default ease back to the centre after
-    // a hold, which undid look-around. Off: the nominal viewer (parallax 0), as before.
+    // eyes, horizontally and vertically, easing back to the centre once the head holds still
+    // (the runtime's default: 1 s hold, 2 s time constant), as the DisplayXR Browser does.
+    // A head move still looks around; a held off-centre pose does not leave the viewer
+    // staring at the filled-in disocclusions. Off: the nominal viewer (parallax 0).
     XrLiftViewControlDXR view{};
     view.type = XR_TYPE_LIFT_VIEW_CONTROL_DXR;
     view.ipdFactor = 1.0f;
     view.parallaxFactor = lookAround_ ? 1.0f : 0.0f;
     view.axisMode = XR_LIFT_AXIS_MODE_XY_DXR;
     view.maxOffsetMeters = 0.0f;
-    view.recenterMode = XR_LIFT_RECENTER_MODE_OFF_DXR;
+    view.recenterMode = XR_LIFT_RECENTER_MODE_EASE_BACK_DXR;
     view.recenterHoldSeconds = -1.0f;
     view.recenterTimeConstantSeconds = 0.0f;
     XrLiftOptionsDXR options{};

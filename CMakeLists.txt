@@ -278,6 +278,7 @@ function(mp_add_player tgt is_pro)
         src/AgentTools.cpp       # the player's agent-tool table (#220)
         src/Log.cpp
         src/platform/Window.cpp
+        src/platform/SingleInstance.cpp  # one player per session (Windows)
         $<$<PLATFORM_ID:Linux>:src/platform/WindowLinux.cpp>  # desktop Linux: displayxr-common window
         src/xr/XrSession.cpp
         src/rhi/VulkanRenderer.cpp

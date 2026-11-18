@@ -4,6 +4,7 @@
 
 #include "AgentTools.h"
 #include "Log.h"
+#include "platform/SingleInstance.h"
 #include "media/EyeAssign.h"
 #include "media/HeifLoader.h"
 #include "media/ImageDecoder.h"
@@ -790,6 +791,24 @@ int App::Run() {
         // event handler — matching the discipline the native dialog already follows.
         if (std::vector<std::string> dropped; window_.TakeDroppedPaths(dropped)) {
             HandleDroppedPaths(std::move(dropped));
+            activity = true;
+        }
+        // A second launch (Explorer, a shortcut) handed us its file: open it as Open
+        // would, and come to the front.
+        if (std::vector<std::string> forwarded; single_instance::Take(forwarded)) {
+            for (const std::string& p : forwarded) {
+                if (p.empty()) continue;
+                LOG_INFO("Forwarded launch: %s", p.c_str());
+                CloseBrowser();
+                OpenChosenPath(p);
+            }
+            if (SDL_Window* w = window_.SdlWindow()) {
+                SDL_RestoreWindow(w);
+                SDL_RaiseWindow(w);
+            }
+#if defined(_WIN32)
+            if (HWND hwnd = (HWND)window_.NativeHandle()) SetForegroundWindow(hwnd);
+#endif
             activity = true;
         }
         if (window_.TakeTogglePauseRequest()) { TogglePlayback(); activity = true; }  // Space
