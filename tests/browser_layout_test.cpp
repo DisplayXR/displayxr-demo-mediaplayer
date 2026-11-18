@@ -167,6 +167,14 @@ void TestViewPrefs() {
     CHECK(odd == DeskViewPrefs{}, "bad values and unknown keys keep the defaults");
     CHECK(Near(ParseDeskViewPrefs("card=9999", 120.0f, 320.0f).cardW, 320.0f), "a card too wide: the largest");
     CHECK(Near(ParseDeskViewPrefs("card=-5", 120.0f, 320.0f).cardW, 120.0f), "a card too narrow: the smallest");
+    {
+        DeskViewPrefs place;
+        place.source = "Media folders";
+        place.folder = "C:/Users/me/Videos/Holiday 2025/";
+        const DeskViewPrefs again = ParseDeskViewPrefs(FormatDeskViewPrefs(place), 120.0f, 320.0f);
+        CHECK(again == place, "the place last shown round-trips (source, folder with spaces)");
+        CHECK(FormatDeskViewPrefs(DeskViewPrefs{}).find("source=") == std::string::npos, "no place: no lines for it");
+    }
 }
 
 void TestClickSelect() {

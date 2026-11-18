@@ -186,7 +186,9 @@ std::string FormatDeskViewPrefs(const DeskViewPrefs& prefs) {
     char buf[96];
     std::snprintf(buf, sizeof(buf), "view=%s\ncard=%d\nsort=%s\n", prefs.details ? "details" : "grid",
                   (int)std::lround(prefs.cardW), prefs.order == SortOrder::OldestFirst ? "oldest" : "newest");
-    return buf;
+    std::string out = buf;
+    if (!prefs.source.empty()) out += "source=" + prefs.source + "\nfolder=" + prefs.folder + "\n";
+    return out;
 }
 
 DeskViewPrefs ParseDeskViewPrefs(const std::string& text, float cardMin, float cardMax) {
@@ -209,6 +211,10 @@ DeskViewPrefs ParseDeskViewPrefs(const std::string& text, float cardMin, float c
             const double v = std::strtod(value.c_str(), &stop);
             if (stop != value.c_str() && *stop == '\0' && std::isfinite(v))
                 p.cardW = std::min(cardMax, std::max(cardMin, (float)v));
+        } else if (key == "source") {
+            p.source = value;
+        } else if (key == "folder") {
+            p.folder = value;
         } else if (key == "sort") {
             if (value == "oldest") p.order = SortOrder::OldestFirst;
             else if (value == "newest") p.order = SortOrder::NewestFirst;

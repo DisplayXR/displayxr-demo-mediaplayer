@@ -615,6 +615,14 @@ int App::Run() {
         }
 #endif
     }
+#if MEDIAPLAYER_BROWSER
+    // Started with no file: open as Open would (#252): outside a workspace that is the
+    // browser, on the place last shown; in one, the shell's picker. A file on the command
+    // line (Explorer, Recent) opens itself; a cloud file downloading shows its card.
+    else if (browser_ && !hasMedia_ && !CloudFetchBusy() && !std::getenv("MEDIAPLAYER_NO_BROWSER_AT_START")) {
+        RequestOpenFile();
+    }
+#endif
     // Test: switch "Convert to 3D" on without a keystroke (headless runs). Retried until it
     // takes, because an in-process session may only learn the conversion task a moment
     // after start. Never set by the player itself.

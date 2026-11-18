@@ -126,7 +126,10 @@ public:
     void FocusSearch() { focusSearch_ = true; }
     // Desktop: grid or details, the cards' size and the sort, as the caller keeps them
     // between launches (BrowserLayout.h).
-    DeskViewPrefs ViewPrefs() const { return DeskViewPrefs{details_, cardW_, options_.order}; }
+    DeskViewPrefs ViewPrefs() const {
+        return DeskViewPrefs{details_, cardW_, options_.order, listed_ ? CurrentSource().name : startSource_,
+                             listed_ ? folder_ : startFolder_};
+    }
     void SetViewPrefs(const DeskViewPrefs& prefs);
     static constexpr float kCardMin = 120.0f, kCardMax = 320.0f;  // desktop: the size slider's range
 
@@ -276,6 +279,7 @@ private:
     ImVec2 typeChip_;       // where the type chip's menu opens, its bottom left
     ImVec2 sortMenuAt_;     // desktop: where the sort menu opens
     std::string startSource_;  // SetStartSource, until the list arrives
+    std::string startFolder_;  // ... and a folder in it (the place kept between launches)
 
     bool selecting_ = false;  // select mode: a tap picks an item, the bin deletes the picked
     // The picked items: select mode's (touch), or Ctrl / Shift + click's (desktop, where a

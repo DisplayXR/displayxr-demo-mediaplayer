@@ -221,7 +221,10 @@ panels, and macOS / Linux keep the system dialog until they get a provider.
 **When it shows.** Open and Ctrl+O show it when there is no workspace picker (inside a
 workspace the shell's picker keeps Open). "Other files..." opens the system dialog. It
 covers the HUD and pauses a playing video; the close button, or Esc at the top of a source,
-goes back to the player.
+goes back to the player. The basic player also starts in it when launched with no file (as
+Open would: the shell's picker inside a workspace), on the place last shown
+(`browser_view.txt` keeps `source=` / `folder=` beside the view); a file on the command line
+opens directly. `MEDIAPLAYER_NO_BROWSER_AT_START=1` keeps the idle screen at launch.
 
 **Sources** (`WindowsMediaProvider`, declared through `MediaLibrary::SetSources`):
 

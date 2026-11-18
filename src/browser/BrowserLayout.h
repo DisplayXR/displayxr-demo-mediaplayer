@@ -46,15 +46,18 @@ bool ViewOptionsAreDefault(const ViewOptions& options, bool showUnsupported);
 const char* TypeLabel(TypeFilter type);
 
 // Desktop (#252): how the browser looks, kept between launches: grid or details, the cards'
-// width (design px), and the sort. As text, one "key=value" a line ("view=details",
+// width (design px), the sort, and the place last shown (a source by name and its folder). As text, one "key=value" a line ("view=details",
 // "card=200", "sort=oldest"); a line it does not know is skipped and a bad value keeps the
 // default, so an older or a newer file still reads.
 struct DeskViewPrefs {
     bool details = false;
     float cardW = 176.0f;
     SortOrder order = SortOrder::NewestFirst;
+    std::string source;  // empty: the browser's own start (Recents, or the first with items)
+    std::string folder;
     bool operator==(const DeskViewPrefs& o) const {
-        return details == o.details && cardW == o.cardW && order == o.order;
+        return details == o.details && cardW == o.cardW && order == o.order && source == o.source &&
+               folder == o.folder;
     }
     bool operator!=(const DeskViewPrefs& o) const { return !(*this == o); }
 };

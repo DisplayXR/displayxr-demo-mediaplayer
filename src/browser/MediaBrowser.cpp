@@ -505,6 +505,8 @@ MediaBrowser::Action MediaBrowser::Build() {
             if (s[i].name != startSource_) continue;
             source_ = i;
             folder_ = s[i].folder;
+            // A folder kept from the last launch: only one inside this source's top.
+            if (!startFolder_.empty() && startFolder_.compare(0, folder_.size(), folder_) == 0) folder_ = startFolder_;
             dirty_ = true;
             found = true;
         }
@@ -517,6 +519,7 @@ MediaBrowser::Action MediaBrowser::Build() {
             found = true;
         }
         startSource_.clear();
+        startFolder_.clear();
     }
     if (desktop_) TrackHistory();
     if (dirty_) {
@@ -1556,6 +1559,11 @@ void MediaBrowser::SetViewPrefs(const DeskViewPrefs& prefs) {
     if (options_.order != prefs.order) {
         options_.order = prefs.order;
         dirty_ = true;
+    }
+    // The place last shown, once the list arrives (a test's SetStartSource still wins).
+    if (startSource_.empty() && !prefs.source.empty()) {
+        startSource_ = prefs.source;
+        startFolder_ = prefs.folder;
     }
 }
 
