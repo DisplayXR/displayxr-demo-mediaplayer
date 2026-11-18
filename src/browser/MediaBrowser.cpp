@@ -945,17 +945,31 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     const float deskPad = desk ? Round(Px(4.0f)) : 0.0f;
     const float usableW = size.x - (desk ? Round(Px(12.0f)) * 2.0f : 0.0f);
     const float gutter = list ? 0.0f : Round(desk ? Px(stereo_ ? 16.0f : 8.0f) : Px(stereo_ ? kStereoGutter : kGutter));
-    const float cardW = Px(std::min(kCardMax, std::max(kCardMin, cardW_)));  // the size slider's
+    // Desktop cards: the size slider's width, eased so a Ctrl+wheel notch glides. A card keeps
+    // that width (the rows end short of the right edge, as File Explorer's): stretched to fill
+    // the row, the cards only changed size when a column came or went.
+    const float cardTarget = std::min(kCardMax, std::max(kCardMin, cardW_));
+    if (cardShown_ <= 0.0f || std::fabs(cardShown_ - cardTarget) < 0.5f) {
+        cardShown_ = cardTarget;
+    } else {
+        const float k = std::min(1.0f, ImGui::GetIO().DeltaTime * 16.0f);
+        cardShown_ += (cardTarget - cardShown_) * k;
+    }
+    const float cardW = Round(Px(cardShown_));
     const int cols = list   ? 1
                      : desk ? std::max(2, (int)((usableW + gutter) / (cardW + gutter)))
                             : GridColumns(size.x / Dp(1.0f));
-    const float tile = std::floor((usableW - gutter * (cols - 1)) / cols);
+    const float tile = desk && !list ? std::min(cardW, std::floor((usableW - gutter * (cols - 1)) / cols))
+                                     : std::floor((usableW - gutter * (cols - 1)) / cols);
     if (tile <= deskPad * 2.0f || size.y <= 0.0f) return Action::None;
     // The picture's edge: the tile's on touch, inside the card on desktop, 40 px in a row.
     const float pic = list ? Round(Px(40.0f)) : tile - deskPad * 2.0f;
     const float tileH = list ? Round(Px(48.0f)) : desk ? deskPad + pic + DeskCaptionHeight() : tile;
     const float step = tileH + gutter;  // the row pitch
-    const float x0 = min.x + Round((size.x - (cols * (tile + gutter) - gutter)) * 0.5f);
+    // Centred on touch; on desktop from the left, so the cards do not slide sideways as they
+    // grow.
+    const float x0 = desk ? min.x + Round(Px(12.0f))
+                          : min.x + Round((size.x - (cols * (tile + gutter) - gutter)) * 0.5f);
     DeskColumns columns;
     if (list) {
         columns = DeskColumnLayout(x0, tile);
@@ -967,14 +981,21 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     const bool headers = !sectionSizes_.empty();
     const float headerH = Round(desk ? Px(30.0f) : Dp(44.0f));
     const size_t topTile = layout_.TileAtOffset(gridScroll_.Offset());  // before the rebuild
+    // How far into its row the view's top was, as a share of the row: kept on a resize.
+    const float into = lastStep_ > 0.0f ? (gridScroll_.Offset() - layout_.OffsetOf(topTile)) / lastStep_ : 0.0f;
     layout_.Build(headers ? sectionSizes_ : std::vector<size_t>{n}, headers, cols, tile, gutter, headerH,
                   desk ? tileH : -1.0f);
     if (cols != columns_ && columns_ > 0) {
         // A reflow (rotation, the rail): keep the top row's first item in the top row.
         gridScroll_.SetLimit(layout_.Height() - size.y);
-        gridScroll_.SetOffset(layout_.OffsetOf(topTile));
+        gridScroll_.SetOffset(layout_.OffsetOf(topTile) + (desk ? std::max(0.0f, into) * step : 0.0f));
+    } else if (desk && lastStep_ > 0.0f && step != lastStep_ && gridScroll_.Offset() > 0.0f) {
+        // The cards grew or shrank: the same item stays at the top of the view.
+        gridScroll_.SetLimit(layout_.Height() - size.y);
+        gridScroll_.SetOffset(layout_.OffsetOf(topTile) + std::max(0.0f, into) * step);
     }
     columns_ = cols;
+    lastStep_ = step;
     gridScroll_.SetSlop(Px(kSlop));
     gridScroll_.SetLimit(layout_.Height() - size.y);
     const float limit = std::max(0.0f, layout_.Height() - size.y);
@@ -1043,7 +1064,10 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     }
     // A thumbnail big enough that the part a tile shows covers it pixel for pixel, as far as
     // an atlas slot holds.
-    const uint32_t need = std::min(atlas_.Tile(), (uint32_t)pic);
+    // On desktop in steps of 128 px: the card size eases through every width, and a new edge
+    // each frame would ask the provider for the whole window again each frame.
+    const uint32_t picPx = desk ? (uint32_t)(std::ceil(pic / 128.0f) * 128.0f) : (uint32_t)pic;
+    const uint32_t need = std::min(atlas_.Tile(), picPx);
     UploadReady(window, need);
 
     // Ask for what the window lacks: the visible rows, then those below, then above. Under a

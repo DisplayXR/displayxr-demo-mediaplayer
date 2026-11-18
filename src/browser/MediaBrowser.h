@@ -210,6 +210,8 @@ private:
     size_t cursor_ = SIZE_MAX;     // desktop: the keyboard's tile (SIZE_MAX: none yet)
     bool details_ = false;         // desktop: the details view
     float cardW_ = 176.0f;         // desktop grid: a card's width, design px (the size slider)
+    float cardShown_ = 0.0f;       // ... as drawn: eases to cardW_ (0: not drawn yet)
+    float lastStep_ = 0.0f;        // the last frame's row pitch, to hold the view on a resize
     char search_[256] = {};        // desktop: the search box's text
     std::string query_;            // ... as the grid filters by it
     bool focusSearch_ = false;     // Ctrl+F: the search box takes the keyboard
