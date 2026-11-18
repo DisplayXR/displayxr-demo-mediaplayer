@@ -133,6 +133,8 @@ public:
     bool WantsStereo() const { return depth_ == DepthFilter::Only3D; }
     // The 2D / 3D filter, as the chip sets it (tests start on "3D only").
     void SetDepthFilter(DepthFilter depth) { SetDepth(depth); }
+    // Tests (MEDIAPLAYER_BROWSER_FOCUS): the focus ring on tile `index` whenever it has none.
+    void SetStartFocus(size_t index) { startFocus_ = index; }
     // Show the source named `name` once the list arrives (tests: MEDIAPLAYER_BROWSER_SOURCE).
     void SetStartSource(std::string name) { startSource_ = std::move(name); }
     // The panel is in 3D and the caller draws Stereo() into the projection layer, so
@@ -206,6 +208,7 @@ private:
     void DeskSearch(ImVec2 pos, float w, float h, const std::string& place);
     void DeskItemMenu();
     void DeskPinnedMenu();
+    void DeskStatusBar(ImVec2 min, ImVec2 max);
     void TrackHistory();
     void UpdatePinnedRows();
 
@@ -216,6 +219,7 @@ private:
     bool folderRequestPending_ = false;
     std::string menuFolder_;       // the folder tile whose menu is open
     size_t cursor_ = SIZE_MAX;     // desktop: the keyboard's tile (SIZE_MAX: none yet)
+    size_t startFocus_ = SIZE_MAX;  // SetStartFocus
     bool details_ = false;         // desktop: the details view
     float cardW_ = 176.0f;         // desktop grid: a card's width, design px (the size slider)
     float cardShown_ = 0.0f;       // ... as drawn: eases to cardW_ (0: not drawn yet)
@@ -237,6 +241,9 @@ private:
     std::vector<Folder> pinnedRows_;
     size_t pinnedSource_ = SIZE_MAX;  // the Pinned source's index, SIZE_MAX: none
     std::string pinnedMenu_;          // the pinned row whose menu is open
+    // Desktop status bar: this frame's tile with the focus ring, else under the pointer.
+    int64_t statusItem_ = -1;
+    size_t statusFolder_ = SIZE_MAX;
     int64_t menuItem_ = -1;        // the file whose menu is open
     bool menuOpen_ = false;        // its menu's "Open", this frame
     MediaLibrary library_;

@@ -597,6 +597,9 @@ int App::Run() {
         if (const char* v = std::getenv("MEDIAPLAYER_BROWSER_VIEW"); browser_ && v && std::string(v) == "details")
             browser_->SetDetails(true);
         if (const char* q = std::getenv("MEDIAPLAYER_BROWSER_QUERY"); browser_ && q && *q) browser_->SetQuery(q);
+        // Test: the focus ring on tile N (0 = the first), as the arrow keys would put it.
+        if (const char* fo = std::getenv("MEDIAPLAYER_BROWSER_FOCUS"); browser_ && fo && *fo)
+            browser_->SetStartFocus((size_t)std::max(0, std::atoi(fo)));
 #endif
     }
     // Test: switch "Convert to 3D" on without a keystroke (headless runs). Retried until it

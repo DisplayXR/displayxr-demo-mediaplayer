@@ -280,6 +280,13 @@ under the 3D filter. The view, the card size and the sort are kept between launc
 `sort=newest|oldest`; an unknown line or a bad value keeps the default), written when one
 changes and the size slider is let go.
 
+**Status bar** (24 px along the window's foot, under the sidebar too; none in a window under
+420 px tall): what the grid holds ("3 folders · 15 items", "12 in 3D" under the 3D filter),
+how many are selected, the focused file (the focus ring's, else the one under the pointer:
+name · width×height · length · 3D (SBS / TB / the format, e.g. LIF) or 2D or 3D? · Online
+only · size on disk; a folder: its name and count), and a hint at the right (from 760 px of
+width). Parts are cut from the right as the window narrows.
+
 **Search** (Ctrl+F, or the box in the header; none below 640 px of window width): shows the
 folders and files of the place shown whose names hold the text, any case. Esc or the cross
 clears it; going to another place clears it too.
@@ -297,7 +304,8 @@ rest of the desktop UI; the sources stay a rail from 600 dp of window width.
 **Testing.** `MEDIAPLAYER_SHOW_BROWSER=1` shows it at launch (`3d`: under the 3D filter);
 with `MEDIAPLAYER_DUMP_HUD` the HUD dump shows it. `MEDIAPLAYER_BROWSER_SOURCE=<name>` starts
 on a source (or, with no source of that name, on the pinned folder of that name), `MEDIAPLAYER_BROWSER_VIEW=details` in the details view,
-`MEDIAPLAYER_BROWSER_QUERY=<text>` with a search. A test run (`MEDIAPLAYER_SHOW_BROWSER`) never
+`MEDIAPLAYER_BROWSER_QUERY=<text>` with a search, `MEDIAPLAYER_BROWSER_FOCUS=<n>` with the focus
+ring on tile n (0 = the first; folders count). A test run (`MEDIAPLAYER_SHOW_BROWSER`) never
 reads or writes the user's `browser_view.txt`; `MEDIAPLAYER_BROWSER_PREFS=<file>` names a view
 file for it to use instead. `win_shell_media_probe` (built on Windows, not a ctest test) prints
 the index query and thumbnail timings on a real box; `--thumb <path> <cacheOnly>` checks one

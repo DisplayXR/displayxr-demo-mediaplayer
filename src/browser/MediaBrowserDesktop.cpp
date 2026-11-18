@@ -707,6 +707,96 @@ MediaBrowser::Action MediaBrowser::DeskSidebar(ImVec2 min, ImVec2 max) {
     return action;
 }
 
+// The status bar (the window's foot, under the sidebar too): what the grid holds, how many are
+// selected, the focused file (name, size in pixels, 3D or 2D, size on disk), and a hint at the
+// right. Parts drop from the right as the window narrows.
+void MediaBrowser::DeskStatusBar(ImVec2 min, ImVec2 max) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(min, max, kPanel);
+    dl->AddLine(ImVec2(min.x, min.y + 0.5f), ImVec2(max.x, min.y + 0.5f), kLine, Px(1.0f));
+    DeskFont f(DeskText::Meta);
+    const float pad = Round(Px(12.0f)), gap = Round(Px(16.0f));
+    const float ty = min.y + Round((max.y - min.y - ImGui::GetFontSize()) * 0.5f);
+    float x = min.x + pad, right = max.x - pad;
+    if (!listed_) return;
+
+    // At the right, the hint, when there is room for it beside the rest.
+    const char* hint = details_ ? "Click opens  \xC2\xB7  Click Date to sort" : "Click opens  \xC2\xB7  Right-click for more";
+    const float hintW = ImGui::CalcTextSize(hint).x;
+    if (max.x - min.x >= Px(760.0f)) {
+        dl->AddText(ImVec2(right - hintW, ty), kTextFaint, hint);
+        right -= hintW + gap;
+    }
+    auto part = [&](const std::string& text, ImU32 ink) {
+        if (text.empty() || x >= right) return;
+        const std::string t = ui::FitText(text, right - x);
+        dl->AddText(ImVec2(x, ty), ink, t.c_str());
+        x += ImGui::CalcTextSize(t.c_str()).x + gap;
+    };
+
+    // What the grid holds.
+    char count[96];
+    const size_t items = shown_.size(), folders = folders_.size();
+    const char* what = depth_ == DepthFilter::Only3D ? " in 3D" : depth_ == DepthFilter::Only2D ? " in 2D" : nullptr;
+    if (folders > 0 && items > 0)
+        std::snprintf(count, sizeof(count), "%zu folder%s  \xC2\xB7  %zu item%s", folders, folders == 1 ? "" : "s", items,
+                      items == 1 ? "" : "s");
+    else if (folders > 0)
+        std::snprintf(count, sizeof(count), "%zu folder%s", folders, folders == 1 ? "" : "s");
+    else if (what)
+        std::snprintf(count, sizeof(count), "%zu%s", items, what);
+    else
+        std::snprintf(count, sizeof(count), "%zu item%s", items, items == 1 ? "" : "s");
+    part(count, kTextFaint);
+    if (!selected_.empty()) {
+        char sel[32];
+        std::snprintf(sel, sizeof(sel), "%zu selected", selected_.size());
+        part(sel, kText);
+    }
+
+    // The focused file or folder.
+    std::string detail;
+    auto add = [&](const std::string& s) {
+        if (s.empty()) return;
+        if (!detail.empty()) detail += "  \xC2\xB7  ";
+        detail += s;
+    };
+    if (statusFolder_ < folders_.size()) {
+        const Folder& fo = folders_[statusFolder_];
+        add(fo.name);
+        char n[32];
+        std::snprintf(n, sizeof(n), "%d item%s", fo.count, fo.count == 1 ? "" : "s");
+        add(n);
+    } else if (const MediaItem* item = statusItem_ >= 0 ? library_.Find(statusItem_) : nullptr) {
+        add(item->name);
+        if (item->width > 0 && item->height > 0) {
+            char wh[32];
+            std::snprintf(wh, sizeof(wh), "%u\xC3\x97%u", item->width, item->height);
+            add(wh);
+        }
+        if (item->type == MediaType::Video && item->durationMs > 0) {
+            char length[24];
+            Duration(item->durationMs, length, sizeof(length));
+            add(length);
+        }
+        const StereoVerdict v = classifier_.Get(*item);
+        if (v.known && v.stereo) {
+            const char* packing = v.layout == StereoLayout::SbsFull || v.layout == StereoLayout::SbsHalf ? "SBS"
+                                  : v.layout == StereoLayout::TbFull || v.layout == StereoLayout::TbHalf ? "TB"
+                                                                                                         : nullptr;
+            const std::string kind = packing ? std::string(packing) : Upper(item->name);
+            add(kind.empty() ? std::string("3D") : "3D (" + kind + ")");
+        } else if (v.known && v.unchecked && item->cloudOnly) {
+            add("3D?");
+        } else if (v.known) {
+            add("2D");
+        }
+        if (item->cloudOnly) add("Online only");
+        if (item->bytes > 0) add(FileSize(item->bytes));
+    }
+    part(detail, kTextDim);
+}
+
 // A pinned folder's menu (right click its sidebar row): show it, or unpin it.
 void MediaBrowser::DeskPinnedMenu() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(4.0f), Px(4.0f)));

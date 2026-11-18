@@ -555,15 +555,18 @@ MediaBrowser::Action MediaBrowser::Build() {
         // The desktop look (#252): a header, a toolbar over the grid, a compact sidebar.
         ImGui::PushFont(ui::DeskFont(ui::DeskText::Body));
         const float headerH = Round(Px(44.0f)), toolbarH = Round(Px(40.0f));
+        // The status bar along the foot: not in a short window.
+        const float statusH = h >= Px(420.0f) ? Round(Px(24.0f)) : 0.0f;
         rail_ = w >= Px(kDesktopRailMinDp);
         if (rail_) drawer_ = false;
         const float sideW = rail_ ? Round(std::min(Px(220.0f), w * 0.34f)) : 0.0f;
-        action = Grid(ImVec2(sideW, headerH + toolbarH), ImVec2(w, h), now);
+        action = Grid(ImVec2(sideW, headerH + toolbarH), ImVec2(w, h - statusH), now);
         DeskToolbar(ImVec2(sideW, headerH), ImVec2(w, headerH + toolbarH));
         if (rail_) {
-            const Action picked = DeskSidebar(ImVec2(0.0f, headerH), ImVec2(sideW, h));
+            const Action picked = DeskSidebar(ImVec2(0.0f, headerH), ImVec2(sideW, h - statusH));
             if (picked != Action::None) action = picked;
         }
+        if (statusH > 0.0f) DeskStatusBar(ImVec2(0.0f, h - statusH), ImVec2(w, h));
         DeskHeader(w, headerH);
         DeskSortMenu();
         closeSheets_ = false;
@@ -902,6 +905,8 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
 }
 
 MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
+    statusItem_ = -1;
+    statusFolder_ = SIZE_MAX;
     const ImGuiStyle& style = ImGui::GetStyle();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const MediaAccess access = provider_->Access();
@@ -1190,6 +1195,13 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         }
         keyOpen = cursor_ < n && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
                                   ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
+    }
+    if (desktop_ && cursor_ >= n && startFocus_ < n) cursor_ = startFocus_;
+    // The status bar's tile: the focus ring's, else the one under the pointer.
+    if (desktop_) {
+        const size_t at = cursor_ < n ? cursor_ : hovered;
+        if (at < nf) statusFolder_ = at;
+        else if (at < n) statusItem_ = items[shown_[at - nf]].id;
     }
     // Desktop: Ctrl+Shift+C copies the path of the file with the focus ring (else under the
     // pointer).
