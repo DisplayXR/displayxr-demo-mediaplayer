@@ -676,7 +676,11 @@ int App::Run() {
         keepRunning = window_.PumpEvents();
         const auto nowT = std::chrono::steady_clock::now();
         bool activity = window_.TakeMouseActivity();   // any input revives the UI
+#if MEDIAPLAYER_PRO
         if (window_.TakeCycleModeRequest()) { CycleRenderingMode(); activity = true; }  // 'V'
+#else
+        if (window_.TakeCycleModeRequest()) { Toggle3D(); activity = true; }  // 'V': the 2D/3D switch
+#endif
         if (window_.TakeToggleHudRequest()) {                        // SHIFT+TAB (master)
             showHud_ = !showHud_;
             LOG_INFO("HUD %s", showHud_ ? "on" : "off");
@@ -1088,6 +1092,14 @@ void App::RenderOneFrame() {
             rendered_ > 1200)
             convertAtStart_ = false;
     }
+#if !MEDIAPLAYER_PRO
+    // The switch turned a 2D file to 3D: the next 2D files walked to convert too.
+    if (stickConvert_ && hasMedia_ && !lift_.On() && stickConvertTried_ != currentMediaPath_ && ConvertEligible() &&
+        lift_.GetAvailability() == lift::Availability::Enabled) {
+        stickConvertTried_ = currentMediaPath_;
+        SetConvert(true, "2D/3D switch, kept while walking");
+    }
+#endif
     PumpConvert(SteadySeconds());  // "Convert to 3D": poll + upload a landed result (no-op off)
     {
         const StageClock::time_point ac0 = StageClock::now();
@@ -1661,6 +1673,34 @@ void App::BuildTransportUI() {
             uiState_.convertProviders.push_back(std::move(row));
         }
         uiState_.convertProviderCurrent = lift_.EffectiveCandidate();
+#if !MEDIAPLAYER_PRO
+        // The basic player: one 2D/3D switch on the transport instead of "Convert to 3D",
+        // Mode and Layout on the bar (they move to the "..." menu). A 2D file shows it when
+        // a converter is installed; a 3D file when the panel has a 2D and a 3D mode.
+        uiState_.caps.moreMenu = true;
+        uiState_.caps.convert = false;
+        const bool mono = layout_ == StereoLayout::Mono;
+        const bool converter = av != lift::Availability::Hidden &&
+                               (av == lift::Availability::Enabled || lift_.On() || !lift_.Candidates().empty());
+        const bool twoModes = xr_.FindFlatMode() >= 0 && xr_.FindStereoMode() >= 0;
+        uiState_.caps.modeSwitch = hasMedia_ && !isLogo_ && (mono ? converter && ConvertEligible() : twoModes);
+        uiState_.mode3D = mono ? lift_.On() : !PanelHeadingFlat();
+        uiState_.modeSwitchEnabled = !mono || lift_.On() || av == lift::Availability::Enabled;
+        uiState_.modeSwitchBusy = mono && lift_.On() && st == lift::State::Warming;
+        if (mono && lift_.On()) {
+            const int c = lift_.EffectiveCandidate();
+            const std::string by = c >= 0 ? " by " + lift_.Candidates()[c].name : std::string();
+            uiState_.modeSwitchTooltip = (st == lift::State::Warming ? "Converting to 3D" + by + " (warming up)"
+                                                                     : "3D, converted from 2D" + by) +
+                                         "\nV: back to 2D";
+        } else if (mono) {
+            uiState_.modeSwitchTooltip = !uiState_.modeSwitchEnabled && !why.empty()
+                                             ? why
+                                             : std::string("2D picture\nV: convert to 3D");
+        } else {
+            uiState_.modeSwitchTooltip = uiState_.mode3D ? "3D\nV: show in 2D (left eye)" : "2D, left eye\nV: back to 3D";
+        }
+#endif
     }
     // Input popup (XR_DXR_input_providers): one combo per family the runtime can supply.
     uiState_.caps.input = input_.Attached();  // hidden only without the extension
@@ -1708,6 +1748,9 @@ void App::BuildTransportUI() {
         RefreshRecentLabels();
     };
     actions.NextMode = [this] { CycleRenderingMode(); };
+#if !MEDIAPLAYER_PRO
+    actions.Toggle3D = [this] { Toggle3D(); };
+#endif
     actions.CycleLayout = [this] { CycleLayoutOverride(); };
     actions.ToggleSlideshow = [this] { ToggleSlideshow(); };
     actions.TogglePlayback = [this] { TogglePlayback(); };
@@ -2263,15 +2306,20 @@ void App::ApplyLayout(const MediaInfo& info) {
         const int32_t flat = xr_.FindFlatMode();
         const bool targetFlat = flat >= 0 ? target == flat : xr_.CurrentModeIsFlat();
         int32_t want = -1;
-        if (layout_ != StereoLayout::Mono && targetFlat) want = xr_.FindStereoMode();
+        const bool stereo = layout_ != StereoLayout::Mono;
+        if (stereo && targetFlat && !stickFlat_) want = xr_.FindStereoMode();
 #if !MEDIAPLAYER_PRO
-        else if (layout_ == StereoLayout::Mono && !targetFlat) want = flat;
+        // The 2D/3D switch's kept choice (#252): 3D files flat, or 2D files converted (the
+        // conversion asks for 3D itself, so the panel does not dip to 2D in between).
+        else if (stereo && !targetFlat && stickFlat_) want = flat;
+        else if (!stereo && !targetFlat &&
+                 !(stickConvert_ && lift_.GetAvailability() == lift::Availability::Enabled)) want = flat;
 #endif
         if (want >= 0 && want != target) {
             pendingModeRequest_ = want;
             silentModeTarget_ = want;  // the content's doing, not the user's: no mode chip
-            LOG_INFO("%s content - requesting the %s mode [%d]", layout_ == StereoLayout::Mono ? "2D" : "3D",
-                     layout_ == StereoLayout::Mono ? "flat" : "first 3D", want);
+            LOG_INFO("%s content - requesting the %s mode [%d]%s", stereo ? "3D" : "2D",
+                     want == flat ? "flat" : "first 3D", want, stickFlat_ ? " (kept 2D)" : "");
         }
     }
     // Toast only for a genuine content verdict. The aspect rung is now the routine
@@ -2359,6 +2407,10 @@ void App::ReloadMedia(const std::string& path) {
     // "Convert to 3D" is off on every load. Put the source picture back first, so a load
     // that fails keeps showing the previous media as it was.
     StopConvert(/*restorePicture=*/true);
+    // The 2D/3D switch's choice is kept only while walking the list; any other open starts
+    // the file at its own default (#252).
+    stickConvertTried_.clear();
+    if (!walking_) stickFlat_ = stickConvert_ = false;
     if (isLive_) StopLive(/*showIdleIfEmpty=*/false);
     if (isStream_) StopStream(/*showIdleIfEmpty=*/false);  // #93: a file replaces the stream
     video_.Stop();   // joins the decode thread (which reads the audio clock) FIRST,
@@ -3454,6 +3506,11 @@ void App::RebuildFolderList(std::string path) {
 }
 
 void App::NavigateMedia(int delta) {
+    struct Walk {
+        bool& w;
+        explicit Walk(bool& f) : w(f) { w = true; }
+        ~Walk() { w = false; }
+    } walk(walking_);
     std::string next;
     if (browserNav_ && BrowserNext(delta, next)) {
         // Opened from the browser: walk its grid as shown (no wrap; #252).
@@ -3604,6 +3661,40 @@ void App::CycleRenderingMode() {
                                       : std::string("Display mode switching unavailable"));
 }
 
+bool App::PanelHeadingFlat() const {
+    const int32_t target = pendingModeRequest_ >= 0 ? pendingModeRequest_ : (int32_t)xr_.CurrentModeIndex();
+    const int32_t flat = xr_.FindFlatMode();
+    return flat >= 0 ? target == flat : xr_.CurrentModeIsFlat();
+}
+
+void App::Toggle3D() {
+    if (!hasMedia_ || isLogo_) return;
+    const int32_t target = pendingModeRequest_ >= 0 ? pendingModeRequest_ : (int32_t)xr_.CurrentModeIndex();
+    auto request = [&](int32_t m) {
+        if (m < 0 || m == target) return;
+        pendingModeRequest_ = m;
+        silentModeTarget_ = m;  // the switch's toast names it
+    };
+    if (layout_ == StereoLayout::Mono) {
+        // A 2D file: convert it, or back to the picture and the flat mode.
+        if (lift_.On() || convertBound_) {
+            SetConvert(false, "2D/3D switch");
+            stickConvert_ = false;
+            request(xr_.FindFlatMode());
+            ShowToast("2D");
+        } else if (SetConvert(true, "2D/3D switch")) {
+            stickConvert_ = true;
+            stickConvertTried_ = currentMediaPath_;
+        }
+        return;
+    }
+    // A 3D file: the flat mode shows its left eye; or back to 3D.
+    stickFlat_ = !PanelHeadingFlat();
+    request(stickFlat_ ? xr_.FindFlatMode() : xr_.FindStereoMode());
+    LOG_INFO("2D/3D switch: %s", stickFlat_ ? "2D (left eye)" : "3D");
+    ShowToast(stickFlat_ ? "2D (left eye)" : "3D");
+}
+
 void App::ToastRenderingMode() { ShowToast(std::string("Mode: ") + xr_.ActiveModeName()); }
 
 void App::OnRenderingModeChanged() {
@@ -3733,14 +3824,19 @@ bool App::SetConvert(bool on, const char* why) {
     // A converted picture wants the panel in 3D: on a flat panel ask for the stereo mode,
     // exactly as V would (and count it as the user's mode choice). Turning the toggle off
     // leaves the mode alone; otherwise the player keeps the mode as it finds it.
-    if (xr_.CurrentModeIsFlat()) {
+    if (PanelHeadingFlat()) {
         const int32_t m = xr_.FindStereoMode();
         if (m >= 0) {
             pendingModeRequest_ = m;
+#if !MEDIAPLAYER_PRO
+            silentModeTarget_ = m;  // the switch is the user's word: its toast, no mode chip
+#endif
             LOG_INFO("Convert to 3D: flat panel - requesting 3D mode [%d]", m);
         }
     }
+#if MEDIAPLAYER_PRO
     userModeChoice_ = true;
+#endif
     if (!video) {
         // A still converts once: downscale its kept pixels now, PumpConvert submits them
         // (and again only if no result came back within the stale period).

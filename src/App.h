@@ -201,6 +201,11 @@ private:
     // Mode chip: V / the Mode button cycle the display's rendering mode, and every mode
     // change shows a toast naming the new mode (the plug-in's mode name).
     void CycleRenderingMode();
+    // The 2D/3D switch (basic player, #252): a 2D file converts to 3D or back; a 3D file
+    // shows flat (the left eye) or back in 3D. V and the switch on the transport.
+    void Toggle3D();
+    // The panel is in, or about to be in, its flat mode.
+    bool PanelHeadingFlat() const;
     void ToastRenderingMode();
     void OnRenderingModeChanged();  // the runtime reported a rendering-mode change
     void TogglePlayback();   // play/pause (video+audio); restarts if the clip already ended
@@ -604,6 +609,12 @@ private:
     // kept so a mode the USER picked while idle is not undone on the way out.
     int32_t pendingModeRequest_ = -1;
     bool userModeChoice_ = false;  // V / the Mode button was used: Pro's auto-3D stays out
+    // The 2D/3D switch's choice, kept while walking the list (Up / Down, the slideshow) and
+    // dropped by any other open (#252): 3D files shown flat, 2D files converted.
+    bool walking_ = false;          // NavigateMedia's load in progress
+    bool stickFlat_ = false;
+    bool stickConvert_ = false;
+    std::string stickConvertTried_;  // the file the kept conversion was last started on
     int32_t modeBeforeIdle_ = -1;
     int32_t idleModeRequested_ = -1;
     // Mode chip: the idle borrow's target, whose change event is not toasted (consumed by

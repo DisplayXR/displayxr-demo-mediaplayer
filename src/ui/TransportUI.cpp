@@ -162,7 +162,7 @@ bool IconButton(const char* id, Glyph kind, float size, bool active = false,
 // The touch player's 2D/3D switch (#180), drawn like the stock player's on the same tablets: a
 // pill track and a round knob naming the mode in force, on the right for 3D and on the
 // left for 2D. `size` is the knob's diameter; the hit box grows like IconButton's.
-bool ModeSwitch(const char* id, bool on3D, float size, float hitScale) {
+bool ModeSwitch(const char* id, bool on3D, float size, float hitScale, bool busy = false) {
     const float pad = size * (std::max(1.0f, hitScale) - 1.0f) * 0.5f;
     const float trackW = size * 1.5f, trackH = size * 0.45f;
     const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -175,6 +175,12 @@ bool ModeSwitch(const char* id, bool on3D, float size, float hitScale) {
     // A 1 px dark grey ring parts the knob from the track.
     dl->AddCircleFilled(c, r, ImGui::GetColorU32(ImVec4(0.30f, 0.30f, 0.32f, 1.0f)));
     dl->AddCircleFilled(c, r - 1.0f, ImGui::GetColorU32(ImVec4(0.05f, 0.05f, 0.06f, 1.0f)));
+    if (busy) {
+        // Warming up: an accent arc turning round the knob.
+        const float t = (float)ImGui::GetTime() * 4.0f;
+        dl->PathArcTo(c, r - 1.0f, t, t + 2.0f, 16);
+        dl->PathStroke(ImGui::GetColorU32(ImVec4(0.20f, 0.65f, 1.00f, 1.0f)), 0, std::max(1.5f, size * 0.07f));
+    }
     const char* label = on3D ? "3D" : "2D";
     const float fontPx = g_switchFont->FontSize;
     const ImVec2 ts = g_switchFont->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, label);
@@ -659,7 +665,9 @@ void TouchChrome(TransportState& s, const TransportActions& a, float W, float H)
             x += slot + st.ItemSpacing.x;
             if (s.caps.modeSwitch) {
                 ImGui::SetCursorScreenPos(ImVec2(x, row.y));
-                if (SegmentSwitch("##mode3d", s.mode3D, switchH, hit)) Fire(a.NextMode);
+                ImGui::BeginDisabled(!s.modeSwitchEnabled);
+                if (SegmentSwitch("##mode3d", s.mode3D, switchH, hit)) Fire(a.Toggle3D ? a.Toggle3D : a.NextMode);
+                ImGui::EndDisabled();
             }
             ImGui::SetCursorScreenPos(ImVec2(row.x, row.y + hit));
             ImGui::Dummy(ImVec2(0.0f, 0.0f));
@@ -668,9 +676,11 @@ void TouchChrome(TransportState& s, const TransportActions& a, float W, float H)
     } else if (s.caps.modeSwitch) {
         // A still: the switch alone, bottom right.
         ImGui::SetNextWindowPos(ImVec2(W, bottom), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
-        if (ImGui::Begin("##touch_modeswitch", nullptr, flags | ImGuiWindowFlags_AlwaysAutoResize) &&
-            SegmentSwitch("##mode3d", s.mode3D, switchH, hit))
-            Fire(a.NextMode);
+        if (ImGui::Begin("##touch_modeswitch", nullptr, flags | ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::BeginDisabled(!s.modeSwitchEnabled);
+            if (SegmentSwitch("##mode3d", s.mode3D, switchH, hit)) Fire(a.Toggle3D ? a.Toggle3D : a.NextMode);
+            ImGui::EndDisabled();
+        }
         ImGui::End();
     }
     ImGui::PopStyleVar();
@@ -762,7 +772,46 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 ImGui::SameLine();
                 CameraCombo(s, a);
             }
-            if (s.caps.mode) {
+            if (s.caps.moreMenu && (s.caps.mode || (s.caps.layout && s.hasMedia) || !s.convertProviders.empty()) &&
+                fits(iconSz)) {
+                ImGui::SameLine();
+                if (IconButton("##more", Glyph::More, iconSz, false, s.hitTargetScale)) ImGui::OpenPopup("##more_menu");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Display mode, layout, 2D->3D converter");
+            }
+            if (s.caps.moreMenu && ImGui::BeginPopup("##more_menu")) {
+                // Rows that cycle keep the menu open, so a few clicks walk the choices.
+                if (s.caps.mode) {
+                    char modeLabel[96];
+                    std::snprintf(modeLabel, sizeof(modeLabel), "Display mode: %s", s.modeName.c_str());
+                    if (ImGui::Selectable(modeLabel, false, ImGuiSelectableFlags_DontClosePopups)) Fire(a.NextMode);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The panel's rendering mode (V flips 2D / 3D)");
+                }
+                if (s.caps.layout && s.hasMedia) {
+                    char layoutRow[64];
+                    std::snprintf(layoutRow, sizeof(layoutRow), "Layout: %s%s", s.layoutName.c_str(),
+                                  s.layoutPinned ? "*" : "");
+                    if (ImGui::Selectable(layoutRow, false, ImGuiSelectableFlags_DontClosePopups)) Fire(a.CycleLayout);
+                    if (ImGui::IsItemHovered() && !s.layoutTooltip.empty())
+                        ImGui::SetTooltip("%s\nL cycles: auto / mono / SBS-full / SBS-half / TB-full / TB-half",
+                                          s.layoutTooltip.c_str());
+                }
+                if (!s.convertProviders.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("2D->3D converter");
+                    for (int i = 0; i < (int)s.convertProviders.size(); ++i) {
+                        const ConvertProviderRow& row = s.convertProviders[i];
+                        ImGui::PushID(i);
+                        ImGui::BeginDisabled(!row.enabled);
+                        if (ImGui::Selectable(row.label.c_str(), i == s.convertProviderCurrent) &&
+                            i != s.convertProviderCurrent && a.SelectConvertProvider)
+                            a.SelectConvertProvider(i);
+                        ImGui::EndDisabled();
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::EndPopup();
+            }
+            if (s.caps.mode && !s.caps.moreMenu) {
                 char modeLabel[96];
                 std::snprintf(modeLabel, sizeof(modeLabel), "Mode: %s", s.modeName.c_str());
                 if (fits(buttonW(modeLabel))) {
@@ -774,7 +823,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             char layoutBtn[64];
             std::snprintf(layoutBtn, sizeof(layoutBtn), "Layout: %s%s", s.layoutName.c_str(),
                           s.layoutPinned ? "*" : "");
-            if (s.caps.layout && s.hasMedia && fits(buttonW(layoutBtn))) {
+            if (s.caps.layout && s.hasMedia && !s.caps.moreMenu && fits(buttonW(layoutBtn))) {
                 ImGui::SameLine();
                 if (ImGui::Button(layoutBtn)) Fire(a.CycleLayout);
                 if (ImGui::IsItemHovered() && !s.layoutTooltip.empty()) {
@@ -1102,9 +1151,14 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
         // The 2D/3D switch: alone at the right edge, level with the transport's row.
         if (s.caps.modeSwitch) {
             ImGui::SetNextWindowPos(ImVec2(W, rowY), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
-            if (ImGui::Begin("##modeswitch", nullptr, pill | ImGuiWindowFlags_NoBackground) &&
-                ModeSwitch("##mode3d", s.mode3D, iconSz, s.hitTargetScale))
-                Fire(a.NextMode);
+            if (ImGui::Begin("##modeswitch", nullptr, pill | ImGuiWindowFlags_NoBackground)) {
+                ImGui::BeginDisabled(!s.modeSwitchEnabled);
+                if (ModeSwitch("##mode3d", s.mode3D, iconSz, s.hitTargetScale, s.modeSwitchBusy))
+                    Fire(a.Toggle3D ? a.Toggle3D : a.NextMode);
+                ImGui::EndDisabled();
+                if (!s.modeSwitchTooltip.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("%s", s.modeSwitchTooltip.c_str());
+            }
             ImGui::End();
         }
         ImGui::PopStyleVar();
