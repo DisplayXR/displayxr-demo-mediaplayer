@@ -328,7 +328,10 @@ void MediaBrowser::TakeResults() {
         library_.SetItems(std::move(items));
         // An empty source at its top (Recents before anything was opened): show the first
         // one that holds something instead.
-        if (CurrentSource().count == 0 && folder_ == CurrentSource().folder) {
+        // Only Recents: an empty source the user picked (Pictures still listing, or empty
+        // Downloads) stays picked.
+        if (CurrentSource().kind == SourceKind::Recents && CurrentSource().count == 0 &&
+            folder_ == CurrentSource().folder) {
             const std::vector<Source>& all = library_.Sources();
             for (size_t i = 0; i < all.size(); ++i) {
                 if (all[i].count == 0 || all[i].kind == SourceKind::Unsupported) continue;

@@ -403,9 +403,10 @@ MediaBrowser::Action MediaBrowser::DeskSidebar(ImVec2 min, ImVec2 max) {
     float contentH = pad;
     for (const Entry& e : entries) contentH += e.kind == 0 ? headH : rowH;
     sidebarScroll_.SetLimit(contentH + pad - (listBottom - min.y));
-    ImGui::SetCursorScreenPos(min);
-    ImGui::InvisibleButton("##sidebar_bg", ImVec2(max.x - min.x, listBottom - min.y));
-    if (ImGui::IsItemHovered() && ImGui::GetIO().MouseWheel != 0.0f)
+    // The wheel scrolls the list. A hit test, not a button under the rows: an item
+    // submitted first takes the hover, and the rows under it could not be clicked.
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(min, ImVec2(max.x, listBottom)) &&
+        ImGui::GetIO().MouseWheel != 0.0f)
         sidebarScroll_.SetOffset(sidebarScroll_.Offset() - ImGui::GetIO().MouseWheel * rowH * 2.0f);
     const float offset = Round(sidebarScroll_.Offset());
 
