@@ -1394,6 +1394,8 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
             }
         }
 
+        BuildAudioSection(st.live);  // --- Audio: volume + meters (LOXR-871/872)
+
         // --- Looks ----------------------------------------------------------
         if (ImGui::CollapsingHeader("Looks", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (ImGui::Button("Load .cube...")) OpenLookDialog(false);
@@ -1646,6 +1648,94 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
 #else
     (void)st;
     (void)uiAlpha;
+#endif
+}
+
+// Audio (LOXR-871/872): the player's volume and mute, and a meter per channel of what is
+// being heard: the file's audio as played (2 or 5.1), or every channel the DeckLink input
+// captures (2, 8 or 16), whichever is playing.
+void ProController::BuildAudioSection(bool live) {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    // Closed by default; closed, the meters measure nothing (no Watch() below).
+    if (!ImGui::CollapsingHeader("Audio")) {
+        meters_.Reset();
+        metersAt_ = {};
+        return;
+    }
+    if (host_.getVolume && host_.setVolume) {
+        float pct = host_.getVolume() * 100.0f;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
+        if (ImGui::SliderFloat("Volume", &pct, 0.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp))
+            host_.setVolume(pct / 100.0f);
+    }
+    if (host_.getMuted && host_.toggleMute) {
+        bool muted = host_.getMuted();
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Mute", &muted)) host_.toggleMute();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("M");
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const float dt = metersAt_.time_since_epoch().count() == 0
+                         ? 0.0f
+                         : std::min(0.25f, std::chrono::duration<float>(now - metersAt_).count());
+    metersAt_ = now;
+    if (host_.audioMeter) {
+        host_.audioMeter->Watch();  // measured only while this section is drawn
+        meters_.Update(host_.audioMeter->Take(), dt);
+    }
+
+    const std::string liveLabel = live ? station_.LiveAudioLabel() : std::string();
+    const bool fileAudio = !live && host_.fileHasAudio && host_.fileHasAudio();
+    if (!host_.audioMeter || (liveLabel.empty() && !fileAudio) || meters_.channels <= 0) {
+        ImGui::TextDisabled(live ? "No live audio (DeckLink dialog: Capture audio)." : "No audio playing.");
+        if (liveLabel.empty() && !fileAudio) meters_.Reset();
+        return;
+    }
+    if (live) ImGui::TextDisabled("%s (dBFS)", liveLabel.c_str());
+    else ImGui::TextDisabled("File audio, %d ch (dBFS)", meters_.channels);
+
+    // One horizontal bar per channel, -60..0 dBFS: the level (RMS) solid, the peak lighter
+    // above it, the hold as a tick; green below -18, amber to -6, red above; CLIP latches.
+    constexpr float kMinDb = -60.0f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float labelW = ImGui::CalcTextSize("16 ").x;
+    const float valueW = ImGui::CalcTextSize(" -60.0 CLIP").x;
+    const float barH = std::max(Px(6.0f), ImGui::GetTextLineHeight() * 0.55f);
+    const float rowH = std::max(barH, ImGui::GetTextLineHeight()) + Px(2.0f);
+    auto frac = [&](float db) { return std::clamp((db - kMinDb) / -kMinDb, 0.0f, 1.0f); };
+    auto colour = [](float db, int a) {
+        return db >= -6.0f ? IM_COL32(235, 70, 55, a) : db >= -18.0f ? IM_COL32(235, 190, 60, a) : IM_COL32(80, 200, 110, a);
+    };
+    for (int c = 0; c < meters_.channels; ++c) {
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float barW = std::max(Px(40.0f), ImGui::GetContentRegionAvail().x - labelW - valueW);
+        char lab[8];
+        std::snprintf(lab, sizeof(lab), "%d", c + 1);
+        dl->AddText(ImVec2(p.x, p.y), ImGui::GetColorU32(ImGuiCol_TextDisabled), lab);
+        const ImVec2 b0(p.x + labelW, p.y + (rowH - barH) * 0.5f);
+        const ImVec2 b1(b0.x + barW, b0.y + barH);
+        dl->AddRectFilled(b0, b1, IM_COL32(40, 40, 44, 255));
+        const float pk = meters_.peakDb[c], lv = meters_.rmsDb[c], hd = meters_.holdDb[c];
+        if (pk > kMinDb) dl->AddRectFilled(b0, ImVec2(b0.x + barW * frac(pk), b1.y), colour(pk, 110));
+        if (lv > kMinDb) dl->AddRectFilled(b0, ImVec2(b0.x + barW * frac(lv), b1.y), colour(lv, 255));
+        if (hd > kMinDb) {
+            const float x = b0.x + barW * frac(hd);
+            dl->AddLine(ImVec2(x, b0.y), ImVec2(x, b1.y), colour(hd, 255), Px(2.0f));
+        }
+        for (float t : {-18.0f, -6.0f})  // scale marks
+            dl->AddLine(ImVec2(b0.x + barW * frac(t), b1.y), ImVec2(b0.x + barW * frac(t), b1.y + Px(2.0f)),
+                        IM_COL32(150, 150, 150, 200));
+        char val[24];
+        if (hd > kMeterFloorDb + 1.0f) std::snprintf(val, sizeof(val), "%6.1f", hd > -0.05f ? 0.0f : hd);  // no "-0.0"
+        else std::snprintf(val, sizeof(val), "   -inf");
+        dl->AddText(ImVec2(b1.x + Px(4.0f), p.y), ImGui::GetColorU32(ImGuiCol_TextDisabled), val);
+        if (meters_.Clipping(c))
+            dl->AddText(ImVec2(b1.x + Px(4.0f) + ImGui::CalcTextSize(" -60.0").x, p.y), IM_COL32(255, 70, 55, 255), " CLIP");
+        ImGui::Dummy(ImVec2(labelW + barW + valueW, rowH));
+    }
+#else
+    (void)live;
 #endif
 }
 

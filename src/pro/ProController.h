@@ -19,6 +19,7 @@
 
 #include "color/Cdl.h"
 #include "color/CubeLut.h"
+#include "media/AudioMeter.h"
 #include "pro/CompareClip.h"
 #include "pro/LookLoader.h"
 #include "pro/TargetScreen.h"
@@ -29,6 +30,7 @@
 #include "pro/Station.h"
 #include "rhi/VulkanRenderer.h"
 
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -134,6 +136,14 @@ struct Host {
     // An RGBA texture for ImGui::Image (scope pictures), per slot: upload `rgba` (nullptr =
     // no change) and return its ImTextureID, nullptr when there is none.
     std::function<void*(int slot, int w, int h, const uint8_t* rgba)> userTexture;
+    // Audio (LOXR-871/872): the player's volume (0..1) and mute (M), and the meter that the
+    // file and DeckLink audio feed (owned by the app; null = no meters).
+    std::function<float()> getVolume;
+    std::function<void(float)> setVolume;
+    std::function<bool()> getMuted;
+    std::function<void()> toggleMute;
+    std::function<bool()> fileHasAudio;  // the open file is playing an audio stream
+    AudioMeter* audioMeter = nullptr;
 };
 
 class ProController {
@@ -275,6 +285,9 @@ private:
     // The live Resolve panel (ProResolve.cpp): status out, playhead + commands in, follow.
     void TickResolve(const Status& st);
     void BuildResolveLines();
+    void BuildAudioSection(bool live);  // volume + per-channel meters (LOXR-871/872)
+    MeterDisplay meters_;
+    std::chrono::steady_clock::time_point metersAt_{};
     static void DialogCallback(void* userdata, const char* const* filelist, int filter);
 
     VulkanRenderer* renderer_ = nullptr;

@@ -26,6 +26,10 @@
 #include <string>
 #include <vector>
 
+namespace mp {
+class AudioMeter;
+}
+
 namespace mp::pro {
 
 constexpr int kLiveAudioRate = 48000;     // SDI embedded audio is always 48 kHz
@@ -74,7 +78,9 @@ public:
 
     // Opens the default playback device for stereo 48 kHz 32-bit. nullptr + `err` on failure
     // (no SDL audio, no output device); the capture then just runs silent.
-    static std::shared_ptr<LiveAudioSink> Open(int channels, int pair, bool muted, std::string& err);
+    // `meter` (may be null) gets the levels of every captured channel (LOXR-871).
+    static std::shared_ptr<LiveAudioSink> Open(int channels, int pair, bool muted, float volume,
+                                               AudioMeter* meter, std::string& err);
     ~LiveAudioSink();
     LiveAudioSink(const LiveAudioSink&) = delete;
     LiveAudioSink& operator=(const LiveAudioSink&) = delete;
@@ -83,14 +89,19 @@ public:
     void Push(const void* samples, int frames);
     void PacketWithoutSamples() { ++bad_; }
     void SetMuted(bool m);
+    void SetVolume(float v);  // 0..1 (LOXR-872); mute wins over it
     Stats GetStats() const;
 
 private:
     LiveAudioSink() = default;
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    void ApplyGain();
     int channels_ = 0;
     int pair_ = 0;
+    AudioMeter* meter_ = nullptr;
+    std::atomic<bool> muted_{false};
+    std::atomic<float> volume_{1.0f};
     std::vector<int32_t> stereo_;  // card thread only
     std::atomic<uint64_t> packets_{0}, frames_{0}, overflows_{0}, bad_{0};
 };

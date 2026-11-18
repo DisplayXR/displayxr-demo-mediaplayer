@@ -5,6 +5,7 @@
 // decode + UI (PRD §4).
 #pragma once
 
+#include "media/AudioMeter.h"
 #include "media/AudioPlayer.h"
 #include "media/RecentList.h"
 #include "media/AutoConvergence.h"
@@ -275,6 +276,11 @@ private:
     AudioPlayer audio_;
     ImGuiLayer imgui_;
     bool muted_ = false;   // audio mute (M / speaker button); persists across clips
+    float volume_ = 1.0f;  // 0..1, Pro's volume slider (LOXR-872); file and live audio
+    void SetVolume(float v);
+#if MEDIAPLAYER_PRO
+    AudioMeter audioMeter_;  // Pro's meters (LOXR-871): fed by the file and DeckLink audio
+#endif
 
     bool hasMedia_ = false;       // an image or video was loaded (vs the idle logo)
     bool isLogo_ = false;         // the idle DisplayXR logo screen is showing (no media)

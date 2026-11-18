@@ -115,6 +115,10 @@ public:
     void BuildDeckLinkDialog();
     // The player's mute (M) also mutes the DeckLink input's live audio (LOXR-870).
     void SetLiveAudioMuted(bool m) { decklink_.SetAudioMuted(m); }
+    void SetLiveAudioVolume(float v) { decklink_.SetAudioVolume(v); }   // LOXR-872
+    void SetLiveAudioMeter(AudioMeter* m) { decklink_.SetAudioMeter(m); }  // LOXR-871
+    // "DeckLink ch 1-2 of 8" while the DeckLink input's audio plays, else "".
+    std::string LiveAudioLabel() const;
     bool ShowTimecode() const { return showTimecode_; }
     std::string InputName() const { return inputIndex_ >= 0 && inputIndex_ < (int)inputs_.size() ? inputs_[inputIndex_].name : std::string(); }
     size_t SnapshotCount() const { return snapshots_.size(); }

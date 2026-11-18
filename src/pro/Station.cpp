@@ -1019,6 +1019,12 @@ void Station::BuildInputsSection(const std::string& liveName, bool live) {
 #endif
 }
 
+std::string Station::LiveAudioLabel() const {
+    const DeckLinkSource::AudioStatus a = decklink_.GetAudioStatus();
+    if (!a.playing) return {};
+    return "DeckLink " + LiveAudioPairName(a.pair) + " of " + std::to_string(a.channels);
+}
+
 void Station::OpenDeckLinkDialog() {
     const bool opening = !dlgOpen_;  // Refresh re-lists the devices but keeps the choices being made
     dlgDevices_ = DeckLinkSource::Available() ? DeckLinkSource::Enumerate() : std::vector<std::string>{};

@@ -34,6 +34,7 @@
 #include <vector>
 
 namespace mp {
+class AudioMeter;
 namespace pro {
 class LiveAudioSink;
 }
@@ -186,6 +187,9 @@ public:
 
     // Live audio (off unless the spec asks for it). Muting follows the player's mute (M).
     void SetAudioMuted(bool m);
+    void SetAudioVolume(float v);  // 0..1 (LOXR-872)
+    // Pro's meters (LOXR-871); a capture opened later feeds it. Must outlive this source.
+    void SetAudioMeter(AudioMeter* m) { audioMeter_ = m; }
     struct AudioStatus {
         bool requested = false;  // the spec asked for audio
         bool playing = false;    // the card delivers it and an output device plays it
@@ -217,6 +221,8 @@ private:
     std::shared_ptr<pro::LiveAudioSink> audioSink_;
     std::string audioError_;
     std::atomic<bool> audioMuted_{false};
+    std::atomic<float> audioVolume_{1.0f};
+    std::atomic<AudioMeter*> audioMeter_{nullptr};
 };
 
 }  // namespace mp

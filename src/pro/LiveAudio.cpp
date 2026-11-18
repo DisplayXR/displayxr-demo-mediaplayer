@@ -2,8 +2,11 @@
 #include "pro/LiveAudio.h"
 
 #include "Log.h"
+#include "media/AudioMeter.h"
 
 #include <SDL3/SDL.h>
+
+#include <algorithm>
 
 namespace mp::pro {
 
@@ -14,7 +17,8 @@ struct LiveAudioSink::Impl {
     }
 };
 
-std::shared_ptr<LiveAudioSink> LiveAudioSink::Open(int channels, int pair, bool muted, std::string& err) {
+std::shared_ptr<LiveAudioSink> LiveAudioSink::Open(int channels, int pair, bool muted, float volume,
+                                                   AudioMeter* meter, std::string& err) {
     if (LiveAudioCaptureChannels(pair) == 0 || pair * 2 > channels) {
         err = "invalid audio channel pair";
         return nullptr;
@@ -27,6 +31,9 @@ std::shared_ptr<LiveAudioSink> LiveAudioSink::Open(int channels, int pair, bool 
     s->impl_ = std::make_unique<Impl>();
     s->channels_ = channels;
     s->pair_ = pair;
+    s->meter_ = meter;
+    s->muted_ = muted;
+    s->volume_ = std::clamp(volume, 0.0f, 1.0f);
     SDL_AudioSpec spec;
     SDL_zero(spec);
     spec.format = SDL_AUDIO_S32;  // the card's samples, as they come (SDL converts to the device)
@@ -38,7 +45,8 @@ std::shared_ptr<LiveAudioSink> LiveAudioSink::Open(int channels, int pair, bool 
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
         return nullptr;
     }
-    SDL_SetAudioStreamGain(s->impl_->stream, muted ? 0.0f : 1.0f);
+    s->ApplyGain();
+    if (meter) meter->Clear();
     SDL_ResumeAudioStreamDevice(s->impl_->stream);
     return s;
 }
@@ -46,6 +54,7 @@ std::shared_ptr<LiveAudioSink> LiveAudioSink::Open(int channels, int pair, bool 
 LiveAudioSink::~LiveAudioSink() {
     const bool opened = impl_ && impl_->stream;
     impl_.reset();
+    if (meter_) meter_->Clear();
     if (opened) SDL_QuitSubSystem(SDL_INIT_AUDIO);  // balances Open's init (ref-counted by SDL)
 }
 
@@ -62,15 +71,33 @@ void LiveAudioSink::Push(const void* samples, int frames) {
     // The card's clock and the output device's are not the same clock: if the queue grows
     // past the limit, start over from this packet rather than drift behind the picture.
     const int maxBytes = kLiveAudioRate * kLiveAudioMaxQueueMs / 1000 * 2 * (int)sizeof(int32_t);
-    if (SDL_GetAudioStreamQueued(impl_->stream) > maxBytes) {
+    int queued = SDL_GetAudioStreamQueued(impl_->stream);
+    if (queued > maxBytes) {
         SDL_ClearAudioStream(impl_->stream);
         ++overflows_;
+        queued = 0;
+        if (meter_) meter_->Clear();
     }
+    // Every captured channel is metered, not only the pair played: the meters show which
+    // channels carry sound.
+    if (meter_)
+        meter_->AddInt32(static_cast<const int32_t*>(samples), frames, channels_,
+                         queued / (2 * (int)sizeof(int32_t)));
     SDL_PutAudioStreamData(impl_->stream, stereo_.data(), bytes);
 }
 
 void LiveAudioSink::SetMuted(bool m) {
-    if (impl_ && impl_->stream) SDL_SetAudioStreamGain(impl_->stream, m ? 0.0f : 1.0f);
+    muted_ = m;
+    ApplyGain();
+}
+
+void LiveAudioSink::SetVolume(float v) {
+    volume_ = std::clamp(v, 0.0f, 1.0f);
+    ApplyGain();
+}
+
+void LiveAudioSink::ApplyGain() {
+    if (impl_ && impl_->stream) SDL_SetAudioStreamGain(impl_->stream, muted_.load() ? 0.0f : volume_.load());
 }
 
 LiveAudioSink::Stats LiveAudioSink::GetStats() const {
