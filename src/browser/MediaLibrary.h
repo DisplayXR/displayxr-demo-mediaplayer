@@ -92,6 +92,12 @@ public:
                               const std::string& folder = std::string()) const;
     // The sub-folders of `folder` that hold something of `source` under `options`, by name.
     std::vector<Folder> Folders(const Source& source, const ViewOptions& options, const std::string& folder) const;
+    // For each of `folders` (as Folders() gave them), up to `max` of what it shows a preview
+    // of: the files in it and its sub-folders (a Grouped source's: in it only; the Newest
+    // tile: its own), local files before cloud-only ones, then newest first. One pass over
+    // the items.
+    std::vector<std::vector<size_t>> FolderPreviews(const Source& source, const ViewOptions& options,
+                                                    const std::vector<Folder>& folders, size_t max) const;
     // The folder one up from `folder` in `source` (`source.folder` at the top).
     std::string Parent(const Source& source, const std::string& folder) const;
     // The parts of `folder` under the source, for the title: "MEDIA", "ZTEPics".

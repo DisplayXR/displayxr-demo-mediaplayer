@@ -35,7 +35,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <sstream>
 
 #include <nlohmann/json.hpp>  // parse agent-tool args / build results (XR_DXR_mcp_tools)
 #include <SDL3/SDL.h>   // SDL_ShowOpenFileDialog (Tier-0 native file dialog)
@@ -532,6 +534,23 @@ bool App::Initialize(const char* mediaPath) {
                     hiddenFile_ = (dir / "hidden_folders.txt").string();
                     pinned_.Load(pinnedFile_);
                     hiddenFolders_.Load(hiddenFile_);
+                    browserPrefsFile_ = (dir / "browser_view.txt").string();
+                }
+                // Tests: MEDIAPLAYER_BROWSER_PREFS names the view file to use instead; a test
+                // run (MEDIAPLAYER_SHOW_BROWSER) without it never reads or writes the user's.
+                if (const char* p = std::getenv("MEDIAPLAYER_BROWSER_PREFS"); p && *p)
+                    browserPrefsFile_ = p;
+                else if (const char* s = std::getenv("MEDIAPLAYER_SHOW_BROWSER"); s && *s && std::string(s) != "0")
+                    browserPrefsFile_.clear();
+                if (!browserPrefsFile_.empty()) {
+                    std::ifstream in(fs::u8path(browserPrefsFile_), std::ios::binary);
+                    if (in) {
+                        std::stringstream text;
+                        text << in.rdbuf();
+                        browser_->SetViewPrefs(browser::ParseDeskViewPrefs(text.str(), browser::MediaBrowser::kCardMin,
+                                                                           browser::MediaBrowser::kCardMax));
+                    }
+                    browserPrefsSaved_ = browser_->ViewPrefs();
                 }
             } else {
                 LOG_WARN("browser: could not start - Open uses the system dialog");
@@ -579,6 +598,21 @@ int App::Run() {
         if (const char* v = std::getenv("MEDIAPLAYER_BROWSER_VIEW"); browser_ && v && std::string(v) == "details")
             browser_->SetDetails(true);
         if (const char* q = std::getenv("MEDIAPLAYER_BROWSER_QUERY"); browser_ && q && *q) browser_->SetQuery(q);
+        // Test: the focus ring on tile N (0 = the first), as the arrow keys would put it.
+        if (const char* fo = std::getenv("MEDIAPLAYER_BROWSER_FOCUS"); browser_ && fo && *fo)
+            browser_->SetStartFocus((size_t)std::max(0, std::atoi(fo)));
+        // Test: select files by their place among the files ("0,2,3").
+        if (const char* se = std::getenv("MEDIAPLAYER_BROWSER_SELECT"); browser_ && se && *se) {
+            std::vector<size_t> files;
+            for (const char* c = se; *c;) {
+                char* end = nullptr;
+                const long v = std::strtol(c, &end, 10);
+                if (end == c) break;
+                if (v >= 0) files.push_back((size_t)v);
+                c = *end == ',' ? end + 1 : end;
+            }
+            browser_->SetStartSelection(std::move(files));
+        }
 #endif
     }
     // Test: switch "Convert to 3D" on without a keystroke (headless runs). Retried until it
@@ -4749,9 +4783,25 @@ void App::ApplyItemRequests() {
 #if MEDIAPLAYER_BROWSER
     browser::MediaBrowser::ItemRequest r;
     if (!browser_ || !browser_->TakeItemRequest(r)) return;
+    using Verb = browser::MediaBrowser::ItemRequest::Verb;
+    if (r.verb == Verb::CopyPath && !r.ids.empty()) {
+        // A selection: one path a line.
+        std::string text;
+        int copied = 0;
+        for (int64_t id : r.ids) {
+            const std::string p = browserProvider_->PathOf(id);
+            if (p.empty()) continue;
+            if (!text.empty()) text += "\n";
+            text += p;
+            ++copied;
+        }
+        if (copied == 0) return;
+        ImGui::SetClipboardText(text.c_str());
+        ShowToast(copied == 1 ? std::string("Path copied") : std::to_string(copied) + " paths copied");
+        return;
+    }
     const std::string path = browserProvider_->PathOf(r.id);
     if (path.empty()) return;
-    using Verb = browser::MediaBrowser::ItemRequest::Verb;
     if (r.verb == Verb::CopyPath) {
         ImGui::SetClipboardText(path.c_str());
         ShowToast("Path copied");
@@ -4931,6 +4981,14 @@ void App::BuildBrowser() {
     }
     ApplyFolderRequests();
     ApplyItemRequests();
+    // The view changed (and the size slider is let go): keep it for the next launch.
+    if (!browserPrefsFile_.empty() && !ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+        browser_->ViewPrefs() != browserPrefsSaved_) {
+        browserPrefsSaved_ = browser_->ViewPrefs();
+        std::ofstream out(std::filesystem::u8path(browserPrefsFile_), std::ios::binary | std::ios::trunc);
+        if (out) out << browser::FormatDeskViewPrefs(browserPrefsSaved_);
+        if (!out) LOG_WARN("browser: could not write '%s'", browserPrefsFile_.c_str());
+    }
     ui::BuildTransportToast(uiState_);
     browser_->RecordUploads(renderer_.FrameCmd());
     // The browser has the keyboard: no player hotkeys. Esc backs out (a sheet, a folder),

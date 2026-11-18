@@ -336,6 +336,7 @@ void MediaBrowser::TakeResults() {
             }
         }
         library_.SetItems(std::move(items));
+        UpdatePinnedRows();
         // An empty source at its top (Recents before anything was opened): show the first
         // one that holds something instead.
         // Only Recents: an empty source the user picked (Pictures still listing, or empty
@@ -418,6 +419,8 @@ void MediaBrowser::Rebuild() {
     auto matches = [&](const std::string& name) { return query_.empty() || ContainsNoCase(name, query_); };
     folders_.erase(std::remove_if(folders_.begin(), folders_.end(), [&](const Folder& f) { return !matches(f.name); }),
                    folders_.end());
+    folderPreviews_.clear();
+    if (desktop_) folderPreviews_ = library_.FolderPreviews(CurrentSource(), options_, folders_, 4);
     for (size_t i : library_.Query(CurrentSource(), options_, folder_)) {
         if (!matches(items[i].name)) continue;
         if (depth_ == DepthFilter::Both) {
@@ -497,11 +500,21 @@ MediaBrowser::Action MediaBrowser::Build() {
     TakeResults();
     if (!startSource_.empty() && listed_) {
         const std::vector<Source>& s = library_.Sources();
+        bool found = false;
         for (size_t i = 0; i < s.size(); ++i) {
             if (s[i].name != startSource_) continue;
             source_ = i;
             folder_ = s[i].folder;
             dirty_ = true;
+            found = true;
+        }
+        // Else a pinned folder by its name (desktop tests: a pinned row lit).
+        for (size_t j = 0; !found && j < pinnedRows_.size(); ++j) {
+            if (pinnedRows_[j].name != startSource_) continue;
+            source_ = pinnedSource_;
+            folder_ = pinnedRows_[j].path;
+            dirty_ = true;
+            found = true;
         }
         startSource_.clear();
     }
@@ -553,19 +566,23 @@ MediaBrowser::Action MediaBrowser::Build() {
         // The desktop look (#252): a header, a toolbar over the grid, a compact sidebar.
         ImGui::PushFont(ui::DeskFont(ui::DeskText::Body));
         const float headerH = Round(Px(44.0f)), toolbarH = Round(Px(40.0f));
+        // The status bar along the foot: not in a short window.
+        const float statusH = h >= Px(420.0f) ? Round(Px(24.0f)) : 0.0f;
         rail_ = w >= Px(kDesktopRailMinDp);
         if (rail_) drawer_ = false;
         const float sideW = rail_ ? Round(std::min(Px(220.0f), w * 0.34f)) : 0.0f;
-        action = Grid(ImVec2(sideW, headerH + toolbarH), ImVec2(w, h), now);
+        action = Grid(ImVec2(sideW, headerH + toolbarH), ImVec2(w, h - statusH), now);
         DeskToolbar(ImVec2(sideW, headerH), ImVec2(w, headerH + toolbarH));
         if (rail_) {
-            const Action picked = DeskSidebar(ImVec2(0.0f, headerH), ImVec2(sideW, h));
+            const Action picked = DeskSidebar(ImVec2(0.0f, headerH), ImVec2(sideW, h - statusH));
             if (picked != Action::None) action = picked;
         }
+        if (statusH > 0.0f) DeskStatusBar(ImVec2(0.0f, h - statusH), ImVec2(w, h));
         DeskHeader(w, headerH);
         DeskSortMenu();
         closeSheets_ = false;
-        sheetOpen_ = ImGui::IsPopupOpen("##sort_menu") || ImGui::IsPopupOpen("##folder_menu");
+        sheetOpen_ = ImGui::IsPopupOpen("##sort_menu") || ImGui::IsPopupOpen("##folder_menu") ||
+                     ImGui::IsPopupOpen("##pinned_menu");
         ImGui::PopFont();
     } else if (open) {
         const bool railShown = rail_ && sidebar_;
@@ -899,6 +916,8 @@ MediaBrowser::Action MediaBrowser::Sidebar(ImVec2 min, ImVec2 max, double now) {
 }
 
 MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
+    statusItem_ = -1;
+    statusFolder_ = SIZE_MAX;
     const ImGuiStyle& style = ImGui::GetStyle();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const MediaAccess access = provider_->Access();
@@ -1073,6 +1092,24 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         cache_.Use(id, slot);  // so a new thumbnail never takes a slot the window still shows
         if (perTile > 1) cache_.Use(RightEyeKey(id), slot);
     }
+    // Desktop grid: the visible folder cards preview what they hold, 2 x 2, from the slots the
+    // files' window leaves: four each while they fit, else one each, else none (the glyph).
+    // Not in the 3D grid, whose files take two slots each.
+    size_t previewEach = 0;
+    const size_t visFolders = visFirst < nf ? std::min(visEnd, nf) - visFirst : 0;
+    if (desk && !list && perTile == 1 && visFolders > 0 && folderPreviews_.size() == nf) {
+        const size_t used = winEnd > std::max(winFirst, nf) ? winEnd - std::max(winFirst, nf) : 0;
+        const size_t spare = atlas_.SlotCount() > used ? atlas_.SlotCount() - used : 0;
+        previewEach = spare >= 4 * visFolders ? 4 : spare >= visFolders ? 1 : 0;
+    }
+    for (size_t p = visFirst; p < visFirst + visFolders && previewEach > 0; ++p) {
+        for (size_t k = 0; k < folderPreviews_[p].size() && k < previewEach; ++k) {
+            const int64_t id = items[folderPreviews_[p][k]].id;
+            window.insert(id);
+            int slot = 0;
+            cache_.Use(id, slot);
+        }
+    }
     // A thumbnail big enough that the part a tile shows covers it pixel for pixel, as far as
     // an atlas slot holds.
     // On desktop in steps of 128 px: the card size eases through every width, and a new edge
@@ -1107,6 +1144,8 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         want.push_back(r);
     };
     for (size_t p = std::max(visFirst, nf); p < winEnd; ++p) ask(items[shown_[p - nf]]);
+    for (size_t p = visFirst; p < visFirst + visFolders && previewEach > 0; ++p)
+        for (size_t k = 0; k < folderPreviews_[p].size() && k < previewEach; ++k) ask(items[folderPreviews_[p][k]]);
     for (size_t p = visFirst; p > std::max(winFirst, nf); --p) ask(items[shown_[p - 1 - nf]]);
     for (size_t k = 0; k < unknown_.size() && k < kScanBatch; ++k) ask(items[unknown_[k]]);
     if (!Same(want, wanted_)) {
@@ -1168,14 +1207,34 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         keyOpen = cursor_ < n && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
                                   ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
     }
-    // Desktop: Ctrl+Shift+C copies the path of the file with the focus ring (else under the
-    // pointer).
+    if (desktop_ && cursor_ >= n && startFocus_ < n) cursor_ = startFocus_;
+    if (desktop_ && !startSelection_.empty() && !shown_.empty()) {
+        for (size_t f : startSelection_)
+            if (f < shown_.size()) selected_.insert(items[shown_[f]].id);
+        startSelection_.clear();
+    }
+    // The status bar's tile: the focus ring's, else the one under the pointer.
+    if (desktop_) {
+        const size_t at = cursor_ < n ? cursor_ : hovered;
+        if (at < nf) statusFolder_ = at;
+        else if (at < n) statusItem_ = items[shown_[at - nf]].id;
+    }
+    // Desktop: Ctrl+Shift+C copies the paths of the selection, else the path of the file with
+    // the focus ring (else under the pointer).
     if (desktop_ && ImGui::GetIO().KeyCtrl && ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
         const size_t at = cursor_ < n ? cursor_ : hovered;
-        if (at >= nf && at < n) {
-            itemRequest_ = ItemRequest{ItemRequest::Verb::CopyPath, items[shown_[at - nf]].id};
+        if (!selected_.empty()) {
+            itemRequest_ = ItemRequest{ItemRequest::Verb::CopyPath, -1, SelectedInOrder()};
+            itemRequestPending_ = true;
+        } else if (at >= nf && at < n) {
+            itemRequest_ = ItemRequest{ItemRequest::Verb::CopyPath, items[shown_[at - nf]].id, {}};
             itemRequestPending_ = true;
         }
+    }
+    // Desktop: Ctrl+A selects every file shown (not in the search box, where it is the text's).
+    if (desktop_ && ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift && !ImGui::GetIO().WantTextInput &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+        for (size_t i : shown_) selected_.insert(items[i].id);
     }
     // A long press on an item starts select mode with it. In select mode it is a tap.
     if (pressed >= nf && pressed < n && !selecting_ && provider_->CanDelete() && gridScroll_.TakeLongPress(now)) {
@@ -1204,7 +1263,8 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
             if (list)
                 DeskFolderRow(dl, folders_[p], columns, a, b, pic, p == hovered, p == pressed, p == cursor_);
             else
-                DeskFolderCard(dl, folders_[p], a, b, pic, p == hovered, p == pressed, p == cursor_);
+                DeskFolderCard(dl, folders_[p], a, b, pic, p == hovered, p == pressed, p == cursor_,
+                               p < folderPreviews_.size() ? &folderPreviews_[p] : nullptr, previewEach);
             continue;
         }
         if (p < nf) {
@@ -1383,6 +1443,8 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
             ImGui::OpenPopup("##folder_menu");
         } else if (clicked >= nf && clicked < n) {
             menuItem_ = items[shown_[clicked - nf]].id;
+            // Outside the selection, the menu is the file's alone (as File Explorer's).
+            if (!selected_.count(menuItem_)) selected_.clear();
             ImGui::OpenPopup("##item_menu");
         }
     }
@@ -1403,6 +1465,18 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     } else if (!tap || !itemAt(gridPress_, picked)) {
         return Action::None;
     }
+    // Desktop: Ctrl / Shift + click selects (folders are left out); a plain click opens, and
+    // leaves the selection behind.
+    if (desktop_ && !keyOpen && (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift)) {
+        if (picked >= nf && picked < n) {
+            std::vector<int64_t> ids;
+            ids.reserve(shown_.size());
+            for (size_t i : shown_) ids.push_back(items[i].id);
+            ClickSelect(ids, picked - nf, ImGui::GetIO().KeyCtrl, ImGui::GetIO().KeyShift, selAnchor_, selected_);
+        }
+        return Action::None;
+    }
+    if (desktop_) selected_.clear();
     if (picked < nf) {
         if (!selecting_) GoTo(folders_[picked].path);
         return Action::None;
@@ -1439,6 +1513,14 @@ void MediaBrowser::FolderMenu() {
     ImGui::EndPopup();
 }
 
+std::vector<int64_t> MediaBrowser::SelectedInOrder() const {
+    std::vector<int64_t> out;
+    const std::vector<MediaItem>& items = library_.Items();
+    for (size_t i : shown_)
+        if (selected_.count(items[i].id)) out.push_back(items[i].id);
+    return out;
+}
+
 void MediaBrowser::GoTo(const std::string& folder) {
     folder_ = folder;
     dirty_ = true;
@@ -1446,6 +1528,36 @@ void MediaBrowser::GoTo(const std::string& folder) {
 }
 
 void MediaBrowser::Up() { GoTo(library_.Parent(CurrentSource(), folder_)); }
+
+// The Pinned source's folders, for the desktop sidebar: one row per pinned folder, with what it
+// holds (as the source rows' counts: every supported file, whatever the view options). A
+// folder shown that is no longer pinned goes back to the source's top.
+void MediaBrowser::UpdatePinnedRows() {
+    pinnedRows_.clear();
+    pinnedSource_ = SIZE_MAX;
+    const std::vector<Source>& sources = library_.Sources();
+    for (size_t i = 0; i < sources.size(); ++i) {
+        if (sources[i].kind != SourceKind::Pinned) continue;
+        pinnedSource_ = i;
+        pinnedRows_ = library_.Folders(sources[i], ViewOptions{}, sources[i].folder);
+        break;
+    }
+    if (source_ != pinnedSource_ || pinnedSource_ == SIZE_MAX || folder_ == CurrentSource().folder) return;
+    for (const Folder& f : pinnedRows_)
+        if (folder_.compare(0, f.path.size(), f.path) == 0) return;
+    folder_ = CurrentSource().folder;
+    dirty_ = true;
+}
+
+void MediaBrowser::SetViewPrefs(const DeskViewPrefs& prefs) {
+    details_ = prefs.details;
+    cardW_ = std::min(kCardMax, std::max(kCardMin, prefs.cardW));
+    cardShown_ = 0.0f;  // drawn at that size at once, not eased to it
+    if (options_.order != prefs.order) {
+        options_.order = prefs.order;
+        dirty_ = true;
+    }
+}
 
 void MediaBrowser::SetQuery(const std::string& query) {
     std::snprintf(search_, sizeof(search_), "%s", query.c_str());
@@ -1467,6 +1579,7 @@ void MediaBrowser::TrackHistory() {
     if (back_.size() > 64) back_.erase(back_.begin());
     forward_.clear();
     here_ = Place{source_, folder_};
+    selected_.clear();  // a selection belongs to the place it was made in
     if (search_[0]) {
         search_[0] = '\0';
         query_.clear();
@@ -1501,7 +1614,8 @@ void MediaBrowser::EndSelection() {
 }
 
 bool MediaBrowser::CanGoBack() const {
-    return provider_ && (drawer_ || sheetOpen_ || selecting_ || folder_ != CurrentSource().folder);
+    return provider_ && (drawer_ || sheetOpen_ || selecting_ || (desktop_ && !selected_.empty()) ||
+                         folder_ != CurrentSource().folder);
 }
 
 bool MediaBrowser::Back() {
@@ -1510,7 +1624,7 @@ bool MediaBrowser::Back() {
         drawer_ = false;
     } else if (sheetOpen_) {
         closeSheets_ = true;  // the next Build() closes it: popups are ImGui's, within a frame
-    } else if (selecting_) {
+    } else if (selecting_ || (desktop_ && !selected_.empty())) {
         EndSelection();
     } else {
         Up();

@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace mp::browser {
@@ -43,6 +44,31 @@ bool ViewOptionsAreDefault(const ViewOptions& options, bool showUnsupported);
 
 // The type chip's label.
 const char* TypeLabel(TypeFilter type);
+
+// Desktop (#252): how the browser looks, kept between launches: grid or details, the cards'
+// width (design px), and the sort. As text, one "key=value" a line ("view=details",
+// "card=200", "sort=oldest"); a line it does not know is skipped and a bad value keeps the
+// default, so an older or a newer file still reads.
+struct DeskViewPrefs {
+    bool details = false;
+    float cardW = 176.0f;
+    SortOrder order = SortOrder::NewestFirst;
+    bool operator==(const DeskViewPrefs& o) const {
+        return details == o.details && cardW == o.cardW && order == o.order;
+    }
+    bool operator!=(const DeskViewPrefs& o) const { return !(*this == o); }
+};
+std::string FormatDeskViewPrefs(const DeskViewPrefs& prefs);
+// The prefs in `text`, from the defaults; `cardW` is clamped to [cardMin, cardMax].
+DeskViewPrefs ParseDeskViewPrefs(const std::string& text, float cardMin, float cardMax);
+
+// Desktop selection, as File Explorer's: a click on `ids[at]` (the files in grid order) with
+// Ctrl toggles it and makes it the anchor; with Shift selects the run from the anchor to it
+// (the anchor stays; with Ctrl too the run is added, else it replaces the selection; no anchor
+// in `ids`: the clicked one); with neither, it alone (the anchor). `anchor` is an id, so it
+// survives the grid being rebuilt.
+void ClickSelect(const std::vector<int64_t>& ids, size_t at, bool ctrl, bool shift, int64_t& anchor,
+                 std::unordered_set<int64_t>& selected);
 
 // A date section: `key` orders and tells sections apart, `label` heads it.
 struct DateSection {

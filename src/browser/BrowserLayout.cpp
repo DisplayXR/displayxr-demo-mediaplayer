@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace mp::browser {
 
@@ -157,6 +159,62 @@ size_t GridLayout::TileAtOffset(float offset) const {
                                [](float v, const Row& r) { return v < r.y; });
     if (it == rows_.begin()) return 0;
     return (it - 1)->first;
+}
+
+void ClickSelect(const std::vector<int64_t>& ids, size_t at, bool ctrl, bool shift, int64_t& anchor,
+                 std::unordered_set<int64_t>& selected) {
+    if (at >= ids.size()) return;
+    if (shift) {
+        size_t from = at;
+        const auto it = std::find(ids.begin(), ids.end(), anchor);
+        if (it != ids.end()) from = (size_t)(it - ids.begin());
+        else anchor = ids[at];
+        if (!ctrl) selected.clear();
+        for (size_t i = std::min(from, at); i <= std::max(from, at); ++i) selected.insert(ids[i]);
+        return;
+    }
+    anchor = ids[at];
+    if (ctrl) {
+        if (!selected.erase(ids[at])) selected.insert(ids[at]);
+        return;
+    }
+    selected.clear();
+    selected.insert(ids[at]);
+}
+
+std::string FormatDeskViewPrefs(const DeskViewPrefs& prefs) {
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "view=%s\ncard=%d\nsort=%s\n", prefs.details ? "details" : "grid",
+                  (int)std::lround(prefs.cardW), prefs.order == SortOrder::OldestFirst ? "oldest" : "newest");
+    return buf;
+}
+
+DeskViewPrefs ParseDeskViewPrefs(const std::string& text, float cardMin, float cardMax) {
+    DeskViewPrefs p;
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(at, end - at);
+        at = end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = line.substr(0, eq), value = line.substr(eq + 1);
+        if (key == "view") {
+            if (value == "details") p.details = true;
+            else if (value == "grid") p.details = false;
+        } else if (key == "card") {
+            char* stop = nullptr;
+            const double v = std::strtod(value.c_str(), &stop);
+            if (stop != value.c_str() && *stop == '\0' && std::isfinite(v))
+                p.cardW = std::min(cardMax, std::max(cardMin, (float)v));
+        } else if (key == "sort") {
+            if (value == "oldest") p.order = SortOrder::OldestFirst;
+            else if (value == "newest") p.order = SortOrder::NewestFirst;
+        }
+    }
+    return p;
 }
 
 float GridLayout::OffsetOf(size_t p) const {

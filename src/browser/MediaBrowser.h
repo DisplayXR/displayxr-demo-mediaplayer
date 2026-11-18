@@ -58,10 +58,12 @@ public:
         return true;
     }
 
-    // Desktop: what the user asked of a file's menu (right click) or its keys.
+    // Desktop: what the user asked of a file's menu (right click) or its keys. CopyPath of a
+    // selection: `ids`, in grid order (one path a line); else `id` alone.
     struct ItemRequest {
         enum class Verb { Reveal, CopyPath } verb = Verb::Reveal;
         int64_t id = -1;
+        std::vector<int64_t> ids;
     };
     bool TakeItemRequest(ItemRequest& out) {
         if (!itemRequestPending_) return false;
@@ -122,12 +124,22 @@ public:
     void SetQuery(const std::string& query);
     // Ctrl+F: the search box takes the keyboard.
     void FocusSearch() { focusSearch_ = true; }
+    // Desktop: grid or details, the cards' size and the sort, as the caller keeps them
+    // between launches (BrowserLayout.h).
+    DeskViewPrefs ViewPrefs() const { return DeskViewPrefs{details_, cardW_, options_.order}; }
+    void SetViewPrefs(const DeskViewPrefs& prefs);
+    static constexpr float kCardMin = 120.0f, kCardMax = 320.0f;  // desktop: the size slider's range
 
     // The 3D grid (#180, StereoGrid.h). The "3D only" filter is on: the caller takes the
     // panel to 3D for it.
     bool WantsStereo() const { return depth_ == DepthFilter::Only3D; }
     // The 2D / 3D filter, as the chip sets it (tests start on "3D only").
     void SetDepthFilter(DepthFilter depth) { SetDepth(depth); }
+    // Tests (MEDIAPLAYER_BROWSER_FOCUS): the focus ring on tile `index` whenever it has none.
+    void SetStartFocus(size_t index) { startFocus_ = index; }
+    // Tests (MEDIAPLAYER_BROWSER_SELECT): select the files at these places in the grid (0 = the
+    // first file, after the folders) once they are shown.
+    void SetStartSelection(std::vector<size_t> files) { startSelection_ = std::move(files); }
     // Show the source named `name` once the list arrives (tests: MEDIAPLAYER_BROWSER_SOURCE).
     void SetStartSource(std::string name) { startSource_ = std::move(name); }
     // The panel is in 3D and the caller draws Stereo() into the projection layer, so
@@ -149,7 +161,6 @@ public:
 private:
     static constexpr uint32_t kTile = 512;  // thumbnail edge, px
     static constexpr uint32_t kSlots = 64;  // thumbnails on the GPU: a screen and a few rows
-    static constexpr float kCardMin = 120.0f, kCardMax = 320.0f;  // desktop: the size slider's range
 
     void TakeResults();
     void Rebuild();
@@ -175,8 +186,10 @@ private:
     void DeskToolbar(ImVec2 min, ImVec2 max);
     void DeskSortMenu();
     Action DeskSidebar(ImVec2 min, ImVec2 max);
+    // `preview`: indices into the library's items to show a mosaic of (up to `shown` of them,
+    // as far as their thumbnails are here); none: the folder glyph.
     void DeskFolderCard(ImDrawList* dl, const Folder& folder, ImVec2 a, ImVec2 b, float pic, bool hovered, bool pressed,
-                        bool focus);
+                        bool focus, const std::vector<size_t>* preview, size_t shown);
     void DeskItemCard(ImDrawList* dl, const MediaItem& item, bool supported, const StereoVerdict& verdict, ImVec2 a,
                       ImVec2 b, float pic, bool hovered, bool pressed, bool focus, bool picture, bool behind);
     static float DeskCaptionHeight();
@@ -199,7 +212,10 @@ private:
                      bool picture, bool behind);
     void DeskSearch(ImVec2 pos, float w, float h, const std::string& place);
     void DeskItemMenu();
+    void DeskPinnedMenu();
+    void DeskStatusBar(ImVec2 min, ImVec2 max);
     void TrackHistory();
+    void UpdatePinnedRows();
 
     MediaProvider* provider_ = nullptr;
     bool desktop_ = false;         // SetDesktop
@@ -208,6 +224,11 @@ private:
     bool folderRequestPending_ = false;
     std::string menuFolder_;       // the folder tile whose menu is open
     size_t cursor_ = SIZE_MAX;     // desktop: the keyboard's tile (SIZE_MAX: none yet)
+    size_t startFocus_ = SIZE_MAX;  // SetStartFocus
+    int64_t selAnchor_ = -1;        // desktop: Shift+click's anchor (ClickSelect)
+    std::vector<size_t> startSelection_;  // SetStartSelection, until applied
+    // Desktop: the selected files' ids in grid order.
+    std::vector<int64_t> SelectedInOrder() const;
     bool details_ = false;         // desktop: the details view
     float cardW_ = 176.0f;         // desktop grid: a card's width, design px (the size slider)
     float cardShown_ = 0.0f;       // ... as drawn: eases to cardW_ (0: not drawn yet)
@@ -225,6 +246,13 @@ private:
     bool placed_ = false;
     ItemRequest itemRequest_;
     bool itemRequestPending_ = false;
+    // Desktop: the Pinned source's folders, a sidebar row each (UpdatePinnedRows).
+    std::vector<Folder> pinnedRows_;
+    size_t pinnedSource_ = SIZE_MAX;  // the Pinned source's index, SIZE_MAX: none
+    std::string pinnedMenu_;          // the pinned row whose menu is open
+    // Desktop status bar: this frame's tile with the focus ring, else under the pointer.
+    int64_t statusItem_ = -1;
+    size_t statusFolder_ = SIZE_MAX;
     int64_t menuItem_ = -1;        // the file whose menu is open
     bool menuOpen_ = false;        // its menu's "Open", this frame
     MediaLibrary library_;
@@ -250,10 +278,14 @@ private:
     std::string startSource_;  // SetStartSource, until the list arrives
 
     bool selecting_ = false;  // select mode: a tap picks an item, the bin deletes the picked
+    // The picked items: select mode's (touch), or Ctrl / Shift + click's (desktop, where a
+    // plain click still opens and Esc clears them).
     std::unordered_set<int64_t> selected_;
 
     bool dirty_ = true;            // folders_ and shown_ need a rebuild
     std::vector<Folder> folders_;  // the folder's sub-folders: the first tiles
+    // Desktop: per folder tile, the files its card previews (MediaLibrary::FolderPreviews).
+    std::vector<std::vector<size_t>> folderPreviews_;
     std::vector<size_t> shown_;    // indices into the library's items, in grid order after the folders
     std::vector<size_t> unknown_;  // under a depth filter: items with no verdict yet
     // The grid's date sections (All media, Camera: "Today", "October 2026"): how many of

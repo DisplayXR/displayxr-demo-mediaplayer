@@ -183,6 +183,45 @@ std::vector<Folder> MediaLibrary::Folders(const Source& source, const ViewOption
     return out;
 }
 
+std::vector<std::vector<size_t>> MediaLibrary::FolderPreviews(const Source& source, const ViewOptions& options,
+                                                              const std::vector<Folder>& folders, size_t max) const {
+    std::vector<std::vector<size_t>> out(folders.size());
+    if (max == 0 || folders.empty()) return out;
+    std::unordered_map<std::string, size_t> byPath;
+    for (size_t f = 0; f < folders.size(); ++f) {
+        if (source.mode == SourceMode::Grouped && folders[f].path == kNewestFolder)
+            out[f] = Query(source, options, kNewestFolder);
+        else
+            byPath.emplace(folders[f].path, f);
+    }
+    const bool exact = source.mode == SourceMode::Grouped;
+    for (size_t i = 0; i < items_.size(); ++i) {
+        if (!Holds(source, options, i)) continue;
+        // The folder tile it falls under: its own folder, or (a tree) one above it.
+        for (std::string p = items_[i].folder; !p.empty(); p = UpOne(p)) {
+            const auto it = byPath.find(p);
+            if (it != byPath.end()) {
+                out[it->second].push_back(i);
+                break;
+            }
+            if (exact) break;
+        }
+    }
+    const auto before = [&](size_t a, size_t b) {
+        const MediaItem& x = items_[a];
+        const MediaItem& y = items_[b];
+        if (x.cloudOnly != y.cloudOnly) return !x.cloudOnly;
+        if (x.dateMs != y.dateMs) return x.dateMs > y.dateMs;
+        return x.id > y.id;
+    };
+    for (std::vector<size_t>& v : out) {
+        const size_t keep = std::min(max, v.size());
+        std::partial_sort(v.begin(), v.begin() + (ptrdiff_t)keep, v.end(), before);
+        v.resize(keep);
+    }
+    return out;
+}
+
 std::string MediaLibrary::Parent(const Source& source, const std::string& folder) const {
     if (folder == source.folder) return folder;
     if (source.mode == SourceMode::Grouped) return source.folder;

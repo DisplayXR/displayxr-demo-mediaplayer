@@ -260,12 +260,58 @@ void TestDeclaredSources() {
     CHECK(!library.Supported(5) && library.Supported(0), "Supported");
 }
 
+// Folder previews (#252 desktop): what a folder card shows a mosaic of.
+void TestFolderPreviews() {
+    using mp::browser::Folder;
+    using mp::browser::kNewestFolder;
+    using mp::browser::SourceMode;
+    std::vector<Source> declared(2);
+    declared[0].kind = SourceKind::Pictures, declared[0].name = "Pictures", declared[0].bit = 0;
+    declared[0].mode = SourceMode::Tree, declared[0].folder = "C:/P/";
+    declared[1].kind = SourceKind::Folders, declared[1].name = "Media folders", declared[1].bit = 1;
+    declared[1].mode = SourceMode::Grouped, declared[1].newest = 3;
+    MediaLibrary library;
+    library.SetSources(declared);
+    MediaItem cloud = Desk(4, "d.jpg", MediaType::Image, 90, "C:/P/trip/", 0b01);
+    cloud.cloudOnly = true;
+    library.SetItems({
+        Desk(1, "a.jpg", MediaType::Image, 10, "C:/P/trip/", 0b11),
+        Desk(2, "b.jpg", MediaType::Image, 30, "C:/P/trip/day1/", 0b11),
+        Desk(3, "c.mp4", MediaType::Video, 20, "C:/P/trip/", 0b11),
+        cloud,
+        Desk(5, "e.jpg", MediaType::Image, 50, "C:/P/trip/", 0b01),
+        Desk(6, "f.jpg", MediaType::Image, 60, "C:/P/work/", 0b01),
+        Desk(7, "g.xyz", MediaType::Image, 70, "C:/P/work/", 0b01),
+    });
+    const std::vector<Source>& s = library.Sources();
+    const ViewOptions all;
+    const std::vector<Folder> tree = library.Folders(s[0], all, "C:/P/");
+    std::vector<std::vector<size_t>> p = library.FolderPreviews(s[0], all, tree, 4);
+    CHECK(tree.size() == 2 && p.size() == 2, "one preview per folder");
+    CHECK((Ids(library, p[0]) == std::vector<int64_t>{5, 2, 3, 1}), "a tree: its sub-folders too, local first, newest first");
+    CHECK((Ids(library, p[1]) == std::vector<int64_t>{6}), "an unsupported file is never a preview");
+    p = library.FolderPreviews(s[0], all, tree, 5);
+    CHECK((Ids(library, p[0]) == std::vector<int64_t>{5, 2, 3, 1, 4}), "a cloud-only file after the local ones");
+    ViewOptions videos;
+    videos.type = TypeFilter::Videos;
+    CHECK((Ids(library, library.FolderPreviews(s[0], videos, tree, 4)[0]) == std::vector<int64_t>{3}),
+          "under the type filter");
+    const std::vector<Folder> groups = library.Folders(s[1], all, "");
+    p = library.FolderPreviews(s[1], all, groups, 4);
+    CHECK(groups.size() == 3 && groups[0].path == kNewestFolder, "Newest, day1, trip");
+    CHECK((Ids(library, p[0]) == std::vector<int64_t>{2, 3, 1}), "the Newest tile: its own");
+    CHECK((Ids(library, p[1]) == std::vector<int64_t>{2}) && (Ids(library, p[2]) == std::vector<int64_t>{3, 1}),
+          "a group: only the files directly in it");
+    CHECK(library.FolderPreviews(s[0], all, tree, 0)[0].empty(), "max 0: none");
+}
+
 int main() {
     TestSupportedSet();
     TestSources();
     TestQuery();
     TestFolders();
     TestDeclaredSources();
+    TestFolderPreviews();
     if (g_failures) {
         std::fprintf(stderr, "media_library_test: %d failure(s)\n", g_failures);
         return 1;

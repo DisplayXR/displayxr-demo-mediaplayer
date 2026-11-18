@@ -468,6 +468,12 @@ private:
     RecentList pinned_{64}, hiddenFolders_{256};
     std::string pinnedFile_, hiddenFile_;
     bool pinPickPending_ = false;  // the folder dialog is choosing a folder to pin
+#if MEDIAPLAYER_BROWSER
+    // The browser's view (grid / details, card size, sort), kept between launches beside
+    // pinned.txt; written when it changes and no drag is under way. Empty: not kept.
+    std::string browserPrefsFile_;
+    browser::DeskViewPrefs browserPrefsSaved_;
+#endif
 
     // Folder navigation / slideshow. folderFiles_ holds the supported assets in the
     // current media's directory (sorted); folderIndex_ points at the loaded one.
