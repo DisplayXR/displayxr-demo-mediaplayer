@@ -2166,20 +2166,29 @@ void App::ApplyLayout(const MediaInfo& info) {
     // make the slideshow look broken. Cleared HERE — at the point a load commits — rather
     // than at LoadMedia entry, so a failed open leaves the still-displayed media's pin on.
     layoutPinned_ = false;
-#if MEDIAPLAYER_PRO
-    // A monitoring station shows stereo content in 3D: when the panel is in a flat mode
-    // that nobody chose (a runtime that starts in 2D, e.g. the sim display), ask for the
-    // first 3D mode. A V press or the Mode button is a choice and is left alone; so is
-    // MEDIAPLAYER_START_MODE. The base player keeps the panel's mode as it finds it.
-    if (layout_ != StereoLayout::Mono && !isLogo_ && !userModeChoice_ && startMode_ < 0 &&
-        pendingModeRequest_ < 0 && xr_.CurrentModeIsFlat()) {
-        const int32_t m = xr_.FindStereoMode();
-        if (m >= 0) {
-            pendingModeRequest_ = m;
-            LOG_INFO("Pro: stereo content on a flat panel - requesting the first 3D mode [%d]", m);
+    // The panel follows the content until the user picks a mode (V, the Mode button,
+    // Convert to 3D, which all set userModeChoice_; MEDIAPLAYER_START_MODE pins it too):
+    // stereo content on a flat panel asks for the first 3D mode. The base player also takes
+    // a 2D picture or video to the flat mode: a 2D photo opened from the browser went 3D,
+    // because the idle screen's borrow handed the panel's 3D start mode back (#252). Pro, a
+    // monitoring station, leaves a mono file in whatever mode the panel is in.
+    if (!isLogo_ && !userModeChoice_ && startMode_ < 0) {
+        // The mode the panel is in, or is about to be in.
+        const int32_t target = pendingModeRequest_ >= 0 ? pendingModeRequest_ : (int32_t)xr_.CurrentModeIndex();
+        const int32_t flat = xr_.FindFlatMode();
+        const bool targetFlat = flat >= 0 ? target == flat : xr_.CurrentModeIsFlat();
+        int32_t want = -1;
+        if (layout_ != StereoLayout::Mono && targetFlat) want = xr_.FindStereoMode();
+#if !MEDIAPLAYER_PRO
+        else if (layout_ == StereoLayout::Mono && !targetFlat) want = flat;
+#endif
+        if (want >= 0 && want != target) {
+            pendingModeRequest_ = want;
+            silentModeTarget_ = want;  // the content's doing, not the user's: no mode chip
+            LOG_INFO("%s content - requesting the %s mode [%d]", layout_ == StereoLayout::Mono ? "2D" : "3D",
+                     layout_ == StereoLayout::Mono ? "flat" : "first 3D", want);
         }
     }
-#endif
     // Toast only for a genuine content verdict. The aspect rung is now the routine
     // default rather than an exception, so toasting it would fire on nearly every load
     // and on every slideshow step; the HUD label carries that state persistently instead.

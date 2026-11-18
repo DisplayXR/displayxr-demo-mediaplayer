@@ -138,6 +138,7 @@ void LiftClient::Refresh() {
                 return;
             }
         }
+        const bool wasPresent = taskPresent_;
         taskPresent_ = false;
         for (uint32_t i = 0; i < n && i < tasks.size(); ++i) {
             if (tasks[i].task == XR_LIFT_TASK_VIEWS_MONO_DXR) {
@@ -146,6 +147,10 @@ void LiftClient::Refresh() {
                 taskPresent_ = true;
             }
         }
+        // The task can arrive after Attach (an in-process session's link to the service
+        // connects in the background): say so when it comes or goes.
+        if (taskPresent_ != wasPresent)
+            LOG_INFO("2D→3D conversion: VIEWS_MONO task %s", taskPresent_ ? TaskStateName(task_.state) : "gone");
         RefreshCandidates();
         return;
     }
