@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -849,6 +850,7 @@ int App::Run() {
             RenderOneFrame();
             const StageClock::time_point loopEnd = StageClock::now();
             renderer_.EndStageLoop(StageMs(loopT0, loopEnd));
+            if (!renderer_.LastSlowLoop().empty()) LOG_WARN("slow frame: %s", renderer_.LastSlowLoop().c_str());
             loopT0 = loopEnd;
         } else {
             loopT0 = StageClock::now();  // not rendering: nothing to time
@@ -1148,6 +1150,18 @@ void App::RenderOneFrame() {
             if (k3dAt > 0 && (long)rendered_ == k3dAt && browser_) {
                 LOG_INFO("test: 3D filter on at frame %ld", k3dAt);
                 browser_->SetDepthFilter(browser::DepthFilter::Only3D);
+            }
+            // Test: MEDIAPLAYER_BROWSER_GOTO=<source> at MEDIAPLAYER_BROWSER_GOTO_AT=<frame>,
+            // as a click on that source in the sidebar.
+            static const long kGotoAt = [] {
+                const char* f = std::getenv("MEDIAPLAYER_BROWSER_GOTO_AT");
+                return f ? std::atol(f) : 0L;
+            }();
+            if (kGotoAt > 0 && (long)rendered_ == kGotoAt && browser_) {
+                if (const char* g = std::getenv("MEDIAPLAYER_BROWSER_GOTO")) {
+                    LOG_INFO("test: go to '%s' at frame %ld", g, kGotoAt);
+                    browser_->SetStartSource(g);
+                }
             }
             RequestBrowserMode();
             if (browser_) browser_->SetStereo(GridStereo(frame.viewCount), xr_.ActiveViewScaleX());
@@ -4908,7 +4922,13 @@ void App::BuildBrowser() {
         BuildTransportUI();
         return;
     }
+    const auto buildT0 = std::chrono::steady_clock::now();
     const browser::MediaBrowser::Action action = browser_->Build();
+    {
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildT0).count();
+        if (ms > 100.0) LOG_WARN("browser: a frame's Build() took %.0f ms", ms);
+    }
     ApplyFolderRequests();
     ApplyItemRequests();
     ui::BuildTransportToast(uiState_);

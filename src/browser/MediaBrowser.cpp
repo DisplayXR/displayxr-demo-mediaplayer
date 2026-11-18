@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "browser/MediaBrowser.h"
 
+#include "Log.h"
+
 #include "browser/TileCrop.h"
 #include "ui/Icons.h"
 #include "ui/TransportUI.h"
@@ -8,6 +10,7 @@
 #include "ui/UiText.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -503,7 +506,15 @@ MediaBrowser::Action MediaBrowser::Build() {
         startSource_.clear();
     }
     if (desktop_) TrackHistory();
-    if (dirty_) Rebuild();
+    if (dirty_) {
+        // A slow rebuild stalls the whole player (it runs on the render thread): say so.
+        const auto t0 = std::chrono::steady_clock::now();
+        Rebuild();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (ms > 50.0)
+            LOG_WARN("browser: rebuild took %.0f ms (%zu folders, %zu items, %zu unknown)", ms, folders_.size(),
+                     shown_.size(), unknown_.size());
+    }
     cache_.NextFrame();
 
     g_dpUnits = desktop_ ? 1.0f : 1.5f;
