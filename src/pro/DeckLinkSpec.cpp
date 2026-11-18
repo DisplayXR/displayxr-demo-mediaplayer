@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pro/DeckLinkSpec.h"
 
+#include "pro/LiveAudio.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -53,6 +55,13 @@ bool ParseDeckLinkSpec(const std::string& args, DeckLinkConfig& c) {
         const std::string t = rest.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
         if (t == "sdi" || t == "hdmi") c.input = t;
         else if (t.rfind("mode=", 0) == 0) c.mode = t.substr(5);
+        else if (t == "audio") c.audioPair = 1;
+        else if (t.rfind("audio=", 0) == 0) {
+            char* end = nullptr;
+            const long pr = std::strtol(t.c_str() + 6, &end, 10);
+            if (!end || *end != '\0' || pr < 0 || pr > kLiveAudioMaxPair) return false;
+            c.audioPair = (int)pr;  // audio=0 is off, same as no token
+        }
         else if (!t.empty()) {
             DeckLinkConfig::Stereo st;
             if (!DeckLinkConfig::ParseStereo(t, st)) return false;
@@ -101,6 +110,7 @@ bool DeckLinkDialogFromConfig(const DeckLinkConfig& c, const std::vector<std::st
     f.conn = c.input == "sdi" ? 1 : c.input == "hdmi" ? 2 : 0;
     f.stereo = c.stereo == S::Sbs ? 1 : c.stereo == S::Dual ? 2 : c.stereo == S::Mono ? 3 : 0;
     f.mode = c.mode;
+    f.audio = c.audioPair;
     out = f;
     return true;
 }
@@ -116,6 +126,8 @@ std::string DeckLinkSpecFromDialog(const DeckLinkDialogFields& f) {
         if (f.stereo >= 1 && f.stereo <= 3) spec += std::string(",") + st[f.stereo];
     }
     if (!f.mode.empty()) spec += ",mode=" + f.mode;
+    if (f.audio == 1) spec += ",audio";
+    else if (f.audio > 1 && f.audio <= kLiveAudioMaxPair) spec += ",audio=" + std::to_string(f.audio);
     return spec;
 }
 

@@ -9,6 +9,7 @@
 #include "pro/ConvertPool.h"
 #include "pro/DeckLinkFormat.h"
 #include "pro/DirectPair.h"
+#include "pro/LiveAudio.h"
 #include "pro/PerfSwitches.h"
 #include "pro/TimecodePairer.h"
 
@@ -93,6 +94,11 @@ bool DeckLinkSource::Open(const DeckLinkConfig& cfg) {
         formatWarning_[0].clear();
         formatWarning_[1].clear();
     }
+    {
+        std::lock_guard<std::mutex> lk(audioMutex_);
+        audioSink_.reset();
+        audioError_.clear();
+    }
     if (!Available()) {
         Fail(LiveState::Failed, "this build has no Blackmagic DeckLink support");
         return false;
@@ -142,6 +148,29 @@ void DeckLinkSource::Stop() {
     }
     stop_ = false;
     SetState(LiveState::Closed);
+}
+
+void DeckLinkSource::SetAudioMuted(bool m) {
+    audioMuted_ = m;  // a sink opened later starts with this
+    std::lock_guard<std::mutex> lk(audioMutex_);
+    if (audioSink_) audioSink_->SetMuted(m);
+}
+
+DeckLinkSource::AudioStatus DeckLinkSource::GetAudioStatus() const {
+    AudioStatus a;
+    a.requested = cfg_.audioPair > 0 && GetState() != LiveState::Closed;
+    std::lock_guard<std::mutex> lk(audioMutex_);
+    a.error = audioError_;
+    if (audioSink_) {
+        const pro::LiveAudioSink::Stats s = audioSink_->GetStats();
+        a.playing = true;
+        a.channels = s.channels;
+        a.pair = s.pair;
+        a.packets = s.packets;
+        a.overflows = s.overflows;
+        a.badPackets = s.badPackets;
+    }
+    return a;
 }
 
 void DeckLinkSource::PrintDeviceList(FILE* out) {
@@ -819,6 +848,10 @@ struct DeckLinkCapture {
     std::atomic<bool> tcFullCount[2] = {false, false};  // per input: timecode counts every frame
     std::atomic<bool> noSignal[2]{};
     std::atomic<bool> dualActive{false};  // Auto switched to the card's dual-stream mode
+    // Live audio (LOXR-870): set before the inputs stream and cleared after they stop, only
+    // when the spec asked for audio. Null otherwise: the card was never asked for audio, its
+    // packets are null, and the frame callback skips it with one test.
+    std::shared_ptr<pro::LiveAudioSink> audio;
 
     std::mutex m;  // the frames below + the pairing state
     // The ring's single-producer side: one compose + publish at a time. Taken while m is
@@ -1792,8 +1825,16 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE VideoInputFrameArrived(IDeckLinkVideoInputFrame* frame,
-                                                     IDeckLinkAudioInputPacket*) override {
-        if (!frame || !cap_->alive) return S_OK;
+                                                     IDeckLinkAudioInputPacket* audio) override {
+        if (!cap_->alive) return S_OK;
+        if (audio && cap_->audio) {  // only with audio on (LOXR-870); off, both are null
+            void* bytes = nullptr;
+            if (SUCCEEDED(audio->GetBytes(&bytes)) && bytes)
+                cap_->audio->Push(bytes, (int)audio->GetSampleFrameCount());
+            else
+                cap_->audio->PacketWithoutSamples();
+        }
+        if (!frame) return S_OK;
         if (frame->GetFlags() & bmdFrameHasNoInputSource) {
             cap_->NoSignal(eye_, true);
             return S_OK;  // keep showing the last picture; the stall watchdog flags it
@@ -1979,6 +2020,7 @@ void DeckLinkSource::Worker() {
     IDeckLinkInput* inputs[2] = {nullptr, nullptr};
     Callback* callbacks[2] = {nullptr, nullptr};
     int started = 0;
+    bool audioOn = false;  // EnableAudioInput succeeded on input 0 (only with audio asked for)
     std::string err;
 
     if (!driver) {
@@ -2052,11 +2094,42 @@ void DeckLinkSource::Worker() {
                         inputs[e]->AddRef();
                         cap.leaseKeep->inputs[e] = inputs[e];
                     }
+                    // Embedded audio, from the left (or only) input, only when the spec asked
+                    // for it (LOXR-870). A refusal leaves the picture running, silent.
+                    if (e == 0 && cfg_.audioPair > 0) {
+                        const int ch = pro::LiveAudioCaptureChannels(cfg_.audioPair);
+                        std::string aerr;
+                        if (ch == 0) {
+                            aerr = "invalid audio channel pair";
+                        } else if (FAILED(inputs[e]->EnableAudioInput(bmdAudioSampleRate48kHz,
+                                                                      bmdAudioSampleType32bitInteger, (uint32_t)ch))) {
+                            aerr = names[(size_t)idx] + " cannot capture " + std::to_string(ch) + " audio channels";
+                        } else {
+                            audioOn = true;
+                            cap.audio = pro::LiveAudioSink::Open(ch, cfg_.audioPair, audioMuted_.load(), aerr);
+                            if (!cap.audio) {
+                                inputs[e]->DisableAudioInput();
+                                audioOn = false;
+                            }
+                        }
+                        if (cap.audio)
+                            LOG_INFO("decklink: audio on: %d channels at 48 kHz from %s, playing %s", ch,
+                                     names[(size_t)idx].c_str(), pro::LiveAudioPairName(cfg_.audioPair).c_str());
+                        else
+                            LOG_WARN("decklink: audio asked for but off: %s", aerr.c_str());
+                        std::lock_guard<std::mutex> lk(audioMutex_);
+                        audioSink_ = cap.audio;
+                        audioError_ = aerr;
+                    }
                     inputs[e]->SetCallback(callbacks[e]);
                     if (FAILED(inputs[e]->StartStreams())) {
                         err = names[(size_t)idx] + ": cannot start capture";
                         inputs[e]->SetCallback(nullptr);
                         inputs[e]->DisableVideoInput();
+                        if (e == 0 && audioOn) {
+                            inputs[e]->DisableAudioInput();
+                            audioOn = false;
+                        }
                     } else {
                         ++started;
                         LOG_INFO("decklink: capturing from %s%s%s", names[(size_t)idx].c_str(),
@@ -2135,6 +2208,7 @@ void DeckLinkSource::Worker() {
                 inputs[e]->StopStreams();
                 inputs[e]->SetCallback(nullptr);
                 inputs[e]->DisableVideoInput();
+                if (e == 0 && audioOn) inputs[e]->DisableAudioInput();
             }
         }
     }
@@ -2142,6 +2216,15 @@ void DeckLinkSource::Worker() {
     // give one in flight time to see `alive` and return before our references go.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     cap.StopLanes();  // `alive` is clear: a lane mid-frame publishes nothing and returns
+    if (cap.audio) {
+        // The streams are stopped and a late callback sees `alive` clear before the audio:
+        // the output device closes with the last reference.
+        {
+            std::lock_guard<std::mutex> lk(audioMutex_);
+            audioSink_.reset();
+        }
+        cap.audio.reset();
+    }
     {
         // Direct pairing: the ring frames still reserved go back to the ring (it outlives this
         // capture: the next Open reserves from it again). No lane runs now, no compose.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The DeckLink station input's spec, "<dev>[+<right>][,sdi|hdmi][,auto|sbs|dual|mono][,mode=Hp25]"
+// The DeckLink station input's spec,
+// "<dev>[+<right>][,sdi|hdmi][,auto|sbs|dual|mono][,mode=Hp25][,audio|,audio=<pair>]"
 // (the part after "decklink:"), and the DeckLink setup dialog's fields for it. Pure (no SDK,
 // no UI) so tests/decklink_spec_test.cpp can check that the dialog shows the input that is
 // set up and that its Open writes the same spec back.
@@ -24,6 +25,7 @@ struct DeckLinkDialogFields {
     int conn = 0;       // 0 as set in Desktop Video, 1 SDI, 2 HDMI
     int stereo = 0;     // one cable: 0 auto, 1 side by side, 2 dual-stream 3D, 3 mono
     std::string mode;   // starting format FourCC; empty = the default
+    int audio = 0;      // embedded audio: 0 off (default), else the channel pair played (1 = ch 1-2)
 };
 
 // The device a selector names, as DeckLinkSource opens it: an index ("1"), else the first

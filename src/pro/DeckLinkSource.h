@@ -28,11 +28,15 @@
 #include <cstdint>
 #include <mutex>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace mp {
+namespace pro {
+class LiveAudioSink;
+}
 
 struct DeckLinkConfig {
     enum class Stereo { Auto, Mono, Sbs, Dual, Pair };
@@ -41,6 +45,10 @@ struct DeckLinkConfig {
     std::string input;         // "" (as set in Desktop Video) | sdi | hdmi
     std::string mode;          // starting display mode FourCC, e.g. "Hp25"; "" = 1080p25
     Stereo stereo = Stereo::Auto;
+    // Embedded audio (LOXR-870, pro/LiveAudio.h): 0 = off (the default: the card is not asked
+    // for audio, nothing is played, no cost); 1..8 = capture it from the (left) input and play
+    // channel pair N (1 = ch 1-2, 2 = ch 3-4, ...).
+    int audioPair = 0;
 
     static bool ParseStereo(const std::string& s, Stereo& out);
     static const char* StereoName(Stereo s);
@@ -176,6 +184,17 @@ public:
 
     const DeckLinkConfig& Config() const { return cfg_; }
 
+    // Live audio (off unless the spec asks for it). Muting follows the player's mute (M).
+    void SetAudioMuted(bool m);
+    struct AudioStatus {
+        bool requested = false;  // the spec asked for audio
+        bool playing = false;    // the card delivers it and an output device plays it
+        int channels = 0, pair = 0;
+        uint64_t packets = 0, overflows = 0, badPackets = 0;
+        std::string error;       // why it is requested but not playing
+    };
+    AudioStatus GetAudioStatus() const;
+
 private:
     friend struct DeckLinkCapture;  // the SDK side (DeckLinkSource.cpp) publishes through us
     void Worker();
@@ -193,6 +212,11 @@ private:
     std::condition_variable stopCv_;  // Stop() wakes the worker's watchdog loop at once
     std::atomic<bool> stop_{false};
     std::atomic<bool> dualActive_{false};  // Auto switched to the card's dual-stream mode
+    // Live audio: set by the worker while capturing with audio on, else null.
+    mutable std::mutex audioMutex_;
+    std::shared_ptr<pro::LiveAudioSink> audioSink_;
+    std::string audioError_;
+    std::atomic<bool> audioMuted_{false};
 };
 
 }  // namespace mp
