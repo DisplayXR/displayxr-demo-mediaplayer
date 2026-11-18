@@ -485,6 +485,28 @@ bool LiftClient::Submit(const uint8_t* rgba, uint32_t width, uint32_t height, ui
     images.imageCount = 1;
     images.images = &img;
 
+    // The viewpoints (sticky per stream, sent with every frame anyway): the tracked viewer's
+    // eyes, horizontally and vertically, without the default ease back to the centre after
+    // a hold, which undid look-around. Off: the nominal viewer (parallax 0), as before.
+    XrLiftViewControlDXR view{};
+    view.type = XR_TYPE_LIFT_VIEW_CONTROL_DXR;
+    view.ipdFactor = 1.0f;
+    view.parallaxFactor = lookAround_ ? 1.0f : 0.0f;
+    view.axisMode = XR_LIFT_AXIS_MODE_XY_DXR;
+    view.maxOffsetMeters = 0.0f;
+    view.recenterMode = XR_LIFT_RECENTER_MODE_OFF_DXR;
+    view.recenterHoldSeconds = -1.0f;
+    view.recenterTimeConstantSeconds = 0.0f;
+    XrLiftOptionsDXR options{};
+    options.type = XR_TYPE_LIFT_OPTIONS_DXR;
+    options.next = &view;
+    options.convergence = XR_LIFT_CONVERGENCE_AUTO_DXR;
+    options.strength = 1.0f;
+    options.inpaint = XR_TRUE;  // fill what a moved eye uncovers
+    options.viewpointSource = XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR;
+    options.viewCount = 2;
+    images.next = &options;
+
     XrLiftFrameSubmitInfoDXR submit{};
     submit.type = XR_TYPE_LIFT_FRAME_SUBMIT_INFO_DXR;
     submit.next = &images;

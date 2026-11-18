@@ -3803,9 +3803,13 @@ void App::PumpConvert(double nowSec) {
         StopConvert(/*restorePicture=*/true);
         return;
     }
-    if (convertStillPending_ && !isVideo_ && !LiveSource() && !convertIn_.empty() &&
+    // A still goes once; with look-around again whenever the last one is back (at most
+    // 30 a second), so its views follow the viewer.
+    const bool again = lift_.LookAround() && convertBound_ && nowSec - convertStillSentAt_ >= 1.0 / 30.0;
+    if ((convertStillPending_ || again) && !isVideo_ && !LiveSource() && !convertIn_.empty() &&
         lift_.WantsFrame(nowSec)) {
-        lift_.Submit(convertIn_.data(), convertInW_, convertInH_, convertInW_ * 4, 0, nowSec);
+        if (lift_.Submit(convertIn_.data(), convertInW_, convertInH_, convertInW_ * 4, 0, nowSec))
+            convertStillSentAt_ = nowSec;
     }
     lift::Result r;
     if (!lift_.Poll(r)) return;

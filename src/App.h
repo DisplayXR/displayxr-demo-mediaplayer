@@ -615,6 +615,7 @@ private:
     bool inputRemember_ = false;
     bool convertBound_ = false;
     bool convertStillPending_ = false;  // still: submit until its result lands
+    double convertStillSentAt_ = 0.0;   // look-around: when the still last went for conversion
     // Full-resolution pixels of the loaded still, kept ONLY when the runtime offers the
     // extension (so the base player on a runtime without it holds no extra copy): the
     // source to convert, and what toggling off puts back.
