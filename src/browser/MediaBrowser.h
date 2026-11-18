@@ -58,6 +58,18 @@ public:
         return true;
     }
 
+    // Desktop: what the user asked of a file's menu (right click) or its keys.
+    struct ItemRequest {
+        enum class Verb { Reveal, CopyPath } verb = Verb::Reveal;
+        int64_t id = -1;
+    };
+    bool TakeItemRequest(ItemRequest& out) {
+        if (!itemRequestPending_) return false;
+        itemRequestPending_ = false;
+        out = itemRequest_;
+        return true;
+    }
+
     MediaBrowser() = default;
     ~MediaBrowser();
 
@@ -101,6 +113,15 @@ public:
     // go up a folder.
     bool CanGoBack() const;
     bool Back();
+    // Desktop: back (-1) or forward (+1) through the places shown, as a file manager's
+    // Back / Forward. False with nowhere to go.
+    bool HistoryStep(int dir);
+    // Desktop: the details view (one row per file) instead of the grid.
+    void SetDetails(bool on) { details_ = on; }
+    // Desktop: show only the names holding `query` (any case), as the search box does.
+    void SetQuery(const std::string& query);
+    // Ctrl+F: the search box takes the keyboard.
+    void FocusSearch() { focusSearch_ = true; }
 
     // The 3D grid (#180, StereoGrid.h). The "3D only" filter is on: the caller takes the
     // panel to 3D for it.
@@ -128,6 +149,7 @@ public:
 private:
     static constexpr uint32_t kTile = 512;  // thumbnail edge, px
     static constexpr uint32_t kSlots = 64;  // thumbnails on the GPU: a screen and a few rows
+    static constexpr float kCardMin = 120.0f, kCardMax = 320.0f;  // desktop: the size slider's range
 
     void TakeResults();
     void Rebuild();
@@ -158,6 +180,26 @@ private:
     void DeskItemCard(ImDrawList* dl, const MediaItem& item, bool supported, const StereoVerdict& verdict, ImVec2 a,
                       ImVec2 b, float pic, bool hovered, bool pressed, bool focus, bool picture, bool behind);
     static float DeskCaptionHeight();
+    // The details view's columns: 0 name, 1 depth, 2 type, 3 dimensions, 4 length, 5 date,
+    // 6 size. Narrow windows drop type, dimensions, size, then date.
+public:
+    struct DeskColumns {
+        float x[7] = {};
+        float w[7] = {};
+        bool on[7] = {};
+    };
+
+private:
+    static DeskColumns DeskColumnLayout(float x0, float width);
+    void DeskColumnHeader(const DeskColumns& c, ImVec2 min, ImVec2 max);
+    void DeskFolderRow(ImDrawList* dl, const Folder& folder, const DeskColumns& c, ImVec2 a, ImVec2 b, float pic,
+                       bool hovered, bool pressed, bool focus);
+    void DeskItemRow(ImDrawList* dl, const MediaItem& item, bool supported, const StereoVerdict& verdict,
+                     const DeskColumns& c, ImVec2 a, ImVec2 b, float pic, bool hovered, bool pressed, bool focus,
+                     bool picture, bool behind);
+    void DeskSearch(ImVec2 pos, float w, float h, const std::string& place);
+    void DeskItemMenu();
+    void TrackHistory();
 
     MediaProvider* provider_ = nullptr;
     bool desktop_ = false;         // SetDesktop
@@ -166,6 +208,23 @@ private:
     bool folderRequestPending_ = false;
     std::string menuFolder_;       // the folder tile whose menu is open
     size_t cursor_ = SIZE_MAX;     // desktop: the keyboard's tile (SIZE_MAX: none yet)
+    bool details_ = false;         // desktop: the details view
+    float cardW_ = 176.0f;         // desktop grid: a card's width, design px (the size slider)
+    char search_[256] = {};        // desktop: the search box's text
+    std::string query_;            // ... as the grid filters by it
+    bool focusSearch_ = false;     // Ctrl+F: the search box takes the keyboard
+    // Desktop: the places shown, for Back / Forward.
+    struct Place {
+        size_t source = 0;
+        std::string folder;
+    };
+    std::vector<Place> back_, forward_;
+    Place here_;
+    bool placed_ = false;
+    ItemRequest itemRequest_;
+    bool itemRequestPending_ = false;
+    int64_t menuItem_ = -1;        // the file whose menu is open
+    bool menuOpen_ = false;        // its menu's "Open", this frame
     MediaLibrary library_;
     StereoClassifier classifier_;
     ThumbnailAtlas atlas_;

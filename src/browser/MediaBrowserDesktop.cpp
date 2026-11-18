@@ -15,6 +15,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 
 namespace mp::browser {
 
@@ -115,6 +116,60 @@ std::string Upper(const std::string& name) {
     return ext;
 }
 
+// "14 Aug 2025", local time; "-" when unknown.
+std::string ShortDate(int64_t ms) {
+    if (ms <= 0) return "-";
+    const std::time_t t = (std::time_t)(ms / 1000);
+    std::tm tm{};
+#if defined(_WIN32)
+    if (localtime_s(&tm, &t) != 0) return "-";
+#else
+    if (!localtime_r(&t, &tm)) return "-";
+#endif
+    char buf[32];
+    if (std::strftime(buf, sizeof(buf), "%d %b %Y", &tm) == 0) return "-";
+    return buf[0] == '0' ? std::string(buf + 1) : std::string(buf);
+}
+
+std::string FileSize(int64_t bytes) {
+    if (bytes <= 0) return "-";
+    char buf[32];
+    if (bytes >= (int64_t)1 << 30) std::snprintf(buf, sizeof(buf), "%.1f GB", (double)bytes / (1 << 30));
+    else if (bytes >= (int64_t)1 << 20) std::snprintf(buf, sizeof(buf), "%.1f MB", (double)bytes / (1 << 20));
+    else std::snprintf(buf, sizeof(buf), "%.0f KB", std::max(1.0, (double)bytes / 1024.0));
+    return buf;
+}
+
+// A segmented control of icons at (x, y): `count` buttons `w` x `h`, `on` the lit one.
+// Returns the one clicked, or -1.
+int IconSegments(const char* id, const Glyph* icons, const char* const* tips, int count, int on, float x, float y,
+                 float w, float h) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float r = Px(6.0f);
+    int clicked = -1;
+    ImGui::PushID(id);
+    for (int i = 0; i < count; ++i) {
+        const float bx = x + w * i;
+        ImGui::SetCursorScreenPos(ImVec2(bx, y));
+        ImGui::PushID(i);
+        if (ImGui::InvisibleButton("##seg", ImVec2(w, h))) clicked = i;
+        const bool hovered = ImGui::IsItemHovered();
+        ImGui::PopID();
+        const ImDrawFlags corners = i == 0           ? ImDrawFlags_RoundCornersLeft
+                                    : i == count - 1 ? ImDrawFlags_RoundCornersRight
+                                                     : ImDrawFlags_RoundCornersNone;
+        if (i == on) dl->AddRectFilled(ImVec2(bx, y), ImVec2(bx + w, y + h), kAccentWeak, r, corners);
+        else if (hovered) dl->AddRectFilled(ImVec2(bx, y), ImVec2(bx + w, y + h), kHoverFill, r, corners);
+        if (i > 0) dl->AddLine(ImVec2(bx, y + 1.0f), ImVec2(bx, y + h - 1.0f), kLine, Px(1.0f));
+        ui::DrawGlyph(dl, icons[i], ImVec2(bx + w * 0.5f, y + h * 0.5f), h * 0.85f,
+                      i == on ? kAccent : hovered ? kText : kTextDim);
+        if (hovered && tips) ImGui::SetTooltip("%s", tips[i]);
+    }
+    ImGui::PopID();
+    dl->AddRect(ImVec2(x, y), ImVec2(x + w * count, y + h), kLineStrong, r, 0, Px(1.0f));
+    return clicked;
+}
+
 } // namespace
 
 float MediaBrowser::DeskCaptionHeight() {
@@ -136,13 +191,22 @@ void MediaBrowser::DeskHeader(float width, float height) {
     }
     const Source& source = CurrentSource();
     const bool canUp = folder_ != source.folder;
-    if (IconBtn("##up", Glyph::Back, ImVec2(x, y), btn, canUp, "Up a folder (Backspace)")) Up();
+    if (IconBtn("##back", Glyph::Back, ImVec2(x, y), btn, !back_.empty(), "Back (Alt+Left)")) HistoryStep(-1);
+    x += btn + gap;
+    if (IconBtn("##forward", Glyph::Forward, ImVec2(x, y), btn, !forward_.empty(), "Forward (Alt+Right)"))
+        HistoryStep(1);
+    x += btn + gap;
+    if (IconBtn("##up", Glyph::Up, ImVec2(x, y), btn, canUp, "Up a folder (Backspace)")) Up();
     x += btn + gap;
     dl->AddLine(ImVec2(x + gap, y + Px(4.0f)), ImVec2(x + gap, y + btn - Px(4.0f)), kLine, Px(1.0f));
     x += gap * 3.0f;
 
     const float closeX = width - pad - btn;
     if (IconBtn("##close", Glyph::Close, ImVec2(closeX, y), btn, true, "Close (Esc)")) closeRequested_ = true;
+    // The search box: 240 px, 160 in a narrower window, none in a narrow one (#252 design).
+    const float searchW = width >= Px(900.0f) ? Round(Px(240.0f)) : width >= Px(640.0f) ? Round(Px(160.0f)) : 0.0f;
+    float crumbEnd = closeX - gap;
+    if (searchW > 0.0f) crumbEnd = closeX - Round(Px(12.0f)) - searchW - Round(Px(12.0f));
 
     // The path: the source, then each folder down to this one. A part's folder is found by
     // walking Parent() up from here, so it is right for every source mode.
@@ -162,7 +226,7 @@ void MediaBrowser::DeskHeader(float width, float height) {
     if (labels.size() != paths.size()) {  // a breadcrumb the walk does not match: show it, not clickable
         paths.assign(labels.size(), folder_);
     }
-    const float room = closeX - gap - x;
+    const float room = crumbEnd - x;
     const float segPad = Round(Px(8.0f)), chev = Round(Px(14.0f));
     auto segW = [&](size_t i) {
         DeskFont f(i + 1 == labels.size() ? DeskText::Title : DeskText::Body);
@@ -197,7 +261,7 @@ void MediaBrowser::DeskHeader(float width, float height) {
         const size_t i = shown[k];
         const bool last = i + 1 == labels.size();
         float w = segW(i);
-        if (x + w > closeX - gap) w = std::max(0.0f, closeX - gap - x);
+        if (x + w > crumbEnd) w = std::max(0.0f, crumbEnd - x);
         if (w <= segPad * 2.0f) break;
         ImGui::SetCursorScreenPos(ImVec2(x, y));
         ImGui::PushID((int)i);
@@ -212,6 +276,64 @@ void MediaBrowser::DeskHeader(float width, float height) {
         if (clicked && !last) GoTo(paths[i]);
         x += w;
     }
+    if (searchW > 0.0f) DeskSearch(ImVec2(closeX - Round(Px(12.0f)) - searchW, y), searchW, btn, labels.back());
+}
+
+// The search box: a magnifier, "Search <here>", and Ctrl+F's key cap while it is empty. It
+// filters the place shown by name; Esc clears it.
+void MediaBrowser::DeskSearch(ImVec2 pos, float w, float h, const std::string& place) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    DeskFont f(DeskText::Label);
+    const float icon = Round(Px(16.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(1.0f, 1.0f, 1.0f, 0.05f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.08f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(1.0f, 1.0f, 1.0f, 0.08f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(kLineStrong));
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImGui::ColorConvertU32ToFloat4(kTextFaint));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, Px(1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, Px(6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(Px(10.0f) + icon + Px(6.0f), std::max(0.0f, Round((h - ImGui::GetFontSize()) * 0.5f))));
+    ImGui::SetCursorScreenPos(pos);
+    ImGui::SetNextItemWidth(w);
+    if (focusSearch_) {
+        ImGui::SetKeyboardFocusHere();
+        focusSearch_ = false;
+    }
+    const std::string hint = ui::FitText("Search " + place, w - Px(10.0f) - icon - Px(6.0f) - Px(64.0f));
+    ImGui::SetNextItemAllowOverlap();  // the clear button lies on it
+    if (ImGui::InputTextWithHint("##search", hint.c_str(), search_, sizeof(search_),
+                                 ImGuiInputTextFlags_EscapeClearsAll)) {
+        query_ = search_;
+        dirty_ = true;
+        gridScroll_.SetOffset(0.0f);
+    }
+    const bool active = ImGui::IsItemActive();
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(5);
+    ui::DrawGlyph(dl, Glyph::Search, ImVec2(pos.x + Px(10.0f) + icon * 0.5f, pos.y + h * 0.5f), icon * 1.2f,
+                  active ? kText : kTextFaint);
+    if (search_[0]) {
+        // A cross that clears it.
+        const float bw = h;
+        ImGui::SetCursorScreenPos(ImVec2(pos.x + w - bw, pos.y));
+        if (ImGui::InvisibleButton("##search_clear", ImVec2(bw, h))) {
+            search_[0] = '\0';
+            query_.clear();
+            dirty_ = true;
+        }
+        const bool hov = ImGui::IsItemHovered();
+        ui::DrawGlyph(dl, Glyph::Close, ImVec2(pos.x + w - bw * 0.5f, pos.y + h * 0.5f), icon, hov ? kText : kTextFaint);
+        if (hov) ImGui::SetTooltip("Clear the search (Esc)");
+    } else if (!active) {
+        DeskFont k(DeskText::Badge);
+        const char* key = "Ctrl+F";
+        const ImVec2 ks = ImGui::CalcTextSize(key);
+        const float kw = ks.x + Px(8.0f), kh = ks.y + Px(4.0f);
+        const float kx = pos.x + w - Px(8.0f) - kw, ky = pos.y + Round((h - kh) * 0.5f);
+        dl->AddRect(ImVec2(kx, ky), ImVec2(kx + kw, ky + kh), kLineStrong, Px(3.0f), 0, Px(1.0f));
+        dl->AddText(ImVec2(kx + Px(4.0f), ky + Px(2.0f)), kTextFaint, key);
+    }
 }
 
 // The toolbar: All / 3D / 2D, the type (all, videos, photos), the sort, and the count.
@@ -222,8 +344,41 @@ void MediaBrowser::DeskToolbar(ImVec2 min, ImVec2 max) {
     const float h = Round(Px(28.0f)), r = Px(6.0f);
     const float y = Round((min.y + max.y - h) * 0.5f);
     float x = min.x + Round(Px(12.0f));
-    const float right = max.x - Round(Px(12.0f));
+    float right = max.x - Round(Px(12.0f));
     DeskFont font(DeskText::Label);
+
+    // At the right: the view (grid, details), and for the grid the cards' size.
+    {
+        const Glyph icons[] = {Glyph::Grid, Glyph::List};
+        const char* tips[] = {"Grid", "Details"};
+        const float w = h + Round(Px(4.0f));
+        const float vx = right - w * 2.0f;
+        const int picked = IconSegments("##view", icons, tips, 2, details_ ? 1 : 0, vx, y, w, h);
+        if (picked >= 0) details_ = picked == 1;
+        right = vx - Round(Px(12.0f));
+        const float icon = Round(Px(16.0f)), track = Round(Px(72.0f)), gap = Round(Px(6.0f));
+        const float total = icon + gap + track + gap + icon;
+        if (!details_ && right - total >= min.x + Px(440.0f)) {
+            const float sx = right - total, cy = y + h * 0.5f;
+            ui::DrawGlyph(dl, Glyph::Grid, ImVec2(sx + icon * 0.5f, cy), icon * 0.8f, kTextFaint);
+            ui::DrawGlyph(dl, Glyph::Grid, ImVec2(sx + total - icon * 0.5f, cy), icon * 1.25f, kTextFaint);
+            const float tx0 = sx + icon + gap, tx1 = tx0 + track;
+            ImGui::SetCursorScreenPos(ImVec2(tx0 - Px(6.0f), y));
+            ImGui::InvisibleButton("##card_size", ImVec2(track + Px(12.0f), h));
+            const bool held = ImGui::IsItemActive(), hov = ImGui::IsItemHovered();
+            if (held) {
+                const float f = std::min(1.0f, std::max(0.0f, (ImGui::GetIO().MousePos.x - tx0) / track));
+                cardW_ = kCardMin + (kCardMax - kCardMin) * f;
+            }
+            if (hov || held) ImGui::SetTooltip("Thumbnail size (Ctrl+wheel)");
+            const float f = (std::min(kCardMax, std::max(kCardMin, cardW_)) - kCardMin) / (kCardMax - kCardMin);
+            const float th = Px(4.0f), kx = tx0 + track * f;
+            dl->AddRectFilled(ImVec2(tx0, cy - th * 0.5f), ImVec2(tx1, cy + th * 0.5f), kLineStrong, th * 0.5f);
+            dl->AddRectFilled(ImVec2(tx0, cy - th * 0.5f), ImVec2(kx, cy + th * 0.5f), kAccent, th * 0.5f);
+            dl->AddCircleFilled(ImVec2(kx, cy), Px(held || hov ? 7.0f : 6.0f), kText);
+            right = sx - Round(Px(12.0f));
+        }
+    }
 
     // All · 3D · 2D: a segmented control.
     {
@@ -323,7 +478,7 @@ void MediaBrowser::DeskToolbar(ImVec2 min, ImVec2 max) {
         else if (!folders_.empty() && items == 0)
             std::snprintf(count, sizeof(count), "%zu folder%s", folders_.size(), folders_.size() == 1 ? "" : "s");
         else if (!folders_.empty())
-            std::snprintf(count, sizeof(count), "%zu folder%s  Â·  %zu item%s", folders_.size(),
+            std::snprintf(count, sizeof(count), "%zu folder%s  \xC2\xB7  %zu item%s", folders_.size(),
                           folders_.size() == 1 ? "" : "s", items, items == 1 ? "" : "s");
         else
             std::snprintf(count, sizeof(count), "%zu item%s", items, items == 1 ? "" : "s");
@@ -612,17 +767,217 @@ void MediaBrowser::DeskItemCard(ImDrawList* dl, const MediaItem& item, bool supp
         } else if (!stereo_ && length[0] && meta.empty()) {
             add("Video");
         }
-        if (meta.empty() && item.bytes > 0) {
-            char size[32];
-            if (item.bytes >= (int64_t)1 << 30) std::snprintf(size, sizeof(size), "%.1f GB", (double)item.bytes / (1 << 30));
-            else std::snprintf(size, sizeof(size), "%.1f MB", (double)item.bytes / (1 << 20));
-            add(size);
-        }
+        if (meta.empty() && item.bytes > 0) add(FileSize(item.bytes));
         dl->AddText(ImVec2(pa.x + Px(2.0f), y), kTextFaint, ui::FitText(meta, pic - Px(4.0f)).c_str());
     }
     if (focus)
         dl->AddRect(ImVec2(a.x - Px(2.0f), a.y - Px(2.0f)), ImVec2(b.x + Px(2.0f), b.y + Px(2.0f)), kFocus, Px(8.0f), 0,
                     Px(2.0f));
+}
+
+// The details view's columns over a row `width` wide from `x0`. The name takes what the
+// others leave; in a narrow window type, dimensions, size and then date drop out.
+MediaBrowser::DeskColumns MediaBrowser::DeskColumnLayout(float x0, float width) {
+    const float want[7] = {0.0f, 64.0f, 110.0f, 110.0f, 72.0f, 110.0f, 84.0f};
+    bool on[7] = {true, true, true, true, true, true, true};
+    auto others = [&] {
+        float s = 0.0f;
+        for (int i = 1; i < 7; ++i)
+            if (on[i]) s += Round(Px(want[i]));
+        return s;
+    };
+    for (int d : {2, 3, 6, 5}) {
+        if (width - others() >= Px(220.0f)) break;
+        on[d] = false;
+    }
+    DeskColumns c;
+    float x = x0;
+    for (int i = 0; i < 7; ++i) {
+        c.on[i] = on[i];
+        if (!on[i]) continue;
+        c.x[i] = x;
+        c.w[i] = i == 0 ? std::max(Px(80.0f), width - others()) : Round(Px(want[i]));
+        x += c.w[i];
+    }
+    return c;
+}
+
+// The column headings. Date sorts: a click turns the order round.
+void MediaBrowser::DeskColumnHeader(const DeskColumns& c, ImVec2 min, ImVec2 max) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(min, max, kToolbar);
+    dl->AddLine(ImVec2(min.x, max.y - 0.5f), ImVec2(max.x, max.y - 0.5f), kLine, Px(1.0f));
+    DeskFont f(DeskText::Meta);
+    const char* names[7] = {"Name", "Depth", "Type", "Dimensions", "Length", "Date", "Size"};
+    const float h = max.y - min.y, ty = min.y + Round((h - ImGui::GetFontSize()) * 0.5f);
+    for (int i = 0; i < 7; ++i) {
+        if (!c.on[i]) continue;
+        const bool right = i == 4 || i == 6;
+        const float tw = ImGui::CalcTextSize(names[i]).x;
+        float tx = right ? c.x[i] + c.w[i] - Px(8.0f) - tw : c.x[i] + Px(8.0f);
+        if (i == 0) tx += Round(Px(4.0f)) + Round(Px(40.0f)) + Px(2.0f);  // over the names, past the pictures
+        ImU32 ink = kTextFaint;
+        if (i == 5) {
+            ImGui::SetCursorScreenPos(ImVec2(c.x[i], min.y));
+            if (ImGui::InvisibleButton("##sort_date", ImVec2(c.w[i], h))) {
+                options_.order = options_.order == SortOrder::NewestFirst ? SortOrder::OldestFirst : SortOrder::NewestFirst;
+                dirty_ = true;
+                gridScroll_.SetOffset(0.0f);
+            }
+            const bool hov = ImGui::IsItemHovered();
+            if (hov) {
+                dl->AddRectFilled(ImVec2(c.x[i], min.y + Px(2.0f)), ImVec2(c.x[i] + c.w[i], max.y - Px(2.0f)), kHoverFill,
+                                  Px(4.0f));
+                ImGui::SetTooltip("%s", options_.order == SortOrder::NewestFirst ? "Newest first: click for oldest first"
+                                                                                  : "Oldest first: click for newest first");
+            }
+            ink = kText;
+            // An arrow: down for newest first.
+            const float ax = tx + tw + Px(8.0f), ay = min.y + h * 0.5f, s = Px(3.0f);
+            const float dir = options_.order == SortOrder::NewestFirst ? 1.0f : -1.0f;
+            const ImVec2 v[] = {ImVec2(ax - s, ay - s * 0.5f * dir), ImVec2(ax, ay + s * 0.5f * dir),
+                                ImVec2(ax + s, ay - s * 0.5f * dir)};
+            dl->AddPolyline(v, 3, ink, 0, Px(1.5f));
+        }
+        dl->AddText(ImVec2(tx, ty), ink, names[i]);
+    }
+}
+
+namespace {
+
+// A cell's text in column `i`: cut to fit, left or right aligned, centred in the row.
+void Cell(ImDrawList* dl, const MediaBrowser::DeskColumns& c, int i, ImVec2 a, ImVec2 b, const std::string& text,
+          ImU32 ink, bool right) {
+    if (!c.on[i] || text.empty()) return;
+    const std::string t = ui::FitText(text, c.w[i] - Px(16.0f));
+    const float tw = ImGui::CalcTextSize(t.c_str()).x;
+    const float x = right ? c.x[i] + c.w[i] - Px(8.0f) - tw : c.x[i] + Px(8.0f);
+    dl->AddText(ImVec2(x, a.y + Round((b.y - a.y - ImGui::GetFontSize()) * 0.5f)), ink, t.c_str());
+}
+
+} // namespace
+
+// A folder's row: the folder in a 40 px square, its name, "Folder", and how many it holds.
+void MediaBrowser::DeskFolderRow(ImDrawList* dl, const Folder& folder, const DeskColumns& c, ImVec2 a, ImVec2 b,
+                                 float pic, bool hovered, bool pressed, bool focus) {
+    if (pressed) dl->AddRectFilled(a, b, kPressFill, Px(4.0f));
+    else if (hovered) dl->AddRectFilled(a, b, kHoverFill, Px(4.0f));
+    dl->AddLine(ImVec2(a.x, b.y - 0.5f), ImVec2(b.x, b.y - 0.5f), IM_COL32(255, 255, 255, 8), Px(1.0f));
+    const ImVec2 pa(a.x + Round(Px(4.0f)), a.y + Round((b.y - a.y - pic) * 0.5f)), pb(pa.x + pic, pa.y + pic);
+    dl->AddRectFilled(pa, pb, kSurface, Px(4.0f));
+    ui::DrawGlyph(dl, Glyph::Folder, ImVec2((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f), pic * 0.6f, kTextDim);
+    {
+        DeskFont f(DeskText::Body);
+        const float nx = pb.x + Px(10.0f);
+        dl->AddText(ImVec2(nx, a.y + Round((b.y - a.y - ImGui::GetFontSize()) * 0.5f)), kText,
+                    ui::FitText(folder.name, c.x[0] + c.w[0] - Px(8.0f) - nx).c_str());
+    }
+    DeskFont f(DeskText::Label);
+    char count[32];
+    std::snprintf(count, sizeof(count), "%d item%s", folder.count, folder.count == 1 ? "" : "s");
+    Cell(dl, c, 2, a, b, "Folder", kTextDim, false);
+    Cell(dl, c, 6, a, b, count, kTextDim, true);
+    if (!c.on[6]) Cell(dl, c, c.on[2] ? 3 : 4, a, b, count, kTextDim, !c.on[2]);
+    if (focus) dl->AddRect(a, b, kFocus, Px(4.0f), 0, Px(2.0f));
+}
+
+// A file's row, all but the picture (drawn by the grid, or by the 3D renderer behind the HUD):
+// the name with a cloud after it, then 3D / 3D? / 2D, the type, the size in pixels, the length,
+// the date and the size on disk.
+void MediaBrowser::DeskItemRow(ImDrawList* dl, const MediaItem& item, bool supported, const StereoVerdict& verdict,
+                               const DeskColumns& c, ImVec2 a, ImVec2 b, float pic, bool hovered, bool pressed,
+                               bool focus, bool picture, bool behind) {
+    const ImVec2 pa(a.x + Round(Px(4.0f)), a.y + Round((b.y - a.y - pic) * 0.5f)), pb(pa.x + pic, pa.y + pic);
+    if (behind) {
+        if (pressed) dl->AddRectFilled(a, b, kPressFill, Px(4.0f));
+        else if (hovered) dl->AddRectFilled(a, b, kHoverFill, Px(4.0f));
+        if (!picture) {
+            dl->AddRectFilled(pa, pb, kSurface, Px(4.0f));
+            ui::DrawGlyph(dl, item.type == MediaType::Video ? Glyph::Video : Glyph::Image,
+                          ImVec2((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f), pic * 0.55f, IM_COL32(170, 176, 186, 150));
+        }
+        return;
+    }
+    dl->AddLine(ImVec2(a.x, b.y - 0.5f), ImVec2(b.x, b.y - 0.5f), IM_COL32(255, 255, 255, 8), Px(1.0f));
+    {
+        DeskFont f(DeskText::Body);
+        const float nx = pb.x + Px(10.0f), fs = ImGui::GetFontSize();
+        const float cloudW = item.cloudOnly ? fs + Px(6.0f) : 0.0f;
+        const std::string name = ui::FitText(item.name, c.x[0] + c.w[0] - Px(8.0f) - nx - cloudW);
+        const float ty = a.y + Round((b.y - a.y - fs) * 0.5f);
+        dl->AddText(ImVec2(nx, ty), kText, name.c_str());
+        if (item.cloudOnly) {
+            const float cx = nx + ImGui::CalcTextSize(name.c_str()).x + Px(6.0f) + fs * 0.5f;
+            ui::DrawGlyph(dl, Glyph::Cloud, ImVec2(cx, ty + fs * 0.5f), fs * 1.3f, kTextDim, false);
+            if (ImGui::IsMouseHoveringRect(ImVec2(cx - fs * 0.5f, ty), ImVec2(cx + fs * 0.5f, ty + fs)))
+                ImGui::SetTooltip("Online only: opening it downloads it");
+        }
+    }
+    DeskFont f(DeskText::Label);
+    // Depth: a badge for 3D, an outlined one for a cloud file not looked into, else text.
+    if (c.on[1]) {
+        const float bh = Round(Px(18.0f)), by = a.y + Round((b.y - a.y - bh) * 0.5f), bx = c.x[1] + Px(8.0f);
+        if (verdict.known && verdict.stereo)
+            Badge(dl, bx, by, "3D", kAccent, kOnAccent, false);
+        else if (verdict.known && verdict.unchecked && item.cloudOnly)
+            Badge(dl, bx, by, "3D?", kBadgeFill, kText, false, IM_COL32(255, 255, 255, 140));
+        else
+            Cell(dl, c, 1, a, b, verdict.known ? "2D" : "-", kTextFaint, false);
+    }
+    const std::string ext = Upper(item.name);
+    if (c.on[2]) {
+        if (!supported && !ext.empty()) {
+            const float bh = Round(Px(18.0f));
+            Badge(dl, c.x[2] + Px(8.0f), a.y + Round((b.y - a.y - bh) * 0.5f), ext.c_str(), kWarnFill, kWarn, false);
+        } else {
+            std::string type = item.type == MediaType::Video ? "Video" : "Photo";
+            if (!ext.empty()) type += "  \xC2\xB7  " + ext;
+            Cell(dl, c, 2, a, b, type, kTextDim, false);
+        }
+    }
+    char wh[48] = "-";
+    if (item.width > 0 && item.height > 0) std::snprintf(wh, sizeof(wh), "%u \xC3\x97 %u", item.width, item.height);
+    Cell(dl, c, 3, a, b, wh, kTextDim, false);
+    char length[24] = "-";
+    if (item.type == MediaType::Video && item.durationMs > 0) Duration(item.durationMs, length, sizeof(length));
+    Cell(dl, c, 4, a, b, length, kTextDim, true);
+    Cell(dl, c, 5, a, b, ShortDate(item.dateMs), kTextDim, false);
+    Cell(dl, c, 6, a, b, FileSize(item.bytes), kTextDim, true);
+    if (focus) dl->AddRect(a, b, kFocus, Px(4.0f), 0, Px(2.0f));
+}
+
+// A file's menu (right click): open it, show it in File Explorer, copy its path.
+void MediaBrowser::DeskItemMenu() {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(4.0f), Px(4.0f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, Px(6.0f));
+    const bool open = ImGui::BeginPopup("##item_menu");
+    ImGui::PopStyleVar(2);
+    if (!open) return;
+    {
+        DeskFont f(DeskText::Label);
+        const float w = Round(Px(240.0f)), rowH = Round(Px(28.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
+        auto row = [&](const char* label, const char* key) {
+            const ImVec2 at = ImGui::GetCursorScreenPos();
+            const bool hit = ImGui::Selectable(label, false, 0, ImVec2(w, rowH));
+            if (key) {
+                DeskFont k(DeskText::Meta);
+                const float kw = ImGui::CalcTextSize(key).x;
+                ImGui::GetWindowDrawList()->AddText(
+                    ImVec2(at.x + w - Px(8.0f) - kw, at.y + Round((rowH - ImGui::GetFontSize()) * 0.5f)), kTextFaint, key);
+            }
+            return hit;
+        };
+        auto ask = [&](ItemRequest::Verb verb) {
+            itemRequest_ = ItemRequest{verb, menuItem_};
+            itemRequestPending_ = true;
+        };
+        if (row("Open", "Enter")) menuOpen_ = true;
+        if (row("Show in File Explorer", nullptr)) ask(ItemRequest::Verb::Reveal);
+        if (row("Copy path", "Ctrl+Shift+C")) ask(ItemRequest::Verb::CopyPath);
+        ImGui::PopStyleVar();
+    }
+    ImGui::EndPopup();
 }
 
 } // namespace mp::browser

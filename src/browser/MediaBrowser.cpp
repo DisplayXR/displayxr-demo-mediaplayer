@@ -26,6 +26,13 @@ using ui::Glyph;
 float g_dpUnits = 1.5f;
 float Dp(float v) { return ui::Px(v * g_dpUnits); }
 constexpr float kDesktopRailMinDp = 600.0f;  // desktop: the sources stay as a rail from here
+
+// Whether `text` holds `part`, ignoring ASCII case (desktop search).
+bool ContainsNoCase(const std::string& text, const std::string& part) {
+    auto low = [](unsigned char c) { return (char)std::tolower(c); };
+    return std::search(text.begin(), text.end(), part.begin(), part.end(),
+                       [&](char x, char y) { return low((unsigned char)x) == low((unsigned char)y); }) != text.end();
+}
 using ui::Px;
 using ui::TextStyle;
 
@@ -404,7 +411,12 @@ void MediaBrowser::Rebuild() {
     folders_ = folder_.empty() && CurrentSource().mode == SourceMode::Flat
                    ? std::vector<Folder>()
                    : library_.Folders(CurrentSource(), options_, folder_);
+    // Desktop search: only the names holding the query, any case.
+    auto matches = [&](const std::string& name) { return query_.empty() || ContainsNoCase(name, query_); };
+    folders_.erase(std::remove_if(folders_.begin(), folders_.end(), [&](const Folder& f) { return !matches(f.name); }),
+                   folders_.end());
     for (size_t i : library_.Query(CurrentSource(), options_, folder_)) {
+        if (!matches(items[i].name)) continue;
         if (depth_ == DepthFilter::Both) {
             shown_.push_back(i);
             continue;
@@ -490,6 +502,7 @@ MediaBrowser::Action MediaBrowser::Build() {
         }
         startSource_.clear();
     }
+    if (desktop_) TrackHistory();
     if (dirty_) Rebuild();
     cache_.NextFrame();
 
@@ -924,18 +937,30 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     // that is one fewer. The drawer lies over the grid and leaves it as it is. Desktop
     // (#252): cards about 176 px wide, a picture with a caption under it.
     const bool desk = desktop_;
-    if (desk) min.y += Round(Px(8.0f));
+    const bool list = desk && details_;  // the details view: a row per file, under column headings
+    const float colH = list ? Round(Px(32.0f)) : 0.0f;
+    const ImVec2 listTop = min;
+    if (desk) min.y += list ? colH : Round(Px(8.0f));
     const ImVec2 size(max.x - min.x, max.y - min.y);
     const float deskPad = desk ? Round(Px(4.0f)) : 0.0f;
     const float usableW = size.x - (desk ? Round(Px(12.0f)) * 2.0f : 0.0f);
-    const float gutter = Round(desk ? Px(stereo_ ? 16.0f : 8.0f) : Px(stereo_ ? kStereoGutter : kGutter));
-    const int cols = desk ? std::max(2, (int)((usableW + gutter) / (Px(176.0f) + gutter))) : GridColumns(size.x / Dp(1.0f));
+    const float gutter = list ? 0.0f : Round(desk ? Px(stereo_ ? 16.0f : 8.0f) : Px(stereo_ ? kStereoGutter : kGutter));
+    const float cardW = Px(std::min(kCardMax, std::max(kCardMin, cardW_)));  // the size slider's
+    const int cols = list   ? 1
+                     : desk ? std::max(2, (int)((usableW + gutter) / (cardW + gutter)))
+                            : GridColumns(size.x / Dp(1.0f));
     const float tile = std::floor((usableW - gutter * (cols - 1)) / cols);
     if (tile <= deskPad * 2.0f || size.y <= 0.0f) return Action::None;
-    const float pic = tile - deskPad * 2.0f;  // the picture's edge (the tile's, on touch)
-    const float tileH = desk ? deskPad + pic + DeskCaptionHeight() : tile;
+    // The picture's edge: the tile's on touch, inside the card on desktop, 40 px in a row.
+    const float pic = list ? Round(Px(40.0f)) : tile - deskPad * 2.0f;
+    const float tileH = list ? Round(Px(48.0f)) : desk ? deskPad + pic + DeskCaptionHeight() : tile;
     const float step = tileH + gutter;  // the row pitch
     const float x0 = min.x + Round((size.x - (cols * (tile + gutter) - gutter)) * 0.5f);
+    DeskColumns columns;
+    if (list) {
+        columns = DeskColumnLayout(x0, tile);
+        DeskColumnHeader(columns, listTop, ImVec2(max.x, listTop.y + colH));
+    }
     const size_t nf = folders_.size();
     const size_t n = nf + shown_.size();  // tiles: the folders, then the items
     // The tiles in sections: the date sections, or one with the folders then the items.
@@ -983,8 +1008,15 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         gridHovered = ImGui::IsItemHovered();
         tap = Track(gridScroll_, gridPress_, now);
         // Desktop: the wheel scrolls by about half a row a notch.
-        if (desktop_ && gridHovered && ImGui::GetIO().MouseWheel != 0.0f)
-            gridScroll_.SetOffset(gridScroll_.Offset() - ImGui::GetIO().MouseWheel * step * 0.5f);
+        if (desktop_ && gridHovered && ImGui::GetIO().MouseWheel != 0.0f) {
+            if (ImGui::GetIO().KeyCtrl) {
+                // Ctrl+wheel: the cards' size, as the toolbar's slider (the grid only).
+                if (!list)
+                    cardW_ = std::min(kCardMax, std::max(kCardMin, cardW_ * (1.0f + 0.1f * ImGui::GetIO().MouseWheel)));
+            } else {
+                gridScroll_.SetOffset(gridScroll_.Offset() - ImGui::GetIO().MouseWheel * (list ? step * 3.0f : step * 0.5f));
+            }
+        }
     }
     const float offset = Round(gridScroll_.Offset());
 
@@ -1101,6 +1133,15 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         keyOpen = cursor_ < n && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
                                   ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
     }
+    // Desktop: Ctrl+Shift+C copies the path of the file with the focus ring (else under the
+    // pointer).
+    if (desktop_ && ImGui::GetIO().KeyCtrl && ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+        const size_t at = cursor_ < n ? cursor_ : hovered;
+        if (at >= nf && at < n) {
+            itemRequest_ = ItemRequest{ItemRequest::Verb::CopyPath, items[shown_[at - nf]].id};
+            itemRequestPending_ = true;
+        }
+    }
     // A long press on an item starts select mode with it. In select mode it is a tap.
     if (pressed >= nf && pressed < n && !selecting_ && provider_->CanDelete() && gridScroll_.TakeLongPress(now)) {
         selecting_ = true;
@@ -1125,7 +1166,10 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         const ImVec2 a(x0 + tx, min.y + ty - offset);
         const ImVec2 b(a.x + tile, a.y + tileH);
         if (desk && p < nf) {
-            DeskFolderCard(dl, folders_[p], a, b, pic, p == hovered, p == pressed, p == cursor_);
+            if (list)
+                DeskFolderRow(dl, folders_[p], columns, a, b, pic, p == hovered, p == pressed, p == cursor_);
+            else
+                DeskFolderCard(dl, folders_[p], a, b, pic, p == hovered, p == pressed, p == cursor_);
             continue;
         }
         if (p < nf) {
@@ -1141,9 +1185,12 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         ThumbnailAtlas::Thumb thumb;
         const bool shown = cache_.Use(item.id, slot) && atlas_.Get(slot, thumb);
         // The picture's square: the tile on touch, inside the card on desktop.
-        const ImVec2 pa(a.x + deskPad, a.y + deskPad), pb(pa.x + pic, pa.y + pic);
+        const ImVec2 pa(a.x + deskPad, list ? a.y + Round((tileH - pic) * 0.5f) : a.y + deskPad), pb(pa.x + pic, pa.y + pic);
         const bool supported = library_.Supported(shown_[p - nf]);
-        if (desk)
+        if (list)
+            DeskItemRow(dl, item, supported, verdict, columns, a, b, pic, p == hovered, p == pressed, p == cursor_, shown,
+                        /*behind=*/true);
+        else if (desk)
             DeskItemCard(dl, item, supported, verdict, a, b, pic, p == hovered, p == pressed, p == cursor_, shown,
                          /*behind=*/true);
         if (shown && stereo_) {
@@ -1182,8 +1229,12 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
             }
         }
         if (desk) {
-            DeskItemCard(dl, item, supported, verdict, a, b, pic, p == hovered, p == pressed, p == cursor_, shown,
-                         /*behind=*/false);
+            if (list)
+                DeskItemRow(dl, item, supported, verdict, columns, a, b, pic, p == hovered, p == pressed, p == cursor_,
+                            shown, /*behind=*/false);
+            else
+                DeskItemCard(dl, item, supported, verdict, a, b, pic, p == hovered, p == pressed, p == cursor_, shown,
+                             /*behind=*/false);
             if (p == hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
                 if (item.cloudOnly)
                     ImGui::SetTooltip("%s\nOnline only: opening it downloads it", item.name.c_str());
@@ -1287,14 +1338,29 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         }
     }
 
-    // Desktop: right click a folder tile for its menu (pin, unpin, hide).
+    // Desktop: right click a folder tile for its menu (pin, unpin, hide), a file for its own
+    // (open, show in File Explorer, copy the path).
     size_t clicked = n;
     if (desktop_ && gridHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
-        itemAt(ImGui::GetIO().MousePos, clicked) && clicked < nf && folders_[clicked].path != kNewestFolder) {
-        menuFolder_ = folders_[clicked].path;
-        ImGui::OpenPopup("##folder_menu");
+        itemAt(ImGui::GetIO().MousePos, clicked)) {
+        if (clicked < nf && folders_[clicked].path != kNewestFolder) {
+            menuFolder_ = folders_[clicked].path;
+            ImGui::OpenPopup("##folder_menu");
+        } else if (clicked >= nf && clicked < n) {
+            menuItem_ = items[shown_[clicked - nf]].id;
+            ImGui::OpenPopup("##item_menu");
+        }
     }
     FolderMenu();
+    if (desktop_) DeskItemMenu();
+    if (menuOpen_) {
+        menuOpen_ = false;
+        if (!selecting_ && library_.Find(menuItem_)) {
+            openedId_ = menuItem_;
+            provider_->Open(openedId_);
+            return Action::Opened;
+        }
+    }
 
     size_t picked = 0;
     if (keyOpen) {
@@ -1345,6 +1411,54 @@ void MediaBrowser::GoTo(const std::string& folder) {
 }
 
 void MediaBrowser::Up() { GoTo(library_.Parent(CurrentSource(), folder_)); }
+
+void MediaBrowser::SetQuery(const std::string& query) {
+    std::snprintf(search_, sizeof(search_), "%s", query.c_str());
+    query_ = search_;
+    dirty_ = true;
+}
+
+// Each change of place (a source, a folder, by any route) goes on the Back list. A new place
+// clears Forward, and the search: it was for the place left.
+void MediaBrowser::TrackHistory() {
+    if (!listed_) return;
+    if (!placed_) {
+        here_ = Place{source_, folder_};
+        placed_ = true;
+        return;
+    }
+    if (here_.source == source_ && here_.folder == folder_) return;
+    back_.push_back(here_);
+    if (back_.size() > 64) back_.erase(back_.begin());
+    forward_.clear();
+    here_ = Place{source_, folder_};
+    if (search_[0]) {
+        search_[0] = '\0';
+        query_.clear();
+        dirty_ = true;
+    }
+}
+
+bool MediaBrowser::HistoryStep(int dir) {
+    std::vector<Place>& from = dir < 0 ? back_ : forward_;
+    std::vector<Place>& to = dir < 0 ? forward_ : back_;
+    TrackHistory();  // a change made this frame goes on the list first
+    while (!from.empty() && from.back().source >= library_.Sources().size()) from.pop_back();
+    if (from.empty()) return false;
+    to.push_back(here_);
+    here_ = from.back();
+    from.pop_back();
+    source_ = here_.source;
+    folder_ = here_.folder;
+    EndSelection();
+    if (search_[0]) {
+        search_[0] = '\0';
+        query_.clear();
+    }
+    dirty_ = true;
+    gridScroll_.SetOffset(0.0f);
+    return true;
+}
 
 void MediaBrowser::EndSelection() {
     selecting_ = false;

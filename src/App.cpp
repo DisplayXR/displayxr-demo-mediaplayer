@@ -47,6 +47,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <shlobj.h>     // SHGetKnownFolderPath — resolve the user's Pictures folder
+#include <shellapi.h>   // ShellExecuteW — "Show in File Explorer" (#252)
 #endif
 
 #if defined(MEDIAPLAYER_WITH_IMGUI)
@@ -573,6 +574,10 @@ int App::Run() {
         if (browser_ && std::string(b) == "3d") browser_->SetDepthFilter(browser::DepthFilter::Only3D);
         if (const char* src = std::getenv("MEDIAPLAYER_BROWSER_SOURCE"); browser_ && src && *src)
             browser_->SetStartSource(src);
+        // Test: "details" starts in the details view; a query starts a search.
+        if (const char* v = std::getenv("MEDIAPLAYER_BROWSER_VIEW"); browser_ && v && std::string(v) == "details")
+            browser_->SetDetails(true);
+        if (const char* q = std::getenv("MEDIAPLAYER_BROWSER_QUERY"); browser_ && q && *q) browser_->SetQuery(q);
 #endif
     }
     // Test: switch "Convert to 3D" on without a keystroke (headless runs). Retried until it
@@ -4703,6 +4708,27 @@ void App::ApplyFolderRequests() {
 #endif
 }
 
+void App::ApplyItemRequests() {
+#if MEDIAPLAYER_BROWSER
+    browser::MediaBrowser::ItemRequest r;
+    if (!browser_ || !browser_->TakeItemRequest(r)) return;
+    const std::string path = browserProvider_->PathOf(r.id);
+    if (path.empty()) return;
+    using Verb = browser::MediaBrowser::ItemRequest::Verb;
+    if (r.verb == Verb::CopyPath) {
+        ImGui::SetClipboardText(path.c_str());
+        ShowToast("Path copied");
+        return;
+    }
+#if defined(_WIN32)
+    // File Explorer, with the file selected.
+    const std::wstring args = L"/select,\"" + std::filesystem::u8path(path).wstring() + L"\"";
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+    LOG_INFO("browser: show in File Explorer '%s'", path.c_str());
+#endif
+#endif
+}
+
 void App::PollCloudFetch() {
 #if defined(_WIN32)
     std::string path;
@@ -4861,6 +4887,7 @@ void App::BuildBrowser() {
     }
     const browser::MediaBrowser::Action action = browser_->Build();
     ApplyFolderRequests();
+    ApplyItemRequests();
     ui::BuildTransportToast(uiState_);
     browser_->RecordUploads(renderer_.FrameCmd());
     // The browser has the keyboard: no player hotkeys. Esc backs out (a sheet, a folder),
@@ -4878,8 +4905,19 @@ void App::BuildBrowser() {
             } else if (!browser_->Back()) {
                 CloseBrowser();
             }
+        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+            browser_->FocusSearch();
+        } else if (io.KeyAlt && (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) ||
+                                 ImGui::IsKeyPressed(ImGuiKey_MouseX1, false))) {
+            // Back through the places shown; with none, up a folder.
+            if (!browser_->HistoryStep(-1)) browser_->Back();
+        } else if (ImGui::IsKeyPressed(ImGuiKey_MouseX1, false)) {
+            if (!browser_->HistoryStep(-1)) browser_->Back();
+        } else if ((io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) ||
+                   ImGui::IsKeyPressed(ImGuiKey_MouseX2, false)) {
+            browser_->HistoryStep(1);
         } else if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false) ||
-                   (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))) {
+                   (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_UpArrow, false))) {
             browser_->Back();
         }
     }

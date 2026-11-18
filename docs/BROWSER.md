@@ -251,16 +251,34 @@ Pinned); Hide from Media folders (top of Media folders, for junk the size filter
 Pinned and hidden folders are kept beside the Recent list (`pinned.txt`,
 `hidden_folders.txt` in `%APPDATA%\DisplayXR\MediaPlayer\`).
 
-**Input.** Mouse: click, wheel scrolling, a hover outline and a name tooltip. Keyboard:
-arrows, Page Up / Down, Home / End move a focus ring, Enter opens, Backspace or Alt+Left go
-up a folder, Esc backs out then closes. Player hotkeys are off while it shows. A file opened
-from the grid makes Up / Down in the player walk the grid as shown (no wrap).
+**File menu** (right click a file): Open; Show in File Explorer; Copy path (also
+Ctrl+Shift+C on the file with the focus ring, else the one under the pointer).
+
+**Views.** The toolbar's grid / details switch, at its right. The grid's cards are 120-320 px
+wide (the size slider beside the switch, or Ctrl+wheel over the grid; 176 at start). The
+details view is a row per file, 48 px with a 40 px picture: name (a cloud after it), depth
+(3D, 3D?, 2D), type, dimensions, length, date, size. A narrow window drops type, dimensions,
+size, then date. The Date heading turns the sort round. Both views draw the pictures in 3D
+under the 3D filter.
+
+**Search** (Ctrl+F, or the box in the header; none below 640 px of window width): shows the
+folders and files of the place shown whose names hold the text, any case. Esc or the cross
+clears it; going to another place clears it too.
+
+**Input.** Mouse: click, wheel scrolling, a hover outline and a name tooltip; the side
+buttons go back and forward. Keyboard: arrows, Page Up / Down, Home / End move a focus ring,
+Enter opens, Alt+Left / Alt+Right go back / forward through the places shown (any route
+there: the sidebar, the path, a folder), Backspace or Alt+Up go up a folder, Esc backs out
+then closes, Ctrl+O the Windows file dialog. Player hotkeys are off while it shows. A file
+opened from the grid makes Up / Down in the player walk the grid as shown (no wrap).
 
 **Sizing.** A dp is one design unit on desktop (1.5 on Android), so the browser matches the
 rest of the desktop UI; the sources stay a rail from 600 dp of window width.
 
-**Testing.** `MEDIAPLAYER_SHOW_BROWSER=1` shows it at launch; with `MEDIAPLAYER_DUMP_HUD`
-the HUD dump shows it. `win_shell_media_probe` (built on Windows, not a ctest test) prints
+**Testing.** `MEDIAPLAYER_SHOW_BROWSER=1` shows it at launch (`3d`: under the 3D filter);
+with `MEDIAPLAYER_DUMP_HUD` the HUD dump shows it. `MEDIAPLAYER_BROWSER_SOURCE=<name>` starts
+on a source, `MEDIAPLAYER_BROWSER_VIEW=details` in the details view,
+`MEDIAPLAYER_BROWSER_QUERY=<text>` with a search. `win_shell_media_probe` (built on Windows, not a ctest test) prints
 the index query and thumbnail timings on a real box; `--thumb <path> <cacheOnly>` checks one
 file and whether it stayed a cloud placeholder.
 

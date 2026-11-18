@@ -108,6 +108,7 @@ private:
     void BuildBrowser();
     bool BrowserNext(int delta, std::string& path) const;
     void ApplyFolderRequests();
+    void ApplyItemRequests();
     // A cloud-only file is downloaded in the background before it opens (#252): the
     // download's end, and its progress panel (Cancel).
     void PollCloudFetch();
