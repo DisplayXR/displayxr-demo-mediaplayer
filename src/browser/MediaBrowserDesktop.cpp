@@ -522,7 +522,8 @@ void MediaBrowser::DeskSortMenu() {
     ImGui::EndPopup();
 }
 
-// The sources: LIBRARY, then PINNED with "Add folder...", and "Open file..." at the foot.
+// The sources: LIBRARY, then PINNED (each pinned folder a row) with "Add folder...", and
+// "Open file..." at the foot.
 MediaBrowser::Action MediaBrowser::DeskSidebar(ImVec2 min, ImVec2 max) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const std::vector<Source>& sources = library_.Sources();
@@ -536,7 +537,8 @@ MediaBrowser::Action MediaBrowser::DeskSidebar(ImVec2 min, ImVec2 max) {
     const float footH = rowH + pad * 2.0f;
     const float listBottom = max.y - footH;
 
-    // The rows, in order: kind 0 = a heading, 1 = a source, 2 = Add folder.
+    // The rows, in order: kind 0 = a heading, 1 = a source, 2 = Add folder, 3 = a pinned
+    // folder (`source` indexes pinnedRows_).
     struct Entry {
         int kind;
         int source;
@@ -546,9 +548,15 @@ MediaBrowser::Action MediaBrowser::DeskSidebar(ImVec2 min, ImVec2 max) {
     entries.push_back({0, -1, "LIBRARY"});
     bool pinnedHeading = false;
     for (int i = 0; i < rows; ++i) {
-        if (sources[(size_t)i].kind == SourceKind::Pinned && !pinnedHeading) {
-            entries.push_back({0, -1, "PINNED"});
+        if (sources[(size_t)i].kind == SourceKind::Pinned) {
+            if (!pinnedHeading) entries.push_back({0, -1, "PINNED"});
             pinnedHeading = true;
+            // Its folders, one by one, in place of one "Pinned" row (the path still names
+            // "Pinned", and its top lists them).
+            if ((size_t)i == pinnedSource_) {
+                for (size_t j = 0; j < pinnedRows_.size(); ++j) entries.push_back({3, (int)j, nullptr});
+                continue;
+            }
         }
         entries.push_back({1, i, nullptr});
     }
@@ -585,7 +593,10 @@ MediaBrowser::Action MediaBrowser::DeskSidebar(ImVec2 min, ImVec2 max) {
         const bool hovered = ImGui::IsItemHovered();
         const bool held = ImGui::IsItemActive();
         ImGui::PopID();
-        const bool on = e.kind == 1 && (size_t)e.source == source_;
+        const Folder* pin = e.kind == 3 ? &pinnedRows_[(size_t)e.source] : nullptr;
+        // A pinned row is lit while its folder, or one inside it, is shown.
+        const bool on = (e.kind == 1 && (size_t)e.source == source_) ||
+                        (pin && source_ == pinnedSource_ && folder_.compare(0, pin->path.size(), pin->path) == 0);
         if (on) {
             dl->AddRectFilled(a, b, kAccentWeak, r);
             dl->AddRectFilled(ImVec2(a.x, a.y + Px(8.0f)), ImVec2(a.x + Px(3.0f), b.y - Px(8.0f)), kAccent, Px(2.0f));
@@ -594,7 +605,7 @@ MediaBrowser::Action MediaBrowser::DeskSidebar(ImVec2 min, ImVec2 max) {
         } else if (hovered) {
             dl->AddRectFilled(a, b, kHoverFill, r);
         }
-        const Glyph glyph = e.kind == 2 ? Glyph::Folder : DeskSourceIcon(sources[(size_t)e.source].kind);
+        const Glyph glyph = e.kind == 2 ? Glyph::Folder : pin ? Glyph::Pin : DeskSourceIcon(sources[(size_t)e.source].kind);
         const float textX = a.x + Px(10.0f) + icon + Px(10.0f);
         ui::DrawGlyph(dl, glyph, ImVec2(a.x + Px(10.0f) + icon * 0.5f, a.y + rowH * 0.5f), icon * 1.6f,
                       on ? kAccent : hovered ? kText : kTextDim, on);
@@ -603,6 +614,38 @@ MediaBrowser::Action MediaBrowser::DeskSidebar(ImVec2 min, ImVec2 max) {
         if (e.kind == 2) {
             dl->AddText(ImVec2(textX, textY), hovered ? kText : kTextDim, ui::FitText(e.label, b.x - textX).c_str());
             if (clicked) action = Action::AddFolder;
+            continue;
+        }
+        if (pin) {
+            char count[16];
+            std::snprintf(count, sizeof(count), "%d", pin->count);
+            float countX = b.x - Px(10.0f);
+            {
+                DeskFont m(DeskText::Meta);
+                countX -= ImGui::CalcTextSize(count).x;
+                dl->AddText(ImVec2(countX, a.y + Round((rowH - ImGui::GetFontSize()) * 0.5f)), kTextFaint, count);
+            }
+            dl->AddText(ImVec2(textX, textY), on || hovered ? kText : kTextDim,
+                        ui::FitText(pin->name, std::max(0.0f, countX - Px(8.0f) - textX)).c_str());
+            if (hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                std::string where = pin->path;
+                std::replace(where.begin(), where.end(), '/', '\\');
+                if (where.size() > 3 && where.back() == '\\') where.pop_back();
+                ImGui::SetTooltip("%s", where.c_str());
+            }
+            // A click shows the folder (from inside it, its top); a right click its menu.
+            if (clicked && (source_ != pinnedSource_ || folder_ != pin->path)) {
+                source_ = pinnedSource_;
+                folder_ = pin->path;
+                EndSelection();
+                sourcePicked_ = true;
+                dirty_ = true;
+                gridScroll_.SetOffset(0.0f);
+            }
+            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                pinnedMenu_ = pin->path;
+                ImGui::OpenPopup("##pinned_menu");
+            }
             continue;
         }
         const Source& s = sources[(size_t)e.source];
@@ -627,6 +670,7 @@ MediaBrowser::Action MediaBrowser::DeskSidebar(ImVec2 min, ImVec2 max) {
         }
     }
     dl->PopClipRect();
+    DeskPinnedMenu();
 
     // The foot: the system's file dialog, always there.
     dl->AddLine(ImVec2(min.x + pad, listBottom + 0.5f), ImVec2(max.x - pad, listBottom + 0.5f), kLine, Px(1.0f));
@@ -661,6 +705,33 @@ MediaBrowser::Action MediaBrowser::DeskSidebar(ImVec2 min, ImVec2 max) {
         }
     }
     return action;
+}
+
+// A pinned folder's menu (right click its sidebar row): show it, or unpin it.
+void MediaBrowser::DeskPinnedMenu() {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(4.0f), Px(4.0f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, Px(6.0f));
+    const bool open = ImGui::BeginPopup("##pinned_menu");
+    ImGui::PopStyleVar(2);
+    if (!open) return;
+    {
+        DeskFont f(DeskText::Label);
+        const float w = Round(Px(200.0f)), rowH = Round(Px(28.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
+        if (ImGui::Selectable("Open", false, 0, ImVec2(w, rowH)) && pinnedSource_ != SIZE_MAX) {
+            source_ = pinnedSource_;
+            folder_ = pinnedMenu_;
+            EndSelection();
+            dirty_ = true;
+            gridScroll_.SetOffset(0.0f);
+        }
+        if (ImGui::Selectable("Remove from Pinned", false, 0, ImVec2(w, rowH))) {
+            folderRequest_ = FolderRequest{FolderRequest::Verb::Unpin, pinnedMenu_};
+            folderRequestPending_ = true;
+        }
+        ImGui::PopStyleVar();
+    }
+    ImGui::EndPopup();
 }
 
 // A folder's card: a surface square with the folder in it and its count, the name and where it

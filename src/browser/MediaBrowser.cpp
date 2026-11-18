@@ -333,6 +333,7 @@ void MediaBrowser::TakeResults() {
             }
         }
         library_.SetItems(std::move(items));
+        UpdatePinnedRows();
         // An empty source at its top (Recents before anything was opened): show the first
         // one that holds something instead.
         // Only Recents: an empty source the user picked (Pictures still listing, or empty
@@ -494,11 +495,21 @@ MediaBrowser::Action MediaBrowser::Build() {
     TakeResults();
     if (!startSource_.empty() && listed_) {
         const std::vector<Source>& s = library_.Sources();
+        bool found = false;
         for (size_t i = 0; i < s.size(); ++i) {
             if (s[i].name != startSource_) continue;
             source_ = i;
             folder_ = s[i].folder;
             dirty_ = true;
+            found = true;
+        }
+        // Else a pinned folder by its name (desktop tests: a pinned row lit).
+        for (size_t j = 0; !found && j < pinnedRows_.size(); ++j) {
+            if (pinnedRows_[j].name != startSource_) continue;
+            source_ = pinnedSource_;
+            folder_ = pinnedRows_[j].path;
+            dirty_ = true;
+            found = true;
         }
         startSource_.clear();
     }
@@ -554,7 +565,8 @@ MediaBrowser::Action MediaBrowser::Build() {
         DeskHeader(w, headerH);
         DeskSortMenu();
         closeSheets_ = false;
-        sheetOpen_ = ImGui::IsPopupOpen("##sort_menu") || ImGui::IsPopupOpen("##folder_menu");
+        sheetOpen_ = ImGui::IsPopupOpen("##sort_menu") || ImGui::IsPopupOpen("##folder_menu") ||
+                     ImGui::IsPopupOpen("##pinned_menu");
         ImGui::PopFont();
     } else if (open) {
         const bool railShown = rail_ && sidebar_;
@@ -1435,6 +1447,26 @@ void MediaBrowser::GoTo(const std::string& folder) {
 }
 
 void MediaBrowser::Up() { GoTo(library_.Parent(CurrentSource(), folder_)); }
+
+// The Pinned source's folders, for the desktop sidebar: one row per pinned folder, with what it
+// holds (as the source rows' counts: every supported file, whatever the view options). A
+// folder shown that is no longer pinned goes back to the source's top.
+void MediaBrowser::UpdatePinnedRows() {
+    pinnedRows_.clear();
+    pinnedSource_ = SIZE_MAX;
+    const std::vector<Source>& sources = library_.Sources();
+    for (size_t i = 0; i < sources.size(); ++i) {
+        if (sources[i].kind != SourceKind::Pinned) continue;
+        pinnedSource_ = i;
+        pinnedRows_ = library_.Folders(sources[i], ViewOptions{}, sources[i].folder);
+        break;
+    }
+    if (source_ != pinnedSource_ || pinnedSource_ == SIZE_MAX || folder_ == CurrentSource().folder) return;
+    for (const Folder& f : pinnedRows_)
+        if (folder_.compare(0, f.path.size(), f.path) == 0) return;
+    folder_ = CurrentSource().folder;
+    dirty_ = true;
+}
 
 void MediaBrowser::SetViewPrefs(const DeskViewPrefs& prefs) {
     details_ = prefs.details;

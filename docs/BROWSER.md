@@ -231,7 +231,7 @@ goes back to the player.
 | Pictures, Videos | the Windows libraries (OneDrive Pictures and added folders included), walked | folder tree; several roots are listed first |
 | Downloads | the known folder, walked | folder tree |
 | Media folders | the Windows Search index: pictures with a long side of at least 1024 px, videos of at least 1 MB, nothing under AppData, Program Files, Windows or a hidden folder | one tile per folder, a Newest tile (50) first |
-| Pinned | folders added with "Add folder...", walked | its folders first, then a tree |
+| Pinned | folders added with "Add folder...", walked | its folders first, then a tree; the sidebar lists each pinned folder as a row of its own |
 
 A walk reads directory entries only, at most 6 folders deep and 3 s per tree. One index
 query takes about 0.15 s for ~1,400 items on the 8K dev box; the whole list about 0.2-0.3 s.
@@ -245,6 +245,12 @@ If the index cannot be queried, Media folders is empty and a strip over the grid
   shows "3D?" (`StereoVerdict::unchecked`) and is 2D for the filters.
 Local stills get the file check (`LifLoader::IsLif`, `MpoLoader::IsMpo`); two-track videos
 are not probed on desktop yet.
+
+**Pinned in the sidebar.** Under PINNED, each pinned folder is a row (a pin, its name, how
+many files it holds), lit while it or a folder inside it is shown; a click shows it, the
+tooltip gives its full path. The path reads "Pinned > <folder>", and Pinned's top still lists
+them all. Right click a row: Open, Remove from Pinned. A folder shown that is unpinned goes
+back to Pinned's top (or the first source, with no pins left).
 
 **Folder menu** (right click a folder tile): Pin this folder; Remove from Pinned (top of
 Pinned); Hide from Media folders (top of Media folders, for junk the size filter keeps).
@@ -280,7 +286,7 @@ rest of the desktop UI; the sources stay a rail from 600 dp of window width.
 
 **Testing.** `MEDIAPLAYER_SHOW_BROWSER=1` shows it at launch (`3d`: under the 3D filter);
 with `MEDIAPLAYER_DUMP_HUD` the HUD dump shows it. `MEDIAPLAYER_BROWSER_SOURCE=<name>` starts
-on a source, `MEDIAPLAYER_BROWSER_VIEW=details` in the details view,
+on a source (or, with no source of that name, on the pinned folder of that name), `MEDIAPLAYER_BROWSER_VIEW=details` in the details view,
 `MEDIAPLAYER_BROWSER_QUERY=<text>` with a search. A test run (`MEDIAPLAYER_SHOW_BROWSER`) never
 reads or writes the user's `browser_view.txt`; `MEDIAPLAYER_BROWSER_PREFS=<file>` names a view
 file for it to use instead. `win_shell_media_probe` (built on Windows, not a ctest test) prints

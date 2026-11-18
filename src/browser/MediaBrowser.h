@@ -203,7 +203,9 @@ private:
                      bool picture, bool behind);
     void DeskSearch(ImVec2 pos, float w, float h, const std::string& place);
     void DeskItemMenu();
+    void DeskPinnedMenu();
     void TrackHistory();
+    void UpdatePinnedRows();
 
     MediaProvider* provider_ = nullptr;
     bool desktop_ = false;         // SetDesktop
@@ -229,6 +231,10 @@ private:
     bool placed_ = false;
     ItemRequest itemRequest_;
     bool itemRequestPending_ = false;
+    // Desktop: the Pinned source's folders, a sidebar row each (UpdatePinnedRows).
+    std::vector<Folder> pinnedRows_;
+    size_t pinnedSource_ = SIZE_MAX;  // the Pinned source's index, SIZE_MAX: none
+    std::string pinnedMenu_;          // the pinned row whose menu is open
     int64_t menuItem_ = -1;        // the file whose menu is open
     bool menuOpen_ = false;        // its menu's "Open", this frame
     MediaLibrary library_;
