@@ -114,6 +114,11 @@ int main() {
         AudioMeter::Reading r = m.Take();
         CHECK(r.any && Near(r.peak[0], 0.25f));  // only what came after Watch()
     }
+    // A/V sync (LOXR-873): + offset = the video runs ahead of the sound by that much.
+    CHECK(ShiftedAudioClock(10.0, 0) == 10.0);
+    CHECK(Near((float)ShiftedAudioClock(10.0, 250), 10.25f) && Near((float)ShiftedAudioClock(10.0, -250), 9.75f));
+    CHECK(ShiftedAudioClock(0.1, -500) == 0.0);    // never negative ("audio gone" to the decoder)
+    CHECK(ShiftedAudioClock(-1.0, 300) == -1.0);   // no audio clock stays "none"
     CHECK(MeterDb(1.0f) == 0.0f && Near(MeterDb(0.5f), -6.0206f) && MeterDb(0.0f) == kMeterFloorDb);
 
     // Ballistics.

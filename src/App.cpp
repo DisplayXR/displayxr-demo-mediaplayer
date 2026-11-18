@@ -362,7 +362,12 @@ bool App::Initialize(const char* mediaPath) {
 
     // Audio is the A/V master: the video decoder paces frames to the audio clock when a
     // clip has sound (else it falls back to its own wall clock).
-    video_.SetMasterClock([this]() { return audio_.ClockSeconds(); });
+    // A/V sync (LOXR-873): the video follows the audio clock shifted by the offset, so a +
+    // offset shows each frame that much before its sound (= the sound plays later). Clamped
+    // at 0: a negative clock would read as "audio gone" and hand pacing to the wall clock.
+    video_.SetMasterClock([this]() {
+        return ShiftedAudioClock(audio_.ClockSeconds(), avOffsetMs_.load(std::memory_order_relaxed));
+    });
     // The video owns Loop (#216): at each wrap it restarts the audio, which never loops by
     // itself, so the two always start a pass together. Called on the decode thread;
     // AudioPlayer::Seek is an atomic store, and the decoder is always stopped before the
@@ -3419,6 +3424,14 @@ void App::TogglePlayback() {
     LOG_INFO("playback %s", video_.Paused() ? "paused" : "playing");
 }
 
+void App::SetAvOffsetMs(int ms) {
+    ms = std::clamp(ms, -500, 500);
+    avOffsetMs_.store(ms);
+#if MEDIAPLAYER_PRO
+    pro_.GetStation().SetLiveAudioDelayMs(std::max(0, ms));  // live audio can only be late
+#endif
+}
+
 void App::SetVolume(float v) {
     volume_ = std::clamp(v, 0.0f, 1.0f);
     audio_.SetVolume(volume_);
@@ -4002,6 +4015,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["is_video"] = isVideo_;
         out["muted"] = muted_;
         out["volume"] = volume_;
+        out["av_offset_ms"] = avOffsetMs_.load();
         out["folder_index"] = static_cast<uint64_t>(folderIndex_);
         out["folder_count"] = static_cast<uint64_t>(folderFiles_.size());
         out["layout"] = MediaSource::LayoutName(layout_);
@@ -4514,6 +4528,8 @@ void App::InitPro() {
                                          LOG_INFO("Pro A/B: %s=%s: %s %s", name, value, what, on ? "on" : "OFF");
                                      });
     pro::Host h;
+    h.getAvOffsetMs = [this] { return avOffsetMs_.load(); };
+    h.setAvOffsetMs = [this](int ms) { SetAvOffsetMs(ms); };
     h.getVolume = [this] { return volume_; };
     h.setVolume = [this](float v) { SetVolume(v); };
     h.getMuted = [this] { return muted_; };
@@ -4715,6 +4731,8 @@ void App::InitPro() {
     pro_.GetStation().SetLiveAudioMuted(muted_);
     pro_.GetStation().SetLiveAudioVolume(volume_);
     pro_.GetStation().SetLiveAudioMeter(&audioMeter_);
+    // A station keeps its sync offset in pro.env (MEDIAPLAYER_AUDIO_OFFSET_MS=<ms>).
+    if (const char* e = std::getenv("MEDIAPLAYER_AUDIO_OFFSET_MS")) SetAvOffsetMs(std::atoi(e));
     audio_.SetMeter(&audioMeter_);  // file audio feeds the same meters (Pro only)
     LOG_INFO("Media Player Pro: ready (lut=%s cdl=%s)", launch_.lutPath.c_str(), launch_.cdlPath.c_str());
 }

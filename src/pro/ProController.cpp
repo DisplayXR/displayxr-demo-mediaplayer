@@ -1675,6 +1675,22 @@ void ProController::BuildAudioSection(bool live) {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("M");
     }
 
+    if (host_.getAvOffsetMs && host_.setAvOffsetMs) {
+        int off = host_.getAvOffsetMs();
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
+        if (ImGui::SliderInt("Sync", &off, -500, 500, off == 0 ? "0 ms" : "%+d ms", ImGuiSliderFlags_AlwaysClamp))
+            host_.setAvOffsetMs(off);
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) host_.setAvOffsetMs(0);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Audio against the picture: + plays the sound later, - earlier.\n"
+                              "Ctrl+click to type a value; right-click resets to 0.");
+        if (live && off < 0) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.25f, 1.0f), "live: on time");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Live audio can be delayed, not played early.");
+        }
+    }
+
     const auto now = std::chrono::steady_clock::now();
     const float dt = metersAt_.time_since_epoch().count() == 0
                          ? 0.0f

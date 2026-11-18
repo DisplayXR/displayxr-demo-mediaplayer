@@ -70,7 +70,19 @@ void LiveAudioSink::Push(const void* samples, int frames) {
     const int bytes = frames * 2 * (int)sizeof(int32_t);
     // The card's clock and the output device's are not the same clock: if the queue grows
     // past the limit, start over from this packet rather than drift behind the picture.
-    const int maxBytes = kLiveAudioRate * kLiveAudioMaxQueueMs / 1000 * 2 * (int)sizeof(int32_t);
+    const int bytesPerMs = kLiveAudioRate / 1000 * 2 * (int)sizeof(int32_t);
+    const int delayMs = delayMs_.load();
+    if (delayMs != appliedDelayMs_) {
+        // The sync delay changed: restart the queue with that much silence ahead.
+        SDL_ClearAudioStream(impl_->stream);
+        if (meter_) meter_->Clear();
+        if (delayMs > 0) {
+            std::vector<int32_t> silence((size_t)delayMs * (size_t)(kLiveAudioRate / 1000) * 2, 0);
+            SDL_PutAudioStreamData(impl_->stream, silence.data(), (int)(silence.size() * sizeof(int32_t)));
+        }
+        appliedDelayMs_ = delayMs;
+    }
+    const int maxBytes = (kLiveAudioMaxQueueMs + appliedDelayMs_) * bytesPerMs;
     int queued = SDL_GetAudioStreamQueued(impl_->stream);
     if (queued > maxBytes) {
         SDL_ClearAudioStream(impl_->stream);

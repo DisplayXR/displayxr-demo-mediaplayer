@@ -143,6 +143,10 @@ struct Host {
     std::function<bool()> getMuted;
     std::function<void()> toggleMute;
     std::function<bool()> fileHasAudio;  // the open file is playing an audio stream
+    // A/V sync (LOXR-873), ms: + = audio heard later than the picture. Files take either
+    // sign; live DeckLink audio can only be delayed (a negative value plays it on time).
+    std::function<int()> getAvOffsetMs;
+    std::function<void(int)> setAvOffsetMs;
     AudioMeter* audioMeter = nullptr;
 };
 

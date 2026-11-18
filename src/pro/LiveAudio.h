@@ -34,7 +34,8 @@ namespace mp::pro {
 
 constexpr int kLiveAudioRate = 48000;     // SDI embedded audio is always 48 kHz
 constexpr int kLiveAudioMaxPair = 8;      // channels 15-16
-constexpr int kLiveAudioMaxQueueMs = 200; // more queued than this = the clocks drifted: drop it
+constexpr int kLiveAudioMaxQueueMs = 200; // more queued than this (past the sync delay) = the clocks drifted: drop it
+constexpr int kLiveAudioMaxDelayMs = 500; // A/V sync (LOXR-873): live audio can be held back up to this
 
 // The channel count to capture so that pair `pair` (1 = ch 1-2, 2 = ch 3-4, ...) is in it:
 // the card takes 2, 8 or 16. 0 for an invalid pair.
@@ -90,6 +91,10 @@ public:
     void PacketWithoutSamples() { ++bad_; }
     void SetMuted(bool m);
     void SetVolume(float v);  // 0..1 (LOXR-872); mute wins over it
+    // A/V sync (LOXR-873): hold the audio back `ms` (0..kLiveAudioMaxDelayMs) behind the
+    // picture. Live audio cannot be played early, only late. Applied at the next packet:
+    // the queue restarts with that much silence ahead (a moment's gap when it changes).
+    void SetDelayMs(int ms) { delayMs_.store(ms < 0 ? 0 : ms > kLiveAudioMaxDelayMs ? kLiveAudioMaxDelayMs : ms); }
     Stats GetStats() const;
 
 private:
@@ -102,6 +107,8 @@ private:
     AudioMeter* meter_ = nullptr;
     std::atomic<bool> muted_{false};
     std::atomic<float> volume_{1.0f};
+    std::atomic<int> delayMs_{0};
+    int appliedDelayMs_ = 0;  // card thread only
     std::vector<int32_t> stereo_;  // card thread only
     std::atomic<uint64_t> packets_{0}, frames_{0}, overflows_{0}, bad_{0};
 };
