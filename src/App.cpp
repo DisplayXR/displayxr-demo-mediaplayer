@@ -1139,6 +1139,16 @@ void App::RenderOneFrame() {
         // The browser: its mode, and whether the 3D grid draws the atlas this frame. It
         // does so after the HUD is laid out (below), at the rects of THIS frame's tiles.
         if (browsing_) {
+            // Test: MEDIAPLAYER_BROWSER_3D_AT=<frame> turns the 3D filter on mid-run, as a
+            // click on "3D" would (#252: a hang reported after that click).
+            static const long k3dAt = [] {
+                const char* f = std::getenv("MEDIAPLAYER_BROWSER_3D_AT");
+                return f ? std::atol(f) : 0L;
+            }();
+            if (k3dAt > 0 && (long)rendered_ == k3dAt && browser_) {
+                LOG_INFO("test: 3D filter on at frame %ld", k3dAt);
+                browser_->SetDepthFilter(browser::DepthFilter::Only3D);
+            }
             RequestBrowserMode();
             if (browser_) browser_->SetStereo(GridStereo(frame.viewCount), xr_.ActiveViewScaleX());
             gridPending = GridStereo(frame.viewCount);
