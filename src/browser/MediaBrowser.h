@@ -122,6 +122,11 @@ public:
     void SetQuery(const std::string& query);
     // Ctrl+F: the search box takes the keyboard.
     void FocusSearch() { focusSearch_ = true; }
+    // Desktop: grid or details, the cards' size and the sort, as the caller keeps them
+    // between launches (BrowserLayout.h).
+    DeskViewPrefs ViewPrefs() const { return DeskViewPrefs{details_, cardW_, options_.order}; }
+    void SetViewPrefs(const DeskViewPrefs& prefs);
+    static constexpr float kCardMin = 120.0f, kCardMax = 320.0f;  // desktop: the size slider's range
 
     // The 3D grid (#180, StereoGrid.h). The "3D only" filter is on: the caller takes the
     // panel to 3D for it.
@@ -149,7 +154,6 @@ public:
 private:
     static constexpr uint32_t kTile = 512;  // thumbnail edge, px
     static constexpr uint32_t kSlots = 64;  // thumbnails on the GPU: a screen and a few rows
-    static constexpr float kCardMin = 120.0f, kCardMax = 320.0f;  // desktop: the size slider's range
 
     void TakeResults();
     void Rebuild();

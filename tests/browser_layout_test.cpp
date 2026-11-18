@@ -149,6 +149,26 @@ void TestGridSections() {
     CHECK(Near(g.OffsetOf(5), 268.0f), "a later row on its own");
 }
 
+void TestViewPrefs() {
+    std::printf("[the desktop view, kept between launches]\n");
+    DeskViewPrefs p;
+    p.details = true;
+    p.cardW = 212.4f;
+    p.order = SortOrder::OldestFirst;
+    const std::string text = FormatDeskViewPrefs(p);
+    CHECK(text == "view=details\ncard=212\nsort=oldest\n", "the file's text");
+    const DeskViewPrefs back = ParseDeskViewPrefs(text, 120.0f, 320.0f);
+    CHECK(back.details && Near(back.cardW, 212.0f) && back.order == SortOrder::OldestFirst, "a round trip");
+    const DeskViewPrefs none = ParseDeskViewPrefs("", 120.0f, 320.0f);
+    CHECK(none == DeskViewPrefs{}, "an empty file: the defaults");
+    const DeskViewPrefs crlf = ParseDeskViewPrefs("view=details\r\nsort=oldest\r\n", 120.0f, 320.0f);
+    CHECK(crlf.details && crlf.order == SortOrder::OldestFirst && Near(crlf.cardW, 176.0f), "CRLF, a missing key");
+    const DeskViewPrefs odd = ParseDeskViewPrefs("view=tiles\ncard=abc\nsort=random\nzoom=3\nnoise", 120.0f, 320.0f);
+    CHECK(odd == DeskViewPrefs{}, "bad values and unknown keys keep the defaults");
+    CHECK(Near(ParseDeskViewPrefs("card=9999", 120.0f, 320.0f).cardW, 320.0f), "a card too wide: the largest");
+    CHECK(Near(ParseDeskViewPrefs("card=-5", 120.0f, 320.0f).cardW, 120.0f), "a card too narrow: the smallest");
+}
+
 }  // namespace
 
 int main() {
@@ -160,6 +180,7 @@ int main() {
     TestDates();
     TestGridPlain();
     TestGridSections();
+    TestViewPrefs();
     if (g_failures) {
         std::fprintf(stderr, "%d CHECK(s) FAILED\n", g_failures);
         return 1;

@@ -34,7 +34,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <sstream>
 
 #include <nlohmann/json.hpp>  // parse agent-tool args / build results (XR_DXR_mcp_tools)
 #include <SDL3/SDL.h>   // SDL_ShowOpenFileDialog (Tier-0 native file dialog)
@@ -531,6 +533,23 @@ bool App::Initialize(const char* mediaPath) {
                     hiddenFile_ = (dir / "hidden_folders.txt").string();
                     pinned_.Load(pinnedFile_);
                     hiddenFolders_.Load(hiddenFile_);
+                    browserPrefsFile_ = (dir / "browser_view.txt").string();
+                }
+                // Tests: MEDIAPLAYER_BROWSER_PREFS names the view file to use instead; a test
+                // run (MEDIAPLAYER_SHOW_BROWSER) without it never reads or writes the user's.
+                if (const char* p = std::getenv("MEDIAPLAYER_BROWSER_PREFS"); p && *p)
+                    browserPrefsFile_ = p;
+                else if (const char* s = std::getenv("MEDIAPLAYER_SHOW_BROWSER"); s && *s && std::string(s) != "0")
+                    browserPrefsFile_.clear();
+                if (!browserPrefsFile_.empty()) {
+                    std::ifstream in(fs::u8path(browserPrefsFile_), std::ios::binary);
+                    if (in) {
+                        std::stringstream text;
+                        text << in.rdbuf();
+                        browser_->SetViewPrefs(browser::ParseDeskViewPrefs(text.str(), browser::MediaBrowser::kCardMin,
+                                                                           browser::MediaBrowser::kCardMax));
+                    }
+                    browserPrefsSaved_ = browser_->ViewPrefs();
                 }
             } else {
                 LOG_WARN("browser: could not start - Open uses the system dialog");
@@ -4888,6 +4907,14 @@ void App::BuildBrowser() {
     const browser::MediaBrowser::Action action = browser_->Build();
     ApplyFolderRequests();
     ApplyItemRequests();
+    // The view changed (and the size slider is let go): keep it for the next launch.
+    if (!browserPrefsFile_.empty() && !ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+        browser_->ViewPrefs() != browserPrefsSaved_) {
+        browserPrefsSaved_ = browser_->ViewPrefs();
+        std::ofstream out(std::filesystem::u8path(browserPrefsFile_), std::ios::binary | std::ios::trunc);
+        if (out) out << browser::FormatDeskViewPrefs(browserPrefsSaved_);
+        if (!out) LOG_WARN("browser: could not write '%s'", browserPrefsFile_.c_str());
+    }
     ui::BuildTransportToast(uiState_);
     browser_->RecordUploads(renderer_.FrameCmd());
     // The browser has the keyboard: no player hotkeys. Esc backs out (a sheet, a folder),

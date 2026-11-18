@@ -1436,6 +1436,16 @@ void MediaBrowser::GoTo(const std::string& folder) {
 
 void MediaBrowser::Up() { GoTo(library_.Parent(CurrentSource(), folder_)); }
 
+void MediaBrowser::SetViewPrefs(const DeskViewPrefs& prefs) {
+    details_ = prefs.details;
+    cardW_ = std::min(kCardMax, std::max(kCardMin, prefs.cardW));
+    cardShown_ = 0.0f;  // drawn at that size at once, not eased to it
+    if (options_.order != prefs.order) {
+        options_.order = prefs.order;
+        dirty_ = true;
+    }
+}
+
 void MediaBrowser::SetQuery(const std::string& query) {
     std::snprintf(search_, sizeof(search_), "%s", query.c_str());
     query_ = search_;

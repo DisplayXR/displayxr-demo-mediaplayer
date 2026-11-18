@@ -259,7 +259,10 @@ wide (the size slider beside the switch, or Ctrl+wheel over the grid; 176 at sta
 details view is a row per file, 48 px with a 40 px picture: name (a cloud after it), depth
 (3D, 3D?, 2D), type, dimensions, length, date, size. A narrow window drops type, dimensions,
 size, then date. The Date heading turns the sort round. Both views draw the pictures in 3D
-under the 3D filter.
+under the 3D filter. The view, the card size and the sort are kept between launches in
+`browser_view.txt` beside `pinned.txt` (`view=grid|details`, `card=<px>`,
+`sort=newest|oldest`; an unknown line or a bad value keeps the default), written when one
+changes and the size slider is let go.
 
 **Search** (Ctrl+F, or the box in the header; none below 640 px of window width): shows the
 folders and files of the place shown whose names hold the text, any case. Esc or the cross
@@ -278,7 +281,9 @@ rest of the desktop UI; the sources stay a rail from 600 dp of window width.
 **Testing.** `MEDIAPLAYER_SHOW_BROWSER=1` shows it at launch (`3d`: under the 3D filter);
 with `MEDIAPLAYER_DUMP_HUD` the HUD dump shows it. `MEDIAPLAYER_BROWSER_SOURCE=<name>` starts
 on a source, `MEDIAPLAYER_BROWSER_VIEW=details` in the details view,
-`MEDIAPLAYER_BROWSER_QUERY=<text>` with a search. `win_shell_media_probe` (built on Windows, not a ctest test) prints
+`MEDIAPLAYER_BROWSER_QUERY=<text>` with a search. A test run (`MEDIAPLAYER_SHOW_BROWSER`) never
+reads or writes the user's `browser_view.txt`; `MEDIAPLAYER_BROWSER_PREFS=<file>` names a view
+file for it to use instead. `win_shell_media_probe` (built on Windows, not a ctest test) prints
 the index query and thumbnail timings on a real box; `--thumb <path> <cacheOnly>` checks one
 file and whether it stayed a cloud placeholder.
 

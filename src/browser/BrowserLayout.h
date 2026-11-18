@@ -44,6 +44,23 @@ bool ViewOptionsAreDefault(const ViewOptions& options, bool showUnsupported);
 // The type chip's label.
 const char* TypeLabel(TypeFilter type);
 
+// Desktop (#252): how the browser looks, kept between launches: grid or details, the cards'
+// width (design px), and the sort. As text, one "key=value" a line ("view=details",
+// "card=200", "sort=oldest"); a line it does not know is skipped and a bad value keeps the
+// default, so an older or a newer file still reads.
+struct DeskViewPrefs {
+    bool details = false;
+    float cardW = 176.0f;
+    SortOrder order = SortOrder::NewestFirst;
+    bool operator==(const DeskViewPrefs& o) const {
+        return details == o.details && cardW == o.cardW && order == o.order;
+    }
+    bool operator!=(const DeskViewPrefs& o) const { return !(*this == o); }
+};
+std::string FormatDeskViewPrefs(const DeskViewPrefs& prefs);
+// The prefs in `text`, from the defaults; `cardW` is clamped to [cardMin, cardMax].
+DeskViewPrefs ParseDeskViewPrefs(const std::string& text, float cardMin, float cardMax);
+
 // A date section: `key` orders and tells sections apart, `label` heads it.
 struct DateSection {
     int64_t key = 0;
