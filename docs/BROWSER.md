@@ -252,6 +252,16 @@ tooltip gives its full path. The path reads "Pinned > <folder>", and Pinned's to
 them all. Right click a row: Open, Remove from Pinned. A folder shown that is unpinned goes
 back to Pinned's top (or the first source, with no pins left).
 
+**Folder previews.** A folder card in the grid shows what it holds instead of a folder
+outline: a 2 x 2 mosaic of thumbnails of its files (`MediaLibrary::FolderPreviews`: files in
+it and its sub-folders, or in it only for a Media folders group; local files before cloud-only
+ones, then newest), with a folder-and-count badge. The previews share the 64 thumbnail slots
+with the files: the visible folder cards get four each while the slots the files leave
+allow, else one each (a single picture), else none. A cell whose thumbnail is not here yet
+stays the surface colour, and a card with none here shows the folder outline. Cloud-only
+files are asked for the same way as their own tiles (the shell's cache only, never a
+download). Not in the details view, nor in the 3D grid (two slots per file).
+
 **Folder menu** (right click a folder tile): Pin this folder; Remove from Pinned (top of
 Pinned); Hide from Media folders (top of Media folders, for junk the size filter keeps).
 Pinned and hidden folders are kept beside the Recent list (`pinned.txt`,

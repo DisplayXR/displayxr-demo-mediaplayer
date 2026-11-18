@@ -416,6 +416,8 @@ void MediaBrowser::Rebuild() {
     auto matches = [&](const std::string& name) { return query_.empty() || ContainsNoCase(name, query_); };
     folders_.erase(std::remove_if(folders_.begin(), folders_.end(), [&](const Folder& f) { return !matches(f.name); }),
                    folders_.end());
+    folderPreviews_.clear();
+    if (desktop_) folderPreviews_ = library_.FolderPreviews(CurrentSource(), options_, folders_, 4);
     for (size_t i : library_.Query(CurrentSource(), options_, folder_)) {
         if (!matches(items[i].name)) continue;
         if (depth_ == DepthFilter::Both) {
@@ -1074,6 +1076,24 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         cache_.Use(id, slot);  // so a new thumbnail never takes a slot the window still shows
         if (perTile > 1) cache_.Use(RightEyeKey(id), slot);
     }
+    // Desktop grid: the visible folder cards preview what they hold, 2 x 2, from the slots the
+    // files' window leaves: four each while they fit, else one each, else none (the glyph).
+    // Not in the 3D grid, whose files take two slots each.
+    size_t previewEach = 0;
+    const size_t visFolders = visFirst < nf ? std::min(visEnd, nf) - visFirst : 0;
+    if (desk && !list && perTile == 1 && visFolders > 0 && folderPreviews_.size() == nf) {
+        const size_t used = winEnd > std::max(winFirst, nf) ? winEnd - std::max(winFirst, nf) : 0;
+        const size_t spare = atlas_.SlotCount() > used ? atlas_.SlotCount() - used : 0;
+        previewEach = spare >= 4 * visFolders ? 4 : spare >= visFolders ? 1 : 0;
+    }
+    for (size_t p = visFirst; p < visFirst + visFolders && previewEach > 0; ++p) {
+        for (size_t k = 0; k < folderPreviews_[p].size() && k < previewEach; ++k) {
+            const int64_t id = items[folderPreviews_[p][k]].id;
+            window.insert(id);
+            int slot = 0;
+            cache_.Use(id, slot);
+        }
+    }
     // A thumbnail big enough that the part a tile shows covers it pixel for pixel, as far as
     // an atlas slot holds.
     // On desktop in steps of 128 px: the card size eases through every width, and a new edge
@@ -1108,6 +1128,8 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         want.push_back(r);
     };
     for (size_t p = std::max(visFirst, nf); p < winEnd; ++p) ask(items[shown_[p - nf]]);
+    for (size_t p = visFirst; p < visFirst + visFolders && previewEach > 0; ++p)
+        for (size_t k = 0; k < folderPreviews_[p].size() && k < previewEach; ++k) ask(items[folderPreviews_[p][k]]);
     for (size_t p = visFirst; p > std::max(winFirst, nf); --p) ask(items[shown_[p - 1 - nf]]);
     for (size_t k = 0; k < unknown_.size() && k < kScanBatch; ++k) ask(items[unknown_[k]]);
     if (!Same(want, wanted_)) {
@@ -1205,7 +1227,8 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
             if (list)
                 DeskFolderRow(dl, folders_[p], columns, a, b, pic, p == hovered, p == pressed, p == cursor_);
             else
-                DeskFolderCard(dl, folders_[p], a, b, pic, p == hovered, p == pressed, p == cursor_);
+                DeskFolderCard(dl, folders_[p], a, b, pic, p == hovered, p == pressed, p == cursor_,
+                               p < folderPreviews_.size() ? &folderPreviews_[p] : nullptr, previewEach);
             continue;
         }
         if (p < nf) {

@@ -734,19 +734,58 @@ void MediaBrowser::DeskPinnedMenu() {
     ImGui::EndPopup();
 }
 
-// A folder's card: a surface square with the folder in it and its count, the name and where it
-// is under it.
+// A folder's card: a surface square with a preview of what it holds (a 2 x 2 mosaic of its
+// newest files' thumbnails, or one), else the folder glyph; a badge with a folder and the
+// count; the name and where it is under it.
 void MediaBrowser::DeskFolderCard(ImDrawList* dl, const Folder& folder, ImVec2 a, ImVec2 b, float pic, bool hovered,
-                                  bool pressed, bool focus) {
+                                  bool pressed, bool focus, const std::vector<size_t>* preview, size_t shown) {
     const float pad = Round(Px(4.0f));
     if (pressed) dl->AddRectFilled(a, b, kPressFill, Px(6.0f));
     else if (hovered) dl->AddRectFilled(a, b, kHoverFill, Px(6.0f));
     const ImVec2 pa(a.x + pad, a.y + pad), pb(pa.x + pic, pa.y + pic);
     dl->AddRectFilled(pa, pb, kSurface, Px(4.0f));
-    ui::DrawGlyph(dl, Glyph::Folder, ImVec2((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f), pic * 0.4f, kTextFaint);
+    // The thumbnails here so far, in preview order (null: not here yet).
+    const size_t cells = preview ? std::min(shown, preview->size()) : 0;
+    ThumbnailAtlas::Thumb thumbs[4];
+    bool have[4] = {};
+    size_t got = 0;
+    for (size_t k = 0; k < cells && k < 4; ++k) {
+        int slot = 0;
+        have[k] = cache_.Use(library_.Items()[(*preview)[k]].id, slot) && atlas_.Get(slot, thumbs[k]);
+        got += have[k];
+    }
+    const float r = Px(4.0f);
+    if (got == 0) {
+        ui::DrawGlyph(dl, Glyph::Folder, ImVec2((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f), pic * 0.4f, kTextFaint);
+    } else if (cells == 1) {
+        dl->AddImageRounded(thumbs[0].texture, pa, pb, thumbs[0].uv0, thumbs[0].uv1, IM_COL32_WHITE, r);
+    } else {
+        // 2 x 2, a 2 px seam; a cell with nothing (yet) stays the surface.
+        const float gap = Round(Px(2.0f)), cell = std::floor((pic - gap) * 0.5f);
+        const ImDrawFlags corner[4] = {ImDrawFlags_RoundCornersTopLeft, ImDrawFlags_RoundCornersTopRight,
+                                       ImDrawFlags_RoundCornersBottomLeft, ImDrawFlags_RoundCornersBottomRight};
+        for (size_t k = 0; k < 4; ++k) {
+            const ImVec2 c0(k % 2 ? pb.x - cell : pa.x, k / 2 ? pb.y - cell : pa.y), c1(c0.x + cell, c0.y + cell);
+            if (k < cells && have[k])
+                dl->AddImageRounded(thumbs[k].texture, c0, c1, thumbs[k].uv0, thumbs[k].uv1, IM_COL32_WHITE, r,
+                                    corner[k]);
+            else
+                dl->AddRectFilled(c0, c1, IM_COL32(36, 41, 52, 255), r, corner[k]);
+        }
+    }
     char count[24];
     std::snprintf(count, sizeof(count), "%d", folder.count);
-    Badge(dl, pa.x + Px(6.0f), pb.y - Px(6.0f) - Px(18.0f), count, kBadgeFill, kText, false);
+    {
+        // The badge: a small folder, then the count.
+        DeskFont f(DeskText::Badge);
+        const float padX = Round(Px(5.0f)), h = Round(Px(18.0f)), g = Round(Px(12.0f));
+        const float x0 = pa.x + Px(6.0f), y0 = pb.y - Px(6.0f) - h;
+        const float w = padX + g + Round(Px(4.0f)) + Round(ImGui::CalcTextSize(count).x) + padX;
+        dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), kBadgeFill, Px(4.0f));
+        ui::DrawGlyph(dl, Glyph::Folder, ImVec2(x0 + padX + g * 0.5f, y0 + h * 0.5f), g * 1.5f, kText);
+        dl->AddText(ImVec2(x0 + padX + g + Round(Px(4.0f)), y0 + Round((h - ImGui::GetFontSize()) * 0.5f)), kText,
+                    count);
+    }
     float y = pb.y + Px(6.0f);
     {
         DeskFont f(DeskText::Label);

@@ -179,8 +179,10 @@ private:
     void DeskToolbar(ImVec2 min, ImVec2 max);
     void DeskSortMenu();
     Action DeskSidebar(ImVec2 min, ImVec2 max);
+    // `preview`: indices into the library's items to show a mosaic of (up to `shown` of them,
+    // as far as their thumbnails are here); none: the folder glyph.
     void DeskFolderCard(ImDrawList* dl, const Folder& folder, ImVec2 a, ImVec2 b, float pic, bool hovered, bool pressed,
-                        bool focus);
+                        bool focus, const std::vector<size_t>* preview, size_t shown);
     void DeskItemCard(ImDrawList* dl, const MediaItem& item, bool supported, const StereoVerdict& verdict, ImVec2 a,
                       ImVec2 b, float pic, bool hovered, bool pressed, bool focus, bool picture, bool behind);
     static float DeskCaptionHeight();
@@ -264,6 +266,8 @@ private:
 
     bool dirty_ = true;            // folders_ and shown_ need a rebuild
     std::vector<Folder> folders_;  // the folder's sub-folders: the first tiles
+    // Desktop: per folder tile, the files its card previews (MediaLibrary::FolderPreviews).
+    std::vector<std::vector<size_t>> folderPreviews_;
     std::vector<size_t> shown_;    // indices into the library's items, in grid order after the folders
     std::vector<size_t> unknown_;  // under a depth filter: items with no verdict yet
     // The grid's date sections (All media, Camera: "Today", "October 2026"): how many of
