@@ -4,6 +4,7 @@
 // (--decklink=0 --decklink-right=1 -> "0+1") shows both eyes, and its Open writes the same
 // spec back.
 #include "pro/DeckLinkSpec.h"
+#include "pro/LiveAudio.h"
 
 #include <cstdio>
 #include <string>
@@ -65,6 +66,39 @@ int main() {
     DeckLinkConfig c;
     CHECK(!ParseDeckLinkSpec("0,xyz", c));                   // unknown token
 
+    // Embedded audio (LOXR-870): OFF unless the spec says so, and an old spec stays off.
+    CHECK(ParseDeckLinkSpec("0+1,sdi", c) && c.audioPair == 0);
+    CHECK(Show("0", f) && f.audio == 0 && DeckLinkSpecFromDialog(f) == "0");
+    CHECK(Show("0,audio", f) && f.audio == 1 && DeckLinkSpecFromDialog(f) == "0,audio");
+    CHECK(Show("0+1,sdi,audio=4", f) && f.audio == 4 && DeckLinkSpecFromDialog(f) == "0+1,sdi,audio=4");
+    CHECK(ParseDeckLinkSpec("0,audio=0", c) && c.audioPair == 0);  // explicit off
+    CHECK(!ParseDeckLinkSpec("0,audio=9", c));                     // no ch 17-18
+    CHECK(!ParseDeckLinkSpec("0,audio=x", c));
+    CHECK(!ParseDeckLinkSpec("0,audio=-1", c));
+
+    // The card captures the fewest channels (2, 8 or 16) that hold the pair played.
+    CHECK(LiveAudioCaptureChannels(0) == 0 && LiveAudioCaptureChannels(9) == 0);
+    CHECK(LiveAudioCaptureChannels(1) == 2);
+    CHECK(LiveAudioCaptureChannels(2) == 8 && LiveAudioCaptureChannels(4) == 8);
+    CHECK(LiveAudioCaptureChannels(5) == 16 && LiveAudioCaptureChannels(8) == 16);
+    CHECK(LiveAudioPairName(1) == "ch 1-2" && LiveAudioPairName(8) == "ch 15-16");
+    for (int pr = 1; pr <= kLiveAudioMaxPair; ++pr) CHECK(pr * 2 <= LiveAudioCaptureChannels(pr));
+
+    // The pair played comes out of the card's interleaved packet as stereo, in order.
+    {
+        const int ch = 8, frames = 3;
+        int32_t in[ch * frames];
+        for (int i = 0; i < frames; ++i)
+            for (int k = 0; k < ch; ++k) in[i * ch + k] = i * 100 + k;  // frame i, channel k
+        int32_t out[2 * frames] = {};
+        CHECK(ExtractStereoPair(in, frames, ch, 3, out));               // ch 5-6 = indices 4, 5
+        CHECK(out[0] == 4 && out[1] == 5 && out[2] == 104 && out[3] == 105 && out[4] == 204 && out[5] == 205);
+        CHECK(ExtractStereoPair(in, frames, ch, 1, out) && out[0] == 0 && out[1] == 1 && out[5] == 201);
+        CHECK(!ExtractStereoPair(in, frames, ch, 5, out));              // ch 9-10 is not in 8 channels
+        CHECK(!ExtractStereoPair(in, frames, 2, 2, out));
+        CHECK(!ExtractStereoPair(nullptr, frames, ch, 1, out));
+    }
+
     // Every dialog choice survives Open -> spec -> dialog unchanged.
     int combos = 0;
     for (int left = 0; left < 4; ++left)
@@ -72,7 +106,8 @@ int main() {
             if (right > 0 && right - 1 == left) continue;  // the dialog refuses the same input twice
             for (int conn = 0; conn < 3; ++conn)
                 for (int stereo = 0; stereo < 4; ++stereo)
-                    for (const char* mode : {"", "Hp25", "4k60"}) {
+                    for (const char* mode : {"", "Hp25", "4k60"})
+                    for (int audio = 0; audio <= kLiveAudioMaxPair; audio += 3) {
                         if (right > 0 && stereo != 0) continue;  // packing is one-cable only
                         DeckLinkDialogFields in;
                         in.left = left;
@@ -80,10 +115,12 @@ int main() {
                         in.conn = conn;
                         in.stereo = stereo;
                         in.mode = mode;
+                        in.audio = audio;
                         DeckLinkDialogFields out;
                         const std::string spec = DeckLinkSpecFromDialog(in);
                         const bool ok = Show(spec, out) && out.left == in.left && out.right == in.right &&
-                                        out.conn == in.conn && out.stereo == in.stereo && out.mode == in.mode;
+                                        out.conn == in.conn && out.stereo == in.stereo && out.mode == in.mode &&
+                                        out.audio == in.audio;
                         if (!ok) std::fprintf(stderr, "round trip failed for spec '%s'\n", spec.c_str()), ++g_fail;
                         ++combos;
                     }

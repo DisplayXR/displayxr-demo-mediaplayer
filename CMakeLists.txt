@@ -485,6 +485,7 @@ function(mp_add_player tgt is_pro)
             src/pro/ProEnvFile.cpp       # pro.env: per-machine settings that survive a reinstall
             src/pro/DeckLinkSource.cpp   # Blackmagic DeckLink SDI / HDMI input
             src/pro/DeckLinkSpec.cpp     # the DeckLink input spec + setup dialog fields (no SDK)
+            src/pro/LiveAudio.cpp        # the DeckLink input's embedded audio, when turned on
             src/pro/RigCheck.cpp         # vertical / depth / colour checks + 60 s history
             src/pro/Station.cpp          # inputs, timecode / delay, rig UI, snapshots
             src/pro/QcReport.cpp         # the session's QC report: HTML + marker EDL / CSV

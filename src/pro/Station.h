@@ -113,6 +113,8 @@ public:
     // starting format, then Open (adds or replaces the "DeckLink" input and switches to it).
     void OpenDeckLinkDialog();
     void BuildDeckLinkDialog();
+    // The player's mute (M) also mutes the DeckLink input's live audio (LOXR-870).
+    void SetLiveAudioMuted(bool m) { decklink_.SetAudioMuted(m); }
     bool ShowTimecode() const { return showTimecode_; }
     std::string InputName() const { return inputIndex_ >= 0 && inputIndex_ < (int)inputs_.size() ? inputs_[inputIndex_].name : std::string(); }
     size_t SnapshotCount() const { return snapshots_.size(); }
@@ -177,6 +179,7 @@ private:
     int dlgConn_ = 0;                 // 0 as set in Desktop Video, 1 SDI, 2 HDMI
     int dlgStereo_ = 0;               // one cable: 0 auto, 1 side by side, 2 dual-stream 3D, 3 mono
     char dlgMode_[8] = "";            // starting format FourCC; empty = 1080p25 (auto-detect follows)
+    int dlgAudio_ = 0;                // embedded audio: 0 off (default), else the channel pair played
     std::string pendingDeckLinkSpec_;  // "0+1,sdi": the "DeckLink" input's spec, opened in Tick()
     bool OpenDeckLinkSpec(const std::string& spec);
     void FillDeckLinkDialogFromInput();  // the dlg* fields from the DeckLink input set up now

@@ -5,6 +5,7 @@
 #include "media/ImageDecoder.h"
 #include "pro/CaptureLevers.h"
 #include "pro/DeckLinkSpec.h"
+#include "pro/LiveAudio.h"
 #include "pro/QcReport.h"
 #include "pro/Thumbnail.h"
 #include "stb_image_write.h"  // implementation compiled in src/rhi/VulkanRenderer.cpp
@@ -1050,6 +1051,7 @@ void Station::FillDeckLinkDialogFromInput() {
     dlgConn_ = f.conn;
     dlgStereo_ = f.stereo;
     std::snprintf(dlgMode_, sizeof(dlgMode_), "%s", f.mode.c_str());
+    dlgAudio_ = f.audio;
 }
 
 void Station::BuildDeckLinkDialog() {
@@ -1113,6 +1115,30 @@ void Station::BuildDeckLinkDialog() {
     ImGui::EndDisabled();
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
     ImGui::InputTextWithHint("Start format", "Hp25 (auto-detect follows)", dlgMode_, sizeof(dlgMode_));
+    // Embedded audio (LOXR-870): off by default. Off, the card is not asked for audio and
+    // nothing is played, so the capture costs exactly what it did before.
+    bool audioOn = dlgAudio_ > 0;
+    if (ImGui::Checkbox("Capture audio", &audioOn)) dlgAudio_ = audioOn ? std::max(1, dlgAudio_) : 0;
+    if (audioOn) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
+        const std::string cur = LiveAudioPairName(dlgAudio_);
+        if (ImGui::BeginCombo("##audiopair", cur.c_str())) {
+            for (int p = 1; p <= kLiveAudioMaxPair; ++p)
+                if (ImGui::Selectable(LiveAudioPairName(p).c_str(), dlgAudio_ == p)) dlgAudio_ = p;
+            ImGui::EndCombo();
+        }
+        ImGui::TextDisabled(pair ? "Embedded audio from the left-eye input, played on this PC (M mutes)."
+                                 : "Embedded audio from the input, played on this PC (M mutes).");
+    } else {
+        ImGui::TextDisabled("Off: the card sends no audio, no cost to the capture.");
+    }
+    const DeckLinkSource::AudioStatus as = decklink_.GetAudioStatus();
+    if (as.playing)
+        ImGui::TextDisabled("Audio now: %s of %d channels, %llu packets%s", LiveAudioPairName(as.pair).c_str(),
+                            as.channels, (unsigned long long)as.packets, as.overflows ? ", resynced" : "");
+    else if (as.requested && !as.error.empty())
+        ImGui::TextColored(kWarn, "Audio off: %s", as.error.c_str());
     ImGui::Separator();
     ImGui::BeginDisabled(sameDevice);
     if (ImGui::Button("Open")) {
@@ -1122,6 +1148,7 @@ void Station::BuildDeckLinkDialog() {
         f.conn = dlgConn_;
         f.stereo = dlgStereo_;
         f.mode = dlgMode_;
+        f.audio = dlgAudio_;
         pendingDeckLinkSpec_ = DeckLinkSpecFromDialog(f);  // opened in Tick()
         dlgOpen_ = false;
     }

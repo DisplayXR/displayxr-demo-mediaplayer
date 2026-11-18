@@ -3421,6 +3421,9 @@ void App::TogglePlayback() {
 void App::ToggleMute() {
     muted_ = !muted_;
     audio_.SetMuted(muted_);
+#if MEDIAPLAYER_PRO
+    pro_.GetStation().SetLiveAudioMuted(muted_);  // the DeckLink input's audio, when it is on
+#endif
     LOG_INFO("audio %s", muted_ ? "muted" : "unmuted");
     ShowToast(muted_ ? "Muted" : "Unmuted");
 }
@@ -4693,6 +4696,7 @@ void App::InitPro() {
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_GAIN_R")) so.testCfg.gainR = (float)std::atof(e);
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_DEPTH")) so.testCfg.depthScale = (float)std::atof(e);
     pro_.GetStation().Init(std::move(sh), so);
+    pro_.GetStation().SetLiveAudioMuted(muted_);
     LOG_INFO("Media Player Pro: ready (lut=%s cdl=%s)", launch_.lutPath.c_str(), launch_.cdlPath.c_str());
 }
 
