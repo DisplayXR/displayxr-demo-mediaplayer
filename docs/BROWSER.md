@@ -333,6 +333,9 @@ Phase 2 (the 3D-only grid with per-eye thumbnails) is planned in #252.
   tap on the splash opens the system picker.
 - The browser borrows the flat 2D mode (the 3D mode under "3D only", see 3D grid) and hands
   the player's mode back on play.
+- The player's mode follows the file: 3D for a 3D file, flat for a 2D one. The 2D/3D switch
+  shows for 3D files only (no 2D->3D conversion on Android yet); a flip to 2D is kept while
+  swiping through the list and dropped by a pick from the grid or the picker.
 - Back from the player stops playback and returns to the browser at the same source and
   scroll position and folder. Back in the browser closes the drawer or a sheet, then leaves
   select mode, then goes up a folder, then goes to the home screen.

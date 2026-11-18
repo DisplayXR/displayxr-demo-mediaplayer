@@ -79,7 +79,16 @@ scripts/run_mediaplayer_handle_vk_macos.sh /path/to/clip_2x1.mp4
 scripts/run_mediaplayer_handle_vk_macos.sh assets/test_LR_2x1.png
 ```
 
-Keys: **V** cycles the display modes the display offers (each change shows the new mode's name for a couple of seconds, e.g. "Mode: 2D"), **SHIFT+TAB** toggles the HUD, **L** cycles the stereo
+**The 2D | 3D switch** (basic player) sits at the bottom right and says how the file is
+shown. Its default comes from the file: a 3D file opens in 3D (2D shows its left eye in the
+flat mode), a 2D file opens in 2D (3D converts it, with look-around that eases back to the
+centre). The choice is kept while walking the folder (Up / Down, the slideshow) and dropped
+by any other open. Mode, Layout and the 2D->3D converter are in the top bar's "..." menu.
+
+**One player at a time** (Windows): opening a file while the player runs hands it to that
+player, which comes to the front; `MEDIAPLAYER_MULTI_INSTANCE=1` allows a second copy.
+
+Keys: **V** flips the 2D | 3D switch (Pro: cycles the display modes the display offers, each change showing the new mode's name for a couple of seconds, e.g. "Mode: 2D"), **SHIFT+TAB** toggles the HUD, **L** cycles the stereo
 layout override (auto / mono / SBS-full / SBS-half / TB-full / TB-half), **Esc** quits. Transport follows the
 editor convention (Resolve, Premiere, Avid, RV): **Space** play/pause, **Left** / **Right**
 one frame back/forward (**Shift** for a 5-frame jump; `[` / `]` do the same), **Up** /
