@@ -161,6 +161,27 @@ size_t GridLayout::TileAtOffset(float offset) const {
     return (it - 1)->first;
 }
 
+void ClickSelect(const std::vector<int64_t>& ids, size_t at, bool ctrl, bool shift, int64_t& anchor,
+                 std::unordered_set<int64_t>& selected) {
+    if (at >= ids.size()) return;
+    if (shift) {
+        size_t from = at;
+        const auto it = std::find(ids.begin(), ids.end(), anchor);
+        if (it != ids.end()) from = (size_t)(it - ids.begin());
+        else anchor = ids[at];
+        if (!ctrl) selected.clear();
+        for (size_t i = std::min(from, at); i <= std::max(from, at); ++i) selected.insert(ids[i]);
+        return;
+    }
+    anchor = ids[at];
+    if (ctrl) {
+        if (!selected.erase(ids[at])) selected.insert(ids[at]);
+        return;
+    }
+    selected.clear();
+    selected.insert(ids[at]);
+}
+
 std::string FormatDeskViewPrefs(const DeskViewPrefs& prefs) {
     char buf[96];
     std::snprintf(buf, sizeof(buf), "view=%s\ncard=%d\nsort=%s\n", prefs.details ? "details" : "grid",

@@ -58,10 +58,12 @@ public:
         return true;
     }
 
-    // Desktop: what the user asked of a file's menu (right click) or its keys.
+    // Desktop: what the user asked of a file's menu (right click) or its keys. CopyPath of a
+    // selection: `ids`, in grid order (one path a line); else `id` alone.
     struct ItemRequest {
         enum class Verb { Reveal, CopyPath } verb = Verb::Reveal;
         int64_t id = -1;
+        std::vector<int64_t> ids;
     };
     bool TakeItemRequest(ItemRequest& out) {
         if (!itemRequestPending_) return false;
@@ -135,6 +137,9 @@ public:
     void SetDepthFilter(DepthFilter depth) { SetDepth(depth); }
     // Tests (MEDIAPLAYER_BROWSER_FOCUS): the focus ring on tile `index` whenever it has none.
     void SetStartFocus(size_t index) { startFocus_ = index; }
+    // Tests (MEDIAPLAYER_BROWSER_SELECT): select the files at these places in the grid (0 = the
+    // first file, after the folders) once they are shown.
+    void SetStartSelection(std::vector<size_t> files) { startSelection_ = std::move(files); }
     // Show the source named `name` once the list arrives (tests: MEDIAPLAYER_BROWSER_SOURCE).
     void SetStartSource(std::string name) { startSource_ = std::move(name); }
     // The panel is in 3D and the caller draws Stereo() into the projection layer, so
@@ -220,6 +225,10 @@ private:
     std::string menuFolder_;       // the folder tile whose menu is open
     size_t cursor_ = SIZE_MAX;     // desktop: the keyboard's tile (SIZE_MAX: none yet)
     size_t startFocus_ = SIZE_MAX;  // SetStartFocus
+    int64_t selAnchor_ = -1;        // desktop: Shift+click's anchor (ClickSelect)
+    std::vector<size_t> startSelection_;  // SetStartSelection, until applied
+    // Desktop: the selected files' ids in grid order.
+    std::vector<int64_t> SelectedInOrder() const;
     bool details_ = false;         // desktop: the details view
     float cardW_ = 176.0f;         // desktop grid: a card's width, design px (the size slider)
     float cardShown_ = 0.0f;       // ... as drawn: eases to cardW_ (0: not drawn yet)
@@ -269,6 +278,8 @@ private:
     std::string startSource_;  // SetStartSource, until the list arrives
 
     bool selecting_ = false;  // select mode: a tap picks an item, the bin deletes the picked
+    // The picked items: select mode's (touch), or Ctrl / Shift + click's (desktop, where a
+    // plain click still opens and Esc clears them).
     std::unordered_set<int64_t> selected_;
 
     bool dirty_ = true;            // folders_ and shown_ need a rebuild

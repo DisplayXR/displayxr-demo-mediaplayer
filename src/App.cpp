@@ -600,6 +600,18 @@ int App::Run() {
         // Test: the focus ring on tile N (0 = the first), as the arrow keys would put it.
         if (const char* fo = std::getenv("MEDIAPLAYER_BROWSER_FOCUS"); browser_ && fo && *fo)
             browser_->SetStartFocus((size_t)std::max(0, std::atoi(fo)));
+        // Test: select files by their place among the files ("0,2,3").
+        if (const char* se = std::getenv("MEDIAPLAYER_BROWSER_SELECT"); browser_ && se && *se) {
+            std::vector<size_t> files;
+            for (const char* c = se; *c;) {
+                char* end = nullptr;
+                const long v = std::strtol(c, &end, 10);
+                if (end == c) break;
+                if (v >= 0) files.push_back((size_t)v);
+                c = *end == ',' ? end + 1 : end;
+            }
+            browser_->SetStartSelection(std::move(files));
+        }
 #endif
     }
     // Test: switch "Convert to 3D" on without a keystroke (headless runs). Retried until it
@@ -4734,9 +4746,25 @@ void App::ApplyItemRequests() {
 #if MEDIAPLAYER_BROWSER
     browser::MediaBrowser::ItemRequest r;
     if (!browser_ || !browser_->TakeItemRequest(r)) return;
+    using Verb = browser::MediaBrowser::ItemRequest::Verb;
+    if (r.verb == Verb::CopyPath && !r.ids.empty()) {
+        // A selection: one path a line.
+        std::string text;
+        int copied = 0;
+        for (int64_t id : r.ids) {
+            const std::string p = browserProvider_->PathOf(id);
+            if (p.empty()) continue;
+            if (!text.empty()) text += "\n";
+            text += p;
+            ++copied;
+        }
+        if (copied == 0) return;
+        ImGui::SetClipboardText(text.c_str());
+        ShowToast(copied == 1 ? std::string("Path copied") : std::to_string(copied) + " paths copied");
+        return;
+    }
     const std::string path = browserProvider_->PathOf(r.id);
     if (path.empty()) return;
-    using Verb = browser::MediaBrowser::ItemRequest::Verb;
     if (r.verb == Verb::CopyPath) {
         ImGui::SetClipboardText(path.c_str());
         ShowToast("Path copied");

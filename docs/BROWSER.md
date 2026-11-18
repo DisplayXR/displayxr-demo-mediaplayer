@@ -268,7 +268,17 @@ Pinned and hidden folders are kept beside the Recent list (`pinned.txt`,
 `hidden_folders.txt` in `%APPDATA%\DisplayXR\MediaPlayer\`).
 
 **File menu** (right click a file): Open; Show in File Explorer; Copy path (also
-Ctrl+Shift+C on the file with the focus ring, else the one under the pointer).
+Ctrl+Shift+C on the file with the focus ring, else the one under the pointer). On a file in
+a selection of several, Copy path becomes "Copy N paths": every selected file's path, one a
+line, in grid order (Ctrl+Shift+C does the same whenever there is a selection). Right click
+outside the selection clears it, so the menu is that file's alone. No delete on desktop.
+
+**Selection** (desktop): Ctrl+click adds or removes a file, Shift+click selects the run from
+the last Ctrl+clicked (or clicked) file, Ctrl+Shift+click adds that run; Ctrl+A selects every
+file shown. Folders are not selected. A plain click still opens (and drops the selection);
+Esc clears it; going to another place clears it. A selected card or row has an accent fill
+and a 2 px accent border (the focus ring stays a light ring outside it); the status bar
+counts it. The rules are `ClickSelect` (BrowserLayout, tested).
 
 **Views.** The toolbar's grid / details switch, at its right. The grid's cards are 120-320 px
 wide (the size slider beside the switch, or Ctrl+wheel over the grid; 176 at start). The
@@ -305,7 +315,8 @@ rest of the desktop UI; the sources stay a rail from 600 dp of window width.
 with `MEDIAPLAYER_DUMP_HUD` the HUD dump shows it. `MEDIAPLAYER_BROWSER_SOURCE=<name>` starts
 on a source (or, with no source of that name, on the pinned folder of that name), `MEDIAPLAYER_BROWSER_VIEW=details` in the details view,
 `MEDIAPLAYER_BROWSER_QUERY=<text>` with a search, `MEDIAPLAYER_BROWSER_FOCUS=<n>` with the focus
-ring on tile n (0 = the first; folders count). A test run (`MEDIAPLAYER_SHOW_BROWSER`) never
+ring on tile n (0 = the first; folders count), `MEDIAPLAYER_BROWSER_SELECT=0,2,3` with those
+files selected (counted among the files). A test run (`MEDIAPLAYER_SHOW_BROWSER`) never
 reads or writes the user's `browser_view.txt`; `MEDIAPLAYER_BROWSER_PREFS=<file>` names a view
 file for it to use instead. `win_shell_media_probe` (built on Windows, not a ctest test) prints
 the index query and thumbnail timings on a real box; `--thumb <path> <cacheOnly>` checks one

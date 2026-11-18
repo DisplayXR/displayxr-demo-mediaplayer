@@ -1197,20 +1197,33 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
                                   ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
     }
     if (desktop_ && cursor_ >= n && startFocus_ < n) cursor_ = startFocus_;
+    if (desktop_ && !startSelection_.empty() && !shown_.empty()) {
+        for (size_t f : startSelection_)
+            if (f < shown_.size()) selected_.insert(items[shown_[f]].id);
+        startSelection_.clear();
+    }
     // The status bar's tile: the focus ring's, else the one under the pointer.
     if (desktop_) {
         const size_t at = cursor_ < n ? cursor_ : hovered;
         if (at < nf) statusFolder_ = at;
         else if (at < n) statusItem_ = items[shown_[at - nf]].id;
     }
-    // Desktop: Ctrl+Shift+C copies the path of the file with the focus ring (else under the
-    // pointer).
+    // Desktop: Ctrl+Shift+C copies the paths of the selection, else the path of the file with
+    // the focus ring (else under the pointer).
     if (desktop_ && ImGui::GetIO().KeyCtrl && ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
         const size_t at = cursor_ < n ? cursor_ : hovered;
-        if (at >= nf && at < n) {
-            itemRequest_ = ItemRequest{ItemRequest::Verb::CopyPath, items[shown_[at - nf]].id};
+        if (!selected_.empty()) {
+            itemRequest_ = ItemRequest{ItemRequest::Verb::CopyPath, -1, SelectedInOrder()};
+            itemRequestPending_ = true;
+        } else if (at >= nf && at < n) {
+            itemRequest_ = ItemRequest{ItemRequest::Verb::CopyPath, items[shown_[at - nf]].id, {}};
             itemRequestPending_ = true;
         }
+    }
+    // Desktop: Ctrl+A selects every file shown (not in the search box, where it is the text's).
+    if (desktop_ && ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift && !ImGui::GetIO().WantTextInput &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+        for (size_t i : shown_) selected_.insert(items[i].id);
     }
     // A long press on an item starts select mode with it. In select mode it is a tap.
     if (pressed >= nf && pressed < n && !selecting_ && provider_->CanDelete() && gridScroll_.TakeLongPress(now)) {
@@ -1419,6 +1432,8 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
             ImGui::OpenPopup("##folder_menu");
         } else if (clicked >= nf && clicked < n) {
             menuItem_ = items[shown_[clicked - nf]].id;
+            // Outside the selection, the menu is the file's alone (as File Explorer's).
+            if (!selected_.count(menuItem_)) selected_.clear();
             ImGui::OpenPopup("##item_menu");
         }
     }
@@ -1439,6 +1454,18 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     } else if (!tap || !itemAt(gridPress_, picked)) {
         return Action::None;
     }
+    // Desktop: Ctrl / Shift + click selects (folders are left out); a plain click opens, and
+    // leaves the selection behind.
+    if (desktop_ && !keyOpen && (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift)) {
+        if (picked >= nf && picked < n) {
+            std::vector<int64_t> ids;
+            ids.reserve(shown_.size());
+            for (size_t i : shown_) ids.push_back(items[i].id);
+            ClickSelect(ids, picked - nf, ImGui::GetIO().KeyCtrl, ImGui::GetIO().KeyShift, selAnchor_, selected_);
+        }
+        return Action::None;
+    }
+    if (desktop_) selected_.clear();
     if (picked < nf) {
         if (!selecting_) GoTo(folders_[picked].path);
         return Action::None;
@@ -1473,6 +1500,14 @@ void MediaBrowser::FolderMenu() {
             ask(FolderRequest::Verb::Hide);
     }
     ImGui::EndPopup();
+}
+
+std::vector<int64_t> MediaBrowser::SelectedInOrder() const {
+    std::vector<int64_t> out;
+    const std::vector<MediaItem>& items = library_.Items();
+    for (size_t i : shown_)
+        if (selected_.count(items[i].id)) out.push_back(items[i].id);
+    return out;
 }
 
 void MediaBrowser::GoTo(const std::string& folder) {
@@ -1533,6 +1568,7 @@ void MediaBrowser::TrackHistory() {
     if (back_.size() > 64) back_.erase(back_.begin());
     forward_.clear();
     here_ = Place{source_, folder_};
+    selected_.clear();  // a selection belongs to the place it was made in
     if (search_[0]) {
         search_[0] = '\0';
         query_.clear();
@@ -1567,7 +1603,8 @@ void MediaBrowser::EndSelection() {
 }
 
 bool MediaBrowser::CanGoBack() const {
-    return provider_ && (drawer_ || sheetOpen_ || selecting_ || folder_ != CurrentSource().folder);
+    return provider_ && (drawer_ || sheetOpen_ || selecting_ || (desktop_ && !selected_.empty()) ||
+                         folder_ != CurrentSource().folder);
 }
 
 bool MediaBrowser::Back() {
@@ -1576,7 +1613,7 @@ bool MediaBrowser::Back() {
         drawer_ = false;
     } else if (sheetOpen_) {
         closeSheets_ = true;  // the next Build() closes it: popups are ImGui's, within a frame
-    } else if (selecting_) {
+    } else if (selecting_ || (desktop_ && !selected_.empty())) {
         EndSelection();
     } else {
         Up();

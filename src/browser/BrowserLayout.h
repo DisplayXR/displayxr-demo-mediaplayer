@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace mp::browser {
@@ -60,6 +61,14 @@ struct DeskViewPrefs {
 std::string FormatDeskViewPrefs(const DeskViewPrefs& prefs);
 // The prefs in `text`, from the defaults; `cardW` is clamped to [cardMin, cardMax].
 DeskViewPrefs ParseDeskViewPrefs(const std::string& text, float cardMin, float cardMax);
+
+// Desktop selection, as File Explorer's: a click on `ids[at]` (the files in grid order) with
+// Ctrl toggles it and makes it the anchor; with Shift selects the run from the anchor to it
+// (the anchor stays; with Ctrl too the run is added, else it replaces the selection; no anchor
+// in `ids`: the clicked one); with neither, it alone (the anchor). `anchor` is an id, so it
+// survives the grid being rebuilt.
+void ClickSelect(const std::vector<int64_t>& ids, size_t at, bool ctrl, bool shift, int64_t& anchor,
+                 std::unordered_set<int64_t>& selected);
 
 // A date section: `key` orders and tells sections apart, `label` heads it.
 struct DateSection {

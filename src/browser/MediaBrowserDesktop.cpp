@@ -721,9 +721,10 @@ void MediaBrowser::DeskStatusBar(ImVec2 min, ImVec2 max) {
     if (!listed_) return;
 
     // At the right, the hint, when there is room for it beside the rest.
-    const char* hint = details_ ? "Click opens  \xC2\xB7  Click Date to sort" : "Click opens  \xC2\xB7  Right-click for more";
+    const char* hint = details_ ? "Click opens  \xC2\xB7  Ctrl/Shift+click selects  \xC2\xB7  Click Date to sort"
+                                : "Click opens  \xC2\xB7  Ctrl/Shift+click selects";
     const float hintW = ImGui::CalcTextSize(hint).x;
-    if (max.x - min.x >= Px(760.0f)) {
+    if (max.x - min.x >= Px(details_ ? 900.0f : 760.0f)) {
         dl->AddText(ImVec2(right - hintW, ty), kTextFaint, hint);
         right -= hintW + gap;
     }
@@ -755,6 +756,9 @@ void MediaBrowser::DeskStatusBar(ImVec2 min, ImVec2 max) {
     }
 
     // The focused file or folder.
+    // ... else the one selected file.
+    int64_t focusItem = statusItem_;
+    if (focusItem < 0 && statusFolder_ >= folders_.size() && selected_.size() == 1) focusItem = *selected_.begin();
     std::string detail;
     auto add = [&](const std::string& s) {
         if (s.empty()) return;
@@ -767,7 +771,7 @@ void MediaBrowser::DeskStatusBar(ImVec2 min, ImVec2 max) {
         char n[32];
         std::snprintf(n, sizeof(n), "%d item%s", fo.count, fo.count == 1 ? "" : "s");
         add(n);
-    } else if (const MediaItem* item = statusItem_ >= 0 ? library_.Find(statusItem_) : nullptr) {
+    } else if (const MediaItem* item = focusItem >= 0 ? library_.Find(focusItem) : nullptr) {
         add(item->name);
         if (item->width > 0 && item->height > 0) {
             char wh[32];
@@ -901,8 +905,11 @@ void MediaBrowser::DeskItemCard(ImDrawList* dl, const MediaItem& item, bool supp
                                 bool behind) {
     const float pad = Round(Px(4.0f));
     const ImVec2 pa(a.x + pad, a.y + pad), pb(pa.x + pic, pa.y + pic);
+    const bool picked = selected_.count(item.id) != 0;
     if (behind) {
-        // Under the picture: the card's fill, and a placeholder where there is no picture yet.
+        // Under the picture: the card's fill (accent when selected), and a placeholder where
+        // there is no picture yet.
+        if (picked) dl->AddRectFilled(a, b, kAccentWeak, Px(6.0f));
         if (pressed) dl->AddRectFilled(a, b, kPressFill, Px(6.0f));
         else if (hovered) dl->AddRectFilled(a, b, kHoverFill, Px(6.0f));
         if (!picture) {
@@ -970,6 +977,7 @@ void MediaBrowser::DeskItemCard(ImDrawList* dl, const MediaItem& item, bool supp
         if (meta.empty() && item.bytes > 0) add(FileSize(item.bytes));
         dl->AddText(ImVec2(pa.x + Px(2.0f), y), kTextFaint, ui::FitText(meta, pic - Px(4.0f)).c_str());
     }
+    if (picked) dl->AddRect(a, b, kAccent, Px(6.0f), 0, Px(2.0f));
     if (focus)
         dl->AddRect(ImVec2(a.x - Px(2.0f), a.y - Px(2.0f)), ImVec2(b.x + Px(2.0f), b.y + Px(2.0f)), kFocus, Px(8.0f), 0,
                     Px(2.0f));
@@ -1088,7 +1096,9 @@ void MediaBrowser::DeskItemRow(ImDrawList* dl, const MediaItem& item, bool suppo
                                const DeskColumns& c, ImVec2 a, ImVec2 b, float pic, bool hovered, bool pressed,
                                bool focus, bool picture, bool behind) {
     const ImVec2 pa(a.x + Round(Px(4.0f)), a.y + Round((b.y - a.y - pic) * 0.5f)), pb(pa.x + pic, pa.y + pic);
+    const bool picked = selected_.count(item.id) != 0;
     if (behind) {
+        if (picked) dl->AddRectFilled(a, b, kAccentWeak, Px(4.0f));
         if (pressed) dl->AddRectFilled(a, b, kPressFill, Px(4.0f));
         else if (hovered) dl->AddRectFilled(a, b, kHoverFill, Px(4.0f));
         if (!picture) {
@@ -1143,6 +1153,7 @@ void MediaBrowser::DeskItemRow(ImDrawList* dl, const MediaItem& item, bool suppo
     Cell(dl, c, 4, a, b, length, kTextDim, true);
     Cell(dl, c, 5, a, b, ShortDate(item.dateMs), kTextDim, false);
     Cell(dl, c, 6, a, b, FileSize(item.bytes), kTextDim, true);
+    if (picked) dl->AddRect(a, b, kAccent, Px(4.0f), 0, Px(2.0f));
     if (focus) dl->AddRect(a, b, kFocus, Px(4.0f), 0, Px(2.0f));
 }
 
@@ -1169,12 +1180,22 @@ void MediaBrowser::DeskItemMenu() {
             return hit;
         };
         auto ask = [&](ItemRequest::Verb verb) {
-            itemRequest_ = ItemRequest{verb, menuItem_};
+            itemRequest_ = ItemRequest{verb, menuItem_, {}};
             itemRequestPending_ = true;
         };
         if (row("Open", "Enter")) menuOpen_ = true;
         if (row("Show in File Explorer", nullptr)) ask(ItemRequest::Verb::Reveal);
-        if (row("Copy path", "Ctrl+Shift+C")) ask(ItemRequest::Verb::CopyPath);
+        // On a selection of several: copy all their paths, one a line.
+        if (selected_.size() > 1 && selected_.count(menuItem_)) {
+            char label[48];
+            std::snprintf(label, sizeof(label), "Copy %zu paths", selected_.size());
+            if (row(label, "Ctrl+Shift+C")) {
+                itemRequest_ = ItemRequest{ItemRequest::Verb::CopyPath, menuItem_, SelectedInOrder()};
+                itemRequestPending_ = true;
+            }
+        } else if (row("Copy path", "Ctrl+Shift+C")) {
+            ask(ItemRequest::Verb::CopyPath);
+        }
         ImGui::PopStyleVar();
     }
     ImGui::EndPopup();
