@@ -41,6 +41,9 @@ public:
     // Pro's meters (LOXR-871): the audio queued is measured into `m` (null = none, the
     // default: nothing is measured). Set before Open; the meter must outlive the player.
     void SetMeter(AudioMeter* m) { meter_.store(m); }
+    // Pro's channel solo (LOXR-874): play output channel `ch` alone on the front pair;
+    // -1 (the default) = every channel as mixed.
+    void SetSolo(int ch) { solo_.store(ch); }
     void Seek(double seconds);         // thread-safe (an atomic store; the audio thread seeks)
 
     // Position currently being played, in seconds — the A/V master clock. Returns -1
@@ -59,6 +62,7 @@ private:
     std::atomic<bool> muted_{false};
     std::atomic<float> volume_{1.0f};
     std::atomic<AudioMeter*> meter_{nullptr};
+    std::atomic<int> solo_{-1};
     float Gain() const { return muted_.load() ? 0.0f : volume_.load(); }
     std::atomic<double> seekRequest_{-1.0};
     bool open_ = false;

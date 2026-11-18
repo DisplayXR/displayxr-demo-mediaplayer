@@ -3,6 +3,7 @@
 // queued; peak / RMS are right for float and the card's int32 samples; the display's
 // ballistics fall, hold and latch a clip as documented.
 #include "media/AudioMeter.h"
+#include "media/AudioSolo.h"
 
 #include <cmath>
 #include <cstdio>
@@ -119,6 +120,26 @@ int main() {
     CHECK(Near((float)ShiftedAudioClock(10.0, 250), 10.25f) && Near((float)ShiftedAudioClock(10.0, -250), 9.75f));
     CHECK(ShiftedAudioClock(0.1, -500) == 0.0);    // never negative ("audio gone" to the decoder)
     CHECK(ShiftedAudioClock(-1.0, 300) == -1.0);   // no audio clock stays "none"
+    // Channel solo (LOXR-874).
+    {
+        float st[] = {0.1f, 0.2f, 0.3f, 0.4f};  // 2 frames of stereo
+        SoloFloatInPlace(st, 2, 2, 1);          // R alone, on both sides
+        CHECK(st[0] == 0.2f && st[1] == 0.2f && st[2] == 0.4f && st[3] == 0.4f);
+        float six[] = {1, 2, 3, 4, 5, 6};      // one 5.1 frame: FL FR FC LFE BL BR
+        SoloFloatInPlace(six, 1, 6, 2);         // the centre alone, on the front pair
+        CHECK(six[0] == 3 && six[1] == 3 && six[2] == 0 && six[3] == 0 && six[4] == 0 && six[5] == 0);
+        float keep[] = {0.5f, 0.6f};
+        SoloFloatInPlace(keep, 1, 2, -1);       // no solo
+        SoloFloatInPlace(keep, 1, 2, 2);        // out of range: no solo
+        CHECK(keep[0] == 0.5f && keep[1] == 0.6f);
+        int32_t card[3 * 8];                    // 3 frames of 8 SDI channels
+        for (int i = 0; i < 3; ++i)
+            for (int k = 0; k < 8; ++k) card[i * 8 + k] = i * 100 + k;
+        int32_t out[6] = {};
+        CHECK(ExtractSoloStereo(card, 3, 8, 6, out));  // ch 7
+        CHECK(out[0] == 6 && out[1] == 6 && out[2] == 106 && out[3] == 106 && out[4] == 206 && out[5] == 206);
+        CHECK(!ExtractSoloStereo(card, 3, 8, 8, out) && !ExtractSoloStereo(card, 3, 8, -1, out));
+    }
     CHECK(MeterDb(1.0f) == 0.0f && Near(MeterDb(0.5f), -6.0206f) && MeterDb(0.0f) == kMeterFloorDb);
 
     // Ballistics.

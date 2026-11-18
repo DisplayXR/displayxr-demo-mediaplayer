@@ -95,6 +95,9 @@ public:
     // picture. Live audio cannot be played early, only late. Applied at the next packet:
     // the queue restarts with that much silence ahead (a moment's gap when it changes).
     void SetDelayMs(int ms) { delayMs_.store(ms < 0 ? 0 : ms > kLiveAudioMaxDelayMs ? kLiveAudioMaxDelayMs : ms); }
+    // Channel solo (LOXR-874): play captured channel `ch` (0-based) alone, on both sides,
+    // instead of the chosen pair; -1 = the pair.
+    void SetSolo(int ch) { solo_.store(ch); }
     Stats GetStats() const;
 
 private:
@@ -109,6 +112,7 @@ private:
     std::atomic<float> volume_{1.0f};
     std::atomic<int> delayMs_{0};
     int appliedDelayMs_ = 0;  // card thread only
+    std::atomic<int> solo_{-1};
     std::vector<int32_t> stereo_;  // card thread only
     std::atomic<uint64_t> packets_{0}, frames_{0}, overflows_{0}, bad_{0};
 };

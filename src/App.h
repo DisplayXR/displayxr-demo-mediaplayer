@@ -282,6 +282,8 @@ private:
     // thread through the master clock; 0 (the default, and always in the base player) = none.
     std::atomic<int> avOffsetMs_{0};
     void SetAvOffsetMs(int ms);
+    int soloChannel_ = -1;  // Pro's channel solo (LOXR-874); -1 = none, reset per clip
+    void SetSoloChannel(int ch);
 #if MEDIAPLAYER_PRO
     AudioMeter audioMeter_;  // Pro's meters (LOXR-871): fed by the file and DeckLink audio
 #endif

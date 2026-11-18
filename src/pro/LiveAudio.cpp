@@ -3,6 +3,7 @@
 
 #include "Log.h"
 #include "media/AudioMeter.h"
+#include "media/AudioSolo.h"
 
 #include <SDL3/SDL.h>
 
@@ -66,7 +67,11 @@ void LiveAudioSink::Push(const void* samples, int frames) {
     ++packets_;
     frames_ += (uint64_t)frames;
     if (stereo_.size() < (size_t)frames * 2) stereo_.resize((size_t)frames * 2);
-    if (!ExtractStereoPair(static_cast<const int32_t*>(samples), frames, channels_, pair_, stereo_.data())) return;
+    const int32_t* in = static_cast<const int32_t*>(samples);
+    const int solo = solo_.load();
+    const bool ok = solo >= 0 && solo < channels_ ? ExtractSoloStereo(in, frames, channels_, solo, stereo_.data())
+                                                  : ExtractStereoPair(in, frames, channels_, pair_, stereo_.data());
+    if (!ok) return;
     const int bytes = frames * 2 * (int)sizeof(int32_t);
     // The card's clock and the output device's are not the same clock: if the queue grows
     // past the limit, start over from this packet rather than drift behind the picture.

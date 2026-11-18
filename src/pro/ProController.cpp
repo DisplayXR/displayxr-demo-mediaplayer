@@ -1708,8 +1708,16 @@ void ProController::BuildAudioSection(bool live) {
         if (liveLabel.empty() && !fileAudio) meters_.Reset();
         return;
     }
-    if (live) ImGui::TextDisabled("%s (dBFS)", liveLabel.c_str());
-    else ImGui::TextDisabled("File audio, %d ch (dBFS)", meters_.channels);
+    // Channel solo (LOXR-874): click a meter to hear that channel alone, again for all.
+    int solo = host_.getSoloChannel ? host_.getSoloChannel() : -1;
+    if (solo >= meters_.channels && host_.setSoloChannel) {  // the channels changed under it
+        host_.setSoloChannel(-1);
+        solo = -1;
+    }
+    if (solo >= 0)
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.25f, 1.0f), "Solo ch %d - click it again for all", solo + 1);
+    else if (live) ImGui::TextDisabled("%s (dBFS) - click to solo", liveLabel.c_str());
+    else ImGui::TextDisabled("File audio, %d ch (dBFS) - click to solo", meters_.channels);
 
     // One horizontal bar per channel, -60..0 dBFS: the level (RMS) solid, the peak lighter
     // above it, the hold as a tick; green below -18, amber to -6, red above; CLIP latches.
@@ -1728,7 +1736,10 @@ void ProController::BuildAudioSection(bool live) {
         const float barW = std::max(Px(40.0f), ImGui::GetContentRegionAvail().x - labelW - valueW);
         char lab[8];
         std::snprintf(lab, sizeof(lab), "%d", c + 1);
-        dl->AddText(ImVec2(p.x, p.y), ImGui::GetColorU32(ImGuiCol_TextDisabled), lab);
+        if (solo == c)  // the soloed row: highlighted, its number in amber
+            dl->AddRectFilled(p, ImVec2(p.x + labelW + barW + valueW, p.y + rowH), IM_COL32(235, 190, 60, 45));
+        dl->AddText(ImVec2(p.x, p.y), solo == c ? IM_COL32(245, 190, 60, 255) : ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                    lab);
         const ImVec2 b0(p.x + labelW, p.y + (rowH - barH) * 0.5f);
         const ImVec2 b1(b0.x + barW, b0.y + barH);
         dl->AddRectFilled(b0, b1, IM_COL32(40, 40, 44, 255));
@@ -1748,7 +1759,12 @@ void ProController::BuildAudioSection(bool live) {
         dl->AddText(ImVec2(b1.x + Px(4.0f), p.y), ImGui::GetColorU32(ImGuiCol_TextDisabled), val);
         if (meters_.Clipping(c))
             dl->AddText(ImVec2(b1.x + Px(4.0f) + ImGui::CalcTextSize(" -60.0").x, p.y), IM_COL32(255, 70, 55, 255), " CLIP");
-        ImGui::Dummy(ImVec2(labelW + barW + valueW, rowH));
+        ImGui::PushID(c);
+        if (ImGui::InvisibleButton("##solo", ImVec2(labelW + barW + valueW, rowH)) && host_.setSoloChannel)
+            host_.setSoloChannel(solo == c ? -1 : c);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(solo == c ? "Click to hear all channels" : "Click to hear channel %d alone", c + 1);
+        ImGui::PopID();
     }
 #else
     (void)live;
