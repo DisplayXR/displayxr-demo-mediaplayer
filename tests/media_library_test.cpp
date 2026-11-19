@@ -305,6 +305,58 @@ void TestFolderPreviews() {
     CHECK(library.FolderPreviews(s[0], all, tree, 0)[0].empty(), "max 0: none");
 }
 
+// A folder's slideshow (#252): what QueryTree() plays.
+void TestQueryTree() {
+    using mp::browser::kNewestFolder;
+    using mp::browser::SourceMode;
+    std::vector<Source> declared(4);
+    declared[0].kind = SourceKind::Pictures, declared[0].name = "Pictures", declared[0].bit = 0;
+    declared[0].mode = SourceMode::Tree, declared[0].roots = {"C:/P/", "D:/A/"};
+    declared[1].kind = SourceKind::Folders, declared[1].name = "Media folders", declared[1].bit = 1;
+    declared[1].mode = SourceMode::Grouped, declared[1].newest = 2;
+    declared[2].kind = SourceKind::Recents, declared[2].name = "Recents", declared[2].bit = 2, declared[2].byOrder = true;
+    declared[3].kind = SourceKind::Unsupported, declared[3].name = "Unsupported";
+    MediaLibrary library;
+    library.SetSources(declared);
+    MediaItem cloud = Desk(8, "h.jpg", MediaType::Image, 80, "C:/P/trip/", 0b001);
+    cloud.cloudOnly = true;
+    library.SetItems({
+        Desk(1, "a.jpg", MediaType::Image, 10, "C:/P/", 0b011),
+        Desk(2, "b.jpg", MediaType::Image, 20, "C:/P/trip/day2/", 0b011),
+        Desk(3, "c.mp4", MediaType::Video, 30, "C:/P/trip/", 0b011),
+        Desk(4, "d.jpg", MediaType::Image, 40, "C:/P/trip/Day1/", 0b001),
+        Desk(5, "e.jpg", MediaType::Image, 50, "C:/P/", 0b101, 1),
+        Desk(6, "f.jpg", MediaType::Image, 60, "D:/A/", 0b101, 0),
+        Desk(7, "g.xyz", MediaType::Image, 70, "C:/P/trip/", 0b001),
+        cloud,
+        Desk(9, "i.jpg", MediaType::Image, 90, "C:/P/trip2/", 0b001),
+    });
+    const std::vector<Source>& s = library.Sources();
+    const ViewOptions all;
+    CHECK((Ids(library, library.QueryTree(s[0], all, "C:/P/trip/")) == std::vector<int64_t>{8, 3, 4, 2}),
+          "a folder: its own files first (newest first, the cloud file too), then each sub-folder by name, any case");
+    CHECK((Ids(library, library.QueryTree(s[0], all, "C:/P/")) == std::vector<int64_t>{5, 1, 8, 3, 4, 2, 9}),
+          "depth first: trip and everything in it before trip2; the unsupported file left out");
+    CHECK((Ids(library, library.QueryTree(s[0], all, "")) == std::vector<int64_t>{5, 1, 8, 3, 4, 2, 9, 6}),
+          "the top of a multi-root tree: every root, in the roots' order");
+    ViewOptions oldest;
+    oldest.order = SortOrder::OldestFirst;
+    CHECK((Ids(library, library.QueryTree(s[0], oldest, "C:/P/")) == std::vector<int64_t>{1, 5, 3, 8, 4, 2, 9}),
+          "the view's sort inside each folder");
+    ViewOptions videos;
+    videos.type = TypeFilter::Videos;
+    CHECK((Ids(library, library.QueryTree(s[0], videos, "C:/P/")) == std::vector<int64_t>{3}), "under the type filter");
+    CHECK((Ids(library, library.QueryTree(s[1], all, "C:/P/trip/")) == std::vector<int64_t>{3}),
+          "a group: only the files directly in it");
+    CHECK((Ids(library, library.QueryTree(s[1], all, kNewestFolder)) == std::vector<int64_t>{3, 2}),
+          "the Newest tile: its own");
+    CHECK((Ids(library, library.QueryTree(s[1], all, "")) == std::vector<int64_t>{2, 1, 3}),
+          "a Grouped top: every group by name, any case (day2, P, trip)");
+    CHECK((Ids(library, library.QueryTree(s[2], all, "")) == std::vector<int64_t>{6, 5}), "a flat source: its list");
+    CHECK(library.QueryTree(s[3], all, "").empty(), "nothing plays from Unsupported");
+    CHECK(library.QueryTree(s[0], all, "C:/Nowhere/").empty(), "an empty folder");
+}
+
 int main() {
     TestSupportedSet();
     TestSources();
@@ -312,6 +364,7 @@ int main() {
     TestFolders();
     TestDeclaredSources();
     TestFolderPreviews();
+    TestQueryTree();
     if (g_failures) {
         std::fprintf(stderr, "media_library_test: %d failure(s)\n", g_failures);
         return 1;
