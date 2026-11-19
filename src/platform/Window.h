@@ -113,6 +113,10 @@ public:
     // Escape quits (default, the base player) or only leaves full screen (Media Player Pro,
     // where a stray Escape must never end a live monitoring session).
     void SetEscapeQuits(bool q) { escapeQuits_ = q; }
+    // Escape backs out instead (#252: a slideshow started from the media browser goes back
+    // to it): it neither quits nor leaves full screen, and TakeEscapeRequest() reports it.
+    void SetEscapeBacksOut(bool b) { escapeBacksOut_ = b; }
+    bool TakeEscapeRequest();
 
     // Pump SDL events; returns false when the user asked to quit (close / Esc).
     bool PumpEvents();
@@ -270,6 +274,8 @@ private:
     bool mouseInWindow_ = true;
     bool fullscreen_ = false;
     bool escapeQuits_ = true;
+    bool escapeBacksOut_ = false;
+    bool escapeRequested_ = false;
     std::function<void()> liveResizeCb_;
     std::function<void(void*)> eventHook_;
     bool eventWatchAdded_ = false;
