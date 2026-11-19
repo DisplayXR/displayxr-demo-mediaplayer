@@ -278,6 +278,10 @@ private:
     bool muted_ = false;   // audio mute (M / speaker button); persists across clips
     float volume_ = 1.0f;  // 0..1, Pro's volume slider (LOXR-872); file and live audio
     void SetVolume(float v);
+    // A/V sync, ms (LOXR-873): + = audio heard later than the picture. Read by the decode
+    // thread through the master clock; 0 (the default, and always in the base player) = none.
+    std::atomic<int> avOffsetMs_{0};
+    void SetAvOffsetMs(int ms);
 #if MEDIAPLAYER_PRO
     AudioMeter audioMeter_;  // Pro's meters (LOXR-871): fed by the file and DeckLink audio
 #endif

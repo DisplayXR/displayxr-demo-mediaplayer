@@ -188,6 +188,7 @@ public:
     // Live audio (off unless the spec asks for it). Muting follows the player's mute (M).
     void SetAudioMuted(bool m);
     void SetAudioVolume(float v);  // 0..1 (LOXR-872)
+    void SetAudioDelayMs(int ms);  // A/V sync (LOXR-873): audio held back this long (>= 0)
     // Pro's meters (LOXR-871); a capture opened later feeds it. Must outlive this source.
     void SetAudioMeter(AudioMeter* m) { audioMeter_ = m; }
     struct AudioStatus {
@@ -222,6 +223,7 @@ private:
     std::string audioError_;
     std::atomic<bool> audioMuted_{false};
     std::atomic<float> audioVolume_{1.0f};
+    std::atomic<int> audioDelayMs_{0};
     std::atomic<AudioMeter*> audioMeter_{nullptr};
 };
 

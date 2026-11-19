@@ -135,6 +135,15 @@ private:
     std::atomic<bool> idle_{false};
 };
 
+// A/V sync (LOXR-873): the clock the video follows, from the audio clock and the offset in
+// ms (+ = sound later than the picture). <0 (no audio clock) passes through; otherwise
+// clamped at 0, because a negative clock would read as "audio gone" to the decoder.
+inline double ShiftedAudioClock(double audioClock, int offsetMs) {
+    if (audioClock < 0.0) return audioClock;
+    const double c = audioClock + offsetMs / 1000.0;
+    return c > 0.0 ? c : 0.0;
+}
+
 // dBFS of a linear level, floored at kFloorDb.
 constexpr float kMeterFloorDb = -96.0f;
 inline float MeterDb(float linear) {
