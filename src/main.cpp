@@ -10,6 +10,7 @@
 #endif
 #include "Log.h"
 #include "media/CameraSource.h"
+#include "platform/SingleInstance.h"
 
 // SDL3 redefines main on some platforms; including SDL_main keeps the entry point
 // portable (and is a no-op where not needed).
@@ -19,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -249,6 +251,25 @@ int main(int argc, char* argv[]) {
         break;
     }
 
+    // One player per session: a second launch hands its file to the running one (a second
+    // in-process session on the panel stalled the first). Live inputs (--camera, --url,
+    // Pro station inputs) are not forwarded: they start their own player as before.
+    const bool forwardable = !launch.camera && launch.url.empty() && launch.proInputs.empty();
+    const bool owner = forwardable && mp::single_instance::Claim(MEDIAPLAYER_PRO != 0);
+    if (forwardable && !owner) {
+        std::string path;
+        if (mediaPath) {
+            std::error_code ec;
+            const std::filesystem::path abs = std::filesystem::absolute(std::filesystem::u8path(mediaPath), ec);
+            path = ec ? std::string(mediaPath) : abs.u8string();
+        }
+        if (mp::single_instance::Forward(path, 20000)) {
+            LOG_INFO("Another player is running: handed it %s", path.empty() ? "a raise" : path.c_str());
+            return 0;
+        }
+        LOG_WARN("Another player holds the lock but did not answer: starting anyway");
+    }
+
     mp::App app;
     app.SetLaunchOptions(launch);
     if (!app.Initialize(mediaPath)) {
@@ -257,6 +278,7 @@ int main(int argc, char* argv[]) {
         app.Shutdown();
         return 1;
     }
+    if (owner) mp::single_instance::Listen();
     int rc = app.Run();
     app.Shutdown();
     LOG_INFO("Clean shutdown (rc=%d)", rc);

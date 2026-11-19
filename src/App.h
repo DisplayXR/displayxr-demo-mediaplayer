@@ -20,9 +20,24 @@
 #include "ui/ImGuiLayer.h"
 #include "ui/TransportUI.h"
 #include "xr/XrSession.h"
+#if defined(_WIN32)
+#include "browser/CloudFetch.h"
+#endif
 #if MEDIAPLAYER_PRO
 #include "pro/PerfSwitches.h"
 #include "pro/ProController.h"
+#endif
+
+// The in-app media browser (#252): the consumer player on Windows. Pro keeps its station
+// panels; macOS / Linux keep the system dialog until they get a provider.
+#if defined(_WIN32) && !MEDIAPLAYER_PRO
+#define MEDIAPLAYER_BROWSER 1
+#include "browser/MediaBrowser.h"
+#include "browser/WindowsMediaProvider.h"
+#include "rhi/StereoGridRenderer.h"
+#include <memory>
+#else
+#define MEDIAPLAYER_BROWSER 0
 #endif
 
 #include <chrono>
@@ -86,6 +101,32 @@ private:
     // Open-file. RequestOpenFile tries the workspace picker, else a native dialog.
     // LoadMedia opens a path fresh; ReloadMedia tears down current media first.
     void RequestOpenFile();
+    // The system file dialog (Open's fallback, and the browser's "Other files...").
+    void ShowNativeOpenDialog();
+    // The media browser (#252): shown by Open where there is no workspace picker.
+    void ShowBrowser();
+    void CloseBrowser();
+    void BuildBrowser();
+    bool BrowserNext(int delta, std::string& path) const;
+    void ApplyFolderRequests();
+    void ApplyItemRequests();
+    // A cloud-only file is downloaded in the background before it opens (#252): the
+    // download's end, and its progress panel (Cancel).
+    void PollCloudFetch();
+    void BuildCloudFetchPanel();
+    bool CloudFetchBusy() const {
+#if defined(_WIN32)
+        return cloudFetch_.Busy();
+#else
+        return false;
+#endif
+    }
+    // The browser's rendering mode (#252 phase 2): flat, or 3D under its "3D only" filter,
+    // borrowed while it shows. End: hand it back, or (`keep`) leave the panel as it is.
+    void RequestBrowserMode();
+    void EndBrowserMode(bool keep);
+    // The 3D grid draws this frame: the "3D only" filter, and the panel already in 3D.
+    bool GridStereo(uint32_t viewCount) const;  // the browser's Add folder / pin / unpin / hide
     // Open folder (#252 phase 0): a native folder dialog; the folder becomes the arrow-key list.
     void RequestOpenFolder();
     // A path the user chose (a picker, a Recent row): a file opens as is, a folder opens
@@ -161,6 +202,11 @@ private:
     // Mode chip: V / the Mode button cycle the display's rendering mode, and every mode
     // change shows a toast naming the new mode (the plug-in's mode name).
     void CycleRenderingMode();
+    // The 2D/3D switch (basic player, #252): a 2D file converts to 3D or back; a 3D file
+    // shows flat (the left eye) or back in 3D. V and the switch on the transport.
+    void Toggle3D();
+    // The panel is in, or about to be in, its flat mode.
+    bool PanelHeadingFlat() const;
     void ToastRenderingMode();
     void OnRenderingModeChanged();  // the runtime reported a rendering-mode change
     void TogglePlayback();   // play/pause (video+audio); restarts if the clip already ended
@@ -415,6 +461,37 @@ private:
     RecentList recent_;
     std::string recentFile_;
 
+#if MEDIAPLAYER_BROWSER
+    std::unique_ptr<browser::WindowsMediaProvider> browserProvider_;
+    std::unique_ptr<browser::MediaBrowser> browser_;
+    // The 3D grid (#252 phase 2, docs/BROWSER.md "3D grid"): draws the tiles into the
+    // projection atlas, each eye's crop into its views, under the "3D only" filter.
+    StereoGridRenderer grid_;
+    bool gridReady_ = false;
+    browser::ModeBorrow browserMode_;
+#endif
+#if defined(_WIN32)
+    browser::win::CloudFetch cloudFetch_;
+#endif
+    // What asked for the open a cloud download is for: a user open adds the file to Recent,
+    // the browser also makes up/down walk its grid. Set around those ReloadMedia calls.
+    enum class OpenIntent { Other, User, Browser };
+    OpenIntent openIntent_ = OpenIntent::Other;
+    OpenIntent cloudIntent_ = OpenIntent::Other;
+    bool browsing_ = false;          // the browser covers the player
+    bool browserNav_ = false;        // up/down walk the browser's grid, not folderFiles_
+    bool resumeAfterBrowse_ = false;  // a video was playing when the browser opened
+    // Pinned folders and folders hidden from Media folders, kept beside the Recent list.
+    RecentList pinned_{64}, hiddenFolders_{256};
+    std::string pinnedFile_, hiddenFile_;
+    bool pinPickPending_ = false;  // the folder dialog is choosing a folder to pin
+#if MEDIAPLAYER_BROWSER
+    // The browser's view (grid / details, card size, sort), kept between launches beside
+    // pinned.txt; written when it changes and no drag is under way. Empty: not kept.
+    std::string browserPrefsFile_;
+    browser::DeskViewPrefs browserPrefsSaved_;
+#endif
+
     // Folder navigation / slideshow. folderFiles_ holds the supported assets in the
     // current media's directory (sorted); folderIndex_ points at the loaded one.
     std::string currentMediaPath_;
@@ -544,6 +621,12 @@ private:
     // kept so a mode the USER picked while idle is not undone on the way out.
     int32_t pendingModeRequest_ = -1;
     bool userModeChoice_ = false;  // V / the Mode button was used: Pro's auto-3D stays out
+    // The 2D/3D switch's choice, kept while walking the list (Up / Down, the slideshow) and
+    // dropped by any other open (#252): 3D files shown flat, 2D files converted.
+    bool walking_ = false;          // NavigateMedia's load in progress
+    bool stickFlat_ = false;
+    bool stickConvert_ = false;
+    std::string stickConvertTried_;  // the file the kept conversion was last started on
     int32_t modeBeforeIdle_ = -1;
     int32_t idleModeRequested_ = -1;
     // Mode chip: the idle borrow's target, whose change event is not toasted (consumed by
@@ -561,6 +644,7 @@ private:
     bool inputRemember_ = false;
     bool convertBound_ = false;
     bool convertStillPending_ = false;  // still: submit until its result lands
+    double convertStillSentAt_ = 0.0;   // look-around: when the still last went for conversion
     // Full-resolution pixels of the loaded still, kept ONLY when the runtime offers the
     // extension (so the base player on a runtime without it holds no extra copy): the
     // source to convert, and what toggling off puts back.

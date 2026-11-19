@@ -138,6 +138,7 @@ void LiftClient::Refresh() {
                 return;
             }
         }
+        const bool wasPresent = taskPresent_;
         taskPresent_ = false;
         for (uint32_t i = 0; i < n && i < tasks.size(); ++i) {
             if (tasks[i].task == XR_LIFT_TASK_VIEWS_MONO_DXR) {
@@ -146,6 +147,10 @@ void LiftClient::Refresh() {
                 taskPresent_ = true;
             }
         }
+        // The task can arrive after Attach (an in-process session's link to the service
+        // connects in the background): say so when it comes or goes.
+        if (taskPresent_ != wasPresent)
+            LOG_INFO("2D→3D conversion: VIEWS_MONO task %s", taskPresent_ ? TaskStateName(task_.state) : "gone");
         RefreshCandidates();
         return;
     }
@@ -479,6 +484,30 @@ bool LiftClient::Submit(const uint8_t* rgba, uint32_t width, uint32_t height, ui
     images.type = XR_TYPE_LIFT_FRAME_IMAGES_DXR;
     images.imageCount = 1;
     images.images = &img;
+
+    // The viewpoints (sticky per stream, sent with every frame anyway): the tracked viewer's
+    // eyes, horizontally and vertically, easing back to the centre once the head holds still
+    // (the runtime's default: 1 s hold, 2 s time constant), as the DisplayXR Browser does.
+    // A head move still looks around; a held off-centre pose does not leave the viewer
+    // staring at the filled-in disocclusions. Off: the nominal viewer (parallax 0).
+    XrLiftViewControlDXR view{};
+    view.type = XR_TYPE_LIFT_VIEW_CONTROL_DXR;
+    view.ipdFactor = 1.0f;
+    view.parallaxFactor = lookAround_ ? 1.0f : 0.0f;
+    view.axisMode = XR_LIFT_AXIS_MODE_XY_DXR;
+    view.maxOffsetMeters = 0.0f;
+    view.recenterMode = XR_LIFT_RECENTER_MODE_EASE_BACK_DXR;
+    view.recenterHoldSeconds = -1.0f;
+    view.recenterTimeConstantSeconds = 0.0f;
+    XrLiftOptionsDXR options{};
+    options.type = XR_TYPE_LIFT_OPTIONS_DXR;
+    options.next = &view;
+    options.convergence = XR_LIFT_CONVERGENCE_AUTO_DXR;
+    options.strength = 1.0f;
+    options.inpaint = XR_TRUE;  // fill what a moved eye uncovers
+    options.viewpointSource = XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR;
+    options.viewCount = 2;
+    images.next = &options;
 
     XrLiftFrameSubmitInfoDXR submit{};
     submit.type = XR_TYPE_LIFT_FRAME_SUBMIT_INFO_DXR;

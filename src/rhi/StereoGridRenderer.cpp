@@ -1,21 +1,27 @@
 // Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
-#include "stereo_grid.h"
+#include "rhi/StereoGridRenderer.h"
 
 #include "ColorPolicy.h"
 
+#include "Log.h"
+
+// The shaders (shaders/stereo_grid.*): the Android leg compiles them at build time, the
+// desktop build embeds them in rhi/Shaders.h (scripts/gen_shaders.sh), as the same names.
+#if defined(__ANDROID__)
 #include "stereo_grid.frag.h"
 #include "stereo_grid.vert.h"
-
-#include <android/log.h>
+#else
+#include "rhi/Shaders.h"
+#endif
 
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <vector>
 
-#define SG_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "MediaPlayerVK", __VA_ARGS__)
-#define SG_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "MediaPlayerVK", __VA_ARGS__)
+#define SG_LOGI(...) LOG_INFO(__VA_ARGS__)
+#define SG_LOGE(...) LOG_ERROR(__VA_ARGS__)
 
 namespace {
 

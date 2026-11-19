@@ -42,7 +42,35 @@ public:
         None,
         Opened,      // an item, already handed to MediaProvider::Open
         OtherFiles,  // "Other files...": the caller opens the system picker
+        Closed,      // desktop: the close button; the caller goes back to the player
+        AddFolder,   // desktop: "Add folder...": the caller asks for a folder to pin
     };
+
+    // Desktop: what the user asked of a folder tile's menu (right click).
+    struct FolderRequest {
+        enum class Verb { Pin, Unpin, Hide } verb = Verb::Pin;
+        std::string path;  // as the provider reported it ('/'-separated, trailing '/')
+    };
+    bool TakeFolderRequest(FolderRequest& out) {
+        if (!folderRequestPending_) return false;
+        folderRequestPending_ = false;
+        out = folderRequest_;
+        return true;
+    }
+
+    // Desktop: what the user asked of a file's menu (right click) or its keys. CopyPath of a
+    // selection: `ids`, in grid order (one path a line); else `id` alone.
+    struct ItemRequest {
+        enum class Verb { Reveal, CopyPath } verb = Verb::Reveal;
+        int64_t id = -1;
+        std::vector<int64_t> ids;
+    };
+    bool TakeItemRequest(ItemRequest& out) {
+        if (!itemRequestPending_) return false;
+        itemRequestPending_ = false;
+        out = itemRequest_;
+        return true;
+    }
 
     MediaBrowser() = default;
     ~MediaBrowser();
@@ -56,6 +84,10 @@ public:
     bool Initialize(MediaProvider* provider, VkPhysicalDevice physicalDevice, VkDevice device,
                     uint32_t framesInFlight, const std::string& cachePath);
     void Shutdown();
+
+    // Desktop (#252): a close button in the top bar, mouse-wheel scrolling and a hover
+    // highlight. Off on Android.
+    void SetDesktop(bool on) { desktop_ = on; }
 
     // Read the library again, e.g. each time the browser is shown.
     void Refresh();
@@ -83,10 +115,36 @@ public:
     // go up a folder.
     bool CanGoBack() const;
     bool Back();
+    // Desktop: back (-1) or forward (+1) through the places shown, as a file manager's
+    // Back / Forward. False with nowhere to go.
+    bool HistoryStep(int dir);
+    // Desktop: the details view (one row per file) instead of the grid.
+    void SetDetails(bool on) { details_ = on; }
+    // Desktop: show only the names holding `query` (any case), as the search box does.
+    void SetQuery(const std::string& query);
+    // Ctrl+F: the search box takes the keyboard.
+    void FocusSearch() { focusSearch_ = true; }
+    // Desktop: grid or details, the cards' size and the sort, as the caller keeps them
+    // between launches (BrowserLayout.h).
+    DeskViewPrefs ViewPrefs() const {
+        return DeskViewPrefs{details_, cardW_, options_.order, listed_ ? CurrentSource().name : startSource_,
+                             listed_ ? folder_ : startFolder_};
+    }
+    void SetViewPrefs(const DeskViewPrefs& prefs);
+    static constexpr float kCardMin = 120.0f, kCardMax = 320.0f;  // desktop: the size slider's range
 
     // The 3D grid (#180, StereoGrid.h). The "3D only" filter is on: the caller takes the
     // panel to 3D for it.
     bool WantsStereo() const { return depth_ == DepthFilter::Only3D; }
+    // The 2D / 3D filter, as the chip sets it (tests start on "3D only").
+    void SetDepthFilter(DepthFilter depth) { SetDepth(depth); }
+    // Tests (MEDIAPLAYER_BROWSER_FOCUS): the focus ring on tile `index` whenever it has none.
+    void SetStartFocus(size_t index) { startFocus_ = index; }
+    // Tests (MEDIAPLAYER_BROWSER_SELECT): select the files at these places in the grid (0 = the
+    // first file, after the folders) once they are shown.
+    void SetStartSelection(std::vector<size_t> files) { startSelection_ = std::move(files); }
+    // Show the source named `name` once the list arrives (tests: MEDIAPLAYER_BROWSER_SOURCE).
+    void SetStartSource(std::string name) { startSource_ = std::move(name); }
     // The panel is in 3D and the caller draws Stereo() into the projection layer, so
     // Build() leaves the tiles' pictures and the background behind them out of the HUD.
     // `viewScale` is the 3D mode's (the useful size of an eye is a tile times it).
@@ -123,10 +181,83 @@ private:
     void SetType(TypeFilter type);
     void UploadReady(const std::unordered_set<int64_t>& window, uint32_t need);
     void GoTo(const std::string& folder);
+    void FolderMenu();
     void Up();
     void EndSelection();
+    // The desktop look (MediaBrowserDesktop.cpp, #252).
+    void DeskHeader(float width, float height);
+    void DeskToolbar(ImVec2 min, ImVec2 max);
+    void DeskSortMenu();
+    Action DeskSidebar(ImVec2 min, ImVec2 max);
+    // `preview`: indices into the library's items to show a mosaic of (up to `shown` of them,
+    // as far as their thumbnails are here); none: the folder glyph.
+    void DeskFolderCard(ImDrawList* dl, const Folder& folder, ImVec2 a, ImVec2 b, float pic, bool hovered, bool pressed,
+                        bool focus, const std::vector<size_t>* preview, size_t shown);
+    void DeskItemCard(ImDrawList* dl, const MediaItem& item, bool supported, const StereoVerdict& verdict, ImVec2 a,
+                      ImVec2 b, float pic, bool hovered, bool pressed, bool focus, bool picture, bool behind);
+    static float DeskCaptionHeight();
+    // The details view's columns: 0 name, 1 depth, 2 type, 3 dimensions, 4 length, 5 date,
+    // 6 size. Narrow windows drop type, dimensions, size, then date.
+public:
+    struct DeskColumns {
+        float x[7] = {};
+        float w[7] = {};
+        bool on[7] = {};
+    };
+
+private:
+    static DeskColumns DeskColumnLayout(float x0, float width);
+    void DeskColumnHeader(const DeskColumns& c, ImVec2 min, ImVec2 max);
+    void DeskFolderRow(ImDrawList* dl, const Folder& folder, const DeskColumns& c, ImVec2 a, ImVec2 b, float pic,
+                       bool hovered, bool pressed, bool focus);
+    void DeskItemRow(ImDrawList* dl, const MediaItem& item, bool supported, const StereoVerdict& verdict,
+                     const DeskColumns& c, ImVec2 a, ImVec2 b, float pic, bool hovered, bool pressed, bool focus,
+                     bool picture, bool behind);
+    void DeskSearch(ImVec2 pos, float w, float h, const std::string& place);
+    void DeskItemMenu();
+    void DeskPinnedMenu();
+    void DeskStatusBar(ImVec2 min, ImVec2 max);
+    void TrackHistory();
+    void UpdatePinnedRows();
 
     MediaProvider* provider_ = nullptr;
+    bool desktop_ = false;         // SetDesktop
+    bool closeRequested_ = false;  // the close button, this frame
+    FolderRequest folderRequest_;
+    bool folderRequestPending_ = false;
+    std::string menuFolder_;       // the folder tile whose menu is open
+    size_t cursor_ = SIZE_MAX;     // desktop: the keyboard's tile (SIZE_MAX: none yet)
+    size_t startFocus_ = SIZE_MAX;  // SetStartFocus
+    int64_t selAnchor_ = -1;        // desktop: Shift+click's anchor (ClickSelect)
+    std::vector<size_t> startSelection_;  // SetStartSelection, until applied
+    // Desktop: the selected files' ids in grid order.
+    std::vector<int64_t> SelectedInOrder() const;
+    bool details_ = false;         // desktop: the details view
+    float cardW_ = 176.0f;         // desktop grid: a card's width, design px (the size slider)
+    float cardShown_ = 0.0f;       // ... as drawn: eases to cardW_ (0: not drawn yet)
+    float lastStep_ = 0.0f;        // the last frame's row pitch, to hold the view on a resize
+    char search_[256] = {};        // desktop: the search box's text
+    std::string query_;            // ... as the grid filters by it
+    bool focusSearch_ = false;     // Ctrl+F: the search box takes the keyboard
+    // Desktop: the places shown, for Back / Forward.
+    struct Place {
+        size_t source = 0;
+        std::string folder;
+    };
+    std::vector<Place> back_, forward_;
+    Place here_;
+    bool placed_ = false;
+    ItemRequest itemRequest_;
+    bool itemRequestPending_ = false;
+    // Desktop: the Pinned source's folders, a sidebar row each (UpdatePinnedRows).
+    std::vector<Folder> pinnedRows_;
+    size_t pinnedSource_ = SIZE_MAX;  // the Pinned source's index, SIZE_MAX: none
+    std::string pinnedMenu_;          // the pinned row whose menu is open
+    // Desktop status bar: this frame's tile with the focus ring, else under the pointer.
+    int64_t statusItem_ = -1;
+    size_t statusFolder_ = SIZE_MAX;
+    int64_t menuItem_ = -1;        // the file whose menu is open
+    bool menuOpen_ = false;        // its menu's "Open", this frame
     MediaLibrary library_;
     StereoClassifier classifier_;
     ThumbnailAtlas atlas_;
@@ -134,7 +265,7 @@ private:
 
     bool listed_ = false;  // an item list has arrived
 
-    SourceKind sourceKind_ = SourceKind::All;
+    size_t source_ = 0;   // index into the library's sources
     std::string folder_;  // the folder shown, in a source browsed as folders
     ViewOptions options_;
     DepthFilter depth_ = DepthFilter::Both;
@@ -146,12 +277,19 @@ private:
     bool sheetOpen_ = false;     // the view options sheet or the type menu is open
     bool closeSheets_ = false;   // Back: close them in the next Build()
     ImVec2 typeChip_;       // where the type chip's menu opens, its bottom left
+    ImVec2 sortMenuAt_;     // desktop: where the sort menu opens
+    std::string startSource_;  // SetStartSource, until the list arrives
+    std::string startFolder_;  // ... and a folder in it (the place kept between launches)
 
     bool selecting_ = false;  // select mode: a tap picks an item, the bin deletes the picked
+    // The picked items: select mode's (touch), or Ctrl / Shift + click's (desktop, where a
+    // plain click still opens and Esc clears them).
     std::unordered_set<int64_t> selected_;
 
     bool dirty_ = true;            // folders_ and shown_ need a rebuild
     std::vector<Folder> folders_;  // the folder's sub-folders: the first tiles
+    // Desktop: per folder tile, the files its card previews (MediaLibrary::FolderPreviews).
+    std::vector<std::vector<size_t>> folderPreviews_;
     std::vector<size_t> shown_;    // indices into the library's items, in grid order after the folders
     std::vector<size_t> unknown_;  // under a depth filter: items with no verdict yet
     // The grid's date sections (All media, Camera: "Today", "October 2026"): how many of

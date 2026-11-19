@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace mp::browser {
@@ -44,6 +45,34 @@ bool ViewOptionsAreDefault(const ViewOptions& options, bool showUnsupported);
 // The type chip's label.
 const char* TypeLabel(TypeFilter type);
 
+// Desktop (#252): how the browser looks, kept between launches: grid or details, the cards'
+// width (design px), the sort, and the place last shown (a source by name and its folder). As text, one "key=value" a line ("view=details",
+// "card=200", "sort=oldest"); a line it does not know is skipped and a bad value keeps the
+// default, so an older or a newer file still reads.
+struct DeskViewPrefs {
+    bool details = false;
+    float cardW = 176.0f;
+    SortOrder order = SortOrder::NewestFirst;
+    std::string source;  // empty: the browser's own start (Recents, or the first with items)
+    std::string folder;
+    bool operator==(const DeskViewPrefs& o) const {
+        return details == o.details && cardW == o.cardW && order == o.order && source == o.source &&
+               folder == o.folder;
+    }
+    bool operator!=(const DeskViewPrefs& o) const { return !(*this == o); }
+};
+std::string FormatDeskViewPrefs(const DeskViewPrefs& prefs);
+// The prefs in `text`, from the defaults; `cardW` is clamped to [cardMin, cardMax].
+DeskViewPrefs ParseDeskViewPrefs(const std::string& text, float cardMin, float cardMax);
+
+// Desktop selection, as File Explorer's: a click on `ids[at]` (the files in grid order) with
+// Ctrl toggles it and makes it the anchor; with Shift selects the run from the anchor to it
+// (the anchor stays; with Ctrl too the run is added, else it replaces the selection; no anchor
+// in `ids`: the clicked one); with neither, it alone (the anchor). `anchor` is an id, so it
+// survives the grid being rebuilt.
+void ClickSelect(const std::vector<int64_t>& ids, size_t at, bool ctrl, bool shift, int64_t& anchor,
+                 std::unordered_set<int64_t>& selected);
+
 // A date section: `key` orders and tells sections apart, `label` heads it.
 struct DateSection {
     int64_t key = 0;
@@ -59,9 +88,10 @@ DateSection DateBucket(int64_t dateMs, int64_t nowMs, int64_t utcOffsetSeconds);
 class GridLayout {
 public:
     // `sections`: the tiles in each section, in order. With `headers`, each section has a
-    // header `headerHeight` tall above its first row.
+    // header `headerHeight` tall above its first row. Tiles are `tile` wide and `tileHeight`
+    // tall (< 0: square; the desktop's have a caption under the picture).
     void Build(const std::vector<size_t>& sections, bool headers, int columns, float tile, float gutter,
-               float headerHeight);
+               float headerHeight, float tileHeight = -1.0f);
 
     size_t Tiles() const { return tiles_; }
     float Height() const { return height_; }
@@ -93,6 +123,7 @@ private:
     std::vector<float> headerY_;
     int columns_ = 1;
     float tile_ = 0.0f, step_ = 0.0f, header_ = 0.0f;
+    float tileH_ = 0.0f, stepY_ = 0.0f;  // rows: the tile's height and the row pitch
     size_t tiles_ = 0;
     float height_ = 0.0f;
 };

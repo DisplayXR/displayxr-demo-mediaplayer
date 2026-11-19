@@ -58,6 +58,10 @@ struct TransportCaps {
     // The desktop Open menu (#252 phase 0): a drop-down arrow beside "Open" with Open file,
     // Open folder and the Recent list. DEFAULT FALSE; the desktop owner sets it.
     bool openMenu = false;
+    // The desktop basic player's "..." menu (#252): Mode, Layout and the 2D->3D converter
+    // move off the top bar into it, and the "Convert to 3D" button goes (the 2D/3D switch
+    // does that). DEFAULT FALSE: Pro keeps them on the bar.
+    bool moreMenu = false;
     // The touch player's layout (#180). DEFAULT FALSE; Android sets it. Instead of the flat
     // bars: gradient scrims at the top and bottom, the back arrow then the file's name left
     // aligned (and its place in the list under it), and the 2D/3D switch as a labelled
@@ -106,6 +110,12 @@ struct TransportState {
     std::vector<std::pair<std::string, std::string>> info;
     std::string modeName;       // e.g. "2x1 Stereo"
     bool mode3D = false;        // the 2D/3D switch's side; only read when caps.modeSwitch
+    // The switch can be greyed (a 2D file whose converter is warming up or failed), with the
+    // reason on hover; `modeSwitchBusy` rings the knob while a conversion warms up. Desktop
+    // only reads the tooltip (no hover on touch).
+    bool modeSwitchEnabled = true;
+    bool modeSwitchBusy = false;
+    std::string modeSwitchTooltip;
     std::string layoutName;     // e.g. "SBS-half"
     std::string layoutTooltip;  // multi-line provenance shown on hover
     bool layoutPinned = false;  // renders a trailing '*'
@@ -206,6 +216,9 @@ struct TransportActions {
     std::function<void(int row)> OpenRecent;    // caps.openMenu: a Recent row, 0 = newest
     std::function<void()> ClearRecent;          // caps.openMenu: "Clear recent"
     std::function<void()> NextMode;  // the Mode button, or a flip of the 2D/3D switch
+    // A flip of the 2D/3D switch when set (the desktop basic player: it converts a 2D file
+    // or shows a 3D one flat); unset, the switch fires NextMode.
+    std::function<void()> Toggle3D;
     std::function<void()> CycleLayout;
     std::function<void()> ToggleSlideshow;
     std::function<void()> TogglePlayback;
@@ -270,6 +283,14 @@ inline ImFont* g_rowFont = nullptr;
 inline ImFont* g_smallFont = nullptr;
 // The font for `style`: null (the UI font) where the type scale is not built.
 ImFont* StyleFont(TextStyle style);
+
+// The desktop browser's type scale (#252): Title 15, Body 14, Label 13, Meta 12 and Badge 11
+// design units. ImGuiLayer rasterizes them only on desktop (metricScale <= 1), beside the UI
+// font, which keeps its size: the player's own UI draws as before. Null on touch.
+enum class DeskText { Title, Body, Label, Meta, Badge, Count };
+float DeskTextPx(DeskText style);
+inline ImFont* g_deskFonts[(int)DeskText::Count] = {};
+inline ImFont* DeskFont(DeskText style) { return g_deskFonts[(int)style]; }
 
 // Advance the purely-visual timers: the auto-hide fade and the toast fade.
 // `uiAwake` is the caller's "should the chrome be visible" verdict (master

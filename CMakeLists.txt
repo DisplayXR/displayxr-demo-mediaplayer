@@ -278,11 +278,13 @@ function(mp_add_player tgt is_pro)
         src/AgentTools.cpp       # the player's agent-tool table (#220)
         src/Log.cpp
         src/platform/Window.cpp
+        src/platform/SingleInstance.cpp  # one player per session (Windows)
         $<$<PLATFORM_ID:Linux>:src/platform/WindowLinux.cpp>  # desktop Linux: displayxr-common window
         src/xr/XrSession.cpp
         src/rhi/VulkanRenderer.cpp
         src/rhi/BandCopy.cpp         # upload copies into staging in row bands (8K live frames)
         src/rhi/AsyncUpload.cpp      # ...on an upload thread, off the render thread (MEDIAPLAYER_ASYNC_UPLOAD)
+        src/rhi/StereoGridRenderer.cpp  # the browser's 3D grid (#252 phase 2), shared with Android
         src/media/ImageDecoder.cpp
         src/media/LifLoader.cpp
         src/media/DepthWarp.cpp      # one-view LIF -> stereo pair (#180)
@@ -294,6 +296,7 @@ function(mp_add_player tgt is_pro)
         src/media/StereoCompose.cpp
         src/media/StereoDetect.cpp
         src/media/VideoStereoProbe.cpp
+        src/media/VideoThumbnail.cpp  # browser grid: a still when the system has none (#252)
         src/media/VideoDecoder.cpp
         src/media/AudioPlayer.cpp
         src/media/CameraSelect.cpp
@@ -313,6 +316,26 @@ function(mp_add_player tgt is_pro)
         src/ui/Icons.cpp  # every icon the chrome draws, shared with the browser (#180)
         src/ui/UiText.cpp  # fitting and wrapping text (#180)
         src/media/FrameRing.h  # header-only triple buffer
+        # The media browser (#160 Android, #252 desktop; docs/BROWSER.md). Mirrors the
+        # Android list; the Windows provider lists media through the shell.
+        src/media/Letterbox.cpp       # black bars off a grid thumbnail (#180)
+        src/browser/BrowserLayout.cpp
+        src/browser/MediaBrowser.cpp
+        src/browser/MediaBrowserDesktop.cpp  # its desktop look (#252)
+        src/browser/MediaLibrary.cpp
+        src/browser/SlideGesture.cpp
+        src/browser/StereoClassifier.cpp
+        src/browser/StereoGrid.cpp
+        src/browser/StereoPairs.cpp
+        src/browser/PairDiskCache.cpp
+        src/browser/ThumbnailAtlas.cpp
+        src/browser/ThumbnailCache.cpp
+        src/browser/ThumbnailDepth.cpp
+        src/browser/TileCrop.cpp
+        src/browser/TouchScroller.cpp
+        $<$<PLATFORM_ID:Windows>:src/browser/WinShellMedia.cpp>
+        $<$<PLATFORM_ID:Windows>:src/browser/CloudFetch.cpp>  # a cloud file downloads before it opens
+        $<$<PLATFORM_ID:Windows>:src/browser/WindowsMediaProvider.cpp>
         ${MP_IMGUI_SOURCES}
     )
 
@@ -394,7 +417,7 @@ function(mp_add_player tgt is_pro)
     # atlas-capture output path under the user's Pictures folder.
     # d3d11 + dxgi: zero-copy D3D11VA->Vulkan decode interop (issue #28).
     if(WIN32)
-        target_link_libraries(${tgt} PRIVATE shell32 ole32 d3d11 dxgi d3dcompiler)
+        target_link_libraries(${tgt} PRIVATE shell32 ole32 oleaut32 uuid cldapi d3d11 dxgi d3dcompiler)
     endif()
 
     # macOS: displayxr-common's Cocoa adapter for dxr::CursorDepth hides the OS pointer
@@ -763,6 +786,15 @@ if(MP_BUILD_TESTS)
         target_link_libraries(recent_list_test PRIVATE shell32 ole32)
     endif()
     add_test(NAME recent_list COMMAND recent_list_test)
+
+    # Desktop browser (#252 phase 1): a MANUAL probe of the Search index, libraries and
+    # shell thumbnails on a real box. Not a ctest test: its results depend on the machine.
+    if(WIN32)
+        add_executable(win_shell_media_probe tests/win_shell_media_probe.cpp src/browser/WinShellMedia.cpp)
+        target_include_directories(win_shell_media_probe PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+        target_link_libraries(win_shell_media_probe PRIVATE shell32 ole32 oleaut32 uuid)
+    endif()
 
     # Media browser (#160): the library's supported set, sources, filter and sort. Pure.
     add_executable(media_library_test

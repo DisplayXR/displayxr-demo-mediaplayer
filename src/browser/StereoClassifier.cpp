@@ -37,13 +37,59 @@ void StereoClassifier::Shutdown() {
     Save();
 }
 
+namespace {
+
+// A side-by-side tag in a file name, as a whole word: SBS, HSBS / Half-SBS (half), FSBS /
+// Full-SBS (full), e.g. "icon_sbs.png", "Movie.HSBS.mkv". A bare SBS is decided by the
+// frame's aspect, as the player decides it. The player opens such a file in 3D anyway (it
+// assumes 3D until a file proves 2D); the browser's badge needs this evidence, and the
+// content check misses flat pictures such as icons.
+bool SbsFromName(const MediaItem& item, StereoLayout& out) {
+    const size_t slash = item.name.find_last_of("/\\");
+    const std::string base = slash == std::string::npos ? item.name : item.name.substr(slash + 1);
+    bool sbs = false, full = false, half = false;
+    std::string tok;
+    for (size_t i = 0; i <= base.size(); ++i) {
+        const char ch = i < base.size() ? (char)std::tolower((unsigned char)base[i]) : '.';
+        if (std::isalnum((unsigned char)ch)) {
+            tok += ch;
+            continue;
+        }
+        if (tok == "sbs") sbs = true;
+        if (tok == "hsbs") sbs = half = true;
+        if (tok == "fsbs") sbs = full = true;
+        if (tok == "full") full = true;
+        if (tok == "half" || tok == "h") half = true;
+        tok.clear();
+    }
+    if (!sbs) return false;
+    if (full) {
+        out = StereoLayout::SbsFull;
+    } else if (half) {
+        out = StereoLayout::SbsHalf;
+    } else {
+        bool ambiguous = false;
+        out = item.width > 0 && item.height > 0
+                  ? StereoDetect::ChooseFullOrHalf((float)item.width / (float)item.height, ambiguous)
+                  : StereoLayout::SbsFull;
+    }
+    return true;
+}
+
+} // namespace
+
 StereoVerdict StereoClassifier::Get(const MediaItem& item) const {
+    // The file name first: it is the user's own word, and it outranks a verdict cached
+    // before the name rules knew its tag.
+    StereoVerdict v;
+    if (MediaSource::LayoutFromFilename(item.name, v.layout) || SbsFromName(item, v.layout)) {
+        v.known = v.stereo = true;
+        return v;
+    }
     const auto it = verdicts_.find(item.id);
     if (it != verdicts_.end() && it->second.modified == item.modified && it->second.bytes == item.bytes) {
         return it->second.verdict;
     }
-    StereoVerdict v;
-    if (MediaSource::LayoutFromFilename(item.name, v.layout)) v.known = v.stereo = true;
     return v;
 }
 
@@ -84,6 +130,7 @@ bool StereoClassifier::TakeResult(Thumbnail& thumbnail, StereoVerdict& verdict) 
     const bool cached =
         it != verdicts_.end() && it->second.modified == job.item.modified && it->second.bytes == job.item.bytes;
     if (!cached) {
+        job.verdict.unchecked = job.unchecked && !job.verdict.stereo;
         const bool save = job.verdict.stereo || !job.unchecked;
         verdicts_[job.item.id] = Entry{job.item.modified, job.item.bytes, job.verdict, save};
         dirty_ = dirty_ || save;

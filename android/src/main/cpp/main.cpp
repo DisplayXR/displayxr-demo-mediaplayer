@@ -62,7 +62,7 @@
 #include <unistd.h>
 
 #include "sbs_renderer.h"
-#include "stereo_grid.h"
+#include "rhi/StereoGridRenderer.h"
 #include "video_decoder.h"
 #include "audio_player.h"
 #include "ColorPolicy.h"  // swapchain encoding policy, shared with the desktop leg (#78)
@@ -472,6 +472,15 @@ int32_t g_active_mode = -1;             // modeIndex of the mode the runtime rep
 mp::browser::ModeBorrow g_mode_borrow;
 int32_t g_pending_mode_request = -1;    // issued from the frame loop once running
 mp::DisplayModeSwitch g_mode_switch;    // the player's 2D/3D switch (#180); its Flat() is the borrow's
+// The switch follows the file (#252, desktop parity): a 3D file opens in the stereo mode, a
+// 2D one in the flat mode. A user flip of a 3D file to 2D sticks while the list is walked
+// (swipe next/prev), so the next 3D files open in 2D too; a fresh open (a grid pick, the SAF
+// picker) clears it and the switch follows the file again. android_main thread only.
+bool g_stick_2d = false;
+// apply_layout() arms it, leave_splash() spends it: the load's content mode is asked for once,
+// after the borrow's hand-back, so the content's mode wins over what the borrow returns.
+bool g_content_mode_due = false;
+int32_t g_handed_back = -1;  // the mode leave_splash() last handed back, until the content's is asked
 
 static void
 adopt_mode(const XrDisplayRenderingModeInfoDXR &m)
@@ -526,6 +535,28 @@ grid_stereo()
 	return g_grid_ready && g_browser.WantsStereo() && g_mode_switch.Is3D() && g_view_count >= 2;
 }
 
+// The mode a loaded file opens in (#252): a 2D file in the flat mode (Android has no 2D->3D
+// conversion, XR_DXR_lift is unsupported in-process, so there is nothing else for it); a 3D
+// file in the stereo mode, or flat while a walk keeps the user's flip to 2D. -1 when the
+// mode table has no such mode (yet).
+static int32_t
+content_mode()
+{
+	const int32_t flat = g_mode_switch.Flat();
+	if (g_image_mono) return flat;
+	if (g_stick_2d && flat >= 0) return flat;
+	return g_mode_switch.Stereo();
+}
+
+// A file opened fresh (a grid pick, the SAF picker), not walked to: the switch follows the
+// file again (#252).
+static void
+open_fresh(const char *why)
+{
+	if (g_stick_2d) LOGI("content: fresh open (%s), the switch follows the file again", why);
+	g_stick_2d = false;
+}
+
 // Every user-media load goes through here: clears the splash flag and hands the
 // borrowed mode back if it is still the one in force.
 static void
@@ -536,8 +567,23 @@ leave_splash()
 	const int32_t back = g_mode_borrow.Return(g_active_mode);
 	if (back >= 0) {
 		g_pending_mode_request = back;
+		g_handed_back = back;
 		LOGI("splash: handing mode %d back", back);
 	}
+	// The loaded file's own mode (#252), once per load and after the hand-back, so it wins.
+	// Video calls this every bound frame; g_content_mode_due keeps it to one request.
+	if (!g_content_mode_due) return;
+	const int32_t want = content_mode();
+	if (want < 0) return;  // the mode table is not known yet: ask on a later call
+	g_content_mode_due = false;
+	// Ask unless it is already in force. A hand-back in flight (this call's, or the video
+	// path's earlier one, made before its layout was known) may still move the panel off it.
+	if (want != g_active_mode || g_handed_back >= 0) {
+		g_pending_mode_request = want;
+		LOGI("content: %s file -> mode %d%s", g_image_mono ? "2D" : "3D", want,
+		     !g_image_mono && g_stick_2d ? " (kept in 2D while walking)" : "");
+	}
+	g_handed_back = -1;
 }
 
 // ── Stereo layout (desktop parity, #45) ─────────────────────────────────────
@@ -553,6 +599,7 @@ apply_layout(mp::StereoLayout layout, int w, int h)
 {
 	g_layout = layout;
 	g_image_mono = layout == mp::StereoLayout::Mono;
+	g_content_mode_due = true;  // leave_splash() asks for this file's mode (#252)
 	if (w > 0 && h > 0) {
 		// Per-eye display aspect. Full SBS is the only layout that packs two eyes
 		// across ONE frame's width, so it is the only one that halves. Dual carries a
@@ -1644,8 +1691,10 @@ fill_transport_state()
 	g_ui_state.hasMedia = g_scene_loaded.load(std::memory_order_relaxed) &&
 	                      !g_showing_splash.load(std::memory_order_relaxed);
 	g_ui_state.isVideo = g_is_video;
-	// The player's 2D/3D switch (#180), not the idle screen's: that one borrows 2D.
-	g_ui_state.caps.modeSwitch = g_ui_state.hasMedia && g_mode_switch.Available();
+	// The player's 2D/3D switch (#180), not the idle screen's: that one borrows 2D. It says
+	// how THIS file is shown (#252), so a 2D file has none: Android cannot convert 2D to 3D
+	// (XR_DXR_lift is unsupported in-process), and there is nothing to switch to.
+	g_ui_state.caps.modeSwitch = g_ui_state.hasMedia && !g_image_mono && g_mode_switch.Available();
 	// The 10 s skips on a tablet (shortest side 600 dp or more), the info sheet always (#180).
 	const float short_side = (float)(g_hud_w < g_hud_h ? g_hud_w : g_hud_h);
 	g_ui_state.caps.skip = g_is_video && short_side >= mp::ui::Dp(600.0f);
@@ -1895,7 +1944,11 @@ hud_init()
 		(g_browser_ready.load(std::memory_order_relaxed) ? g_browser_request : g_open_picker_request)
 		    .store(true, std::memory_order_relaxed);
 	};
-	g_ui_actions.NextMode = [] { g_pending_mode_request = g_mode_switch.Flipped(); };
+	g_ui_actions.NextMode = [] {
+		// A flip to 2D sticks while the list is walked (#252); one back to 3D unsticks it.
+		g_stick_2d = g_mode_switch.Is3D();
+		g_pending_mode_request = g_mode_switch.Flipped();
+	};
 	g_ui_actions.TogglePlayback = toggle_playback;
 	// AMediaExtractor has no cheap keyframe-preview mode here, so `preview` is
 	// ignored; the shared machine's follow-up exact seek is idempotent.
@@ -2187,6 +2240,7 @@ stop_media()
 	g_sbs.resetVideoAhb();
 	LOGI("[LVF] teardown: complete");
 	g_scene_loaded.store(false, std::memory_order_relaxed);
+	g_content_mode_due = false;  // the next file's apply_layout() arms its own (#252)
 	g_zoom.Reset();
 	g_ui_state.infoOpen = false;
 	// A seek the old clip's scrubber still waits on must not hold the next clip's knob
@@ -2788,8 +2842,11 @@ render_frame()
 			// The HUD IS the tile, so the remap is the identity rect.
 			g_imgui.BeginFrame((float)g_hud_w, (float)g_hud_h, 0.0f, 0.0f, 1.0f, 1.0f);
 			if (browsing) {
-				if (g_browser.Build() == mp::browser::MediaBrowser::Action::OtherFiles)
+				const mp::browser::MediaBrowser::Action act = g_browser.Build();
+				if (act == mp::browser::MediaBrowser::Action::OtherFiles)
 					g_open_picker_request.store(true, std::memory_order_relaxed);
+				else if (act == mp::browser::MediaBrowser::Action::Opened)
+					open_fresh("grid");  // picked from the browser, not swiped to (#252)
 				mp::ui::BuildTransportToast(g_ui_state);  // e.g. a file that would not open
 				g_browser.RecordUploads(g_sbs.frameCmd());
 			} else {
@@ -3675,6 +3732,9 @@ android_main(struct android_app *app)
 				const bool is_gif = have_magic && std::memcmp(magic, "GIF8", 4) == 0;
 				const bool is_bmp = have_magic && magic[0] == 'B' && magic[1] == 'M';
 				stop_media();
+				// Pending only between the SAF picker's launch and its fd (or cancel): a
+				// grid pick or a swipe reaches here with it false.
+				if (g_pick_pending.load(std::memory_order_relaxed)) open_fresh("picker");
 				g_pick_pending.store(false, std::memory_order_relaxed);
 				if (is_jpeg || is_png || is_gif || is_bmp) {
 					if (!load_picked_image(app, pick, off, len)) {

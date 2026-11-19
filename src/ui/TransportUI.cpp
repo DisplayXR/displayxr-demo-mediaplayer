@@ -114,6 +114,11 @@ float TextStylePx(TextStyle style, float k) {
     return std::ceil(Dp(dp) * g_fontScale - 0.001f);
 }
 
+float DeskTextPx(DeskText style) {
+    static const float kPx[] = {15.0f, 14.0f, 13.0f, 12.0f, 11.0f};
+    return std::ceil(kPx[(int)style] * g_uiScale - 0.001f);
+}
+
 ImFont* StyleFont(TextStyle style) {
     switch (style) {
         case TextStyle::Title: return g_titleFont;
@@ -157,7 +162,7 @@ bool IconButton(const char* id, Glyph kind, float size, bool active = false,
 // The touch player's 2D/3D switch (#180), drawn like the stock player's on the same tablets: a
 // pill track and a round knob naming the mode in force, on the right for 3D and on the
 // left for 2D. `size` is the knob's diameter; the hit box grows like IconButton's.
-bool ModeSwitch(const char* id, bool on3D, float size, float hitScale) {
+bool ModeSwitch(const char* id, bool on3D, float size, float hitScale, bool busy = false) {
     const float pad = size * (std::max(1.0f, hitScale) - 1.0f) * 0.5f;
     const float trackW = size * 1.5f, trackH = size * 0.45f;
     const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -170,6 +175,12 @@ bool ModeSwitch(const char* id, bool on3D, float size, float hitScale) {
     // A 1 px dark grey ring parts the knob from the track.
     dl->AddCircleFilled(c, r, ImGui::GetColorU32(ImVec4(0.30f, 0.30f, 0.32f, 1.0f)));
     dl->AddCircleFilled(c, r - 1.0f, ImGui::GetColorU32(ImVec4(0.05f, 0.05f, 0.06f, 1.0f)));
+    if (busy) {
+        // Warming up: an accent arc turning round the knob.
+        const float t = (float)ImGui::GetTime() * 4.0f;
+        dl->PathArcTo(c, r - 1.0f, t, t + 2.0f, 16);
+        dl->PathStroke(ImGui::GetColorU32(ImVec4(0.20f, 0.65f, 1.00f, 1.0f)), 0, std::max(1.5f, size * 0.07f));
+    }
     const char* label = on3D ? "3D" : "2D";
     const float fontPx = g_switchFont->FontSize;
     const ImVec2 ts = g_switchFont->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, label);
@@ -654,7 +665,9 @@ void TouchChrome(TransportState& s, const TransportActions& a, float W, float H)
             x += slot + st.ItemSpacing.x;
             if (s.caps.modeSwitch) {
                 ImGui::SetCursorScreenPos(ImVec2(x, row.y));
-                if (SegmentSwitch("##mode3d", s.mode3D, switchH, hit)) Fire(a.NextMode);
+                ImGui::BeginDisabled(!s.modeSwitchEnabled);
+                if (SegmentSwitch("##mode3d", s.mode3D, switchH, hit)) Fire(a.Toggle3D ? a.Toggle3D : a.NextMode);
+                ImGui::EndDisabled();
             }
             ImGui::SetCursorScreenPos(ImVec2(row.x, row.y + hit));
             ImGui::Dummy(ImVec2(0.0f, 0.0f));
@@ -663,9 +676,11 @@ void TouchChrome(TransportState& s, const TransportActions& a, float W, float H)
     } else if (s.caps.modeSwitch) {
         // A still: the switch alone, bottom right.
         ImGui::SetNextWindowPos(ImVec2(W, bottom), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
-        if (ImGui::Begin("##touch_modeswitch", nullptr, flags | ImGuiWindowFlags_AlwaysAutoResize) &&
-            SegmentSwitch("##mode3d", s.mode3D, switchH, hit))
-            Fire(a.NextMode);
+        if (ImGui::Begin("##touch_modeswitch", nullptr, flags | ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::BeginDisabled(!s.modeSwitchEnabled);
+            if (SegmentSwitch("##mode3d", s.mode3D, switchH, hit)) Fire(a.Toggle3D ? a.Toggle3D : a.NextMode);
+            ImGui::EndDisabled();
+        }
         ImGui::End();
     }
     ImGui::PopStyleVar();
@@ -736,21 +751,79 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 }
                 ImGui::EndPopup();
             }
-            if (s.caps.camera || s.caps.url) {
+            // A narrow window: the buttons that no longer fit before the slideshow icon are
+            // left out, from the right. The bar stays one row.
+            const ImGuiStyle& bst = ImGui::GetStyle();
+            const float barLimit = ImGui::GetWindowWidth() - bst.WindowPadding.x -
+                                   (s.caps.slideshow ? iconSz + bst.ItemSpacing.x : 0.0f);
+            bool barFull = false;
+            auto fits = [&](float w) {
+                if (barFull) return false;
+                const float x = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + bst.ItemSpacing.x;
+                if (x + w <= barLimit) return true;
+                barFull = true;  // and everything after it: the order never changes
+                return false;
+            };
+            auto buttonW = [&](const char* label) {
+                return ImGui::CalcTextSize(label, nullptr, true).x + bst.FramePadding.x * 2.0f;
+            };
+            if ((s.caps.camera || s.caps.url) &&
+                fits(ImGui::CalcTextSize("Live...").x + bst.FramePadding.x * 2.0f + ImGui::GetFrameHeight())) {
                 ImGui::SameLine();
                 CameraCombo(s, a);
             }
-            if (s.caps.mode) {
+            if (s.caps.moreMenu && (s.caps.mode || (s.caps.layout && s.hasMedia) || !s.convertProviders.empty()) &&
+                fits(iconSz)) {
                 ImGui::SameLine();
+                if (IconButton("##more", Glyph::More, iconSz, false, s.hitTargetScale)) ImGui::OpenPopup("##more_menu");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Display mode, layout, 2D->3D converter");
+            }
+            if (s.caps.moreMenu && ImGui::BeginPopup("##more_menu")) {
+                // Rows that cycle keep the menu open, so a few clicks walk the choices.
+                if (s.caps.mode) {
+                    char modeLabel[96];
+                    std::snprintf(modeLabel, sizeof(modeLabel), "Display mode: %s", s.modeName.c_str());
+                    if (ImGui::Selectable(modeLabel, false, ImGuiSelectableFlags_DontClosePopups)) Fire(a.NextMode);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The panel's rendering mode (V flips 2D / 3D)");
+                }
+                if (s.caps.layout && s.hasMedia) {
+                    char layoutRow[64];
+                    std::snprintf(layoutRow, sizeof(layoutRow), "Layout: %s%s", s.layoutName.c_str(),
+                                  s.layoutPinned ? "*" : "");
+                    if (ImGui::Selectable(layoutRow, false, ImGuiSelectableFlags_DontClosePopups)) Fire(a.CycleLayout);
+                    if (ImGui::IsItemHovered() && !s.layoutTooltip.empty())
+                        ImGui::SetTooltip("%s\nL cycles: auto / mono / SBS-full / SBS-half / TB-full / TB-half",
+                                          s.layoutTooltip.c_str());
+                }
+                if (!s.convertProviders.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("2D->3D converter");
+                    for (int i = 0; i < (int)s.convertProviders.size(); ++i) {
+                        const ConvertProviderRow& row = s.convertProviders[i];
+                        ImGui::PushID(i);
+                        ImGui::BeginDisabled(!row.enabled);
+                        if (ImGui::Selectable(row.label.c_str(), i == s.convertProviderCurrent) &&
+                            i != s.convertProviderCurrent && a.SelectConvertProvider)
+                            a.SelectConvertProvider(i);
+                        ImGui::EndDisabled();
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::EndPopup();
+            }
+            if (s.caps.mode && !s.caps.moreMenu) {
                 char modeLabel[96];
                 std::snprintf(modeLabel, sizeof(modeLabel), "Mode: %s", s.modeName.c_str());
-                if (ImGui::Button(modeLabel)) Fire(a.NextMode);
+                if (fits(buttonW(modeLabel))) {
+                    ImGui::SameLine();
+                    if (ImGui::Button(modeLabel)) Fire(a.NextMode);
+                }
             }
             // Stereo layout + override (#45). The trailing '*' marks a manual pin.
-            if (s.caps.layout && s.hasMedia) {
-                char layoutBtn[64];
-                std::snprintf(layoutBtn, sizeof(layoutBtn), "Layout: %s%s", s.layoutName.c_str(),
-                              s.layoutPinned ? "*" : "");
+            char layoutBtn[64];
+            std::snprintf(layoutBtn, sizeof(layoutBtn), "Layout: %s%s", s.layoutName.c_str(),
+                          s.layoutPinned ? "*" : "");
+            if (s.caps.layout && s.hasMedia && !s.caps.moreMenu && fits(buttonW(layoutBtn))) {
                 ImGui::SameLine();
                 if (ImGui::Button(layoutBtn)) Fire(a.CycleLayout);
                 if (ImGui::IsItemHovered() && !s.layoutTooltip.empty()) {
@@ -761,11 +834,12 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             // Convert to 3D: mono content only (caps). Highlighted while on; greyed with
             // the reason while the conversion cannot serve (a temporary state). The "###"
             // keeps one widget id across the label changes.
-            if (s.caps.convert && s.hasMedia) {
+            const char* convertLabel = "Convert to 3D###convert3d";
+            if (s.convertWarming) convertLabel = "Convert to 3D (warming)###convert3d";
+            if (s.convertUnavailable) convertLabel = "Convert to 3D (unavailable)###convert3d";
+            if (s.caps.convert && s.hasMedia && fits(buttonW(convertLabel))) {
                 ImGui::SameLine();
-                const char* label = "Convert to 3D###convert3d";
-                if (s.convertWarming) label = "Convert to 3D (warming)###convert3d";
-                if (s.convertUnavailable) label = "Convert to 3D (unavailable)###convert3d";
+                const char* label = convertLabel;
                 ImGui::BeginDisabled(!s.convertEnabled);
                 if (s.convertOn)
                     ImGui::PushStyleColor(ImGuiCol_Button,
@@ -783,13 +857,16 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     const bool valid = cur >= 0 && cur < (int)s.convertProviders.size();
                     const char* preview =
                         valid ? s.convertProviders[cur].preview.c_str() : "Default";
-                    ImGui::SameLine();
                     const ImGuiStyle& st = ImGui::GetStyle();
-                    ImGui::SetNextItemWidth(std::min(ImGui::CalcTextSize(preview).x +
-                                                         ImGui::GetFrameHeight() +
-                                                         st.FramePadding.x * 2.0f,
-                                                     Px(280.0f)));
-                    if (ImGui::BeginCombo("##convert3d_provider", preview)) {
+                    const float comboW = std::min(ImGui::CalcTextSize(preview).x + ImGui::GetFrameHeight() +
+                                                      st.FramePadding.x * 2.0f,
+                                                  Px(280.0f));
+                    const bool comboFits = fits(comboW);
+                    if (comboFits) {
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(comboW);
+                    }
+                    if (comboFits && ImGui::BeginCombo("##convert3d_provider", preview)) {
                         for (int i = 0; i < (int)s.convertProviders.size(); ++i) {
                             const ConvertProviderRow& row = s.convertProviders[i];
                             ImGui::PushID(i);
@@ -802,7 +879,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                         }
                         ImGui::EndCombo();
                     }
-                    if (ImGui::IsItemHovered())
+                    if (comboFits && ImGui::IsItemHovered())
                         ImGui::SetTooltip(
                             "2D->3D provider for this session\n"
                             "(the default is set in DisplayXR's settings)");
@@ -810,7 +887,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             }
             // Input providers: one button, a small popup with a combo per role family and the
             // "Remember for this app" checkbox. Names are the runtime's, verbatim.
-            if (s.caps.input) {
+            if (s.caps.input && fits(buttonW("Input"))) {
                 ImGui::SameLine();
                 if (ImGui::Button("Input")) ImGui::OpenPopup("##input_providers");
                 if (ImGui::IsItemHovered())
@@ -856,7 +933,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             }
             // Auto-convergence (#92): live, or a stereo file. Highlighted while on.
             if (((s.caps.camera && s.isLive) || (s.caps.url && s.isStream) || s.autoConvFile) &&
-                !s.autoConvLabel.empty()) {
+                !s.autoConvLabel.empty() && fits(buttonW(s.autoConvLabel.c_str()))) {
                 ImGui::SameLine();
                 if (s.autoConvOn)
                     ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
@@ -892,22 +969,21 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 }
             }
             // Right-align the slideshow toggle. (Close the app via ESC or the window's
-            // own close button — no in-UI X needed.) When the buttons already reach that
-            // spot it takes a second row, right-aligned, instead of drawing over them.
-            if (s.caps.slideshow) {
-                const float slideX = ImGui::GetWindowWidth() - iconSz - ImGui::GetStyle().WindowPadding.x;
-                const float usedX = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x +
-                                    ImGui::GetStyle().ItemSpacing.x;
-                if (usedX <= slideX) ImGui::SameLine(slideX);
-                else ImGui::SetCursorPosX(slideX);
+            // own close button — no in-UI X needed.) The buttons left of it never reach it:
+            // the ones that do not fit are left out above.
+            // A window too narrow for even Open beside it leaves the icon out (it would draw
+            // over Open's menu arrow).
+            const float slideX = ImGui::GetWindowWidth() - iconSz - ImGui::GetStyle().WindowPadding.x;
+            if (s.caps.slideshow &&
+                ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetStyle().ItemSpacing.x <= slideX) {
+                ImGui::SameLine(slideX);
                 if (IconButton("##slideshow", Glyph::Slideshow, iconSz, s.slideshowActive,
                                s.hitTargetScale))
                     Fire(a.ToggleSlideshow);
             }
         }
         if (!s.stripOnly) {
-            // The bar wraps to a second row on a narrow window: the toast reads its real
-            // bottom edge so it is never drawn under the bar.
+            // The toast reads the bar's real bottom edge so it is never drawn under it.
             g_topBarBottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
             ImGui::End();
         } else {
@@ -993,49 +1069,74 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                     frameSlotW = std::max(slotW(lastFrm), ImGui::CalcTextSize(frm).x);
                 }
                 const float labelGap = ImGui::CalcTextSize("  ").x;
+                // A narrow window: what does not fit beside a usable scrubber is left out,
+                // least needed first (frame number, loop, mute, Panels, the total time, then
+                // the current time), instead of running off the bar's right edge.
+                const ImGuiStyle& tst = ImGui::GetStyle();
+                const float iconW = iconSz * s.hitTargetScale;
+                const float panelsBtnW = ImGui::CalcTextSize("Panels").x + tst.FramePadding.x * 2.0f;
+                const float minScrubW = iconSz;  // the scrubber, at its smallest
+                bool showFrameNo = showFrame, showTot = true, showMute = s.caps.mute, showLoop = s.caps.loop,
+                     showPanels = s.panelsButton, showTime = true;
+                auto rowNeed = [&] {
+                    float w = (showTime ? timeSlotW + tst.ItemSpacing.x : 0.0f) +
+                              (showFrameNo ? labelGap + frameSlotW : 0.0f) + minScrubW;
+                    if (showTot) w += tst.ItemSpacing.x + ImGui::CalcTextSize(tot).x;
+                    if (showMute) w += tst.ItemSpacing.x + iconW;
+                    if (showLoop) w += tst.ItemSpacing.x + iconW;
+                    if (showPanels) w += tst.ItemSpacing.x + panelsBtnW;
+                    return w;
+                };
+                const float rowRoom = ImGui::GetContentRegionAvail().x;
+                for (bool* drop : {&showFrameNo, &showLoop, &showMute, &showPanels, &showTot, &showTime})
+                    if (rowNeed() > rowRoom) *drop = false;
                 const float curX = ImGui::GetCursorPosX();
-                ImGui::SetCursorPosX(curX + timeSlotW - ImGui::CalcTextSize(cur).x);
-                ImGui::AlignTextToFramePadding();
-                ImGui::Text("%s", cur);
-                float labelW = timeSlotW;
-                if (showFrame) {
+                float labelW = 0.0f;
+                if (showTime) {
+                    ImGui::SetCursorPosX(curX + timeSlotW - ImGui::CalcTextSize(cur).x);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("%s", cur);
+                    labelW = timeSlotW;
+                }
+                if (showTime && showFrameNo) {
                     ImGui::SameLine(curX + timeSlotW + labelGap);
                     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
                     ImGui::AlignTextToFramePadding();
                     ImGui::Text("%s", frm);
                     labelW += labelGap + frameSlotW;
                 }
-                ImGui::SameLine(curX + labelW + ImGui::GetStyle().ItemSpacing.x);
-                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
+                if (showTime) {
+                    ImGui::SameLine(curX + labelW + ImGui::GetStyle().ItemSpacing.x);
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
+                }
                 // Leave room on the right for the total-time label + mute + loop icons.
                 // Derived from the live style rather than a magic constant, so the
                 // touch build spaces correctly instead of crowding the total time.
                 const ImGuiStyle& st = ImGui::GetStyle();
-                const int rightIcons = (s.caps.mute ? 1 : 0) + (s.caps.loop ? 1 : 0);
-                const float panelsW = s.panelsButton ? ImGui::CalcTextSize("Panels").x +
-                                                           st.FramePadding.x * 2.0f + st.ItemSpacing.x
-                                                     : 0.0f;
-                const float rightW = ImGui::CalcTextSize(tot).x +
-                                     (float)rightIcons * (iconSz * s.hitTargetScale) +
-                                     (float)(rightIcons + 2) * st.ItemSpacing.x +
+                const int rightIcons = (showMute ? 1 : 0) + (showLoop ? 1 : 0);
+                const float panelsW = showPanels ? panelsBtnW + st.ItemSpacing.x : 0.0f;
+                const float rightW = (showTot ? ImGui::CalcTextSize(tot).x + st.ItemSpacing.x : 0.0f) +
+                                     (float)rightIcons * iconW + (float)(rightIcons + 1) * st.ItemSpacing.x +
                                      st.WindowPadding.x + panelsW;
-                DriveScrub(s, a, dur, ImGui::GetContentRegionAvail().x - rightW);
-                ImGui::SameLine();
-                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
-                ImGui::AlignTextToFramePadding();
-                ImGui::Text("%s", tot);
-                if (s.caps.mute) {
+                DriveScrub(s, a, dur, std::max(minScrubW, ImGui::GetContentRegionAvail().x - rightW));
+                if (showTot) {
+                    ImGui::SameLine();
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + rowPad);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("%s", tot);
+                }
+                if (showMute) {
                     ImGui::SameLine();
                     if (IconButton("##mute", s.muted ? Glyph::SpeakerMuted : Glyph::Speaker, iconSz,
                                    s.muted, s.hitTargetScale))
                         Fire(a.ToggleMute);
                 }
-                if (s.caps.loop) {
+                if (showLoop) {
                     ImGui::SameLine();
                     if (IconButton("##loop", Glyph::Loop, iconSz, s.loop, s.hitTargetScale))
                         Fire(a.ToggleLoop);
                 }
-                if (s.panelsButton) {
+                if (showPanels) {
                     ImGui::SameLine();
                     if (s.panelsOn)
                         ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
@@ -1050,9 +1151,14 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
         // The 2D/3D switch: alone at the right edge, level with the transport's row.
         if (s.caps.modeSwitch) {
             ImGui::SetNextWindowPos(ImVec2(W, rowY), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
-            if (ImGui::Begin("##modeswitch", nullptr, pill | ImGuiWindowFlags_NoBackground) &&
-                ModeSwitch("##mode3d", s.mode3D, iconSz, s.hitTargetScale))
-                Fire(a.NextMode);
+            if (ImGui::Begin("##modeswitch", nullptr, pill | ImGuiWindowFlags_NoBackground)) {
+                ImGui::BeginDisabled(!s.modeSwitchEnabled);
+                if (ModeSwitch("##mode3d", s.mode3D, iconSz, s.hitTargetScale, s.modeSwitchBusy))
+                    Fire(a.Toggle3D ? a.Toggle3D : a.NextMode);
+                ImGui::EndDisabled();
+                if (!s.modeSwitchTooltip.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("%s", s.modeSwitchTooltip.c_str());
+            }
             ImGui::End();
         }
         ImGui::PopStyleVar();

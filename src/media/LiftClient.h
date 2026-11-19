@@ -145,6 +145,11 @@ public:
     bool Start(bool video);
     void Stop();
     bool On() const { return want_; }
+    // Look-around: the views follow the tracked viewer (TRACKED viewpoints, no easing back
+    // to the centre). A still is then converted again and again, so it re-renders as the
+    // viewer moves; a video does that anyway, frame by frame.
+    bool LookAround() const { return lookAround_; }
+    void SetLookAround(bool on) { lookAround_ = on; }
     // Discontinuity (seek, source switch, size change): recreate the stream so no
     // result from before the jump can land after it. No-op when off.
     void Reset();
@@ -209,6 +214,7 @@ private:
     uint32_t lastW_ = 0, lastH_ = 0;
     std::vector<uint8_t> swizzle_;  // BGRA -> RGBA when the export is BGRA
     uint64_t submitted_ = 0, converted_ = 0;
+    bool lookAround_ = true;
     bool acquireErrLogged_ = false;
     std::vector<Candidate> candidates_;
     std::string preferred_;

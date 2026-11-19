@@ -207,6 +207,68 @@ void DrawGlyph(ImDrawList* dl, Glyph glyph, ImVec2 c, float size, ImU32 u, bool 
             dl->AddPolyline(outline, 6, u, ImDrawFlags_Closed, T(1.0f));
             break;
         }
+        case Glyph::Recent: {
+            dl->AddCircle(P(0.0f, 0.0f), size * 0.32f, u, 0, T(1.0f));
+            const ImVec2 hands[] = {P(0.0f, -0.19f), P(0.0f, 0.0f), P(0.13f, 0.09f)};
+            dl->AddPolyline(hands, 3, u, 0, T(1.0f));
+            break;
+        }
+        case Glyph::Cloud: {
+            // Three bumps on a flat base.
+            const float r1 = size * 0.13f, r2 = size * 0.18f, r3 = size * 0.12f;
+            if (filled) {
+                dl->AddCircleFilled(P(-0.18f, 0.04f), r1, u);
+                dl->AddCircleFilled(P(0.0f, -0.04f), r2, u);
+                dl->AddCircleFilled(P(0.19f, 0.05f), r3, u);
+                dl->AddRectFilled(P(-0.18f, 0.04f), P(0.19f, 0.17f), u);
+                break;
+            }
+            dl->PathArcTo(P(-0.18f, 0.04f), r1, 3.14159f * 0.5f, 3.14159f * 1.5f);
+            dl->PathArcTo(P(0.0f, -0.04f), r2, 3.14159f * 1.15f, 3.14159f * 1.95f);
+            dl->PathArcTo(P(0.19f, 0.05f), r3, 3.14159f * 1.5f, 3.14159f * 2.5f);
+            dl->PathStroke(u, ImDrawFlags_Closed, T(1.0f));
+            break;
+        }
+        case Glyph::Pin: {
+            // A pushpin: head, body widening to a bar, and the needle.
+            const ImVec2 body[] = {P(-0.10f, -0.32f), P(0.10f, -0.32f), P(0.10f, -0.08f), P(0.22f, 0.06f),
+                                   P(-0.22f, 0.06f), P(-0.10f, -0.08f)};
+            if (filled)
+                dl->AddConvexPolyFilled(body, 6, u);
+            else
+                dl->AddPolyline(body, 6, u, ImDrawFlags_Closed, T(1.0f));
+            dl->AddLine(P(0.0f, 0.06f), P(0.0f, 0.34f), u, T(1.0f));
+            break;
+        }
+        case Glyph::Forward: {
+            dl->AddLine(P(-0.28f, 0.0f), P(0.26f, 0.0f), u, T(1.0f));
+            const ImVec2 head[] = {P(0.04f, -0.22f), P(0.26f, 0.0f), P(0.04f, 0.22f)};
+            dl->AddPolyline(head, 3, u, 0, T(1.0f));
+            break;
+        }
+        case Glyph::Up: {
+            dl->AddLine(P(0.0f, 0.28f), P(0.0f, -0.26f), u, T(1.0f));
+            const ImVec2 head[] = {P(-0.22f, -0.04f), P(0.0f, -0.26f), P(0.22f, -0.04f)};
+            dl->AddPolyline(head, 3, u, 0, T(1.0f));
+            break;
+        }
+        case Glyph::Search:
+            dl->AddCircle(P(-0.05f, -0.05f), size * 0.21f, u, 0, T(1.0f));
+            dl->AddLine(P(0.11f, 0.11f), P(0.29f, 0.29f), u, T(1.0f));
+            break;
+        case Glyph::Grid:
+            for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x)
+                    dl->AddRectFilled(P(x * 0.22f - 0.08f, y * 0.22f - 0.08f), P(x * 0.22f + 0.08f, y * 0.22f + 0.08f),
+                                      u, size * 0.02f);
+            }
+            break;
+        case Glyph::List:
+            for (int i = -1; i <= 1; ++i) {
+                dl->AddRectFilled(P(-0.30f, i * 0.22f - 0.06f), P(-0.18f, i * 0.22f + 0.06f), u, size * 0.02f);
+                dl->AddLine(P(-0.08f, i * 0.22f), P(0.30f, i * 0.22f), u, T(1.0f));
+            }
+            break;
     }
 }
 

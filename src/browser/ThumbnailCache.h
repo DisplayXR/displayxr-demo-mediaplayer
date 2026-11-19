@@ -5,6 +5,7 @@
 // this frame: that would change a tile on screen. Pure logic, render thread.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>

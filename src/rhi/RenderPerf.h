@@ -251,6 +251,18 @@ public:
         double covered = loopWait_;
         for (int i = 0; i < other; ++i) covered += loopStage_[i];
         loopStage_[other] = loopMs > covered ? loopMs - covered : 0.0;
+        // A stalled iteration (a quarter second or more): its stages, for the caller to log.
+        lastSlow_.clear();
+        if (loopMs >= 250.0) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "loop %.0f ms: xr_wait %.0f", loopMs, loopWait_);
+            lastSlow_ = buf;
+            for (int i = 0; i < kRenderStages; ++i) {
+                if (loopStage_[i] < 1.0) continue;
+                std::snprintf(buf, sizeof(buf), ", %s %.0f", RenderStageName((RenderStage)i), loopStage_[i]);
+                lastSlow_ += buf;
+            }
+        }
         for (int i = 0; i < kRenderStages; ++i) {
             stageSum_[i] += loopStage_[i];
             if (loopStage_[i] > stageMax_[i]) stageMax_[i] = loopStage_[i];
@@ -261,6 +273,8 @@ public:
     }
 
     const RenderPerfWindow& Last() const { return last_; }
+    // The last iteration's stages if it stalled (EndLoop), else empty.
+    const std::string& LastSlowLoop() const { return lastSlow_; }
 
 private:
     void Close(double nowSec) {
@@ -327,6 +341,7 @@ private:
     PerfAcc asyncWait_;            // this window's recorded staged frames: the commit's wait
     double loopStage_[kRenderStages] = {};  // the open loop iteration's stages
     double loopWait_ = 0.0;                 // ... and its xrWaitFrame
+    std::string lastSlow_;
     double stageSum_[kRenderStages] = {}, stageMax_[kRenderStages] = {};
     uint32_t loops_ = 0;                    // iterations ended in this window
     RenderPerfWindow last_;

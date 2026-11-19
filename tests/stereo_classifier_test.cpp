@@ -101,6 +101,18 @@ void TestEvidence(const std::string& cachePath) {
     const StereoVerdict byName = c.Get(Item(1, "clip_half_2x1.mp4"));
     CHECK(byName.known && byName.stereo && byName.layout == StereoLayout::SbsHalf, "file name decides at once");
     CHECK(!c.Get(Item(2, "photo.jpg")).known, "a plain name is not known before its thumbnail");
+    {
+        MediaItem icon = Item(20, "icon_sbs.png");
+        icon.width = 1024;
+        icon.height = 512;
+        const StereoVerdict v = c.Get(icon);
+        CHECK(v.known && v.stereo && v.layout == StereoLayout::SbsFull, "_sbs: 3D, full at 2:1 (square eyes)");
+        const StereoVerdict h = c.Get(Item(21, "Movie.2019.HSBS.1080p.mkv"));
+        CHECK(h.known && h.stereo && h.layout == StereoLayout::SbsHalf, "HSBS: half");
+        const StereoVerdict f = c.Get(Item(22, "clip-full-sbs.mp4"));
+        CHECK(f.known && f.stereo && f.layout == StereoLayout::SbsFull, "full-sbs: full");
+        CHECK(!c.Get(Item(23, "sbsbank_statement.jpg")).known, "sbs inside a word is not a tag");
+    }
 
     CHECK(c.NeedsFileCheck(Item(2, "photo.JPG")), "file check: an unknown JPEG may be a LIF");
     CHECK(c.NeedsFileCheck(Item(2, "photo.lif")), "file check: a .lif");

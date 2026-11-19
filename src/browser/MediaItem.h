@@ -22,6 +22,13 @@ struct MediaItem {
     int64_t durationMs = 0;  // videos only
     std::string folder;      // its path in shared storage, e.g. "DCIM/Camera/"
     uint32_t width = 0, height = 0;  // px, upright (rotation applied); 0 x 0 if unknown
+    // Desktop (#252). The provider-declared sources it belongs to: bit i = Source::bit i
+    // (MediaLibrary::SetSources). Unused with the built-in (Android) sources.
+    uint64_t sources = 0;
+    // Its place in a source sorted by the provider (Recents: 0 = opened last).
+    int order = 0;
+    // A cloud placeholder: reading its bytes would download it, so the browser never does.
+    bool cloudOnly = false;
 };
 
 } // namespace mp::browser

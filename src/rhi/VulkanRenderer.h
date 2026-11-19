@@ -143,6 +143,7 @@ public:
     // add up), then the iteration's end with its wall time, loop top to loop top.
     void NoteStage(RenderStage s, double ms) { perf_.Stage(s, ms); }
     void EndStageLoop(double loopMs) { perf_.EndLoop(loopMs); }
+    const std::string& LastSlowLoop() const { return perf_.LastSlowLoop(); }
 
     // Record a copy of an RGBA8 buffer into an external (e.g. HUD swapchain) VkImage into
     // the frame command buffer, leaving it in COLOR_ATTACHMENT_OPTIMAL (the layout the

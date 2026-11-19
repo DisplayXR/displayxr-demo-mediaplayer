@@ -1,8 +1,8 @@
 # Media browser
 
 The in-app gallery (#160): pick a photo or video from the device's library without
-leaving the 3D session, with 3D badges, durations and filters. Android comes first. The
-browser code is platform-neutral, so a desktop browser can follow by adding a provider.
+leaving the 3D session, with 3D badges, durations and filters. Android came first; the
+Windows consumer player has it too (#252, see [Desktop (Windows)](#desktop-windows)).
 
 This is the developer reference.
 
@@ -213,12 +213,129 @@ eye in the left-eye views, its right eye in the others. Android only.
   with the panel in 3D. The player's frames (and the swipe's pages) always take the atlas
   pass as before.
 
+## Desktop (Windows)
+
+Phase 1 of #252: the 2D browser in the consumer player on Windows. Pro keeps its station
+panels, and macOS / Linux keep the system dialog until they get a provider.
+
+**When it shows.** Open and Ctrl+O show it when there is no workspace picker (inside a
+workspace the shell's picker keeps Open). "Other files..." opens the system dialog. It
+covers the HUD and pauses a playing video; the close button, or Esc at the top of a source,
+goes back to the player. The basic player also starts in it when launched with no file (as
+Open would: the shell's picker inside a workspace), on the place last shown
+(`browser_view.txt` keeps `source=` / `folder=` beside the view); a file on the command line
+opens directly. `MEDIAPLAYER_NO_BROWSER_AT_START=1` keeps the idle screen at launch.
+
+**Sources** (`WindowsMediaProvider`, declared through `MediaLibrary::SetSources`):
+
+| Source | From | Browsed |
+|---|---|---|
+| Recents | the Recent list (files only) | flat, in the order opened |
+| Pictures, Videos | the Windows libraries (OneDrive Pictures and added folders included), walked | folder tree; several roots are listed first |
+| Downloads | the known folder, walked | folder tree |
+| Media folders | the Windows Search index: pictures with a long side of at least 1024 px, videos of at least 1 MB, nothing under AppData, Program Files, Windows or a hidden folder | one tile per folder, a Newest tile (50) first |
+| Pinned | folders added with "Add folder...", walked | its folders first, then a tree; the sidebar lists each pinned folder as a row of its own |
+
+A walk reads directory entries only, at most 6 folders deep and 3 s per tree. One index
+query takes about 0.15 s for ~1,400 items on the 8K dev box; the whole list about 0.2-0.3 s.
+If the index cannot be queried, Media folders is empty and a strip over the grid says so.
+
+**Cloud files** (OneDrive / SharePoint placeholders) are never read while browsing:
+- thumbnails come from the shell's thumbnail cache only; a file Windows has none for shows
+  the image icon until it has been opened once;
+- a cloud tile shows a cloud bottom left, and its tooltip says opening it downloads it;
+- the file check for 3D (LIF, MPO) is skipped, so a cloud file the name does not settle
+  shows "3D?" (`StereoVerdict::unchecked`) and is 2D for the filters.
+Local stills get the file check (`LifLoader::IsLif`, `MpoLoader::IsMpo`); two-track videos
+are not probed on desktop yet.
+
+**Pinned in the sidebar.** Under PINNED, each pinned folder is a row (a pin, its name, how
+many files it holds), lit while it or a folder inside it is shown; a click shows it, the
+tooltip gives its full path. The path reads "Pinned > <folder>", and Pinned's top still lists
+them all. Right click a row: Open, Remove from Pinned. A folder shown that is unpinned goes
+back to Pinned's top (or the first source, with no pins left).
+
+**Folder previews.** A folder card in the grid shows what it holds instead of a folder
+outline: a 2 x 2 mosaic of thumbnails of its files (`MediaLibrary::FolderPreviews`: files in
+it and its sub-folders, or in it only for a Media folders group; local files before cloud-only
+ones, then newest), with a folder-and-count badge. The previews share the 64 thumbnail slots
+with the files: the visible folder cards get four each while the slots the files leave
+allow, else one each (a single picture), else none. A cell whose thumbnail is not here yet
+stays the surface colour, and a card with none here shows the folder outline. Cloud-only
+files are asked for the same way as their own tiles (the shell's cache only, never a
+download). Not in the details view, nor in the 3D grid (two slots per file).
+
+**Folder menu** (right click a folder tile): Pin this folder; Remove from Pinned (top of
+Pinned); Hide from Media folders (top of Media folders, for junk the size filter keeps).
+Pinned and hidden folders are kept beside the Recent list (`pinned.txt`,
+`hidden_folders.txt` in `%APPDATA%\DisplayXR\MediaPlayer\`).
+
+**File menu** (right click a file): Open; Show in File Explorer; Copy path (also
+Ctrl+Shift+C on the file with the focus ring, else the one under the pointer). On a file in
+a selection of several, Copy path becomes "Copy N paths": every selected file's path, one a
+line, in grid order (Ctrl+Shift+C does the same whenever there is a selection). Right click
+outside the selection clears it, so the menu is that file's alone. No delete on desktop.
+
+**Selection** (desktop): Ctrl+click adds or removes a file, Shift+click selects the run from
+the last Ctrl+clicked (or clicked) file, Ctrl+Shift+click adds that run; Ctrl+A selects every
+file shown. Folders are not selected. A plain click still opens (and drops the selection);
+Esc clears it; going to another place clears it. A selected card or row has an accent fill
+and a 2 px accent border (the focus ring stays a light ring outside it); the status bar
+counts it. The rules are `ClickSelect` (BrowserLayout, tested).
+
+**Views.** The toolbar's grid / details switch, at its right. The grid's cards are 120-320 px
+wide (the size slider beside the switch, or Ctrl+wheel over the grid; 176 at start). The
+details view is a row per file, 48 px with a 40 px picture: name (a cloud after it), depth
+(3D, 3D?, 2D), type, dimensions, length, date, size. A narrow window drops type, dimensions,
+size, then date. The Date heading turns the sort round. Both views draw the pictures in 3D
+under the 3D filter. The view, the card size and the sort are kept between launches in
+`browser_view.txt` beside `pinned.txt` (`view=grid|details`, `card=<px>`,
+`sort=newest|oldest`; an unknown line or a bad value keeps the default), written when one
+changes and the size slider is let go.
+
+**Status bar** (24 px along the window's foot, under the sidebar too; none in a window under
+420 px tall): what the grid holds ("3 folders · 15 items", "12 in 3D" under the 3D filter),
+how many are selected, the focused file (the focus ring's, else the one under the pointer:
+name · width×height · length · 3D (SBS / TB / the format, e.g. LIF) or 2D or 3D? · Online
+only · size on disk; a folder: its name and count), and a hint at the right (from 760 px of
+width). Parts are cut from the right as the window narrows.
+
+**Search** (Ctrl+F, or the box in the header; none below 640 px of window width): shows the
+folders and files of the place shown whose names hold the text, any case. Esc or the cross
+clears it; going to another place clears it too.
+
+**Input.** Mouse: click, wheel scrolling, a hover outline and a name tooltip; the side
+buttons go back and forward. Keyboard: arrows, Page Up / Down, Home / End move a focus ring,
+Enter opens, Alt+Left / Alt+Right go back / forward through the places shown (any route
+there: the sidebar, the path, a folder), Backspace or Alt+Up go up a folder, Esc backs out
+then closes, Ctrl+O the Windows file dialog. Player hotkeys are off while it shows. A file
+opened from the grid makes Up / Down in the player walk the grid as shown (no wrap).
+
+**Sizing.** A dp is one design unit on desktop (1.5 on Android), so the browser matches the
+rest of the desktop UI; the sources stay a rail from 600 dp of window width.
+
+**Testing.** `MEDIAPLAYER_SHOW_BROWSER=1` shows it at launch (`3d`: under the 3D filter);
+with `MEDIAPLAYER_DUMP_HUD` the HUD dump shows it. `MEDIAPLAYER_BROWSER_SOURCE=<name>` starts
+on a source (or, with no source of that name, on the pinned folder of that name), `MEDIAPLAYER_BROWSER_VIEW=details` in the details view,
+`MEDIAPLAYER_BROWSER_QUERY=<text>` with a search, `MEDIAPLAYER_BROWSER_FOCUS=<n>` with the focus
+ring on tile n (0 = the first; folders count), `MEDIAPLAYER_BROWSER_SELECT=0,2,3` with those
+files selected (counted among the files). A test run (`MEDIAPLAYER_SHOW_BROWSER`) never
+reads or writes the user's `browser_view.txt`; `MEDIAPLAYER_BROWSER_PREFS=<file>` names a view
+file for it to use instead. `win_shell_media_probe` (built on Windows, not a ctest test) prints
+the index query and thumbnail timings on a real box; `--thumb <path> <cacheOnly>` checks one
+file and whether it stayed a cloud placeholder.
+
+Phase 2 (the 3D-only grid with per-eye thumbnails) is planned in #252.
+
 ## Android behaviour
 
 - Launch opens the browser, over the idle splash. Without a HUD there is no browser and a
   tap on the splash opens the system picker.
 - The browser borrows the flat 2D mode (the 3D mode under "3D only", see 3D grid) and hands
   the player's mode back on play.
+- The player's mode follows the file: 3D for a 3D file, flat for a 2D one. The 2D/3D switch
+  shows for 3D files only (no 2D->3D conversion on Android yet); a flip to 2D is kept while
+  swiping through the list and dropped by a pick from the grid or the picker.
 - Back from the player stops playback and returns to the browser at the same source and
   scroll position and folder. Back in the browser closes the drawer or a sheet, then leaves
   select mode, then goes up a folder, then goes to the home screen.
