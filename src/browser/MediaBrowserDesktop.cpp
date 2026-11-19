@@ -207,6 +207,15 @@ void MediaBrowser::DeskHeader(float width, float height) {
     const float searchW = width >= Px(900.0f) ? Round(Px(240.0f)) : width >= Px(640.0f) ? Round(Px(160.0f)) : 0.0f;
     float crumbEnd = closeX - gap;
     if (searchW > 0.0f) crumbEnd = closeX - Round(Px(12.0f)) - searchW - Round(Px(12.0f));
+    // Play the place shown as a slideshow (#252): its files and its sub-folders'. Not under
+    // Unsupported, where nothing plays.
+    if (slideshows_ && source.kind != SourceKind::Unsupported) {
+        const float playX = crumbEnd - btn;
+        if (IconBtn("##play_here", Glyph::Slideshow, ImVec2(playX, y), btn, CanPlayHere(),
+                    "Play slideshow of this place (Ctrl+Enter)"))
+            AskSlideshow(folder_, true);
+        crumbEnd = playX - gap;
+    }
 
     // The path: the source, then each folder down to this one. A part's folder is found by
     // walking Parent() up from here, so it is right for every source mode.
@@ -1159,6 +1168,10 @@ void MediaBrowser::DeskItemRow(ImDrawList* dl, const MediaItem& item, bool suppo
 
 // A file's menu (right click): open it, show it in File Explorer, copy its path.
 void MediaBrowser::DeskItemMenu() {
+    if (menuAtSet_ && ImGui::IsPopupOpen("##item_menu")) {
+        ImGui::SetNextWindowPos(menuAt_, ImGuiCond_Appearing);
+        menuAtSet_ = false;
+    }
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(4.0f), Px(4.0f)));
     ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, Px(6.0f));
     const bool open = ImGui::BeginPopup("##item_menu");
@@ -1184,6 +1197,8 @@ void MediaBrowser::DeskItemMenu() {
             itemRequestPending_ = true;
         };
         if (row("Open", "Enter")) menuOpen_ = true;
+        // The grid as shown, from this file (#252).
+        if (slideshows_ && row("Play slideshow from here", "Shift+Enter")) AskSlideshowFrom(menuItem_);
         if (row("Show in File Explorer", nullptr)) ask(ItemRequest::Verb::Reveal);
         // On a selection of several: copy all their paths, one a line.
         if (selected_.size() > 1 && selected_.count(menuItem_)) {
