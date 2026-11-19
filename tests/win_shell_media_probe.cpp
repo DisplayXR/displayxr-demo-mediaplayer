@@ -74,7 +74,8 @@ int main(int argc, char** argv) {
     std::vector<FoundFile> found;
     std::string error;
     double t0 = NowMs();
-    const bool ok = QueryIndex(IndexQuery{}, found, error);
+    IndexSkipped skipped;
+    const bool ok = QueryIndex(IndexQuery{}, found, error, &skipped);
     const double ms = NowMs() - t0;
     if (!ok) {
         std::printf("index: FAILED: %s\n", error.c_str());
@@ -89,6 +90,8 @@ int main(int argc, char** argv) {
     }
     std::printf("index: %zu items (%d videos, %d cloud-only) in %zu folders, %.0f ms\n", found.size(), videos, cloud,
                 folders.size(), ms);
+    std::printf("index left out: %d in code checkouts, %d in game libraries, %d in asset folders, %d pictures beside a "
+                "program\n", skipped.code, skipped.library, skipped.assetFolder, skipped.appFolder);
     int shown = 0;
     for (auto it = folders.begin(); it != folders.end() && shown < 12; ++it, ++shown)
         std::printf("  %4d  %s\n", it->second, it->first.c_str());

@@ -247,7 +247,12 @@ void WindowsMediaProvider::ListWorker() {
         for (const std::string& f : pinned) walk(f, kPinned);
         std::vector<win::FoundFile> indexed;
         std::string error;
-        const bool indexOk = win::QueryIndex(win::IndexQuery{}, indexed, error);
+        win::IndexSkipped skipped;
+        const bool indexOk = win::QueryIndex(win::IndexQuery{}, indexed, error, &skipped);
+        if (indexOk)
+            LOG_INFO("browser: index left out software files - %d in code checkouts, %d in game libraries, "
+                     "%d in asset folders, %d pictures beside a program",
+                     skipped.code, skipped.library, skipped.assetFolder, skipped.appFolder);
         auto isHidden = [&](const std::string& folder) {
             std::string k = Slashes(folder, true);
             for (char& c : k) c = (char)std::tolower((unsigned char)c);

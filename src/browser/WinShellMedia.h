@@ -55,15 +55,27 @@ std::string DownloadsFolder();
 
 // The Search index's pictures and videos, junk-filtered (#252 decisions): pictures with a
 // long side >= minPictureEdge, videos of at least minVideoBytes; nothing under AppData,
-// Program Files, Windows or a hidden folder. False (with `error`) when the index cannot
-// be queried, e.g. the WSearch service is stopped.
+// Program Files, Windows or a hidden folder. Nor what software keeps beside itself
+// (#252): anything inside a git checkout or a game library (Epic, Steam, ...), under an
+// asset-named folder (textures, icons, Models, *_Data, ...), and pictures in a folder
+// that holds a program (.exe / .dll). Media folders lists the user's own media; Open
+// file / Open folder, drop and pinned folders still reach everything. False (with
+// `error`) when the index cannot be queried, e.g. the WSearch service is stopped.
 struct IndexQuery {
     uint32_t minPictureEdge = 1024;
     int64_t minVideoBytes = 1 << 20;
     // Only under this folder (e.g. a library folder); empty = every indexed location.
     std::string scope;
 };
-bool QueryIndex(const IndexQuery& query, std::vector<FoundFile>& out, std::string& error);
+// How many files each software rule left out (for the log).
+struct IndexSkipped {
+    int code = 0;         // inside a git checkout
+    int library = 0;      // under a game library
+    int assetFolder = 0;  // under an asset-named folder
+    int appFolder = 0;    // a picture beside a program
+};
+bool QueryIndex(const IndexQuery& query, std::vector<FoundFile>& out, std::string& error,
+                IndexSkipped* skipped = nullptr);
 
 // Walk `folder` for files `accept` takes, at most `maxDepth` folders down (0 = only its
 // own files), until `deadlineMs` (steady clock ms; 0 = none). Reads directory entries
