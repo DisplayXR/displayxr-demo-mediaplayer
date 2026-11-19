@@ -613,7 +613,13 @@ MediaBrowser::Action MediaBrowser::Build() {
     }
     if (closeRequested_ && action == Action::None) action = Action::Closed;
     closeRequested_ = false;
-    if (action == Action::Opened) classifier_.Save();  // the app may be stopped while playing
+    // A slideshow asked for this frame (#252), unless something else won it.
+    if (playlistPending_) {
+        if (action == Action::None) action = Action::Slideshow;
+        else if (action != Action::Slideshow) playlistPending_ = false;
+    }
+    // The app may be stopped while playing.
+    if (action == Action::Opened || action == Action::Slideshow) classifier_.Save();
     if (action != Action::None && !wanted_.empty()) {
         // The grid is going away: stop the thumbnail work, so it does not compete with
         // opening the file and decoding its neighbours. The grid asks again when it shows.
@@ -1207,8 +1213,41 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
                 else if (ty + tileH > offset + size.y) gridScroll_.SetOffset(ty + tileH - size.y);
             }
         }
+        if (move != 0) focusId_ = -1;  // the user moves the ring: no FocusItem() to come
         keyOpen = cursor_ < n && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
                                   ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
+        // Shift+Enter: a folder's slideshow, or the grid's from this file (#252).
+        if (keyOpen && slideshows_ && ImGui::GetIO().KeyShift) {
+            keyOpen = false;
+            if (cursor_ < nf) AskSlideshow(folders_[cursor_].path, false);
+            else AskSlideshowFrom(items[shown_[cursor_ - nf]].id);
+        }
+    }
+    // Ctrl+Enter: the place shown as a slideshow, as the header's play button (#252).
+    if (desktop_ && slideshows_ && ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyAlt && !ImGui::GetIO().WantTextInput &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
+        (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) &&
+        CanPlayHere())
+        AskSlideshow(folder_, true);
+    // Back from a slideshow (FocusItem): the ring on the file it ended on, in view.
+    if (focusId_ >= 0 && !dirty_) {
+        for (size_t p = 0; p < shown_.size(); ++p) {
+            if (items[shown_[p]].id != focusId_) continue;
+            cursor_ = nf + p;
+            focusId_ = -1;
+            float tx = 0.0f, ty = 0.0f;
+            if (layout_.TilePos(cursor_, tx, ty)) {
+                if (ty < offset) gridScroll_.SetOffset(ty);
+                else if (ty + tileH > offset + size.y) gridScroll_.SetOffset(ty + tileH - size.y);
+            }
+            break;
+        }
+    }
+    // Tests (SetStartSlideshow): play a tile once the grid holds it.
+    if (startSlideshow_ != SIZE_MAX && slideshows_ && startSlideshow_ < n && !dirty_) {
+        if (startSlideshow_ < nf) AskSlideshow(folders_[startSlideshow_].path, false);
+        else AskSlideshowFrom(items[shown_[startSlideshow_ - nf]].id);
+        startSlideshow_ = SIZE_MAX;
     }
     if (desktop_ && cursor_ >= n && startFocus_ < n) cursor_ = startFocus_;
     if (desktop_ && !startSelection_.empty() && !shown_.empty()) {
@@ -1238,6 +1277,13 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     if (desktop_ && ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift && !ImGui::GetIO().WantTextInput &&
         !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
         for (size_t i : shown_) selected_.insert(items[i].id);
+    }
+    // A long press on a folder opens its menu (touch's right click, #252), where the caller
+    // plays slideshows.
+    if (slideshows_ && pressed < nf && !selecting_ && gridScroll_.TakeLongPress(now)) {
+        menuFolder_ = folders_[pressed].path;
+        ImGui::OpenPopup("##folder_menu");
+        provider_->Haptic();
     }
     // A long press on an item starts select mode with it. In select mode it is a tap.
     if (pressed >= nf && pressed < n && !selecting_ && provider_->CanDelete() && gridScroll_.TakeLongPress(now)) {
@@ -1441,7 +1487,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
     size_t clicked = n;
     if (desktop_ && gridHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
         itemAt(ImGui::GetIO().MousePos, clicked)) {
-        if (clicked < nf && folders_[clicked].path != kNewestFolder) {
+        if (clicked < nf && (slideshows_ || folders_[clicked].path != kNewestFolder)) {
             menuFolder_ = folders_[clicked].path;
             ImGui::OpenPopup("##folder_menu");
         } else if (clicked >= nf && clicked < n) {
@@ -1449,6 +1495,27 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
             // Outside the selection, the menu is the file's alone (as File Explorer's).
             if (!selected_.count(menuItem_)) selected_.clear();
             ImGui::OpenPopup("##item_menu");
+        }
+    }
+    // Desktop: Shift+F10 or the Menu key opens the menu of the tile with the focus ring, at it.
+    if (desktop_ && cursor_ < n && !ImGui::GetIO().WantTextInput &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
+        (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+         (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
+        float tx = 0.0f, ty = 0.0f;
+        if (layout_.TilePos(cursor_, tx, ty)) {
+            menuAt_ = ImVec2(x0 + tx + Round(Px(16.0f)), min.y + ty - offset + Round(Px(16.0f)));
+            menuAtSet_ = true;
+        }
+        if (cursor_ < nf && (slideshows_ || folders_[cursor_].path != kNewestFolder)) {
+            menuFolder_ = folders_[cursor_].path;
+            ImGui::OpenPopup("##folder_menu");
+        } else if (cursor_ >= nf) {
+            menuItem_ = items[shown_[cursor_ - nf]].id;
+            if (!selected_.count(menuItem_)) selected_.clear();
+            ImGui::OpenPopup("##item_menu");
+        } else {
+            menuAtSet_ = false;
         }
     }
     FolderMenu();
@@ -1496,24 +1563,93 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
 }
 
 void MediaBrowser::FolderMenu() {
+    if (menuAtSet_ && ImGui::IsPopupOpen("##folder_menu")) {
+        ImGui::SetNextWindowPos(menuAt_, ImGuiCond_Appearing);
+        menuAtSet_ = false;
+    }
     if (!ImGui::BeginPopup("##folder_menu")) return;
     const Source& s = CurrentSource();
     const bool top = folder_ == s.folder;
+    const bool newest = menuFolder_ == kNewestFolder;
     auto ask = [&](FolderRequest::Verb verb) {
         folderRequest_ = FolderRequest{verb, menuFolder_};
         folderRequestPending_ = true;
     };
     {
         FontScope row(TextStyle::Row);
-        if (s.kind == SourceKind::Pinned && top) {
-            if (ImGui::MenuItem("Remove from Pinned")) ask(FolderRequest::Verb::Unpin);
-        } else if (ImGui::MenuItem("Pin this folder")) {
-            ask(FolderRequest::Verb::Pin);
+        if (slideshows_) {
+            // Play it (#252): what the tile counts, it and its sub-folders. Open is the click.
+            if (ImGui::MenuItem("Play slideshow", desktop_ ? "Shift+Enter" : nullptr)) AskSlideshow(menuFolder_, false);
+            if (ImGui::MenuItem("Open", desktop_ ? "Enter" : nullptr)) GoTo(menuFolder_);
         }
-        if (s.mode == SourceMode::Grouped && top && ImGui::MenuItem("Hide from Media folders"))
-            ask(FolderRequest::Verb::Hide);
+        if (desktop_ && !newest) {
+            if (slideshows_) ImGui::Separator();
+            if (s.kind == SourceKind::Pinned && top) {
+                if (ImGui::MenuItem("Remove from Pinned")) ask(FolderRequest::Verb::Unpin);
+            } else if (ImGui::MenuItem("Pin this folder")) {
+                ask(FolderRequest::Verb::Pin);
+            }
+            if (s.mode == SourceMode::Grouped && top && ImGui::MenuItem("Hide from Media folders"))
+                ask(FolderRequest::Verb::Hide);
+        }
     }
     ImGui::EndPopup();
+}
+
+bool MediaBrowser::CanPlayHere() const {
+    const Source& s = CurrentSource();
+    if (!listed_ || s.kind == SourceKind::Unsupported) return false;
+    for (const Folder& f : folders_)
+        if (f.count > 0) return true;
+    return !shown_.empty();
+}
+
+void MediaBrowser::AskSlideshow(const std::string& folder, bool here) {
+    const std::vector<MediaItem>& items = library_.Items();
+    playlist_.clear();
+    playlistStart_ = 0;
+    playlistSkipped_ = 0;
+    for (size_t i : library_.QueryTree(CurrentSource(), options_, folder)) {
+        const MediaItem& item = items[i];
+        if (here && !query_.empty() && !ContainsNoCase(item.name, query_)) continue;
+        if (depth_ != DepthFilter::Both) {
+            // As the grid: the 3D / 2D filter keeps the files whose verdict is known and fits.
+            const StereoVerdict v = classifier_.Get(item);
+            if (!v.known || v.stereo != (depth_ == DepthFilter::Only3D)) continue;
+        }
+        if (item.cloudOnly) {
+            ++playlistSkipped_;  // a slideshow never downloads
+            continue;
+        }
+        playlist_.push_back(item.id);
+    }
+    playlistPending_ = true;  // empty too: the caller says there is nothing to play
+    LOG_INFO("browser: slideshow of '%s'%s: %zu file(s), %d cloud-only left out", folder.c_str(),
+             here ? " (the place shown)" : "", playlist_.size(), playlistSkipped_);
+}
+
+void MediaBrowser::AskSlideshowFrom(int64_t id) {
+    const std::vector<MediaItem>& items = library_.Items();
+    playlist_.clear();
+    playlistStart_ = 0;
+    playlistSkipped_ = 0;
+    bool reached = false;
+    for (size_t i : shown_) {
+        const MediaItem& item = items[i];
+        if (item.id == id) {
+            reached = true;
+            playlistStart_ = playlist_.size();  // the file, or (cloud-only) the next local one
+        }
+        if (item.cloudOnly) {
+            ++playlistSkipped_;
+            continue;
+        }
+        playlist_.push_back(item.id);
+    }
+    if (!reached || playlistStart_ >= playlist_.size()) playlistStart_ = 0;
+    playlistPending_ = true;
+    LOG_INFO("browser: slideshow of the grid from item %lld: %zu file(s), start %zu, %d cloud-only left out",
+             (long long)id, playlist_.size(), playlistStart_, playlistSkipped_);
 }
 
 std::vector<int64_t> MediaBrowser::SelectedInOrder() const {
@@ -1525,6 +1661,7 @@ std::vector<int64_t> MediaBrowser::SelectedInOrder() const {
 }
 
 void MediaBrowser::GoTo(const std::string& folder) {
+    focusId_ = -1;
     folder_ = folder;
     dirty_ = true;
     gridScroll_.SetOffset(0.0f);

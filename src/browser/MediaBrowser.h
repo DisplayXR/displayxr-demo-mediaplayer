@@ -44,7 +44,31 @@ public:
         OtherFiles,  // "Other files...": the caller opens the system picker
         Closed,      // desktop: the close button; the caller goes back to the player
         AddFolder,   // desktop: "Add folder...": the caller asks for a folder to pin
+        Slideshow,   // play a folder, the place shown or the grid from a file: TakePlaylist()
     };
+
+    // The playlist an Action::Slideshow asks to play (#252): media ids in play order, where
+    // to start, and how many cloud-only files were left out (a slideshow never downloads).
+    // False when none is waiting.
+    bool TakePlaylist(std::vector<int64_t>& ids, size_t& start, int& skippedCloud) {
+        if (!playlistPending_) return false;
+        playlistPending_ = false;
+        ids = std::move(playlist_);
+        playlist_.clear();
+        start = playlistStart_;
+        skippedCloud = playlistSkipped_;
+        return true;
+    }
+    // The caller plays Action::Slideshow (desktop, #252): the folder menu's "Play slideshow",
+    // the file menu's "Play slideshow from here", the header's play button, Shift+Enter /
+    // Ctrl+Enter, and a long press on a folder. Off: none of them shows.
+    void SetSlideshows(bool on) { slideshows_ = on; }
+    // Tests (MEDIAPLAYER_BROWSER_SLIDESHOW): once the grid is listed, play tile `index` (0 =
+    // the first; folders count): a folder's slideshow, or the grid's from a file.
+    void SetStartSlideshow(size_t index) { startSlideshow_ = index; }
+    // Put the focus ring on the file `id` the next time the grid shows it (back from a
+    // slideshow), and scroll it into view. Nothing when it is not in the grid.
+    void FocusItem(int64_t id) { focusId_ = id; }
 
     // Desktop: what the user asked of a folder tile's menu (right click).
     struct FolderRequest {
@@ -182,6 +206,12 @@ private:
     void UploadReady(const std::unordered_set<int64_t>& window, uint32_t need);
     void GoTo(const std::string& folder);
     void FolderMenu();
+    // Ask the caller to play (Action::Slideshow, #252). `folder`: what QueryTree() gives for
+    // it; `here`: the place shown, so the search applies too. From a file: the grid as shown.
+    void AskSlideshow(const std::string& folder, bool here);
+    void AskSlideshowFrom(int64_t id);
+    // The place shown has something a slideshow could play (the header's play button).
+    bool CanPlayHere() const;
     void Up();
     void EndSelection();
     // The desktop look (MediaBrowserDesktop.cpp, #252).
@@ -226,6 +256,17 @@ private:
     FolderRequest folderRequest_;
     bool folderRequestPending_ = false;
     std::string menuFolder_;       // the folder tile whose menu is open
+    // The keyboard opened a tile's menu (Shift+F10, the Menu key): open it at the tile.
+    ImVec2 menuAt_;
+    bool menuAtSet_ = false;
+    // Slideshows (#252): SetSlideshows, and the playlist waiting for TakePlaylist().
+    bool slideshows_ = false;
+    bool playlistPending_ = false;
+    std::vector<int64_t> playlist_;
+    size_t playlistStart_ = 0;
+    int playlistSkipped_ = 0;
+    size_t startSlideshow_ = SIZE_MAX;  // SetStartSlideshow
+    int64_t focusId_ = -1;              // FocusItem
     size_t cursor_ = SIZE_MAX;     // desktop: the keyboard's tile (SIZE_MAX: none yet)
     size_t startFocus_ = SIZE_MAX;  // SetStartFocus
     int64_t selAnchor_ = -1;        // desktop: Shift+click's anchor (ClickSelect)
