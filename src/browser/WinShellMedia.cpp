@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <unordered_map>
 
@@ -104,6 +105,112 @@ bool ExcludedPath(const std::string& path) {
         if (lower.find('\\', i + 1) != std::string::npos) return true;
     return false;
 }
+
+// What software keeps beside itself, not the user's media (#252: Media folders listed
+// every engine icon and test texture on a developer's box). Per folder, cached: the
+// index lists many files per folder.
+class SoftwareFolders {
+public:
+    enum Kind { kNone, kCode, kLibrary, kAssetFolder, kAppFolder };
+
+    SoftwareFolders() {
+        // Walks up for a .git stop here: a dotfiles repo at the profile (or a drive)
+        // would otherwise take everything.
+        for (const KNOWNFOLDERID* id : {&FOLDERID_Profile, &FOLDERID_Desktop, &FOLDERID_Documents,
+                                        &FOLDERID_Downloads, &FOLDERID_Pictures, &FOLDERID_Videos}) {
+            PWSTR p = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(*id, KF_FLAG_DEFAULT, nullptr, &p)) && p)
+                stops_.push_back(Key(Utf8(p, wcslen(p))));
+            CoTaskMemFree(p);
+        }
+    }
+
+    // `folder` ends with a separator. `picture`: the program-beside rule applies.
+    Kind Classify(const std::string& folder, bool picture) {
+        const std::string key = Key(folder);
+        auto it = kinds_.find(key);
+        Kind k;
+        if (it != kinds_.end()) {
+            k = it->second;
+        } else {
+            k = ByName(key);
+            if (k == kNone && InCheckout(key)) k = kCode;
+            if (k == kNone && HoldsProgram(folder)) k = kAppFolder;
+            kinds_[key] = k;
+        }
+        return k == kAppFolder && !picture ? kNone : k;
+    }
+
+private:
+    // Lower case, '/' separators, a trailing '/'.
+    static std::string Key(std::string p) {
+        for (char& c : p) c = c == '\\' ? '/' : (char)std::tolower((unsigned char)c);
+        if (p.empty() || p.back() != '/') p += '/';
+        return p;
+    }
+
+    static Kind ByName(const std::string& key) {
+        static const char* const kLibraries[] = {"/epic games/", "/steamapps/", "/steamlibrary/", "/gog games/",
+                                                 "/gog galaxy/", "/ubisoft game launcher/", "/ea games/",
+                                                 "/riot games/", "/battle.net/"};
+        for (const char* s : kLibraries)
+            if (key.find(s) != std::string::npos) return kLibrary;
+        static const char* const kAssets[] = {"textures", "texture",   "tex",       "icons",           "icon",
+                                              "models",   "resource",  "resources", "streamingassets", "sprites",
+                                              "shaders",  "fonts",     "thirdparty", "plugins"};
+        size_t start = 0;
+        for (size_t slash = key.find('/'); slash != std::string::npos;
+             start = slash + 1, slash = key.find('/', start)) {
+            const std::string part = key.substr(start, slash - start);
+            if (part.empty()) continue;
+            for (const char* a : kAssets)
+                if (part == a) return kAssetFolder;
+            auto ends = [&](const char* s) {
+                const size_t n = std::strlen(s);
+                return part.size() > n && part.compare(part.size() - n, n, s) == 0;
+            };
+            if (ends("_data") || ends(".fbm")) return kAssetFolder;  // Unity players, FBX texture folders
+        }
+        return kNone;
+    }
+
+    bool Stop(const std::string& key) const {
+        if (key.size() <= 3) return true;  // "c:/"
+        return std::find(stops_.begin(), stops_.end(), key) != stops_.end();
+    }
+
+    // `key` or a parent (up to a stop) holds a .git (a folder, or a worktree's file).
+    bool InCheckout(const std::string& key) {
+        if (Stop(key)) return false;
+        auto it = checkout_.find(key);
+        if (it != checkout_.end()) return it->second;
+        bool in = GetFileAttributesW(Wide(key + ".git").c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (!in) {
+            const size_t cut = key.find_last_of('/', key.size() - 2);
+            if (cut != std::string::npos) in = InCheckout(key.substr(0, cut + 1));
+        }
+        checkout_[key] = in;
+        return in;
+    }
+
+    // The folder itself holds an .exe or a .dll (an unpacked app, a demo build). Its own
+    // files only: a stray installer in a parent must not hide the media below it.
+    static bool HoldsProgram(const std::string& folder) {
+        for (const char* pattern : {"*.exe", "*.dll"}) {
+            WIN32_FIND_DATAW fd;
+            HANDLE h = FindFirstFileExW(Wide(folder + pattern).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch,
+                                        nullptr, 0);
+            if (h == INVALID_HANDLE_VALUE) continue;
+            FindClose(h);
+            return true;
+        }
+        return false;
+    }
+
+    std::vector<std::string> stops_;
+    std::unordered_map<std::string, Kind> kinds_;
+    std::unordered_map<std::string, bool> checkout_;
+};
 
 // Whether `folder` or one of its parents is hidden. Cached: the index lists many files
 // per folder. Reads folder attributes only (never hydrates anything).
@@ -290,13 +397,22 @@ std::string DownloadsFolder() {
     return out;
 }
 
-bool QueryIndex(const IndexQuery& q, std::vector<FoundFile>& out, std::string& error) {
+bool QueryIndex(const IndexQuery& q, std::vector<FoundFile>& out, std::string& error, IndexSkipped* skipped) {
     HiddenFolders hidden;
+    SoftwareFolders software;
+    IndexSkipped counts;
     const std::wstring scope = ScopeClause(q.scope);
     auto keep = [&](FoundFile& f, uint32_t attributes) {
         if (f.path.empty() || ExcludedPath(f.path)) return;
         SplitPath(f.path, f.folder, f.name);
         if (hidden.Hidden(f.folder)) return;
+        switch (software.Classify(f.folder, !f.video)) {
+        case SoftwareFolders::kCode: ++counts.code; return;
+        case SoftwareFolders::kLibrary: ++counts.library; return;
+        case SoftwareFolders::kAssetFolder: ++counts.assetFolder; return;
+        case SoftwareFolders::kAppFolder: ++counts.appFolder; return;
+        case SoftwareFolders::kNone: break;
+        }
         f.cloudOnly = IsCloudOnly(attributes);
         out.push_back(std::move(f));
     };
@@ -340,6 +456,7 @@ bool QueryIndex(const IndexQuery& q, std::vector<FoundFile>& out, std::string& e
         f.durationMs = VarInt(c[5].value) / 10000;  // 100 ns units
         keep(f, (uint32_t)VarInt(c[6].value));
     }, error);
+    if (skipped) *skipped = counts;
     return ok;
 }
 

@@ -233,12 +233,28 @@ opens directly. `MEDIAPLAYER_NO_BROWSER_AT_START=1` keeps the idle screen at lau
 | Recents | the Recent list (files only) | flat, in the order opened |
 | Pictures, Videos | the Windows libraries (OneDrive Pictures and added folders included), walked | folder tree; several roots are listed first |
 | Downloads | the known folder, walked | folder tree |
-| Media folders | the Windows Search index: pictures with a long side of at least 1024 px, videos of at least 1 MB, nothing under AppData, Program Files, Windows or a hidden folder | one tile per folder, a Newest tile (50) first |
+| Media folders | the Windows Search index: pictures with a long side of at least 1024 px, videos of at least 1 MB, nothing under AppData, Program Files, Windows or a hidden folder, nor what software keeps beside itself (below) | one tile per folder, a Newest tile (50) first |
 | Pinned | folders added with "Add folder...", walked | its folders first, then a tree; the sidebar lists each pinned folder as a row of its own |
 
 A walk reads directory entries only, at most 6 folders deep and 3 s per tree. One index
 query takes about 0.15 s for ~1,400 items on the 8K dev box; the whole list about 0.2-0.3 s.
 If the index cannot be queried, Media folders is empty and a strip over the grid says so.
+
+**What software keeps beside itself is left out of Media folders** (`SoftwareFolders` in
+`WinShellMedia.cpp`). On a developer's box the index holds every engine icon, test texture and
+demo build's screenshots; per folder, cached:
+
+| Rule | Leaves out |
+|---|---|
+| Code checkout | anything in a folder with a `.git` (folder or worktree file) on its way up, stopping at the profile and its known folders, so a dotfiles repo cannot take everything |
+| Game library | anything under `Epic Games`, `steamapps`, `SteamLibrary`, `GOG Games`, ... |
+| Asset folder | anything under a folder named `textures`, `tex`, `icons`, `models`, `resources`, `sprites`, `shaders`, `fonts`, `plugins`, `thirdparty`, `StreamingAssets`, `*_Data` (a Unity player) or `*.fbm` (FBX textures) |
+| Program beside | pictures (not videos) in a folder that itself holds an `.exe` or `.dll`; the folder's own files only, so a stray installer in Downloads hides nothing below it |
+
+The log line `browser: index left out software files - ...` counts each rule. On the 8K dev
+box they take Media folders from 171 folders (3,467 files) to 62 (3,114): the files were mostly
+the user's own, the folders mostly not. Pictures, Videos, Downloads and pinned folders are
+walked, not filtered; Open file / Open folder and drop reach everything.
 
 **Cloud files** (OneDrive / SharePoint placeholders) are never read while browsing:
 - thumbnails come from the shell's thumbnail cache only; a file Windows has none for shows
