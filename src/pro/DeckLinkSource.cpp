@@ -156,6 +156,12 @@ void DeckLinkSource::SetAudioMuted(bool m) {
     if (audioSink_) audioSink_->SetMuted(m);
 }
 
+void DeckLinkSource::SetAudioVolume(float v) {
+    audioVolume_ = v;  // a sink opened later starts with this
+    std::lock_guard<std::mutex> lk(audioMutex_);
+    if (audioSink_) audioSink_->SetVolume(v);
+}
+
 DeckLinkSource::AudioStatus DeckLinkSource::GetAudioStatus() const {
     AudioStatus a;
     a.requested = cfg_.audioPair > 0 && GetState() != LiveState::Closed;
@@ -2106,7 +2112,8 @@ void DeckLinkSource::Worker() {
                             aerr = names[(size_t)idx] + " cannot capture " + std::to_string(ch) + " audio channels";
                         } else {
                             audioOn = true;
-                            cap.audio = pro::LiveAudioSink::Open(ch, cfg_.audioPair, audioMuted_.load(), aerr);
+                            cap.audio = pro::LiveAudioSink::Open(ch, cfg_.audioPair, audioMuted_.load(), audioVolume_.load(),
+                                                                 audioMeter_.load(), aerr);
                             if (!cap.audio) {
                                 inputs[e]->DisableAudioInput();
                                 audioOn = false;

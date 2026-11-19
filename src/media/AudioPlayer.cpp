@@ -3,6 +3,7 @@
 
 #include "Log.h"
 #include "media/AudioLayout.h"
+#include "media/AudioMeter.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -155,7 +156,7 @@ bool AudioPlayer::Open(const std::string& path) {
         impl_.reset();
         return false;
     }
-    SDL_SetAudioStreamGain(impl_->stream, muted_.load() ? 0.0f : 1.0f);
+    SDL_SetAudioStreamGain(impl_->stream, Gain());
     SDL_ResumeAudioStreamDevice(impl_->stream);
 
     open_ = true;
@@ -182,6 +183,7 @@ void AudioPlayer::DecodeLoop() {
 
     auto resetClock = [&]() {
         if (impl_->stream) SDL_ClearAudioStream(impl_->stream);
+        if (AudioMeter* m = meter_.load()) m->Clear();
         impl_->firstPts.store(-1.0);
         impl_->pushedSamples.store(0);
         impl_->ended.store(false);
@@ -201,6 +203,9 @@ void AudioPlayer::DecodeLoop() {
         const int got = swr_convert(impl_->swr, &outPtr, maxOut,
                                     (const uint8_t**)frame->extended_data, frame->nb_samples);
         if (got > 0) {
+            if (AudioMeter* m = meter_.load())  // Pro only; the base player never sets one
+                m->AddFloat(reinterpret_cast<const float*>(outBuf.data()), got, impl_->outChannels,
+                            SDL_GetAudioStreamQueued(impl_->stream) / bytesPerFrame);
             SDL_PutAudioStreamData(impl_->stream, outBuf.data(), got * bytesPerFrame);
             impl_->pushedSamples.fetch_add(got);
         }
@@ -260,6 +265,7 @@ void AudioPlayer::Stop() {
     if (thread_.joinable()) thread_.join();
     open_ = false;
     impl_.reset();
+    if (AudioMeter* m = meter_.load()) m->Clear();  // what was queued will not be heard
 }
 
 void AudioPlayer::SetPaused(bool p) {
@@ -272,7 +278,12 @@ void AudioPlayer::SetPaused(bool p) {
 
 void AudioPlayer::SetMuted(bool m) {
     muted_.store(m);
-    if (impl_ && impl_->stream) SDL_SetAudioStreamGain(impl_->stream, m ? 0.0f : 1.0f);
+    if (impl_ && impl_->stream) SDL_SetAudioStreamGain(impl_->stream, Gain());
+}
+
+void AudioPlayer::SetVolume(float v) {
+    volume_.store(v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v);
+    if (impl_ && impl_->stream) SDL_SetAudioStreamGain(impl_->stream, Gain());
 }
 
 void AudioPlayer::Seek(double seconds) {
@@ -304,6 +315,7 @@ bool AudioPlayer::Open(const std::string&) { return false; }
 void AudioPlayer::Stop() {}
 void AudioPlayer::SetPaused(bool) {}
 void AudioPlayer::SetMuted(bool) {}
+void AudioPlayer::SetVolume(float) {}
 void AudioPlayer::Seek(double) {}
 void AudioPlayer::DecodeLoop() {}
 double AudioPlayer::ClockSeconds() const { return -1.0; }

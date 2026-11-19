@@ -1840,6 +1840,7 @@ bool App::LoadMediaFile(const std::string& path) {
         // video's alone (it restarts the audio at each wrap, SetLoopCallback above).
         audio_.Open(path);
         audio_.SetMuted(muted_);
+        audio_.SetVolume(volume_);
         LOG_INFO("Playing %s video (%s), per-eye aspect %.3f",
                  LayoutLabel().c_str(), path.c_str(), contentAspect_);
         currentMediaPath_ = path;
@@ -3418,6 +3419,14 @@ void App::TogglePlayback() {
     LOG_INFO("playback %s", video_.Paused() ? "paused" : "playing");
 }
 
+void App::SetVolume(float v) {
+    volume_ = std::clamp(v, 0.0f, 1.0f);
+    audio_.SetVolume(volume_);
+#if MEDIAPLAYER_PRO
+    pro_.GetStation().SetLiveAudioVolume(volume_);
+#endif
+}
+
 void App::ToggleMute() {
     muted_ = !muted_;
     audio_.SetMuted(muted_);
@@ -3992,6 +4001,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["has_media"] = hasMedia_;
         out["is_video"] = isVideo_;
         out["muted"] = muted_;
+        out["volume"] = volume_;
         out["folder_index"] = static_cast<uint64_t>(folderIndex_);
         out["folder_count"] = static_cast<uint64_t>(folderFiles_.size());
         out["layout"] = MediaSource::LayoutName(layout_);
@@ -4504,6 +4514,12 @@ void App::InitPro() {
                                          LOG_INFO("Pro A/B: %s=%s: %s %s", name, value, what, on ? "on" : "OFF");
                                      });
     pro::Host h;
+    h.getVolume = [this] { return volume_; };
+    h.setVolume = [this](float v) { SetVolume(v); };
+    h.getMuted = [this] { return muted_; };
+    h.toggleMute = [this] { ToggleMute(); };
+    h.fileHasAudio = [this] { return audio_.HasAudio(); };
+    h.audioMeter = &audioMeter_;
     h.getConvergence = [this] { return convergence_; };
     h.setConvergence = [this](float c) {
         convergence_ = std::clamp(c, -kConvergenceMax, kConvergenceMax);
@@ -4697,6 +4713,9 @@ void App::InitPro() {
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_DEPTH")) so.testCfg.depthScale = (float)std::atof(e);
     pro_.GetStation().Init(std::move(sh), so);
     pro_.GetStation().SetLiveAudioMuted(muted_);
+    pro_.GetStation().SetLiveAudioVolume(volume_);
+    pro_.GetStation().SetLiveAudioMeter(&audioMeter_);
+    audio_.SetMeter(&audioMeter_);  // file audio feeds the same meters (Pro only)
     LOG_INFO("Media Player Pro: ready (lut=%s cdl=%s)", launch_.lutPath.c_str(), launch_.cdlPath.c_str());
 }
 
