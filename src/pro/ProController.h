@@ -147,6 +147,9 @@ struct Host {
     // sign; live DeckLink audio can only be delayed (a negative value plays it on time).
     std::function<int()> getAvOffsetMs;
     std::function<void(int)> setAvOffsetMs;
+    // Channel solo (LOXR-874): the metered channel played alone (0-based), -1 = none.
+    std::function<int()> getSoloChannel;
+    std::function<void(int)> setSoloChannel;
     AudioMeter* audioMeter = nullptr;
 };
 

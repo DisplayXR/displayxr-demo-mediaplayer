@@ -162,6 +162,12 @@ void DeckLinkSource::SetAudioDelayMs(int ms) {
     if (audioSink_) audioSink_->SetDelayMs(ms);
 }
 
+void DeckLinkSource::SetAudioSolo(int ch) {
+    audioSolo_ = ch;  // a sink opened later starts with this
+    std::lock_guard<std::mutex> lk(audioMutex_);
+    if (audioSink_) audioSink_->SetSolo(ch);
+}
+
 void DeckLinkSource::SetAudioVolume(float v) {
     audioVolume_ = v;  // a sink opened later starts with this
     std::lock_guard<std::mutex> lk(audioMutex_);
@@ -2121,6 +2127,7 @@ void DeckLinkSource::Worker() {
                             cap.audio = pro::LiveAudioSink::Open(ch, cfg_.audioPair, audioMuted_.load(), audioVolume_.load(),
                                                                  audioMeter_.load(), aerr);
                             if (cap.audio) cap.audio->SetDelayMs(audioDelayMs_.load());
+                            if (cap.audio) cap.audio->SetSolo(audioSolo_.load());
                             if (!cap.audio) {
                                 inputs[e]->DisableAudioInput();
                                 audioOn = false;

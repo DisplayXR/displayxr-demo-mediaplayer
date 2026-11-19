@@ -4,6 +4,7 @@
 #include "Log.h"
 #include "media/AudioLayout.h"
 #include "media/AudioMeter.h"
+#include "media/AudioSolo.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -206,6 +207,8 @@ void AudioPlayer::DecodeLoop() {
             if (AudioMeter* m = meter_.load())  // Pro only; the base player never sets one
                 m->AddFloat(reinterpret_cast<const float*>(outBuf.data()), got, impl_->outChannels,
                             SDL_GetAudioStreamQueued(impl_->stream) / bytesPerFrame);
+            if (const int solo = solo_.load(); solo >= 0)  // after the meters: they show every channel
+                SoloFloatInPlace(reinterpret_cast<float*>(outBuf.data()), got, impl_->outChannels, solo);
             SDL_PutAudioStreamData(impl_->stream, outBuf.data(), got * bytesPerFrame);
             impl_->pushedSamples.fetch_add(got);
         }

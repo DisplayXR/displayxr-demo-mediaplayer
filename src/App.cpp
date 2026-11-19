@@ -1846,6 +1846,7 @@ bool App::LoadMediaFile(const std::string& path) {
         audio_.Open(path);
         audio_.SetMuted(muted_);
         audio_.SetVolume(volume_);
+        if (soloChannel_ >= 0) SetSoloChannel(-1);  // a new clip starts with every channel
         LOG_INFO("Playing %s video (%s), per-eye aspect %.3f",
                  LayoutLabel().c_str(), path.c_str(), contentAspect_);
         currentMediaPath_ = path;
@@ -3432,6 +3433,15 @@ void App::SetAvOffsetMs(int ms) {
 #endif
 }
 
+void App::SetSoloChannel(int ch) {
+    soloChannel_ = ch < 0 ? -1 : ch;
+    audio_.SetSolo(soloChannel_);
+#if MEDIAPLAYER_PRO
+    pro_.GetStation().SetLiveAudioSolo(soloChannel_);
+#endif
+    LOG_INFO("audio solo: %s", soloChannel_ < 0 ? "off" : ("ch " + std::to_string(soloChannel_ + 1)).c_str());
+}
+
 void App::SetVolume(float v) {
     volume_ = std::clamp(v, 0.0f, 1.0f);
     audio_.SetVolume(volume_);
@@ -4016,6 +4026,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
         out["muted"] = muted_;
         out["volume"] = volume_;
         out["av_offset_ms"] = avOffsetMs_.load();
+        out["solo_channel"] = soloChannel_ < 0 ? 0 : soloChannel_ + 1;  // 1-based; 0 = none
         out["folder_index"] = static_cast<uint64_t>(folderIndex_);
         out["folder_count"] = static_cast<uint64_t>(folderFiles_.size());
         out["layout"] = MediaSource::LayoutName(layout_);
@@ -4530,6 +4541,8 @@ void App::InitPro() {
     pro::Host h;
     h.getAvOffsetMs = [this] { return avOffsetMs_.load(); };
     h.setAvOffsetMs = [this](int ms) { SetAvOffsetMs(ms); };
+    h.getSoloChannel = [this] { return soloChannel_; };
+    h.setSoloChannel = [this](int ch) { SetSoloChannel(ch); };
     h.getVolume = [this] { return volume_; };
     h.setVolume = [this](float v) { SetVolume(v); };
     h.getMuted = [this] { return muted_; };

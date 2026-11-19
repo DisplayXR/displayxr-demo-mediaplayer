@@ -117,6 +117,7 @@ public:
     void SetLiveAudioMuted(bool m) { decklink_.SetAudioMuted(m); }
     void SetLiveAudioVolume(float v) { decklink_.SetAudioVolume(v); }   // LOXR-872
     void SetLiveAudioDelayMs(int ms) { decklink_.SetAudioDelayMs(ms); }  // LOXR-873
+    void SetLiveAudioSolo(int ch) { decklink_.SetAudioSolo(ch); }       // LOXR-874
     void SetLiveAudioMeter(AudioMeter* m) { decklink_.SetAudioMeter(m); }  // LOXR-871
     // "DeckLink ch 1-2 of 8" while the DeckLink input's audio plays, else "".
     std::string LiveAudioLabel() const;
