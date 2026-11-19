@@ -136,6 +136,56 @@ std::vector<size_t> MediaLibrary::Query(const Source& source, const ViewOptions&
     return out;
 }
 
+std::vector<size_t> MediaLibrary::QueryTree(const Source& source, const ViewOptions& options,
+                                            const std::string& folder) const {
+    if (source.kind == SourceKind::Unsupported) return {};
+    if (source.mode == SourceMode::Flat || (source.mode == SourceMode::Grouped && !folder.empty()))
+        return Query(source, options, folder);
+    std::vector<size_t> out;
+    for (size_t i = 0; i < items_.size(); ++i)
+        if ((folder.empty() || Under(items_[i], folder)) && Holds(source, options, i)) out.push_back(i);
+    Sort(source, options, out);
+    // Then folder by folder, keeping the sort inside each.
+    const bool grouped = source.mode == SourceMode::Grouped;
+    auto rootOf = [&](const std::string& path) {
+        for (size_t r = 0; r < source.roots.size(); ++r)
+            if (path.compare(0, source.roots[r].size(), source.roots[r]) == 0) return r;
+        return source.roots.size();
+    };
+    // Depth first: a folder's parts compared one by one, any case; a folder before the
+    // folders inside it.
+    auto treeLess = [](const std::string& a, const std::string& b) {
+        size_t i = 0, j = 0;
+        while (i < a.size() && j < b.size()) {
+            const size_t ea = std::min(a.find('/', i), a.size()), eb = std::min(b.find('/', j), b.size());
+            const std::string pa = a.substr(i, ea - i), pb = b.substr(j, eb - j);
+            if (LessNoCase(pa, pb)) return true;
+            if (LessNoCase(pb, pa)) return false;
+            if (pa != pb) return pa < pb;
+            i = ea + 1;
+            j = eb + 1;
+        }
+        return a.size() - std::min(a.size(), i) < b.size() - std::min(b.size(), j);
+    };
+    std::stable_sort(out.begin(), out.end(), [&](size_t x, size_t y) {
+        const std::string& a = items_[x].folder;
+        const std::string& b = items_[y].folder;
+        if (a == b) return false;
+        if (grouped) {
+            const std::string na = LastPart(a), nb = LastPart(b);
+            if (LessNoCase(na, nb)) return true;
+            if (LessNoCase(nb, na)) return false;
+            return LessNoCase(a, b);
+        }
+        if (!source.roots.empty()) {
+            const size_t ra = rootOf(a), rb = rootOf(b);
+            if (ra != rb) return ra < rb;
+        }
+        return treeLess(a, b);
+    });
+    return out;
+}
+
 std::vector<Folder> MediaLibrary::Folders(const Source& source, const ViewOptions& options,
                                           const std::string& folder) const {
     std::vector<Folder> out;

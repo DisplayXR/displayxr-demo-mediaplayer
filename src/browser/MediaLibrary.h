@@ -90,6 +90,13 @@ public:
     // `folder`, only what is directly in it.
     std::vector<size_t> Query(const Source& source, const ViewOptions& options,
                               const std::string& folder = std::string()) const;
+    // What a slideshow of `folder` plays (#252): what `source` holds under `options` in it
+    // and its sub-folders, as its folder tile counts them. Folder by folder (the files directly
+    // in a folder, then each sub-folder by name, depth first; a Tree's roots in their order),
+    // each folder's files in the view's sort. A Grouped source's group or Newest tile, and a
+    // Flat source, give Query()'s list; a Grouped source's top gives every group, by name.
+    // Empty for the Unsupported source (nothing there plays).
+    std::vector<size_t> QueryTree(const Source& source, const ViewOptions& options, const std::string& folder) const;
     // The sub-folders of `folder` that hold something of `source` under `options`, by name.
     std::vector<Folder> Folders(const Source& source, const ViewOptions& options, const std::string& folder) const;
     // For each of `folders` (as Folders() gave them), up to `max` of what it shows a preview
