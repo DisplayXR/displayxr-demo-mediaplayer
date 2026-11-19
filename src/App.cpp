@@ -4727,13 +4727,15 @@ void App::InitPro() {
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_EYE_DELAY")) so.testCfg.eyeDelay = std::atoi(e);
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_GAIN_R")) so.testCfg.gainR = (float)std::atof(e);
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_DEPTH")) so.testCfg.depthScale = (float)std::atof(e);
-    pro_.GetStation().Init(std::move(sh), so);
+    // Audio settings go in BEFORE Station::Init: Init can start a DeckLink capture from the
+    // launch args, and its audio sink takes mute, volume, meter and delay when it opens.
     pro_.GetStation().SetLiveAudioMuted(muted_);
     pro_.GetStation().SetLiveAudioVolume(volume_);
     pro_.GetStation().SetLiveAudioMeter(&audioMeter_);
     // A station keeps its sync offset in pro.env (MEDIAPLAYER_AUDIO_OFFSET_MS=<ms>).
     if (const char* e = std::getenv("MEDIAPLAYER_AUDIO_OFFSET_MS")) SetAvOffsetMs(std::atoi(e));
     audio_.SetMeter(&audioMeter_);  // file audio feeds the same meters (Pro only)
+    pro_.GetStation().Init(std::move(sh), so);
     LOG_INFO("Media Player Pro: ready (lut=%s cdl=%s)", launch_.lutPath.c_str(), launch_.cdlPath.c_str());
 }
 
