@@ -230,8 +230,9 @@ bool Window::PumpEvents() {
             }
             else if (!e.key.repeat) {
                 if (e.key.key == SDLK_ESCAPE) {
-                    if (escapeQuits_) return false;
-                    if (fullscreen_) ToggleFullscreen();
+                    if (escapeBacksOut_) escapeRequested_ = true;
+                    else if (escapeQuits_) return false;
+                    else if (fullscreen_) ToggleFullscreen();
                 }
                 if (e.key.key == SDLK_V) cycleModeRequested_ = true;
                 if (e.key.key == SDLK_TAB && (e.key.mod & SDL_KMOD_SHIFT)) toggleHudRequested_ = true;
@@ -453,6 +454,12 @@ bool Window::TakePrevMediaRequest() {
 bool Window::TakeNextMediaRequest() {
     bool v = nextMediaRequested_;
     nextMediaRequested_ = false;
+    return v;
+}
+
+bool Window::TakeEscapeRequest() {
+    bool v = escapeRequested_;
+    escapeRequested_ = false;
     return v;
 }
 

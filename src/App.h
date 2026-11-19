@@ -131,7 +131,13 @@ private:
     void RequestOpenFolder();
     // A path the user chose (a picker, a Recent row): a file opens as is, a folder opens
     // its first supported file. Either is recorded in Recent when it loads.
-    void OpenChosenPath(const std::string& path);
+    // `play`: a folder also starts the slideshow (a folder handed over on a command line).
+    void OpenChosenPath(const std::string& path, bool play = false);
+    // The media browser's slideshow (#252): play `paths` from `start` as a fixed playlist.
+    void StartBrowserSlideshow(std::vector<std::string> paths, std::vector<int64_t> ids, size_t start,
+                               int skippedCloud);
+    // Esc in a slideshow from the browser: stop it and show the browser again.
+    void BackToBrowser();
     void OpenRecent(int row);
     void NoteRecent(const std::string& path);
     void RefreshRecentLabels();
@@ -144,7 +150,7 @@ private:
 
     // Drag and drop (#44). Filters the batch through MediaSource::IsSupported, toasts
     // what was rejected, then loads: one file behaves exactly like Ctrl+O, while a
-    // multi-file drop installs the dropped set as a playlist (see playlistFromDrop_).
+    // multi-file drop installs the dropped set as a playlist (see playlistFixed_).
     void HandleDroppedPaths(std::vector<std::string> paths);
 
     // Folder navigation: scan the current file's directory for supported assets, and
@@ -152,6 +158,10 @@ private:
     // VALUE on purpose: callers pass a reference into folderFiles_, which this clears.
     void RebuildFolderList(std::string path);
     void NavigateMedia(int delta);
+    // A cloud placeholder (Windows): a slideshow steps over it rather than download it (#252).
+    static bool IsCloudOnly(const std::string& path);
+    // The slideshow ran out of files to play: stop it and say so.
+    void EndOfSlideshow();
     // Start a dip-to-black transition that navigates by `delta` at full black (manual
     // ←/→). Shares the fade machine with the slideshow.
     void RequestNavTransition(int delta);
@@ -497,11 +507,18 @@ private:
     std::string currentMediaPath_;
     std::vector<std::string> folderFiles_;
     size_t folderIndex_ = 0;
-    // Set when folderFiles_ came from a multi-file drop rather than a directory scan
-    // (#44). RebuildFolderList() honours it and re-locates the index inside the existing
-    // list instead of rescanning the parent directory, which would otherwise destroy the
-    // dropped set on the very next load. Cleared by any later single-target open.
-    bool playlistFromDrop_ = false;
+    // Set when folderFiles_ is a fixed playlist rather than a directory scan: a multi-file
+    // drop (#44), or a slideshow from the media browser (#252). RebuildFolderList() honours
+    // it and re-locates the index inside the existing list instead of rescanning the parent
+    // directory, which would otherwise destroy the playlist on the very next load. Cleared
+    // by any later single-target open.
+    bool playlistFixed_ = false;
+    // The playlist is a slideshow the media browser asked for (#252): Esc goes back to the
+    // browser instead of quitting, as long as this list is the one walked. playlistIds_ are
+    // the browser's ids, in step with folderFiles_ (the ring goes to the file it ended on).
+    bool fromBrowserList_ = false;
+    bool startingBrowserList_ = false;  // its first file is loading: ReloadMedia keeps the flag
+    std::vector<int64_t> playlistIds_;
 
     // Live camera (#90). isLive_ is mutually exclusive with file media: every file load
     // goes through ReloadMedia, which stops the camera first.

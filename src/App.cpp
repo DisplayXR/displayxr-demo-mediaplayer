@@ -485,7 +485,15 @@ bool App::Initialize(const char* mediaPath) {
             std::sort(files.begin(), files.end());
             if (!files.empty()) {
                 LOG_INFO("Folder '%s': %zu asset(s), opening first", mediaPath, files.size());
-                if (LoadMedia(files.front())) NoteRecent(mediaPath);
+                if (LoadMedia(files.front())) {
+                    NoteRecent(mediaPath);
+                    // A folder on the command line means "play this folder", as a dropped
+                    // one does (#252): the slideshow starts.
+                    SetSlideshow(true);
+                    char t[64];
+                    std::snprintf(t, sizeof(t), "Slideshow: %zu items", files.size());
+                    ShowToast(t);
+                }
             } else {
                 LOG_WARN("No supported media in folder '%s'", mediaPath);
             }
@@ -528,6 +536,7 @@ bool App::Initialize(const char* mediaPath) {
             if (browser_->Initialize(browserProvider_.get(), xr_.PhysicalDevice(), xr_.Device(),
                                      renderer_.FramesInFlight(), verdicts.string())) {
                 browser_->SetDesktop(true);
+                browser_->SetSlideshows(true);  // play a folder, the place shown, the grid (#252)
                 gridReady_ = grid_.init(xr_.PhysicalDevice(), xr_.Device(), (VkFormat)xr_.SwapchainFormat(),
                                         renderer_.FramesInFlight());
                 if (!gridReady_) {
@@ -628,6 +637,10 @@ int App::Run() {
     else if (browser_ && !hasMedia_ && !CloudFetchBusy() && !std::getenv("MEDIAPLAYER_NO_BROWSER_AT_START")) {
         RequestOpenFile();
     }
+    // Test (#252): play tile N of the browser (0 = the first; folders count) once it is listed:
+    // a folder's slideshow, or the grid's from a file.
+    if (const char* ss = std::getenv("MEDIAPLAYER_BROWSER_SLIDESHOW"); browser_ && ss && *ss)
+        browser_->SetStartSlideshow((size_t)std::max(0, std::atoi(ss)));
 #endif
     // Test: switch "Convert to 3D" on without a keystroke (headless runs). Retried until it
     // takes, because an in-process session may only learn the conversion task a moment
@@ -809,7 +822,7 @@ int App::Run() {
                 if (p.empty()) continue;
                 LOG_INFO("Forwarded launch: %s", p.c_str());
                 CloseBrowser();
-                OpenChosenPath(p);
+                OpenChosenPath(p, /*play=*/true);  // a folder: its slideshow, as on the command line
             }
             if (SDL_Window* w = window_.SdlWindow()) {
                 SDL_RestoreWindow(w);
@@ -818,6 +831,12 @@ int App::Run() {
 #if defined(_WIN32)
             if (HWND hwnd = (HWND)window_.NativeHandle()) SetForegroundWindow(hwnd);
 #endif
+            activity = true;
+        }
+        // Esc backs out of a slideshow from the media browser to it (#252), else quits.
+        window_.SetEscapeBacksOut(fromBrowserList_ && !browsing_);
+        if (window_.TakeEscapeRequest()) {
+            if (fromBrowserList_ && !browsing_) BackToBrowser();
             activity = true;
         }
         if (window_.TakeTogglePauseRequest()) { TogglePlayback(); activity = true; }  // Space
@@ -904,7 +923,7 @@ int App::Run() {
         // Test hook: exercise the media-swap path without a dialog.
         if (openAfterPath_ && !openedAfter_ && frames_ > 150) {
             openedAfter_ = true;
-            playlistFromDrop_ = false;
+            playlistFixed_ = false;
             // Test: pause the playing video first (a pause must not carry over to the new file).
             if (const char* p = std::getenv("MEDIAPLAYER_OPEN_AFTER_PAUSED"); p && *p && *p != '0' && isVideo_ &&
                 !video_.Paused()) {
@@ -2418,6 +2437,8 @@ void App::ReloadMedia(const std::string& path) {
     // the file at its own default (#252).
     stickConvertTried_.clear();
     if (!walking_) stickFlat_ = stickConvert_ = false;
+    // ... and the browser's slideshow list (#252), but for its own first file.
+    if (!walking_ && !startingBrowserList_) fromBrowserList_ = false;
     if (isLive_) StopLive(/*showIdleIfEmpty=*/false);
     if (isStream_) StopStream(/*showIdleIfEmpty=*/false);  // #93: a file replaces the stream
     video_.Stop();   // joins the decode thread (which reads the audio clock) FIRST,
@@ -2536,7 +2557,8 @@ void App::EnterLive(LiveProducer* p, const std::string& name) {
     currentMediaPath_.clear();
     folderFiles_.clear();
     folderIndex_ = 0;
-    playlistFromDrop_ = false;
+    playlistFixed_ = false;
+    fromBrowserList_ = false;
     if (uiState_.slideshowActive) SetSlideshow(false);
     uiState_.scrubValue = 0.0f;
     uiState_.scrubActive = false;
@@ -2712,7 +2734,8 @@ bool App::LoadUrl(const std::string& url) {
     currentMediaPath_.clear();
     folderFiles_.clear();
     folderIndex_ = 0;
-    playlistFromDrop_ = false;
+    playlistFixed_ = false;
+    fromBrowserList_ = false;
     if (uiState_.slideshowActive) SetSlideshow(false);
     uiState_.scrubValue = 0.0f;
     uiState_.scrubActive = false;
@@ -3410,7 +3433,7 @@ void App::HandleDroppedPaths(std::vector<std::string> paths) {
     if (droppedOneFolder) {
         // Exactly the argv-folder gesture: open the first asset and let the normal
         // directory scan govern ↑/↓, so the folder itself becomes the nav list.
-        playlistFromDrop_ = false;
+        playlistFixed_ = false;
         LOG_INFO("Drop: folder '%s', %zu asset(s), opening first", paths[0].c_str(), good.size());
         ReloadMedia(good.front());
         if (currentMediaPath_ == good.front()) NoteRecent(paths[0]);
@@ -3428,7 +3451,7 @@ void App::HandleDroppedPaths(std::vector<std::string> paths) {
     if (good.size() == 1) {
         // A single drop is the same gesture as Ctrl+O: load it and let the normal
         // directory scan govern ↑/↓, so the user can walk the containing folder.
-        playlistFromDrop_ = false;
+        playlistFixed_ = false;
         LOG_INFO("Drop: loading '%s'", good[0].c_str());
         if (rejected > 0) {
             char t[64];
@@ -3441,11 +3464,11 @@ void App::HandleDroppedPaths(std::vector<std::string> paths) {
     }
 
     // Multi-file drop: the dropped set IS the nav list. Install it BEFORE loading —
-    // RebuildFolderList() sees playlistFromDrop_ and re-locates the index inside it
+    // RebuildFolderList() sees playlistFixed_ and re-locates the index inside it
     // rather than rescanning the parent directory.
     folderFiles_ = std::move(good);
     folderIndex_ = 0;
-    playlistFromDrop_ = true;
+    playlistFixed_ = true;
     LOG_INFO("Drop: playlist of %zu asset(s), %zu unsupported", folderFiles_.size(), rejected);
     char t[80];
     if (rejected > 0) {
@@ -3463,7 +3486,7 @@ void App::RebuildFolderList(std::string path) {
     std::error_code ec;
     fs::path p = fs::absolute(fs::path(path), ec);
     if (ec) p = fs::path(path);
-    if (playlistFromDrop_) {
+    if (playlistFixed_) {
         // A dropped playlist replaces the directory scan (#44) — only re-locate the
         // current entry. NOTE: folderFiles_ must NOT be cleared here, and `path` may
         // alias into it, which is exactly why this runs before any mutation.
@@ -3519,20 +3542,54 @@ void App::NavigateMedia(int delta) {
         ~Walk() { w = false; }
     } walk(walking_);
     std::string next;
-    if (browserNav_ && BrowserNext(delta, next)) {
-        // Opened from the browser: walk its grid as shown (no wrap; #252).
+    // A slideshow steps over cloud-only files (#252): opening one would stop it on a download.
+    const bool skipCloud = uiState_.slideshowActive;
+    if (browserNav_) {
+        // Opened from the browser: walk its grid as shown (no wrap; #252). Never on into
+        // folderFiles_ past either end: that is another list, in another order.
+        int step = delta;
+        while (BrowserNext(step, next) && skipCloud && IsCloudOnly(next)) step += delta;
+        if (next.empty() || !BrowserNext(step, next)) {
+            if (skipCloud) EndOfSlideshow();
+            return;
+        }
         ReloadMedia(next);
 #if MEDIAPLAYER_BROWSER
-        if (currentMediaPath_ == next) browser_->StepTo(delta);
+        if (currentMediaPath_ == next) browser_->StepTo(step);
 #endif
         return;
     }
     const size_t n = folderFiles_.size();
     if (n < 2) return;  // nothing to step to (LoadMedia rebuilt folderIndex_)
     const int wrapped = ((delta % (int)n) + (int)n) % (int)n;
-    folderIndex_ = (folderIndex_ + (size_t)wrapped) % n;
-    ReloadMedia(folderFiles_[folderIndex_]);  // sets currentMediaPath_ + rebuilds list
+    size_t at = folderIndex_;
+    for (size_t tries = 0; tries < n; ++tries) {
+        at = (at + (size_t)wrapped) % n;
+        if (!skipCloud || !IsCloudOnly(folderFiles_[at])) break;
+        if (tries + 1 == n) {
+            EndOfSlideshow();  // nothing here but cloud-only files
+            return;
+        }
+    }
+    folderIndex_ = at;
+    const std::string path = folderFiles_[folderIndex_];  // a copy: the load may rebuild the list
+    ReloadMedia(path);  // sets currentMediaPath_ + rebuilds list
     // (filename is shown persistently in the top bar — no toast needed here.)
+}
+
+bool App::IsCloudOnly(const std::string& path) {
+#if defined(_WIN32)
+    return browser::win::IsCloudOnlyPath(path);
+#else
+    (void)path;
+    return false;
+#endif
+}
+
+void App::EndOfSlideshow() {
+    if (!uiState_.slideshowActive) return;
+    SetSlideshow(false);
+    ShowToast("Slideshow: end of the list");
 }
 
 void App::RequestNavTransition(int delta) {
@@ -4301,7 +4358,7 @@ std::string App::DispatchAgentTool(const std::string& tool, const std::string& a
             return "{\"error\":\"missing required string arg 'path'\"}";
         }
         const std::string path = args["path"].get<std::string>();
-        playlistFromDrop_ = false;   // explicit single-target open retires a drop playlist
+        playlistFixed_ = false;   // explicit single-target open retires a drop playlist
         ReloadMedia(path);  // tears down current media, then loads; keeps prior on failure
         if (currentMediaPath_ != path) {
             success = false;
@@ -4701,9 +4758,16 @@ void App::TickUi() {
             slideshowImageElapsed_ += dt;
             advance = slideshowImageElapsed_ >= kStillSeconds;
         }
-        if (advance && folderFiles_.size() > 1) {
-            pendingNavDelta_ = +1;
-            transition_ = Transition::FadeOut;
+        if (advance) {
+            // The list walked: the browser's grid (which ends; #252), else folderFiles_.
+            std::string next;
+            const bool more = browserNav_ ? BrowserNext(+1, next) : folderFiles_.size() > 1;
+            if (more) {
+                pendingNavDelta_ = +1;
+                transition_ = Transition::FadeOut;
+            } else if (browserNav_) {
+                EndOfSlideshow();
+            }
         }
     }
     switch (transition_) {
@@ -4796,10 +4860,10 @@ void App::RequestOpenFolder() {
                              start.empty() ? nullptr : start.c_str(), false);
 }
 
-void App::OpenChosenPath(const std::string& path) {
+void App::OpenChosenPath(const std::string& path, bool play) {
     namespace fs = std::filesystem;
     browserNav_ = false;  // a pick outside the browser walks its own folder
-    playlistFromDrop_ = false;  // an explicit pick retires a drop's playlist (#44)
+    playlistFixed_ = false;  // an explicit pick retires a drop's playlist (#44)
     std::error_code ec;
     if (fs::is_directory(fs::path(path), ec) && !ec) {
         // The command-line folder gesture: open the first supported file (sorted) and let
@@ -4821,8 +4885,9 @@ void App::OpenChosenPath(const std::string& path) {
         ReloadMedia(files.front());
         if (currentMediaPath_ == files.front()) {
             NoteRecent(path);
+            if (play) SetSlideshow(true);
             char t[64];
-            std::snprintf(t, sizeof(t), "Folder: %zu items", files.size());
+            std::snprintf(t, sizeof(t), play ? "Slideshow: %zu items" : "Folder: %zu items", files.size());
             ShowToast(t);
         }
         return;
@@ -4887,6 +4952,7 @@ void App::ShowBrowser() {
     if (!browser_ || browsing_) return;
     browsing_ = true;
     if (uiState_.slideshowActive) SetSlideshow(false);
+    fromBrowserList_ = false;  // Esc in the browser is the browser's again
     resumeAfterBrowse_ = isVideo_ && !video_.Paused() && !video_.Ended();
     if (resumeAfterBrowse_) TogglePlayback();
     browserProvider_->SetRecents(recent_.Items());
@@ -4904,6 +4970,52 @@ void App::CloseBrowser() {
     EndBrowserMode(false);
     if (resumeAfterBrowse_ && isVideo_ && video_.Paused()) TogglePlayback();
     resumeAfterBrowse_ = false;
+}
+
+void App::StartBrowserSlideshow(std::vector<std::string> paths, std::vector<int64_t> ids, size_t start,
+                                int skippedCloud) {
+    if (paths.empty()) return;
+    if (start >= paths.size()) start = 0;
+    browserNav_ = false;  // the playlist is walked, not the grid
+    folderFiles_ = std::move(paths);
+    playlistIds_ = std::move(ids);
+    folderIndex_ = start;
+    playlistFixed_ = true;
+    const std::string first = folderFiles_[start];  // a copy: ReloadMedia takes a reference
+    LOG_INFO("browser: slideshow of %zu file(s) from %zu, %d cloud-only left out", folderFiles_.size(), start,
+             skippedCloud);
+    startingBrowserList_ = true;
+    ReloadMedia(first);  // an open, not a walk: the 2D/3D switch starts at the file's own default
+    startingBrowserList_ = false;
+    if (currentMediaPath_ != first) {
+        // It did not open (the load toasted why): back to the browser rather than a stale picture.
+        playlistFixed_ = false;
+        fromBrowserList_ = false;
+        ShowBrowser();
+        return;
+    }
+    fromBrowserList_ = true;
+    SetSlideshow(true);
+    char t[96];
+    if (skippedCloud > 0)
+        std::snprintf(t, sizeof(t), "Slideshow: %zu items (%d online-only skipped)", folderFiles_.size(), skippedCloud);
+    else
+        std::snprintf(t, sizeof(t), "Slideshow: %zu items", folderFiles_.size());
+    ShowToast(t);  // replaces SetSlideshow's "Slideshow on"
+}
+
+void App::BackToBrowser() {
+#if MEDIAPLAYER_BROWSER
+    const int64_t id = fromBrowserList_ && folderIndex_ < playlistIds_.size() &&
+                               playlistIds_.size() == folderFiles_.size()
+                           ? playlistIds_[folderIndex_]
+                           : -1;
+    LOG_INFO("browser: Esc in its slideshow - back to the browser");
+    if (uiState_.slideshowActive) SetSlideshow(false);
+    // The picture stays paused behind the browser; Open / a pick replaces it.
+    ShowBrowser();
+    if (browser_ && id >= 0) browser_->FocusItem(id);
+#endif
 }
 
 void App::ApplyFolderRequests() {
@@ -5198,7 +5310,37 @@ void App::BuildBrowser() {
             if (currentMediaPath_ == path) {
                 NoteRecent(path);
                 browserNav_ = true;  // up/down walk the grid it came from
+                playlistFixed_ = false;  // ... not a playlist left from a drop or a slideshow
             }
+            break;
+        }
+        case browser::MediaBrowser::Action::Slideshow: {
+            // Play a folder, the place shown or the grid from a file (#252).
+            std::vector<int64_t> ids;
+            size_t start = 0;
+            int skipped = 0;
+            if (!browser_->TakePlaylist(ids, start, skipped)) break;
+            std::vector<std::string> paths;
+            std::vector<int64_t> kept;
+            size_t keptStart = 0;
+            for (size_t i = 0; i < ids.size(); ++i) {
+                std::string p = browserProvider_->PathOf(ids[i]);
+                if (p.empty()) continue;
+                if (i == start) keptStart = paths.size();
+                paths.push_back(std::move(p));
+                kept.push_back(ids[i]);
+            }
+            if (paths.empty()) {
+                // Stay in the browser: nothing it could play.
+                ShowToast(skipped > 0 ? "Nothing local to play (online-only files are not downloaded)"
+                                      : "Nothing to play here");
+                break;
+            }
+            browsing_ = false;
+            // From the 3D grid: 3D files, so the panel stays in 3D for them.
+            EndBrowserMode(browser_->WantsStereo());
+            resumeAfterBrowse_ = false;
+            StartBrowserSlideshow(std::move(paths), std::move(kept), keptStart, skipped);
             break;
         }
         case browser::MediaBrowser::Action::OtherFiles:
