@@ -265,12 +265,46 @@ stays the surface colour, and a card with none here shows the folder outline. Cl
 files are asked for the same way as their own tiles (the shell's cache only, never a
 download). Not in the details view, nor in the 3D grid (two slots per file).
 
-**Folder menu** (right click a folder tile): Pin this folder; Remove from Pinned (top of
-Pinned); Hide from Media folders (top of Media folders, for junk the size filter keeps).
-Pinned and hidden folders are kept beside the Recent list (`pinned.txt`,
+**Folder menu** (right click a folder tile, Shift+F10 or the Menu key on the one with the
+focus ring, or a long press on a touch screen): Play slideshow (also Shift+Enter); Open (also
+Enter, or a click); then Pin this folder; Remove from Pinned (top of Pinned); Hide from Media
+folders (top of Media folders, for junk the size filter keeps). The Newest tile has only Play
+slideshow and Open. Pinned and hidden folders are kept beside the Recent list (`pinned.txt`,
 `hidden_folders.txt` in `%APPDATA%\DisplayXR\MediaPlayer\`).
 
-**File menu** (right click a file): Open; Show in File Explorer; Copy path (also
+**Slideshows.** A click on a folder opens it; playing one is asked for (`Action::Slideshow`,
+the ids through `MediaBrowser::TakePlaylist`, `SetSlideshows` turns it on):
+
+| From | Plays |
+|---|---|
+| A folder tile (menu, Shift+Enter) | the folder and its sub-folders (`MediaLibrary::QueryTree`), as its tile counts them: the files directly in a folder first, then each sub-folder by name, depth first; each folder's files in the view's sort. A Media folders group or the Newest tile: its own files |
+| The header's play button, Ctrl+Enter | the place shown the same way, under the search too; a flat source (Recents) its list. Not under Unsupported |
+| A file's menu: Play slideshow from here (Shift+Enter on a file) | the grid as shown, from that file |
+
+All of them keep to the type filter and the All / 3D / 2D filter (a file whose verdict is not
+known yet is left out under 3D or 2D). **Cloud-only files are left out**: a slideshow never
+downloads, and the toast counts them ("Slideshow: 42 items (3 online-only skipped)"); with
+nothing local, the browser stays and says so. The player takes the list as a fixed playlist
+(`playlistFixed_`, as a multi-file drop): 5 s a still, a video once, a dip to black between,
+and it **loops**. Up / Down step through it; S or the slideshow button pause it on the list.
+
+- **Esc** during it (or after S, while the list is still the one walked) goes back to the
+  browser at the place it started from, the focus ring on the file it was showing. Esc quits
+  everywhere else, as before (`Window::SetEscapeBacksOut`).
+- **2D / 3D switch:** the first file is an open, so it starts at its own default; the walk
+  keeps a flip for the rest of the slideshow; any other open drops it. Under the 3D-only
+  filter the panel stays in 3D for the slideshow (as for a file opened from the 3D grid).
+- Opening one file from the grid does not start a slideshow; the slideshow button then walks
+  the grid and **stops at its end** (it used to run on into the folder's name-sorted list).
+  It steps over cloud-only files too, rather than stop at a download.
+- Outside the browser: a folder on the command line, dropped on the window, or handed over by
+  a second launch starts the slideshow over its own files by name; Open folder... (Ctrl+Shift+O)
+  opens the first file without one.
+
+Android: not yet (its player has no slideshow); a long press on a folder there does nothing.
+
+**File menu** (right click a file, or Shift+F10 / the Menu key on the focused one): Open; Play
+slideshow from here; Show in File Explorer; Copy path (also
 Ctrl+Shift+C on the file with the focus ring, else the one under the pointer). On a file in
 a selection of several, Copy path becomes "Copy N paths": every selected file's path, one a
 line, in grid order (Ctrl+Shift+C does the same whenever there is a selection). Right click
@@ -306,7 +340,9 @@ clears it; going to another place clears it too.
 
 **Input.** Mouse: click, wheel scrolling, a hover outline and a name tooltip; the side
 buttons go back and forward. Keyboard: arrows, Page Up / Down, Home / End move a focus ring,
-Enter opens, Alt+Left / Alt+Right go back / forward through the places shown (any route
+Enter opens, Shift+Enter plays the focused folder (or the grid from the focused file),
+Ctrl+Enter plays the place shown, Shift+F10 or the Menu key opens the focused tile's menu,
+Alt+Left / Alt+Right go back / forward through the places shown (any route
 there: the sidebar, the path, a folder), Backspace or Alt+Up go up a folder, Esc backs out
 then closes, Ctrl+O the Windows file dialog. Player hotkeys are off while it shows. A file
 opened from the grid makes Up / Down in the player walk the grid as shown (no wrap).
@@ -318,7 +354,9 @@ rest of the desktop UI; the sources stay a rail from 600 dp of window width.
 with `MEDIAPLAYER_DUMP_HUD` the HUD dump shows it. `MEDIAPLAYER_BROWSER_SOURCE=<name>` starts
 on a source (or, with no source of that name, on the pinned folder of that name), `MEDIAPLAYER_BROWSER_VIEW=details` in the details view,
 `MEDIAPLAYER_BROWSER_QUERY=<text>` with a search, `MEDIAPLAYER_BROWSER_FOCUS=<n>` with the focus
-ring on tile n (0 = the first; folders count), `MEDIAPLAYER_BROWSER_SELECT=0,2,3` with those
+ring on tile n (0 = the first; folders count), `MEDIAPLAYER_BROWSER_SLIDESHOW=<n>` plays tile n
+once the grid is listed (a folder's slideshow, or the grid's from a file; works on the browser
+shown at launch, with or without `MEDIAPLAYER_SHOW_BROWSER`), `MEDIAPLAYER_BROWSER_SELECT=0,2,3` with those
 files selected (counted among the files). A test run (`MEDIAPLAYER_SHOW_BROWSER`) never
 reads or writes the user's `browser_view.txt`; `MEDIAPLAYER_BROWSER_PREFS=<file>` names a view
 file for it to use instead. `win_shell_media_probe` (built on Windows, not a ctest test) prints

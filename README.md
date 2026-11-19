@@ -89,7 +89,8 @@ by any other open. Mode, Layout and the 2D->3D converter are in the top bar's ".
 player, which comes to the front; `MEDIAPLAYER_MULTI_INSTANCE=1` allows a second copy.
 
 Keys: **V** flips the 2D | 3D switch (Pro: cycles the display modes the display offers, each change showing the new mode's name for a couple of seconds, e.g. "Mode: 2D"), **SHIFT+TAB** toggles the HUD, **L** cycles the stereo
-layout override (auto / mono / SBS-full / SBS-half / TB-full / TB-half), **Esc** quits. Transport follows the
+layout override (auto / mono / SBS-full / SBS-half / TB-full / TB-half), **Esc** quits (in a slideshow
+started from the media browser, it goes back to the browser). Transport follows the
 editor convention (Resolve, Premiere, Avid, RV): **Space** play/pause, **Left** / **Right**
 one frame back/forward (**Shift** for a 5-frame jump; `[` / `]` do the same), **Up** /
 **Down** previous/next asset in the folder. On a still, where there is no frame to step,
@@ -103,7 +104,8 @@ Move it by its title bar, or **right-drag anywhere in the picture**. Either drag
 You can also **drag files or a folder onto the window**. Dropping several files at once
 loads the first and makes the dropped set the list Up / Down and the slideshow walk.
 Dropping a **folder** opens its first asset and starts the slideshow, with the folder as
-that list — the same thing as passing the folder on the command line, plus playback.
+that list — the same thing as passing the folder on the command line (or opening one with the
+player already running), which starts the slideshow too.
 
 The arrow beside **Open** opens a menu: **Open file...** (`Ctrl+O`), **Open folder...**
 (`Ctrl+Shift+O`: the folder's first file opens and the folder becomes the Up / Down list) and
@@ -116,7 +118,12 @@ On **Windows**, **Open** (and `Ctrl+O`) shows the **media browser** outside a wo
 Pictures, Videos, Downloads, **Media folders** (every folder Windows Search knows holds photos
 or videos) and folders you pin, with thumbnails, 3D badges and an All / 3D / 2D filter. Files
 kept online only (OneDrive) show a cloud and are not downloaded until you open one.
-**Other files...** opens the system dialog. Details: [docs/BROWSER.md](docs/BROWSER.md#desktop-windows).
+**Other files...** opens the system dialog. A click on a folder opens it; to **play a folder as a
+slideshow**, right-click it (or long-press it on a touch screen) and pick **Play slideshow**, or
+select it and press `Shift+Enter`. The play button in the browser's header (`Ctrl+Enter`) plays
+the place shown, and a file's menu has **Play slideshow from here**. A folder's slideshow
+includes its sub-folders and loops; **Esc** goes back to the browser. Details:
+[docs/BROWSER.md](docs/BROWSER.md#desktop-windows).
 
 ## VR180 / VR360 viewer (#155)
 
