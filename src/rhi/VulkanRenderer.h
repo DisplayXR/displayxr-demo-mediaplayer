@@ -269,7 +269,11 @@ public:
     // (cached per handle) and its two planes bound as Y (R8) + UV (R8G8); DrawViews syncs
     // the D3D11 producer copy against the sample with a keyed mutex. Returns false (caller
     // falls back to UploadYUV) on any import failure.
-    bool BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t height);
+    // packedYuv (MEDIAPLAYER_ZEROCOPY_10BIT): the texture is R10G10B10A2 Y'CbCr, sampled as
+    // mode 3 with the frame's range / matrix (tenBit: 10-bit codes, the P016 levels) so the
+    // grade and SetSourceHdr's tone map apply as for a CPU frame.
+    bool BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t height, bool packedYuv = false,
+                        bool tenBit = false, bool fullRange = false, int matrix = 0);
     // Release all imported shared textures (call on media change / shutdown).
     void ClearSharedImports();
 #endif
@@ -507,8 +511,10 @@ private:
     struct SharedImport {
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;       // single R8G8B8A8 color view
+        VkImageView view = VK_NULL_HANDLE;       // single R8G8B8A8 (or A2B10G10R10, packed) view
         bool layoutReady = false;                // acquired UNDEFINED->GENERAL once
+        uint32_t width = 0, height = 0;          // what was imported: a reused KMT handle value
+        VkFormat format = VK_FORMAT_UNDEFINED;   // with other dims / format is re-imported
     };
     std::vector<std::pair<void*, SharedImport>> imports_;  // keyed by shared handle
     bool sharedActive_ = false;                // current frame is a shared RGBA texture
@@ -521,7 +527,7 @@ private:
     // soon as we move on, so SubmitFrame() keeps that path frame-synchronous (drains
     // the ring) exactly as before — the frame ring buys nothing there that is safe.
     bool sharedSampledThisFrame_ = false;
-    SharedImport* ImportSharedRGBA(void* handle, uint32_t w, uint32_t h);
+    SharedImport* ImportSharedRGBA(void* handle, uint32_t w, uint32_t h, VkFormat format);
 #endif
     // Pro grade: the 3D LUT at binding 3, or a 1x1x1 dummy when none is loaded.
     GradeParams grade_{};

@@ -1872,8 +1872,26 @@ void VulkanRenderer::SubmitFrame() {
 #if defined(_WIN32)
 
 VulkanRenderer::SharedImport* VulkanRenderer::ImportSharedRGBA(void* handle, uint32_t w,
-                                                               uint32_t h) {
-    for (auto& kv : imports_) if (kv.first == handle) return &kv.second;  // already imported
+                                                               uint32_t h, VkFormat format) {
+    for (auto it = imports_.begin(); it != imports_.end(); ++it) {
+        if (it->first != handle) continue;
+        SharedImport& s = it->second;
+        if (s.width == w && s.height == h && s.format == format) return &s;  // already imported
+        // The producer released a texture and a new one (other size, or RGBA <-> packed) got
+        // the same KMT handle value: drop the stale import once nothing in flight samples it.
+        // The erase moves the other entries, so the bound pointers go too (the caller rebinds).
+        ring_.waitAll();
+        sharedActive_ = false;
+        sharedImage_ = VK_NULL_HANDLE;
+        sharedMemory_ = VK_NULL_HANDLE;
+        sharedLayoutReady_ = nullptr;
+        sharedView_ = VK_NULL_HANDLE;
+        if (s.view) vkDestroyImageView(device_, s.view, nullptr);
+        if (s.image) vkDestroyImage(device_, s.image, nullptr);
+        if (s.memory) vkFreeMemory(device_, s.memory, nullptr);
+        imports_.erase(it);
+        break;
+    }
 
     SharedImport imp;
     VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
@@ -1882,7 +1900,9 @@ VulkanRenderer::SharedImport* VulkanRenderer::ImportSharedRGBA(void* handle, uin
     ici.pNext = &ext;
     ici.flags = 0;
     ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = VK_FORMAT_R8G8B8A8_UNORM;  // == DXGI_FORMAT_R8G8B8A8_UNORM (producer converted)
+    // R8G8B8A8 == DXGI_FORMAT_R8G8B8A8_UNORM (producer converted); A2B10G10R10_PACK32 ==
+    // DXGI_FORMAT_R10G10B10A2_UNORM (MEDIAPLAYER_ZEROCOPY_10BIT, packed Y'CbCr).
+    ici.format = format;
     ici.extent = {w, h, 1};
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
@@ -1921,7 +1941,8 @@ VulkanRenderer::SharedImport* VulkanRenderer::ImportSharedRGBA(void* handle, uin
     vkGetImageMemoryRequirements(device_, imp.image, &req);
     const uint32_t chosenType = FindMemoryType(req.memoryTypeBits & handleTypeBits,
                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    LOG_INFO("zc-import: RGBA reqBits=0x%x handleBits=0x%x -> type=%u size=%llu", req.memoryTypeBits,
+    LOG_INFO("zc-import: %s reqBits=0x%x handleBits=0x%x -> type=%u size=%llu",
+             format == VK_FORMAT_R8G8B8A8_UNORM ? "RGBA" : "A2B10G10R10", req.memoryTypeBits,
              handleTypeBits, chosenType, (unsigned long long)req.size);
 
     VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
@@ -1950,7 +1971,7 @@ VulkanRenderer::SharedImport* VulkanRenderer::ImportSharedRGBA(void* handle, uin
     VkImageViewCreateInfo v = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     v.image = imp.image;
     v.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    v.format = VK_FORMAT_R8G8B8A8_UNORM;
+    v.format = format;
     v.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     if (vkCreateImageView(device_, &v, nullptr, &imp.view) != VK_SUCCESS) {
         LOG_WARN("ImportSharedRGBA: view create failed");
@@ -1958,14 +1979,20 @@ VulkanRenderer::SharedImport* VulkanRenderer::ImportSharedRGBA(void* handle, uin
         vkDestroyImage(device_, imp.image, nullptr);
         return nullptr;
     }
+    imp.width = w;
+    imp.height = h;
+    imp.format = format;
     imports_.emplace_back(handle, imp);
-    LOG_INFO("VulkanRenderer: imported shared RGBA %ux%u (zero-copy #28)", w, h);
+    LOG_INFO("VulkanRenderer: imported shared %s %ux%u (zero-copy #28)",
+             format == VK_FORMAT_R8G8B8A8_UNORM ? "RGBA" : "packed Y'CbCr 10-bit", w, h);
     return &imports_.back().second;
 }
 
-bool VulkanRenderer::BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t height) {
+bool VulkanRenderer::BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t height, bool packedYuv,
+                                    bool tenBit, bool fullRange, int matrix) {
     if (!sharedHandle) return false;
-    SharedImport* imp = ImportSharedRGBA(sharedHandle, width, height);
+    SharedImport* imp = ImportSharedRGBA(sharedHandle, width, height,
+                                         packedYuv ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R8G8B8A8_UNORM);
     if (!imp) return false;
     CancelPendingUpload();  // this frame replaces one staged earlier in this iteration
     if (planes_[0].view != VK_NULL_HANDLE) DestroyTexture();  // drop CPU planes; sample the import
@@ -1974,8 +2001,15 @@ bool VulkanRenderer::BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t
     sharedMemory_ = imp->memory;
     sharedLayoutReady_ = &imp->layoutReady;
     sharedView_ = imp->view;
-    sourceMode_ = 0;  // packed RGBA (producer already did YUV->RGB); sampled by the main pipeline
-    sourceFullRange_ = 0.0f;
+    if (packedYuv) {  // MEDIAPLAYER_ZEROCOPY_10BIT: Y'CbCr in one texture, converted in sbs.frag
+        sourceMode_ = 3;
+        sourceFullRange_ = fullRange ? 1.0f : 0.0f;
+        source16_ = tenBit;  // 10-bit codes: the shader rescales them to the P016 levels
+        sourceMatrix_ = (matrix == 1 || matrix == 2) ? matrix : 0;  // anything else -> BT.709
+    } else {
+        sourceMode_ = 0;  // packed RGBA (producer already did YUV->RGB); sampled by the main pipeline
+        sourceFullRange_ = 0.0f;
+    }
     // DrawViews writes sharedView_ into the frame's descriptor set (GENERAL layout, see the
     // sharedActive_ branch of BindDescriptors).
     return true;

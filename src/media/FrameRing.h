@@ -108,6 +108,11 @@ public:
         bool gpu = false;
         void* gpuSharedTexture = nullptr;  // ID3D11Texture2D* (per-slot, decoder-owned)
         void* gpuSharedHandle = nullptr;   // legacy KMT shared handle for Vulkan import
+        // MEDIAPLAYER_ZEROCOPY_10BIT: the shared texture is R10G10B10A2 holding Y'CbCr (.r Y,
+        // .g Cb, .b Cr), not RGB; fullRange / matrix / transfer describe it and the renderer
+        // converts (sbs.frag mode 3). gpuPacked10: the codes are 10-bit (P010), else 8-bit.
+        bool gpuPackedYuv = false;
+        bool gpuPacked10 = false;
     };
 
     static constexpr int kBufferCount = 3;  // slots the latest-wins mode uses (the decoder's GPU slots)
