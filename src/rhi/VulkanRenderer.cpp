@@ -1923,6 +1923,7 @@ void VulkanRenderer::SubmitFrame() {
     // of this function), so only an unfenced shared frame drains.
     if (sharedSampledThisFrame_ && !fencedSubmit) ring_.waitAll();
     sharedSampledThisFrame_ = false;
+    if (clearAfterSubmit_) ClearSharedImports();  // deferred from mid-frame (see there)
 #endif
 }
 
@@ -2127,6 +2128,15 @@ void VulkanRenderer::DestroyFenceImport() {
 }
 
 void VulkanRenderer::ClearSharedImports() {
+    // A media change from the UI runs between this frame's draw and its submit: the open
+    // command buffer already references the bound import (and, fenced, waits its semaphore).
+    // Destroying them now would submit a frame that reads freed memory (device lost), so
+    // tear down right after SubmitFrame instead.
+    if (ring_.frameOpen() && (sharedActive_ || !imports_.empty() || zcFence_.ready)) {
+        clearAfterSubmit_ = true;
+        return;
+    }
+    clearAfterSubmit_ = false;
     // Media change / shutdown: every frame in flight may reference these imports.
     ring_.waitAll();
     DestroyFenceImport();

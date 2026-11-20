@@ -555,6 +555,9 @@ private:
     uint64_t fenceWaitValue_ = 0;         // ...and this ready value
     std::function<void(void*, uint64_t, uint64_t)> sharedReadSink_;
     bool fenceFailed_ = false;            // a submit / import failed: logged, back to the drain
+    // ClearSharedImports while a frame is open (a file opened from the UI, mid-frame): that
+    // frame's command buffer already samples an import, so the teardown waits for its submit.
+    bool clearAfterSubmit_ = false;
     void DestroyFenceImport();
 #endif
     // Pro grade: the 3D LUT at binding 3, or a 1x1x1 dummy when none is loaded.
