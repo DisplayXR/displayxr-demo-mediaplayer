@@ -24,6 +24,7 @@
 // extern "C" block below it mis-declares d3d11.h's operator==/!= as C functions.
 #if defined(_WIN32)
 #include <d3d11.h>
+#include <d3d11_4.h>  // ID3D11Fence: MEDIAPLAYER_ZEROCOPY_FENCE
 #include <d3dcompiler.h>  // D3DCompile: NV12->RGBA convert shaders (#28)
 #include <dxgi1_2.h>
 #endif
@@ -218,6 +219,17 @@ struct VideoDecoder::Impl {
     ID3D11DeviceContext* d3dContext = nullptr;
     AVD3D11VADeviceContext* d3dHwctx = nullptr;
     ID3D11Query* copyDoneQuery = nullptr;  // event query: producer waits for the copy (#28)
+    // MEDIAPLAYER_ZEROCOPY_FENCE: readyFence is signalled after each fill (the renderer's GPU
+    // waits it), readFence by the renderer once it has read a texture (our next fill of it
+    // GPU-waits that). Shared, with NT handles the renderer imports as timeline semaphores.
+    ID3D11Fence* readyFence = nullptr;
+    ID3D11Fence* readFence = nullptr;
+    HANDLE readyFenceHandle = nullptr;
+    HANDLE readFenceHandle = nullptr;
+    ID3D11DeviceContext4* ctx4 = nullptr;
+    uint64_t readyValue = 0;
+    bool fenceTried = false;               // creation attempted (once per open)
+    uint64_t fenceGen = 0;                 // VideoDecoder::fenceGen_ when this pair was made
 
     // NV12->RGBA convert pass (#28). Vulkan can't sample an imported D3D11 multiplanar NV12
     // (the driver's UV-plane alignment differs from D3D's tight pack), so we convert to a
@@ -239,6 +251,11 @@ struct VideoDecoder::Impl {
     ~Impl() {
 #if defined(_WIN32)
         if (packPS) packPS->Release();
+        if (ctx4) ctx4->Release();
+        if (readyFence) readyFence->Release();
+        if (readFence) readFence->Release();
+        if (readyFenceHandle) CloseHandle(readyFenceHandle);
+        if (readFenceHandle) CloseHandle(readFenceHandle);
         if (copyDoneQuery) copyDoneQuery->Release();
         if (srvUV) srvUV->Release();
         if (srvY) srvY->Release();
@@ -319,6 +336,19 @@ VideoDecoder::VideoDecoder() = default;
 VideoDecoder::~VideoDecoder() { Stop(); }
 
 #if defined(_WIN32)
+void VideoDecoder::NoteSharedRead(void* handle, uint64_t fenceGen, uint64_t value) {
+    if (fenceGen == 0 || fenceGen != fenceGen_.load()) return;  // another open's fences
+    std::lock_guard<std::mutex> lk(sharedReadMutex_);
+    for (auto& r : sharedRead_) {
+        if (r.texture == handle) {
+            if (r.gen != fenceGen) r = {handle, fenceGen, value};
+            else if (value > r.value) r.value = value;
+            return;
+        }
+    }
+    sharedRead_.push_back({handle, fenceGen, value});
+}
+
 void VideoDecoder::SetInteropAdapterLUID(const uint8_t* luid8) {
     std::memcpy(interopLUID_, luid8, 8);
     haveInteropLUID_ = true;
@@ -1000,7 +1030,51 @@ void VideoDecoder::DecodeLoop() {
                 ID3D11DeviceContext* ctx = impl_->d3dContext;
                 D3D11_BOX box = {0, 0, 0, (UINT)f->width, (UINT)f->height, 1};
                 impl_->d3dHwctx->lock(impl_->d3dHwctx->lock_ctx);
-                if (!impl_->copyDoneQuery) {
+                // MEDIAPLAYER_ZEROCOPY_FENCE: build the two shared fences once per open; any
+                // failure leaves them null and this open keeps the CPU wait below.
+                if (zeroCopyFence_ && !impl_->fenceTried) {
+                    impl_->fenceTried = true;
+                    ID3D11Device5* dev5 = nullptr;
+                    bool ok = SUCCEEDED(impl_->d3dDevice->QueryInterface(__uuidof(ID3D11Device5), (void**)&dev5)) &&
+                              SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void**)&impl_->ctx4));
+                    ok = ok && SUCCEEDED(dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
+                                                           (void**)&impl_->readyFence)) &&
+                         SUCCEEDED(dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
+                                                     (void**)&impl_->readFence)) &&
+                         SUCCEEDED(impl_->readyFence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr,
+                                                                         &impl_->readyFenceHandle)) &&
+                         SUCCEEDED(impl_->readFence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr,
+                                                                        &impl_->readFenceHandle));
+                    if (dev5) dev5->Release();
+                    if (ok) {
+                        impl_->fenceGen = fenceGen_.fetch_add(1) + 1;
+                        LOG_INFO("VideoDecoder: zero-copy fence ON (MEDIAPLAYER_ZEROCOPY_FENCE): shared D3D11 "
+                                 "fences, no CPU wait per frame");
+                    } else {
+                        LOG_WARN("VideoDecoder: MEDIAPLAYER_ZEROCOPY_FENCE: shared fence create failed — "
+                                 "keeping the CPU wait");
+                        if (impl_->ctx4) { impl_->ctx4->Release(); impl_->ctx4 = nullptr; }
+                        if (impl_->readyFence) { impl_->readyFence->Release(); impl_->readyFence = nullptr; }
+                        if (impl_->readFence) { impl_->readFence->Release(); impl_->readFence = nullptr; }
+                        if (impl_->readyFenceHandle) { CloseHandle(impl_->readyFenceHandle); impl_->readyFenceHandle = nullptr; }
+                        if (impl_->readFenceHandle) { CloseHandle(impl_->readFenceHandle); impl_->readFenceHandle = nullptr; }
+                    }
+                }
+                const bool fenced = impl_->readyFenceHandle && impl_->readFenceHandle && impl_->ctx4;
+                if (fenced) {
+                    // Don't overwrite this texture before the renderer's frames that read it
+                    // are done: a GPU-side wait, the CPU goes on.
+                    uint64_t readValue = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(sharedReadMutex_);
+                        // Only a value on THIS open's fence: another open's would never come.
+                        for (const auto& r : sharedRead_)
+                            if (r.texture == dst.gpuSharedHandle && r.gen == impl_->fenceGen)
+                                readValue = r.value;
+                    }
+                    if (readValue) impl_->ctx4->Wait(impl_->readFence, readValue);
+                }
+                if (!fenced && !impl_->copyDoneQuery) {
                     D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
                     impl_->d3dDevice->CreateQuery(&qd, &impl_->copyDoneQuery);
                 }
@@ -1035,11 +1109,13 @@ void VideoDecoder::DecodeLoop() {
                     ctx->OMSetRenderTargets(1, &nullRtv, nullptr);
                     rtv->Release();
                 }
-                if (impl_->copyDoneQuery) ctx->End(impl_->copyDoneQuery);
+                if (fenced) impl_->ctx4->Signal(impl_->readyFence, ++impl_->readyValue);
+                else if (impl_->copyDoneQuery) ctx->End(impl_->copyDoneQuery);
                 ctx->Flush();
                 // Block until the GPU finishes, so the published frame's memory is coherent for
-                // the Vulkan sample (which happens later, on the render thread).
-                if (impl_->copyDoneQuery) {
+                // the Vulkan sample (which happens later, on the render thread). Fenced: the
+                // renderer's GPU waits readyFence instead.
+                if (!fenced && impl_->copyDoneQuery) {
                     BOOL done = FALSE;
                     for (int i = 0; i < 2000; ++i) {  // ~100ms cap; a wedged GPU can't hang us
                         if (ctx->GetData(impl_->copyDoneQuery, &done, sizeof(done), 0) == S_OK)
@@ -1058,6 +1134,10 @@ void VideoDecoder::DecodeLoop() {
                     dst.fullRange = f->color_range == AVCOL_RANGE_JPEG;
                     dst.gpuPacked10 = tenBit;
                 }
+                dst.gpuFenceValue = fenced ? impl_->readyValue : 0;
+                dst.gpuReadyFence = fenced ? impl_->readyFenceHandle : nullptr;
+                dst.gpuReadFence = fenced ? impl_->readFenceHandle : nullptr;
+                dst.gpuFenceGen = fenced ? impl_->fenceGen : 0;
                 dst.matrix = MatrixOf(f, impl_->codec);  // (applied above; the tag is for the UI / tools)
                 dst.transfer = TransferOf(f, impl_->codec);
                 dst.primaries2020 = PrimariesAre2020(f, impl_->codec);
@@ -1556,6 +1636,14 @@ void VideoDecoder::Stop() {
         b.gpu = false;
         b.gpuPackedYuv = false;
         b.gpuPacked10 = false;
+        b.gpuFenceValue = 0;
+        b.gpuReadyFence = nullptr;
+        b.gpuReadFence = nullptr;
+        b.gpuFenceGen = 0;
+    }
+    {
+        std::lock_guard<std::mutex> lk(sharedReadMutex_);
+        sharedRead_.clear();
     }
 #endif
     impl_.reset();

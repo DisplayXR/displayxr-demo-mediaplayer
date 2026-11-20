@@ -153,6 +153,15 @@ public:
     // to Y'CbCr in a 10-bit shared texture the renderer converts (Frame::gpuPackedYuv). Off =
     // today's behaviour: those take the CPU path. Call before Open().
     void SetZeroCopy10Bit(bool on) { zeroCopy10Bit_ = on; }
+    // MEDIAPLAYER_ZEROCOPY_FENCE: order the zero-copy texture with two shared D3D11 fences
+    // (Frame::gpuReadyFence / gpuReadFence) instead of a CPU wait here and a wait-for-idle in
+    // the renderer. Call before Open().
+    void SetZeroCopyFence(bool on) { zeroCopyFence_ = on; }
+    // The renderer's frames that sampled the shared texture `handle` are done once the read
+    // fence of generation `fenceGen` (the Frame's gpuFenceGen) reaches `value`; the next
+    // refill of that texture GPU-waits it. A note for another generation is ignored (its
+    // value would never come on this open's fence). Any thread.
+    void NoteSharedRead(void* handle, uint64_t fenceGen, uint64_t value);
 #endif
 
     bool IsOpen() const { return open_; }
@@ -219,6 +228,11 @@ private:
     bool warnedZeroCopyFormat_ = false;  // logged once: a non-NV12 surface took the CPU path
     bool warnedZeroCopyHdr_ = false;     // logged once: an HLG / PQ stream took the CPU path (#169)
     bool zeroCopy10Bit_ = false;         // MEDIAPLAYER_ZEROCOPY_10BIT (SetZeroCopy10Bit)
+    bool zeroCopyFence_ = false;         // MEDIAPLAYER_ZEROCOPY_FENCE (SetZeroCopyFence)
+    std::mutex sharedReadMutex_;         // guards sharedRead_
+    struct SharedRead { void* texture; uint64_t gen; uint64_t value; };
+    std::atomic<uint64_t> fenceGen_{0};  // bumped per fence pair created; 0 = none
+    std::vector<SharedRead> sharedRead_;  // per texture: read fence + the value to wait
     bool loggedZeroCopyPacked_ = false;  // logged once: the packed 10-bit path is in use
 #endif
     std::thread thread_;

@@ -1844,7 +1844,64 @@ bool VulkanRenderer::DrawViews(uint32_t imageIndex, const XrSession::ViewRect* r
 
 void VulkanRenderer::SubmitFrame() {
     if (!ring_.frameOpen()) return;
+#if defined(_WIN32)
+    // MEDIAPLAYER_ZEROCOPY_FENCE: wait the producer's ready value on the GPU. The ring's one
+    // submit takes only binary waits, so a wait-only submit ahead of it turns the timeline
+    // wait into the binary bridge semaphore the frame waits.
+    bool fencedSubmit = false;
+    if (sharedSampledThisFrame_ && fenceBound_ && !fenceFailed_ && zcFence_.ready && zcBridge_) {
+        const uint64_t waitVal = fenceWaitValue_;
+        const uint64_t zero = 0;
+        VkTimelineSemaphoreSubmitInfoKHR tsi = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+        tsi.waitSemaphoreValueCount = 1;
+        tsi.pWaitSemaphoreValues = &waitVal;
+        tsi.signalSemaphoreValueCount = 1;
+        tsi.pSignalSemaphoreValues = &zero;  // binary: ignored
+        const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.pNext = &tsi;
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &zcFence_.ready;
+        si.pWaitDstStageMask = &stage;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &zcBridge_;
+        if (vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
+            fencedSubmit = true;
+        } else {
+            fenceFailed_ = true;
+            LOG_ERROR("zero-copy fence: wait submit failed, back to draining the ring (logged once)");
+        }
+    }
+    const VkPipelineStageFlags bridgeStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const VkResult r = fencedSubmit ? ring_.endFrame(&zcBridge_, &bridgeStage, 1)
+                                    : ring_.endFrame();  // EXACTLY one vkQueueSubmit, slot fence, no wait
+    if (fencedSubmit && r == VK_SUCCESS) {
+        // Signal the read fence after everything submitted so far (this frame included):
+        // the producer's next fill of this texture GPU-waits it.
+        const uint64_t sigVal = zcFence_.readValue + 1;
+        VkTimelineSemaphoreSubmitInfoKHR tsi = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+        tsi.signalSemaphoreValueCount = 1;
+        tsi.pSignalSemaphoreValues = &sigVal;
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.pNext = &tsi;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &zcFence_.read;
+        if (vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
+            zcFence_.readValue = sigVal;
+            if (sharedReadSink_) sharedReadSink_(boundSharedHandle_, zcFence_.gen, sigVal);
+        } else {
+            // Unreported: the producer's next fill of this texture would not wait for us, so
+            // drain (below) to finish this frame's read first.
+            fenceFailed_ = true;
+            fencedSubmit = false;
+            LOG_ERROR("zero-copy fence: signal submit failed, back to draining the ring (logged once)");
+        }
+    } else if (fencedSubmit) {
+        fencedSubmit = false;  // the frame never went: drain as before
+    }
+#else
     const VkResult r = ring_.endFrame();  // EXACTLY one vkQueueSubmit, slot fence, no wait
+#endif
     ++frameSerial_;  // staging marked with the old value belongs to a submitted frame now
     if (r != VK_SUCCESS && !submitErrLogged_) {
         submitErrLogged_ = true;
@@ -1862,10 +1919,10 @@ void VulkanRenderer::SubmitFrame() {
     // desktop GPUs have no Adreno-style busy-% governor, and this path cannot be made
     // asynchronous safely without a cross-API semaphore. The keyed-mutex experiment
     // (MEDIAPLAYER_ZC_KM, off by default) was dropped: it needed its own submit pNext.
-    if (sharedSampledThisFrame_) {
-        ring_.waitAll();
-        sharedSampledThisFrame_ = false;
-    }
+    // MEDIAPLAYER_ZEROCOPY_FENCE: a fenced frame was ordered on the GPU instead (see the top
+    // of this function), so only an unfenced shared frame drains.
+    if (sharedSampledThisFrame_ && !fencedSubmit) ring_.waitAll();
+    sharedSampledThisFrame_ = false;
 #endif
 }
 
@@ -2001,6 +2058,8 @@ bool VulkanRenderer::BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t
     sharedMemory_ = imp->memory;
     sharedLayoutReady_ = &imp->layoutReady;
     sharedView_ = imp->view;
+    boundSharedHandle_ = sharedHandle;
+    fenceBound_ = false;  // SetSharedFence arms it for a fenced frame
     if (packedYuv) {  // MEDIAPLAYER_ZEROCOPY_10BIT: Y'CbCr in one texture, converted in sbs.frag
         sourceMode_ = 3;
         sourceFullRange_ = fullRange ? 1.0f : 0.0f;
@@ -2015,9 +2074,66 @@ bool VulkanRenderer::BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t
     return true;
 }
 
+bool VulkanRenderer::SetSharedFence(void* readyFence, void* readFence, uint64_t gen, uint64_t value) {
+    fenceBound_ = false;
+    if (!readyFence || !readFence || gen == 0 || fenceFailed_) return false;
+    if (zcFence_.gen != gen) {
+        DestroyFenceImport();
+        auto pfnImport = (PFN_vkImportSemaphoreWin32HandleKHR)vkGetDeviceProcAddr(
+            device_, "vkImportSemaphoreWin32HandleKHR");
+        if (!pfnImport) {
+            fenceFailed_ = true;
+            LOG_WARN("zero-copy fence: no vkImportSemaphoreWin32HandleKHR, keeping the drain");
+            return false;
+        }
+        VkSemaphoreTypeCreateInfoKHR tci = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR};
+        tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE_KHR;
+        tci.initialValue = 0;
+        VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        sci.pNext = &tci;
+        bool ok = vkCreateSemaphore(device_, &sci, nullptr, &zcFence_.ready) == VK_SUCCESS &&
+                  vkCreateSemaphore(device_, &sci, nullptr, &zcFence_.read) == VK_SUCCESS;
+        VkSemaphoreCreateInfo bci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        ok = ok && (zcBridge_ || vkCreateSemaphore(device_, &bci, nullptr, &zcBridge_) == VK_SUCCESS);
+        for (int i = 0; ok && i < 2; ++i) {
+            VkImportSemaphoreWin32HandleInfoKHR ii = {VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR};
+            ii.semaphore = i == 0 ? zcFence_.ready : zcFence_.read;
+            ii.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE_BIT;
+            ii.handle = (HANDLE)(i == 0 ? readyFence : readFence);
+            ok = pfnImport(device_, &ii) == VK_SUCCESS;
+        }
+        if (!ok) {
+            DestroyFenceImport();
+            fenceFailed_ = true;
+            LOG_WARN("zero-copy fence: semaphore import failed, keeping the drain");
+            return false;
+        }
+        zcFence_.gen = gen;
+        zcFence_.readValue = 0;
+        LOG_INFO("VulkanRenderer: zero-copy fence imported (generation %llu): GPU-ordered, no drain",
+                 (unsigned long long)gen);
+    }
+    fenceBound_ = true;
+    fenceWaitValue_ = value;
+    return true;
+}
+
+void VulkanRenderer::DestroyFenceImport() {
+    if (zcFence_.ready || zcFence_.read) ring_.waitAll();  // in-flight submits reference them
+    if (zcFence_.ready) vkDestroySemaphore(device_, zcFence_.ready, nullptr);
+    if (zcFence_.read) vkDestroySemaphore(device_, zcFence_.read, nullptr);
+    zcFence_ = FenceImport{};
+    fenceBound_ = false;
+}
+
 void VulkanRenderer::ClearSharedImports() {
     // Media change / shutdown: every frame in flight may reference these imports.
     ring_.waitAll();
+    DestroyFenceImport();
+    if (zcBridge_) {
+        vkDestroySemaphore(device_, zcBridge_, nullptr);
+        zcBridge_ = VK_NULL_HANDLE;
+    }
     for (auto& kv : imports_) {
         SharedImport& s = kv.second;
         if (s.view) vkDestroyImageView(device_, s.view, nullptr);

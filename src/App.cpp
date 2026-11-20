@@ -363,6 +363,12 @@ bool App::Initialize(const char* mediaPath) {
         LOG_ERROR("Vulkan renderer initialization failed");
         return false;
     }
+#if defined(_WIN32)
+    // MEDIAPLAYER_ZEROCOPY_FENCE: each fenced read goes straight back to the decoder, so its
+    // next fill of that texture GPU-waits our frames rather than overwriting them.
+    renderer_.SetSharedReadSink(
+        [this](void* tex, uint64_t gen, uint64_t value) { video_.NoteSharedRead(tex, gen, value); });
+#endif
     // Transparent-background experiment: when the session was created with it, clear
     // the letterbox to alpha 0 so the runtime composes those pixels through.
     renderer_.SetTransparentLetterbox(xr_.TransparentBackground());
@@ -1077,6 +1083,11 @@ void App::RenderOneFrame() {
                                                  (uint32_t)vf->height, vf->gpuPackedYuv, vf->gpuPacked10,
                                                  vf->fullRange, (int)vf->matrix);
                 packedBound = bound && vf->gpuPackedYuv;
+                // MEDIAPLAYER_ZEROCOPY_FENCE: the producer did not CPU-wait this frame; our GPU
+                // waits its ready fence instead.
+                if (bound && vf->gpuFenceValue)
+                    renderer_.SetSharedFence(vf->gpuReadyFence, vf->gpuReadFence, vf->gpuFenceGen,
+                                             vf->gpuFenceValue);
             }
 #else
             const bool packedBound = false;
@@ -2050,6 +2061,9 @@ bool App::LoadMediaFile(const std::string& path) {
         // go zero-copy too, as packed Y'CbCr the renderer converts; off = the CPU path for them.
         const char* zc10 = std::getenv("MEDIAPLAYER_ZEROCOPY_10BIT");
         video_.SetZeroCopy10Bit(zc10 && *zc10 && *zc10 != '0');
+        // MEDIAPLAYER_ZEROCOPY_FENCE=1: order the zero-copy frame with shared D3D11 fences on
+        // the GPU (the device was made with timeline semaphores for it) instead of CPU waits.
+        video_.SetZeroCopyFence(xr_.ZeroCopyFenceCapable());
 #endif
         // Probe BEFORE opening for playback: a bounded, software-only pre-roll on its own
         // context. See VideoStereoProbe.h for why this is synchronous rather than
