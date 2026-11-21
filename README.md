@@ -369,6 +369,27 @@ Kill the sender to watch it reconnect, then start it again and the picture comes
 | `MEDIAPLAYER_URL=<u>` | opens at launch when the command line names nothing else, and prefills the Stream URL field |
 | **Ctrl+U** | the Stream URL field |
 
+## Settings (#265)
+
+The gear at the right end of the top bar, **Ctrl+,** (Cmd+, on macOS), or "Settings..." in
+the "..." menu opens the **Settings** window. Esc closes it. Changes apply at once and are
+kept in `settings.txt`, beside the Recent list (`%APPDATA%\DisplayXR\MediaPlayer\` on
+Windows, `~/Library/Application Support/DisplayXR/MediaPlayer/` on macOS,
+`~/.config/displayxr/mediaplayer/` on Linux). The file is `key=value` lines and may be
+edited by hand: comments and keys the player does not know are kept when it saves. With no
+file the player behaves as before.
+
+| Key | Default | Row |
+|---|---|---|
+| `browser.enabled` | `1` | Use the media browser for Open (Windows; off = the system file dialog) |
+| `browser.at_start` | `1` | Start in the media browser when opened with no file |
+| `browser.source.index` | `1` | Show Media folders (the Windows Search index) |
+| `browser.source.libraries` | `1` | Show Pictures, Videos, Downloads |
+
+`MEDIAPLAYER_SETTINGS_FILE=<path>` uses another file (`off` = keep nothing). A browser test
+run (`MEDIAPLAYER_SHOW_BROWSER`) leaves the user's file alone unless that variable is set.
+Media Player Pro keeps its own file; its rows are in the Pro user guide.
+
 ## Media Player Pro (Windows, macOS)
 
 The same source tree also builds **Media Player Pro** (`mediaplayer_pro_handle_vk_<plat>`), a

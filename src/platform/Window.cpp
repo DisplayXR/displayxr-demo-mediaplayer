@@ -262,6 +262,12 @@ bool Window::PumpEvents() {
                     else openFileRequested_ = true;                               // Ctrl+O — open
                 }
                 if (e.key.key == SDLK_U && (e.key.mod & SDL_KMOD_CTRL)) openUrlRequested_ = true;  // Ctrl+U — stream URL (#93)
+#if defined(__APPLE__)
+                if (e.key.key == SDLK_COMMA && (e.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI)))  // Cmd+, is the Mac's
+#else
+                if (e.key.key == SDLK_COMMA && (e.key.mod & SDL_KMOD_CTRL))
+#endif
+                    openSettingsRequested_ = true;  // the Settings window (#265)
                 if (e.key.key == SDLK_F || e.key.key == SDLK_F11) ToggleFullscreen();
             }
         }
@@ -339,6 +345,12 @@ bool Window::TakeTogglePauseRequest() {
 bool Window::TakeOpenFileRequest() {
     bool v = openFileRequested_;
     openFileRequested_ = false;
+    return v;
+}
+
+bool Window::TakeOpenSettingsRequest() {
+    bool v = openSettingsRequested_;
+    openSettingsRequested_ = false;
     return v;
 }
 

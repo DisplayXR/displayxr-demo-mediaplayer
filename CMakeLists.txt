@@ -293,6 +293,7 @@ function(mp_add_player tgt is_pro)
         src/media/SpatialMedia.cpp   # MV-HEVC / HEIC eye order + HEIF box walk (#154), pure
         src/media/MediaSource.cpp
         src/media/RecentList.cpp     # desktop Recent menu (#252 phase 0)
+        src/media/Settings.cpp       # settings.txt beside recent.txt (#265)
         src/media/StereoCompose.cpp
         src/media/StereoDetect.cpp
         src/media/VideoStereoProbe.cpp
@@ -314,6 +315,7 @@ function(mp_add_player tgt is_pro)
         # is hand-curated and desktop CI cannot catch the resulting Android link error.
         src/ui/TransportUI.cpp
         src/ui/Icons.cpp  # every icon the chrome draws, shared with the browser (#180)
+        src/ui/SettingsPanel.cpp  # the Settings window; rows come from each product (#265)
         src/ui/UiText.cpp  # fitting and wrapping text (#180)
         src/media/FrameRing.h  # header-only triple buffer
         # The media browser (#160 Android, #252 desktop; docs/BROWSER.md). Mirrors the
@@ -786,6 +788,14 @@ if(MP_BUILD_TESTS)
         target_link_libraries(recent_list_test PRIVATE shell32 ole32)
     endif()
     add_test(NAME recent_list COMMAND recent_list_test)
+
+    # Settings store (#265): round trip keeps unknown lines, defaults + clamping, file I/O.
+    add_executable(settings_test tests/settings_test.cpp src/media/Settings.cpp src/media/RecentList.cpp)
+    target_include_directories(settings_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(settings_test PRIVATE shell32 ole32)
+    endif()
+    add_test(NAME settings COMMAND settings_test)
 
     # Desktop browser (#252 phase 1): a MANUAL probe of the Search index, libraries and
     # shell thumbnails on a real box. Not a ctest test: its results depend on the machine.

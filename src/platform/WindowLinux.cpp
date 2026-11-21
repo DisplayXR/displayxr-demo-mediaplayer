@@ -302,6 +302,7 @@ void Window::HandleLinuxKey(uint32_t ks, uint32_t mods, bool repeat, bool* quit)
             break;
         case XK_o: if (ctrl) openFileRequested_ = true; break;    // Ctrl+O — open
         case XK_u: if (ctrl) openUrlRequested_ = true; break;     // Ctrl+U — stream URL (#93)
+        case XK_comma: if (ctrl) openSettingsRequested_ = true; break;  // Ctrl+, — Settings (#265)
         case XK_f: ToggleFullscreen(); break;
         // F11 is the window helper's own (it toggles fullscreen inside the pump).
         default: break;

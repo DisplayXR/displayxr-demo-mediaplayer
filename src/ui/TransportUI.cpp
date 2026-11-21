@@ -754,8 +754,9 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             // A narrow window: the buttons that no longer fit before the slideshow icon are
             // left out, from the right. The bar stays one row.
             const ImGuiStyle& bst = ImGui::GetStyle();
+            const float gearW = s.caps.settings ? iconSz + bst.ItemSpacing.x : 0.0f;  // dropped last
             const float barLimit = ImGui::GetWindowWidth() - bst.WindowPadding.x -
-                                   (s.caps.slideshow ? iconSz + bst.ItemSpacing.x : 0.0f);
+                                   (s.caps.slideshow ? iconSz + bst.ItemSpacing.x : 0.0f) - gearW;
             bool barFull = false;
             auto fits = [&](float w) {
                 if (barFull) return false;
@@ -772,11 +773,12 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 ImGui::SameLine();
                 CameraCombo(s, a);
             }
-            if (s.caps.moreMenu && (s.caps.mode || (s.caps.layout && s.hasMedia) || !s.convertProviders.empty()) &&
+            if (s.caps.moreMenu &&
+                (s.caps.mode || (s.caps.layout && s.hasMedia) || !s.convertProviders.empty() || s.caps.settings) &&
                 fits(iconSz)) {
                 ImGui::SameLine();
                 if (IconButton("##more", Glyph::More, iconSz, false, s.hitTargetScale)) ImGui::OpenPopup("##more_menu");
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Display mode, layout, 2D->3D converter");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Display mode, layout, 2D->3D converter, settings");
             }
             if (s.caps.moreMenu && ImGui::BeginPopup("##more_menu")) {
                 // Rows that cycle keep the menu open, so a few clicks walk the choices.
@@ -808,6 +810,10 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                         ImGui::EndDisabled();
                         ImGui::PopID();
                     }
+                }
+                if (s.caps.settings) {
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Settings...", "Ctrl+,")) Fire(a.OpenSettings);
                 }
                 ImGui::EndPopup();
             }
@@ -954,7 +960,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 // shortened to fit rather than run under the icon (#252 phase 0 review).
                 const ImGuiStyle& st = ImGui::GetStyle();
                 const float right = ImGui::GetWindowWidth() - st.WindowPadding.x -
-                                    (s.caps.slideshow ? iconSz + st.ItemSpacing.x : 0.0f);
+                                    (s.caps.slideshow ? iconSz + st.ItemSpacing.x : 0.0f) - gearW;
                 const float room = right - ImGui::GetCursorPosX();
                 if (room > ImGui::CalcTextSize("...").x) {
                     const std::string name = FitText(s.mediaFilename, room);
@@ -973,13 +979,21 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             // the ones that do not fit are left out above.
             // A window too narrow for even Open beside it leaves the icon out (it would draw
             // over Open's menu arrow).
-            const float slideX = ImGui::GetWindowWidth() - iconSz - ImGui::GetStyle().WindowPadding.x;
+            const float slideX = ImGui::GetWindowWidth() - iconSz - ImGui::GetStyle().WindowPadding.x - gearW;
             if (s.caps.slideshow &&
                 ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetStyle().ItemSpacing.x <= slideX) {
                 ImGui::SameLine(slideX);
                 if (IconButton("##slideshow", Glyph::Slideshow, iconSz, s.slideshowActive,
                                s.hitTargetScale))
                     Fire(a.ToggleSlideshow);
+            }
+            // The gear (#265): the last icon at the far right.
+            const float gearX = ImGui::GetWindowWidth() - iconSz - ImGui::GetStyle().WindowPadding.x;
+            if (s.caps.settings &&
+                ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetStyle().ItemSpacing.x <= gearX) {
+                ImGui::SameLine(gearX);
+                if (IconButton("##settings", Glyph::Settings, iconSz, false, s.hitTargetScale)) Fire(a.OpenSettings);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Settings (Ctrl+,)");
             }
         }
         if (!s.stripOnly) {

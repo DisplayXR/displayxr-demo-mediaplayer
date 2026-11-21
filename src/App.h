@@ -8,6 +8,7 @@
 #include "media/AudioMeter.h"
 #include "media/AudioPlayer.h"
 #include "media/RecentList.h"
+#include "media/Settings.h"
 #include "media/AutoConvergence.h"
 #include "media/CameraSource.h"
 #include "media/InputProviderClient.h"
@@ -18,6 +19,7 @@
 #include "platform/Window.h"
 #include "rhi/VulkanRenderer.h"
 #include "ui/ImGuiLayer.h"
+#include "ui/SettingsPanel.h"
 #include "ui/TransportUI.h"
 #include "xr/XrSession.h"
 #if defined(_WIN32)
@@ -70,6 +72,7 @@ public:
         // Media Player Pro station (src/pro/Station.h); ignored by the base player.
         std::vector<std::string> proInputs;  // --input="Name=spec", --decklink..., --test-signal
         float proBudget[5] = {-2.0f, 1.0f, 1.0f, 2.0f, -0.3f};  // near %, far %, vertical px, dE, edge %
+        unsigned proBudgetFromCli = 0;  // bit i: proBudget[i] came from the command line (wins over settings)
         bool proTimecode = true;             // --no-timecode
         double proSeqFps = 24.0;             // --seq-fps: EXR / DPX / TIFF sequence rate
         std::string proCompare;              // --compare=<file>: the B clip (B swaps A/B)
@@ -470,6 +473,17 @@ private:
     // (empty = not kept). Arrow-key walks and the slideshow do not add to it.
     RecentList recent_;
     std::string recentFile_;
+    // Settings (#265): settings.txt beside recent.txt, and the window that edits it. Saved
+    // ~0.5 s after the last change (never mid-drag) and at shutdown.
+    Settings settings_;
+    ui::SettingsPanel settingsPanel_;
+    uint64_t settingsGen_ = 0;
+    std::chrono::steady_clock::time_point settingsChangedAt_{};
+    void RegisterSettingsRows();
+    void TickSettings(bool flush);
+    void OpenSettings(const char* via);  // the gear / menu ("ui"), Ctrl+, ("key"), Pro's Station ("station")
+    // The media browser may serve Open (it exists and the setting allows it).
+    bool BrowserAllowed() const;
 
 #if MEDIAPLAYER_BROWSER
     std::unique_ptr<browser::WindowsMediaProvider> browserProvider_;
