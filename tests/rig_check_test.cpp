@@ -736,8 +736,157 @@ void ThreadedDownsampleIsExact() {
 #endif
 }
 
+// #268: the dense map recovers each disc's disparity. The disc centres follow the test
+// signal's motion (TestSignalSource.cpp DrawEye: base position + sway / bob, each eye
+// shifted by half the disparity); the cells well inside a disc read its parallax.
+void DenseMapRecoversDiscs() {
+    struct D {
+        float cx, cy, r;
+    };
+    const D base[TestSignalSource::kDiscs] = {{0.30f, 0.55f, 0.14f}, {0.55f, 0.40f, 0.12f}, {0.75f, 0.62f, 0.10f},
+                                              {0.15f, 0.30f, 0.07f}};
+    for (float scale : {1.0f, 1.5f}) {
+        TestSignalConfig cfg;
+        cfg.depthScale = scale;
+        cfg.vShiftPx = 4.0f;  // a real rig's small vertical error must not lose the map
+        const int64_t frame = 30;
+        livepix::Nv12 px;
+        TestSignalSource::Render(cfg, frame, px);
+        rig::EyePair e;
+        CHECK(rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, e), "dense: downsample");
+        const rig::DenseMap m = rig::MeasureDense(e);
+        std::printf("  dense x%.1f: %dx%d cells, %d matched, %d filled, %.2f ms\n", scale, m.cols, m.rows, m.matched,
+                    m.filled, m.ms);
+        CHECK(m.Ok() && m.cols >= 36 && m.rows >= 18, "dense: about 40 x 20 cells");
+        const double t = (double)frame / cfg.fps;
+        const float w = (float)cfg.eyeW, h = (float)cfg.eyeH;
+        for (int d = 0; d < TestSignalSource::kDiscs; ++d) {
+            const float want = TestSignalSource::kDisparity[d] * scale * 100.f;
+            const float sway = 0.04f * (float)std::sin(t * (0.6 + 0.25 * d) + d);
+            const float bob = 0.05f * (float)std::sin(t * (0.9 + 0.3 * d) + 2 * d);
+            const float cx = ((base[d].cx + sway) * w - 0.5f * want / 100.f * w) / w;  // left eye, 0..1
+            const float cy = (base[d].cy + bob);
+            const float r = base[d].r * h;
+            std::vector<float> in;
+            for (int j = 0; j < m.rows; ++j)
+                for (int i = 0; i < m.cols; ++i) {
+                    const float p = m.pct[(size_t)j * m.cols + i];
+                    const float dx = (m.u0 + i * m.du - cx) * w, dy = (m.v0 + j * m.dv - cy) * h;
+                    if (!std::isnan(p) && dx * dx + dy * dy < 0.36f * r * r) in.push_back(p);
+                }
+            float got = 1e9f;
+            if (!in.empty()) {
+                std::nth_element(in.begin(), in.begin() + in.size() / 2, in.end());
+                got = in[in.size() / 2];
+            }
+            std::printf("    disc %d: want %+.2f%% got %+.3f%% (%zu cells)\n", d, want, got, in.size());
+            char msg[96];
+            std::snprintf(msg, sizeof(msg), "dense x%.1f: disc %d within 0.1%% of width", scale, d);
+            CHECK(!in.empty() && std::fabs(got - want) < 0.1f, msg);
+        }
+        // the histogram of the sparse matches peaks at each disc's depth
+        const auto tm = std::chrono::steady_clock::now();
+        const rig::Result r = rig::Measure(e);
+        std::printf("    sparse Measure %.2f ms\n",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tm).count());
+        const std::vector<int> hist = rig::Histogram(r.parallaxPct, rig::kHistLoPct, rig::kHistHiPct, rig::kHistBins);
+        int total = 0;
+        for (int c : hist) total += c;
+        CHECK(total == (int)r.parallaxPct.size(), "histogram counts every match");
+        for (int d = 0; d < TestSignalSource::kDiscs; ++d) {
+            const float want = TestSignalSource::kDisparity[d] * scale * 100.f;
+            const int b = std::clamp((int)std::floor((want - rig::kHistLoPct) * rig::kHistBins /
+                                                     (rig::kHistHiPct - rig::kHistLoPct)), 0, rig::kHistBins - 1);
+            int n = 0;
+            for (int k = std::max(0, b - 1); k <= std::min(rig::kHistBins - 1, b + 1); ++k) n += hist[k];
+            char msg[96];
+            std::snprintf(msg, sizeof(msg), "histogram x%.1f: a peak at disc %d (%+.1f%%)", scale, d, want);
+            CHECK(n >= 2, msg);
+        }
+        // the cursor probe at a disc centre reads that disc
+        for (int d = 0; d < TestSignalSource::kDiscs; ++d) {
+            const float want = TestSignalSource::kDisparity[d] * scale * 100.f;
+            const float sway = 0.04f * (float)std::sin(t * (0.6 + 0.25 * d) + d);
+            const float bob = 0.05f * (float)std::sin(t * (0.9 + 0.3 * d) + 2 * d);
+            float pct = 0, conf = 0;
+            const rig::Probe pr = rig::ProbeAt(e, base[d].cx + sway - 0.5f * want / 100.f, base[d].cy + bob, pct, conf);
+            std::printf("    probe disc %d: state %d %+.3f%% (ncc %.2f)\n", d, (int)pr, pct, conf);
+            char msg[96];
+            std::snprintf(msg, sizeof(msg), "probe x%.1f: disc %d read", scale, d);
+            CHECK(pr == rig::Probe::Ok && std::fabs(pct - want) < 0.15f, msg);
+        }
+    }
+    // an untextured point reads "flat"
+    {
+        rig::EyePair e;
+        e.eyeW = 640;
+        e.h = 360;
+        e.left.assign((size_t)640 * 360, 80.f);
+        e.right = e.left;
+        float pct, conf;
+        CHECK(rig::ProbeAt(e, 0.5f, 0.5f, pct, conf) == rig::Probe::Flat, "probe: a flat area reads flat");
+    }
+}
+
+// #268: readings in full-resolution DISPLAYED pixels - a half-SBS eye is shown at twice
+// its stored width, so it reports the same px as the full-SBS master.
+void DisplayedPixels() {
+    TestSignalConfig cfg;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    rig::EyePair full, half;
+    CHECK(rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, full), "px: full downsamples");
+    CHECK(rig::Downsample(ToFrame(Squeeze(px)), StereoLayout::SbsHalf, 640, half), "px: half downsamples");
+    const rig::Result a = rig::Measure(full), b = rig::Measure(half);
+    std::printf("  px: full near %+.2f%% = %+.1f px (%.2f px/%%), half near %+.2f%% = %+.1f px (%.2f px/%%), median %+.2f%%\n",
+                a.nearPct, a.Px(a.nearPct), a.pxPerPct, b.nearPct, b.Px(b.nearPct), b.pxPerPct, a.medianPct);
+    CHECK(std::fabs(a.pxPerPct - 19.2f) < 1e-3f, "px: full SBS 1920 px eye = 19.2 px per %");
+    CHECK(std::fabs(b.pxPerPct - 19.2f) < 1e-3f, "px: half SBS 960 px stored, shown 1920 = 19.2 px per %");
+    CHECK(std::fabs(a.Px(a.nearPct) - (-2.0f * 19.2f)) < 0.35f * 19.2f, "px: the front disc is ~-38 px");
+    CHECK(std::fabs(a.Px(a.nearPct) - b.Px(b.nearPct)) < 0.3f * 19.2f, "px: half SBS reports displayed px like full");
+    CHECK(a.medianPct >= a.nearPct && a.medianPct <= a.farPct, "median within near..far");
+}
+
+// #268 on the monitor: the dense pass runs only while enabled (and maps the measured pair),
+// and the cursor probe answers off the caller's thread.
+void MonitorDenseAndProbe() {
+    TestSignalConfig cfg;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    const std::vector<uint8_t> rgba = ToRgba(px);
+    rig::RigMonitor m;
+    m.SubmitStill(rgba.data(), px.width, px.height, StereoLayout::SbsFull, false);
+    for (int i = 0; i < 500 && m.History(1e9).empty(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(m.Last().ok, "monitor: the still is measured");
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    CHECK(m.Dense().seq == 0, "monitor: no dense pass while the heatmap is off");
+    m.SetDenseEnabled(true);
+    for (int i = 0; i < 300 && !m.Dense().Ok(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const rig::DenseMap d = m.Dense();
+    std::printf("  monitor dense: seq %llu, %d matched, %.2f ms\n", (unsigned long long)d.seq, d.matched, d.ms);
+    CHECK(d.Ok(), "monitor: the dense map arrives once enabled");
+    m.SetDenseEnabled(false);
+    CHECK(!m.Dense().Ok(), "monitor: off clears the map");
+    // the front disc (frame 30 of the test signal, its left-eye centre)
+    const double t = 30.0 / cfg.fps;
+    const float u = 0.30f + 0.04f * (float)std::sin(t * 0.6) + 0.5f * 0.02f;
+    const float v = 0.55f + 0.05f * (float)std::sin(t * 0.9);
+    rig::Probe s = rig::Probe::None;
+    float pct = 0, conf = 0;
+    CHECK(!m.ProbeResult(s, pct, conf), "monitor: no probe result before a request");
+    m.RequestProbe(u, v);
+    bool got = false;
+    for (int i = 0; i < 300 && !(got = m.ProbeResult(s, pct, conf)); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::printf("  monitor probe: state %d %+.3f%%\n", (int)s, pct);
+    CHECK(got && s == rig::Probe::Ok && std::fabs(pct + 2.0f) < 0.15f, "monitor: the probe thread reads the front disc");
+}
+
 int main() {
     ThreadedDownsampleIsExact();
+    DenseMapRecoversDiscs();
+    DisplayedPixels();
+    MonitorDenseAndProbe();
     CleanRig();
     VerticalFault();
     ColourFault();

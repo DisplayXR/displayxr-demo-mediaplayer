@@ -12,6 +12,7 @@
 #include <ctime>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <thread>
 
 namespace mp::rig {
@@ -322,7 +323,7 @@ namespace {
 // against periodic texture). On success dx / dy are where it sits in `b` minus where it
 // sits in `a`, analysis px. tpl is scratch (bs * bs).
 bool MatchAt(const std::vector<float>& a, const std::vector<float>& b, int W, int H, const Options& o, int bx, int by,
-             int R, int D, std::vector<float>& tpl, float& outDx, float& outDy) {
+             int R, int D, std::vector<float>& tpl, float& outDx, float& outDy, float* outScore = nullptr) {
     const int bs = o.block;
     float mean = 0;
     for (int j = 0; j < bs; ++j)
@@ -381,6 +382,7 @@ bool MatchAt(const std::vector<float>& a, const std::vector<float>& b, int W, in
                       Ncc(b, W, tpl.data(), norm, bs, bx + bdx, by + bdy + 1));
     outDx = (float)bdx + fx;
     outDy = (float)bdy + fy;
+    if (outScore) *outScore = best;
     return true;
 }
 
@@ -503,6 +505,8 @@ Result Measure(const EyePair& e, const Options& o) {
     auto pct = [&](float q) { return sorted[(size_t)std::lround(q * (float)(sorted.size() - 1))]; };
     r.nearPct = pct(0.02f);
     r.farPct = pct(0.98f);
+    r.medianPct = pct(0.5f);
+    r.pxPerPct = e.fullEyeW * e.xStretch / 100.f;
     const float scaleY = e.PxPerRow();
     // roll: least-squares slope of dy over x (both in analysis px)
     double mx = 0, my = 0;
@@ -537,6 +541,143 @@ Result Measure(const EyePair& e, const Options& o) {
     }
     r.deltaE = DeltaE76(e.meanRgb[0], e.meanRgb[1]);
     return r;
+}
+
+std::vector<int> Histogram(const std::vector<float>& pct, float lo, float hi, int bins) {
+    std::vector<int> h((size_t)std::max(1, bins), 0);
+    if (!(hi > lo)) return h;
+    const float k = (float)h.size() / (hi - lo);
+    for (float p : pct) h[(size_t)std::clamp((int)std::floor((p - lo) * k), 0, (int)h.size() - 1)]++;
+    return h;
+}
+
+DenseMap MeasureDense(const EyePair& e) {
+    DenseMap m;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int W = e.eyeW / 2, H = e.h / 2;
+    if (W < 64 || H < 32 || e.left.size() < (size_t)e.eyeW * e.h || e.right.size() < e.left.size()) return m;
+    // a 2x box-down of the analysis eyes: 320 px per eye, about 40 x 20 cells
+    std::vector<float> L((size_t)W * H), R((size_t)W * H);
+    for (int y = 0; y < H; ++y) {
+        const size_t a = (size_t)(2 * y) * e.eyeW, b = a + e.eyeW;
+        for (int x = 0; x < W; ++x) {
+            L[(size_t)y * W + x] = 0.25f * (e.left[a + 2 * x] + e.left[a + 2 * x + 1] + e.left[b + 2 * x] + e.left[b + 2 * x + 1]);
+            R[(size_t)y * W + x] =
+                0.25f * (e.right[a + 2 * x] + e.right[a + 2 * x + 1] + e.right[b + 2 * x] + e.right[b + 2 * x + 1]);
+        }
+    }
+    Options o;
+    o.block = 12;
+    o.step = 8;
+    o.maxDy = 3;  // rows at 320 px: a rig within ~12 px vertical at 1080p
+    const int bs = o.block, D = o.maxDy;
+    const int Rx = std::max(2, (int)std::lround(o.maxParallaxPct / 100.f * W));
+    const int bx0 = 2, by0 = D + 2;
+    m.cols = (W - bs - 2 - bx0) / o.step + 1;
+    m.rows = (H - bs - D - 2 - by0) / o.step + 1;
+    if (m.cols < 1 || m.rows < 1) return DenseMap{};
+    m.u0 = ((float)bx0 + bs * 0.5f) / (float)W;
+    m.v0 = ((float)by0 + bs * 0.5f) / (float)H;
+    m.du = (float)o.step / (float)W;
+    m.dv = (float)o.step / (float)H;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<float> raw((size_t)m.cols * m.rows, nan);
+    // ~800 blocks: split by rows over a few threads, so a pass stays a few ms (it runs on
+    // the rig worker, never the render thread)
+    auto rows = [&](int j0, int j1) {
+        std::vector<float> tpl((size_t)bs * bs);
+        for (int j = j0; j < j1; ++j)
+            for (int i = 0; i < m.cols; ++i) {
+                float dx, dy;
+                if (MatchAt(L, R, W, H, o, bx0 + i * o.step, by0 + j * o.step, Rx, D, tpl, dx, dy))
+                    raw[(size_t)j * m.cols + i] = dx / (float)W * 100.f;
+            }
+    };
+    const int chunks = std::clamp((int)std::thread::hardware_concurrency() / 2, 1, 4);
+    std::vector<std::future<void>> jobs;
+    for (int c = 1; c < chunks; ++c)
+        jobs.push_back(std::async(std::launch::async, rows, m.rows * c / chunks, m.rows * (c + 1) / chunks));
+    rows(0, m.rows / chunks);
+    for (auto& j : jobs) j.get();
+    // MAD cut, as Measure's: a block locked on the wrong repeat of a texture is one wild value
+    std::vector<float> v;
+    for (float p : raw)
+        if (!std::isnan(p)) v.push_back(p);
+    if (v.size() >= 8) {
+        auto median = [](std::vector<float> a) {
+            std::nth_element(a.begin(), a.begin() + a.size() / 2, a.end());
+            return a[a.size() / 2];
+        };
+        const float med = median(v);
+        std::vector<float> ad(v.size());
+        for (size_t k = 0; k < v.size(); ++k) ad[k] = std::fabs(v[k] - med);
+        const float t = std::max(5.f * 1.4826f * median(ad), 3.f);  // the scene's depth spread must survive
+        for (float& p : raw)
+            if (!std::isnan(p) && std::fabs(p - med) > t) p = nan;
+    }
+    // 3x3 median hole fill: an empty cell with at least half of its neighbours measured
+    // takes their median; wide flat areas stay empty (transparent on the heatmap)
+    m.pct = raw;
+    for (int j = 0; j < m.rows; ++j)
+        for (int i = 0; i < m.cols; ++i) {
+            const size_t c = (size_t)j * m.cols + i;
+            if (!std::isnan(raw[c])) {
+                ++m.matched;
+                continue;
+            }
+            float nb[8];
+            int n = 0;
+            for (int dj = -1; dj <= 1; ++dj)
+                for (int di = -1; di <= 1; ++di) {
+                    const int ii = i + di, jj = j + dj;
+                    if ((di || dj) && ii >= 0 && jj >= 0 && ii < m.cols && jj < m.rows &&
+                        !std::isnan(raw[(size_t)jj * m.cols + ii]))
+                        nb[n++] = raw[(size_t)jj * m.cols + ii];
+                }
+            if (n < 4) continue;
+            std::nth_element(nb, nb + n / 2, nb + n);
+            m.pct[c] = nb[n / 2];
+            ++m.filled;
+        }
+    m.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return m;
+}
+
+Probe ProbeAt(const EyePair& e, float u, float v, float& pct, float& conf, const Options& o) {
+    pct = conf = 0.f;
+    const int W = e.eyeW, H = e.h, D = o.maxDy;
+    if (W < 8 * o.block || H < 8 * o.block || e.left.size() < (size_t)W * H || u < 0.f || u > 1.f || v < 0.f ||
+        v > 1.f)
+        return Probe::None;
+    const int R = std::max(2, (int)std::lround(o.maxParallaxPct / 100.f * W));
+    // The grid's block first; on a smooth area (the middle of a large shaded object) a
+    // block twice as wide, so the point still reads when its surroundings carry texture.
+    Probe got = Probe::Flat;
+    for (int bs = o.block; bs <= 2 * o.block; bs *= 2) {
+        Options ob = o;
+        ob.block = bs;
+        // the block centred on the point, kept where the search window fits (as the grid's)
+        const int bx = std::clamp((int)std::lround(u * W - bs * 0.5f), 2, W - bs - 2);
+        const int by = std::clamp((int)std::lround(v * H - bs * 0.5f), D + 2, H - bs - D - 2);
+        float mean = 0, sq = 0;
+        for (int j = 0; j < bs; ++j)
+            for (int i = 0; i < bs; ++i) {
+                const float x = e.left[(size_t)(by + j) * W + bx + i];
+                mean += x;
+                sq += x * x;
+            }
+        const float n = (float)(bs * bs);
+        mean /= n;
+        if (std::sqrt(std::max(0.f, sq / n - mean * mean)) < o.minTexture) continue;
+        std::vector<float> tpl((size_t)bs * bs);
+        float dx, dy;
+        if (MatchAt(e.left, e.right, W, H, ob, bx, by, R, D, tpl, dx, dy, &conf)) {
+            pct = dx / (float)W * 100.f;
+            return Probe::Ok;
+        }
+        got = Probe::NoMatch;
+    }
+    return got;
 }
 
 namespace {
@@ -818,6 +959,12 @@ RigMonitor::~RigMonitor() {
     }
     cv_.notify_all();
     if (worker_.joinable()) worker_.join();
+    {
+        std::lock_guard<std::mutex> pl(pairM_);
+        probeStop_ = true;
+    }
+    probeCv_.notify_all();
+    if (probeThread_.joinable()) probeThread_.join();
 }
 
 void RigMonitor::Submit(const FrameRing::Frame& f, StereoLayout layout, int eyeOffsetFrames,
@@ -1030,11 +1177,72 @@ const char* RigMonitor::Unmeasurable() const {
     }
 }
 
+namespace {
+// The worker's cost, logged every 5 s (measurement aid, #268 acceptance): the measurement
+// (with the eye-sync burst and any re-measure) and the dense heatmap pass.
+struct WorkerLog {
+    double sum[2] = {}, mx[2] = {}, next = 0.0;
+    int n[2] = {};
+    void Add(int k, double ms) {
+        sum[k] += ms;
+        mx[k] = std::max(mx[k], ms);
+        ++n[k];
+        const double now = LiveProducer::NowSeconds();
+        if (now < next) return;
+        if (next > 0.0) {
+            if (n[1])
+                std::fprintf(stderr,
+                             "[mediaplayer][INFO ] Rig check (worker): measure %d x avg %.2f max %.2f ms, dense %d x avg "
+                             "%.2f max %.2f ms\n",
+                             n[0], n[0] ? sum[0] / n[0] : 0.0, mx[0], n[1], sum[1] / n[1], mx[1]);
+            else
+                std::fprintf(stderr, "[mediaplayer][INFO ] Rig check (worker): measure %d x avg %.2f max %.2f ms\n", n[0],
+                             n[0] ? sum[0] / n[0] : 0.0, mx[0]);
+        }
+        *this = WorkerLog{};
+        next = now + 5.0;
+    }
+};
+WorkerLog g_workerLog;  // the worker thread only
+}  // namespace
+
+void RigMonitor::RunDense(std::unique_lock<std::mutex>& lk) {
+    std::shared_ptr<const EyePair> p;
+    uint64_t seq = 0;
+    {
+        std::lock_guard<std::mutex> pl(pairM_);
+        p = lastPair_;
+        seq = pairSeq_;
+    }
+    if (!p || seq == denseFor_) return;  // nothing new since the last map (a still, a pause)
+    const uint64_t gen = generation_;
+    lk.unlock();
+    DenseMap d = MeasureDense(*p);
+    lk.lock();
+    denseFor_ = seq;
+    g_workerLog.Add(1, d.ms);
+    if (gen != generation_ || !denseOn_) return;
+    d.seq = dense_.seq + 1;
+    dense_ = std::move(d);
+}
+
 void RigMonitor::Worker() {
     std::unique_lock<std::mutex> lk(m_);
+    auto nextDense = std::chrono::steady_clock::now();
     while (true) {
-        cv_.wait(lk, [this] { return stop_ || pending_; });
+        // The dense pass (#268) runs only while nothing is queued: a hand-over always goes first.
+        if (denseOn_)
+            cv_.wait_until(lk, nextDense, [this] { return stop_ || pending_ || !denseOn_; });
+        else
+            cv_.wait(lk, [this] { return stop_ || pending_ || denseOn_; });
         if (stop_) return;
+        if (!pending_) {
+            if (denseOn_ && std::chrono::steady_clock::now() >= nextDense) {
+                RunDense(lk);
+                nextDense = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            }
+            continue;
+        }
         std::vector<EyePair> seq = std::move(work_);
         work_.clear();
         pending_ = false;  // a new hand-over may queue while this one is measured
@@ -1111,7 +1319,15 @@ void RigMonitor::Worker() {
         if (gen != generation_) continue;  // Reset() ran meanwhile: this was the old input
         if (still && stillSerial != stillSerial_) continue;  // a newer still view (or frames) replaced it
         measureMs_ = ms;
+        g_workerLog.Add(0, ms);
         last_ = r;
+        if (!seq.empty()) {
+            // the cursor probe and the dense pass read the measured pair (#268)
+            auto pair = std::make_shared<const EyePair>(std::move(seq.back()));
+            std::lock_guard<std::mutex> pl(pairM_);
+            lastPair_ = std::move(pair);
+            ++pairSeq_;
+        }
         Sample s;
         s.t = LiveProducer::NowSeconds();
         s.ok = r.ok;
@@ -1277,6 +1493,13 @@ void RigMonitor::Reset() {
     history_.clear();
     alerts_.clear();
     last_ = Result{};
+    {
+        const uint64_t s = dense_.seq;  // kept rising: the UI re-uploads on a new seq
+        dense_ = DenseMap{};
+        dense_.seq = s;
+        std::lock_guard<std::mutex> pl(pairM_);
+        lastPair_.reset();
+    }
     for (Run& r : runs_) r.since = -1;
     lastGoodT_ = notOkSince_ = -1.0;
     lastGoodTc_.clear();
@@ -1328,6 +1551,76 @@ bool RigMonitor::Active(double now) const {
 double RigMonitor::LastMeasureMs() const {
     std::lock_guard<std::mutex> lk(m_);
     return measureMs_;
+}
+
+Probe RigMonitor::ProbeParallax(float u, float v, float& pct, float& conf) const {
+    std::shared_ptr<const EyePair> p;
+    {
+        std::lock_guard<std::mutex> pl(pairM_);
+        p = lastPair_;
+    }
+    pct = conf = 0.f;
+    return p ? ProbeAt(*p, u, v, pct, conf) : Probe::None;
+}
+
+void RigMonitor::RequestProbe(float u, float v) {
+    {
+        std::lock_guard<std::mutex> pl(pairM_);
+        probeU_ = u;
+        probeV_ = v;
+        probeReq_ = true;
+        if (!probeThread_.joinable()) probeThread_ = std::thread([this] { ProbeWorker(); });
+    }
+    probeCv_.notify_one();
+}
+
+bool RigMonitor::ProbeResult(Probe& state, float& pct, float& conf) const {
+    std::lock_guard<std::mutex> pl(pairM_);
+    state = probeState_;
+    pct = probePct_;
+    conf = probeConf_;
+    return probeDone_;
+}
+
+// A larger block on a smooth area costs up to ~1 ms: kept off the render thread, and off
+// the rig worker, which can be busy with a measurement for longer than a cursor can wait.
+void RigMonitor::ProbeWorker() {
+    std::unique_lock<std::mutex> pl(pairM_);
+    while (true) {
+        probeCv_.wait(pl, [this] { return probeStop_ || probeReq_; });
+        if (probeStop_) return;
+        probeReq_ = false;
+        const float u = probeU_, v = probeV_;
+        const std::shared_ptr<const EyePair> p = lastPair_;
+        pl.unlock();
+        float pct = 0.f, conf = 0.f;
+        const Probe s = p ? ProbeAt(*p, u, v, pct, conf) : Probe::None;
+        pl.lock();
+        probeState_ = s;
+        probePct_ = pct;
+        probeConf_ = conf;
+        probeDone_ = true;
+    }
+}
+
+void RigMonitor::SetDenseEnabled(bool on) {
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        if (denseOn_ == on) return;
+        denseOn_ = on;
+        denseFor_ = 0;  // on again: map the current pair at once
+        if (!on) {
+            const uint64_t s = dense_.seq;
+            dense_ = DenseMap{};
+            dense_.seq = s;
+        }
+    }
+    cv_.notify_all();
+}
+
+DenseMap RigMonitor::Dense() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return dense_;
 }
 
 }  // namespace mp::rig

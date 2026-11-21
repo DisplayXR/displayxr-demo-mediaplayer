@@ -31,6 +31,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -85,6 +86,11 @@ struct Result {
     float dyMad = 0.f;            // spread (MAD) of the vertical residuals about that line, full-res px
     float nearPct = 0.f;          // 2nd percentile parallax, % of eye width (negative = in front)
     float farPct = 0.f;           // 98th percentile parallax
+    float medianPct = 0.f;        // median parallax (#268)
+    // Full-resolution DISPLAYED px per 1 % of the eye width (#268): a half-SBS eye is
+    // reported as shown, not as stored. 0 = not measured.
+    float pxPerPct = 0.f;
+    float Px(float pct) const { return pct * pxPerPct; }
     float deltaE = 0.f;           // CIE76 between the eyes' mean colours
     std::vector<float> parallaxPct;  // every match's parallax (for the depth overlay)
     std::vector<float> matchX, matchY;  // match centres, 0..1 of the left eye
@@ -109,6 +115,31 @@ struct Options {
 };
 
 Result Measure(const EyePair& e, const Options& o = {});
+
+// The disparity readout's histogram (#268): `bins` counts of `pct` over [lo, hi], the values
+// outside it counted in the end bins (so a far outlier still shows).
+std::vector<int> Histogram(const std::vector<float>& pct, float lo, float hi, int bins);
+constexpr int kHistBins = 64;
+constexpr float kHistLoPct = -4.f, kHistHiPct = 4.f;
+
+// A dense disparity map (#268, the heatmap): the NCC matcher on a regular grid at half the
+// analysis size (320 px per eye), small blocks, with the uniqueness test, a MAD cut and a
+// 3x3 median fill of the holes. Cell (i, j) is centred at (u0 + i * du, v0 + j * dv) in
+// the shown LEFT eye (0..1); pct is its parallax in % of eye width, NaN = no value.
+struct DenseMap {
+    int cols = 0, rows = 0;
+    float u0 = 0, v0 = 0, du = 0, dv = 0;
+    std::vector<float> pct;
+    int matched = 0, filled = 0;  // cells from a match / from the hole fill
+    uint64_t seq = 0;             // bumped by RigMonitor per new map (0 = none yet)
+    double ms = 0.0;              // how long the pass took
+    bool Ok() const { return cols > 0 && matched > 0; }
+};
+DenseMap MeasureDense(const EyePair& e);
+
+// One block match at a point of the shown left eye (u, v in 0..1) - the cursor readout.
+enum class Probe { None = 0, Ok, Flat, NoMatch };
+Probe ProbeAt(const EyePair& e, float u, float v, float& pct, float& conf, const Options& o = {});
 
 // Temporal eye sync from consecutive frames (oldest first, all the same size; the last is
 // the current one). Compares the current right eye with the last K left eyes and the
@@ -243,6 +274,18 @@ public:
     std::vector<Alert> Alerts() const;  // most recent last, at most 20
     bool Active(double now) const;      // measured within the last 2 s
     double LastMeasureMs() const;
+    // #268: one block match at (u, v) of the shown left eye on the last measured pair
+    // (Probe::None before the first). Cheap (~0.1 ms); any thread.
+    Probe ProbeParallax(float u, float v, float& pct, float& conf) const;
+    // The same off the caller's thread (the UI's cursor readout): RequestProbe queues a
+    // point (the latest wins) for a small probe thread; ProbeResult gives the last finished
+    // one (false before any).
+    void RequestProbe(float u, float v);
+    bool ProbeResult(Probe& state, float& pct, float& conf) const;
+    // #268: the dense heatmap pass, about twice a second on the worker while it is idle
+    // (never ahead of a measurement). Off by default; nothing runs while off.
+    void SetDenseEnabled(bool on);
+    DenseMap Dense() const;  // the last map (seq 0 = none)
 
 private:
     void Worker();
@@ -272,6 +315,23 @@ private:
     std::vector<Alert> alerts_;
     Budget budget_;
     double measureMs_ = 0.0;
+    // #268: the last measured pair (the cursor probe and the dense pass read it), its own
+    // lock so a probe never waits on a measurement; and the dense map.
+    mutable std::mutex pairM_;
+    std::shared_ptr<const EyePair> lastPair_;
+    uint64_t pairSeq_ = 0;     // bumped per new pair (under pairM_)
+    // the probe thread (started by the first RequestProbe), its request and result, under pairM_
+    std::thread probeThread_;
+    std::condition_variable probeCv_;
+    bool probeStop_ = false, probeReq_ = false, probeDone_ = false;
+    float probeU_ = 0, probeV_ = 0;
+    Probe probeState_ = Probe::None;
+    float probePct_ = 0, probeConf_ = 0;
+    void ProbeWorker();
+    bool denseOn_ = false;     // under m_
+    uint64_t denseFor_ = 0;    // the pairSeq_ the last map was made from (under m_)
+    DenseMap dense_;           // under m_
+    void RunDense(std::unique_lock<std::mutex>& lk);  // worker, called with lk held
     SyncConfirm syncConfirm_;  // worker thread only; restarted when generation_ moves
     uint64_t syncGen_ = 0;
     StereoLayout pendingLayout_ = StereoLayout::SbsFull;

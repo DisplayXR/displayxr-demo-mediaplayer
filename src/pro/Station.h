@@ -109,7 +109,7 @@ public:
     // Inspector sections and the bottom history strip (ImGui).
     void BuildInputsSection(const std::string& liveName, bool live);
     void BuildSignalLines(bool live);
-    void BuildRigSection(bool stereo);
+    void BuildRigSection(bool stereo, const std::function<void()>& extra = {});
     void BuildSnapshotsSection();
     // True (and the strip's HUD rect) when it was drawn as a flat card (`flat`).
     bool BuildHistoryStrip(float alpha, bool stereo, bool flat = false, float* x = nullptr, float* y = nullptr,
@@ -133,6 +133,16 @@ public:
     bool ShowHistory() const { return showHistory_; }
     rig::Result RigLast() const { return rig_.Last(); }
     rig::Budget RigBudget() const { return rig_.GetBudget(); }
+    // #268 disparity readout: the cursor probe on the last measured pair, the dense heatmap
+    // pass (never while the rig check is switched off, MEDIAPLAYER_PRO_RIG=0), and the state
+    // the card shows.
+    void RequestRigProbe(float u, float v) { rig_.RequestProbe(u, v); }  // answered off this thread
+    bool RigProbeResult(rig::Probe& s, float& pct, float& conf) const { return rig_.ProbeResult(s, pct, conf); }
+    void SetRigDense(bool on) { rig_.SetDenseEnabled(on && opt_.perf.rig); }
+    rig::DenseMap RigDense() const { return rig_.Dense(); }
+    const char* RigUnmeasurable() const { return rig_.Unmeasurable(); }
+    bool RigActive() const;
+    float ParallaxOffsetPct() const { return parallaxOffsetPct_; }
     const std::string& Timecode() const { return timecode_; }
     // The live signal's frame rate (rounded), written with every timecode (notes, alerts,
     // the Resolve link) so a 50p timecode can be placed on a 25p timeline. 0 = unknown.

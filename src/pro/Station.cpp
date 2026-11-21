@@ -311,6 +311,19 @@ static nlohmann::json TargetJson(const target::Screen& t, float scale, const rig
     return j;
 }
 
+// #268: the disparity readout's figures - median, the readings in full-resolution displayed
+// px, the 64-bin histogram of the matches, and near / far as shown (with convergence).
+static void DisparityJson(const rig::Result& r, float parallaxOffsetPct, nlohmann::json& j) {
+    j["median_pct"] = r.medianPct;
+    j["near_px"] = r.Px(r.nearPct);
+    j["far_px"] = r.Px(r.farPct);
+    j["median_px"] = r.Px(r.medianPct);
+    j["histogram"] = {{"lo_pct", rig::kHistLoPct}, {"hi_pct", rig::kHistHiPct},
+                      {"bins", rig::Histogram(r.parallaxPct, rig::kHistLoPct, rig::kHistHiPct, rig::kHistBins)}};
+    j["as_shown_near_pct"] = r.nearPct + parallaxOffsetPct;
+    j["as_shown_far_pct"] = r.farPct + parallaxOffsetPct;
+}
+
 static nlohmann::json CalibrationJson(const qc::Calibration& c) {
     nlohmann::json j;
     j["state"] = c.state.empty() ? std::string("none") : c.state;
@@ -386,6 +399,7 @@ void Station::SaveNote(size_t i) {
         j["near_pct"] = s.rig.nearPct;
         j["far_pct"] = s.rig.farPct;
         j["delta_e"] = s.rig.deltaE;
+        DisparityJson(s.rig, s.parallaxOffsetPct, j);
         for (int i = 0; i < 2; ++i)
             if (s.rig.edge[i].measured) j[i == 0 ? "edge_left_pct" : "edge_right_pct"] = s.rig.edge[i].parallaxPct;
     }
@@ -770,6 +784,8 @@ void Station::LogPerf(bool live) {
     }
 }
 
+bool Station::RigActive() const { return rig_.Active(LiveProducer::NowSeconds()); }
+
 std::string Station::RigStatusJson() const {
     using json = nlohmann::json;
     const rig::Result r = rig_.Last();
@@ -786,6 +802,7 @@ std::string Station::RigStatusJson() const {
     out["near_pct"] = r.nearPct;
     out["far_pct"] = r.farPct;
     out["delta_e"] = r.deltaE;
+    DisparityJson(r, parallaxOffsetPct_, out);
     // edge violations: the 2nd most in-front parallax along each frame edge, null = not measured
     for (int i = 0; i < 2; ++i) {
         const char* k = i == 0 ? "edge_left_pct" : "edge_right_pct";
@@ -1221,9 +1238,17 @@ void Station::BuildSignalLines(bool live) {
 #endif
 }
 
-void Station::BuildRigSection(bool stereo) {
+void Station::BuildRigSection(bool stereo, const std::function<void()>& extra) {
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     if (!ImGui::CollapsingHeader("Rig check", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    // the caller's rows (the disparity readout's toggles, #268) close the section, whatever
+    // state it is in
+    struct AtEnd {
+        const std::function<void()>& f;
+        ~AtEnd() {
+            if (f) f();
+        }
+    } atEnd{extra};
     const rig::Result r = rig_.Last();
     const rig::Budget b = rig_.GetBudget();
     if (!stereo) {
@@ -1301,6 +1326,7 @@ void Station::BuildRigSection(bool stereo) {
     }
 #else
     (void)stereo;
+    (void)extra;
 #endif
 }
 
