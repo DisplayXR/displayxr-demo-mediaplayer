@@ -134,6 +134,82 @@ constexpr float kHudDisparity = 0.0f;
 
 // Auto-hide / slideshow timing.
 constexpr double kIdleHideSeconds = 5.0;    // fade the UI out after this much inactivity
+// The projection picker's order after its "Auto" row (#251): P's cycle order.
+constexpr vr::Projection kVrPickerOrder[] = {vr::Projection::None,     vr::Projection::Equirect180,
+                                             vr::Projection::Equirect360, vr::Projection::Fisheye,
+                                             vr::Projection::Cubemap,  vr::Projection::Eac};
+constexpr const char* kVrHintId = "vr_viewer";  // hintsFile_'s line for the VR viewer hint
+
+// The shortcuts panel (#251), read off the key handling in platform/Window.cpp (SDL) and
+// WindowLinux.cpp, plus App's own meaning for each request. Keep it in step with them. An
+// empty key starts a section.
+std::vector<std::pair<std::string, std::string>> ShortcutRows() {
+    std::vector<std::pair<std::string, std::string>> r = {
+        {"", "Playback"},
+        {"Space", "Play / pause"},
+        {"Left / Right", "Frame back / forward (a still: previous / next file)"},
+        {"Shift+Left / Right", "Five frames back / forward"},
+        {"[ / ]", "Frame back / forward"},
+        {"Up / Down", "Previous / next file (also PgUp / PgDn)"},
+        {"M", "Mute"},
+        {"S", "Slideshow on / off"},
+        {"", "3D picture"},
+#if MEDIAPLAYER_PRO
+        {"V", "Next display mode"},
+#else
+        {"V", "2D / 3D switch"},
+#endif
+        {"L", "Stereo layout: auto / mono / SBS / TB"},
+        {"Shift+L", "Convert a 2D picture to 3D"},
+        {"X", "Swap eyes"},
+        {"- / =", "Convergence"},
+        {"0", "Reset convergence"},
+        {"Backspace", "Converge once (the file's estimate)"},
+        {"A", "Auto-convergence on / off"},
+        {"Shift+A", "Auto-convergence subject"},
+        {"Ctrl+click", "Pin the auto-convergence subject"},
+        {"", "VR180 / VR360"},
+#if !MEDIAPLAYER_PRO
+        {"P", "Projection: auto, flat, VR180, VR360, fisheye, cubemap, EAC"},
+#endif
+        {"Drag, wheel", "Look around, zoom"},
+        {"Arrows", "Look around in 5 degree steps"},
+#if MEDIAPLAYER_PRO
+        {"Double-click", "Re-centre the view"},
+#else
+        {"R, double-click", "Re-centre the view"},
+#endif
+#if MEDIAPLAYER_PRO
+        {"", "Pro"},
+        {"Tab", "Show / pin the panels"},
+        {"1 .. 6", "3D, left, right, difference, anaglyph, false colour"},
+        {"7, 8, 9", "Zebras, wipe, channel"},
+        {"W, P, Q", "Scopes, pixel probe, frame line"},
+        {"H, Z", "Zoom to fit, 1:1"},
+        {"G, Shift+G", "Grade bypass, calibration bypass"},
+        {"D", "Depth overlay"},
+        {"T, R", "Timecode, history strip"},
+        {"N, J, B", "Snapshot, next input, A/B compare"},
+#endif
+        {"", "Window"},
+        {"F / F11", "Full screen"},
+        {"Ctrl+O", "Open a file"},
+#if !(defined(__linux__) && !defined(__ANDROID__))
+        {"Ctrl+Shift+O", "Open a folder"},
+#endif
+        {"Ctrl+U", "Open a stream URL"},
+        {"C", "Live camera on / off"},
+        {"I", "Save a snapshot of the 3D picture"},
+        {"Shift+Tab", "Hide / show all UI"},
+        {"F1 or ?", "This panel"},
+#if MEDIAPLAYER_PRO
+        {"Esc", "Leave full screen"},
+#else
+        {"Esc", "Quit (a browser slideshow: back to the browser)"},
+#endif
+    };
+    return r;
+}
 #if MEDIAPLAYER_PRO
 constexpr double kStripHideSeconds = 2.5;   // Pro: the mouse-move strip goes sooner
 #endif
@@ -409,6 +485,17 @@ bool App::Initialize(const char* mediaPath) {
     recentFile_ = RecentListPath(MEDIAPLAYER_PRO ? "MediaPlayerPro" : "MediaPlayer");
     if (recent_.Load(recentFile_))
         LOG_INFO("Recent: %zu item(s) from '%s'", recent_.Items().size(), recentFile_.c_str());
+    // One-time hints (#251) live beside the Recent list, so MEDIAPLAYER_RECENT_FILE=off (the
+    // tests) keeps neither and a hint shows once per run.
+    if (!recentFile_.empty()) {
+        hintsFile_ = (std::filesystem::u8path(recentFile_).parent_path() / "hints_shown.txt").u8string();
+        std::ifstream in(std::filesystem::u8path(hintsFile_));
+        for (std::string line; std::getline(in, line);) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (line == kVrHintId) vrHintShown_ = true;
+        }
+    }
+    uiState_.helpRows = ShortcutRows();
     RefreshRecentLabels();
     if (!launch_.camera) {
         if (const char* e = std::getenv("MEDIAPLAYER_CAMERA")) {
@@ -839,10 +926,16 @@ int App::Run() {
 #endif
             activity = true;
         }
-        // Esc backs out of a slideshow from the media browser to it (#252), else quits.
-        window_.SetEscapeBacksOut(fromBrowserList_ && !browsing_);
+        if (window_.TakeHelpRequest()) {  // F1 / '?': the shortcuts panel (#251)
+            uiState_.helpOpen = !uiState_.helpOpen;
+            activity = true;
+        }
+        // Esc closes the shortcuts panel (#251), backs out of a slideshow from the media
+        // browser to it (#252), else quits.
+        window_.SetEscapeBacksOut(uiState_.helpOpen || (fromBrowserList_ && !browsing_));
         if (window_.TakeEscapeRequest()) {
-            if (fromBrowserList_ && !browsing_) BackToBrowser();
+            if (uiState_.helpOpen) uiState_.helpOpen = false;
+            else if (fromBrowserList_ && !browsing_) BackToBrowser();
             activity = true;
         }
         if (window_.TakeTogglePauseRequest()) { TogglePlayback(); activity = true; }  // Space
@@ -1667,6 +1760,12 @@ void App::BuildTransportUI() {
     uiState_.muted = muted_;
     uiState_.loop = video_.Loop();
     uiState_.openFilePending = openFilePending_;
+    // Desktop top bar (#251): full screen, the shortcuts panel, the projection picker.
+    uiState_.caps.fullscreen = true;
+    uiState_.caps.help = true;
+    uiState_.caps.projection = true;
+    uiState_.isFullscreen = window_.IsFullscreen();
+    FillProjectionPicker();
 
     // Live camera (#90). Slideshow has nothing to advance through while live, so its
     // icon is hidden; the bottom transport hides itself because isVideo is false.
@@ -1840,6 +1939,12 @@ void App::BuildTransportUI() {
         SetInputProvider(fams[family], id, inputRemember_, "ui");
     };
     actions.SetInputRemember = [this](bool remember) { inputRemember_ = remember; };
+    actions.ToggleFullscreen = [this] { window_.ToggleFullscreen(); };
+    actions.SelectProjection = [this](int row) { SelectProjectionRow(row); };
+    actions.SetFisheyeFov = [this](float deg) {
+        vrFisheyeFovDeg_ = std::min(250.0f, std::max(90.0f, deg));  // MCP set_layout's range
+        ++vrViewGen_;
+    };
 #if MEDIAPLAYER_PRO
     actions.TogglePanels = [this] { pro_.SetPanelsPinned(!pro_.PanelsPinned()); };
 #endif
@@ -1860,10 +1965,7 @@ void App::BuildTransportUI() {
 }
 
 void App::ApplyCursorHidden() {
-    bool idle = false;
-#if MEDIAPLAYER_PRO
-    idle = proCursorIdle_;
-#endif
+    const bool idle = cursorIdle_;
 #if defined(__APPLE__)
     // macOS: the depth cursor hides the pointer through the Cocoa adapter, not SDL; only
     // the idle hide goes through SDL here.
@@ -1916,10 +2018,7 @@ void App::UpdateDepthCursor() {
     float mx = 0.0f, my = 0.0f;
     window_.MousePosition(mx, my);
     XrVector2f uv{};
-    bool pointerIdle = false;
-#if MEDIAPLAYER_PRO
-    pointerIdle = proCursorIdle_;  // the pointer is hidden with the UI: draw no cursor either
-#endif
+    const bool pointerIdle = cursorIdle_;  // the pointer is hidden with the UI: draw no cursor either
     if (!pointerIdle && window_.MouseInWindow() && !imgui_.WantCaptureMouse() &&
         dxr::cursorCanvasUV(mx, my, pw, ph, /*yUp=*/false, uv))
         cursor.setPointerUV(uv.x, uv.y);
@@ -3027,7 +3126,50 @@ void App::ResolveVr(const std::string& path, int sphKind, float sphCoverage, int
     }
     LOG_INFO("VR: %s %s (%s), default FOV %.1f deg", vr::ProjectionName(vrProj_), MediaSource::LayoutName(layout_),
              vrSignal_, VrDefaultFovDeg());
-    ShowToast(std::string(vr::ProjectionName(vrProj_)) + " viewer: drag to look around, scroll to zoom, R re-centres");
+    VrViewerCameOn(std::string(vr::ProjectionName(vrProj_)) + " viewer");
+}
+
+void App::VrViewerCameOn(const std::string& toast) {
+    if (!toast.empty()) ShowToast(toast);
+    if (vrHintShown_) return;
+    vrHintShown_ = true;
+    vrHintPending_ = true;  // TickUi shows it once the toast is free (the start-up mode toast)
+    if (hintsFile_.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::u8path(hintsFile_).parent_path(), ec);
+    std::ofstream out(std::filesystem::u8path(hintsFile_), std::ios::app);
+    out << kVrHintId << "\n";
+    if (!out) LOG_WARN("hints: could not write '%s'", hintsFile_.c_str());
+}
+
+void App::FillProjectionPicker() {
+    // "Auto" names what detection found, so a VR file shown flat by choice reads as such.
+    uiState_.projectionRows.clear();
+    std::string autoRow = "Auto (";
+    autoRow += vrAuto_ == vr::Projection::None ? "flat" : vr::ProjectionName(vrAuto_);
+    uiState_.projectionRows.push_back(autoRow + ")");
+    uiState_.projectionCurrent = 0;
+    for (size_t i = 0; i < std::size(kVrPickerOrder); ++i) {
+        std::string row = vr::ProjectionName(kVrPickerOrder[i]);
+        if (!row.empty()) row[0] = (char)std::toupper((unsigned char)row[0]);  // "flat" -> "Flat"
+        uiState_.projectionRows.push_back(row);
+        if (vrPinned_ && vrPinnedValue_ == kVrPickerOrder[i]) uiState_.projectionCurrent = (int)i + 1;
+    }
+    uiState_.projectionName = vr::ProjectionName(VrActive() ? vrProj_ : vr::Projection::None);
+    // On the bar while VR is up, and while a detected VR file is shown flat (the way back).
+    const bool picture = hasMedia_ && !isLogo_ && !convertBound_;
+    uiState_.projectionOnBar = VrActive() || (picture && vrAuto_ != vr::Projection::None);
+    uiState_.fisheyeFovShown = VrActive() && vrProj_ == vr::Projection::Fisheye;
+    uiState_.fisheyeFovDeg = vrFisheyeFovDeg_;
+#if !MEDIAPLAYER_PRO
+    uiState_.projectionKey = "P cycles";
+    uiState_.projectionKeyHint = " (P cycles)";
+#endif
+}
+
+void App::SelectProjectionRow(int row) {
+    if (row == 0) SetVrProjectionPin(false, vrAuto_, "ui");
+    else if (row > 0 && row <= (int)std::size(kVrPickerOrder)) SetVrProjectionPin(true, kVrPickerOrder[row - 1], "ui");
 }
 
 void App::SetVrProjectionPin(bool pin, vr::Projection p, const char* why) {
@@ -3039,7 +3181,9 @@ void App::SetVrProjectionPin(bool pin, vr::Projection p, const char* why) {
     vrView_ = vr::ViewState{};
     ++vrViewGen_;
     LOG_INFO("VR projection %s: %s (%s)", pin ? "pinned" : "auto", vr::ProjectionName(vrProj_), why);
-    ShowToast(std::string("Projection: ") + (pin ? "" : "auto - ") + vr::ProjectionName(vrProj_));
+    const std::string toast = std::string("Projection: ") + (pin ? "" : "auto - ") + vr::ProjectionName(vrProj_);
+    if (VrActive()) VrViewerCameOn(toast);  // the first time, then how to steer it
+    else ShowToast(toast);
 }
 
 void App::CycleVrProjection() {
@@ -4705,6 +4849,26 @@ void App::TickUi() {
     // Keep the UI pinned visible until a pending HUD dump lands (diagnostic/screenshot).
     if (dumpHudPath_ && !dumpedHud_) lastActivity_ = now;
 
+#if !MEDIAPLAYER_PRO
+    // The chrome stays while the pointer rests on it, a menu is open or the shortcuts panel
+    // is up (#251): the pointer now goes with it, and must not vanish over a control.
+    if (uiState_.helpOpen || (uiState_.fadeAlpha > 0.001f && imgui_.Ready() && imgui_.WantCaptureMouse()))
+        lastActivity_ = now;
+#endif
+
+    // The one-time VR hint (#251), queued behind whatever toast is up so neither hides it.
+    if (vrHintPending_ && VrActive() && !uiState_.helpOpen && uiState_.toastSecondsLeft <= 0.0) {
+        vrHintPending_ = false;
+#if MEDIAPLAYER_PRO
+        const char* recentre = "double-click to re-center";  // R is Pro's history strip
+#else
+        const char* recentre = "R to re-center";
+#endif
+        ui::ShowTransportToast(uiState_,
+                               std::string(vr::ProjectionName(vrProj_)) + ": drag to look, wheel to zoom, " + recentre,
+                               6.0);
+    }
+
     // Auto-hide + toast fades are shared with Android — see ui/TransportUI.cpp. What
     // counts as "activity" is platform-specific and stays here (mouse motion above).
     const double idle = duration<double>(now - lastActivity_).count();
@@ -4765,14 +4929,27 @@ void App::TickUi() {
         // The pointer goes with the UI (it is an overlay at screen depth too), except while
         // the pixel probe needs it.
         const bool cursorIdle = !visible && !pro_.ProbeOn();
-        if (cursorIdle != proCursorIdle_) {
-            proCursorIdle_ = cursorIdle;
+        if (cursorIdle != cursorIdle_) {
+            cursorIdle_ = cursorIdle;
             ApplyCursorHidden();
         }
         ui::TickTransportUI(uiState_, dt, /*uiAwake=*/visible);
     }
 #else
-    ui::TickTransportUI(uiState_, dt, /*uiAwake=*/showHud_ && idle < kIdleHideSeconds);
+    const bool awake = showHud_ && idle < kIdleHideSeconds;
+    ui::TickTransportUI(uiState_, dt, /*uiAwake=*/awake);
+    {
+        // The pointer goes with the chrome once it has faded over a picture, and comes back
+        // on motion (which wakes the chrome). Never over the browser or a popup (#251).
+        const bool picture = (hasMedia_ && !isLogo_) || isLive_ || isStream_;
+        const bool cursorIdle = !awake && uiState_.fadeAlpha <= 0.001f && picture && !browsing_ &&
+                                !uiState_.helpOpen && window_.MouseInWindow() &&
+                                !(imgui_.Ready() && imgui_.WantCaptureMouse());
+        if (cursorIdle != cursorIdle_) {
+            cursorIdle_ = cursorIdle;
+            ApplyCursorHidden();
+        }
+    }
 #endif
 
     // Dip-to-black transition machine, shared by the slideshow and manual ↑/↓ nav.

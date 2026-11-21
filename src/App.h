@@ -389,6 +389,12 @@ private:
     void VrSteer(float dYawDeg, float dPitchDeg, float fovScale);  // clamps, bumps vrViewGen_
     void VrRecenter(const char* why);
     void VrHandleInput(bool& activity);
+    // A VR projection just came on screen: `toast`, then (once, kept in hintsFile_) the
+    // "drag to look" hint (#251).
+    void VrViewerCameOn(const std::string& toast);
+    // The projection picker's rows (#251): [0] auto, then kVrPickerOrder.
+    void FillProjectionPicker();
+    void SelectProjectionRow(int row);
     std::string VrViewJson() const;  // MCP get_view / set_view result
 
     // #133: the display the window is on, from the runtime's enumeration: on Windows the
@@ -470,6 +476,11 @@ private:
     // (empty = not kept). Arrow-key walks and the slideshow do not add to it.
     RecentList recent_;
     std::string recentFile_;
+    // One-time hints already shown (#251), one id per line, beside recentFile_ (empty = not
+    // kept: then a hint shows once per run).
+    std::string hintsFile_;
+    bool vrHintShown_ = false;
+    bool vrHintPending_ = false;  // shown, but waiting for the toast slot
 
 #if MEDIAPLAYER_BROWSER
     std::unique_ptr<browser::WindowsMediaProvider> browserProvider_;
@@ -692,16 +703,17 @@ private:
     float proRestX_ = -1.0f, proRestY_ = -1.0f;  // pointer rest point for the 8 px wake
     bool proPanelsBeforeClean_ = false;
     bool proPanelsSeen_ = false;    // edge detector: Tab pressed while in the clean feed
-    bool proCursorIdle_ = false;    // pointer hidden with the strip
     // A/B switches for the render thread's optional per-frame work (pro/PerfSwitches.h),
     // read once in InitPro: App skips auto-convergence sampling (autoConv) and the UI while
     // live (ui); the station gets the rest.
     pro::PerfSwitches proPerf_;
 #endif
-    // The OS pointer is hidden while the runtime draws the depth cursor, and (Pro) while
-    // the UI is idle; ApplyCursorHidden() combines the two.
+    // The OS pointer is hidden while the runtime draws the depth cursor, and while the UI
+    // is idle; ApplyCursorHidden() combines the two.
     bool depthCursorShown_ = false;
     bool cursorHiddenApplied_ = false;
+    // The pointer is hidden with the UI: Pro's strip, the basic player's chrome (#251).
+    bool cursorIdle_ = false;
     void ApplyCursorHidden();
 #if MEDIAPLAYER_PRO
     float proHud_[4] = {0.f, 0.f, 1.f, 1.f};  // HUD rect in window fractions (x, y, w, h)

@@ -269,6 +269,29 @@ void DrawGlyph(ImDrawList* dl, Glyph glyph, ImVec2 c, float size, ImU32 u, bool 
                 dl->AddLine(P(-0.08f, i * 0.22f), P(0.30f, i * 0.22f), u, T(1.0f));
             }
             break;
+        case Glyph::Fullscreen:
+        case Glyph::ExitFullscreen: {
+            // One L-shaped corner per quadrant: its vertex at the box's corner for "enlarge",
+            // pulled in towards the centre (the arms pointing out) for "leave".
+            const bool out = glyph == Glyph::Fullscreen;
+            const float o = 0.30f, k = 0.13f;  // the corner's reach, its arm length
+            for (int q = 0; q < 4; ++q) {
+                const float sx = (q & 1) ? 1.0f : -1.0f, sy = (q & 2) ? 1.0f : -1.0f;
+                const float v = out ? o : o - k, e = out ? o - k : o;  // vertex, arm end
+                const ImVec2 arm[] = {P(sx * v, sy * e), P(sx * v, sy * v), P(sx * e, sy * v)};
+                dl->AddPolyline(arm, 3, u, 0, T(1.0f));
+            }
+            break;
+        }
+        case Glyph::Help: {
+            dl->AddCircle(c, size * 0.32f, u, 0, T(1.0f));
+            // The hook of the "?", then its dot (the circled "i"'s proportions).
+            dl->PathArcTo(P(0.0f, -0.07f), size * 0.09f, kPi * 1.0f, kPi * 2.25f, 12);
+            dl->PathLineTo(P(0.0f, 0.07f));
+            dl->PathStroke(u, 0, T(0.9f));
+            dl->AddCircleFilled(P(0.0f, 0.17f), size * 0.045f, u);
+            break;
+        }
     }
 }
 
