@@ -62,7 +62,8 @@ void RegisterProAgentTools(const AgentToolRegisterFn& reg) {
     reg("get_rig_status",
         "Read the live rig checks for a side-by-side stereo source: vertical error (full-res px, + = "
         "right eye lower), roll (degrees), near / far screen parallax (% of eye width, negative = in "
-        "front of the screen), edge violations (edge_left_pct / edge_right_pct: the most in-front "
+        "front of the screen; median_pct, near_px / far_px / median_px in full-res displayed px, a "
+        "64-bin histogram of the matches, as_shown_near_pct / as_shown_far_pct with convergence), edge violations (edge_left_pct / edge_right_pct: the most in-front "
         "parallax along each frame edge, null = not measured), scale (scale_pct: the right eye's size against the "
         "left in %, + = larger; scale_measured; keystone_px), colour match between the eyes (CIE76 dE, and color: per-channel "
         "gain_pct / lift_pct of the right eye against the left, luma_pct, luma_stops, shape), eye sync (frames between "

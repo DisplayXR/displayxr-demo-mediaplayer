@@ -192,6 +192,15 @@ void ProController::ApplyTestEnv() {
     }
     if (const char* p = std::getenv("MEDIAPLAYER_PRO_PROBE"))
         probeOn_ = std::sscanf(p, "%f,%f", &testProbeU_, &testProbeV_) == 2;
+    // #268: stand-ins for qc.disparity.readout / qc.disparity.heatmap until the settings
+    // store lands; _HEATMAP=budget paints only the cells outside the depth budget.
+    if (const char* d = std::getenv("MEDIAPLAYER_PRO_DISPARITY")) disparityCard_ = (*d && *d != '0');
+    if (const char* d = std::getenv("MEDIAPLAYER_PRO_DISPARITY_HEATMAP")) {
+        disparityHeatmap_ = (*d && *d != '0');
+        heatmapBudgetOnly_ = std::string(d) == "budget";
+    }
+    if (const char* p = std::getenv("MEDIAPLAYER_PRO_DISPARITY_PROBE"))
+        if (std::sscanf(p, "%f,%f", &testDispU_, &testDispV_) != 2) testDispU_ = testDispV_ = -1.0f;
 }
 
 void ProController::AddFlatRectOfCurrentWindow() {
@@ -1162,6 +1171,10 @@ void ProController::Tick(const Status& st) {
     TickCalibration();
     if (targetDirty_) ApplyTarget();
     PushTargetToStation();
+    if (disparityHeatmap_ != heatmapSent_) {  // #268: the dense pass runs only while the heatmap is on
+        station_.SetRigDense(disparityHeatmap_);
+        heatmapSent_ = disparityHeatmap_;
+    }
     if (!renderer_) return;
     // #134: an OCIO look follows the source: re-bake when an EXR comes or goes.
     if (lutIsOcio_ && lutLoading_.empty() && lutPqShaper_ != SourceIsSceneLinear()) LoadOcio(ocioReq_);
@@ -1199,6 +1212,17 @@ void ProController::Tick(const Status& st) {
 // Inspector
 // ---------------------------------------------------------------------------
 
+namespace {
+// The depth colour ramp (the overlay's dots, the heatmap, the histogram): white on the
+// screen plane, towards orange-red in front, towards blue behind; +-2 % spans it.
+void DepthRamp(float pct, float rgb[3]) {
+    const float t = std::clamp(pct / 2.0f, -1.0f, 1.0f);
+    rgb[0] = t < 0 ? 1.0f : 1.0f - 0.75f * t;
+    rgb[1] = t < 0 ? 1.0f + 0.55f * t : 1.0f - 0.45f * t;
+    rgb[2] = t < 0 ? 1.0f + 0.85f * t : 1.0f;
+}
+}  // namespace
+
 // The depth overlay (Phase 2, "depth overlay"): every rig-check match drawn where it is
 // on the picture, coloured by screen parallax - warm in front of the screen, white on
 // it, blue behind - and ringed red when it breaks the depth budget. Follows pan / zoom.
@@ -1222,10 +1246,9 @@ void ProController::BuildDepthOverlay(const Status& st) {
         if (u < 0.f || u > 1.f || v < 0.f || v > 1.f) continue;
         const ImVec2 c((px + u * pw) * W, (py + v * ph) * H);
         const float p = r.parallaxPct[i];
-        const float t = std::clamp(p / 2.0f, -1.0f, 1.0f);  // +-2 % spans the ramp
-        const ImVec4 col = t < 0 ? ImVec4(1.0f, 1.0f + 0.55f * t, 1.0f + 0.85f * t, 0.95f)    // white -> orange-red
-                                 : ImVec4(1.0f - 0.75f * t, 1.0f - 0.45f * t, 1.0f, 0.95f);   // white -> blue
-        dl->AddCircleFilled(c, rad, ImGui::GetColorU32(col));
+        float rgb[3];
+        DepthRamp(p, rgb);
+        dl->AddCircleFilled(c, rad, ImGui::GetColorU32(ImVec4(rgb[0], rgb[1], rgb[2], 0.95f)));
         if (p < b.nearPct || p > b.farPct) dl->AddCircle(c, rad * 1.9f, IM_COL32(255, 60, 50, 255), 0, Px(2.0f));
     }
     // Edge violations: a red bar along the frame edge over the rows where something in
@@ -1329,6 +1352,200 @@ void ProController::BuildColourOverlay(const Status& st) {
     dl->AddText(ImVec2(mode == 1 ? lx + bw + Px(8.0f) : lx, ly - Px(4.0f)), IM_COL32(255, 255, 255, 230), text);
 #else
     (void)st;
+#endif
+}
+
+// #268: the disparity readout card, at the picture's top-left (under the depth overlay's
+// legend when that is on). The figures are the rig check's (source parallax, x_right -
+// x_left, negative = in front of the screen); "as shown" adds what convergence contributes.
+void ProController::BuildDisparityCard(const Status& st) {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    if (!disparityCard_ || !st.stereo || !st.hasPicture || st.isLogo || !host_.pictureInHud) return;
+    float px, py, pw, ph;
+    if (!host_.pictureInHud(px, py, pw, ph)) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const float pad = Px(7.0f), gap = Px(4.0f), lh = ImGui::GetTextLineHeight();
+    const bool legend = depthOverlay_ && !rightOnlyView_;  // the depth overlay's text line is up
+    const ImVec2 o(px * W + Px(8.0f), py * H + Px(8.0f) + (legend ? lh + Px(8.0f) : 0.0f));
+    const ImU32 text = IM_COL32(235, 238, 242, 255), dim = IM_COL32(150, 158, 170, 255);
+    auto box = [&](float w, float h) {
+        dl->AddRectFilled(o, ImVec2(o.x + w + 2.0f * pad, o.y + h + 2.0f * pad), IM_COL32(10, 12, 16, 205), Px(4.0f));
+    };
+    const rig::Result r = station_.RigLast();
+    const char* why = station_.RigUnmeasurable();
+    if (why || !r.ok || !station_.RigActive()) {
+        char t[160];
+        std::snprintf(t, sizeof(t), "Disparity: %s", why ? why : "measuring... (needs texture in the picture)");
+        const ImVec2 ts = ImGui::CalcTextSize(t);
+        box(ts.x, ts.y);
+        dl->AddText(ImVec2(o.x + pad, o.y + pad), dim, t);
+        return;
+    }
+    const rig::Budget b = station_.RigBudget();
+    const float off = station_.ParallaxOffsetPct();
+    // a reading that rounds to zero prints as +0, not -0
+    auto P = [](float pct) { return std::fabs(pct) < 0.005f ? 0.0f : pct; };
+    auto PX = [&](float pct) { return std::fabs(r.Px(pct)) < 0.5f ? 0.0f : r.Px(pct); };
+    char l1[192], l2[160], l3[96] = "";
+    std::snprintf(l1, sizeof(l1), "Disparity   near %+.2f%% (%+.0f px)   median %+.2f%% (%+.0f px)   far %+.2f%% (%+.0f px)",
+                  P(r.nearPct), PX(r.nearPct), P(r.medianPct), PX(r.medianPct), P(r.farPct), PX(r.farPct));
+    std::snprintf(l2, sizeof(l2), "as shown (convergence %+.2f%%):  near %+.2f%%   far %+.2f%%      %d matches", P(off),
+                  P(r.nearPct + off), P(r.farPct + off), r.matches);
+    // The value under the cursor: one block match at that point of the shown left eye on the
+    // last measured pair (pan / zoom aware, like the pixel probe). Not in the right-eye view.
+    bool cursor = false;
+    ImVec2 at;
+    if (!rightOnlyView_) {
+        float u, v;
+        if (testDispU_ >= 0.0f) {
+            u = testDispU_;
+            v = testDispV_;
+            at = ImVec2((px + u * pw) * W, (py + v * ph) * H);
+        } else {
+            at = io.MousePos;
+            u = (at.x - px * W) / (pw * W);
+            v = (at.y - py * H) / (ph * H);
+        }
+        if (u >= 0.f && u <= 1.f && v >= 0.f && v <= 1.f) {
+            cursor = true;
+            const float su = panX_ + u / zoom_, sv = panY_ + v / zoom_;
+            const double now =
+                std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            // matched on the rig check's probe thread: asked at most 30 times a second while
+            // the pointer moves, 8 while it rests (each measurement brings a new pair)
+            const bool moved = su != dispProbeU_ || sv != dispProbeV_;
+            if ((moved && now - dispProbeAt_ > 1.0 / 30.0) || now - dispProbeAt_ > 1.0 / 8.0) {
+                station_.RequestRigProbe(su, sv);
+                dispProbeU_ = su;
+                dispProbeV_ = sv;
+                dispProbeAt_ = now;
+            }
+            if (!station_.RigProbeResult(dispProbe_, dispProbePct_, dispProbeConf_)) dispProbe_ = rig::Probe::None;
+            switch (dispProbe_) {
+                case rig::Probe::Ok:
+                    std::snprintf(l3, sizeof(l3), "cursor %+.2f%% (%+.0f px)   match %.2f", P(dispProbePct_),
+                                  PX(dispProbePct_), dispProbeConf_);
+                    break;
+                case rig::Probe::Flat: std::snprintf(l3, sizeof(l3), "cursor: flat (no texture to match)"); break;
+                case rig::Probe::NoMatch: std::snprintf(l3, sizeof(l3), "cursor: no clear match"); break;
+                default: std::snprintf(l3, sizeof(l3), "cursor: -"); break;
+            }
+        }
+    }
+    const float histH = Px(48.0f);
+    float w = std::max(ui::CalcTabularTextSize(l1).x, ui::CalcTabularTextSize(l2).x);
+    if (cursor) w = std::max(w, ui::CalcTabularTextSize(l3).x);
+    w = std::max(w, Px(260.0f));
+    box(w, 2.0f * lh + histH + 2.0f * gap + (cursor ? lh + gap : 0.0f));
+    const float x = o.x + pad;
+    float y = o.y + pad;
+    ui::AddTabularText(dl, ImVec2(x, y), text, l1);
+    y += lh + gap;
+    // Histogram of the matches' parallax (64 bins, -4..+4 %, the ends hold what is beyond),
+    // bins outside the budget in red, the budget's near / far as amber lines.
+    {
+        const float lo = rig::kHistLoPct, hi = rig::kHistHiPct;
+        const std::vector<int> hist = rig::Histogram(r.parallaxPct, lo, hi, rig::kParallaxHistBins);
+        int mx = 1;
+        for (int c : hist) mx = std::max(mx, c);
+        const float bw = w / (float)rig::kParallaxHistBins;
+        auto X = [&](float pct) { return x + (std::clamp(pct, lo, hi) - lo) / (hi - lo) * w; };
+        dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + histH), IM_COL32(255, 255, 255, 16));
+        for (int i = 0; i < rig::kParallaxHistBins; ++i) {
+            if (!hist[i]) continue;
+            const float c = lo + ((float)i + 0.5f) * (hi - lo) / (float)rig::kParallaxHistBins;
+            float rgb[3];
+            DepthRamp(c, rgb);
+            const ImU32 col = c < b.nearPct || c > b.farPct ? IM_COL32(255, 70, 60, 245)
+                                                             : ImGui::GetColorU32(ImVec4(rgb[0], rgb[1], rgb[2], 0.92f));
+            const float bh = std::max(Px(2.0f), histH * (float)hist[i] / (float)mx);
+            dl->AddRectFilled(ImVec2(x + i * bw + 0.5f, y + histH - bh), ImVec2(x + (i + 1) * bw - 0.5f, y + histH), col);
+        }
+        dl->AddLine(ImVec2(X(0.0f), y), ImVec2(X(0.0f), y + histH), IM_COL32(255, 255, 255, 110), Px(1.0f));
+        for (float lim : {b.nearPct, b.farPct})
+            dl->AddLine(ImVec2(X(lim), y), ImVec2(X(lim), y + histH), IM_COL32(255, 190, 60, 235), Px(1.5f));
+        const char* loT = "-4%";
+        const char* hiT = "+4%";
+        dl->AddText(ImVec2(x + Px(2.0f), y + Px(1.0f)), dim, loT);
+        dl->AddText(ImVec2(x + w - ImGui::CalcTextSize(hiT).x - Px(2.0f), y + Px(1.0f)), dim, hiT);
+    }
+    y += histH + gap;
+    ui::AddTabularText(dl, ImVec2(x, y), text, l2);
+    y += lh + gap;
+    if (cursor) {
+        ui::AddTabularText(dl, ImVec2(x, y), dispProbe_ == rig::Probe::Ok ? text : dim, l3);
+        // where it was read
+        ImDrawList* fg = ImGui::GetForegroundDrawList();
+        fg->AddCircle(at, Px(7.0f), IM_COL32(0, 0, 0, 200), 0, Px(3.0f));
+        fg->AddCircle(at, Px(7.0f), IM_COL32(255, 255, 255, 235), 0, Px(1.5f));
+    }
+#else
+    (void)st;
+#endif
+}
+
+// #268: the dense disparity map as a translucent false-colour layer over the picture (the
+// depth overlay's ramp, 45 %), with pan / zoom. Positions are in the shown left eye, so not
+// in the right-eye view. "Budget violations only" paints just the cells outside the budget.
+void ProController::BuildDisparityHeatmap(const Status& st) {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    if (!disparityHeatmap_ || !st.stereo || !st.hasPicture || st.isLogo || rightOnlyView_ || !host_.pictureInHud ||
+        !host_.userTexture || !station_.RigActive())
+        return;
+    float px, py, pw, ph;
+    if (!host_.pictureInHud(px, py, pw, ph)) return;
+    const rig::DenseMap m = station_.RigDense();
+    if (!m.Ok()) return;
+    const rig::Budget b = station_.RigBudget();
+    // ~900 cells: recoloured every frame (the budget and the mode can change), uploaded only
+    // when the colours changed
+    std::vector<uint8_t> rgba((size_t)m.cols * m.rows * 4, 0);
+    for (size_t c = 0; c < m.pct.size(); ++c) {
+        const float p = m.pct[c];
+        if (std::isnan(p)) continue;
+        const bool over = p < b.nearPct || p > b.farPct;
+        if (heatmapBudgetOnly_ && !over) continue;
+        float rgb[3];
+        DepthRamp(p, rgb);
+        uint8_t* d = &rgba[c * 4];
+        for (int k = 0; k < 3; ++k) d[k] = (uint8_t)std::lround(std::clamp(rgb[k], 0.0f, 1.0f) * 255.0f);
+        d[3] = 115;
+    }
+    const bool changed = rgba != heatRgba_ || m.seq != heatSeq_;
+    if (changed) {
+        heatRgba_.swap(rgba);
+        heatSeq_ = m.seq;
+    }
+    void* tex = host_.userTexture(3, m.cols, m.rows, changed ? heatRgba_.data() : nullptr);
+    if (!tex) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    // the map's extent in eye UV (each cell spans one grid step around its centre)
+    const float u0 = m.u0 - 0.5f * m.du, u1 = m.u0 + ((float)m.cols - 0.5f) * m.du;
+    const float v0 = m.v0 - 0.5f * m.dv, v1 = m.v0 + ((float)m.rows - 0.5f) * m.dv;
+    auto Sx = [&](float u) { return (px + (u - panX_) * zoom_ * pw) * W; };
+    auto Sy = [&](float v) { return (py + (v - panY_) * zoom_ * ph) * H; };
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    dl->PushClipRect(ImVec2(px * W, py * H), ImVec2((px + pw) * W, (py + ph) * H), true);
+    dl->AddImage((ImTextureID)tex, ImVec2(Sx(u0), Sy(v0)), ImVec2(Sx(u1), Sy(v1)));
+    dl->PopClipRect();
+#else
+    (void)st;
+#endif
+}
+
+void ProController::BuildDisparityToggles() {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    ImGui::Checkbox("Disparity readout", &disparityCard_);
+    ImGui::SameLine();
+    ImGui::Checkbox("Heatmap", &disparityHeatmap_);
+    if (disparityHeatmap_) {
+        ImGui::Indent();
+        ImGui::Checkbox("Budget violations only", &heatmapBudgetOnly_);
+        ImGui::Unindent();
+    }
 #endif
 }
 
@@ -1480,8 +1697,10 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
         panelsFit_ = fio.DisplaySize.x >= Px(kPanelsMinW) && fio.DisplaySize.y >= Px(kPanelsMinH);
     }
     BuildOverlays(st, PanelsShown() ? 1.0f : uiAlpha);  // framing + burn-ins: not faded
+    BuildDisparityHeatmap(st);  // under the depth overlay's dots
     BuildDepthOverlay(st);  // on the picture; independent of the inspector fade
     BuildColourOverlay(st);
+    BuildDisparityCard(st);
     BuildWipeLine(st);
     BuildPixelProbe(st);
     flatRects_.clear();
@@ -1730,7 +1949,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
         }
 
         // --- Rig check (Phase 2) --------------------------------------------
-        station_.BuildRigSection(st.stereo && st.hasPicture);  // measured (Phase 2)
+        station_.BuildRigSection(st.stereo && st.hasPicture, [this] { BuildDisparityToggles(); });  // measured (Phase 2)
 
         // --- Target screen (#135): the depth as it plays on the screen it is made for ---
         if (ImGui::CollapsingHeader("Target screen", ImGuiTreeNodeFlags_DefaultOpen)) {
