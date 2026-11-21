@@ -1083,6 +1083,7 @@ void ProController::AttachSettings(Settings* store, ui::SettingsPanel* panel) {
 void ProController::Tick(const Status& st) {
     PersistBudget();
     stereoSource_ = st.stereo;
+    station_.UpdateStill(st.layout, st.eyesSwapped, !st.isLogo);
     station_.SetSignalFps(st.live ? st.sourceFps : 0.0f);
     PushCalibrationToStation();
     station_.Tick();
