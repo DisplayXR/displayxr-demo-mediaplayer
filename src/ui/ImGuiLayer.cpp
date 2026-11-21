@@ -261,36 +261,54 @@ bool ImGuiLayer::RecreateTarget(VkFormat hudFormat, uint32_t hudWidth, uint32_t 
 }
 
 void ImGuiLayer::AddUiFont() {
+    ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    // File names are drawn in these fonts, and a glyph not baked draws as '?' (#251: a
+    // Cyrillic name showed as "??????"). Every script Inter covers: Latin with its
+    // extensions (Vietnamese too), Greek, Cyrillic, punctuation and currency. Inter has
+    // no CJK, so that is not asked for; code points the font lacks cost no atlas space.
+    static const ImWchar kGlyphs[] = {
+        0x0020, 0x024F,  // Basic Latin, Latin-1, Latin Extended-A and -B
+        0x0370, 0x03FF,  // Greek and Coptic
+        0x0400, 0x04FF,  // Cyrillic
+        0x1E00, 0x1EFF,  // Latin Extended Additional (Vietnamese)
+        0x2010, 0x205E,  // dashes, quotes, ellipsis, primes
+        0x20A0, 0x20BF,  // currency signs
+        0,
+    };
+    // Five times the glyphs of Latin-1 alone: keep the atlas in check at a high DPI scale.
+    // No power-of-two height, and no horizontal oversampling at a large size, where it
+    // adds width but no visible sharpness (ImGui 1.92 makes the same call).
+    atlas->Flags |= ImFontAtlasFlags_NoPowerOfTwoHeight;
     // Rasterized at the size it is drawn at, not a small font scaled up.
-    ImFontConfig fontCfg;
-    fontCfg.FontDataOwnedByAtlas = false;  // a static array, not ImGui's to free
-    static const ImWchar kGlyphs[] = {0x0020, 0x00FF, 0x2010, 0x2026, 0};  // Latin-1, dashes, quotes, ellipsis
-    ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void*)kUiFontTtf, (int)sizeof(kUiFontTtf),
-                                               ui::UiFontPx(metricScale_), &fontCfg, kGlyphs);
+    auto add = [&](float px, const ImWchar* glyphs) {
+        ImFontConfig cfg;
+        cfg.FontDataOwnedByAtlas = false;  // a static array, not ImGui's to free
+        if (px > 36.0f) cfg.OversampleH = 1;
+        return atlas->AddFontFromMemoryTTF((void*)kUiFontTtf, (int)sizeof(kUiFontTtf), px, &cfg, glyphs);
+    };
+    add(ui::UiFontPx(metricScale_), kGlyphs);
     static const ImWchar kSwitchGlyphs[] = {'2', '3', 'D', 'D', 0};
-    ui::g_switchFont = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(
-        (void*)kUiFontTtf, (int)sizeof(kUiFontTtf), ui::SwitchFontPx(metricScale_), &fontCfg,
-        kSwitchGlyphs);
+    ui::g_switchFont = add(ui::SwitchFontPx(metricScale_), kSwitchGlyphs);
     // The touch type scale (#180). Not on desktop: its atlas, and so every pixel, stays as
     // it was, and the null fonts mean the UI font.
     ui::g_titleFont = ui::g_rowFont = ui::g_smallFont = nullptr;
     if (metricScale_ > 1.0f) {
-        auto add = [&](ui::TextStyle style) {
-            return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(
-                (void*)kUiFontTtf, (int)sizeof(kUiFontTtf), ui::TextStylePx(style, metricScale_),
-                &fontCfg, kGlyphs);
-        };
-        ui::g_titleFont = add(ui::TextStyle::Title);
-        ui::g_rowFont = add(ui::TextStyle::Row);
-        ui::g_smallFont = add(ui::TextStyle::Small);
+        ui::g_titleFont = add(ui::TextStylePx(ui::TextStyle::Title, metricScale_), kGlyphs);
+        ui::g_rowFont = add(ui::TextStylePx(ui::TextStyle::Row, metricScale_), kGlyphs);
+        ui::g_smallFont = add(ui::TextStylePx(ui::TextStyle::Small, metricScale_), kGlyphs);
     }
     // The desktop browser's type scale (#252), beside the UI font (which keeps its size).
     for (ImFont*& f : ui::g_deskFonts) f = nullptr;
     if (!(metricScale_ > 1.0f)) {
         for (int i = 0; i < (int)ui::DeskText::Count; ++i)
-            ui::g_deskFonts[i] = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(
-                (void*)kUiFontTtf, (int)sizeof(kUiFontTtf), ui::DeskTextPx((ui::DeskText)i), &fontCfg, kGlyphs);
+            ui::g_deskFonts[i] = add(ui::DeskTextPx((ui::DeskText)i), kGlyphs);
     }
+}
+
+// Upload the atlas AddUiFont built, and say how big it came out.
+static void CreateFontTexture() {
+    ImGui_ImplVulkan_CreateFontsTexture();
+    LOG_INFO("ImGuiLayer: font atlas %dx%d", ImGui::GetIO().Fonts->TexWidth, ImGui::GetIO().Fonts->TexHeight);
 }
 
 void ImGuiLayer::SetFontScale(float scale) {
@@ -301,7 +319,7 @@ void ImGuiLayer::SetFontScale(float scale) {
     ImGui_ImplVulkan_DestroyFontsTexture();
     ImGui::GetIO().Fonts->Clear();
     AddUiFont();
-    ImGui_ImplVulkan_CreateFontsTexture();
+    CreateFontTexture();
 }
 
 void ImGuiLayer::SetUiScale(float scale) {
@@ -314,7 +332,7 @@ void ImGuiLayer::SetUiScale(float scale) {
     ImGui_ImplVulkan_DestroyFontsTexture();
     ImGui::GetIO().Fonts->Clear();
     AddUiFont();
-    ImGui_ImplVulkan_CreateFontsTexture();
+    CreateFontTexture();
     ui::ApplyMediaPlayerStyle(metricScale_);
 }
 
@@ -398,7 +416,7 @@ bool ImGuiLayer::Init(void* nativeWindow, VkInstance instance, VkPhysicalDevice 
         ImGui::DestroyContext();
         return false;
     }
-    ImGui_ImplVulkan_CreateFontsTexture();
+    CreateFontTexture();
 
 #if defined(_WIN32) && defined(MEDIAPLAYER_IMGUI_SDL)
     if (nativeWindow_ && !g_originalWndProc) {

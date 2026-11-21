@@ -1,4 +1,4 @@
-; DisplayXR Stereo Media Player Demo — Windows Installer
+﻿; DisplayXR Stereo Media Player Demo — Windows Installer
 ; Copyright 2026, DisplayXR
 ; SPDX-License-Identifier: Apache-2.0
 ;
@@ -13,6 +13,11 @@
 ; The OpenXR loader is statically linked into the exe (the CMake build fetches +
 ; builds the Khronos loader from source), so — unlike the model/gauss demos —
 ; there is no openxr_loader.dll to ship next to the exe.
+
+; Unicode installer (#251): an ANSI one turned text outside the system code page (a path,
+; a user name) into mojibake. This file starts with a UTF-8 BOM: without one, makensis
+; reads it in the system code page and mangles every non-ASCII character in it.
+Unicode true
 
 !ifndef VERSION
     !define VERSION "0.0.0"
