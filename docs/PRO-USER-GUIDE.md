@@ -292,6 +292,36 @@ logged with their timecode to `Pictures\DisplayXR\station_alerts.jsonl`.
   a **red bar** along that edge, over the rows where it happens, with its depth
   (`EDGE -2.5%`). Press **`D`** again to turn the dots and bars off.
 
+### Disparity readout
+
+Tick **Disparity readout** at the bottom of the **Rig check** section for a card at the
+top-left of the picture with the stereo disparity of what is on screen:
+
+- **near / median / far**: the 2nd percentile, median and 98th percentile parallax of the
+  matched points, in % of the eye width and in **displayed pixels** at full resolution (a
+  half side-by-side master counts as shown, at twice its stored width). Negative is in
+  front of the screen, as in the rest of the rig check.
+- a **histogram** of the matched points from -4 % to +4 % (beyond that they pile up in the
+  end bars), with the depth budget's near and far as amber lines; bars outside the budget
+  are red. One peak per depth plane in the scene.
+- **as shown**: near and far with what convergence adds, which is what reaches the panel.
+- **cursor**: with the pointer over the picture, the disparity at that point
+  (`-1.24% (-24 px)`), or **flat** where there is no texture to match. It follows pan and
+  zoom, and is not shown in the right-eye-only view.
+
+Tick **Heatmap** for a dense disparity map laid over the picture in the same colours as
+the `D` dots, refreshed about twice a second. **Budget violations only** paints just the
+parts outside the depth budget. Like the dots it marks positions in the left eye, so it is
+not drawn in the right-eye-only view. Flat areas stay clear: they have nothing to match.
+
+Both are off by default and cost nothing while off. The heatmap is computed on the rig
+check's own thread, never while the rig check is switched off (`MEDIAPLAYER_PRO_RIG=0`).
+Until the Settings window carries them, `MEDIAPLAYER_PRO_DISPARITY=1` and
+`MEDIAPLAYER_PRO_DISPARITY_HEATMAP=1` (or `=budget`) turn them on at launch.
+`get_rig_status` and snapshot notes carry the same figures: `median_pct`, `near_px`,
+`far_px`, `median_px`, `histogram` (64 bins over `lo_pct`..`hi_pct`), `as_shown_near_pct`
+and `as_shown_far_pct`.
+
 ### Limits
 
 Depth is in % of the picture width: negative is in front of the screen, positive behind.
