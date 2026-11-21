@@ -1009,6 +1009,7 @@ void ProController::PushTargetToStation() {
 
 void ProController::Tick(const Status& st) {
     stereoSource_ = st.stereo;
+    station_.UpdateStill(st.layout, st.eyesSwapped, !st.isLogo);
     station_.SetSignalFps(st.live ? st.sourceFps : 0.0f);
     PushCalibrationToStation();
     station_.Tick();

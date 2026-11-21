@@ -100,36 +100,73 @@ float DeltaE76(const float a[3], const float b[3]) {
                      (la[2] - lb[2]) * (la[2] - lb[2]));
 }
 
-bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, EyePair& out, bool swapEyes) {
-    if (layout != StereoLayout::SbsFull && layout != StereoLayout::SbsHalf) return false;
-    if (f.width < 64 || f.height < 32 || f.plane[0].empty()) return false;
-    if (f.format != PixFormat::NV12 && f.format != PixFormat::I420 && f.format != PixFormat::P016) return false;
-    const bool p16 = f.format == PixFormat::P016;  // 16-bit samples, MSB-aligned
-    const int fullEye = f.width / 2;
-    const int aw = std::min(analysisW, fullEye);
-    const float sx = (float)fullEye / (float)aw;
-    const int ah = std::max(16, (int)std::lround(f.height / sx));
-    const float sy = (float)f.height / (float)ah;
+namespace {
+
+// Where the two eyes sit in a packed frame (side by side or top/bottom), in source pixels,
+// as SHOWN: with the eyes swapped the second half feeds the left eye. Half layouts are
+// squeezed along their packing axis and stretched back on display (x/yStretch).
+struct EyeGeom {
+    int x0[2] = {}, y0[2] = {};
+    int w = 0, h = 0;  // one eye as stored
+    float xStretch = 1.f, yStretch = 1.f;
+};
+
+bool EyeGeometry(StereoLayout layout, int frameW, int frameH, bool swapEyes, EyeGeom& g) {
+    const bool sbs = layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf;
+    const bool tb = layout == StereoLayout::TbFull || layout == StereoLayout::TbHalf;
+    if (!sbs && !tb) return false;
+    g.w = sbs ? frameW / 2 : frameW;
+    g.h = tb ? frameH / 2 : frameH;
+    for (int eye = 0; eye < 2; ++eye) {
+        const int k = eye ^ (swapEyes ? 1 : 0);
+        g.x0[eye] = sbs ? k * g.w : 0;
+        g.y0[eye] = tb ? k * g.h : 0;
+    }
+    g.xStretch = layout == StereoLayout::SbsHalf ? 2.f : 1.f;
+    g.yStretch = layout == StereoLayout::TbHalf ? 2.f : 1.f;
+    return g.w >= 32 && g.h >= 32;
+}
+
+// Integer sums of one eye's mean-colour samples (three channels: Y'CbCr or R'G'B').
+struct Sums {
+    uint64_t c[3] = {};
+    int64_t n = 0;
+};
+
+// The downsample shared by every pixel format: a box filter of each eye to the analysis
+// size and each eye's mean colour, on several threads. The format lives in the callbacks:
+//   addRow(eye, row, colSum)       add source row `row` (frame coordinates) of that eye's
+//                                  columns into colSum (g.w integer sums of luma)
+//   meanRow(eye, row, x0, x1, s)   add that eye's colour samples of columns [x0, x1) of
+//                                  eye-local row `row` into s
+//   toRgb(sums, rgb)               the mean (sums / sums.n) as display-referred R'G'B' 0..1
+// unit scales the luma sums to 0..255. Each analysis pixel and each mean is computed
+// exactly as on one thread (each output row is independent; each mean is summed on one
+// thread, and integer sums do not depend on their order).
+template <class AddRow, class MeanRow, class ToRgb>
+void DownsampleEyes(const EyeGeom& g, int analysisW, float unit, AddRow addRow, MeanRow meanRow, ToRgb toRgb,
+                    EyePair& out) {
+    const int aw = std::min(analysisW, g.w);
+    const float sx = (float)g.w / (float)aw;
+    // A squeezed top/bottom eye gets its displayed rows back (yStretch), so the vertical
+    // error keeps the precision of a full-height eye.
+    const int ah = std::max(16, (int)std::lround(g.h * g.yStretch / sx));
+    const float sy = (float)g.h / (float)ah;
     out.eyeW = aw;
     out.h = ah;
-    out.fullEyeW = (float)fullEye;
-    out.fullH = (float)f.height;
-    out.xStretch = layout == StereoLayout::SbsHalf ? 2.f : 1.f;  // half-SBS eyes are squeezed
+    out.fullEyeW = (float)g.w;
+    out.fullH = (float)g.h;
+    out.xStretch = g.xStretch;
+    out.yStretch = g.yStretch;
     out.left.resize((size_t)aw * ah);
     out.right.resize((size_t)aw * ah);
-    const int W = f.width;
-    // The work is the same per output row and per eye, so it runs on several threads and
-    // the render thread waits for them: every analysis pixel and the mean colours are
-    // computed exactly as on one thread (each mean on one thread, so its sum order holds).
     // At 7680x2160 SBS this was 8-9 ms a call (max ~24) on the render thread, ~9 calls a
-    // second during bursts (#120 review, 2026-10-19).
+    // second during bursts (#120 review, 2026-10-19), hence the threads.
     auto lumaRows = [&](int eye, int yBegin, int yEnd) {
         std::vector<float>& dst = eye == 0 ? out.left : out.right;
-        // the eye as SHOWN: with the eyes swapped the right half feeds the left eye
-        const int x0 = (eye ^ (swapEyes ? 1 : 0)) * fullEye;
-        // Integer sums: the samples are integers (P016 scaled by 1/256 at the end), every
+        // Integer sums: the samples are integers (scaled by `unit` at the end), every
         // partial sum stays under 2^24, so the result is the float sum bit for bit.
-        std::vector<uint32_t> colSum((size_t)fullEye);
+        std::vector<uint32_t> colSum((size_t)g.w);
         // A box over each analysis pixel's whole footprint (sx x sy source pixels). Sampling
         // a 2x2 corner of a 3x3 footprint, as this did, skips five source pixels in nine:
         // an edge moving through the skipped rows does not move in the analysis image,
@@ -137,24 +174,14 @@ bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, E
         // vanished - the eye-sync reading split between the true delay and its neighbour
         // or read "in step" (tmp-mp-pro, 2026-10-18).
         for (int y = yBegin; y < yEnd; ++y) {
-            const int ya = std::min(f.height - 1, (int)(y * sy));
-            const int yb = std::max(ya + 1, std::min(f.height, (int)((y + 1) * sy)));
+            const int ya = std::min(g.h - 1, (int)(y * sy));
+            const int yb = std::max(ya + 1, std::min(g.h, (int)((y + 1) * sy)));
             std::fill(colSum.begin(), colSum.end(), 0u);
-            for (int yy = ya; yy < yb; ++yy) {
-                const size_t r = (size_t)yy * W + x0;
-                if (p16) {
-                    const uint16_t* src = reinterpret_cast<const uint16_t*>(f.plane[0].data()) + r;
-                    for (int x = 0; x < fullEye; ++x) colSum[x] += src[x];
-                } else {
-                    const uint8_t* src = f.plane[0].data() + r;
-                    for (int x = 0; x < fullEye; ++x) colSum[x] += src[x];
-                }
-            }
-            const float unit = p16 ? 1.0f / 256.0f : 1.0f;
+            for (int yy = ya; yy < yb; ++yy) addRow(eye, g.y0[eye] + yy, colSum.data());
             float* d = dst.data() + (size_t)y * aw;
             for (int x = 0; x < aw; ++x) {
-                const int xa = std::min(fullEye - 1, (int)(x * sx));
-                const int xb = std::max(xa + 1, std::min(fullEye, (int)((x + 1) * sx)));
+                const int xa = std::min(g.w - 1, (int)(x * sx));
+                const int xb = std::max(xa + 1, std::min(g.w, (int)((x + 1) * sx)));
                 uint32_t acc = 0;
                 for (int xx = xa; xx < xb; ++xx) acc += colSum[xx];
                 d[x] = ((float)acc * unit) / (float)((xb - xa) * (yb - ya));
@@ -164,50 +191,14 @@ bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, E
     // Mean colour over the central 80 %: whole rows, every 7th. A sparse grid aliases with
     // periodic content (a 16 px grid on a drifting 160 px grating read one eye 15 % brighter
     // for a burst now and then, and the colour alert latched that peak - tmp-mp-pro
-    // 2026-10-18). Summed in integers per chunk of rows: the samples are integers (P016 in
-    // 1/256 steps), so the total is exact and equals the old double sum bit for bit.
-    struct Sums {
-        uint64_t y = 0, u = 0, v = 0;
-        int64_t n = 0;
-    };
-    const int rowFirst = f.height / 10, rowEnd = f.height * 9 / 10;
+    // 2026-10-18). Summed in integers per chunk of rows, so the total is exact.
+    const int rowFirst = g.h / 10, rowEnd = g.h * 9 / 10;
     const int rowCount = rowFirst < rowEnd ? (rowEnd - rowFirst + 6) / 7 : 0;
-    const int xFirst = fullEye / 10, xEnd = fullEye * 9 / 10;
-    const int cw = W / 2;
+    const int xFirst = g.w / 10, xEnd = g.w * 9 / 10;
     auto meanRows = [&](int eye, int kBegin, int kEnd) {
-        const int x0 = (eye ^ (swapEyes ? 1 : 0)) * fullEye;
         Sums s;
         for (int k = kBegin; k < kEnd; ++k) {
-            const int y = rowFirst + 7 * k;
-            if (p16) {
-                const uint16_t* Y = reinterpret_cast<const uint16_t*>(f.plane[0].data()) + (size_t)y * W;
-                const uint16_t* UV = reinterpret_cast<const uint16_t*>(f.plane[1].data()) + (size_t)(y / 2) * W;
-                for (int x = xFirst; x < xEnd; ++x) {
-                    const int gx = x0 + x;
-                    s.y += Y[gx];
-                    s.u += UV[gx & ~1];
-                    s.v += UV[(gx & ~1) + 1];
-                }
-            } else if (f.format == PixFormat::NV12) {
-                const uint8_t* Y = f.plane[0].data() + (size_t)y * W;
-                const uint8_t* UV = f.plane[1].data() + (size_t)(y / 2) * W;
-                for (int x = xFirst; x < xEnd; ++x) {
-                    const int gx = x0 + x;
-                    s.y += Y[gx];
-                    s.u += UV[gx & ~1];
-                    s.v += UV[(gx & ~1) + 1];
-                }
-            } else {
-                const uint8_t* Y = f.plane[0].data() + (size_t)y * W;
-                const uint8_t* U = f.plane[1].data() + (size_t)(y / 2) * cw;
-                const uint8_t* V = f.plane[2].data() + (size_t)(y / 2) * cw;
-                for (int x = xFirst; x < xEnd; ++x) {
-                    const int gx = x0 + x;
-                    s.y += Y[gx];
-                    s.u += U[gx / 2];
-                    s.v += V[gx / 2];
-                }
-            }
+            meanRow(eye, rowFirst + 7 * k, xFirst, xEnd, s);
             s.n += std::max(0, xEnd - xFirst);
         }
         return s;
@@ -227,20 +218,100 @@ bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, E
         }
     lumaRows(1, ah * (chunks - 1) / chunks, ah);
     for (auto& j : jobs) j.get();
-    const double scale = p16 ? 1.0 / 256.0 : 1.0;
     for (int eye = 0; eye < 2; ++eye) {
         Sums t;
         for (auto& m : means[eye]) {
             const Sums s = m.get();
-            t.y += s.y;
-            t.u += s.u;
-            t.v += s.v;
+            for (int k = 0; k < 3; ++k) t.c[k] += s.c[k];
             t.n += s.n;
         }
-        if (t.n > 0)
-            YuvToRgb((float)((double)t.y * scale / (double)t.n), (float)((double)t.u * scale / (double)t.n),
-                     (float)((double)t.v * scale / (double)t.n), f.fullRange, out.meanRgb[eye]);
+        if (t.n > 0) toRgb(t, out.meanRgb[eye]);
     }
+}
+
+}  // namespace
+
+bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, EyePair& out, bool swapEyes) {
+    if (f.gpu || f.plane[0].empty()) return false;
+    if (f.format != PixFormat::NV12 && f.format != PixFormat::I420 && f.format != PixFormat::P016) return false;
+    EyeGeom g;
+    if (!EyeGeometry(layout, f.width, f.height, swapEyes, g)) return false;
+    const bool p16 = f.format == PixFormat::P016;  // 16-bit samples, MSB-aligned
+    const int W = f.width, cw = W / 2;
+    auto addRow = [&](int eye, int row, uint32_t* colSum) {
+        const size_t r = (size_t)row * W + g.x0[eye];
+        if (p16) {
+            const uint16_t* src = reinterpret_cast<const uint16_t*>(f.plane[0].data()) + r;
+            for (int x = 0; x < g.w; ++x) colSum[x] += src[x];
+        } else {
+            const uint8_t* src = f.plane[0].data() + r;
+            for (int x = 0; x < g.w; ++x) colSum[x] += src[x];
+        }
+    };
+    auto meanRow = [&](int eye, int yEye, int xFirst, int xEnd, Sums& s) {
+        const int y = g.y0[eye] + yEye, x0 = g.x0[eye];
+        if (p16) {
+            const uint16_t* Y = reinterpret_cast<const uint16_t*>(f.plane[0].data()) + (size_t)y * W;
+            const uint16_t* UV = reinterpret_cast<const uint16_t*>(f.plane[1].data()) + (size_t)(y / 2) * W;
+            for (int x = xFirst; x < xEnd; ++x) {
+                const int gx = x0 + x;
+                s.c[0] += Y[gx];
+                s.c[1] += UV[gx & ~1];
+                s.c[2] += UV[(gx & ~1) + 1];
+            }
+        } else if (f.format == PixFormat::NV12) {
+            const uint8_t* Y = f.plane[0].data() + (size_t)y * W;
+            const uint8_t* UV = f.plane[1].data() + (size_t)(y / 2) * W;
+            for (int x = xFirst; x < xEnd; ++x) {
+                const int gx = x0 + x;
+                s.c[0] += Y[gx];
+                s.c[1] += UV[gx & ~1];
+                s.c[2] += UV[(gx & ~1) + 1];
+            }
+        } else {
+            const uint8_t* Y = f.plane[0].data() + (size_t)y * W;
+            const uint8_t* U = f.plane[1].data() + (size_t)(y / 2) * cw;
+            const uint8_t* V = f.plane[2].data() + (size_t)(y / 2) * cw;
+            for (int x = xFirst; x < xEnd; ++x) {
+                const int gx = x0 + x;
+                s.c[0] += Y[gx];
+                s.c[1] += U[gx / 2];
+                s.c[2] += V[gx / 2];
+            }
+        }
+    };
+    const double scale = p16 ? 1.0 / 256.0 : 1.0;
+    auto toRgb = [&](const Sums& t, float rgb[3]) {
+        const double n = (double)t.n;
+        YuvToRgb((float)((double)t.c[0] * scale / n), (float)((double)t.c[1] * scale / n),
+                 (float)((double)t.c[2] * scale / n), f.fullRange, rgb);
+    };
+    DownsampleEyes(g, analysisW, p16 ? 1.0f / 256.0f : 1.0f, addRow, meanRow, toRgb, out);
+    return true;
+}
+
+bool DownsampleRgba(const uint8_t* rgba, int w, int h, StereoLayout layout, int analysisW, EyePair& out,
+                    bool swapEyes) {
+    if (!rgba) return false;
+    EyeGeom g;
+    if (!EyeGeometry(layout, w, h, swapEyes, g)) return false;
+    // Luma: BT.709 Y' from the (full-range) R'G'B', weights in 1/256 so the sums stay integer.
+    auto addRow = [&](int eye, int row, uint32_t* colSum) {
+        const uint8_t* src = rgba + ((size_t)row * w + g.x0[eye]) * 4;
+        for (int x = 0; x < g.w; ++x, src += 4) colSum[x] += 54u * src[0] + 183u * src[1] + 19u * src[2];
+    };
+    auto meanRow = [&](int eye, int yEye, int xFirst, int xEnd, Sums& s) {
+        const uint8_t* src = rgba + ((size_t)(g.y0[eye] + yEye) * w + g.x0[eye] + xFirst) * 4;
+        for (int x = xFirst; x < xEnd; ++x, src += 4) {
+            s.c[0] += src[0];
+            s.c[1] += src[1];
+            s.c[2] += src[2];
+        }
+    };
+    auto toRgb = [](const Sums& t, float rgb[3]) {
+        for (int k = 0; k < 3; ++k) rgb[k] = (float)((double)t.c[k] / 255.0 / (double)t.n);
+    };
+    DownsampleEyes(g, analysisW, 1.0f / 256.0f, addRow, meanRow, toRgb, out);
     return true;
 }
 
@@ -432,7 +503,7 @@ Result Measure(const EyePair& e, const Options& o) {
     auto pct = [&](float q) { return sorted[(size_t)std::lround(q * (float)(sorted.size() - 1))]; };
     r.nearPct = pct(0.02f);
     r.farPct = pct(0.98f);
-    const float scaleY = e.fullH / (float)H;
+    const float scaleY = e.PxPerRow();
     // roll: least-squares slope of dy over x (both in analysis px)
     double mx = 0, my = 0;
     for (size_t i = 0; i < xs.size(); ++i) {
@@ -449,7 +520,7 @@ Result Measure(const EyePair& e, const Options& o) {
     // dy is in rows of H, x in columns of W; convert both to full-res DISPLAYED px before
     // the angle (a half-SBS eye is shown twice as wide as it is stored)
     const double slopeA = sxx > 0 ? sxy / sxx : 0.0;  // analysis rows per analysis column
-    const double slope = slopeA * (scaleY / (e.fullEyeW * e.xStretch / (float)W));
+    const double slope = slopeA * (scaleY / e.PxPerCol());
     r.rollDeg = (float)(std::atan(slope) * 180.0 / 3.14159265358979);
     r.dySlope = (float)slopeA;
     // vertical error: the offset at the picture centre with the roll taken out. A plain
@@ -752,9 +823,21 @@ RigMonitor::~RigMonitor() {
 void RigMonitor::Submit(const FrameRing::Frame& f, StereoLayout layout, int eyeOffsetFrames,
                         const std::string& timecode, bool swapEyes) {
     const double now = LiveProducer::NowSeconds();
+    if (stillHeld_) ClearStill();  // frames again
+    // Frames the downsample cannot read say why, instead of a "Measuring..." that never
+    // ends: zero-copy decode keeps the picture on the GPU (no CPU planes).
+    const bool readable = f.format == PixFormat::NV12 || f.format == PixFormat::I420 || f.format == PixFormat::P016;
+    const int why = f.gpu ? 1 : (!readable || f.plane[0].empty()) ? 2 : 0;
+    unmeasurable_.store(why, std::memory_order_relaxed);
+    if (why) {
+        burst_.clear();
+        burstBroken_ = false;
+        burstStart_ = -1.0;
+        return;
+    }
     if (burst_.empty() && !burstBroken_) {
         std::lock_guard<std::mutex> lk(m_);
-        if (pending_ || now - lastSubmit_ < 0.25) return;  // ~4 measurements a second
+        if (pending_ || busy_ || now - lastSubmit_ < 0.25) return;  // ~4 measurements a second
     } else if (!burst_.empty() &&
                (f.serial != burstLastSerial_ + 1 || layout != burstLayout_ || swapEyes != burstSwap_)) {
         // A dropped frame or a change: no consecutive burst this time. The window keeps its
@@ -812,9 +895,139 @@ void RigMonitor::Submit(const FrameRing::Frame& f, StereoLayout layout, int eyeO
     pendingLayout_ = layout;
     pendingSwap_ = swapEyes;
     pendingTimecode_ = timecode;
+    pendingStill_ = false;
     pending_ = true;
     lastSubmit_ = now;
     cv_.notify_one();
+}
+
+namespace {
+
+// The still's kept copy: an integer box reduce by k to about kKeepMax px on its long side,
+// so a re-measure (layout / eye swap) needs no decode and the 640 px analysis eyes still
+// have 2x the pixels. k is picked to divide both half sizes where it can, so no reduced
+// pixel straddles the two eyes of either packing.
+constexpr int kKeepMax = 2560;
+
+int StillReduceFactor(int w, int h) {
+    const int k0 = std::max(1, (std::max(w, h) + kKeepMax - 1) / kKeepMax);
+    for (int k = k0; k <= 2 * k0; ++k)
+        if ((w / 2) % k == 0 && (h / 2) % k == 0) return k;
+    return k0;
+}
+
+void ReduceRgba(const uint8_t* src, int w, int h, int k, std::vector<uint8_t>& dst, int& rw, int& rh) {
+    rw = w / k;
+    rh = h / k;
+    dst.resize((size_t)rw * rh * 4);
+    if (k == 1) {
+        std::copy(src, src + dst.size(), dst.begin());
+        return;
+    }
+    const uint32_t n = (uint32_t)(k * k);
+    auto rows = [&](int y0, int y1) {
+        std::vector<uint32_t> acc((size_t)rw * 4);
+        for (int y = y0; y < y1; ++y) {
+            std::fill(acc.begin(), acc.end(), 0u);
+            for (int j = 0; j < k; ++j) {
+                const uint8_t* s = src + (size_t)(y * k + j) * w * 4;
+                for (int x = 0; x < rw; ++x)
+                    for (int i = 0; i < k; ++i)
+                        for (int c = 0; c < 4; ++c) acc[(size_t)x * 4 + c] += s[((size_t)x * k + i) * 4 + c];
+            }
+            uint8_t* d = dst.data() + (size_t)y * rw * 4;
+            for (size_t i = 0; i < acc.size(); ++i) d[i] = (uint8_t)((acc[i] + n / 2) / n);
+        }
+    };
+    const int chunks = std::clamp((int)std::thread::hardware_concurrency(), 1, 8);
+    std::vector<std::future<void>> jobs;
+    for (int c = 1; c < chunks; ++c)
+        jobs.push_back(std::async(std::launch::async, rows, rh * c / chunks, rh * (c + 1) / chunks));
+    rows(0, rh / chunks);
+    for (auto& j : jobs) j.get();
+}
+
+}  // namespace
+
+void RigMonitor::SubmitStill(const uint8_t* rgba, int w, int h, StereoLayout layout, bool swapEyes) {
+    if (!rgba || w < 2 || h < 2) {
+        ClearStill();
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    unmeasurable_.store(0, std::memory_order_relaxed);
+    burst_.clear();
+    burstBroken_ = false;
+    burstStart_ = -1.0;
+    stillK_ = StillReduceFactor(w, h);
+    ReduceRgba(rgba, w, h, stillK_, still_, stillW_, stillH_);
+    stillHeld_ = true;
+    stillLayout_ = layout;
+    stillSwap_ = swapEyes;
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        stillShown_ = true;
+    }
+    std::fprintf(stderr, "[mediaplayer][INFO ] Rig check (render thread): still %dx%d kept at %dx%d in %.2f ms\n", w, h,
+                 stillW_, stillH_,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    MeasureStill();
+}
+
+void RigMonitor::UpdateStill(StereoLayout layout, bool swapEyes) {
+    if (!stillHeld_ || (layout == stillLayout_ && swapEyes == stillSwap_)) return;
+    stillLayout_ = layout;
+    stillSwap_ = swapEyes;
+    MeasureStill();
+}
+
+void RigMonitor::MeasureStill() {
+    EyePair e;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = DownsampleRgba(still_.data(), stillW_, stillH_, stillLayout_, 640, e, stillSwap_);
+    // the readings are in the source's pixels, not the kept copy's
+    e.fullEyeW *= (float)stillK_;
+    e.fullH *= (float)stillK_;
+    if (ok)
+        std::fprintf(stderr, "[mediaplayer][INFO ] Rig check (render thread): still downsample %.2f ms (%s%s)\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                     stillLayout_ == StereoLayout::TbFull || stillLayout_ == StereoLayout::TbHalf ? "top/bottom"
+                                                                                                  : "side by side",
+                     stillSwap_ ? ", eyes swapped" : "");
+    std::lock_guard<std::mutex> lk(m_);
+    work_.clear();
+    if (ok) work_.push_back(std::move(e));  // nothing to measure (mono): the worker records "not measured"
+    pendingEyeOffset_ = -1;
+    pendingTimecode_.clear();
+    pendingLayout_ = stillLayout_;
+    pendingSwap_ = stillSwap_;
+    pendingStill_ = true;
+    pendingStillSerial_ = ++stillSerial_;
+    stillMeasured_ = false;
+    pending_ = true;
+    cv_.notify_one();
+}
+
+void RigMonitor::ClearStill() {
+    if (!stillHeld_) return;
+    stillHeld_ = false;
+    std::vector<uint8_t>().swap(still_);
+    std::lock_guard<std::mutex> lk(m_);
+    stillShown_ = stillMeasured_ = false;
+    ++stillSerial_;  // a still measurement still running is dropped
+}
+
+bool RigMonitor::StillShown() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return stillShown_;
+}
+
+const char* RigMonitor::Unmeasurable() const {
+    switch (unmeasurable_.load(std::memory_order_relaxed)) {
+        case 1: return "Rig check needs CPU frames: hardware decode is on (zero-copy)";
+        case 2: return "Rig check cannot read this pixel format yet";
+        default: return nullptr;
+    }
 }
 
 void RigMonitor::Worker() {
@@ -824,6 +1037,10 @@ void RigMonitor::Worker() {
         if (stop_) return;
         std::vector<EyePair> seq = std::move(work_);
         work_.clear();
+        pending_ = false;  // a new hand-over may queue while this one is measured
+        busy_ = true;
+        const bool still = pendingStill_;
+        const uint64_t stillSerial = pendingStillSerial_;
         const uint64_t gen = generation_;
         const int eyeOffset = pendingEyeOffset_;
         const std::string tc = pendingTimecode_;
@@ -838,7 +1055,7 @@ void RigMonitor::Worker() {
             std::nth_element(p.begin(), p.begin() + p.size() / 2, p.end());
             const EyePair& e = seq.back();
             const float shiftX = p[p.size() / 2] / 100.f * (float)e.eyeW;
-            const float shiftY = e.fullH > 0 ? r.verticalPx * (float)e.h / e.fullH : 0.f;
+            const float shiftY = e.PxPerRow() > 0 ? r.verticalPx / e.PxPerRow() : 0.f;
             const int m = MeasureEyeSync(seq, shiftX, shiftY, r.dySlope, &r.eyeSyncLateEye);
             if (gen != syncGen_) {  // Reset() ran since the last burst: start the vote afresh
                 syncConfirm_ = SyncConfirm{};
@@ -890,8 +1107,9 @@ void RigMonitor::Worker() {
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         lk.lock();
-        pending_ = false;
+        busy_ = false;
         if (gen != generation_) continue;  // Reset() ran meanwhile: this was the old input
+        if (still && stillSerial != stillSerial_) continue;  // a newer still view (or frames) replaced it
         measureMs_ = ms;
         last_ = r;
         Sample s;
@@ -908,7 +1126,17 @@ void RigMonitor::Worker() {
             s.edgeMeasured[i] = r.edge[i].measured;
             s.edgePct[i] = r.edge[i].parallaxPct;
         }
-        AddSampleLocked(s, tc);
+        if (still) {
+            // A still has no duration: its sample joins the history (strip, report) but
+            // opens no alert run, and the runs the frames before it left open end at
+            // their last good sample.
+            stillMeasured_ = true;
+            history_.push_back(s);
+            if (lastGoodT_ >= 0)
+                for (int i = 0; i < kRuns; ++i) CloseRun(i, lastGoodT_, lastGoodTc_);
+        } else {
+            AddSampleLocked(s, tc);
+        }
     }
 }
 
@@ -1052,6 +1280,7 @@ void RigMonitor::Reset() {
     for (Run& r : runs_) r.since = -1;
     lastGoodT_ = notOkSince_ = -1.0;
     lastGoodTc_.clear();
+    unmeasurable_.store(0, std::memory_order_relaxed);
 }
 
 Result RigMonitor::Last() const {
@@ -1092,6 +1321,7 @@ std::vector<Alert> RigMonitor::Alerts() const {
 
 bool RigMonitor::Active(double now) const {
     std::lock_guard<std::mutex> lk(m_);
+    if (stillShown_) return stillMeasured_;  // a still is measured once and holds
     return !history_.empty() && now - history_.back().t < 2.0;
 }
 

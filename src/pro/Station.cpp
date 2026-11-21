@@ -260,11 +260,25 @@ void Station::OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live,
         timecode_.clear();
         delayMs_ = 0.0;
     }
-    if (opt_.perf.rig && (layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf)) {
+    if (opt_.perf.rig && (layout == StereoLayout::SbsFull || layout == StereoLayout::SbsHalf ||
+                          layout == StereoLayout::TbFull || layout == StereoLayout::TbHalf)) {
         const auto t0 = StageClock::now();
         rig_.Submit(f, layout, live ? eyeOffsetFrames : -1, f.timecode, eyesSwapped);
         lastRigMs_ = stageMs(t0);
     }
+}
+
+void Station::OnStill(const uint8_t* rgba, int w, int h, StereoLayout layout, bool eyesSwapped) {
+    if (!rgba || !opt_.perf.rig) {
+        rig_.ClearStill();
+        return;
+    }
+    rig_.SubmitStill(rgba, w, h, layout, eyesSwapped);
+}
+
+void Station::UpdateStill(StereoLayout layout, bool eyesSwapped, bool shown) {
+    if (!shown) rig_.ClearStill();
+    else rig_.UpdateStill(layout, eyesSwapped);
 }
 
 int Station::MeasuredEyeSync(int* lateEye) const {
@@ -763,6 +777,9 @@ std::string Station::RigStatusJson() const {
     const std::vector<rig::Sample> h = rig_.History(1.0);
     json out;
     out["measured"] = r.ok && rig_.Active(LiveProducer::NowSeconds());
+    out["source"] = rig_.StillShown() ? "still" : "frames";
+    const char* why = rig_.Unmeasurable();  // frames it cannot read (GPU-only, pixel format)
+    out["unmeasurable"] = why ? nlohmann::json(why) : nlohmann::json(nullptr);
     out["matches"] = r.matches;
     out["vertical_px"] = r.verticalPx;
     out["roll_deg"] = r.rollDeg;
@@ -1210,7 +1227,11 @@ void Station::BuildRigSection(bool stereo) {
     const rig::Result r = rig_.Last();
     const rig::Budget b = rig_.GetBudget();
     if (!stereo) {
-        ImGui::TextDisabled("Needs a side-by-side stereo source.");
+        ImGui::TextDisabled("Needs a stereo source (side by side or top/bottom).");
+        return;
+    }
+    if (const char* why = rig_.Unmeasurable()) {
+        ImGui::TextDisabled("%s", why);
         return;
     }
     if (!r.ok || !rig_.Active(LiveProducer::NowSeconds())) {

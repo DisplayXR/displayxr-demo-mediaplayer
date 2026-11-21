@@ -104,6 +104,9 @@ void ProController::OnFrame(const FrameRing::Frame& f, StereoLayout layout) {
 }
 
 void ProController::OnStill(const uint8_t* rgba, int w, int h, StereoLayout layout) {
+    // The rig check measures a stereo still too (#266). The effective eye swap is not known
+    // here; the next Tick's UpdateStill re-measures if it is on.
+    station_.OnStill(rgba, w, h, layout, false);
     if (!rgba) {
         scopeIsStill_ = false;
         return;
