@@ -241,7 +241,9 @@ public:
     // What is on screen: pinned AND room for it. App's UI state follows this, not the pin.
     bool PanelsShown() const { return inspectorPinned_ && panelsFit_; }
     bool ProbeOn() const { return probeOn_; }
-    bool KeepHudAwake() const { return PanelsShown() || depthOverlay_ || OverlaysOn() || scopesOn_; }
+    bool KeepHudAwake() const {
+        return PanelsShown() || depthOverlay_ || OverlaysOn() || scopesOn_ || station_.ColourOverlay() != 0;
+    }
 
     ViewMode Mode() const { return mode_; }
     // The monitoring station: inputs, timecode / delay, rig checks, snapshots (Station.h).
@@ -261,6 +263,7 @@ public:
 private:
     void SetMode(ViewMode m, bool announce);
     void BuildDepthOverlay(const Status& st);
+    void BuildColourOverlay(const Status& st);  // #270: the colour difference between the eyes
     void BuildWipeLine(const Status& st);
     void SetWipe(Wipe w, bool announce);
     void BuildOverlays(const Status& st, float uiAlpha);
@@ -420,6 +423,7 @@ private:
     std::string ScopeKey();
     scopes::Result scope_;                       // the last finished measurement
     std::vector<uint8_t> waveRgba_, vecRgba_;
+    std::vector<uint8_t> colourRgba_;  // #270: the colour-difference overlay as uploaded
     bool scopeTexDirty_ = false;
     std::string colourTag_;                      // "BT.709 SDR, 10-bit" (the colour burn-in)
     std::string compare_[2];       // A (what was open) and B

@@ -211,24 +211,27 @@ std::string MakeCsv(const Session& s) {
     std::string o =
         "kind,timecode,end_timecode,duration_frames,tc_fps,clock,description,note,vertical_px,roll_deg,"
         "near_pct,far_pct,delta_e,edge_left_pct,edge_right_pct,eye_sync_frames,image,"
-        "calibration,calibration_name,calibration_fingerprint,calibration_panel,scale_pct\n";
+        "calibration,calibration_name,calibration_fingerprint,calibration_panel,scale_pct,gain_r_pct,gain_g_pct,gain_b_pct,luma_pct\n";
     Marker m;
     for (const Alert& a : s.alerts) {
         const bool ok = AlertMarker(a, s, m);
         o += "alert," + Csv(a.timecode) + "," + Csv(a.endTimecode) + "," + (ok ? std::to_string(m.frames) : "") + "," +
              (a.tcFps > 0 ? std::to_string(a.tcFps) : "") + "," + Csv(a.clock) + "," +
-             Csv(AlertText(a)) + ",,,,,,,,,,,,,,,\n";
+             Csv(AlertText(a)) + ",,,,,,,,,,,,,,,,,,,\n";
     }
     for (const Snapshot& sn : s.snapshots) {
         const Rig& r = sn.rig;
         auto rig = [&](float v, int d) { return r.measured ? Num(v, d) : std::string(); };
+        std::string gains;  // #270
+        for (float v : {r.gainPct[0], r.gainPct[1], r.gainPct[2], r.lumaPct})
+            gains += "," + (r.measured && r.colourMeasured ? Num(v, 2) : std::string());
         o += "snapshot," + Csv(sn.timecode) + ",,1," + (sn.tcFps > 0 ? std::to_string(sn.tcFps) : "") + "," +
              Csv(sn.clock) + ",Snapshot," + Csv(sn.note) + "," + rig(r.verticalPx, 2) + "," + rig(r.rollDeg, 2) + "," +
              rig(r.nearPct, 2) + "," + rig(r.farPct, 2) + "," + rig(r.deltaE, 2) + "," +
              (r.edgeMeasured[0] ? Num(r.edgePct[0], 2) : "") + "," + (r.edgeMeasured[1] ? Num(r.edgePct[1], 2) : "") +
              "," + (sn.eyeSyncFrames >= 0 ? std::to_string(sn.eyeSyncFrames) : "") + "," + Csv(sn.image) + "," +
              Csv(sn.calibration.state) + "," + Csv(sn.calibration.name) + "," + Csv(sn.calibration.fingerprint) +
-             "," + Csv(sn.calibration.panel) + "," + (r.measured && r.scaleMeasured ? Num(r.scalePct, 2) : "") + "\n";
+             "," + Csv(sn.calibration.panel) + "," + (r.measured && r.scaleMeasured ? Num(r.scalePct, 2) : "") + gains + "\n";
     }
     return o;
 }
@@ -261,7 +264,8 @@ std::string MakeHtml(const Session& s) {
          ". Depth budget " + Num(s.budgetNearPct, 1) + "% to " + Num(s.budgetFarPct, 1) +
          "% of the eye width; vertical &le; " + Num(s.budgetVerticalPx, 1) + " px; colour &Delta;E &le; " +
          Num(s.budgetDeltaE, 1) + "; nothing nearer than " + Num(s.budgetEdgePct, 1) + "% at the frame edges" +
-         (s.budgetScalePct > 0 ? "; eye sizes within " + Num(s.budgetScalePct, 2) + "%" : std::string()) + ".</p>\n";
+         (s.budgetScalePct > 0 ? "; eye sizes within " + Num(s.budgetScalePct, 2) + "%" : std::string()) +
+         (s.budgetGainPct > 0 ? "; channel gains within " + Num(s.budgetGainPct, 1) + "%" : std::string()) + ".</p>\n";
     if (!s.calibration.state.empty())
         o += "<p>Display calibration at export: " + Html(CalibrationText(s.calibration)) +
              ". Each snapshot lists the calibration that was in its capture.</p>\n";
@@ -307,6 +311,13 @@ std::string MakeHtml(const Session& s) {
             o += "<span>Depth " + over(r.nearPct < s.budgetNearPct, Num(r.nearPct, 2) + "%") + " to " +
                  over(r.farPct > s.budgetFarPct, Num(r.farPct, 2) + "%") + "</span>";
             o += "<span>Colour &Delta;E " + over(r.deltaE > s.budgetDeltaE, Num(r.deltaE, 2)) + "</span>";
+            if (r.colourMeasured) {  // #270
+                o += "<span>Gain";
+                for (int c = 0; c < 3; ++c)
+                    o += std::string(" ") + "RGB"[c] + " " +
+                         over(s.budgetGainPct > 0 && std::fabs(r.gainPct[c]) > s.budgetGainPct, Num(r.gainPct[c], 1) + "%");
+                o += " &middot; Y " + Num(r.lumaPct, 1) + "%</span>";
+            }
             for (int e = 0; e < 2; ++e)
                 if (r.edgeMeasured[e])
                     o += std::string("<span>") + (e == 0 ? "Left" : "Right") + " edge " +
