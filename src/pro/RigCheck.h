@@ -10,7 +10,10 @@
 //   scale           the right eye's size against the left (a zoom mismatch, %), from the
 //                   vertical component of the matches, which carries no scene depth (#269)
 //   colour match    CIE76 delta-E between the two eyes' mean colours (the same scene
-//                   through two cameras should match; > ~2 is visible)
+//                   through two cameras should match; > ~2 is visible), and per channel
+//                   gain / lift from the eyes' histograms (#270); both over the OVERLAP
+//                   only (the band at each eye's outer edge, which only that eye sees, and
+//                   matte rows left out), in the source's code values (before the grade)
 //   frame edges     edge (window) violations: something in front of the screen that the
 //                   left or right frame edge cuts off - one eye sees more of it than the
 //                   other, and the eyes read the frame as a window it pokes through
@@ -40,6 +43,15 @@
 
 namespace mp::rig {
 
+// #270: the colour samples' resolution. Histograms of 12-bit code values in 256 bins: at 64,
+// the in-bin interpolation of the percentiles alone was worth up to 0.3 % of gain on the
+// test signal (the whole tolerance), at 256 it is under 0.15 %; the shape score still
+// compares 64. The colour grid (for the colour-difference overlay) covers the whole eye.
+constexpr int kHistShift = 4;
+constexpr int kHistBins = 4096 >> kHistShift;
+constexpr int kColourGridW = 96, kColourGridH = 54;
+constexpr float kOverlapEdge = 0.08f;  // edge bands left out of the colour figures (= the parallax search range)
+
 // The measurement image: both eyes as grey + mean colour, at the analysis resolution.
 struct EyePair {
     int eyeW = 0, h = 0;          // analysis size per eye
@@ -47,7 +59,15 @@ struct EyePair {
     float xStretch = 1.f;         // displayed / stored eye width (2 for half-SBS)
     float yStretch = 1.f;         // displayed / stored eye height (2 for half-TB)
     std::vector<float> left, right;  // eyeW * h luma (0..255)
-    float meanRgb[2][3] = {};     // per eye, display-referred 0..1
+    float meanRgb[2][3] = {};     // per eye, R'G'B' code values 0..1, mean over the overlap (#270)
+    // #270, per eye over the overlap: R', G', B' and luma histograms (12-bit code values >> kHistShift),
+    // the mean luma, the samples counted; and the mean R'G'B' of each grid cell (whole eye,
+    // kColourGridW x kColourGridH x 3, NaN = no samples: matte rows).
+    uint32_t hist[2][4][kHistBins] = {};
+    float meanLuma[2] = {};
+    int64_t colourSamples[2] = {};
+    std::vector<float> grid[2];
+    bool pq = false;              // the code values are PQ (the readout says so)
     int64_t serial = 0;           // the source frame's ring serial (diagnostics)
     // Full-resolution DISPLAYED px per analysis column / row: what the readings are
     // reported in (a half layout's eye is shown stretched along its packing axis).
@@ -65,6 +85,34 @@ bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, E
 // the full-range R'G'B', the mean colours are the R'G'B' means.
 bool DownsampleRgba(const uint8_t* rgba, int w, int h, StereoLayout layout, int analysisW, EyePair& out,
                     bool swapEyes = false);
+
+// #270: the eyes' colour against each other, right = gain * left + lift per channel (R'G'B'
+// code values), from matched percentiles (p5..p95) of the overlap histograms.
+struct ColourMatch {
+    bool measured = false;  // enough samples, and every channel had a spread to fit
+    float gainPct[3] = {};  // (gain - 1) x 100, R G B
+    float liftPct[3] = {};  // lift x 100 (% of full scale)
+    float shape[3] = {};    // histogram intersection after the gain / lift: 1 = they explain it all
+    float lumaPct = 0.f;    // mean luma, right against left, %
+    float lumaStops = 0.f;  // the same as log2
+    bool pq = false;        // PQ code values
+    int WorstChannel() const;  // the channel with the largest |gain|
+};
+
+// #270: the colour-difference overlay: both eyes box-filtered to cols x rows cells over the
+// overlap, the right eye sampled at the median parallax, right minus left per cell.
+struct ColourDiff {
+    int cols = 48, rows = 27;
+    float u0 = 0.f, u1 = 1.f, v0 = 0.f, v1 = 1.f;  // the cells' extent in the left eye (0..1)
+    std::vector<float> y, cb, cr;                  // luma, and the chroma direction; NaN = empty
+    bool Ok() const { return (int)y.size() == cols * rows; }
+};
+
+ColourMatch MeasureColour(const EyePair& e);
+ColourDiff MeasureColourDiff(const EyePair& e, float shiftPct);
+// An ASC CDL (.cc, slope / offset) for the right eye that matches it to the left: the
+// inverse of the measured gain / lift.
+std::string ColourFixCc(const ColourMatch& c);
 
 // One frame edge: the matches in a band along it. Something in front of the screen sits
 // further left in the right eye than in the left, so at the LEFT edge its blocks are taken
@@ -95,7 +143,9 @@ struct Result {
     float keystonePx = 0.f;       // vertical keystone: at the top edge, right minus left side, full-res px
     float nearPct = 0.f;          // 2nd percentile parallax, % of eye width (negative = in front)
     float farPct = 0.f;           // 98th percentile parallax
-    float deltaE = 0.f;           // CIE76 between the eyes' mean colours
+    float deltaE = 0.f;           // CIE76 between the eyes' mean colours (over the overlap, #270)
+    ColourMatch colour;           // #270
+    ColourDiff colourDiff;
     std::vector<float> parallaxPct;  // every match's parallax (for the depth overlay)
     std::vector<float> matchX, matchY;  // match centres, 0..1 of the left eye
     // Measured eye sync (MeasureEyeSync): frames between the eyes, 0 = in step, -1 = not
@@ -194,6 +244,7 @@ struct Budget {
     float maxDeltaE = 2.0f;
     float edgePct = -0.3f;  // nearest parallax allowed at the left / right frame edge
     float scalePct = 0.5f;  // #269: largest allowed size difference between the eyes, %
+    float gainPct = 2.0f;   // #270: largest allowed gain difference of any channel, %
     // #135: > 0 = the far parallax at which the TARGET screen's background diverges past
     // the cap (target::DivergenceLimitPct); 0 = no target screen, no divergence alert.
     float divergeFarPct = 0.0f;
@@ -209,6 +260,8 @@ struct Sample {
     float nearPct = 0, farPct = 0, verticalPx = 0, deltaE = 0;
     bool scaleMeasured = false;
     float scalePct = 0;             // the shown (smoothed) reading
+    bool colourMeasured = false;    // #270
+    float gainPct[3] = {};
     int eyeOffsetFrames = -1;       // from the source's timecodes (-1 unknown)
     int eyeSyncMeasured = -1;       // measured from the pixels (-1 not measured)
     int eyeSyncLateEye = 0;         // +1 right late, -1 left late
@@ -255,7 +308,8 @@ public:
     // Which optional checks are shown and alert (#269; the settings qc.*). Off only hides
     // them: they are still measured (it costs microseconds) and stay in get_rig_status.
     struct Checks {
-        bool scale = true;  // qc.scale_check
+        bool scale = true;   // qc.scale_check
+        bool colour = true;  // qc.color_check (#270: the per-channel line and the gain alert)
     };
     void SetChecks(const Checks& c);
     Checks GetChecks() const;
@@ -299,9 +353,10 @@ private:
     Budget budget_;
     Checks checks_;
     double measureMs_ = 0.0;
-    // Worker only (#269): the last few scale readings (the shown value is their median) and
+    // Worker only (#269): the last few scale / colour readings (the shown value is their median) and
     // the last fit, which seeds the next frame's vertical search; both restart with generation_.
     std::deque<float> scaleRecent_;
+    std::deque<ColourMatch> colourRecent_;  // #270: the same for the colour figures
     Options seed_;
     int seedW_ = 0, seedH_ = 0;  // the eye size seed_ was fitted at
     uint64_t seedGen_ = 0;
@@ -323,11 +378,12 @@ private:
     uint64_t stillSerial_ = 0, pendingStillSerial_ = 0;
     std::atomic<int> unmeasurable_{0};  // Submit's last frame: 0 measurable, 1 GPU-only, 2 format
     // open alert runs: near, far, vertical, colour, left edge, right edge, divergence (#135),
-    // scale (#269)
-    static constexpr int kRuns = 8;
+    // scale (#269), colour gain (#270)
+    static constexpr int kRuns = 9;
     struct Run {
         double since = -1;
         float worst = 0;
+        int channel = 0;  // the gain run: which channel the worst reading was
         std::string tc, clock;
     };
     Run runs_[kRuns];

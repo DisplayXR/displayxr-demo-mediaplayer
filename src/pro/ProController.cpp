@@ -1190,6 +1190,74 @@ void ProController::BuildDepthOverlay(const Status& st) {
 #endif
 }
 
+// #270: the colour difference between the eyes (right minus left), low-passed to the rig
+// check's 48 x 27 cells over the overlap, the right eye sampled at the median parallax: a
+// translucent diverging map over the picture, drawn through the userTexture hook (no shader
+// change). Luma: red = the right eye brighter, blue = darker; chroma: the hue of the right
+// eye's colour cast. Full strength at 5 % of full scale. Like the depth dots it marks
+// positions in the left eye, so not in the right-eye-only view.
+void ProController::BuildColourOverlay(const Status& st) {
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    const int mode = station_.ColourOverlay();
+    if (!mode || !st.stereo || !st.hasPicture || st.isLogo || rightOnlyView_ || !host_.pictureInHud || !host_.userTexture)
+        return;
+    float px, py, pw, ph;
+    if (!host_.pictureInHud(px, py, pw, ph)) return;
+    const rig::Result r = station_.RigLast();
+    const rig::ColourDiff& d = r.colourDiff;
+    if (!r.ok || !d.Ok()) return;
+    constexpr float kFull = 0.05f;
+    std::vector<uint8_t> rgba((size_t)d.cols * d.rows * 4, 0);
+    for (size_t k = 0; k < d.y.size(); ++k) {
+        uint8_t* o = &rgba[k * 4];
+        if (std::isnan(d.y[k])) continue;
+        float rgb[3], a;
+        if (mode == 1) {
+            const float t = std::clamp(d.y[k] / kFull, -1.0f, 1.0f);
+            rgb[0] = t > 0 ? 1.0f : 0.25f;
+            rgb[1] = t > 0 ? 0.30f : 0.50f;
+            rgb[2] = t > 0 ? 0.20f : 1.0f;
+            a = std::fabs(t);
+        } else {
+            const float mag = std::hypot(d.cb[k], d.cr[k]);
+            if (mag < 1e-5f) continue;
+            const float cb = d.cb[k] / mag, cr = d.cr[k] / mag;  // the cast's direction, at a fixed strength
+            rgb[0] = 0.5f + 0.45f * 1.5748f * cr;
+            rgb[1] = 0.5f - 0.45f * (0.1873f * cb + 0.4681f * cr);
+            rgb[2] = 0.5f + 0.45f * 1.8556f * cb;
+            a = std::min(1.0f, mag / kFull);
+        }
+        for (int c = 0; c < 3; ++c) o[c] = (uint8_t)std::lround(std::clamp(rgb[c], 0.0f, 1.0f) * 255.0f);
+        o[3] = (uint8_t)std::lround(a * 190.0f);
+    }
+    const bool changed = rgba != colourRgba_;
+    if (changed) colourRgba_.swap(rgba);
+    void* tex = host_.userTexture(2, d.cols, d.rows, changed ? colourRgba_.data() : nullptr);
+    if (!tex) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    auto Sx = [&](float u) { return (px + (u - panX_) * zoom_ * pw) * W; };
+    auto Sy = [&](float v) { return (py + (v - panY_) * zoom_ * ph) * H; };
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    dl->PushClipRect(ImVec2(px * W, py * H), ImVec2((px + pw) * W, (py + ph) * H), true);
+    dl->AddImage((ImTextureID)tex, ImVec2(Sx(d.u0), Sy(d.v0)), ImVec2(Sx(d.u1), Sy(d.v1)));
+    dl->PopClipRect();
+    // legend, bottom-left of the picture: the ramp and what it means
+    const float lx = px * W + Px(8.0f), ly = (py + ph) * H - Px(30.0f), bw = Px(120.0f), bh = Px(8.0f);
+    if (mode == 1) {
+        dl->AddRectFilledMultiColor(ImVec2(lx, ly), ImVec2(lx + bw * 0.5f, ly + bh), IM_COL32(64, 128, 255, 220),
+                                    IM_COL32(64, 128, 255, 0), IM_COL32(64, 128, 255, 0), IM_COL32(64, 128, 255, 220));
+        dl->AddRectFilledMultiColor(ImVec2(lx + bw * 0.5f, ly), ImVec2(lx + bw, ly + bh), IM_COL32(255, 77, 51, 0),
+                                    IM_COL32(255, 77, 51, 220), IM_COL32(255, 77, 51, 220), IM_COL32(255, 77, 51, 0));
+    }
+    const char* text = mode == 1 ? "Colour difference, luma (right - left): blue darker, red brighter, -5..+5 %"
+                                 : "Colour difference, chroma: the hue of the right eye's cast, full at 5 %";
+    dl->AddText(ImVec2(mode == 1 ? lx + bw + Px(8.0f) : lx, ly - Px(4.0f)), IM_COL32(255, 255, 255, 230), text);
+#else
+    (void)st;
+#endif
+}
+
 // The wipe line, drawn where the shader splits the picture (picture fractions as shown, not
 // panned / zoomed), with what each side holds.
 void ProController::BuildWipeLine(const Status& st) {
@@ -1339,6 +1407,7 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     }
     BuildOverlays(st, PanelsShown() ? 1.0f : uiAlpha);  // framing + burn-ins: not faded
     BuildDepthOverlay(st);  // on the picture; independent of the inspector fade
+    BuildColourOverlay(st);
     BuildWipeLine(st);
     BuildPixelProbe(st);
     flatRects_.clear();

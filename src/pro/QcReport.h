@@ -28,6 +28,9 @@ struct Rig {  // the rig numbers with a snapshot (measured = false: none)
     float edgePct[2] = {0, 0};  // left, right frame edge
     bool scaleMeasured = false;  // #269: the right eye's size against the left, %
     float scalePct = 0;
+    bool colourMeasured = false;  // #270: per-channel gain (R G B) and mean luma, right against left, %
+    float gainPct[3] = {0, 0, 0};
+    float lumaPct = 0;
 };
 
 // The display calibration (#133) in effect: snapshots and the report show the picture with
@@ -87,6 +90,7 @@ struct Session {
     Calibration calibration;  // the display calibration when the report was made
     float budgetNearPct = 0, budgetFarPct = 0, budgetVerticalPx = 0, budgetDeltaE = 0, budgetEdgePct = 0;
     float budgetScalePct = 0;  // #269 (0 = not recorded: no scale flagging)
+    float budgetGainPct = 0;   // #270 (0 = not recorded)
     std::vector<Alert> alerts;
     std::vector<Snapshot> snapshots;
 };
