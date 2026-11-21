@@ -263,6 +263,9 @@ bool Window::PumpEvents() {
                 }
                 if (e.key.key == SDLK_U && (e.key.mod & SDL_KMOD_CTRL)) openUrlRequested_ = true;  // Ctrl+U — stream URL (#93)
                 if (e.key.key == SDLK_F || e.key.key == SDLK_F11) ToggleFullscreen();
+                // '?' is Shift+/ on most layouts; SDL reports the unshifted key, so take both.
+                if (e.key.key == SDLK_F1 || e.key.key == SDLK_SLASH || e.key.key == SDLK_QUESTION)
+                    helpRequested_ = true;
             }
         }
     }
@@ -428,6 +431,12 @@ bool Window::TakeRecenterRequest() {
 bool Window::TakeCycleProjectionRequest() {
     const bool v = cycleProjectionRequested_;
     cycleProjectionRequested_ = false;
+    return v;
+}
+
+bool Window::TakeHelpRequest() {
+    const bool v = helpRequested_;
+    helpRequested_ = false;
     return v;
 }
 

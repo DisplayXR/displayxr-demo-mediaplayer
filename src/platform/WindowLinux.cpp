@@ -275,7 +275,10 @@ void Window::HandleLinuxKey(uint32_t ks, uint32_t mods, bool repeat, bool* quit)
     }
     if (repeat) return;
     switch (ks) {
-        case XK_Escape: *quit = true; break;
+        case XK_Escape:  // an open panel (help) or a browser slideshow backs out first
+            if (escapeBacksOut_) escapeRequested_ = true;
+            else *quit = true;
+            break;
         case XK_v: cycleModeRequested_ = true; break;
         case XK_Tab: if (shift) toggleHudRequested_ = true; break;
         case XK_0: resetConvergenceRequested_ = true; break;
@@ -303,6 +306,7 @@ void Window::HandleLinuxKey(uint32_t ks, uint32_t mods, bool repeat, bool* quit)
         case XK_o: if (ctrl) openFileRequested_ = true; break;    // Ctrl+O — open
         case XK_u: if (ctrl) openUrlRequested_ = true; break;     // Ctrl+U — stream URL (#93)
         case XK_f: ToggleFullscreen(); break;
+        case XK_F1: case XK_slash: case XK_question: helpRequested_ = true; break;  // shortcuts (#251)
         // F11 is the window helper's own (it toggles fullscreen inside the pump).
         default: break;
     }

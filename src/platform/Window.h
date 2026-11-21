@@ -181,6 +181,7 @@ public:
     bool TakeDoubleClick();            // left double-click in the content
     bool TakeRecenterRequest();        // `R` — re-centre the VR view
     bool TakeCycleProjectionRequest(); // `P` — cycle the VR projection override
+    bool TakeHelpRequest();            // F1 / `?` — the shortcuts panel (#251)
     // While an ImGui text field has focus the app's single-key shortcuts (Space, L, V,
     // ESC-quits, ...) must not fire on what the user types. The app sets this each frame
     // from ImGui's WantTextInput; PumpEvents then leaves key-downs to ImGui alone.
@@ -260,6 +261,7 @@ private:
     bool doubleClick_ = false;
     bool recenterRequested_ = false;
     bool cycleProjectionRequested_ = false;
+    bool helpRequested_ = false;
 #if defined(__linux__) && !defined(__ANDROID__)
     float dragLastX_ = 0.0f, dragLastY_ = 0.0f;
     uint32_t lastClickMs_ = 0;

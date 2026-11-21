@@ -49,6 +49,10 @@ enum class Glyph {
     Search,       // a magnifier (desktop, #252)
     Grid,         // nine squares: the grid view (desktop, #252)
     List,         // rows: the details view (desktop, #252)
+    // The desktop top bar (#251).
+    Fullscreen,      // four corners pointing out
+    ExitFullscreen,  // four corners pointing in
+    Help,            // a circled "?": the shortcuts panel
 };
 
 // One stroke width for every outline, HUD pixels; 0 = the desktop's proportional strokes.

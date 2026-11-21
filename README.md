@@ -83,12 +83,18 @@ scripts/run_mediaplayer_handle_vk_macos.sh assets/test_LR_2x1.png
 shown. Its default comes from the file: a 3D file opens in 3D (2D shows its left eye in the
 flat mode), a 2D file opens in 2D (3D converts it, with look-around that eases back to the
 centre). The choice is kept while walking the folder (Up / Down, the slideshow) and dropped
-by any other open. Mode, Layout and the 2D->3D converter are in the top bar's "..." menu.
+by any other open. Mode, Layout, the VR projection and the 2D->3D converter are in the top
+bar's "..." menu.
+
+**The top bar's right end** has **?** (the keyboard shortcuts; also **F1** or **?**, Esc
+closes it), the slideshow toggle and **full screen** (also **F** / **F11**). While the picture
+plays and the bar has faded, the mouse pointer hides too; moving the mouse brings both back.
+The pointer never hides over the bar, an open menu, the shortcuts panel or the media browser.
 
 **One player at a time** (Windows): opening a file while the player runs hands it to that
 player, which comes to the front; `MEDIAPLAYER_MULTI_INSTANCE=1` allows a second copy.
 
-Keys: **V** flips the 2D | 3D switch (Pro: cycles the display modes the display offers, each change showing the new mode's name for a couple of seconds, e.g. "Mode: 2D"), **SHIFT+TAB** toggles the HUD, **L** cycles the stereo
+Keys (the in-app **?** panel lists them all): **V** flips the 2D | 3D switch (Pro: cycles the display modes the display offers, each change showing the new mode's name for a couple of seconds, e.g. "Mode: 2D"), **SHIFT+TAB** toggles the HUD, **L** cycles the stereo
 layout override (auto / mono / SBS-full / SBS-half / TB-full / TB-half), **Esc** quits (in a slideshow
 started from the media browser, it goes back to the browser). Transport follows the
 editor convention (Resolve, Premiere, Avid, RV): **Space** play/pause, **Left** / **Right**
@@ -113,6 +119,7 @@ The arrow beside **Open** opens a menu: **Open file...** (`Ctrl+O`), **Open fold
 command line; walking a folder does not add to it). The list is kept in
 `%APPDATA%\DisplayXR\MediaPlayer\recent.txt` (macOS: `~/Library/Application Support/DisplayXR/MediaPlayer/`,
 Linux: `~/.config/displayxr/mediaplayer/`); `MEDIAPLAYER_RECENT_FILE` moves it (`off` keeps none).
+One-time hints already shown are kept in `hints_shown.txt` in the same folder.
 
 On **Windows**, **Open** (and `Ctrl+O`) shows the **media browser** outside a workspace: Recents,
 Pictures, Videos, Downloads, **Media folders** (every folder Windows Search knows holds photos
@@ -144,6 +151,11 @@ sphere and seen through a virtual camera window.
   frame of the right shape; a cubemap / EAC eye is 3:2). EAC carries no metadata FFmpeg reads
   (YouTube marks it with an sv3d mesh), so it comes from the name or the override. **P**
   cycles the projection override (auto / flat / VR180 / VR360 / fisheye / cubemap / EAC); **L** still sets the packing. MCP: `set_layout {projection, fisheye_fov_deg}`.
+- **Projection picker:** while a VR file is on screen (or a detected one is shown flat) the top
+  bar has a button naming its projection; it opens the list (Auto shows what was detected) and,
+  for fisheye, the **lens FOV** slider (90-250°). The same list is under **Projection** in the
+  "..." menu for any file. The first time a VR projection comes on, a hint says how to steer
+  it; it is shown once, remembered in `hints_shown.txt` beside the Recent list.
 - **Controls:** drag pans and tilts, the wheel zooms, **double-click** or **R** re-centres,
   the arrow keys pan in 5° steps (`[` / `]` step frames and PageUp / PageDown walk the folder
   meanwhile). MCP `get_view` / `set_view {yaw_deg, pitch_deg, fov_deg, recenter}`.

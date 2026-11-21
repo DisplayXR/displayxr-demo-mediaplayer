@@ -385,6 +385,7 @@ or use the **Clip A | B** wipe (`8`) to see both at once, split by the line.
 |---|---|
 | `Tab` / `Shift+Tab` | pin the panels / hide or show all UI |
 | `F` / `F11`, `Esc` | full screen, leave full screen |
+| `F1` / `?` | the shortcuts panel (also the **?** button on the top bar); `Esc` closes it |
 | `Ctrl+O`, `Ctrl+Shift+O`, `Ctrl+U` | open a file, open a folder, open a stream URL |
 | `Up` / `Down` | previous / next file in the folder |
 | `Space`, `Left` / `Right`, `Shift+Left` / `Shift+Right`, `[` / `]` | play / pause, frame step, 5 frames, frame step |
