@@ -787,6 +787,11 @@ if(MP_BUILD_TESTS)
     endif()
     add_test(NAME recent_list COMMAND recent_list_test)
 
+    # Closing with a file on a stalled network share (#251): a blocked read is cancelled.
+    add_executable(join_cancel_io_test tests/join_cancel_io_test.cpp)
+    target_include_directories(join_cancel_io_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME join_cancel_io COMMAND join_cancel_io_test)
+
     # Desktop browser (#252 phase 1): a MANUAL probe of the Search index, libraries and
     # shell thumbnails on a real box. Not a ctest test: its results depend on the machine.
     if(WIN32)
