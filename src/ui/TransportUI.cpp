@@ -864,8 +864,9 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             // A narrow window: the buttons that no longer fit before the slideshow icon are
             // left out, from the right. The bar stays one row.
             const ImGuiStyle& bst = ImGui::GetStyle();
-            // The icons at the right end: help, slideshow, full screen (#251).
-            const int rightIcons = (s.caps.help ? 1 : 0) + (s.caps.slideshow ? 1 : 0) + (s.caps.fullscreen ? 1 : 0);
+            // The icons at the right end: help, slideshow, full screen (#251), then the gear (#265).
+            const int rightIcons = (s.caps.help ? 1 : 0) + (s.caps.slideshow ? 1 : 0) + (s.caps.fullscreen ? 1 : 0) +
+                                   (s.caps.settings ? 1 : 0);
             const float rightW = rightIcons * (iconSz + bst.ItemSpacing.x);
             const float barLimit = ImGui::GetWindowWidth() - bst.WindowPadding.x - rightW;
             bool barFull = false;
@@ -886,11 +887,12 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             }
             const bool projectionMenu = s.caps.projection && s.hasMedia && !s.projectionRows.empty();
             if (s.caps.moreMenu &&
-                (s.caps.mode || (s.caps.layout && s.hasMedia) || projectionMenu || !s.convertProviders.empty()) &&
+                (s.caps.mode || (s.caps.layout && s.hasMedia) || projectionMenu || !s.convertProviders.empty() ||
+                 s.caps.settings) &&
                 fits(iconSz)) {
                 ImGui::SameLine();
                 if (IconButton("##more", Glyph::More, iconSz, false, s.hitTargetScale)) ImGui::OpenPopup("##more_menu");
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Display mode, layout, projection, 2D->3D converter");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Display mode, layout, projection, 2D->3D converter, settings");
             }
             if (s.caps.moreMenu && ImGui::BeginPopup("##more_menu")) {
                 // Rows that cycle keep the menu open, so a few clicks walk the choices.
@@ -932,6 +934,10 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                         ImGui::EndDisabled();
                         ImGui::PopID();
                     }
+                }
+                if (s.caps.settings) {
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Settings...", "Ctrl+,")) Fire(a.OpenSettings);
                 }
                 ImGui::EndPopup();
             }
@@ -1141,6 +1147,11 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                         Fire(a.ToggleFullscreen);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip(s.isFullscreen ? "Leave full screen (F)" : "Full screen (F)");
+                }
+                if (s.caps.settings) {
+                    next();
+                    if (IconButton("##settings", Glyph::Settings, iconSz, false, s.hitTargetScale)) Fire(a.OpenSettings);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Settings (Ctrl+,)");
                 }
             }
         }

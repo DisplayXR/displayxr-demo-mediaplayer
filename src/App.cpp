@@ -202,6 +202,7 @@ std::vector<std::pair<std::string, std::string>> ShortcutRows() {
         {"I", "Save a snapshot of the 3D picture"},
         {"Shift+Tab", "Hide / show all UI"},
         {"F1 or ?", "This panel"},
+        {"Ctrl+,", "Settings"},
 #if MEDIAPLAYER_PRO
         {"Esc", "Leave full screen"},
 #else
@@ -482,6 +483,7 @@ bool App::Initialize(const char* mediaPath) {
     uiState_.caps.camera = true;
     // The Open menu (#252 phase 0): Open file / Open folder / Recent. Desktop only.
     uiState_.caps.openMenu = true;
+    uiState_.caps.settings = true;  // the gear + Ctrl+, (#265)
     recentFile_ = RecentListPath(MEDIAPLAYER_PRO ? "MediaPlayerPro" : "MediaPlayer");
     if (recent_.Load(recentFile_))
         LOG_INFO("Recent: %zu item(s) from '%s'", recent_.Items().size(), recentFile_.c_str());
@@ -497,6 +499,17 @@ bool App::Initialize(const char* mediaPath) {
     }
     uiState_.helpRows = ShortcutRows();
     RefreshRecentLabels();
+    // Settings (#265), beside the Recent list. A browser test run (MEDIAPLAYER_SHOW_BROWSER)
+    // never reads or writes the user's file unless MEDIAPLAYER_SETTINGS_FILE names one.
+    {
+        std::string file = SettingsPath(MEDIAPLAYER_PRO ? "MediaPlayerPro" : "MediaPlayer");
+        const char* show = std::getenv("MEDIAPLAYER_SHOW_BROWSER");
+        if (!std::getenv("MEDIAPLAYER_SETTINGS_FILE") && show && *show && std::string(show) != "0") file.clear();
+        if (settings_.Load(file)) LOG_INFO("Settings: read '%s'", file.c_str());
+        else LOG_INFO("Settings: %s", file.empty() ? "not kept (memory only)" : ("none yet at '" + file + "'").c_str());
+        settingsGen_ = settings_.Generation();
+        settingsPanel_.SetStore(&settings_);
+    }
     if (!launch_.camera) {
         if (const char* e = std::getenv("MEDIAPLAYER_CAMERA")) {
             launch_.camera = true;          // "auto" / "" = default pick; "0" = index 0
@@ -670,6 +683,7 @@ bool App::Initialize(const char* mediaPath) {
             LOG_WARN("ImGui unavailable — using the text HUD");
         }
     }
+    RegisterSettingsRows();
 #if MEDIAPLAYER_PRO
     InitPro();
 #endif
@@ -727,7 +741,8 @@ int App::Run() {
     // Started with no file: open as Open would (#252): outside a workspace that is the
     // browser, on the place last shown; in one, the shell's picker. A file on the command
     // line (Explorer, Recent) opens itself; a cloud file downloading shows its card.
-    else if (browser_ && !hasMedia_ && !CloudFetchBusy() && !std::getenv("MEDIAPLAYER_NO_BROWSER_AT_START")) {
+    else if (BrowserAllowed() && settings_.GetBool("browser.at_start", true) && !hasMedia_ && !CloudFetchBusy() &&
+             !std::getenv("MEDIAPLAYER_NO_BROWSER_AT_START")) {
         RequestOpenFile();
     }
     // Test (#252): play tile N of the browser (0 = the first; folders count) once it is listed:
@@ -902,6 +917,8 @@ int App::Run() {
         }
         if (window_.TakeOpenFileRequest()) { RequestOpenFile(); activity = true; }     // Ctrl+O
         if (window_.TakeOpenFolderRequest()) { RequestOpenFolder(); activity = true; } // Ctrl+Shift+O
+        if (window_.TakeOpenSettingsRequest()) { OpenSettings("key"); activity = true; }  // Ctrl+, (#265)
+        TickSettings(/*flush=*/false);
         // Dropped files (#44). Loading happens HERE, on the app thread — not in the SDL
         // event handler — matching the discipline the native dialog already follows.
         if (std::vector<std::string> dropped; window_.TakeDroppedPaths(dropped)) {
@@ -1106,7 +1123,9 @@ void App::RenderOneFrame() {
     // The live camera (#90) publishes into a FrameRing of its own, so it rides the same
     // upload path. Freeze = stop acquiring: the last uploaded texture keeps drawing.
     // A stream (#93) is video_ in live mode: same ring, same freeze-by-not-acquiring.
-    window_.SetKeyboardCaptured(false);  // BuildTransportUI re-asserts it while a field is focused
+    // BuildTransportUI re-asserts it while a field is focused; an open Settings window holds it
+    // even on a frame with no HUD (#265).
+    window_.SetKeyboardCaptured(settingsPanel_.IsOpen());
     FrameRing* ring = isLive_     ? (livePaused_ ? nullptr : &live_->Ring())
                       : isStream_ ? (streamPaused_ ? nullptr : &video_.Ring())
                                   : (isVideo_ ? &video_.Ring() : nullptr);
@@ -1560,7 +1579,7 @@ void App::RenderOneFrame() {
 #endif
     const bool wantHud =
         frame.shouldRender && xr_.HasHud() && uiAllowed &&
-        (imguiReady ? (browsing_ || showHud_ || CloudFetchBusy() || uiState_.fadeAlpha > 0.001f || uiState_.toastAlpha > 0.001f ||
+        (imguiReady ? (browsing_ || showHud_ || settingsPanel_.IsOpen() || CloudFetchBusy() || uiState_.fadeAlpha > 0.001f || uiState_.toastAlpha > 0.001f ||
                        uiState_.transitionAlpha > 0.001f
 #if MEDIAPLAYER_PRO
                        || pro_.KeepHudAwake()
@@ -1893,6 +1912,7 @@ void App::BuildTransportUI() {
         recent_.Save(recentFile_);
         RefreshRecentLabels();
     };
+    actions.OpenSettings = [this] { OpenSettings("ui"); };
     actions.NextMode = [this] { CycleRenderingMode(); };
 #if !MEDIAPLAYER_PRO
     actions.Toggle3D = [this] { Toggle3D(); };
@@ -1958,9 +1978,20 @@ void App::BuildTransportUI() {
     // The strip is the trunk's transport alone: Pro's panels stay down until the full UI.
     if (showHud_) pro_.BuildUI(ProStatus(), uiState_.stripOnly ? 0.0f : uiState_.fadeAlpha);
 #endif
+    // The Settings window (#265), over everything, even with the HUD hidden: it was asked for.
+    float settingsRect[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const bool settingsWasOpen = settingsPanel_.IsOpen();
+    if (settingsPanel_.Build(settingsRect)) {
+#if MEDIAPLAYER_PRO
+        if (pro_.FlatNow()) pro_.AddFlatRect({settingsRect[0], settingsRect[1], settingsRect[2], settingsRect[3]});
+#endif
+    } else if (settingsWasOpen) {
+        LOG_INFO("Settings: window closed");
+    }
 #if defined(MEDIAPLAYER_WITH_IMGUI)
-    // A focused text field (the Stream URL popup) owns the keyboard: no hotkeys.
-    window_.SetKeyboardCaptured(ImGui::GetIO().WantTextInput);
+    // A focused text field (the Stream URL popup) owns the keyboard: no hotkeys. So does the
+    // Settings window while it is open (Esc closes it), and never once it is closed.
+    window_.SetKeyboardCaptured(ImGui::GetIO().WantTextInput || settingsPanel_.IsOpen());
 #endif
 }
 
@@ -2048,6 +2079,7 @@ void App::UpdateFps() {
 }
 
 void App::Shutdown() {
+    TickSettings(/*flush=*/true);  // a change still inside the save delay (#265)
     renderer_.SetUploadSource(nullptr);  // the upload thread lets go of the live ring first
     autoConvWorker_.Stop();  // #92
 #if MEDIAPLAYER_PRO
@@ -2071,6 +2103,74 @@ void App::Shutdown() {
     input_.Detach();
     xr_.Shutdown();
     window_.Destroy();
+}
+
+// --- Settings (#265) --------------------------------------------------------------
+
+bool App::BrowserAllowed() const {
+#if MEDIAPLAYER_BROWSER
+    return browser_ && settings_.GetBool("browser.enabled", true);
+#else
+    return false;
+#endif
+}
+
+// The basic player's rows. Pro registers its own in ProController::AttachSettings. Every
+// default is the player's behaviour before the setting existed.
+void App::RegisterSettingsRows() {
+#if !MEDIAPLAYER_PRO
+    const char* group = "Opening files";
+#if MEDIAPLAYER_BROWSER
+    const bool haveBrowser = browser_ != nullptr;
+    const char* why = "unavailable";
+#else
+    const bool haveBrowser = false;
+    const char* why = "Windows only";
+#endif
+    auto browserOn = [this, haveBrowser] { return haveBrowser && settings_.GetBool("browser.enabled", true); };
+    settingsPanel_.AddToggle(group, "Use the media browser for Open", "browser.enabled", true,
+                             "Open and Ctrl+O show the in-app media browser.\n"
+                             "Off: the system file dialog.",
+                             [haveBrowser] { return haveBrowser; }, why);
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    settingsPanel_.AddCustom(group, [] { ImGui::Indent(); });  // the browser's own options under it
+#endif
+    settingsPanel_.AddToggle(group, "Start in the media browser", "browser.at_start", true,
+                             "Opened with no file, the player starts in the browser", browserOn, why);
+    settingsPanel_.AddToggle(group, "Show Media folders (Windows Search)", "browser.source.index", true,
+                             "Media found by the Windows Search index, grouped by folder", browserOn, why);
+    settingsPanel_.AddToggle(group, "Show Pictures, Videos, Downloads", "browser.source.libraries", true,
+                             "Walk your Pictures and Videos libraries and the Downloads folder", browserOn, why);
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    settingsPanel_.AddCustom(group, [] { ImGui::Unindent(); });
+#endif
+#endif
+}
+
+void App::OpenSettings(const char* via) {
+    if (settingsPanel_.IsOpen()) return;
+    settingsPanel_.Open();
+    LOG_INFO("Settings: window opened (%s)", via);
+}
+
+void App::TickSettings(bool flush) {
+    const auto now = std::chrono::steady_clock::now();
+    if (settings_.Generation() != settingsGen_) {
+        settingsGen_ = settings_.Generation();
+        settingsChangedAt_ = now;
+    }
+    if (!settings_.Dirty() || settings_.Path().empty()) return;
+    if (!flush) {
+        if (now - settingsChangedAt_ < std::chrono::milliseconds(500)) return;
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+        if (imgui_.Ready() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) return;  // not mid-drag
+#endif
+    }
+    if (settings_.Save()) LOG_INFO("Settings: saved '%s'", settings_.Path().c_str());
+    else {
+        LOG_WARN("Settings: could not write '%s'", settings_.Path().c_str());
+        settingsChangedAt_ = now;  // retry after the delay, not every frame
+    }
 }
 
 // --- Open-file ------------------------------------------------------------------
@@ -4848,6 +4948,7 @@ void App::TickUi() {
     if (uiState_.scrubActive) lastActivity_ = now;
     // Keep the UI pinned visible until a pending HUD dump lands (diagnostic/screenshot).
     if (dumpHudPath_ && !dumpedHud_) lastActivity_ = now;
+    if (settingsPanel_.IsOpen()) lastActivity_ = now;  // the bar stays while Settings is up (#265)
 
 #if !MEDIAPLAYER_PRO
     // The chrome stays while the pointer rests on it, a menu is open or the shortcuts panel
@@ -5010,7 +5111,7 @@ void App::RequestOpenFile() {
         return;
     }
 #if MEDIAPLAYER_BROWSER
-    if (browser_) {
+    if (BrowserAllowed()) {
         LOG_INFO("Open: workspace picker unavailable (status=%d) - media browser", (int)st);
         openFilePending_ = false;  // the browser is not a pending pick
         ShowBrowser();
@@ -5165,6 +5266,8 @@ void App::ShowBrowser() {
     browserProvider_->SetRecents(recent_.Items());
     browserProvider_->SetPinned(pinned_.Items());
     browserProvider_->SetHidden(hiddenFolders_.Items());
+    browserProvider_->SetSources(settings_.GetBool("browser.source.libraries", true),
+                                 settings_.GetBool("browser.source.index", true));
     browser_->Refresh();
     window_.SetKeyboardCaptured(true);  // the browser's keys from the next event on
     LOG_INFO("browser: shown");
@@ -5660,6 +5763,7 @@ void App::InitPro() {
     };
     h.isFullscreen = [this] { return window_.IsFullscreen(); };
     h.toggleFullscreen = [this] { window_.ToggleFullscreen(); };
+    h.openSettings = [this] { OpenSettings("station"); };
     h.setDesqueeze = [this](float f) { proDesqueeze_ = f > 0.1f ? f : 1.0f; };
     h.mediaFps = [this] { return isVideo_ ? video_.FrameRate() : 0.0; };
     h.setTargetScreen = [this](float widthM, float distanceM) {
@@ -5705,7 +5809,7 @@ void App::InitPro() {
             imgui_.ProcessEvent(ev);
             wantMouse = imgui_.WantCaptureMouse();
 #if defined(MEDIAPLAYER_WITH_IMGUI)
-            wantKeys = ImGui::GetIO().WantTextInput;
+            wantKeys = ImGui::GetIO().WantTextInput || settingsPanel_.IsOpen();  // Settings has the keys (#265)
 #endif
         }
 #if !(defined(__linux__) && !defined(__ANDROID__))
@@ -5777,6 +5881,8 @@ void App::InitPro() {
     so.budget.maxVerticalPx = launch_.proBudget[2];
     so.budget.maxDeltaE = launch_.proBudget[3];
     so.budget.edgePct = launch_.proBudget[4];
+    // #265: the budget kept in settings.txt, except what the command line set for this run.
+    pro::ProController::BudgetFromSettings(settings_, so.budget, launch_.proBudgetFromCli);
     so.timecode = launch_.proTimecode;
     so.startFirstInput = !hasMedia_ || isLogo_;  // a file / camera / URL from the command line wins
     so.perf = proPerf_;                          // the station skips the rig check / thumbnails when off
@@ -5793,6 +5899,7 @@ void App::InitPro() {
     if (const char* e = std::getenv("MEDIAPLAYER_AUDIO_OFFSET_MS")) SetAvOffsetMs(std::atoi(e));
     audio_.SetMeter(&audioMeter_);  // file audio feeds the same meters (Pro only)
     pro_.GetStation().Init(std::move(sh), so);
+    pro_.AttachSettings(&settings_, &settingsPanel_);
     LOG_INFO("Media Player Pro: ready (lut=%s cdl=%s)", launch_.lutPath.c_str(), launch_.cdlPath.c_str());
 }
 

@@ -145,6 +145,7 @@ public:
     bool TakeTogglePauseRequest(); // Space — play/pause
     bool TakeOpenFileRequest();    // Ctrl+O — open the file picker
     bool TakeOpenFolderRequest();  // Ctrl+Shift+O — open a folder (#252)
+    bool TakeOpenSettingsRequest(); // Ctrl+, (and Cmd+, on macOS) — the Settings window (#265)
 
     // --- Drag and drop (#44) ---
     // Paths dropped on the window since the last read, in drop order; moved into `out`
@@ -252,6 +253,7 @@ private:
     bool ctrlClick_ = false;
     float ctrlClickX_ = 0.0f, ctrlClickY_ = 0.0f;
     bool openUrlRequested_ = false;
+    bool openSettingsRequested_ = false;
     // VR viewer input (#155).
     bool arrowsPanView_ = false;
     int viewNudgeX_ = 0, viewNudgeY_ = 0;

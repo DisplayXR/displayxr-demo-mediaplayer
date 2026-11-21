@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pro/ProController.h"
 #include "pro/DisplayCalibration.h"
+#include "pro/ProEnvFile.h"
+#include "pro/RigBudgetSettings.h"
 
 #include "Log.h"
+#include "media/Settings.h"
+#include "ui/SettingsPanel.h"
 #include "ui/TabularText.h"
 #include "ui/UiScale.h"
 
@@ -1007,7 +1011,77 @@ void ProController::PushTargetToStation() {
                        host_.parallaxOffsetPct ? host_.parallaxOffsetPct() : 0.0f);
 }
 
+// ---------------------------------------------------------------------------
+// Settings (#265): the rig budget is kept as rig.budget.* (RigBudgetSettings.h).
+// ---------------------------------------------------------------------------
+void ProController::BudgetFromSettings(const Settings& store, rig::Budget& b, unsigned keepMask) {
+    if (!LoadRigBudget(store, b, keepMask))  // a hand-edited pair the wrong way round is ignored whole
+        LOG_WARN("Settings: rig.budget near is not below far - kept the start budget");
+    LOG_INFO("Rig budget: near %+.2f%% far %+.2f%% vertical %.2f px dE %.2f edge %+.2f%% (command line: 0x%x)",
+             b.nearPct, b.farPct, b.maxVerticalPx, b.maxDeltaE, b.edgePct, keepMask);
+}
+
+void ProController::PersistBudget() {
+    if (settings_) SaveRigBudgetChanges(*settings_, station_.RigBudget(), budgetSeen_);
+}
+
+void ProController::AttachSettings(Settings* store, ui::SettingsPanel* panel) {
+    settings_ = store;
+    SeenRigBudget(station_.RigBudget(), budgetSeen_);  // the start is not a change
+    if (!panel) return;
+#if defined(MEDIAPLAYER_WITH_IMGUI)
+    panel->AddCustom("Station", [] {
+        const std::string path = ProEnvFilePath();
+        ImGui::TextUnformatted("Station file (applies at start):");
+        ImGui::TextWrapped("%s", path.empty() ? "(none: MEDIAPLAYER_PRO_ENV_FILE is off)" : path.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("pro.env: KEY=VALUE environment levers read once at start\n"
+                              "(capture, 10-bit atlas, DisplayXR runtime knobs). Restart to apply.");
+        ImGui::BeginDisabled(path.empty());
+        if (ImGui::SmallButton("Open folder")) {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            const fs::path dir = fs::u8path(path).parent_path();
+            fs::create_directories(dir, ec);  // a station with no file yet still gets the folder
+            std::string url = "file:///";
+            for (char c : dir.generic_u8string()) {
+                if (c == ' ') url += "%20";
+                else if (c == '%') url += "%25";
+                else if (c == '#') url += "%23";
+                else url += c;
+            }
+            if (!SDL_OpenURL(url.c_str())) LOG_WARN("Settings: could not open '%s': %s", url.c_str(), SDL_GetError());
+        }
+        ImGui::EndDisabled();
+    });
+    panel->AddCustom("Rig check budget", [this] {
+        rig::Budget b = station_.RigBudget();
+        bool changed = false;
+        ImGui::PushItemWidth(Px(110.0f));
+        changed |= ImGui::DragFloat("Near (in front), % of width", &b.nearPct, 0.05f, -20.0f, b.farPct - 0.1f, "%+.2f");
+        changed |= ImGui::DragFloat("Far (behind), % of width", &b.farPct, 0.05f, b.nearPct + 0.1f, 20.0f, "%+.2f");
+        changed |= ImGui::DragFloat("Vertical error, px", &b.maxVerticalPx, 0.05f, 0.0f, 100.0f, "%.2f");
+        changed |= ImGui::DragFloat("Colour match, dE", &b.maxDeltaE, 0.05f, 0.0f, 100.0f, "%.2f");
+        changed |= ImGui::DragFloat("Frame edges, % of width", &b.edgePct, 0.05f, -20.0f, 20.0f, "%+.2f");
+        ImGui::PopItemWidth();
+        if (ImGui::SmallButton("Defaults")) {
+            const rig::Budget d;
+            b.nearPct = d.nearPct;
+            b.farPct = d.farPct;
+            b.maxVerticalPx = d.maxVerticalPx;
+            b.maxDeltaE = d.maxDeltaE;
+            b.edgePct = d.edgePct;
+            changed = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("Kept between runs; a command-line limit wins for its run.");
+        if (changed && b.nearPct < b.farPct) station_.SetRigBudget(b);  // keeps the target-screen fields
+    });
+#endif
+}
+
 void ProController::Tick(const Status& st) {
+    PersistBudget();
     stereoSource_ = st.stereo;
     station_.SetSignalFps(st.live ? st.sourceFps : 0.0f);
     PushCalibrationToStation();
@@ -1368,11 +1442,25 @@ void ProController::BuildUI(const Status& st, float uiAlpha) {
     if (flat) ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     placePanel(Px(8.0f));
     if (ImGui::Begin("Station", nullptr, flags)) {
+        const float rowRight = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
         ImGui::Checkbox("Show panels (Tab)", &inspectorPinned_);
-        // The hint shares the row only when it fits; a narrow panel clipped it mid-word.
-        const float hintW = ImGui::CalcTextSize("Shift+Tab: all UI").x + ImGui::GetStyle().ItemSpacing.x;
-        if (ImGui::GetContentRegionAvail().x - ImGui::GetItemRectSize().x >= hintW) ImGui::SameLine();
-        ImGui::TextDisabled("Shift+Tab: all UI");
+        // Settings (#265) at the row's end: Pro users live in the panels. The hint shares the
+        // row only when it fits; a narrow panel clipped it mid-word.
+        const ImGuiStyle& hs = ImGui::GetStyle();
+        const float setW = host_.openSettings ? ImGui::CalcTextSize("Settings").x + hs.FramePadding.x * 2.0f : 0.0f;
+        const float hintW = ImGui::CalcTextSize("Shift+Tab: all UI").x + hs.ItemSpacing.x;
+        const bool hintFits =
+            ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + hintW + hs.ItemSpacing.x + setW <= rowRight;
+        if (hintFits) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("Shift+Tab: all UI");
+        }
+        if (host_.openSettings) {
+            ImGui::SameLine(rowRight - setW);
+            if (ImGui::SmallButton("Settings")) host_.openSettings();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Settings (Ctrl+,)");
+        }
+        if (!hintFits) ImGui::TextDisabled("Shift+Tab: all UI");
         // --- Inputs (DeckLink / test rig / camera / stream) ----------------------
         station_.BuildInputsSection(st.sourceLabel, st.live);
 

@@ -70,6 +70,9 @@ struct TransportCaps {
     // (any file), and a button on the bar while VR media is on screen (projectionOnBar), so a
     // mouse-only user finds it. Fisheye adds its lens FOV slider.
     bool projection = false;
+    // The desktop gear at the right of the top bar, and a "Settings..." row in the "..."
+    // menu (#265). DEFAULT FALSE; the desktop owner sets it.
+    bool settings = false;
     // The touch player's layout (#180). DEFAULT FALSE; Android sets it. Instead of the flat
     // bars: gradient scrims at the top and bottom, the back arrow then the file's name left
     // aligned (and its place in the list under it), and the 2D/3D switch as a labelled
@@ -240,6 +243,7 @@ struct TransportActions {
     std::function<void()> OpenFolder;           // caps.openMenu: "Open folder..."
     std::function<void(int row)> OpenRecent;    // caps.openMenu: a Recent row, 0 = newest
     std::function<void()> ClearRecent;          // caps.openMenu: "Clear recent"
+    std::function<void()> OpenSettings;         // caps.settings: the gear, "Settings..."
     std::function<void()> NextMode;  // the Mode button, or a flip of the 2D/3D switch
     // A flip of the 2D/3D switch when set (the desktop basic player: it converts a 2D file
     // or shows a 3D one flat); unset, the switch fires NextMode.

@@ -118,6 +118,12 @@ void WindowsMediaProvider::SetHidden(std::vector<std::string> folders) {
     hidden_ = std::move(folders);
 }
 
+void WindowsMediaProvider::SetSources(bool libraries, bool index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    libraries_ = libraries;
+    index_ = index;
+}
+
 std::string WindowsMediaProvider::PathOf(int64_t id) const {
     std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex_));
     const auto it = paths_.find(id);
@@ -188,6 +194,7 @@ void WindowsMediaProvider::ListWorker() {
     win::ScopedCom com;
     for (;;) {
         std::vector<std::string> recents, pinned, hidden;
+        bool libraries = true, useIndex = true;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             listWake_.wait(lock, [this] { return stop_ || refresh_; });
@@ -195,6 +202,8 @@ void WindowsMediaProvider::ListWorker() {
             refresh_ = false;
             recents = recents_;
             pinned = pinned_;
+            libraries = libraries_;
+            useIndex = index_;
             for (const std::string& h : hidden_) {
                 std::string k = Slashes(h, true);
                 for (char& c : k) c = (char)std::tolower((unsigned char)c);
@@ -240,9 +249,12 @@ void WindowsMediaProvider::ListWorker() {
             win::FoundFile f;
             if (StatFile(p, f)) add(std::move(f), kRecents, order++);
         }
-        const std::vector<std::string> pictures = win::LibraryFolders(win::Library::Pictures);
-        const std::vector<std::string> videos = win::LibraryFolders(win::Library::Videos);
-        const std::string downloads = win::DownloadsFolder();
+        // Settings can leave out the library walks and the index (#265): no source, no walk.
+        const std::vector<std::string> pictures =
+            libraries ? win::LibraryFolders(win::Library::Pictures) : std::vector<std::string>();
+        const std::vector<std::string> videos =
+            libraries ? win::LibraryFolders(win::Library::Videos) : std::vector<std::string>();
+        const std::string downloads = libraries ? win::DownloadsFolder() : std::string();
         for (const std::string& f : pictures) walk(f, kPictures);
         for (const std::string& f : videos) walk(f, kVideos);
         if (!downloads.empty()) walk(downloads, kDownloads);
@@ -250,7 +262,7 @@ void WindowsMediaProvider::ListWorker() {
         std::vector<win::FoundFile> indexed;
         std::string error;
         win::IndexSkipped skipped;
-        const bool indexOk = win::QueryIndex(win::IndexQuery{}, indexed, error, &skipped);
+        const bool indexOk = useIndex && win::QueryIndex(win::IndexQuery{}, indexed, error, &skipped);
         if (indexOk)
             LOG_INFO("browser: index left out software files - %d in code checkouts, %d in game libraries, "
                      "%d in asset folders, %d pictures beside a program",
@@ -284,12 +296,16 @@ void WindowsMediaProvider::ListWorker() {
             return sources.back();
         };
         source(SourceKind::Recents, "Recents", kRecents).byOrder = true;
-        tree(source(SourceKind::Pictures, "Pictures", kPictures), pictures);
-        tree(source(SourceKind::Movies, "Videos", kVideos), videos);
+        if (libraries) {
+            tree(source(SourceKind::Pictures, "Pictures", kPictures), pictures);
+            tree(source(SourceKind::Movies, "Videos", kVideos), videos);
+        }
         if (!downloads.empty()) tree(source(SourceKind::Downloads, "Downloads", kDownloads), {downloads});
-        Source& folders = source(SourceKind::Folders, "Media folders", kIndex);
-        folders.mode = SourceMode::Grouped;
-        folders.newest = kNewest;
+        if (useIndex) {
+            Source& folders = source(SourceKind::Folders, "Media folders", kIndex);
+            folders.mode = SourceMode::Grouped;
+            folders.newest = kNewest;
+        }
         if (!pinned.empty()) {
             // Pinned lists its folders first even when there is one, so each can be unpinned.
             Source& s = source(SourceKind::Pinned, "Pinned", kPinned);
@@ -323,18 +339,19 @@ void WindowsMediaProvider::ListWorker() {
             cloud[m.id] = f.cloudOnly;
             items.push_back(std::move(m));
         }
-        LOG_INFO("browser: %zu items (%d cloud-only), index %s (%zu), %.0f ms", items.size(), nCloud,
-                 indexOk ? "ok" : "OFF", indexed.size(), win::NowMs() - t0);
+        LOG_INFO("browser: %zu items (%d cloud-only), index %s (%zu), libraries %s, %.0f ms", items.size(), nCloud,
+                 !useIndex ? "not used" : indexOk ? "ok" : "OFF", indexed.size(), libraries ? "on" : "off",
+                 win::NowMs() - t0);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             sources_ = std::move(sources);
             items_ = std::move(items);
             paths_ = std::move(paths);
             cloud_ = std::move(cloud);
-            notice_ = indexOk ? std::string()
+            notice_ = indexOk || !useIndex ? std::string()
                               : "Windows Search is off, so Media folders is empty. Pictures, Videos, "
                                 "Downloads and pinned folders still work.";
-            if (!indexOk) LOG_WARN("browser: index query failed: %s", error.c_str());
+            if (!indexOk && useIndex) LOG_WARN("browser: index query failed: %s", error.c_str());
             haveList_ = true;
         }
     }

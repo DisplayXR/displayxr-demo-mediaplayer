@@ -96,18 +96,23 @@ bool TakeCameraArgs(std::vector<std::string>& args, mp::App::LaunchOptions& o, b
         } else if (a == "--depth-budget=comfort") {
             o.proBudget[0] = -1.0f;  // #135: -1 / +2 % (in front / behind), the plan-review preset
             o.proBudget[1] = 2.0f;
+            o.proBudgetFromCli |= 3u;
         } else if (a.rfind("--depth-budget=", 0) == 0) {
             if (std::sscanf(a.c_str() + 15, "%f,%f", &o.proBudget[0], &o.proBudget[1]) != 2 ||
                 o.proBudget[0] >= o.proBudget[1]) {
                 LOG_ERROR("--depth-budget: expected near,far in %% of eye width (e.g. -2,1), or comfort (-1,2)");
                 return false;
             }
+            o.proBudgetFromCli |= 3u;
         } else if (a.rfind("--vertical-limit=", 0) == 0) {
             o.proBudget[2] = (float)std::atof(a.c_str() + 17);
+            o.proBudgetFromCli |= 4u;
         } else if (a.rfind("--colour-limit=", 0) == 0) {
             o.proBudget[3] = (float)std::atof(a.c_str() + 15);
+            o.proBudgetFromCli |= 8u;
         } else if (a.rfind("--edge-limit=", 0) == 0) {
             o.proBudget[4] = (float)std::atof(a.c_str() + 13);
+            o.proBudgetFromCli |= 16u;
         } else if (a == "--no-timecode") {
             o.proTimecode = false;
         } else if (a.rfind("--seq-fps=", 0) == 0) {
