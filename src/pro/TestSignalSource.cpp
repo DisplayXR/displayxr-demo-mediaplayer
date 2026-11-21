@@ -67,9 +67,10 @@ std::shared_ptr<const TestSignalConfig::Plate> TestSignalConfig::BuildPlate(cons
     // Right-eye faults: red gain, vertical shift (down), extra crossed parallax (the right
     // eye moves left, so everything comes forward by (depthScale - 1) x 2 % of the width).
     const float dx = (cfg.depthScale - 1.0f) * 0.02f * ew;
-    // roll: the right eye's plate pixel (x, y) samples the un-rolled plate at the inverse
-    // rotation about the plate centre
-    const float rr = cfg.rollDeg * 3.14159265f / 180.0f, rc = std::cos(rr), rs = std::sin(rr);
+    // roll and zoom: the right eye's plate pixel (x, y) samples the plain plate at the
+    // inverse rotation + scale about the plate centre
+    const float rr = cfg.rollDeg * 3.14159265f / 180.0f, rc = std::cos(rr) / cfg.scale, rs = std::sin(rr) / cfg.scale;
+    const bool warp = cfg.rollDeg != 0.0f || cfg.scale != 1.0f;
     const float pcx = pw * 0.5f, pcy = ph * 0.5f;
     std::vector<uint8_t> bgra((size_t)pw * ph * 4);
     for (int eye = 0; eye < 2; ++eye) {
@@ -77,7 +78,7 @@ std::shared_ptr<const TestSignalConfig::Plate> TestSignalConfig::BuildPlate(cons
         for (int y = 0; y < ph; ++y) {
             for (int x = 0; x < pw; ++x) {
                 float ux = (float)x, uy = (float)y;
-                if (right && cfg.rollDeg != 0.0f) {
+                if (right && warp) {
                     const float qx = x - pcx, qy = y - pcy;
                     ux = pcx + qx * rc + qy * rs;
                     uy = pcy - qx * rs + qy * rc;
@@ -116,6 +117,7 @@ bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
     Stop();
     TestSignalConfig cfg = cfgIn;
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_ROLL")) cfg.rollDeg = (float)std::atof(e);
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_SCALE")) cfg.scale = std::clamp((float)std::atof(e), 0.5f, 2.0f);
     if (!cfg.image.empty() && !cfg.plate) {
         std::string err;
         cfg.plate = TestSignalConfig::BuildPlate(cfg, &err);
@@ -164,8 +166,9 @@ bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
     SetState(LiveState::Opening);
     stop_ = false;
     worker_ = std::thread([this] { Worker(); });
-    LOG_INFO("test signal: %s, vshift %.1f px, eye delay %d, right gain %.2f, roll %.2f deg, wire %s%s, preroll %d", name_.c_str(),
-             cfg.vShiftPx, cfg.eyeDelay, cfg.gainR, cfg.rollDeg, WireName(), still_ ? ", still (frame 0)" : "", preroll_);
+    LOG_INFO("test signal: %s, vshift %.1f px, eye delay %d, right gain %.2f, roll %.2f deg, scale %.4f, wire %s%s, preroll %d",
+             name_.c_str(), cfg.vShiftPx, cfg.eyeDelay, cfg.gainR, cfg.rollDeg, cfg.scale, WireName(),
+             still_ ? ", still (frame 0)" : "", preroll_);
     return true;
 }
 
@@ -210,6 +213,42 @@ void DrawEye(livepix::Nv12& dst, int x0, int w, int h, double t, float disparity
         const int yv = std::clamp((int)((40 + (row * 50) / h) * gain), 16, 235);
         std::memset(dst.y.data() + (size_t)row * dst.width + x0, yv, (size_t)w);
     }
+    // ... and a textured band along the top and bottom, on the screen plane like the bars,
+    // so the rig check has matches spread over the height: the zoom reading (#269) needs
+    // them in both halves, and the discs alone sit mid-frame. (At the far disc's depth the
+    // band moved the matches' median parallax so far that the front disc was cut as an
+    // outlier.)
+    auto inBand = [h](float ry) { return ry < h * 0.12f || ry >= h * 0.84f; };  // clear of the discs (and their bob)
+    {
+        // Static, so drawn once per eye and kept (per thread: the worker and tests draw
+        // concurrently); per pixel it cost the worker most of its frame time.
+        struct Band {
+            int w = 0, h = 0;
+            float vShift = 0, gain = 0;
+            std::vector<uint8_t> y;  // w * h, only the band's rows filled
+        };
+        thread_local Band cache[2];
+        Band& c = cache[rightEye ? 1 : 0];
+        if (c.w != w || c.h != h || c.vShift != vShift || c.gain != gain) {
+            c.w = w;
+            c.h = h;
+            c.vShift = vShift;
+            c.gain = gain;
+            c.y.assign((size_t)w * h, 0);
+            const float sx = 1920.0f / (float)w;  // the texture's cells scale with the picture
+            for (int row = 0; row < h; ++row) {
+                const float ry = row - (rightEye ? vShift : 0.0f);
+                if (!inBand(ry)) continue;
+                const int base = 40 + (row * 50) / h;
+                uint8_t* yo = c.y.data() + (size_t)row * w;
+                for (int x = 0; x < w; ++x)
+                    yo[x] = (uint8_t)std::clamp((int)((base + 2.0f * Blotch(x * sx, ry * sx, 11)) * gain), 16, 235);
+            }
+        }
+        for (int row = 0; row < h; ++row)
+            if (inBand(row - (rightEye ? vShift : 0.0f)))
+                std::memcpy(dst.y.data() + (size_t)row * dst.width + x0, c.y.data() + (size_t)row * w, (size_t)w);
+    }
     for (int row = 0; row < h / 2; ++row) {
         uint8_t* uv = dst.uv.data() + (size_t)row * dst.width + x0;
         for (int i = 0; i < w / 2; ++i) {
@@ -222,7 +261,9 @@ void DrawEye(livepix::Nv12& dst, int x0, int w, int h, double t, float disparity
     const int phase = (int)(t * 120.0) % period;
     for (int row = 0; row < h; ++row) {
         const int ry = (int)(row - vShift);
-        if (ry < 0 || ry >= h || (ry % 64) > 40) continue;
+        // not over the band: a bar drifting over texture is a moving block that matches
+        // at the rig's offset in every frame, and the eye-sync reading drowned in those
+        if (ry < 0 || ry >= h || (ry % 64) > 40 || inBand((float)ry)) continue;
         uint8_t* yo = dst.y.data() + (size_t)row * dst.width + x0;
         for (int x = phase; x < w; x += period) yo[x] = (uint8_t)std::clamp((int)(200 * gain), 16, 235);
     }
@@ -308,16 +349,16 @@ void TestSignalSource::Render(const TestSignalConfig& cfg, int64_t n, livepix::N
         return;
     }
     DrawEye(frame, 0, w, h, t, cfg.depthScale, 0.0f, 1.0f, false);
-    if (cfg.rollDeg == 0.0f) {
+    if (cfg.rollDeg == 0.0f && cfg.scale == 1.0f) {
         DrawEye(frame, w, w, h, tR, cfg.depthScale, cfg.vShiftPx, cfg.gainR, true);
         return;
     }
-    // Roll: draw the right eye un-rolled, then resample it rotated about its centre
-    // (bilinear luma, nearest chroma) into the right half.
+    // Roll / zoom: draw the right eye plain, then resample it rotated and scaled about its
+    // centre (bilinear luma, nearest chroma) into the right half.
     thread_local livepix::Nv12 eye;
     if (eye.width != w || eye.height != h) eye.Resize(w, h);
     DrawEye(eye, 0, w, h, tR, cfg.depthScale, cfg.vShiftPx, cfg.gainR, true);
-    const float a = cfg.rollDeg * 3.14159265f / 180.0f, c = std::cos(a), s = std::sin(a);
+    const float a = cfg.rollDeg * 3.14159265f / 180.0f, c = std::cos(a) / cfg.scale, s = std::sin(a) / cfg.scale;
     const float cx = w * 0.5f, cy = h * 0.5f;
     for (int y = 0; y < h; ++y) {
         uint8_t* yo = frame.y.data() + (size_t)y * frame.width + w;

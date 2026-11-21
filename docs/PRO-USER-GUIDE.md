@@ -272,6 +272,10 @@ hides it) and the measured delay from capture to screen.
 The **Rig check** section (Inspector) shows, each in green, amber or red:
 
 - **Vertical error** and **roll**: one eye higher than, or tilted against, the other.
+- **Scale**: one eye slightly larger than the other (one lens zoomed against the other),
+  in %, `+` when the right eye is larger. It needs detail near the top and the bottom of
+  the picture; without it the line says *needs texture top and bottom*. Hover it for the
+  roll, vertical error and keystone next to it.
 - **Eye sync**: the two eyes from different moments (frames apart).
 - **Colour match**: the eyes differ in colour or brightness.
 - **Depth range**: how far in front of and behind the screen the scene goes, against your
@@ -303,6 +307,7 @@ The defaults, and how to change them when starting the player:
 | Vertical error | 1 px | `--vertical-limit=1` |
 | Colour match | dE 2 | `--colour-limit=2` |
 | Frame edges (nearest allowed at the edge) | -0.3 % | `--edge-limit=-0.3` |
+| Scale (size difference between the eyes) | 0.5 % | `MEDIAPLAYER_RIG_BUDGET_SCALE_PCT=0.5` in `pro.env`; `MEDIAPLAYER_QC_SCALE_CHECK=0` hides the line and its alerts |
 
 ### Target screen
 

@@ -60,7 +60,17 @@ void Station::Init(StationHost host, const StationOptions& opt) {
     host_ = std::move(host);
     opt_ = opt;
     showTimecode_ = opt.timecode;
-    rig_.SetBudget(opt.budget);
+    {
+        // #269: until the settings store (#265) keeps them as rig.budget.scale_pct and
+        // qc.scale_check, the scale budget and the check's toggle come from the environment.
+        rig::Budget b = opt.budget;
+        if (const char* e = std::getenv("MEDIAPLAYER_RIG_BUDGET_SCALE_PCT"); e && *e)
+            b.scalePct = std::clamp((float)std::atof(e), 0.01f, 20.0f);
+        rig_.SetBudget(b);
+        rig::RigMonitor::Checks c;
+        if (const char* e = std::getenv("MEDIAPLAYER_QC_SCALE_CHECK"); e && *e) c.scale = *e != '0';
+        rig_.SetChecks(c);
+    }
     // The QC report's session (#137): alerts logged from here on (the log is appended to
     // across sessions) and the clock it started at.
     {
@@ -388,13 +398,17 @@ void Station::SaveNote(size_t i) {
         j["delta_e"] = s.rig.deltaE;
         for (int i = 0; i < 2; ++i)
             if (s.rig.edge[i].measured) j[i == 0 ? "edge_left_pct" : "edge_right_pct"] = s.rig.edge[i].parallaxPct;
+        if (s.rig.scaleMeasured) {  // #269
+            j["scale_pct"] = s.rig.scalePct;
+            j["keystone_px"] = s.rig.keystonePx;
+        }
     }
     if (s.eyeSync >= 0) j["eye_sync_frames"] = s.eyeSync;
     if (s.rig.eyeSyncMeasuredFrames >= 0) j["eye_sync_measured_frames"] = s.rig.eyeSyncMeasuredFrames;
     if (s.target.On()) j["target"] = TargetJson(s.target, s.pictureScale, s.rig, s.parallaxOffsetPct);
     j["calibration"] = CalibrationJson(s.calibration);
     const rig::Budget b = rig_.GetBudget();
-    j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"edge_pct", b.edgePct}};
+    j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"edge_pct", b.edgePct}, {"scale_pct", b.scalePct}};
     std::ofstream(s.notePath) << j.dump(2) << "\n";
 }
 
@@ -461,6 +475,7 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
     s.budgetVerticalPx = b.maxVerticalPx;
     s.budgetDeltaE = b.maxDeltaE;
     s.budgetEdgePct = b.edgePct;
+    s.budgetScalePct = b.scalePct;
     // Closed alerts: this session's part of the log (the in-memory history keeps only 20).
     {
         std::ifstream log((std::filesystem::path(folder) / "station_alerts.jsonl").string(), std::ios::binary);
@@ -523,6 +538,8 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
         q.rig.nearPct = sn.rig.nearPct;
         q.rig.farPct = sn.rig.farPct;
         q.rig.deltaE = sn.rig.deltaE;
+        q.rig.scaleMeasured = sn.rig.scaleMeasured;
+        q.rig.scalePct = sn.rig.scalePct;
         for (int e = 0; e < 2; ++e) {
             q.rig.edgeMeasured[e] = sn.rig.edge[e].measured;
             q.rig.edgePct[e] = sn.rig.edge[e].parallaxPct;
@@ -786,6 +803,11 @@ std::string Station::RigStatusJson() const {
     out["near_pct"] = r.nearPct;
     out["far_pct"] = r.farPct;
     out["delta_e"] = r.deltaE;
+    // #269: the right eye's size against the left (%, + = right larger; the shown, smoothed
+    // reading), whether the matches spread far enough over the height to say, and keystone
+    out["scale_pct"] = r.scalePct;
+    out["scale_measured"] = r.scaleMeasured;
+    out["keystone_px"] = r.keystonePx;
     // edge violations: the 2nd most in-front parallax along each frame edge, null = not measured
     for (int i = 0; i < 2; ++i) {
         const char* k = i == 0 ? "edge_left_pct" : "edge_right_pct";
@@ -796,7 +818,9 @@ std::string Station::RigStatusJson() const {
     out["eye_sync_measured_frames"] = MeasuredEyeSync(&late);  // from the pixels, -1 = not measured
     out["eye_sync_late_eye"] = late > 0 ? "right" : late < 0 ? "left" : "none";
     out["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
-                     {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}, {"divergence_far_pct", b.divergeFarPct}};
+                     {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}, {"divergence_far_pct", b.divergeFarPct},
+                     {"scale_pct", b.scalePct}};
+    out["checks"] = {{"scale", rig_.GetChecks().scale}};  // qc.* toggles: off hides the row and the alerts
     json alerts = json::array();
     for (const rig::Alert& al : rig_.Alerts())
         alerts.push_back({{"what", al.what}, {"timecode", al.timecode}, {"time", al.wallClock}, {"open", al.end < 0}});
@@ -900,10 +924,12 @@ bool Station::DispatchTool(const std::string& tool, const std::string& argsJson,
         num("vertical_px", b.maxVerticalPx);
         num("delta_e", b.maxDeltaE);
         num("edge_pct", b.edgePct);
+        num("scale_pct", b.scalePct);
         if (!(b.nearPct < b.farPct)) return err("near_pct must be below far_pct");
+        if (!(b.scalePct > 0.0f)) return err("scale_pct must be above 0");
         rig_.SetBudget(b);
         result = json{{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
-                      {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}}.dump();
+                      {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}, {"scale_pct", b.scalePct}}.dump();
         return true;
     }
     if (tool == "snapshot") {
@@ -1243,6 +1269,24 @@ void Station::BuildRigSection(bool stereo) {
     Graded("Vertical error", v, std::fabs(r.verticalPx), b.maxVerticalPx);
     std::snprintf(v, sizeof(v), "%.2f deg", r.rollDeg);
     Graded("Roll", v, std::fabs(r.rollDeg), 0.5f);
+    // #269: the right eye's size against the left. Red past the budget (amber from 75 %);
+    // without matches top and bottom there is nothing to read it from.
+    if (rig_.GetChecks().scale) {
+        if (r.scaleMeasured) {
+            std::snprintf(v, sizeof(v), "%+.2f %%%s", r.scalePct,
+                          std::fabs(r.scalePct) < 0.005f ? "" : r.scalePct > 0 ? " (R larger)" : " (R smaller)");
+            Graded("Scale", v, std::fabs(r.scalePct), b.scalePct);
+        } else {
+            ImGui::TextUnformatted("Scale");
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.56f);
+            ImGui::TextDisabled("needs texture top and bottom");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Right eye is %.2f %% %s than the left (budget %.2f %%).\nRoll %.2f deg, vertical error %.1f px, "
+                              "keystone %.1f px (top edge, right minus left).",
+                              std::fabs(r.scalePct), r.scalePct >= 0 ? "larger" : "smaller", b.scalePct, r.rollDeg,
+                              r.verticalPx, r.keystonePx);
+    }
     const std::vector<rig::Sample> h = rig_.History(1.0);
     const int sync = h.empty() ? -1 : h.back().eyeOffsetFrames;
     int late = 0;
@@ -1290,7 +1334,8 @@ void Station::BuildRigSection(bool stereo) {
             Graded("Frame edges", v, std::max(0.0f, b.edgePct - worst) + 0.01f, 0.05f);
         }
     }
-    ImGui::TextDisabled("budget %+.1f%% .. %+.1f%%, edges %+.1f%%  (R: 60 s history)", b.nearPct, b.farPct, b.edgePct);
+    ImGui::TextDisabled("budget %+.1f%% .. %+.1f%%, edges %+.1f%%, scale %.1f%%  (R: 60 s history)", b.nearPct, b.farPct,
+                        b.edgePct, b.scalePct);
     const std::vector<rig::Alert> alerts = rig_.Alerts();
     if (!alerts.empty()) {
         const rig::Alert& al = alerts.back();

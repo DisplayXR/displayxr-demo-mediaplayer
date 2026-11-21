@@ -127,6 +127,14 @@ void CsvAndHtml() {
     CHECK(Has(h, "<span class=bad>1.50 px</span>"), "a number over budget is flagged");
     CHECK(Has(h, "Depth -1.00%") && !Has(h, "<span class=bad>-1.00%"), "a number in budget is not");
     CHECK(Has(h, "1 row(s) have no source timecode"), "the untimed rows are called out");
+    // #269: a scale reading goes into the HTML row (flagged over budget) and the CSV's last column
+    Session sc = Sample();
+    sc.budgetScalePct = 0.5f;
+    sc.snapshots[0].rig.scaleMeasured = true;
+    sc.snapshots[0].rig.scalePct = 1.04f;
+    CHECK(Has(MakeHtml(sc), "<span>Scale <span class=bad>1.04%</span></span>"), "a scale over budget is flagged");
+    CHECK(Has(MakeHtml(sc), "eye sizes within 0.50%"), "the scale budget is in the header");
+    CHECK(Has(MakeCsv(sc), ",1.04\n"), "CSV carries scale_pct");
     Session empty;
     const std::string he = MakeHtml(empty);
     CHECK(Has(he, "No rig check went over budget") && Has(he, "No snapshots"), "an empty session says so");
@@ -182,8 +190,9 @@ void CalibrationRecord() {
               Has(h, "(not the one at export)"),
           "HTML: a snapshot with a different calibration is flagged");
     const std::string c = MakeCsv(s);
-    CHECK(Has(c, ",image,calibration,calibration_name,calibration_fingerprint,calibration_panel\n"), "CSV header columns");
-    CHECK(Has(c, ",on,Suite A D65 2.4,0123456789abcdef,ACR-0000-871E4C17\n"), "CSV snapshot row");
+    CHECK(Has(c, ",image,calibration,calibration_name,calibration_fingerprint,calibration_panel,scale_pct\n"),
+          "CSV header columns");
+    CHECK(Has(c, ",on,Suite A D65 2.4,0123456789abcdef,ACR-0000-871E4C17,\n"), "CSV snapshot row");
     CHECK(Has(c, ",bypassed,Suite A D65 2.4,"), "CSV second snapshot bypassed");
     // every row has the header's column count
     size_t cols = 0;
@@ -200,7 +209,7 @@ void CalibrationRecord() {
         if (!cols) cols = n;
         else same = same && n == cols;
     }
-    CHECK(cols == 21 && same, "CSV: every row has 21 columns");
+    CHECK(cols == 22 && same, "CSV: every row has 22 columns");
     // an older session (nothing recorded) prints no calibration lines
     const std::string old = MakeHtml(Sample());
     CHECK(!Has(old, "Display calibration") && !Has(old, "Calibration "), "HTML: no record, no line");
