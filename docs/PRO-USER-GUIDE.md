@@ -304,6 +304,11 @@ The defaults, and how to change them when starting the player:
 | Colour match | dE 2 | `--colour-limit=2` |
 | Frame edges (nearest allowed at the edge) | -0.3 % | `--edge-limit=-0.3` |
 
+The limits are also in **Settings > Rig check budget** (see [Settings](#settings)), which
+keeps them for the next run, as does the `set_depth_budget` agent tool and the Inspector's
+"Depth budget -1 / +2 %" button. A limit given on the command line wins for that run and is
+not saved.
+
 ### Target screen
 
 The same picture has more depth on a screen that fills more of your view (a cinema) and
@@ -379,6 +384,34 @@ Pick a second clip with **Load B...** (Inspector > View), `--compare=<file>` or 
 clip and the compare clip at the same position (the status bar shows **[A]** or **[B]**),
 or use the **Clip A | B** wipe (`8`) to see both at once, split by the line.
 
+## Settings
+
+The gear at the right end of the top bar, **Ctrl+,**, or the **Settings** button at the top
+of the Station panel opens the Settings window. Esc closes it. While the panels are pinned
+and shown flat, the window is flat too.
+
+- **Station:** the path of the station file, `pro.env`, with **Open folder**. That file holds
+  the start-time levers (capture, 10-bit atlas, DisplayXR runtime knobs) and applies at the
+  next start; it is not edited here.
+- **Rig check budget:** near, far, vertical error, colour match and frame-edge limits, and
+  **Defaults**.
+
+What the window changes is kept in `settings.txt` beside the Recent list
+(`%APPDATA%\DisplayXR\MediaPlayerPro\` on Windows,
+`~/Library/Application Support/DisplayXR/MediaPlayerPro/` on macOS). It is `key=value`
+lines; comments and unknown keys survive a save. `MEDIAPLAYER_SETTINGS_FILE=<path>` uses
+another file (`off` = keep nothing).
+
+| Key | Default |
+|---|---|
+| `rig.budget.near_pct` | `-2` |
+| `rig.budget.far_pct` | `1` |
+| `rig.budget.vertical_px` | `1` |
+| `rig.budget.delta_e` | `2` |
+| `rig.budget.edge_pct` | `-0.3` |
+
+The panel switches (scopes, probe, overlays, pin) are not kept between runs.
+
 ## All keys
 
 | Key | Does |
@@ -387,6 +420,7 @@ or use the **Clip A | B** wipe (`8`) to see both at once, split by the line.
 | `F` / `F11`, `Esc` | full screen, leave full screen |
 | `F1` / `?` | the shortcuts panel (also the **?** button on the top bar); `Esc` closes it |
 | `Ctrl+O`, `Ctrl+Shift+O`, `Ctrl+U` | open a file, open a folder, open a stream URL |
+| `Ctrl+,` | Settings |
 | `Up` / `Down` | previous / next file in the folder |
 | `Space`, `Left` / `Right`, `Shift+Left` / `Shift+Right`, `[` / `]` | play / pause, frame step, 5 frames, frame step |
 | `1`..`6` | 3D, left, right, difference, anaglyph, false colour |

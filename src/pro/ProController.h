@@ -38,6 +38,13 @@
 
 struct SDL_Window;
 
+namespace mp {
+class Settings;
+namespace ui {
+class SettingsPanel;
+}
+}  // namespace mp
+
 namespace mp::pro {
 
 enum class ViewMode { Stereo3D = 0, LeftOnly, RightOnly, Difference, Anaglyph, FalseColour, Count };
@@ -150,6 +157,7 @@ struct Host {
     // Channel solo (LOXR-874): the metered channel played alone (0-based), -1 = none.
     std::function<int()> getSoloChannel;
     std::function<void(int)> setSoloChannel;
+    std::function<void()> openSettings;  // the Settings window (#265): the Station header's button
     AudioMeter* audioMeter = nullptr;
 };
 
@@ -221,6 +229,18 @@ public:
     // UI while pinned) must not resubmit last frame's cards over a HUD with no panels.
     void ClearFlatRects() { flatRects_.clear(); }
     void SetFlatPanelsAvailable(bool on) { flatAvailable_ = on; }
+    // The panels go out flat this frame; another trunk window (Settings) joins them.
+    bool FlatNow() const { return flatAvailable_ && flatPanels_ && PanelsShown(); }
+    void AddFlatRect(const FlatRect& r) { flatRects_.push_back(r); }
+
+    // Settings (#265): Pro's rows in the shared window (the station file, the rig budget),
+    // and the rig budget kept in `store` (rig.budget.*). Call after the station's Init: the
+    // budget it started with (settings, or the command line, which wins) is the baseline,
+    // and only what changes after it is written back.
+    void AttachSettings(Settings* store, ui::SettingsPanel* panel);
+    // The rig budget in `store` over `b`, except the fields whose bit is set in `keepMask`
+    // (set on the command line). An inverted near/far pair is ignored.
+    static void BudgetFromSettings(const Settings& store, rig::Budget& b, unsigned keepMask);
 
     // True while Pro wants the HUD kept alive (pinned inspector).
     // Tab / "Show panels": the full UI (top bar, panels, transport) is up and stays up, no
@@ -382,8 +402,12 @@ private:
     std::vector<FlatRect> flatRects_;
     bool flatAvailable_ = false;    // the runtime takes Local2D layers (XR_DXR_local_3d_zone)
     bool flatPanels_ = true;        // MEDIAPLAYER_PRO_PANELS_3D=1 keeps pinned panels woven
-    bool FlatNow() const { return flatAvailable_ && flatPanels_ && PanelsShown(); }
     void AddFlatRectOfCurrentWindow();
+    // #265: write the rig budget fields that changed (a set_depth_budget call, the preset,
+    // the Settings rows) to settings_.
+    void PersistBudget();
+    Settings* settings_ = nullptr;
+    float budgetSeen_[5] = {};
     Station station_;
     bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture
 

@@ -53,6 +53,7 @@ enum class Glyph {
     Fullscreen,      // four corners pointing out
     ExitFullscreen,  // four corners pointing in
     Help,            // a circled "?": the shortcuts panel
+    Settings,     // a gear: the Settings window (desktop, #265)
 };
 
 // One stroke width for every outline, HUD pixels; 0 = the desktop's proportional strokes.

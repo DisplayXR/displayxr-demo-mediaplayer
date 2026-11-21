@@ -292,6 +292,24 @@ void DrawGlyph(ImDrawList* dl, Glyph glyph, ImVec2 c, float size, ImU32 u, bool 
             dl->AddCircleFilled(P(0.0f, 0.17f), size * 0.045f, u);
             break;
         }
+        case Glyph::Settings: {
+            // A gear: eight flat teeth round a ring, and the hole.
+            constexpr int kTeeth = 8;
+            ImVec2 pts[kTeeth * 4];
+            for (int i = 0; i < kTeeth; ++i) {
+                const float a = i * 2.0f * kPi / kTeeth;
+                const float half = kPi / kTeeth;  // a tooth and a gap share each step
+                const float rIn = 0.24f, rOut = 0.34f;
+                const float a0 = a - half * 0.95f, a1 = a - half * 0.45f, a2 = a + half * 0.45f, a3 = a + half * 0.95f;
+                pts[i * 4 + 0] = P(rIn * std::cos(a0), rIn * std::sin(a0));
+                pts[i * 4 + 1] = P(rOut * std::cos(a1), rOut * std::sin(a1));
+                pts[i * 4 + 2] = P(rOut * std::cos(a2), rOut * std::sin(a2));
+                pts[i * 4 + 3] = P(rIn * std::cos(a3), rIn * std::sin(a3));
+            }
+            dl->AddPolyline(pts, kTeeth * 4, u, ImDrawFlags_Closed, T(0.8f));
+            dl->AddCircle(c, size * 0.10f, u, 0, T(0.8f));
+            break;
+        }
     }
 }
 
