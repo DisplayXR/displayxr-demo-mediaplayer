@@ -5600,7 +5600,8 @@ pro::Status App::ProStatus() const {
     st.modeName = xr_.ActiveModeName() ? xr_.ActiveModeName() : "";
     st.live = isLive_;
     st.eyesSwapped = swapEyes_ != mediaEyeSwap_;
-    st.hasPicture = hasMedia_ && !isLogo_ && (isLive_ || isStream_ || isVideo_);
+    st.hasPicture = hasMedia_ && !isLogo_ && (isLive_ || isStream_ || isVideo_ || st.stereo);  // a stereo still: #266
+    st.layout = layout_;
     if (isLive_) {
         st.sourceKind = LiveIsCamera() ? "Camera" : live_->Kind();
         st.sourceLabel = live_->DeviceName();

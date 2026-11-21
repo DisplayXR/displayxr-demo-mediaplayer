@@ -19,13 +19,15 @@
 // Eye swap: every measurement is of the eyes AS SHOWN. With the player's X toggle (or a
 // R|L container) on, the right half of the frame is the left eye, so signs stay right.
 // Measured on a downsampled luma copy of the frame on a worker thread a few times a
-// second; the 60-second history and the depth-budget alerts live in RigMonitor. Pure:
+// second, or once for a still; side by side or top/bottom. The 60-second history and the
+// depth-budget alerts live in RigMonitor. Pure:
 // no SDL, no Vulkan, no App. Tested against the test signal (tests/rig_check_test.cpp).
 #pragma once
 
 #include "media/FrameRing.h"
 #include "media/StereoTypes.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -39,19 +41,28 @@ namespace mp::rig {
 // The measurement image: both eyes as grey + mean colour, at the analysis resolution.
 struct EyePair {
     int eyeW = 0, h = 0;          // analysis size per eye
-    float fullEyeW = 0, fullH = 0;  // the source's per-eye size (to report full-res px)
+    float fullEyeW = 0, fullH = 0;  // the source's per-eye size as stored (to report full-res px)
     float xStretch = 1.f;         // displayed / stored eye width (2 for half-SBS)
+    float yStretch = 1.f;         // displayed / stored eye height (2 for half-TB)
     std::vector<float> left, right;  // eyeW * h luma (0..255)
     float meanRgb[2][3] = {};     // per eye, display-referred 0..1
     int64_t serial = 0;           // the source frame's ring serial (diagnostics)
+    // Full-resolution DISPLAYED px per analysis column / row: what the readings are
+    // reported in (a half layout's eye is shown stretched along its packing axis).
+    float PxPerCol() const { return eyeW > 0 ? fullEyeW * xStretch / (float)eyeW : 0.f; }
+    float PxPerRow() const { return h > 0 ? fullH * yStretch / (float)h : 0.f; }
 };
 
-// Build an EyePair from an NV12/I420 side-by-side frame (SbsFull or SbsHalf; both eyes
-// are side by side in the frame). analysisW = the per-eye width to measure at.
-// swapEyes = the frame's RIGHT half is the left eye (the effective eye swap). False for
-// mono layouts or an empty frame.
+// Build an EyePair from an NV12/I420/P016 frame with CPU planes, side by side (SbsFull,
+// SbsHalf) or top/bottom (TbFull, TbHalf). analysisW = the per-eye width to measure at.
+// swapEyes = the frame's second half (right, or bottom) is the left eye (the effective eye
+// swap). False for mono layouts, an empty or GPU-only frame, or another pixel format.
 bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, EyePair& out,
                 bool swapEyes = false);
+// The same from an RGBA still (8-bit R'G'B'A, w * 4 bytes a row): luma is BT.709 Y' of
+// the full-range R'G'B', the mean colours are the R'G'B' means.
+bool DownsampleRgba(const uint8_t* rgba, int w, int h, StereoLayout layout, int analysisW, EyePair& out,
+                    bool swapEyes = false);
 
 // One frame edge: the matches in a band along it. Something in front of the screen sits
 // further left in the right eye than in the left, so at the LEFT edge its blocks are taken
@@ -206,6 +217,17 @@ public:
     static constexpr int kSyncFrames = 4;  // current + K = 3 earlier frames
     void Submit(const FrameRing::Frame& f, StereoLayout layout, int eyeOffsetFrames,
                 const std::string& timecode, bool swapEyes = false);
+    // Render thread: a still (#266). Measured once (no eye-sync burst), and again when
+    // UpdateStill sees the layout or the eye swap change: a reduced copy is kept for that.
+    // While the still is up, Active() holds once it is measured; a still sample joins the
+    // history but opens no alert (a still has no duration). Submit or ClearStill ends it.
+    void SubmitStill(const uint8_t* rgba, int w, int h, StereoLayout layout, bool swapEyes);
+    void UpdateStill(StereoLayout layout, bool swapEyes);
+    void ClearStill();
+    bool StillShown() const;
+    // Why the frames handed to Submit cannot be measured (nullptr = they can): a GPU-only
+    // frame (zero-copy decode) or a pixel format the downsample does not read.
+    const char* Unmeasurable() const;
     // Record one measurement (the worker's path; public so tests can drive the history and
     // the alerts with their own clock).
     void AddSample(const Sample& s, const std::string& timecode);
@@ -224,6 +246,7 @@ public:
 
 private:
     void Worker();
+    void MeasureStill();  // render thread: downsample the kept still, hand it to the worker
     void AddSampleLocked(const Sample& s, const std::string& timecode);  // under m_
     void UpdateAlerts(const Sample& s, const std::string& timecode);
 
@@ -231,7 +254,8 @@ private:
     std::condition_variable cv_;
     std::thread worker_;
     bool stop_ = false;
-    bool pending_ = false;
+    bool pending_ = false;  // work_ waits for the worker
+    bool busy_ = false;     // the worker is measuring
     std::vector<EyePair> work_;      // the burst, oldest first; the last is measured
     // burst being collected (render thread only)
     std::vector<EyePair> burst_;
@@ -254,6 +278,17 @@ private:
     bool pendingSwap_ = false;
     float targetParallaxOffsetPct_ = 0.0f;
     uint64_t generation_ = 0;  // bumped by Reset: a measurement started before it is dropped
+    // The still (#266). Render thread: the kept copy, at most ~2560 px on its long side
+    // (integer box reduce by stillK_), and the layout / swap it was last measured with.
+    std::vector<uint8_t> still_;
+    int stillW_ = 0, stillH_ = 0, stillK_ = 1;
+    bool stillHeld_ = false;
+    StereoLayout stillLayout_ = StereoLayout::Mono;
+    bool stillSwap_ = false;
+    // Under m_: shown / measured, and a serial so a superseded still measurement is dropped.
+    bool stillShown_ = false, stillMeasured_ = false, pendingStill_ = false;
+    uint64_t stillSerial_ = 0, pendingStillSerial_ = 0;
+    std::atomic<int> unmeasurable_{0};  // Submit's last frame: 0 measurable, 1 GPU-only, 2 format
     // open alert runs: near, far, vertical, colour, left edge, right edge, divergence (#135)
     static constexpr int kRuns = 7;
     struct Run {

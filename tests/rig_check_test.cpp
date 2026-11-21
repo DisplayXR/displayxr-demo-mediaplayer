@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -175,6 +176,155 @@ void RollFault() {
     const rig::Result h = rig::Measure(e);
     std::printf("  roll 0.6 deg half-SBS: roll=%.2f deg (stretch %.0f)\n", h.rollDeg, e.xStretch);
     CHECK(h.ok && std::fabs(h.rollDeg - 0.6f) < 0.15f, "half-SBS roll is the displayed roll, not 2x");
+}
+
+// --- Stills and top/bottom (#266) ------------------------------------------------------
+
+// Limited-range BT.709 NV12 -> 8-bit R'G'B'A, what a decoded side-by-side photo hands OnStill.
+std::vector<uint8_t> ToRgba(const livepix::Nv12& px) {
+    std::vector<uint8_t> o((size_t)px.width * px.height * 4);
+    for (int y = 0; y < px.height; ++y)
+        for (int x = 0; x < px.width; ++x) {
+            const float Y = (px.y[(size_t)y * px.width + x] - 16.f) / 219.f;
+            const size_t c = (size_t)(y / 2) * px.width + (x & ~1);
+            const float u = (px.uv[c] - 128.f) / 224.f, v = (px.uv[c + 1] - 128.f) / 224.f;
+            const float rgb[3] = {Y + 1.5748f * v, Y - 0.1873f * u - 0.4681f * v, Y + 1.8556f * u};
+            uint8_t* d = &o[((size_t)y * px.width + x) * 4];
+            for (int k = 0; k < 3; ++k) d[k] = (uint8_t)std::lround(std::clamp(rgb[k], 0.f, 1.f) * 255.f);
+            d[3] = 255;
+        }
+    return o;
+}
+
+// Restack an SBS-full frame as top/bottom: full (each eye at its size, the frame twice as
+// tall) or half (each eye squeezed to half its height, every 2nd row).
+livepix::Nv12 ToTopBottom(const livepix::Nv12& px, bool half) {
+    const int ew = px.width / 2, eh = px.height, step = half ? 2 : 1, oh = eh / step;
+    livepix::Nv12 o;
+    o.Resize(ew, 2 * oh);
+    for (int eye = 0; eye < 2; ++eye) {
+        for (int y = 0; y < oh; ++y)
+            std::copy_n(&px.y[(size_t)(y * step) * px.width + eye * ew], ew, &o.y[(size_t)(eye * oh + y) * ew]);
+        for (int y = 0; y < oh / 2; ++y)
+            std::copy_n(&px.uv[(size_t)(y * step) * px.width + eye * ew], ew, &o.uv[(size_t)(eye * oh / 2 + y) * ew]);
+    }
+    return o;
+}
+
+void PrintResult(const char* what, const rig::Result& r) {
+    std::printf("  %-22s ok=%d matches=%3d vertical=%5.2f px roll=%5.2f near=%+.2f%% far=%+.2f%% dE=%.2f edges %d/%d\n",
+                what, r.ok, r.matches, r.verticalPx, r.rollDeg, r.nearPct, r.farPct, r.deltaE, r.edge[0].measured,
+                r.edge[1].measured);
+}
+
+// The test plate as a side-by-side still, top/bottom (full and half, video and still) and
+// swapped reads what the side-by-side video frame reads, within the matcher's noise.
+void StillsAndTopBottom() {
+    TestSignalConfig cfg;
+    cfg.vShiftPx = 3.0f;
+    cfg.rollDeg = 0.4f;
+    cfg.gainR = 1.15f;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    rig::EyePair sbs, e;
+    CHECK(rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, sbs), "SBS downsamples");
+    const rig::Result ref = rig::Measure(sbs);
+    PrintResult("SBS video frame", ref);
+    auto same = [&](const char* what, const rig::Result& r, float dETol) {
+        PrintResult(what, r);
+        char m[128];
+        std::snprintf(m, sizeof(m), "%s: measured", what);
+        CHECK(r.ok, m);
+        std::snprintf(m, sizeof(m), "%s: vertical error as SBS", what);
+        CHECK(std::fabs(r.verticalPx - ref.verticalPx) < 0.4f, m);
+        std::snprintf(m, sizeof(m), "%s: roll as SBS", what);
+        CHECK(std::fabs(r.rollDeg - ref.rollDeg) < 0.1f, m);
+        std::snprintf(m, sizeof(m), "%s: depth range as SBS", what);
+        CHECK(std::fabs(r.nearPct - ref.nearPct) < 0.2f && std::fabs(r.farPct - ref.farPct) < 0.2f, m);
+        std::snprintf(m, sizeof(m), "%s: colour match as SBS", what);
+        CHECK(std::fabs(r.deltaE - ref.deltaE) < dETol, m);
+        std::snprintf(m, sizeof(m), "%s: frame edges as SBS", what);
+        CHECK(r.edge[0].measured == ref.edge[0].measured && r.edge[1].measured == ref.edge[1].measured, m);
+    };
+    // TB full carries the same pixels per eye: the analysis image is the same, bit for bit
+    CHECK(rig::Downsample(ToFrame(ToTopBottom(px, false)), StereoLayout::TbFull, 640, e), "TB-full downsamples");
+    CHECK(e.left == sbs.left && e.right == sbs.right && e.meanRgb[1][0] == sbs.meanRgb[1][0],
+          "TB-full analysis image = SBS's");
+    same("TB-full video frame", rig::Measure(e), 0.01f);
+    CHECK(rig::Downsample(ToFrame(ToTopBottom(px, true)), StereoLayout::TbHalf, 640, e), "TB-half downsamples");
+    CHECK(e.yStretch == 2.f && e.h == sbs.h, "TB-half: displayed rows restored, stretch 2");
+    same("TB-half video frame", rig::Measure(e), 0.3f);
+    // stills: the eyes from R'G'B' (dE is on R'G'B' means instead of Y'CbCr ones: a little apart)
+    const std::vector<uint8_t> rgba = ToRgba(px);
+    CHECK(rig::DownsampleRgba(rgba.data(), px.width, px.height, StereoLayout::SbsFull, 640, e), "RGBA still downsamples");
+    same("SBS still", rig::Measure(e), 0.5f);
+    const livepix::Nv12 tb = ToTopBottom(px, false);
+    const std::vector<uint8_t> tbRgba = ToRgba(tb);
+    CHECK(rig::DownsampleRgba(tbRgba.data(), tb.width, tb.height, StereoLayout::TbFull, 640, e), "TB still downsamples");
+    same("TB-full still", rig::Measure(e), 0.5f);
+    // an R|L still with the swap flag reads as the L|R one
+    const livepix::Nv12 sw = SwapHalves(px);
+    const std::vector<uint8_t> swRgba = ToRgba(sw);
+    CHECK(rig::DownsampleRgba(swRgba.data(), sw.width, sw.height, StereoLayout::SbsFull, 640, e, true), "swapped still");
+    same("R|L still, swapped", rig::Measure(e), 0.5f);
+    CHECK(!rig::DownsampleRgba(rgba.data(), px.width, px.height, StereoLayout::Mono, 640, e), "a mono still is not measured");
+    // half SBS still: the roll on screen, not 2x
+    const livepix::Nv12 hs = Squeeze(px);
+    const std::vector<uint8_t> hsRgba = ToRgba(hs);
+    CHECK(rig::DownsampleRgba(hsRgba.data(), hs.width, hs.height, StereoLayout::SbsHalf, 640, e), "half-SBS still");
+    const rig::Result h = rig::Measure(e);
+    PrintResult("half-SBS still", h);
+    CHECK(h.ok && std::fabs(h.rollDeg - ref.rollDeg) < 0.15f && std::fabs(h.verticalPx - ref.verticalPx) < 0.5f,
+          "half-SBS still: displayed roll and vertical error");
+}
+
+// The monitor's still path: measured once without frames, held while shown, re-measured
+// on an eye-swap / layout change, ended by frames; a GPU-only frame says why it is not
+// measured.
+void MonitorStill() {
+    TestSignalConfig cfg;
+    cfg.vShiftPx = 4.0f;
+    cfg.eyeW = 2880;  // a 5760x1620 still: kept reduced (k = 3), readings still in source px
+    cfg.eyeH = 1620;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    const std::vector<uint8_t> rgba = ToRgba(px);
+    rig::RigMonitor m;
+    auto waitSamples = [&](size_t n) {
+        for (int i = 0; i < 500 && m.History(1e9).size() < n; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        return m.History(1e9).size() >= n;
+    };
+    m.SubmitStill(rgba.data(), px.width, px.height, StereoLayout::SbsFull, false);
+    CHECK(waitSamples(1), "a still is measured without any frames");
+    rig::Result r = m.Last();
+    PrintResult("monitor still", r);
+    CHECK(r.ok && std::fabs(r.verticalPx - 4.0f) < 0.75f, "still: 4 px vertical error, in source px");
+    CHECK(r.eyeSyncMeasuredFrames == -1, "still: no eye sync");
+    CHECK(m.StillShown() && m.Active(LiveProducer::NowSeconds() + 10.0), "still: held long after it was measured");
+    CHECK(m.Alerts().empty(), "still: no alert (no duration)");
+    m.UpdateStill(StereoLayout::SbsFull, false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(m.History(1e9).size() == 1, "no change, no re-measure");
+    m.UpdateStill(StereoLayout::SbsFull, true);
+    CHECK(waitSamples(2), "eye swap re-measures");
+    r = m.Last();
+    PrintResult("monitor still, swapped", r);
+    CHECK(r.ok && r.verticalPx < -3.0f, "swapped: vertical sign follows the eyes as shown");
+    m.UpdateStill(StereoLayout::Mono, false);
+    CHECK(waitSamples(3), "layout change re-measures");
+    CHECK(!m.Last().ok, "mono: not measured");
+    // a zero-copy (GPU-only) frame ends the still and says why it cannot be measured
+    FrameRing::Frame g;
+    g.width = 3840;
+    g.height = 1080;
+    g.format = PixFormat::RGBA;
+    g.gpu = true;
+    m.Submit(g, StereoLayout::SbsFull, -1, "");
+    CHECK(!m.StillShown(), "frames end the still");
+    CHECK(m.Unmeasurable() != nullptr && std::string(m.Unmeasurable()).find("CPU frames") != std::string::npos,
+          "GPU-only frames: the reason is given");
+    m.Submit(ToFrame(px), StereoLayout::SbsFull, -1, "");
+    CHECK(m.Unmeasurable() == nullptr, "CPU frames: no reason");
 }
 
 void TooFewMatches() {
@@ -596,6 +746,8 @@ int main() {
     DeltaE();
     EyeSwap();
     RollFault();
+    StillsAndTopBottom();
+    MonitorStill();
     TooFewMatches();
     EdgeViolations();
     EdgeAlert();
