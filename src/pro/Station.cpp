@@ -54,6 +54,16 @@ std::string Clock(char* stampOut, size_t stampN) {
 
 }  // namespace
 
+namespace {
+// #270: a colour match as get_rig_status / the snapshot note carry it.
+nlohmann::json ColourJson(const rig::ColourMatch& c) {
+    auto three = [](const float* v) { return nlohmann::json::array({v[0], v[1], v[2]}); };
+    return {{"measured", c.measured}, {"gain_pct", three(c.gainPct)}, {"lift_pct", three(c.liftPct)},
+            {"luma_pct", c.lumaPct}, {"luma_stops", c.lumaStops}, {"shape", three(c.shape)}, {"overlap", true},
+            {"pq_code_values", c.pq}};
+}
+}  // namespace
+
 Station::~Station() { Shutdown(); }
 
 void Station::Init(StationHost host, const StationOptions& opt) {
@@ -67,9 +77,14 @@ void Station::Init(StationHost host, const StationOptions& opt) {
         if (const char* e = std::getenv("MEDIAPLAYER_RIG_BUDGET_SCALE_PCT"); e && *e)
             b.scalePct = std::clamp((float)std::atof(e), 0.01f, 20.0f);
         rig_.SetBudget(b);
+        if (const char* e = std::getenv("MEDIAPLAYER_RIG_BUDGET_GAIN_PCT"); e && *e)  // #270: rig.budget.gain_pct
+            b.gainPct = std::clamp((float)std::atof(e), 0.01f, 50.0f);
         rig::RigMonitor::Checks c;
         if (const char* e = std::getenv("MEDIAPLAYER_QC_SCALE_CHECK"); e && *e) c.scale = *e != '0';
+        if (const char* e = std::getenv("MEDIAPLAYER_QC_COLOR_CHECK"); e && *e) c.colour = *e != '0';  // qc.color_check
         rig_.SetChecks(c);
+        if (const char* e = std::getenv("MEDIAPLAYER_PRO_COLOUR_OVERLAY"); e && *e)
+            colourOverlay_ = std::string(e) == "chroma" ? 2 : *e != '0' ? 1 : 0;
     }
     // The QC report's session (#137): alerts logged from here on (the log is appended to
     // across sessions) and the clock it started at.
@@ -402,13 +417,15 @@ void Station::SaveNote(size_t i) {
             j["scale_pct"] = s.rig.scalePct;
             j["keystone_px"] = s.rig.keystonePx;
         }
+        if (s.rig.colour.measured) j["color"] = ColourJson(s.rig.colour);  // #270
     }
     if (s.eyeSync >= 0) j["eye_sync_frames"] = s.eyeSync;
     if (s.rig.eyeSyncMeasuredFrames >= 0) j["eye_sync_measured_frames"] = s.rig.eyeSyncMeasuredFrames;
     if (s.target.On()) j["target"] = TargetJson(s.target, s.pictureScale, s.rig, s.parallaxOffsetPct);
     j["calibration"] = CalibrationJson(s.calibration);
     const rig::Budget b = rig_.GetBudget();
-    j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"edge_pct", b.edgePct}, {"scale_pct", b.scalePct}};
+    j["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"edge_pct", b.edgePct}, {"scale_pct", b.scalePct},
+                   {"gain_pct", b.gainPct}};
     std::ofstream(s.notePath) << j.dump(2) << "\n";
 }
 
@@ -476,6 +493,7 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
     s.budgetDeltaE = b.maxDeltaE;
     s.budgetEdgePct = b.edgePct;
     s.budgetScalePct = b.scalePct;
+    s.budgetGainPct = b.gainPct;
     // Closed alerts: this session's part of the log (the in-memory history keeps only 20).
     {
         std::ifstream log((std::filesystem::path(folder) / "station_alerts.jsonl").string(), std::ios::binary);
@@ -540,6 +558,9 @@ bool Station::ExportQcReport(std::string& dirOut, std::string& error, int* untim
         q.rig.deltaE = sn.rig.deltaE;
         q.rig.scaleMeasured = sn.rig.scaleMeasured;
         q.rig.scalePct = sn.rig.scalePct;
+        q.rig.colourMeasured = sn.rig.colour.measured;
+        for (int c = 0; c < 3; ++c) q.rig.gainPct[c] = sn.rig.colour.gainPct[c];
+        q.rig.lumaPct = sn.rig.colour.lumaPct;
         for (int e = 0; e < 2; ++e) {
             q.rig.edgeMeasured[e] = sn.rig.edge[e].measured;
             q.rig.edgePct[e] = sn.rig.edge[e].parallaxPct;
@@ -808,6 +829,8 @@ std::string Station::RigStatusJson() const {
     out["scale_pct"] = r.scalePct;
     out["scale_measured"] = r.scaleMeasured;
     out["keystone_px"] = r.keystonePx;
+    // #270: per-channel gain / lift (right against left, source code values, over the overlap)
+    out["color"] = ColourJson(r.colour);
     // edge violations: the 2nd most in-front parallax along each frame edge, null = not measured
     for (int i = 0; i < 2; ++i) {
         const char* k = i == 0 ? "edge_left_pct" : "edge_right_pct";
@@ -819,8 +842,10 @@ std::string Station::RigStatusJson() const {
     out["eye_sync_late_eye"] = late > 0 ? "right" : late < 0 ? "left" : "none";
     out["budget"] = {{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
                      {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}, {"divergence_far_pct", b.divergeFarPct},
-                     {"scale_pct", b.scalePct}};
-    out["checks"] = {{"scale", rig_.GetChecks().scale}};  // qc.* toggles: off hides the row and the alerts
+                     {"scale_pct", b.scalePct}, {"gain_pct", b.gainPct}};
+    const rig::RigMonitor::Checks checks = rig_.GetChecks();
+    out["checks"] = {{"scale", checks.scale}, {"color", checks.colour}};  // qc.* toggles: off hides the row and the alerts
+    out["color_overlay"] = colourOverlay_ == 2 ? "chroma" : colourOverlay_ == 1 ? "luma" : "off";
     json alerts = json::array();
     for (const rig::Alert& al : rig_.Alerts())
         alerts.push_back({{"what", al.what}, {"timecode", al.timecode}, {"time", al.wallClock}, {"open", al.end < 0}});
@@ -925,11 +950,14 @@ bool Station::DispatchTool(const std::string& tool, const std::string& argsJson,
         num("delta_e", b.maxDeltaE);
         num("edge_pct", b.edgePct);
         num("scale_pct", b.scalePct);
+        num("gain_pct", b.gainPct);
         if (!(b.nearPct < b.farPct)) return err("near_pct must be below far_pct");
         if (!(b.scalePct > 0.0f)) return err("scale_pct must be above 0");
+        if (!(b.gainPct > 0.0f)) return err("gain_pct must be above 0");
         rig_.SetBudget(b);
         result = json{{"near_pct", b.nearPct}, {"far_pct", b.farPct}, {"vertical_px", b.maxVerticalPx},
-                      {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}, {"scale_pct", b.scalePct}}.dump();
+                      {"delta_e", b.maxDeltaE}, {"edge_pct", b.edgePct}, {"scale_pct", b.scalePct},
+                      {"gain_pct", b.gainPct}}.dump();
         return true;
     }
     if (tool == "snapshot") {
@@ -1310,6 +1338,51 @@ void Station::BuildRigSection(bool stereo) {
     }
     std::snprintf(v, sizeof(v), "dE %.1f", r.deltaE);
     Graded("Color match", v, r.deltaE, b.maxDeltaE);
+    // #270: which channel is off, and whether it is gain or lift (source code values, over
+    // the overlap), each channel graded against the gain budget; the fix as an ASC CDL.
+    const rig::RigMonitor::Checks checks = rig_.GetChecks();
+    if (checks.colour && r.colour.measured) {
+        const rig::ColourMatch& c = r.colour;
+        ImGui::Indent();
+        ImGui::BeginGroup();
+        for (int k = 0; k < 3; ++k) {
+            if (k) ImGui::SameLine();
+            const float m = std::fabs(c.gainPct[k]);
+            ImGui::TextColored(m <= b.gainPct * 0.75f ? kOk : m <= b.gainPct ? kWarn : kBad, "%c %+.1f %%", "RGB"[k],
+                               c.gainPct[k]);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("| Y %+.1f %% (%+.2f stop)", c.lumaPct, c.lumaStops);
+        if (c.pq) ImGui::TextDisabled("(PQ code values)");
+        ImGui::EndGroup();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Right eye against left, per channel, source code values (before the grade), over the "
+                              "overlap:\nright = gain x left + lift\nlift  R %+.2f  G %+.2f  B %+.2f %% of full scale\n"
+                              "shape R %.2f  G %.2f  B %.2f  (1 = gain and lift explain the difference)\n"
+                              "gain budget %.1f %%",
+                              c.liftPct[0], c.liftPct[1], c.liftPct[2], c.shape[0], c.shape[1], c.shape[2], b.gainPct);
+        if (ImGui::SmallButton("Copy fix (.cc)")) {
+            ImGui::SetClipboardText(rig::ColourFixCc(c).c_str());
+            if (host_.toast) host_.toast("Copied an ASC CDL (.cc) for the right eye");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Slope / offset for the RIGHT eye that match it to the left. Paste it into the grading "
+                              "tool as a .cc.");
+        ImGui::Unindent();
+    }
+    {
+        // the colour-difference overlay on the picture (one picture overlay at a time: it
+        // and the disparity heatmap exclude each other)
+        int ov = colourOverlay_;
+        ImGui::TextUnformatted("Colour difference");
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.56f);
+        ImGui::RadioButton("off##cd", &ov, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("luma##cd", &ov, 1);
+        ImGui::SameLine();
+        ImGui::RadioButton("chroma##cd", &ov, 2);
+        colourOverlay_ = ov;
+    }
     std::snprintf(v, sizeof(v), "%+.1f%% .. %+.1f%%", r.nearPct, r.farPct);
     const float over = std::max(b.nearPct - r.nearPct, r.farPct - b.farPct);
     Graded("Depth range", v, std::max(0.0f, over) + 0.01f, 0.05f);
