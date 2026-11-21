@@ -503,6 +503,19 @@ bool XrSession::CreateVulkanDevice() {
     // win32-keyed-mutex (sync the D3D11 copy against the Vulkan sample).
     zeroCopyCapable_ = deviceHas("VK_KHR_external_memory_win32") &&
                        deviceHas("VK_KHR_win32_keyed_mutex");
+    // MEDIAPLAYER_ZEROCOPY_FENCE: the decoder's shared D3D11 fences imported as timeline
+    // semaphores, so the zero-copy frame is ordered on the GPU instead of by CPU waits. Only
+    // when the switch is on, so the default device is unchanged.
+    const char* zcFence = std::getenv("MEDIAPLAYER_ZEROCOPY_FENCE");
+    if (zeroCopyCapable_ && zcFence && *zcFence && *zcFence != '0' && deviceHas("VK_KHR_external_semaphore") &&
+        deviceHas("VK_KHR_external_semaphore_win32") && deviceHas("VK_KHR_timeline_semaphore")) {
+        for (const char* ext : {"VK_KHR_external_semaphore", "VK_KHR_external_semaphore_win32",
+                                "VK_KHR_timeline_semaphore"})
+            devExtPtrs.push_back(ext);
+        zeroCopyFenceCapable_ = true;
+    } else if (zcFence && *zcFence && *zcFence != '0') {
+        LOG_WARN("MEDIAPLAYER_ZEROCOPY_FENCE is set but the device lacks external / timeline semaphores");
+    }
 #endif
 
     // Zero-copy upload of capture rows (#238 phase 3, MEDIAPLAYER_ZERO_COPY_UPLOAD): a producer's host
@@ -530,6 +543,12 @@ bool XrSession::CreateVulkanDevice() {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = (uint32_t)devExtPtrs.size();
     dci.ppEnabledExtensionNames = devExtPtrs.data();
+#if defined(_WIN32)
+    VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timeline = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+    timeline.timelineSemaphore = VK_TRUE;
+    if (zeroCopyFenceCapable_) dci.pNext = &timeline;
+#endif
 
     XrVulkanDeviceCreateInfoKHR xdci = {XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
     xdci.systemId = systemId_;

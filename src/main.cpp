@@ -182,6 +182,26 @@ int main(int argc, char* argv[]) {
     // OpenXR call). docs/CAPTURE-LEVERS.md.
     mp::pro::LoadProEnvFile();
 #endif
+#if defined(_WIN32)
+    // Zero-copy decode switches as flags (each sets its MEDIAPLAYER_* variable, overriding
+    // pro.env), taken out of `args` so the media path is still the first argument left:
+    //   --zerocopy          MEDIAPLAYER_ZEROCOPY=1        decoded frames stay on the GPU (#28)
+    //   --zerocopy-10bit    + MEDIAPLAYER_ZEROCOPY_10BIT=1  10-bit / HDR files too
+    //   --zerocopy-fence    + MEDIAPLAYER_ZEROCOPY_FENCE=1  GPU-side sync, no CPU waits
+    //   --zerocopy-all      all three
+    for (auto it = args.begin(); it != args.end();) {
+        const std::string& a = *it;
+        const bool all = a == "--zerocopy-all";
+        if (a != "--zerocopy" && a != "--zerocopy-10bit" && a != "--zerocopy-fence" && !all) {
+            ++it;
+            continue;
+        }
+        _putenv_s("MEDIAPLAYER_ZEROCOPY", "1");
+        if (all || a == "--zerocopy-10bit") _putenv_s("MEDIAPLAYER_ZEROCOPY_10BIT", "1");
+        if (all || a == "--zerocopy-fence") _putenv_s("MEDIAPLAYER_ZEROCOPY_FENCE", "1");
+        it = args.erase(it);
+    }
+#endif
 #if defined(__linux__) && !defined(__ANDROID__)
     // --platform=x11|wayland|auto (default auto, a capability probe). Taken out
     // of the argument list first: the media path is the first argument left.

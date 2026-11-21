@@ -24,6 +24,7 @@
 // extern "C" block below it mis-declares d3d11.h's operator==/!= as C functions.
 #if defined(_WIN32)
 #include <d3d11.h>
+#include <d3d11_4.h>  // ID3D11Fence: MEDIAPLAYER_ZEROCOPY_FENCE
 #include <d3dcompiler.h>  // D3DCompile: NV12->RGBA convert shaders (#28)
 #include <dxgi1_2.h>
 #endif
@@ -218,6 +219,17 @@ struct VideoDecoder::Impl {
     ID3D11DeviceContext* d3dContext = nullptr;
     AVD3D11VADeviceContext* d3dHwctx = nullptr;
     ID3D11Query* copyDoneQuery = nullptr;  // event query: producer waits for the copy (#28)
+    // MEDIAPLAYER_ZEROCOPY_FENCE: readyFence is signalled after each fill (the renderer's GPU
+    // waits it), readFence by the renderer once it has read a texture (our next fill of it
+    // GPU-waits that). Shared, with NT handles the renderer imports as timeline semaphores.
+    ID3D11Fence* readyFence = nullptr;
+    ID3D11Fence* readFence = nullptr;
+    HANDLE readyFenceHandle = nullptr;
+    HANDLE readFenceHandle = nullptr;
+    ID3D11DeviceContext4* ctx4 = nullptr;
+    uint64_t readyValue = 0;
+    bool fenceTried = false;               // creation attempted (once per open)
+    uint64_t fenceGen = 0;                 // VideoDecoder::fenceGen_ when this pair was made
 
     // NV12->RGBA convert pass (#28). Vulkan can't sample an imported D3D11 multiplanar NV12
     // (the driver's UV-plane alignment differs from D3D's tight pack), so we convert to a
@@ -225,17 +237,25 @@ struct VideoDecoder::Impl {
     // Vulkan imports at offset 0 with no alignment constraint. Built lazily, reused per stream.
     ID3D11VertexShader* convVS = nullptr;
     ID3D11PixelShader* convPS = nullptr;
+    ID3D11PixelShader* packPS = nullptr;            // MEDIAPLAYER_ZEROCOPY_10BIT: Y'CbCr unpack, no convert
     ID3D11SamplerState* convSampler = nullptr;
     ID3D11RasterizerState* convRaster = nullptr;    // cull-none, solid
-    ID3D11Buffer* convCB = nullptr;                 // { float fullRange, matrix; } per-frame
+    ID3D11Buffer* convCB = nullptr;                 // { float fullRange, matrix, scale; } per-frame
     ID3D11Texture2D* nv12Intermediate = nullptr;    // SRV-able copy target for the decoded slice
-    ID3D11ShaderResourceView* srvY = nullptr;       // R8   over plane 0
-    ID3D11ShaderResourceView* srvUV = nullptr;      // R8G8 over plane 1
+    ID3D11ShaderResourceView* srvY = nullptr;       // R8 / R16 over plane 0
+    ID3D11ShaderResourceView* srvUV = nullptr;      // R8G8 / R16G16 over plane 1
     int convW = 0, convH = 0;                       // cached intermediate dims
+    DXGI_FORMAT convFmt = DXGI_FORMAT_UNKNOWN;      // cached intermediate format (NV12 or P010)
 #endif
 
     ~Impl() {
 #if defined(_WIN32)
+        if (packPS) packPS->Release();
+        if (ctx4) ctx4->Release();
+        if (readyFence) readyFence->Release();
+        if (readFence) readFence->Release();
+        if (readyFenceHandle) CloseHandle(readyFenceHandle);
+        if (readFenceHandle) CloseHandle(readFenceHandle);
         if (copyDoneQuery) copyDoneQuery->Release();
         if (srvUV) srvUV->Release();
         if (srvY) srvY->Release();
@@ -316,6 +336,19 @@ VideoDecoder::VideoDecoder() = default;
 VideoDecoder::~VideoDecoder() { Stop(); }
 
 #if defined(_WIN32)
+void VideoDecoder::NoteSharedRead(void* handle, uint64_t fenceGen, uint64_t value) {
+    if (fenceGen == 0 || fenceGen != fenceGen_.load()) return;  // another open's fences
+    std::lock_guard<std::mutex> lk(sharedReadMutex_);
+    for (auto& r : sharedRead_) {
+        if (r.texture == handle) {
+            if (r.gen != fenceGen) r = {handle, fenceGen, value};
+            else if (value > r.value) r.value = value;
+            return;
+        }
+    }
+    sharedRead_.push_back({handle, fenceGen, value});
+}
+
 void VideoDecoder::SetInteropAdapterLUID(const uint8_t* luid8) {
     std::memcpy(interopLUID_, luid8, 8);
     haveInteropLUID_ = true;
@@ -371,14 +404,16 @@ AVBufferRef* CreateD3D11VADeviceOnLUID(const uint8_t luid[8]) {
 // Create a shareable RGBA render-target texture on `device`, w x h, plus its shared KMT
 // handle for Vulkan import. Returns false on failure. Caller owns tex (Release); the KMT
 // handle is owned by the resource (freed by its Release, not CloseHandle).
+// `packed` makes it R10G10B10A2 instead: the MEDIAPLAYER_ZEROCOPY_10BIT surface, which holds
+// Y'CbCr (not RGB) at 10 bits so the renderer's grade + HDR tone map see the source's levels.
 bool CreateSharedRGBA(ID3D11Device* device, int w, int h, ID3D11Texture2D** outTex,
-                      void** outHandle) {
+                      void** outHandle, bool packed = false) {
     D3D11_TEXTURE2D_DESC d = {};
     d.Width = (UINT)w;
     d.Height = (UINT)h;
     d.MipLevels = 1;
     d.ArraySize = 1;
-    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.Format = packed ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT;
     d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;  // convert draws into it
@@ -410,7 +445,7 @@ static const char* kConvertHLSL = R"(
 Texture2D<float>  texY  : register(t0);
 Texture2D<float2> texUV : register(t1);
 SamplerState samp : register(s0);
-cbuffer Params : register(b0) { float uFullRange; float uMatrix; float2 _pad; };
+cbuffer Params : register(b0) { float uFullRange; float uMatrix; float uScale; float _pad; };
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 VSOut vsMain(uint vid : SV_VertexID) {
     VSOut o;
@@ -440,10 +475,20 @@ float4 psMain(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         rgb = float3(yb + 1.5748 * vb, yb - 0.1873 * ub - 0.4681 * vb, yb + 1.8556 * ub);
     return float4(saturate(rgb), 1.0);
 }
+// MEDIAPLAYER_ZEROCOPY_10BIT: unpack only — Y in .r, Cb in .g, Cr in .b, chroma upsampled
+// bilinear as the renderer samples a CPU P016 frame. No range expand, no matrix: the
+// renderer's shader (sbs.frag mode 3) does both, then the grade and the HDR tone map, the
+// same as for the CPU path. uScale turns a P010 sample (code x 64 / 65535) into code / 1023,
+// so the 10-bit target stores the source code exactly; 1.0 for an 8-bit NV12 surface.
+float4 psPack(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float y = texY.Sample(samp, uv).r;
+    float2 c = texUV.Sample(samp, uv).rg;
+    return float4(saturate(float3(y, c) * uScale), 1.0);
+}
 )";
 
 bool CompileConvertShaders(ID3D11Device* device, ID3D11VertexShader** outVS,
-                           ID3D11PixelShader** outPS) {
+                           ID3D11PixelShader** outPS, ID3D11PixelShader** outPackPS) {
     const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
     ID3DBlob* vsb = nullptr;
     ID3DBlob* psb = nullptr;
@@ -462,13 +507,25 @@ bool CompileConvertShaders(ID3D11Device* device, ID3D11VertexShader** outVS,
         vsb->Release();
         return false;
     }
+    ID3DBlob* pkb = nullptr;
+    if (FAILED(D3DCompile(kConvertHLSL, len, "convert", nullptr, nullptr, "psPack", "ps_5_0",
+                          flags, 0, &pkb, &err))) {
+        if (err) LOG_WARN("pack PS compile: %s", (const char*)err->GetBufferPointer());
+        if (err) err->Release();
+        vsb->Release();
+        psb->Release();
+        return false;
+    }
     const bool ok =
         SUCCEEDED(device->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(),
                                              nullptr, outVS)) &&
         SUCCEEDED(device->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(),
-                                            nullptr, outPS));
+                                            nullptr, outPS)) &&
+        SUCCEEDED(device->CreatePixelShader(pkb->GetBufferPointer(), pkb->GetBufferSize(),
+                                            nullptr, outPackPS));
     vsb->Release();
     psb->Release();
+    pkb->Release();
     return ok;
 }
 } // namespace
@@ -858,28 +915,43 @@ void VideoDecoder::DecodeLoop() {
         // slot's shared RGBA texture) and hand the renderer that handle — Vulkan imports a plain
         // single-plane RGBA image (no multiplanar plane-alignment mismatch). Skips the CPU
         // download/convert/upload. Any failure disables interop and falls through to the CPU path.
-        // Only an 8-bit NV12 surface: the convert pass reads NV12 planes into an 8-bit RGBA
-        // target, so a 10-bit (P010) decode takes the CPU path, which keeps 16 bits (#140).
+        // By default only an 8-bit SDR NV12 surface: the convert pass reads NV12 planes into an
+        // 8-bit RGBA target, so a 10-bit (P010) decode takes the CPU path, which keeps 16 bits
+        // (#140). MEDIAPLAYER_ZEROCOPY_10BIT adds the packed path: P010 (and an 8-bit HDR NV12)
+        // is unpacked to Y'CbCr in a 10-bit R10G10B10A2 texture, and the renderer does the
+        // range, matrix, grade and tone map exactly as for the CPU frame (sbs.frag mode 3).
         const AVHWFramesContext* hwFrames =
             f->hw_frames_ctx ? reinterpret_cast<const AVHWFramesContext*>(f->hw_frames_ctx->data) : nullptr;
-        if (interopActive_ && hwFrames && hwFrames->sw_format != AV_PIX_FMT_NV12 && !warnedZeroCopyFormat_) {
-            LOG_INFO("VideoDecoder: %s surfaces: zero-copy is 8-bit NV12 only, using the CPU path",
-                     av_get_pix_fmt_name(hwFrames->sw_format));
+        const AVPixelFormat swFmt = hwFrames ? hwFrames->sw_format : AV_PIX_FMT_NONE;
+        // An HLG / PQ frame takes the CPU path too (#169) unless packed: the convert pass hands
+        // over SDR RGBA, which carries no transfer, so Pro's tone map would be skipped (an 8-bit
+        // HDR stream showed as raw signal). The base player shows the same pixels either way.
+        const bool hdrFrame = TransferOf(f, impl_->codec) != ColorTransfer::SDR;
+        const bool packed = zeroCopy10Bit_ && (swFmt == AV_PIX_FMT_P010 || (swFmt == AV_PIX_FMT_NV12 && hdrFrame));
+        const bool tenBit = packed && swFmt == AV_PIX_FMT_P010;
+        if (interopActive_ && hwFrames && !packed && swFmt != AV_PIX_FMT_NV12 && !warnedZeroCopyFormat_) {
+            LOG_INFO("VideoDecoder: %s surfaces: zero-copy is 8-bit NV12 only%s, using the CPU path",
+                     av_get_pix_fmt_name(swFmt),
+                     swFmt == AV_PIX_FMT_P010 ? " (MEDIAPLAYER_ZEROCOPY_10BIT=1 adds P010)" : "");
             warnedZeroCopyFormat_ = true;
         }
-        // An HLG / PQ frame takes the CPU path too (#169): the convert pass hands over SDR RGBA,
-        // which carries no transfer, so Pro's tone map would be skipped (an 8-bit HDR stream
-        // showed as raw signal). The base player shows the same pixels either way.
-        const bool hdrFrame = TransferOf(f, impl_->codec) != ColorTransfer::SDR;
-        if (interopActive_ && hdrFrame && !warnedZeroCopyHdr_) {
+        if (interopActive_ && hdrFrame && !packed && !warnedZeroCopyHdr_) {
             LOG_INFO("VideoDecoder: HDR stream: zero-copy hands over SDR RGBA, using the CPU path");
             warnedZeroCopyHdr_ = true;
         }
-        if (interopActive_ && !hdrFrame && impl_->hwPixFmt != AV_PIX_FMT_NONE && f->format == impl_->hwPixFmt &&
-            hwFrames && hwFrames->sw_format == AV_PIX_FMT_NV12 && impl_->d3dContext && impl_->d3dHwctx) {
+        if (interopActive_ && packed && !loggedZeroCopyPacked_) {
+            LOG_INFO("VideoDecoder: zero-copy 10-bit path: %s%s surfaces -> packed Y'CbCr R10G10B10A2",
+                     av_get_pix_fmt_name(swFmt), hdrFrame ? " HDR" : "");
+            loggedZeroCopyPacked_ = true;
+        }
+        if (interopActive_ && (packed || !hdrFrame) && impl_->hwPixFmt != AV_PIX_FMT_NONE &&
+            f->format == impl_->hwPixFmt && hwFrames && (packed || swFmt == AV_PIX_FMT_NV12) &&
+            impl_->d3dContext && impl_->d3dHwctx) {
             FrameRing::Frame& dst = ring_.WriteBuffer();
-            // (Re)create this slot's shared RGBA texture on first use or a size change.
-            if (dst.gpuSharedTexture && (dst.width != f->width || dst.height != f->height)) {
+            // (Re)create this slot's shared texture on first use, a size change or a change
+            // between the RGBA and the packed Y'CbCr format.
+            if (dst.gpuSharedTexture &&
+                (dst.width != f->width || dst.height != f->height || dst.gpuPackedYuv != packed)) {
                 reinterpret_cast<ID3D11Texture2D*>(dst.gpuSharedTexture)->Release();
                 dst.gpuSharedTexture = nullptr;  // KMT handle freed by the Release, not closed
                 dst.gpuSharedHandle = nullptr;
@@ -887,9 +959,10 @@ void VideoDecoder::DecodeLoop() {
             if (!dst.gpuSharedTexture) {
                 ID3D11Texture2D* t = nullptr;
                 void* hnd = nullptr;
-                if (CreateSharedRGBA(impl_->d3dDevice, f->width, f->height, &t, &hnd)) {
+                if (CreateSharedRGBA(impl_->d3dDevice, f->width, f->height, &t, &hnd, packed)) {
                     dst.gpuSharedTexture = t;
                     dst.gpuSharedHandle = hnd;
+                    dst.gpuPackedYuv = packed;
                 } else {
                     LOG_WARN("VideoDecoder: shared RGBA create failed — disabling zero-copy");
                     interopActive_ = false;
@@ -897,7 +970,7 @@ void VideoDecoder::DecodeLoop() {
             }
             // Lazily build the convert pass (shaders/sampler/raster/cbuffer), once.
             if (interopActive_ && !impl_->convVS) {
-                if (!CompileConvertShaders(impl_->d3dDevice, &impl_->convVS, &impl_->convPS)) {
+                if (!CompileConvertShaders(impl_->d3dDevice, &impl_->convVS, &impl_->convPS, &impl_->packPS)) {
                     LOG_WARN("VideoDecoder: convert-shader build failed — disabling zero-copy");
                     interopActive_ = false;
                 } else {
@@ -911,38 +984,42 @@ void VideoDecoder::DecodeLoop() {
                     rd.CullMode = D3D11_CULL_NONE;
                     impl_->d3dDevice->CreateRasterizerState(&rd, &impl_->convRaster);
                     D3D11_BUFFER_DESC bd = {};
-                    bd.ByteWidth = 16;  // { float fullRange; float matrix; float2 pad; }
+                    bd.ByteWidth = 16;  // { float fullRange; float matrix; float scale; float pad; }
                     bd.Usage = D3D11_USAGE_DEFAULT;
                     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
                     impl_->d3dDevice->CreateBuffer(&bd, nullptr, &impl_->convCB);
                 }
             }
-            // (Re)create the SRV-able NV12 intermediate + its plane SRVs on size change.
-            if (interopActive_ && (impl_->convW != f->width || impl_->convH != f->height)) {
+            // (Re)create the SRV-able intermediate + its plane SRVs on a size or format change
+            // (NV12: R8 / R8G8 planes; P010: R16 / R16G16, the 10 bits MSB-aligned).
+            const DXGI_FORMAT interFmt = tenBit ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
+            if (interopActive_ &&
+                (impl_->convW != f->width || impl_->convH != f->height || impl_->convFmt != interFmt)) {
                 if (impl_->srvUV) { impl_->srvUV->Release(); impl_->srvUV = nullptr; }
                 if (impl_->srvY) { impl_->srvY->Release(); impl_->srvY = nullptr; }
                 if (impl_->nv12Intermediate) { impl_->nv12Intermediate->Release(); impl_->nv12Intermediate = nullptr; }
                 D3D11_TEXTURE2D_DESC nd = {};
                 nd.Width = (UINT)f->width; nd.Height = (UINT)f->height;
-                nd.MipLevels = 1; nd.ArraySize = 1; nd.Format = DXGI_FORMAT_NV12;
+                nd.MipLevels = 1; nd.ArraySize = 1; nd.Format = interFmt;
                 nd.SampleDesc.Count = 1; nd.Usage = D3D11_USAGE_DEFAULT;
                 nd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
                 bool ok = SUCCEEDED(impl_->d3dDevice->CreateTexture2D(&nd, nullptr, &impl_->nv12Intermediate));
                 if (ok) {
                     D3D11_SHADER_RESOURCE_VIEW_DESC yv = {};
-                    yv.Format = DXGI_FORMAT_R8_UNORM;  // plane 0 (Y)
+                    yv.Format = tenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;  // plane 0 (Y)
                     yv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
                     yv.Texture2D.MipLevels = 1;
                     ok = SUCCEEDED(impl_->d3dDevice->CreateShaderResourceView(
                              impl_->nv12Intermediate, &yv, &impl_->srvY));
                     D3D11_SHADER_RESOURCE_VIEW_DESC uv = yv;
-                    uv.Format = DXGI_FORMAT_R8G8_UNORM;  // plane 1 (interleaved UV, half-res)
+                    uv.Format = tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM;  // plane 1 (UV, half-res)
                     ok = ok && SUCCEEDED(impl_->d3dDevice->CreateShaderResourceView(
                                    impl_->nv12Intermediate, &uv, &impl_->srvUV));
                 }
-                if (ok) { impl_->convW = f->width; impl_->convH = f->height; }
+                if (ok) { impl_->convW = f->width; impl_->convH = f->height; impl_->convFmt = interFmt; }
                 else {
-                    LOG_WARN("VideoDecoder: NV12 intermediate/SRV create failed — disabling zero-copy");
+                    LOG_WARN("VideoDecoder: %s intermediate/SRV create failed — disabling zero-copy",
+                             tenBit ? "P010" : "NV12");
                     interopActive_ = false;
                 }
             }
@@ -953,24 +1030,71 @@ void VideoDecoder::DecodeLoop() {
                 ID3D11DeviceContext* ctx = impl_->d3dContext;
                 D3D11_BOX box = {0, 0, 0, (UINT)f->width, (UINT)f->height, 1};
                 impl_->d3dHwctx->lock(impl_->d3dHwctx->lock_ctx);
-                if (!impl_->copyDoneQuery) {
+                // MEDIAPLAYER_ZEROCOPY_FENCE: build the two shared fences once per open; any
+                // failure leaves them null and this open keeps the CPU wait below.
+                if (zeroCopyFence_ && !impl_->fenceTried) {
+                    impl_->fenceTried = true;
+                    ID3D11Device5* dev5 = nullptr;
+                    bool ok = SUCCEEDED(impl_->d3dDevice->QueryInterface(__uuidof(ID3D11Device5), (void**)&dev5)) &&
+                              SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void**)&impl_->ctx4));
+                    ok = ok && SUCCEEDED(dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
+                                                           (void**)&impl_->readyFence)) &&
+                         SUCCEEDED(dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
+                                                     (void**)&impl_->readFence)) &&
+                         SUCCEEDED(impl_->readyFence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr,
+                                                                         &impl_->readyFenceHandle)) &&
+                         SUCCEEDED(impl_->readFence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr,
+                                                                        &impl_->readFenceHandle));
+                    if (dev5) dev5->Release();
+                    if (ok) {
+                        impl_->fenceGen = fenceGen_.fetch_add(1) + 1;
+                        LOG_INFO("VideoDecoder: zero-copy fence ON (MEDIAPLAYER_ZEROCOPY_FENCE): shared D3D11 "
+                                 "fences, no CPU wait per frame");
+                    } else {
+                        LOG_WARN("VideoDecoder: MEDIAPLAYER_ZEROCOPY_FENCE: shared fence create failed — "
+                                 "keeping the CPU wait");
+                        if (impl_->ctx4) { impl_->ctx4->Release(); impl_->ctx4 = nullptr; }
+                        if (impl_->readyFence) { impl_->readyFence->Release(); impl_->readyFence = nullptr; }
+                        if (impl_->readFence) { impl_->readFence->Release(); impl_->readFence = nullptr; }
+                        if (impl_->readyFenceHandle) { CloseHandle(impl_->readyFenceHandle); impl_->readyFenceHandle = nullptr; }
+                        if (impl_->readFenceHandle) { CloseHandle(impl_->readFenceHandle); impl_->readFenceHandle = nullptr; }
+                    }
+                }
+                const bool fenced = impl_->readyFenceHandle && impl_->readFenceHandle && impl_->ctx4;
+                if (fenced) {
+                    // Don't overwrite this texture before the renderer's frames that read it
+                    // are done: a GPU-side wait, the CPU goes on.
+                    uint64_t readValue = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(sharedReadMutex_);
+                        // Only a value on THIS open's fence: another open's would never come.
+                        for (const auto& r : sharedRead_)
+                            if (r.texture == dst.gpuSharedHandle && r.gen == impl_->fenceGen)
+                                readValue = r.value;
+                    }
+                    if (readValue) impl_->ctx4->Wait(impl_->readFence, readValue);
+                }
+                if (!fenced && !impl_->copyDoneQuery) {
                     D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
                     impl_->d3dDevice->CreateQuery(&qd, &impl_->copyDoneQuery);
                 }
-                // 1) Decoder slice -> SRV-able NV12 intermediate.
+                // 1) Decoder slice -> SRV-able NV12 / P010 intermediate.
                 ctx->CopySubresourceRegion(impl_->nv12Intermediate, 0, 0, 0, 0, decoderTex, slice, &box);
-                // 2) Fullscreen NV12->RGB draw into the shared RGBA texture.
+                // 2) Fullscreen NV12->RGB draw into the shared RGBA texture, or (packed) the
+                //    Y'CbCr unpack into the shared R10G10B10A2 texture.
                 ID3D11RenderTargetView* rtv = nullptr;
                 if (SUCCEEDED(impl_->d3dDevice->CreateRenderTargetView(rgba, nullptr, &rtv))) {
                     const float full = (f->color_range == AVCOL_RANGE_JPEG) ? 1.0f : 0.0f;
-                    float cb[4] = {full, (float)(int)MatrixOf(f, impl_->codec), 0, 0};
+                    // P010 sample = code x 64 / 65535 -> code / 1023 in the 10-bit target.
+                    const float scale = tenBit ? 65535.0f / (64.0f * 1023.0f) : 1.0f;
+                    float cb[4] = {full, (float)(int)MatrixOf(f, impl_->codec), scale, 0};
                     ctx->UpdateSubresource(impl_->convCB, 0, nullptr, cb, 0, 0);
                     D3D11_VIEWPORT vp = {0, 0, (float)f->width, (float)f->height, 0, 1};
                     ID3D11ShaderResourceView* srvs[2] = {impl_->srvY, impl_->srvUV};
                     ctx->IASetInputLayout(nullptr);
                     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     ctx->VSSetShader(impl_->convVS, nullptr, 0);
-                    ctx->PSSetShader(impl_->convPS, nullptr, 0);
+                    ctx->PSSetShader(packed ? impl_->packPS : impl_->convPS, nullptr, 0);
                     ctx->PSSetShaderResources(0, 2, srvs);
                     ctx->PSSetSamplers(0, 1, &impl_->convSampler);
                     ctx->PSSetConstantBuffers(0, 1, &impl_->convCB);
@@ -985,11 +1109,13 @@ void VideoDecoder::DecodeLoop() {
                     ctx->OMSetRenderTargets(1, &nullRtv, nullptr);
                     rtv->Release();
                 }
-                if (impl_->copyDoneQuery) ctx->End(impl_->copyDoneQuery);
+                if (fenced) impl_->ctx4->Signal(impl_->readyFence, ++impl_->readyValue);
+                else if (impl_->copyDoneQuery) ctx->End(impl_->copyDoneQuery);
                 ctx->Flush();
                 // Block until the GPU finishes, so the published frame's memory is coherent for
-                // the Vulkan sample (which happens later, on the render thread).
-                if (impl_->copyDoneQuery) {
+                // the Vulkan sample (which happens later, on the render thread). Fenced: the
+                // renderer's GPU waits readyFence instead.
+                if (!fenced && impl_->copyDoneQuery) {
                     BOOL done = FALSE;
                     for (int i = 0; i < 2000; ++i) {  // ~100ms cap; a wedged GPU can't hang us
                         if (ctx->GetData(impl_->copyDoneQuery, &done, sizeof(done), 0) == S_OK)
@@ -1004,6 +1130,14 @@ void VideoDecoder::DecodeLoop() {
                 dst.format = PixFormat::RGBA;  // convert already did YUV->RGB + range expand
                 dst.fullRange = false;
                 dst.gpu = true;
+                if (packed) {  // the renderer range-expands + converts (sbs.frag mode 3)
+                    dst.fullRange = f->color_range == AVCOL_RANGE_JPEG;
+                    dst.gpuPacked10 = tenBit;
+                }
+                dst.gpuFenceValue = fenced ? impl_->readyValue : 0;
+                dst.gpuReadyFence = fenced ? impl_->readyFenceHandle : nullptr;
+                dst.gpuReadFence = fenced ? impl_->readFenceHandle : nullptr;
+                dst.gpuFenceGen = fenced ? impl_->fenceGen : 0;
                 dst.matrix = MatrixOf(f, impl_->codec);  // (applied above; the tag is for the UI / tools)
                 dst.transfer = TransferOf(f, impl_->codec);
                 dst.primaries2020 = PrimariesAre2020(f, impl_->codec);
@@ -1500,6 +1634,16 @@ void VideoDecoder::Stop() {
         }
         b.gpuSharedHandle = nullptr;  // KMT handle owned by the texture (freed by Release above)
         b.gpu = false;
+        b.gpuPackedYuv = false;
+        b.gpuPacked10 = false;
+        b.gpuFenceValue = 0;
+        b.gpuReadyFence = nullptr;
+        b.gpuReadFence = nullptr;
+        b.gpuFenceGen = 0;
+    }
+    {
+        std::lock_guard<std::mutex> lk(sharedReadMutex_);
+        sharedRead_.clear();
     }
 #endif
     impl_.reset();

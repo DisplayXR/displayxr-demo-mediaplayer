@@ -363,6 +363,12 @@ bool App::Initialize(const char* mediaPath) {
         LOG_ERROR("Vulkan renderer initialization failed");
         return false;
     }
+#if defined(_WIN32)
+    // MEDIAPLAYER_ZEROCOPY_FENCE: each fenced read goes straight back to the decoder, so its
+    // next fill of that texture GPU-waits our frames rather than overwriting them.
+    renderer_.SetSharedReadSink(
+        [this](void* tex, uint64_t gen, uint64_t value) { video_.NoteSharedRead(tex, gen, value); });
+#endif
     // Transparent-background experiment: when the session was created with it, clear
     // the letterbox to alpha 0 so the runtime composes those pixels through.
     renderer_.SetTransparentLetterbox(xr_.TransparentBackground());
@@ -1069,9 +1075,22 @@ void App::RenderOneFrame() {
             // Zero-copy (#28): a GPU frame carries a shared RGBA texture handle (the producer
             // converted NV12->RGBA on the D3D side) — bind it directly. Falls back to the CPU
             // upload if the import fails.
-            if (!bound && vf->gpu && vf->gpuSharedHandle)
+            // MEDIAPLAYER_ZEROCOPY_10BIT: a packed Y'CbCr texture carries its range / matrix and
+            // takes the HDR tags below, as a CPU frame does.
+            bool packedBound = false;
+            if (!bound && vf->gpu && vf->gpuSharedHandle) {
                 bound = renderer_.BindSharedRGBA(vf->gpuSharedHandle, (uint32_t)vf->width,
-                                                 (uint32_t)vf->height);
+                                                 (uint32_t)vf->height, vf->gpuPackedYuv, vf->gpuPacked10,
+                                                 vf->fullRange, (int)vf->matrix);
+                packedBound = bound && vf->gpuPackedYuv;
+                // MEDIAPLAYER_ZEROCOPY_FENCE: the producer did not CPU-wait this frame; our GPU
+                // waits its ready fence instead.
+                if (bound && vf->gpuFenceValue)
+                    renderer_.SetSharedFence(vf->gpuReadyFence, vf->gpuReadFence, vf->gpuFenceGen,
+                                             vf->gpuFenceValue);
+            }
+#else
+            const bool packedBound = false;
 #endif
             if (bound && staged) renderer_.CancelStagedFrame();  // (cannot happen: see stageNow)
             if (!bound) {
@@ -1087,15 +1106,19 @@ void App::RenderOneFrame() {
                                         (uint32_t)vf->height,
                                         i420 ? 0 : vf->format == PixFormat::P016 ? 2 : 1, vf->fullRange,
                                         (int)vf->matrix);  // the frame's colour tag (BT.709 default)
+            }
 #if MEDIAPLAYER_PRO
+            if (!bound || packedBound) {
                 // HDR (#134): the shader maps HLG / PQ / scene-linear EXR to the SDR panel. A
                 // live source tags HDR but not primaries; HDR on the BT.2020 matrix is BT.2020.
                 const bool hdr = vf->transfer == ColorTransfer::HLG || vf->transfer == ColorTransfer::PQ;
                 renderer_.SetSourceHdr((int)vf->transfer,
                                        vf->primaries2020 || (hdr && vf->matrix == ColorMatrix::BT2020),
                                        vf->peakNits);
-#endif
             }
+#else
+            (void)packedBound;
+#endif
         }
         renderer_.NoteStage(RenderStage::Upload, StageMs(upload0) - nestedMs);
     }
@@ -2034,6 +2057,13 @@ bool App::LoadMediaFile(const std::string& path) {
         const char* zc = std::getenv("MEDIAPLAYER_ZEROCOPY");
         if (zc && *zc && *zc != '0' && xr_.ZeroCopyCapable() && xr_.DeviceLUIDValid())
             video_.SetInteropAdapterLUID(xr_.DeviceLUID());
+        // MEDIAPLAYER_ZEROCOPY_10BIT=1 (with MEDIAPLAYER_ZEROCOPY=1): P010 and 8-bit HDR surfaces
+        // go zero-copy too, as packed Y'CbCr the renderer converts; off = the CPU path for them.
+        const char* zc10 = std::getenv("MEDIAPLAYER_ZEROCOPY_10BIT");
+        video_.SetZeroCopy10Bit(zc10 && *zc10 && *zc10 != '0');
+        // MEDIAPLAYER_ZEROCOPY_FENCE=1: order the zero-copy frame with shared D3D11 fences on
+        // the GPU (the device was made with timeline semaphores for it) instead of CPU waits.
+        video_.SetZeroCopyFence(xr_.ZeroCopyFenceCapable());
 #endif
         // Probe BEFORE opening for playback: a bounded, software-only pre-roll on its own
         // context. See VideoStereoProbe.h for why this is synchronous rather than

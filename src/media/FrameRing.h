@@ -108,6 +108,20 @@ public:
         bool gpu = false;
         void* gpuSharedTexture = nullptr;  // ID3D11Texture2D* (per-slot, decoder-owned)
         void* gpuSharedHandle = nullptr;   // legacy KMT shared handle for Vulkan import
+        // MEDIAPLAYER_ZEROCOPY_10BIT: the shared texture is R10G10B10A2 holding Y'CbCr (.r Y,
+        // .g Cb, .b Cr), not RGB; fullRange / matrix / transfer describe it and the renderer
+        // converts (sbs.frag mode 3). gpuPacked10: the codes are 10-bit (P010), else 8-bit.
+        bool gpuPackedYuv = false;
+        bool gpuPacked10 = false;
+        // MEDIAPLAYER_ZEROCOPY_FENCE: the producer signalled gpuReadyFence (a shared D3D11
+        // fence, NT handle, decoder-owned) to gpuFenceValue after filling the texture, and did
+        // NOT CPU-wait it; the renderer's GPU waits it. gpuReadFence is the fence the renderer
+        // signals once its frames have read the texture (VideoDecoder::NoteSharedRead).
+        // gpuFenceValue 0 = no fence: the producer CPU-waited (the default).
+        uint64_t gpuFenceValue = 0;
+        uint64_t gpuFenceGen = 0;  // which fence pair (one per open that made one); never reused
+        void* gpuReadyFence = nullptr;
+        void* gpuReadFence = nullptr;
     };
 
     static constexpr int kBufferCount = 3;  // slots the latest-wins mode uses (the decoder's GPU slots)

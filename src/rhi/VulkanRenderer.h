@@ -40,6 +40,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 #include "media/FrameRing.h"
@@ -269,7 +270,22 @@ public:
     // (cached per handle) and its two planes bound as Y (R8) + UV (R8G8); DrawViews syncs
     // the D3D11 producer copy against the sample with a keyed mutex. Returns false (caller
     // falls back to UploadYUV) on any import failure.
-    bool BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t height);
+    // packedYuv (MEDIAPLAYER_ZEROCOPY_10BIT): the texture is R10G10B10A2 Y'CbCr, sampled as
+    // mode 3 with the frame's range / matrix (tenBit: 10-bit codes, the P016 levels) so the
+    // grade and SetSourceHdr's tone map apply as for a CPU frame.
+    bool BindSharedRGBA(void* sharedHandle, uint32_t width, uint32_t height, bool packedYuv = false,
+                        bool tenBit = false, bool fullRange = false, int matrix = 0);
+    // MEDIAPLAYER_ZEROCOPY_FENCE, after BindSharedRGBA: the bound texture is ready once the
+    // producer's shared D3D11 fence `readyFence` reaches `value` (it did not CPU-wait); our
+    // frame GPU-waits that, and signals `readFence` when done instead of draining the ring.
+    // The pair is imported once per generation `gen`. Returns false if it cannot be used.
+    bool SetSharedFence(void* readyFence, void* readFence, uint64_t gen, uint64_t value);
+    // Told, inside SubmitFrame, of each fenced read of a shared texture (texture handle, fence
+    // generation, read value) - for VideoDecoder::NoteSharedRead. It must reach the producer
+    // before the frame's ring slot is handed back, hence a call from SubmitFrame itself.
+    void SetSharedReadSink(std::function<void(void*, uint64_t, uint64_t)> sink) {
+        sharedReadSink_ = std::move(sink);
+    }
     // Release all imported shared textures (call on media change / shutdown).
     void ClearSharedImports();
 #endif
@@ -507,8 +523,10 @@ private:
     struct SharedImport {
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;       // single R8G8B8A8 color view
+        VkImageView view = VK_NULL_HANDLE;       // single R8G8B8A8 (or A2B10G10R10, packed) view
         bool layoutReady = false;                // acquired UNDEFINED->GENERAL once
+        uint32_t width = 0, height = 0;          // what was imported: a reused KMT handle value
+        VkFormat format = VK_FORMAT_UNDEFINED;   // with other dims / format is re-imported
     };
     std::vector<std::pair<void*, SharedImport>> imports_;  // keyed by shared handle
     bool sharedActive_ = false;                // current frame is a shared RGBA texture
@@ -521,7 +539,26 @@ private:
     // soon as we move on, so SubmitFrame() keeps that path frame-synchronous (drains
     // the ring) exactly as before — the frame ring buys nothing there that is safe.
     bool sharedSampledThisFrame_ = false;
-    SharedImport* ImportSharedRGBA(void* handle, uint32_t w, uint32_t h);
+    SharedImport* ImportSharedRGBA(void* handle, uint32_t w, uint32_t h, VkFormat format);
+    // MEDIAPLAYER_ZEROCOPY_FENCE: the producer's fence pair as timeline semaphores, plus a
+    // binary semaphore bridging the timeline wait into the frame ring's single submit (its
+    // endFrame takes plain wait semaphores, no timeline values).
+    struct FenceImport {
+        uint64_t gen = 0;
+        VkSemaphore ready = VK_NULL_HANDLE;   // producer signals, we wait
+        VkSemaphore read = VK_NULL_HANDLE;    // we signal, producer waits
+        uint64_t readValue = 0;               // last value we signalled on `read`
+    } zcFence_;
+    VkSemaphore zcBridge_ = VK_NULL_HANDLE;
+    void* boundSharedHandle_ = nullptr;   // the bound texture's KMT handle
+    bool fenceBound_ = false;             // the bound frame came with a fence
+    uint64_t fenceWaitValue_ = 0;         // ...and this ready value
+    std::function<void(void*, uint64_t, uint64_t)> sharedReadSink_;
+    bool fenceFailed_ = false;            // a submit / import failed: logged, back to the drain
+    // ClearSharedImports while a frame is open (a file opened from the UI, mid-frame): that
+    // frame's command buffer already samples an import, so the teardown waits for its submit.
+    bool clearAfterSubmit_ = false;
+    void DestroyFenceImport();
 #endif
     // Pro grade: the 3D LUT at binding 3, or a 1x1x1 dummy when none is loaded.
     GradeParams grade_{};

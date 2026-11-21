@@ -276,6 +276,8 @@ public:
     // VK_KHR_external_memory_win32; deviceLUID (when valid) pins the D3D11 decode device to
     // the same adapter. Both are false/invalid off-Windows or on drivers lacking interop.
     bool ZeroCopyCapable() const { return zeroCopyCapable_; }
+    // MEDIAPLAYER_ZEROCOPY_FENCE was set and the device has external timeline semaphores.
+    bool ZeroCopyFenceCapable() const { return zeroCopyFenceCapable_; }
     bool DeviceLUIDValid() const { return deviceLUIDValid_; }
     const uint8_t* DeviceLUID() const { return deviceLUID_; }  // VK_LUID_SIZE bytes
 
@@ -471,6 +473,7 @@ private:
 
     // Zero-copy decode interop (issue #28); Windows-only, off elsewhere.
     bool zeroCopyCapable_ = false;
+    bool zeroCopyFenceCapable_ = false;
     bool deviceLUIDValid_ = false;
     uint8_t deviceLUID_[VK_LUID_SIZE] = {};
 };

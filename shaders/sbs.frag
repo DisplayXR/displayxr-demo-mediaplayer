@@ -36,7 +36,8 @@ layout(binding = 7) uniform sampler3D calLut;  // per-panel display calibration 
 layout(push_constant) uniform PushConstants {
     vec2 uvOffset;
     vec2 uvScale;
-    int mode;        // bits 0-1: 0 = RGBA, 1 = I420, 2 = NV12. MP_GRADE: bits 2 / 3 = A / B is
+    int mode;        // bits 0-1: 0 = RGBA, 1 = I420, 2 = NV12, 3 = packed Y'CbCr in plane0's .rgb
+                     // (MP_GRADE, MEDIAPLAYER_ZEROCOPY_10BIT). MP_GRADE: bits 2 / 3 = A / B is
                      // scene-linear EXR kept above white into the grade (#169); bits 8+ = VR flags (#155)
     float fullRange; // 1 = full/JPEG range, 0 = limited/MPEG range
     float srgbTarget;// 1 = the colour attachment is an _SRGB view (encodes on store)
@@ -101,13 +102,29 @@ int SrcMode() { return pc.mode & 3; }
 vec3 SampleSource(vec2 uv) {
     if (SrcMode() == 0) return texture(plane0, uv).rgb;
 
-    float y = texture(plane0, uv).r;
-    float u, v;
-    if (SrcMode() == 2) {          // NV12: chroma interleaved in .rg
+    float y, u, v;
+    if (SrcMode() == 3) {          // packed Y'CbCr (zero-copy 10-bit): Y .r, Cb .g, Cr .b
+        vec3 p = texture(plane0, uv).rgb;
+        y = p.r;
+        u = p.g;
+        v = p.b;
+#ifdef MP_GRADE
+        // 10-bit codes stored as code / 1023: rescale to the P016 sample (code x 64 / 65535),
+        // so the 10-bit branch below and the CPU P016 frame see the same numbers.
+        if (pc.lutDomain.w > 0.5) {
+            const float k = 1023.0 * 64.0 / 65535.0;
+            y *= k;
+            u *= k;
+            v *= k;
+        }
+#endif
+    } else if (SrcMode() == 2) {   // NV12: chroma interleaved in .rg
+        y = texture(plane0, uv).r;
         vec2 c = texture(plane1, uv).rg;
         u = c.r;
         v = c.g;
     } else {                       // I420: separate U and V planes
+        y = texture(plane0, uv).r;
         u = texture(plane1, uv).r;
         v = texture(plane2, uv).r;
     }
