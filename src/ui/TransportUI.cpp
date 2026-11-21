@@ -9,6 +9,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "imgui.h"
@@ -687,6 +688,115 @@ void TouchChrome(TransportState& s, const TransportActions& a, float W, float H)
 }
 }  // namespace
 
+namespace {
+// The projection picker's rows (caps.projection), shared by the "..." submenu and the bar
+// button's popup; the fisheye lens FOV slider follows while fisheye is in force.
+void ProjectionItems(TransportState& s, const TransportActions& a) {
+    for (int i = 0; i < (int)s.projectionRows.size(); ++i) {
+        ImGui::PushID(i);
+        if (ImGui::MenuItem(s.projectionRows[i].c_str(), i == 0 && !s.projectionKey.empty() ? s.projectionKey.c_str() : nullptr,
+                            i == s.projectionCurrent) &&
+            i != s.projectionCurrent && a.SelectProjection)
+            a.SelectProjection(i);
+        ImGui::PopID();
+    }
+    if (s.fisheyeFovShown) {
+        ImGui::Separator();
+        ImGui::TextDisabled("Fisheye lens FOV");
+        float fov = s.fisheyeFovDeg;
+        ImGui::SetNextItemWidth(Px(220.0f));
+        if (ImGui::SliderFloat("##fisheye_fov", &fov, 90.0f, 250.0f, "%.0f deg", ImGuiSliderFlags_AlwaysClamp) &&
+            a.SetFisheyeFov)
+            a.SetFisheyeFov(fov);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The camera lens's field of view (180 for most VR180 cameras)");
+    }
+}
+
+// The shortcuts panel (caps.help): centred, two columns of sections, drawn at full alpha
+// over the faded chrome so it stays readable while open. Esc / F1 / ? or its cross close it.
+void HelpPanel(TransportState& s, float W, float H) {
+    if (!s.helpOpen || s.helpRows.empty()) return;
+    const ImGuiStyle& st = ImGui::GetStyle();
+    ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(W - Px(32.0f), H - Px(32.0f)));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.06f, 0.08f, 0.92f));
+    // A scrollbar (and the wheel) only when the window is too small for the whole list.
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                                   ImGuiWindowFlags_AlwaysAutoResize;
+    if (ImGui::Begin("##help_panel", nullptr, flags)) {
+        // Split at the section boundary nearest the middle, so neither column runs long.
+        const int n = (int)s.helpRows.size();
+        int split = n;
+        for (int i = 1, best = n; i < n; ++i) {
+            if (!s.helpRows[i].first.empty()) continue;
+            if (std::abs(n - 2 * i) < best) best = std::abs(n - 2 * i), split = i;
+        }
+        // The rows in the browser's body size (desktop): the list is long. Null = the UI font.
+        ImGui::PushFont(DeskFont(DeskText::Body));
+        auto keyWidth = [&](int from, int to) {
+            float w = 0.0f;
+            for (int i = from; i < to; ++i)
+                if (!s.helpRows[i].first.empty()) w = std::max(w, ImGui::CalcTextSize(s.helpRows[i].first.c_str()).x);
+            return w + st.ItemSpacing.x * 2.0f;
+        };
+        auto columnWidth = [&](int from, int to) {
+            float w = 0.0f;
+            for (int i = from; i < to; ++i) w = std::max(w, ImGui::CalcTextSize(s.helpRows[i].second.c_str()).x);
+            return keyWidth(from, to) + w;
+        };
+        // Two columns where they fit side by side, else one that scrolls.
+        const float gap = Px(40.0f);
+        const float twoW = split < n ? columnWidth(0, split) + gap + columnWidth(split, n) : FLT_MAX;
+        const bool two = twoW <= W - Px(32.0f) - st.WindowPadding.x * 2.0f - st.ScrollbarSize;
+        const float contentW = two ? twoW : columnWidth(0, n);
+        ImGui::PopFont();
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Keyboard shortcuts");
+        const float iconSz = ImGui::GetFrameHeight();
+        // The cross at the right edge of the list (not of the window: that would pin its
+        // auto-size to the last frame's width).
+        ImGui::SameLine(std::max(ImGui::GetCursorPosX(), st.WindowPadding.x + contentW - iconSz));
+        if (IconButton("##help_close", Glyph::Close, iconSz)) s.helpOpen = false;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close (Esc)");
+        ImGui::Separator();
+
+        ImGui::PushFont(DeskFont(DeskText::Body));
+        // Plain groups, not tables: a fixed-fit table inside an auto-resizing window has no
+        // width to fit to and collapses its columns.
+        auto column = [&](int from, int to) {
+            const float keyW = keyWidth(from, to);
+            ImGui::BeginGroup();
+            for (int i = from; i < to; ++i) {
+                const auto& row = s.helpRows[i];
+                if (row.first.empty()) {  // a section title, with air above all but the first
+                    if (i != from) ImGui::Dummy(ImVec2(0.0f, st.ItemSpacing.y));
+                    ImGui::TextColored(ImVec4(0.20f, 0.65f, 1.00f, 1.0f), "%s", row.second.c_str());
+                    continue;
+                }
+                const float x = ImGui::GetCursorPosX();
+                ImGui::TextUnformatted(row.first.c_str());
+                ImGui::SameLine(x + keyW);
+                ImGui::TextDisabled("%s", row.second.c_str());
+            }
+            ImGui::EndGroup();
+        };
+        if (two) {
+            column(0, split);
+            ImGui::SameLine(0.0f, gap);
+            column(split, n);
+        } else {
+            column(0, n);
+        }
+        ImGui::PopFont();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+}
+}  // namespace
+
 void BuildTransportUI(TransportState& s, const TransportActions& a) {
     ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
@@ -754,8 +864,10 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             // A narrow window: the buttons that no longer fit before the slideshow icon are
             // left out, from the right. The bar stays one row.
             const ImGuiStyle& bst = ImGui::GetStyle();
-            const float barLimit = ImGui::GetWindowWidth() - bst.WindowPadding.x -
-                                   (s.caps.slideshow ? iconSz + bst.ItemSpacing.x : 0.0f);
+            // The icons at the right end: help, slideshow, full screen (#251).
+            const int rightIcons = (s.caps.help ? 1 : 0) + (s.caps.slideshow ? 1 : 0) + (s.caps.fullscreen ? 1 : 0);
+            const float rightW = rightIcons * (iconSz + bst.ItemSpacing.x);
+            const float barLimit = ImGui::GetWindowWidth() - bst.WindowPadding.x - rightW;
             bool barFull = false;
             auto fits = [&](float w) {
                 if (barFull) return false;
@@ -772,11 +884,13 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 ImGui::SameLine();
                 CameraCombo(s, a);
             }
-            if (s.caps.moreMenu && (s.caps.mode || (s.caps.layout && s.hasMedia) || !s.convertProviders.empty()) &&
+            const bool projectionMenu = s.caps.projection && s.hasMedia && !s.projectionRows.empty();
+            if (s.caps.moreMenu &&
+                (s.caps.mode || (s.caps.layout && s.hasMedia) || projectionMenu || !s.convertProviders.empty()) &&
                 fits(iconSz)) {
                 ImGui::SameLine();
                 if (IconButton("##more", Glyph::More, iconSz, false, s.hitTargetScale)) ImGui::OpenPopup("##more_menu");
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Display mode, layout, 2D->3D converter");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Display mode, layout, projection, 2D->3D converter");
             }
             if (s.caps.moreMenu && ImGui::BeginPopup("##more_menu")) {
                 // Rows that cycle keep the menu open, so a few clicks walk the choices.
@@ -795,6 +909,16 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                         ImGui::SetTooltip("%s\nL cycles: auto / mono / SBS-full / SBS-half / TB-full / TB-half",
                                           s.layoutTooltip.c_str());
                 }
+                // A submenu, not a cycling row: seven stops are too many to walk by clicking.
+                if (projectionMenu) {
+                    char projLabel[96];
+                    std::snprintf(projLabel, sizeof(projLabel), "Projection: %s###projection_sub",
+                                  s.projectionName.c_str());
+                    if (ImGui::BeginMenu(projLabel)) {
+                        ProjectionItems(s, a);
+                        ImGui::EndMenu();
+                    }
+                }
                 if (!s.convertProviders.empty()) {
                     ImGui::Separator();
                     ImGui::TextDisabled("2D->3D converter");
@@ -809,6 +933,25 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                         ImGui::PopID();
                     }
                 }
+                ImGui::EndPopup();
+            }
+            // VR media on screen: the projection on the bar too, so the viewer is found without P.
+            if (s.caps.projection && s.hasMedia && s.projectionOnBar && !s.projectionRows.empty()) {
+                char projBtn[96];
+                std::snprintf(projBtn, sizeof(projBtn), "%s###projection_btn", s.projectionName.c_str());
+                if (fits(buttonW(projBtn) + 1.0f + ImGui::GetFrameHeight())) {
+                    ImGui::SameLine();
+                    bool open = ImGui::Button(projBtn);
+                    bool hovered = ImGui::IsItemHovered();
+                    ImGui::SameLine(0.0f, 1.0f);
+                    open |= ImGui::ArrowButton("##projection_arrow", ImGuiDir_Down);
+                    hovered |= ImGui::IsItemHovered();
+                    if (open) ImGui::OpenPopup("##projection_menu");
+                    if (hovered) ImGui::SetTooltip("Projection%s\nDrag to look around, wheel to zoom", s.projectionKeyHint.c_str());
+                }
+            }
+            if (ImGui::BeginPopup("##projection_menu")) {
+                ProjectionItems(s, a);
                 ImGui::EndPopup();
             }
             if (s.caps.mode && !s.caps.moreMenu) {
@@ -952,9 +1095,7 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                 ImGui::SameLine();
                 // The room left before the slideshow icon: on a narrow window the name is
                 // shortened to fit rather than run under the icon (#252 phase 0 review).
-                const ImGuiStyle& st = ImGui::GetStyle();
-                const float right = ImGui::GetWindowWidth() - st.WindowPadding.x -
-                                    (s.caps.slideshow ? iconSz + st.ItemSpacing.x : 0.0f);
+                const float right = barLimit;
                 const float room = right - ImGui::GetCursorPosX();
                 if (room > ImGui::CalcTextSize("...").x) {
                     const std::string name = FitText(s.mediaFilename, room);
@@ -973,13 +1114,34 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
             // the ones that do not fit are left out above.
             // A window too narrow for even Open beside it leaves the icon out (it would draw
             // over Open's menu arrow).
-            const float slideX = ImGui::GetWindowWidth() - iconSz - ImGui::GetStyle().WindowPadding.x;
-            if (s.caps.slideshow &&
-                ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetStyle().ItemSpacing.x <= slideX) {
-                ImGui::SameLine(slideX);
-                if (IconButton("##slideshow", Glyph::Slideshow, iconSz, s.slideshowActive,
-                               s.hitTargetScale))
-                    Fire(a.ToggleSlideshow);
+            const float rightX = ImGui::GetWindowWidth() - bst.WindowPadding.x - rightW + bst.ItemSpacing.x;
+            if (rightIcons > 0 &&
+                ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + bst.ItemSpacing.x <= rightX) {
+                ImGui::SameLine(rightX);
+                bool first = true;
+                auto next = [&] {
+                    if (!first) ImGui::SameLine();
+                    first = false;
+                };
+                if (s.caps.help) {
+                    next();
+                    if (IconButton("##help", Glyph::Help, iconSz, s.helpOpen, s.hitTargetScale)) s.helpOpen = !s.helpOpen;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keyboard shortcuts (F1 or ?)");
+                }
+                if (s.caps.slideshow) {
+                    next();
+                    if (IconButton("##slideshow", Glyph::Slideshow, iconSz, s.slideshowActive,
+                                   s.hitTargetScale))
+                        Fire(a.ToggleSlideshow);
+                }
+                if (s.caps.fullscreen) {
+                    next();
+                    if (IconButton("##fullscreen", s.isFullscreen ? Glyph::ExitFullscreen : Glyph::Fullscreen, iconSz,
+                                   false, s.hitTargetScale))
+                        Fire(a.ToggleFullscreen);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(s.isFullscreen ? "Leave full screen (F)" : "Full screen (F)");
+                }
             }
         }
         if (!s.stripOnly) {
@@ -1167,8 +1329,12 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
     // --- Stream URL popup (#93): independent of the bar fade, like the toast ---
     if (s.caps.url) UrlPopup(s, a);
 
+    // --- Shortcuts panel (#251): independent of the bar fade too. While it is up the toast
+    //     stays down: it would draw over the list. ---
+    if (s.caps.help) HelpPanel(s, W, H);
+
     // --- Toast (convergence readout, nav filename): own alpha, shows even when hidden ---
-    BuildTransportToast(s);
+    if (!s.helpOpen) BuildTransportToast(s);
 
     // --- Slideshow dip-to-black: a full-canvas overlay above everything. Because the
     //     HUD layer composites on top of the content layer, this dims the whole view. ---

@@ -114,7 +114,8 @@ blocking readback deadlocks the app (the atlas capture already contains the HUD)
 | `B` | A/B compare |
 | `Space`, `Left` / `Right`, `Shift+Left` / `Shift+Right`, `Up` / `Down` | play/pause, one frame back/forward, 5-frame jump, previous/next asset (the player's own, editor convention; `[` / `]` also step) |
 | `X`, `-` / `=`, `0` | swap eyes, convergence, reset convergence (the player's own) |
-| `F` / `F11`, `Esc` | full screen, leave full screen |
+| `F` / `F11`, `Esc` | full screen, leave full screen (the top bar's full-screen button does the same) |
+| `F1` / `?` | the shortcuts panel (the top bar's **?** button); `Esc` closes it |
 
 ## Build, run, release
 
