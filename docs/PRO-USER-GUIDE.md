@@ -296,7 +296,8 @@ The **Rig check** section (Inspector) shows, each in green, amber or red:
   clipboard: applied to the **right** eye in your grading tool, it matches it to the left.
   **Colour difference** (off / luma / chroma) tints the picture where the eyes differ:
   luma red where the right eye is brighter, blue where darker; chroma shows the hue of the
-  right eye's colour cast. A radial pattern is vignetting.
+  right eye's colour cast. A radial pattern is vignetting. It and the disparity **Heatmap** are one
+  picture overlay at a time: turning one on turns the other off.
 - **Depth range**: how far in front of and behind the screen the scene goes, against your
   depth budget.
 - **Frame edges**: something in front of the screen that the left or right edge of the
@@ -335,7 +336,8 @@ top-left of the picture with the stereo disparity of what is on screen:
 Tick **Heatmap** for a dense disparity map laid over the picture in the same colours as
 the `D` dots, refreshed about twice a second. **Budget violations only** paints just the
 parts outside the depth budget. Like the dots it marks positions in the left eye, so it is
-not drawn in the right-eye-only view. Flat areas stay clear: they have nothing to match.
+not drawn in the right-eye-only view. Flat areas stay clear: they have nothing to match. Turning
+the heatmap on turns the **Colour difference** overlay off, and the other way round.
 
 Both are off by default and cost nothing while off. The heatmap is computed on the rig
 check's own thread, never while the rig check is switched off (`MEDIAPLAYER_PRO_RIG=0`).

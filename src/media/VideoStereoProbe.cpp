@@ -27,7 +27,7 @@ VideoStereoProbe::Result VideoStereoProbe::Run(const std::string&, bool, int) {
     return VideoStereoProbe::Result{};
 }
 
-bool VideoStereoProbe::ReadSpherical(const std::string&, int&, float&) { return false; }
+bool VideoStereoProbe::ReadSpherical(const std::string&, int&, float&, int*) { return false; }
 
 #else
 
