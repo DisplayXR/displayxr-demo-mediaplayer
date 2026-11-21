@@ -34,6 +34,9 @@ public:
     void SetPinned(std::vector<std::string> folders);
     // Folders left out of Media folders (with what is under them): "Hide from Media folders".
     void SetHidden(std::vector<std::string> folders);
+    // Settings (#265): list Pictures / Videos / Downloads (the library walks) and Media
+    // folders (the Search index). Both on by default. Used by the next Refresh().
+    void SetSources(bool libraries, bool index);
 
     // The path of an item, or empty.
     std::string PathOf(int64_t id) const;
@@ -63,6 +66,7 @@ private:
 
     // Inputs (under mutex_).
     std::vector<std::string> recents_, pinned_, hidden_;
+    bool libraries_ = true, index_ = true;
 
     // Results (under mutex_).
     bool haveList_ = false;
