@@ -87,6 +87,7 @@ Glyph SourceIcon(SourceKind kind) {
         case SourceKind::Recents: return Glyph::Recent;
         case SourceKind::Folders: return Glyph::Folder;
         case SourceKind::Pinned: return Glyph::Pin;
+        case SourceKind::ThisFolder: return Glyph::Folder;  // Pro (#267)
     }
     return Glyph::Unsupported;
 }
@@ -362,7 +363,9 @@ void MediaBrowser::TakeResults() {
     }
 
     Thumbnail thumbnail;
-    while (provider_->TakeThumbnail(thumbnail)) {
+    // Paused for a capture (#267): finished thumbnails wait in the provider, so the
+    // classifier gets nothing to do until it resumes.
+    while (!backgroundPaused_ && provider_->TakeThumbnail(thumbnail)) {
         const MediaItem* item = library_.Find(thumbnail.id);
         if (thumbnail.file >= 0) {
             // Asked for its pair: the file goes to StereoPairs (which closes it) with the view.
@@ -765,6 +768,7 @@ void MediaBrowser::ChipRow(ImVec2 min, ImVec2 max) {
 }
 
 void MediaBrowser::SetDepth(DepthFilter depth) {
+    if (depth == DepthFilter::Only3D && !allowStereo_) return;  // Pro: no 3D grid (#267)
     if (depth == depth_) return;
     depth_ = depth;
     dirty_ = true;
@@ -962,7 +966,9 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         return Action::None;
     }
     // The provider's notice (desktop: the Search index is off), as a strip over the grid.
-    const std::string notice = provider_->Notice();
+    // Pro's capture pause (#267) comes first.
+    std::string notice = provider_->Notice();
+    if (!pausedNotice_.empty()) notice = notice.empty() ? pausedNotice_ : pausedNotice_ + "  " + notice;
     if (!notice.empty()) {
         const float h = Round(std::max(Dp(40.0f), ImGui::GetFrameHeight() + style.ItemSpacing.y * 2.0f));
         const float pad = Round(style.WindowPadding.x);
@@ -1157,6 +1163,7 @@ MediaBrowser::Action MediaBrowser::Grid(ImVec2 min, ImVec2 max, double now) {
         for (size_t k = 0; k < folderPreviews_[p].size() && k < previewEach; ++k) ask(items[folderPreviews_[p][k]]);
     for (size_t p = visFirst; p > std::max(winFirst, nf); --p) ask(items[shown_[p - 1 - nf]]);
     for (size_t k = 0; k < unknown_.size() && k < kScanBatch; ++k) ask(items[unknown_[k]]);
+    if (backgroundPaused_) want.clear();  // a capture runs: no thumbnail work (#267)
     if (!Same(want, wanted_)) {
         provider_->WantThumbnails(want);
         wanted_ = std::move(want);
