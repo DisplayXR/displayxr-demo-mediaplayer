@@ -62,6 +62,14 @@ struct TransportCaps {
     // move off the top bar into it, and the "Convert to 3D" button goes (the 2D/3D switch
     // does that). DEFAULT FALSE: Pro keeps them on the bar.
     bool moreMenu = false;
+    // Desktop top bar (#251), DEFAULT FALSE: `fullscreen` a full-screen button, `help` a "?"
+    // button and the shortcuts panel (TransportState::helpRows), both at the right end.
+    bool fullscreen = false;
+    bool help = false;
+    // The VR projection picker (#251), DEFAULT FALSE: a "Projection" submenu in the "..." menu
+    // (any file), and a button on the bar while VR media is on screen (projectionOnBar), so a
+    // mouse-only user finds it. Fisheye adds its lens FOV slider.
+    bool projection = false;
     // The touch player's layout (#180). DEFAULT FALSE; Android sets it. Instead of the flat
     // bars: gradient scrims at the top and bottom, the back arrow then the file's name left
     // aligned (and its place in the list under it), and the 2D/3D switch as a labelled
@@ -175,6 +183,21 @@ struct TransportState {
     // Frames per second of the open video, 0 = unknown / not shown. When > 0 the transport
     // also shows the current frame number. DEFAULT 0: only Pro sets it.
     double frameRate = 0.0;
+    // Full screen (caps.fullscreen): picks the button's glyph.
+    bool isFullscreen = false;
+    // Projection picker (caps.projection): the rows ([0] = "Auto (...)"), the one in force, the
+    // bar button's label, whether the bar shows it, and the fisheye lens FOV slider.
+    std::vector<std::string> projectionRows;
+    int projectionCurrent = 0;
+    std::string projectionName;
+    bool projectionOnBar = false;
+    bool fisheyeFovShown = false;
+    std::string projectionKey;      // its key beside "Auto" ("" = none: Pro's P is the probe)
+    std::string projectionKeyHint;  // the same in the bar button's tooltip, e.g. " (P cycles)"
+    float fisheyeFovDeg = 180.0f;
+    // The shortcuts panel's rows (caps.help), key then what it does; an empty key starts a
+    // section titled by the second string. The owner lists them: the bindings are its own.
+    std::vector<std::pair<std::string, std::string>> helpRows;
     // Input popup - only read when caps.input.
     std::vector<InputFamilyRow> inputFamilies;
     bool inputRemember = false;  // "Remember for this app": the next pick persists (per-app pin)
@@ -194,6 +217,8 @@ struct TransportState {
     char urlBuf[1024] = {};
     // The info sheet is open (caps.info); the owner may close it (a new file).
     bool infoOpen = false;
+    // The shortcuts panel is open (caps.help); the owner toggles it too (F1 / ?, Esc).
+    bool helpOpen = false;
 
     // Auto-hide fade (whole-UI alpha) and the independent toast fade.
     float fadeAlpha = 0.0f;
@@ -226,6 +251,9 @@ struct TransportActions {
     std::function<void()> ToggleLoop;
     std::function<void()> TogglePanels;  // Pro, used only when panelsButton
     std::function<void(float seconds)> Skip;  // caps.skip: seek this far from where it plays
+    std::function<void()> ToggleFullscreen;    // caps.fullscreen
+    std::function<void(int row)> SelectProjection;  // caps.projection: a row of projectionRows
+    std::function<void(float deg)> SetFisheyeFov;   // caps.projection: the lens FOV slider
 
     // Scrub machine. Seek(preview=true) is a cheap keyframe seek for a fast
     // sweep; preview=false is the exact frame. ScrubHeld fires once when the
