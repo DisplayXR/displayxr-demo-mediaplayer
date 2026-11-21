@@ -211,13 +211,13 @@ std::string MakeCsv(const Session& s) {
     std::string o =
         "kind,timecode,end_timecode,duration_frames,tc_fps,clock,description,note,vertical_px,roll_deg,"
         "near_pct,far_pct,delta_e,edge_left_pct,edge_right_pct,eye_sync_frames,image,"
-        "calibration,calibration_name,calibration_fingerprint,calibration_panel\n";
+        "calibration,calibration_name,calibration_fingerprint,calibration_panel,scale_pct\n";
     Marker m;
     for (const Alert& a : s.alerts) {
         const bool ok = AlertMarker(a, s, m);
         o += "alert," + Csv(a.timecode) + "," + Csv(a.endTimecode) + "," + (ok ? std::to_string(m.frames) : "") + "," +
              (a.tcFps > 0 ? std::to_string(a.tcFps) : "") + "," + Csv(a.clock) + "," +
-             Csv(AlertText(a)) + ",,,,,,,,,,,,,,\n";
+             Csv(AlertText(a)) + ",,,,,,,,,,,,,,,\n";
     }
     for (const Snapshot& sn : s.snapshots) {
         const Rig& r = sn.rig;
@@ -228,7 +228,7 @@ std::string MakeCsv(const Session& s) {
              (r.edgeMeasured[0] ? Num(r.edgePct[0], 2) : "") + "," + (r.edgeMeasured[1] ? Num(r.edgePct[1], 2) : "") +
              "," + (sn.eyeSyncFrames >= 0 ? std::to_string(sn.eyeSyncFrames) : "") + "," + Csv(sn.image) + "," +
              Csv(sn.calibration.state) + "," + Csv(sn.calibration.name) + "," + Csv(sn.calibration.fingerprint) +
-             "," + Csv(sn.calibration.panel) + "\n";
+             "," + Csv(sn.calibration.panel) + "," + (r.measured && r.scaleMeasured ? Num(r.scalePct, 2) : "") + "\n";
     }
     return o;
 }
@@ -260,7 +260,8 @@ std::string MakeHtml(const Session& s) {
          std::to_string(s.snapshots.size()) + " snapshot" + (s.snapshots.size() == 1 ? "" : "s") +
          ". Depth budget " + Num(s.budgetNearPct, 1) + "% to " + Num(s.budgetFarPct, 1) +
          "% of the eye width; vertical &le; " + Num(s.budgetVerticalPx, 1) + " px; colour &Delta;E &le; " +
-         Num(s.budgetDeltaE, 1) + "; nothing nearer than " + Num(s.budgetEdgePct, 1) + "% at the frame edges.</p>\n";
+         Num(s.budgetDeltaE, 1) + "; nothing nearer than " + Num(s.budgetEdgePct, 1) + "% at the frame edges" +
+         (s.budgetScalePct > 0 ? "; eye sizes within " + Num(s.budgetScalePct, 2) + "%" : std::string()) + ".</p>\n";
     if (!s.calibration.state.empty())
         o += "<p>Display calibration at export: " + Html(CalibrationText(s.calibration)) +
              ". Each snapshot lists the calibration that was in its capture.</p>\n";
@@ -299,6 +300,10 @@ std::string MakeHtml(const Session& s) {
             o += "<span>Vertical " + over(std::fabs(r.verticalPx) > s.budgetVerticalPx, Num(r.verticalPx, 2) + " px") +
                  "</span>";
             o += "<span>Roll " + Num(r.rollDeg, 2) + "&deg;</span>";
+            if (r.scaleMeasured)
+                o += "<span>Scale " +
+                     over(s.budgetScalePct > 0 && std::fabs(r.scalePct) > s.budgetScalePct, Num(r.scalePct, 2) + "%") +
+                     "</span>";
             o += "<span>Depth " + over(r.nearPct < s.budgetNearPct, Num(r.nearPct, 2) + "%") + " to " +
                  over(r.farPct > s.budgetFarPct, Num(r.farPct, 2) + "%") + "</span>";
             o += "<span>Colour &Delta;E " + over(r.deltaE > s.budgetDeltaE, Num(r.deltaE, 2)) + "</span>";
