@@ -2,6 +2,7 @@
 #include "media/VideoDecoder.h"
 #include "media/ImageSequence.h"
 #include "media/StreamUrl.h"
+#include "platform/JoinCancelIo.h"
 
 #include "Log.h"
 #include "color/ToneMap.h"  // scene-linear EXR -> PQ code (#134)
@@ -660,10 +661,17 @@ bool VideoDecoder::Open(const std::string& path) {
             av_dict_set(&opts, "pattern_type", "none", 0);  // one still, no number
         }
     }
+    // A file on a network share reads through the plain file protocol: let Stop() cut the
+    // open, the probe and every later read short (#251). Cleared here, as Stop() left it set.
+    stop_ = false;
+    impl_->fmt = avformat_alloc_context();
+    impl_->fmt->interrupt_callback.callback = &VideoDecoder::InterruptCallback;
+    impl_->fmt->interrupt_callback.opaque = this;
     const int openRc = avformat_open_input(&impl_->fmt, openPath.c_str(), ifmt, &opts);
     av_dict_free(&opts);
     if (openRc < 0) {
         LOG_ERROR("VideoDecoder: cannot open '%s'", openPath.c_str());
+        impl_->fmt = nullptr;  // avformat_open_input frees it on failure
         impl_.reset();
         return false;
     }
@@ -1486,7 +1494,7 @@ void VideoDecoder::Seek(double seconds, bool preview) {
 
 void VideoDecoder::Stop() {
     stop_ = true;
-    if (thread_.joinable()) thread_.join();
+    JoinCancellingIo(thread_);  // a read stalled on a network share (#251)
     open_ = false;
 #if defined(_WIN32)
     // Release the per-slot shared NV12 textures + handles (zero-copy, #28). Safe after the

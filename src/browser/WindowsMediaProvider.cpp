@@ -7,6 +7,7 @@
 #include "media/MediaSource.h"
 #include "media/MpoLoader.h"
 #include "media/VideoThumbnail.h"
+#include "platform/JoinCancelIo.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -97,8 +98,9 @@ WindowsMediaProvider::~WindowsMediaProvider() {
     }
     listWake_.notify_all();
     thumbWake_.notify_all();
-    if (listThread_.joinable()) listThread_.join();
-    if (thumbThread_.joinable()) thumbThread_.join();
+    // Either may be reading a file on a network share (a Recent, a thumbnail) (#251).
+    JoinCancellingIo(listThread_);
+    JoinCancellingIo(thumbThread_);
 }
 
 void WindowsMediaProvider::SetRecents(std::vector<std::string> paths) {
