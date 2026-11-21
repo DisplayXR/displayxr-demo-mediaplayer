@@ -176,6 +176,22 @@ public:
         stereo_ = on;
         if (viewScale > 0.0f) viewScale_ = viewScale;
     }
+    // Pro (#267): no 3D grid. The All / 3D / 2D control is not shown and the "3D only"
+    // filter never turns on, so the caller never borrows a 3D mode or draws the atlas.
+    void SetAllowStereo(bool on) {
+        allowStereo_ = on;
+        if (!on && depth_ == DepthFilter::Only3D) depth_ = DepthFilter::Both;
+    }
+    // Pro (#267, BackgroundGate.h): while a capture runs, ask for no thumbnails and take
+    // none, so the provider's thumbnail thread and the 3D classifier sit idle, and show
+    // `notice` over the grid. Listing still works.
+    void SetBackgroundPaused(bool paused, const std::string& notice = std::string()) {
+        backgroundPaused_ = paused;
+        pausedNotice_ = paused ? notice : std::string();
+    }
+    // Desktop: keep `px` (HUD pixels) free at the status bar's right end, for a chip the
+    // caller draws there (Pro's LIVE chip, #267); the hint gives way to it.
+    void SetStatusReserve(float px) { statusReserve_ = px; }
     // Make pairs for 3D photos whose thumbnail is one view (LIF, MPO: StereoPairs.h).
     // `read` / `close` work on the file descriptors the provider hands over. Call after
     // Initialize; without it those tiles stay flat. `diskDir`: where the pairs are kept
@@ -357,6 +373,10 @@ private:
     int columns_ = 0;   // the last frame's, to keep the top row on a reflow
     float thumbGrab_ = 0.0f;  // where the fast-scroll thumb was taken, from its top
 
+    bool allowStereo_ = true;       // SetAllowStereo
+    bool backgroundPaused_ = false;  // SetBackgroundPaused
+    std::string pausedNotice_;
+    float statusReserve_ = 0.0f;     // SetStatusReserve
     bool stereo_ = false;        // SetStereo
     StereoFrame stereoFrame_;    // this frame's tiles, when stereo_
     ThumbnailDepth thumbDepth_;  // per-thumbnail convergence for the 3D grid

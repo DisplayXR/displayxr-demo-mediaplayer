@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // WindowsMediaProvider: the desktop browser's media on Windows (#252). Sources:
-// Recents, Pictures and Videos (the libraries), Downloads, Media folders (the Search
-// index, grouped by folder) and Pinned folders. Lists are made on a worker thread and
+// Recents, This folder (Pro, #267), Pictures and Videos (the libraries), Downloads, Media
+// folders (the Search index, grouped by folder) and Pinned folders; the app picks which. Lists are made on a worker thread and
 // thumbnails on another, both through WinShellMedia: nothing reads a cloud-only file's
 // bytes. Render-thread calls never block.
 #pragma once
@@ -37,6 +37,12 @@ public:
     // Settings (#265): list Pictures / Videos / Downloads (the library walks) and Media
     // folders (the Search index). Both on by default. Used by the next Refresh().
     void SetSources(bool libraries, bool index);
+    // Pro (#267): "This folder", a folder tree after Recents (empty = no such source); how
+    // deep and how long a folder walk may go (slow network shares); and numbered EXR / DPX /
+    // TIFF frames as one item per sequence (SequenceTiles.h). Used by the next Refresh().
+    void SetThisFolder(std::string folder);
+    void SetWalkLimits(int depth, double budgetMs);
+    void SetCollapseSequences(bool on);
 
     // The path of an item, or empty.
     std::string PathOf(int64_t id) const;
@@ -67,6 +73,10 @@ private:
     // Inputs (under mutex_).
     std::vector<std::string> recents_, pinned_, hidden_;
     bool libraries_ = true, index_ = true;
+    std::string thisFolder_;
+    int walkDepth_ = 6;
+    double walkBudgetMs_ = 3000.0;  // per folder tree (libraries, Downloads, a pin)
+    bool collapseSequences_ = false;
 
     // Results (under mutex_).
     bool haveList_ = false;

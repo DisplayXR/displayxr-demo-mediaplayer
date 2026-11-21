@@ -122,6 +122,11 @@ public:
     // "DeckLink ch 1-2 of 8" while the DeckLink input's audio plays, else "".
     std::string LiveAudioLabel() const;
     bool ShowTimecode() const { return showTimecode_; }
+    // A DeckLink input or the test signal is streaming (#267): the media browser keeps out
+    // of the capture's way while it is (no thumbnail work).
+    bool CaptureActive() const {
+        return decklink_.GetState() == LiveState::Streaming || testSignal_.GetState() == LiveState::Streaming;
+    }
     std::string InputName() const { return inputIndex_ >= 0 && inputIndex_ < (int)inputs_.size() ? inputs_[inputIndex_].name : std::string(); }
     size_t SnapshotCount() const { return snapshots_.size(); }
 
