@@ -17,11 +17,13 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -300,6 +302,13 @@ int main(int argc, char* argv[]) {
     }
     if (owner) mp::single_instance::Listen();
     int rc = app.Run();
+    // Last resort (#251): the user asked to quit, so a teardown stuck on something no
+    // cancel reaches (a stalled network share) must not leave a frozen window forever.
+    std::thread([rc] {
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+        LOG_ERROR("Shutdown still blocked after 15 s: exiting without finishing it");
+        std::_Exit(rc);
+    }).detach();
     app.Shutdown();
     LOG_INFO("Clean shutdown (rc=%d)", rc);
     return rc;

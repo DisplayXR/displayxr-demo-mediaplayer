@@ -5,6 +5,7 @@
 #include "media/AudioLayout.h"
 #include "media/AudioMeter.h"
 #include "media/AudioSolo.h"
+#include "platform/JoinCancelIo.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -54,7 +55,15 @@ AudioPlayer::~AudioPlayer() { Stop(); }
 bool AudioPlayer::Open(const std::string& path) {
     impl_ = std::make_unique<Impl>();
 
+    // A file on a network share: Stop() cuts a stalled read short (#251).
+    stop_ = false;
+    impl_->fmt = avformat_alloc_context();
+    impl_->fmt->interrupt_callback.callback = [](void* self) -> int {
+        return static_cast<AudioPlayer*>(self)->stop_.load() ? 1 : 0;
+    };
+    impl_->fmt->interrupt_callback.opaque = this;
     if (avformat_open_input(&impl_->fmt, path.c_str(), nullptr, nullptr) < 0) {
+        impl_->fmt = nullptr;  // avformat_open_input frees it on failure
         LOG_WARN("AudioPlayer: cannot open '%s' for audio - silent", path.c_str());
         impl_.reset();
         return false;
@@ -265,7 +274,7 @@ void AudioPlayer::DecodeLoop() {
 
 void AudioPlayer::Stop() {
     stop_ = true;
-    if (thread_.joinable()) thread_.join();
+    JoinCancellingIo(thread_);  // a read stalled on a network share (#251)
     open_ = false;
     impl_.reset();
     if (AudioMeter* m = meter_.load()) m->Clear();  // what was queued will not be heard
