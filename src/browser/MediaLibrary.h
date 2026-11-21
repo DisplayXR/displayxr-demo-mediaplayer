@@ -23,7 +23,7 @@
 namespace mp::browser {
 
 // Built-in sources first (their values index the built-in table), then the desktop's.
-enum class SourceKind { All, Camera, Downloads, Pictures, Movies, Unsupported, Recents, Folders, Pinned };
+enum class SourceKind { All, Camera, Downloads, Pictures, Movies, Unsupported, Recents, Folders, Pinned, ThisFolder };
 
 // How a declared source is browsed.
 enum class SourceMode {

@@ -30,10 +30,12 @@
 #include "pro/ProController.h"
 #endif
 
-// The in-app media browser (#252): the consumer player on Windows. Pro keeps its station
-// panels; macOS / Linux keep the system dialog until they get a provider.
-#if defined(_WIN32) && !MEDIAPLAYER_PRO
+// The in-app media browser (#252) on Windows. The basic player uses it for Open by default;
+// Pro builds it in but uses it only when Settings turns it on (#267), as a 2D Open dialog.
+// macOS / Linux keep the system dialog until they get a provider.
+#if defined(_WIN32)
 #define MEDIAPLAYER_BROWSER 1
+#include "browser/BackgroundGate.h"
 #include "browser/MediaBrowser.h"
 #include "browser/WindowsMediaProvider.h"
 #include "rhi/StereoGridRenderer.h"
@@ -493,8 +495,10 @@ private:
     void RegisterSettingsRows();
     void TickSettings(bool flush);
     void OpenSettings(const char* via);  // the gear / menu ("ui"), Ctrl+, ("key"), Pro's Station ("station")
-    // The media browser may serve Open (it exists and the setting allows it).
+    // The media browser may serve Open (it exists, or Pro can make it, and the setting allows it).
     bool BrowserAllowed() const;
+    bool BrowserAvailable() const;  // ... whatever the setting says
+    bool openAtDone_ = false;       // MEDIAPLAYER_OPEN_AT (test)
 
 #if MEDIAPLAYER_BROWSER
     std::unique_ptr<browser::WindowsMediaProvider> browserProvider_;
@@ -504,6 +508,15 @@ private:
     StereoGridRenderer grid_;
     bool gridReady_ = false;
     browser::ModeBorrow browserMode_;
+    // Pro (#267): the browser is made on the first Open that wants it, never before, so a
+    // station that leaves it off runs none of it. False once a make failed.
+    bool browserDeferred_ = false;
+    bool CreateBrowser();
+    bool EnsureBrowser();
+    std::string BrowserThisFolder() const;  // Pro's "This folder": the open file's, else the last opened
+    browser::BackgroundGate browserGate_;   // Pro: capture first, thumbnails after
+    void BuildLiveChip();                   // Pro: "LIVE: <input> <timecode>" over the browser
+    float liveChipW_ = 0.0f;                // ... its width last frame, kept free in the status bar
 #endif
 #if defined(_WIN32)
     browser::win::CloudFetch cloudFetch_;

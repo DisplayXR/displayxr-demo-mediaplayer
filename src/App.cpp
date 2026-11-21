@@ -18,6 +18,9 @@
 #include "ui/Hud.h"
 #include "ui/UiScale.h"
 #include "ui/UiText.h"
+#if MEDIAPLAYER_PRO
+#include "ui/TabularText.h"  // the browser's LIVE chip (#267)
+#endif
 
 // The product name in the window title. Media Player Pro is the same trunk built with
 // MEDIAPLAYER_PRO=1 (docs/PRO.md).
@@ -131,6 +134,11 @@ std::string MakeCaptureAtlasPrefix(const std::string& stem, uint32_t cols, uint3
 // where the cursor is and clicks align across both eyes. (A small negative value would
 // float it toward the viewer per PRD §9, but that offsets the perceived hit target.)
 constexpr float kHudDisparity = 0.0f;
+
+// The media browser's settings (#265, #267): on in the basic player, off in Pro, where the
+// wide sources (the library walks, the Search index) are off too and "This folder" is on.
+constexpr bool kBrowserDefault = !MEDIAPLAYER_PRO;
+constexpr bool kBrowserWideSources = !MEDIAPLAYER_PRO;
 
 // Auto-hide / slideshow timing.
 constexpr double kIdleHideSeconds = 5.0;    // fade the UI out after this much inactivity
@@ -630,54 +638,9 @@ bool App::Initialize(const char* mediaPath) {
                         xr_.HudImages(), renderer_.FramesInFlight())) {
             window_.SetEventHook([this](void* ev) { imgui_.ProcessEvent(ev); });
 #if MEDIAPLAYER_BROWSER
-            // The media browser (#252): its 3D verdicts are kept beside the Recent list.
-            namespace fs = std::filesystem;
-            std::error_code ec;
-            fs::path verdicts = recentFile_.empty() ? fs::temp_directory_path(ec) / "DisplayXR-MediaPlayer"
-                                                    : fs::path(recentFile_).parent_path();
-            fs::create_directories(verdicts, ec);
-            verdicts /= "stereo_verdicts.txt";
-            browserProvider_ = std::make_unique<browser::WindowsMediaProvider>();
-            browser_ = std::make_unique<browser::MediaBrowser>();
-            if (browser_->Initialize(browserProvider_.get(), xr_.PhysicalDevice(), xr_.Device(),
-                                     renderer_.FramesInFlight(), verdicts.string())) {
-                browser_->SetDesktop(true);
-                browser_->SetSlideshows(true);  // play a folder, the place shown, the grid (#252)
-                gridReady_ = grid_.init(xr_.PhysicalDevice(), xr_.Device(), (VkFormat)xr_.SwapchainFormat(),
-                                        renderer_.FramesInFlight());
-                if (!gridReady_) {
-                    LOG_WARN("browser: the 3D grid could not start - it stays flat");
-                    grid_.cleanup();
-                }
-                if (!recentFile_.empty()) {
-                    const fs::path dir = fs::path(recentFile_).parent_path();
-                    pinnedFile_ = (dir / "pinned.txt").string();
-                    hiddenFile_ = (dir / "hidden_folders.txt").string();
-                    pinned_.Load(pinnedFile_);
-                    hiddenFolders_.Load(hiddenFile_);
-                    browserPrefsFile_ = (dir / "browser_view.txt").string();
-                }
-                // Tests: MEDIAPLAYER_BROWSER_PREFS names the view file to use instead; a test
-                // run (MEDIAPLAYER_SHOW_BROWSER) without it never reads or writes the user's.
-                if (const char* p = std::getenv("MEDIAPLAYER_BROWSER_PREFS"); p && *p)
-                    browserPrefsFile_ = p;
-                else if (const char* s = std::getenv("MEDIAPLAYER_SHOW_BROWSER"); s && *s && std::string(s) != "0")
-                    browserPrefsFile_.clear();
-                if (!browserPrefsFile_.empty()) {
-                    std::ifstream in(fs::u8path(browserPrefsFile_), std::ios::binary);
-                    if (in) {
-                        std::stringstream text;
-                        text << in.rdbuf();
-                        browser_->SetViewPrefs(browser::ParseDeskViewPrefs(text.str(), browser::MediaBrowser::kCardMin,
-                                                                           browser::MediaBrowser::kCardMax));
-                    }
-                    browserPrefsSaved_ = browser_->ViewPrefs();
-                }
-            } else {
-                LOG_WARN("browser: could not start - Open uses the system dialog");
-                browser_.reset();
-                browserProvider_.reset();
-            }
+            // The media browser (#252). Pro makes it on the first Open that wants it (#267).
+            if (MEDIAPLAYER_PRO) browserDeferred_ = true;
+            else CreateBrowser();
 #endif
         } else {
             LOG_WARN("ImGui unavailable — using the text HUD");
@@ -708,6 +671,9 @@ int App::Run() {
     dumpHudPath_ = std::getenv("MEDIAPLAYER_DUMP_HUD");
     if (const char* f = std::getenv("MEDIAPLAYER_DUMP_FRAME")) dumpFrame_ = std::max(1, std::atoi(f));
     openAfterPath_ = std::getenv("MEDIAPLAYER_OPEN_AFTER");  // test: swap media mid-run
+    // Test (#267): the Settings window at launch (its rows in a HUD dump).
+    if (const char* st = std::getenv("MEDIAPLAYER_SHOW_SETTINGS"); st && *st && std::string(st) != "0")
+        OpenSettings("test");
     // Test (#252): show the media browser at launch, without a click.
     if (const char* b = std::getenv("MEDIAPLAYER_SHOW_BROWSER"); b && *b && std::string(b) != "0") {
         ShowBrowser();
@@ -741,7 +707,8 @@ int App::Run() {
     // Started with no file: open as Open would (#252): outside a workspace that is the
     // browser, on the place last shown; in one, the shell's picker. A file on the command
     // line (Explorer, Recent) opens itself; a cloud file downloading shows its card.
-    else if (BrowserAllowed() && settings_.GetBool("browser.at_start", true) && !hasMedia_ && !CloudFetchBusy() &&
+    else if (!MEDIAPLAYER_PRO && BrowserAllowed() && settings_.GetBool("browser.at_start", true) && !hasMedia_ &&
+             !CloudFetchBusy() &&
              !std::getenv("MEDIAPLAYER_NO_BROWSER_AT_START")) {
         RequestOpenFile();
     }
@@ -916,6 +883,16 @@ int App::Run() {
             activity = true;
         }
         if (window_.TakeOpenFileRequest()) { RequestOpenFile(); activity = true; }     // Ctrl+O
+        // Test (#267): MEDIAPLAYER_OPEN_AT=<frame> presses Open once, as the button and Ctrl+O do.
+        static const long kOpenAt = [] {
+            const char* f = std::getenv("MEDIAPLAYER_OPEN_AT");
+            return f ? std::atol(f) : 0L;
+        }();
+        if (kOpenAt > 0 && !openAtDone_ && (long)rendered_ >= kOpenAt) {
+            openAtDone_ = true;
+            LOG_INFO("test: Open at frame %ld", (long)rendered_);
+            RequestOpenFile();
+        }
         if (window_.TakeOpenFolderRequest()) { RequestOpenFolder(); activity = true; } // Ctrl+Shift+O
         if (window_.TakeOpenSettingsRequest()) { OpenSettings("key"); activity = true; }  // Ctrl+, (#265)
         TickSettings(/*flush=*/false);
@@ -2107,43 +2084,144 @@ void App::Shutdown() {
 
 // --- Settings (#265) --------------------------------------------------------------
 
-bool App::BrowserAllowed() const {
 #if MEDIAPLAYER_BROWSER
-    return browser_ && settings_.GetBool("browser.enabled", true);
+bool App::CreateBrowser() {
+    // The media browser (#252): its 3D verdicts are kept beside the Recent list.
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path verdicts = recentFile_.empty() ? fs::temp_directory_path(ec) / "DisplayXR-MediaPlayer"
+                                            : fs::path(recentFile_).parent_path();
+    fs::create_directories(verdicts, ec);
+    verdicts /= "stereo_verdicts.txt";
+    browserProvider_ = std::make_unique<browser::WindowsMediaProvider>();
+    browser_ = std::make_unique<browser::MediaBrowser>();
+    if (browser_->Initialize(browserProvider_.get(), xr_.PhysicalDevice(), xr_.Device(),
+                             renderer_.FramesInFlight(), verdicts.string())) {
+        browser_->SetDesktop(true);
+        browser_->SetSlideshows(true);  // play a folder, the place shown, the grid (#252)
+#if MEDIAPLAYER_PRO
+        // Pro (#267): 2D only. The 3D grid would draw into the projection atlas the monitored
+        // picture uses and borrow the panel's mode. Network shares get shorter walks, and a
+        // render's frames show as one tile per sequence.
+        browser_->SetAllowStereo(false);
+        browserProvider_->SetWalkLimits(3, 1500.0);
+        browserProvider_->SetCollapseSequences(true);
+        LOG_INFO("browser: made for Open (Pro: 2D grid, walks depth 3 / 1.5 s, sequences as one tile)");
+#else
+        gridReady_ = grid_.init(xr_.PhysicalDevice(), xr_.Device(), (VkFormat)xr_.SwapchainFormat(),
+                                renderer_.FramesInFlight());
+        if (!gridReady_) {
+            LOG_WARN("browser: the 3D grid could not start - it stays flat");
+            grid_.cleanup();
+        }
+#endif
+        if (!recentFile_.empty()) {
+            const fs::path dir = fs::path(recentFile_).parent_path();
+            pinnedFile_ = (dir / "pinned.txt").string();
+            hiddenFile_ = (dir / "hidden_folders.txt").string();
+            pinned_.Load(pinnedFile_);
+            hiddenFolders_.Load(hiddenFile_);
+            browserPrefsFile_ = (dir / "browser_view.txt").string();
+        }
+        // Tests: MEDIAPLAYER_BROWSER_PREFS names the view file to use instead; a test
+        // run (MEDIAPLAYER_SHOW_BROWSER) without it never reads or writes the user's.
+        if (const char* p = std::getenv("MEDIAPLAYER_BROWSER_PREFS"); p && *p)
+            browserPrefsFile_ = p;
+        else if (const char* s = std::getenv("MEDIAPLAYER_SHOW_BROWSER"); s && *s && std::string(s) != "0")
+            browserPrefsFile_.clear();
+        if (!browserPrefsFile_.empty()) {
+            std::ifstream in(fs::u8path(browserPrefsFile_), std::ios::binary);
+            if (in) {
+                std::stringstream text;
+                text << in.rdbuf();
+                browser_->SetViewPrefs(browser::ParseDeskViewPrefs(text.str(), browser::MediaBrowser::kCardMin,
+                                                                   browser::MediaBrowser::kCardMax));
+            }
+            browserPrefsSaved_ = browser_->ViewPrefs();
+        }
+    } else {
+        LOG_WARN("browser: could not start - Open uses the system dialog");
+        browser_.reset();
+        browserProvider_.reset();
+    }
+    return browser_ != nullptr;
+}
+
+// Pro makes the browser here, on the first Open that wants it (#267).
+bool App::EnsureBrowser() {
+    if (browser_) return true;
+    if (!browserDeferred_ || !settings_.GetBool("browser.enabled", kBrowserDefault)) return false;
+    browserDeferred_ = false;  // one try: a failure leaves Open on the system dialog
+    return CreateBrowser();
+}
+
+// Pro's "This folder" (#267): the open file's folder, else the newest folder in Recent (a
+// folder opened, or a file's folder). Empty: none (a live input, nothing opened yet). Names
+// only, no disk access: a Recent entry on a stalled share must not hold up Open; the list
+// thread walks the folder and copes when it is gone.
+std::string App::BrowserThisFolder() const {
+    namespace fs = std::filesystem;
+    if (hasMedia_ && !isLogo_ && !isLive_ && !isStream_ && !currentMediaPath_.empty())
+        return fs::u8path(currentMediaPath_).parent_path().u8string();
+    for (const std::string& p : recent_.Items()) {
+        if (!MediaSource::IsSupported(p)) return p;  // a folder (Open folder, a dropped folder)
+        const std::string dir = fs::u8path(p).parent_path().u8string();
+        if (!dir.empty()) return dir;
+    }
+    return {};
+}
+#endif
+
+bool App::BrowserAvailable() const {
+#if MEDIAPLAYER_BROWSER
+    return browser_ || browserDeferred_;
 #else
     return false;
 #endif
 }
 
-// The basic player's rows. Pro registers its own in ProController::AttachSettings. Every
-// default is the player's behaviour before the setting existed.
+bool App::BrowserAllowed() const {
+    return BrowserAvailable() && settings_.GetBool("browser.enabled", kBrowserDefault);
+}
+
+// The media browser's rows, both products (Pro adds its own in ProController::AttachSettings).
+// Every default is the product's behaviour before the setting existed.
 void App::RegisterSettingsRows() {
-#if !MEDIAPLAYER_PRO
     const char* group = "Opening files";
 #if MEDIAPLAYER_BROWSER
-    const bool haveBrowser = browser_ != nullptr;
     const char* why = "unavailable";
+    const char* subWhy = "";  // greyed while the browser is off: no note needed
 #else
-    const bool haveBrowser = false;
     const char* why = "Windows only";
+    const char* subWhy = why;
 #endif
-    auto browserOn = [this, haveBrowser] { return haveBrowser && settings_.GetBool("browser.enabled", true); };
-    settingsPanel_.AddToggle(group, "Use the media browser for Open", "browser.enabled", true,
-                             "Open and Ctrl+O show the in-app media browser.\n"
-                             "Off: the system file dialog.",
-                             [haveBrowser] { return haveBrowser; }, why);
+    auto have = [this] { return BrowserAvailable(); };
+    auto browserOn = [this] { return BrowserAllowed(); };
+    settingsPanel_.AddToggle(group, "Use the media browser for Open", "browser.enabled", kBrowserDefault,
+                             MEDIAPLAYER_PRO ? "Open and Ctrl+O show the in-app media browser (2D), on Recents,\n"
+                                               "pinned folders and the open file's folder.\n"
+                                               "Off: the system file dialog. Ctrl+O in the browser opens it too."
+                                             : "Open and Ctrl+O show the in-app media browser.\n"
+                                               "Off: the system file dialog.",
+                             have, why);
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     settingsPanel_.AddCustom(group, [] { ImGui::Indent(); });  // the browser's own options under it
 #endif
+#if MEDIAPLAYER_PRO
+    // Never at launch in Pro (#267): no "Start in the browser" row.
+    settingsPanel_.AddToggle(group, "Show This folder", "browser.source.this_folder", true,
+                             "The open file's folder, else the last folder opened", browserOn, subWhy);
+#else
     settingsPanel_.AddToggle(group, "Start in the media browser", "browser.at_start", true,
-                             "Opened with no file, the player starts in the browser", browserOn, why);
-    settingsPanel_.AddToggle(group, "Show Media folders (Windows Search)", "browser.source.index", true,
-                             "Media found by the Windows Search index, grouped by folder", browserOn, why);
-    settingsPanel_.AddToggle(group, "Show Pictures, Videos, Downloads", "browser.source.libraries", true,
-                             "Walk your Pictures and Videos libraries and the Downloads folder", browserOn, why);
+                             "Opened with no file, the player starts in the browser", browserOn, subWhy);
+#endif
+    settingsPanel_.AddToggle(group, "Show Media folders (Windows Search)", "browser.source.index", kBrowserWideSources,
+                             "Media found by the Windows Search index, grouped by folder", browserOn, subWhy);
+    settingsPanel_.AddToggle(group, "Show Pictures, Videos, Downloads", "browser.source.libraries",
+                             kBrowserWideSources, "Walk your Pictures and Videos libraries and the Downloads folder",
+                             browserOn, subWhy);
 #if defined(MEDIAPLAYER_WITH_IMGUI)
     settingsPanel_.AddCustom(group, [] { ImGui::Unindent(); });
-#endif
 #endif
 }
 
@@ -5127,10 +5205,7 @@ void App::ShowNativeOpenDialog() {
     // The native dialog is a desktop window — useful for standalone/dev runs, but inside a
     // fullscreen workspace it opens behind the compositor and looks like a dead button. Toast
     // so the fallback is never a silent no-op. (The browser's "Other files..." asked for it.)
-#if MEDIAPLAYER_BROWSER
-    if (!browser_)
-#endif
-        ShowToast("File picker unavailable — opening desktop dialog");
+    if (!BrowserAllowed()) ShowToast("File picker unavailable — opening desktop dialog");
 
     static const SDL_DialogFileFilter kFilters[] = {
         // Keep in sync with MediaSource::IsSupported — SDL wants its own filter string.
@@ -5257,7 +5332,7 @@ void App::RefreshRecentLabels() {
 
 void App::ShowBrowser() {
 #if MEDIAPLAYER_BROWSER
-    if (!browser_ || browsing_) return;
+    if (browsing_ || !EnsureBrowser()) return;
     browsing_ = true;
     if (uiState_.slideshowActive) SetSlideshow(false);
     fromBrowserList_ = false;  // Esc in the browser is the browser's again
@@ -5266,8 +5341,13 @@ void App::ShowBrowser() {
     browserProvider_->SetRecents(recent_.Items());
     browserProvider_->SetPinned(pinned_.Items());
     browserProvider_->SetHidden(hiddenFolders_.Items());
-    browserProvider_->SetSources(settings_.GetBool("browser.source.libraries", true),
-                                 settings_.GetBool("browser.source.index", true));
+    browserProvider_->SetSources(settings_.GetBool("browser.source.libraries", kBrowserWideSources),
+                                 settings_.GetBool("browser.source.index", kBrowserWideSources));
+#if MEDIAPLAYER_PRO
+    browserGate_ = browser::BackgroundGate();  // a capture that ended while it was closed is over
+    browserProvider_->SetThisFolder(settings_.GetBool("browser.source.this_folder", true) ? BrowserThisFolder()
+                                                                                         : std::string());
+#endif
     browser_->Refresh();
     window_.SetKeyboardCaptured(true);  // the browser's keys from the next event on
     LOG_INFO("browser: shown");
@@ -5502,6 +5582,9 @@ void App::BuildCloudFetchPanel() {
 void App::RequestBrowserMode() {
 #if MEDIAPLAYER_BROWSER
     if (startMode_ >= 0 || !xr_.HasRenderingModes()) return;  // a test pin owns the mode
+    // Pro (#267) keeps the panel's mode: a monitoring station does not switch the display
+    // for an Open dialog. The browser goes out as a flat layer instead (BuildBrowser).
+    if (MEDIAPLAYER_PRO) return;
     const bool only3D = browser_ && browser_->WantsStereo() && gridReady_;
     const int32_t want = browser::BrowserMode(only3D, xr_.FindFlatMode(), xr_.FindStereoMode());
     const int32_t req = browserMode_.Borrow(want, (int32_t)xr_.CurrentModeIndex());
@@ -5555,6 +5638,13 @@ void App::BuildBrowser() {
         BuildTransportUI();
         return;
     }
+#if MEDIAPLAYER_PRO
+    browser_->SetStatusReserve(liveChipW_);  // last frame's chip, at the status bar's right end
+    // Capture first (#267): no thumbnail work while a DeckLink input or the test signal runs.
+    if (browserGate_.Update(pro_.GetStation().CaptureActive(), LiveProducer::NowSeconds()))
+        LOG_INFO("browser: thumbnails %s", browserGate_.Paused() ? "paused - a capture runs" : "resumed");
+    browser_->SetBackgroundPaused(browserGate_.Paused(), browser::BackgroundGate::Notice());
+#endif
     const auto buildT0 = std::chrono::steady_clock::now();
     const browser::MediaBrowser::Action action = browser_->Build();
     {
@@ -5573,6 +5663,12 @@ void App::BuildBrowser() {
         if (!out) LOG_WARN("browser: could not write '%s'", browserPrefsFile_.c_str());
     }
     ui::BuildTransportToast(uiState_);
+#if MEDIAPLAYER_PRO
+    BuildLiveChip();
+    // A flat (2D) layer over the whole HUD where the runtime takes one, as the pinned panels
+    // are: crisp text without borrowing a 2D mode.
+    if (xr_.HasLocal2D()) pro_.AddFlatRect({0.0f, 0.0f, ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y});
+#endif
     browser_->RecordUploads(renderer_.FrameCmd());
     // The browser has the keyboard: no player hotkeys. Esc backs out (a sheet, a folder),
     // then closes; Backspace and Alt+Left back out.
@@ -5672,6 +5768,35 @@ void App::BuildBrowser() {
     }
 #endif
 }
+
+#if MEDIAPLAYER_BROWSER
+// Pro (#267): the feed stays in sight over the browser, which covers the station panels.
+// A chip at the right end of the browser's status bar: "LIVE: <input>  <timecode>".
+void App::BuildLiveChip() {
+#if MEDIAPLAYER_PRO
+    liveChipW_ = 0.0f;
+    if (!isLive_) return;
+    const pro::Station& station = pro_.GetStation();
+    std::string name = station.InputName();
+    if (name.empty()) name = live_->DeviceName();
+    std::string text = "LIVE: " + name;
+    if (!station.Timecode().empty()) text += "  " + station.Timecode();
+    const ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImGui::PushFont(ui::DeskFont(ui::DeskText::Meta));
+    const ImVec2 ts = ImGui::CalcTextSize(text.c_str());
+    const float padX = ui::Px(8.0f), dot = ui::Px(4.0f), bandH = ui::Px(24.0f);
+    const float w = padX * 2.0f + dot * 2.0f + ui::Px(6.0f) + ts.x, h = std::min(bandH - ui::Px(4.0f), ts.y + ui::Px(6.0f));
+    const float x = io.DisplaySize.x - ui::Px(8.0f) - w, y = io.DisplaySize.y - bandH + (bandH - h) * 0.5f;
+    liveChipW_ = w + ui::Px(8.0f);
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(40, 14, 14, 255), h * 0.5f);
+    dl->AddCircleFilled(ImVec2(x + padX + dot, y + h * 0.5f), dot, IM_COL32(235, 60, 50, 255));
+    ui::AddTabularText(dl, ImVec2(x + padX + dot * 2.0f + ui::Px(6.0f), y + (h - ts.y) * 0.5f),
+                       IM_COL32(235, 238, 242, 255), text.c_str());
+    ImGui::PopFont();
+#endif
+}
+#endif
 
 #if MEDIAPLAYER_PRO
 // ---------------------------------------------------------------------------
@@ -5810,6 +5935,7 @@ void App::InitPro() {
             wantMouse = imgui_.WantCaptureMouse();
 #if defined(MEDIAPLAYER_WITH_IMGUI)
             wantKeys = ImGui::GetIO().WantTextInput || settingsPanel_.IsOpen();  // Settings has the keys (#265)
+            if (browsing_) wantKeys = wantMouse = true;  // the browser covers the station (#267)
 #endif
         }
 #if !(defined(__linux__) && !defined(__ANDROID__))

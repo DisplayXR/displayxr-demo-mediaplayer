@@ -27,6 +27,16 @@ hides or shows all the UI. **`F`** or **`F11`** is full screen with only the pic
 - **A file**: click **Open** (or `Ctrl+O`), or drag the file onto the window. Movies (ProRes,
   DNxHR, H.264 / H.265, MXF), stills (JPEG, PNG, TIFF, MPO, LIF) and image sequences (EXR,
   DPX, TIFF: open any frame of the sequence).
+- **The media browser** (Windows, optional): with **Settings > Opening files > Use the media
+  browser for Open** on, Open and `Ctrl+O` show a grid of thumbnails instead of the system
+  dialog. It lists **Recents**, **This folder** (the open file's folder, or the last folder
+  you opened) and **Pinned** folders (**Add folder...** pins an ingest folder or a network
+  share). A render's frames show as one tile, e.g. `shot.[1001-1240].exr`; opening it plays
+  the sequence. `Ctrl+O` inside the browser opens the system dialog; Esc closes it. It never
+  opens by itself at start. While a capture runs it shows no thumbnails ("Thumbnails paused
+  while capture runs"), so it takes nothing from the capture, and a **LIVE** chip with the
+  input and timecode stays in its bottom-right corner. On macOS and Linux the setting is
+  greyed ("Windows only").
 - **A folder**: the arrow beside **Open**, then **Open folder...** (or `Ctrl+Shift+O`). Its first
   file opens and `Down` / `Up` walk the folder. The same menu lists the **Recent** files and
   folders (kept in `%APPDATA%\DisplayXR\MediaPlayerPro\recent.txt`).
@@ -390,6 +400,9 @@ The gear at the right end of the top bar, **Ctrl+,**, or the **Settings** button
 of the Station panel opens the Settings window. Esc closes it. While the panels are pinned
 and shown flat, the window is flat too.
 
+- **Opening files:** **Use the media browser for Open** (off by default; see
+  [Opening something](#opening-something)), and the browser's sources: **This folder** (on),
+  **Media folders** (the Windows Search index, off) and **Pictures, Videos, Downloads** (off).
 - **Station:** the path of the station file, `pro.env`, with **Open folder**. That file holds
   the start-time levers (capture, 10-bit atlas, DisplayXR runtime knobs) and applies at the
   next start; it is not edited here.
@@ -404,6 +417,10 @@ another file (`off` = keep nothing).
 
 | Key | Default |
 |---|---|
+| `browser.enabled` | `0` |
+| `browser.source.this_folder` | `1` |
+| `browser.source.index` | `0` |
+| `browser.source.libraries` | `0` |
 | `rig.budget.near_pct` | `-2` |
 | `rig.budget.far_pct` | `1` |
 | `rig.budget.vertical_px` | `1` |

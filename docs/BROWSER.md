@@ -215,8 +215,9 @@ eye in the left-eye views, its right eye in the others. Android only.
 
 ## Desktop (Windows)
 
-Phase 1 of #252: the 2D browser in the consumer player on Windows. Pro keeps its station
-panels, and macOS / Linux keep the system dialog until they get a provider.
+Phase 1 of #252: the 2D browser in the consumer player on Windows. Media Player Pro has it
+as an opt-in Open dialog (#267, below). macOS / Linux keep the system dialog until they get a
+provider.
 
 **When it shows.** Open and Ctrl+O show it when there is no workspace picker (inside a
 workspace the shell's picker keeps Open). "Other files..." opens the system dialog. It
@@ -225,6 +226,36 @@ goes back to the player. The basic player also starts in it when launched with n
 Open would: the shell's picker inside a workspace), on the place last shown
 (`browser_view.txt` keeps `source=` / `folder=` beside the view); a file on the command line
 opens directly. `MEDIAPLAYER_NO_BROWSER_AT_START=1` keeps the idle screen at launch.
+
+**In Pro** (#267). Built into the Windows binary, used only when Settings > Opening files >
+**Use the media browser for Open** (`browser.enabled`) is on; it is off by default, and turning
+it on or off needs no restart. Off, Open behaves as before (picker, then the system dialog)
+and nothing of the browser exists: it is made on the first Open that wants it (log
+`browser: made for Open`). On, it differs from the basic player in these ways:
+
+- Open, Ctrl+O and "Open file..." show it; it never shows at launch (no `browser.at_start`).
+  Ctrl+O inside it still opens the system dialog, and "Open folder..." is unchanged.
+- Sources: **Recents**, **This folder** (the open file's folder, else the newest folder in
+  Recent: a folder opened, or a file's folder; `browser.source.this_folder`) and **Pinned**.
+  Pictures / Videos / Downloads (`browser.source.libraries`) and Media folders
+  (`browser.source.index`) are off: the index misses network shares and its software filter
+  hides plate and texture folders. Settings can turn them on.
+- 2D grid only: no All / 3D / 2D control, no 3D grid, no rendering-mode borrow (the panel
+  keeps its mode; the browser goes out as a flat Local2D layer where the runtime takes one).
+  The 3D grid would draw into the projection atlas the monitored picture uses.
+- Folder walks stop at depth 3 and 1.5 s a tree (6 and 3 s in the basic player), for slow
+  shares.
+- Numbered EXR / DPX / TIFF frames show as one tile per sequence (`SequenceTiles.h`, keyed by
+  `imageseq::Key` and the padding), named `shot.[1001-1240].exr`, with the frames' total size.
+  It opens its lowest frame, which plays the sequence.
+- Capture first: while a DeckLink input or the test signal streams
+  (`Station::CaptureActive()`), the browser asks for no thumbnails and takes none, so the
+  thumbnail thread and the 3D classifier sit idle, and shows "Thumbnails paused while
+  capture runs." It resumes 2 s after the capture stops (`BackgroundGate.h`; log
+  `browser: thumbnails paused` / `resumed`). Listing still works. A **LIVE: <input>
+  <timecode>** chip sits at the right end of the status bar while a live input runs.
+- Tests: `MEDIAPLAYER_OPEN_AT=<frame>` presses Open once; `MEDIAPLAYER_SHOW_BROWSER` works
+  when the setting is on; `MEDIAPLAYER_SHOW_SETTINGS=1` opens the Settings window.
 
 **Sources** (`WindowsMediaProvider`, declared through `MediaLibrary::SetSources`):
 

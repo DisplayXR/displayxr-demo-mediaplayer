@@ -2,6 +2,7 @@
 #include "browser/WindowsMediaProvider.h"
 
 #include "Log.h"
+#include "browser/SequenceTiles.h"
 #include "browser/WinShellMedia.h"
 #include "media/LifLoader.h"
 #include "media/MediaSource.h"
@@ -23,11 +24,9 @@ namespace mp::browser {
 namespace {
 
 // The sidebar, in order. Each source holds the items with its bit.
-enum Bit { kRecents = 0, kPictures, kVideos, kDownloads, kIndex, kPinned };
+enum Bit { kRecents = 0, kPictures, kVideos, kDownloads, kIndex, kPinned, kThisFolder };
 
 constexpr int kNewest = 50;              // Media folders' Newest tile
-constexpr double kWalkBudgetMs = 3000.0;  // per folder tree (libraries, Downloads, a pin)
-constexpr int kWalkDepth = 6;
 
 // What the player opens, and whether it is a video, by extension alone (quietly:
 // MediaSource::Identify logs each call, and a walk sees thousands of files).
@@ -124,6 +123,22 @@ void WindowsMediaProvider::SetSources(bool libraries, bool index) {
     index_ = index;
 }
 
+void WindowsMediaProvider::SetThisFolder(std::string folder) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    thisFolder_ = std::move(folder);
+}
+
+void WindowsMediaProvider::SetWalkLimits(int depth, double budgetMs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    walkDepth_ = depth;
+    walkBudgetMs_ = budgetMs;
+}
+
+void WindowsMediaProvider::SetCollapseSequences(bool on) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    collapseSequences_ = on;
+}
+
 std::string WindowsMediaProvider::PathOf(int64_t id) const {
     std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex_));
     const auto it = paths_.find(id);
@@ -195,6 +210,10 @@ void WindowsMediaProvider::ListWorker() {
     for (;;) {
         std::vector<std::string> recents, pinned, hidden;
         bool libraries = true, useIndex = true;
+        std::string thisFolder;
+        int walkDepth = 6;
+        double walkBudgetMs = 3000.0;
+        bool collapse = false;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             listWake_.wait(lock, [this] { return stop_ || refresh_; });
@@ -204,6 +223,10 @@ void WindowsMediaProvider::ListWorker() {
             pinned = pinned_;
             libraries = libraries_;
             useIndex = index_;
+            thisFolder = thisFolder_;
+            walkDepth = walkDepth_;
+            walkBudgetMs = walkBudgetMs_;
+            collapse = collapseSequences_;
             for (const std::string& h : hidden_) {
                 std::string k = Slashes(h, true);
                 for (char& c : k) c = (char)std::tolower((unsigned char)c);
@@ -239,8 +262,8 @@ void WindowsMediaProvider::ListWorker() {
         };
         auto walk = [&](const std::string& folder, int bit) {
             std::vector<win::FoundFile> found;
-            const bool complete = win::WalkFolder(folder, kWalkDepth, win::NowMs() + kWalkBudgetMs, Accept, found);
-            if (!complete) LOG_WARN("browser: %s - walk cut short after %.0f ms", folder.c_str(), kWalkBudgetMs);
+            const bool complete = win::WalkFolder(folder, walkDepth, win::NowMs() + walkBudgetMs, Accept, found);
+            if (!complete) LOG_WARN("browser: %s - walk cut short after %.0f ms", folder.c_str(), walkBudgetMs);
             for (win::FoundFile& f : found) add(std::move(f), bit, 0);
         };
 
@@ -259,6 +282,7 @@ void WindowsMediaProvider::ListWorker() {
         for (const std::string& f : videos) walk(f, kVideos);
         if (!downloads.empty()) walk(downloads, kDownloads);
         for (const std::string& f : pinned) walk(f, kPinned);
+        if (!thisFolder.empty()) walk(thisFolder, kThisFolder);
         std::vector<win::FoundFile> indexed;
         std::string error;
         win::IndexSkipped skipped;
@@ -296,6 +320,7 @@ void WindowsMediaProvider::ListWorker() {
             return sources.back();
         };
         source(SourceKind::Recents, "Recents", kRecents).byOrder = true;
+        if (!thisFolder.empty()) tree(source(SourceKind::ThisFolder, "This folder", kThisFolder), {thisFolder});
         if (libraries) {
             tree(source(SourceKind::Pictures, "Pictures", kPictures), pictures);
             tree(source(SourceKind::Movies, "Videos", kVideos), videos);
@@ -313,6 +338,35 @@ void WindowsMediaProvider::ListWorker() {
             for (const std::string& r : pinned) s.roots.push_back(Slashes(r, true));
         }
 
+        // Pro (#267): a render's frames as one item per sequence, kept on its lowest frame
+        // (which opens the sequence), with every frame's sources, the newest Recent place and
+        // the frames' total size.
+        std::unordered_map<int64_t, std::string> seqNames;
+        if (collapse) {
+            std::vector<int64_t> ids;
+            std::vector<std::string> framePaths;
+            for (const auto& kv : all) {
+                ids.push_back(kv.first);
+                framePaths.push_back(kv.second.file.path);
+            }
+            size_t folded = 0;
+            for (const SequenceTile& t : GroupSequences(framePaths)) {
+                Entry& keep = all[ids[t.first]];
+                for (size_t m : t.members) {
+                    if (m == t.first) continue;
+                    const Entry& e = all[ids[m]];
+                    if ((e.bits & (1ull << kRecents)) && (!(keep.bits & (1ull << kRecents)) || e.order < keep.order))
+                        keep.order = e.order;
+                    keep.bits |= e.bits;
+                    keep.file.bytes += e.file.bytes;  // the size shown is the whole sequence's
+                    all.erase(ids[m]);
+                    ++folded;
+                }
+                seqNames[ids[t.first]] = SequenceTileName(keep.file.name, t.firstFrame, t.lastFrame);
+            }
+            if (folded) LOG_INFO("browser: %zu sequence(s), %zu frames folded into them", seqNames.size(), folded);
+        }
+
         std::vector<MediaItem> items;
         std::unordered_map<int64_t, std::string> paths;
         std::unordered_map<int64_t, bool> cloud;
@@ -322,7 +376,8 @@ void WindowsMediaProvider::ListWorker() {
             const win::FoundFile& f = kv.second.file;
             MediaItem m;
             m.id = kv.first;
-            m.name = f.name;
+            const auto seq = seqNames.find(kv.first);
+            m.name = seq != seqNames.end() ? seq->second : f.name;
             m.type = f.video ? MediaType::Video : MediaType::Image;
             m.dateMs = f.dateMs;
             m.modified = f.modified;

@@ -338,6 +338,7 @@ function(mp_add_player tgt is_pro)
         $<$<PLATFORM_ID:Windows>:src/browser/WinShellMedia.cpp>
         $<$<PLATFORM_ID:Windows>:src/browser/CloudFetch.cpp>  # a cloud file downloads before it opens
         $<$<PLATFORM_ID:Windows>:src/browser/WindowsMediaProvider.cpp>
+        $<$<PLATFORM_ID:Windows>:src/browser/SequenceTiles.cpp>  # Pro: a render's frames as one tile (#267)
         ${MP_IMGUI_SOURCES}
     )
 
@@ -1068,6 +1069,11 @@ if(MP_BUILD_TESTS)
     add_executable(image_sequence_test tests/image_sequence_test.cpp src/media/ImageSequence.cpp)
     target_include_directories(image_sequence_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME image_sequence COMMAND image_sequence_test)
+    # The media browser in Pro (#267): sequences as one tile, the capture gate. Pure.
+    add_executable(pro_browser_test tests/pro_browser_test.cpp src/browser/SequenceTiles.cpp
+        src/media/ImageSequence.cpp)
+    target_include_directories(pro_browser_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME pro_browser COMMAND pro_browser_test)
     if(TARGET PkgConfig::FFMPEG OR TARGET mp_ffmpeg)
         add_executable(decode_formats_test tests/decode_formats_test.cpp src/media/VideoDecoder.cpp
             src/media/StreamUrl.cpp src/media/ImageSequence.cpp src/Log.cpp)
