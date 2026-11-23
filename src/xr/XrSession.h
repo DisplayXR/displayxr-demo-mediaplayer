@@ -440,6 +440,7 @@ private:
     //! binding extension to enable).
     bool linuxWayland_ = false;
     bool hasWeaveExt_ = false;          //!< XR_DXR_weave: the drag's phase snap
+    bool hasWorkspaceInputExt_ = false; //!< XR_DXR_workspace_client_input: input under the workspace
     DxrLinuxWindow* linuxWin_ = nullptr; //!< the bound window (snap provider installed)
     std::unique_ptr<DxrWeaveSnap> weaveSnap_;
 #endif
