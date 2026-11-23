@@ -65,6 +65,7 @@ Glyph DeskSourceIcon(SourceKind kind) {
         case SourceKind::Recents: return Glyph::Recent;
         case SourceKind::Folders: return Glyph::Folder;
         case SourceKind::Pinned: return Glyph::Pin;
+        case SourceKind::ThisFolder: return Glyph::Folder;  // Pro (#267)
     }
     return Glyph::Unsupported;
 }
@@ -389,8 +390,8 @@ void MediaBrowser::DeskToolbar(ImVec2 min, ImVec2 max) {
         }
     }
 
-    // All · 3D · 2D: a segmented control.
-    {
+    // All · 3D · 2D: a segmented control. Not in Pro, which has no 3D grid (#267).
+    if (allowStereo_) {
         const char* labels[] = {"All", "3D", "2D"};
         const DepthFilter values[] = {DepthFilter::Both, DepthFilter::Only3D, DepthFilter::Only2D};
         const char* tips[] = {"Every file", "3D photos and videos (the panel goes 3D)", "2D photos and videos"};
@@ -415,8 +416,8 @@ void MediaBrowser::DeskToolbar(ImVec2 min, ImVec2 max) {
             x += w;
         }
         dl->AddRect(ImVec2(x0, y), ImVec2(x, y + h), kLineStrong, r, 0, Px(1.0f));
+        x += Round(Px(8.0f));
     }
-    x += Round(Px(8.0f));
 
     // The type: icons, all / videos / photos.
     {
@@ -726,14 +727,14 @@ void MediaBrowser::DeskStatusBar(ImVec2 min, ImVec2 max) {
     DeskFont f(DeskText::Meta);
     const float pad = Round(Px(12.0f)), gap = Round(Px(16.0f));
     const float ty = min.y + Round((max.y - min.y - ImGui::GetFontSize()) * 0.5f);
-    float x = min.x + pad, right = max.x - pad;
+    float x = min.x + pad, right = max.x - pad - statusReserve_;
     if (!listed_) return;
 
     // At the right, the hint, when there is room for it beside the rest.
     const char* hint = details_ ? "Click opens  \xC2\xB7  Ctrl/Shift+click selects  \xC2\xB7  Click Date to sort"
                                 : "Click opens  \xC2\xB7  Ctrl/Shift+click selects";
     const float hintW = ImGui::CalcTextSize(hint).x;
-    if (max.x - min.x >= Px(details_ ? 900.0f : 760.0f)) {
+    if (max.x - min.x - statusReserve_ >= Px(details_ ? 900.0f : 760.0f)) {
         dl->AddText(ImVec2(right - hintW, ty), kTextFaint, hint);
         right -= hintW + gap;
     }
