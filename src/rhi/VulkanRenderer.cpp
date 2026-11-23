@@ -1897,7 +1897,12 @@ void VulkanRenderer::SubmitFrame() {
             LOG_ERROR("zero-copy fence: signal submit failed, back to draining the ring (logged once)");
         }
     } else if (fencedSubmit) {
-        fencedSubmit = false;  // the frame never went: drain as before
+        // The frame never went, but the wait-submit already signalled zcBridge_ and nothing
+        // waits it now. Signalling a signalled binary semaphore is invalid, so the bridge can't
+        // be used again: latch back to draining for the rest of the session.
+        fenceFailed_ = true;
+        fencedSubmit = false;
+        LOG_ERROR("zero-copy fence: frame submit failed after the wait submit, back to draining the ring (logged once)");
     }
 #else
     const VkResult r = ring_.endFrame();  // EXACTLY one vkQueueSubmit, slot fence, no wait
