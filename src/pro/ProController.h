@@ -262,7 +262,8 @@ public:
     bool PanelsShown() const { return inspectorPinned_ && panelsFit_; }
     bool ProbeOn() const { return probeOn_; }
     bool KeepHudAwake() const {
-        return PanelsShown() || depthOverlay_ || OverlaysOn() || scopesOn_ || station_.ColourOverlay() != 0;
+        return PanelsShown() || depthOverlay_ || OverlaysOn() || scopesOn_ || station_.ColourOverlay() != 0 ||
+               disparityCard_ || disparityHeatmap_;
     }
 
     ViewMode Mode() const { return mode_; }
@@ -284,6 +285,12 @@ private:
     void SetMode(ViewMode m, bool announce);
     void BuildDepthOverlay(const Status& st);
     void BuildColourOverlay(const Status& st);  // #270: the colour difference between the eyes
+    // #268 disparity readout: the card at the picture's top-left (near / median / far in %
+    // and displayed px, the histogram against the budget, as shown with convergence, the
+    // value under the cursor) and the dense heatmap under the depth overlay's dots.
+    void BuildDisparityCard(const Status& st);
+    void BuildDisparityHeatmap(const Status& st);
+    void BuildDisparityToggles();  // the Rig check section's checkboxes
     void BuildWipeLine(const Status& st);
     void SetWipe(Wipe w, bool announce);
     void BuildOverlays(const Status& st, float uiAlpha);
@@ -414,6 +421,19 @@ private:
     float budgetSeen_[5] = {};
     Station station_;
     bool depthOverlay_ = false;    // D: the rig check's depth matches drawn on the picture
+    // #268: settings qc.disparity.readout / qc.disparity.heatmap (off by default; env
+    // stand-ins MEDIAPLAYER_PRO_DISPARITY / _DISPARITY_HEATMAP until the settings store).
+    bool disparityCard_ = false, disparityHeatmap_ = false, heatmapBudgetOnly_ = false;
+    bool heatmapSent_ = false;                       // what the rig worker was last told
+    float testDispU_ = -1.0f, testDispV_ = -1.0f;    // MEDIAPLAYER_PRO_DISPARITY_PROBE: a fixed cursor
+    uint64_t heatSeq_ = 0;                           // the dense map last uploaded
+    rig::DenseMap heat_;
+    std::vector<uint8_t> heatRgba_;
+    // the cursor probe, re-run when the point moves or at most ~15 times a second
+    float dispProbeU_ = -1.0f, dispProbeV_ = -1.0f;
+    double dispProbeAt_ = 0.0;
+    rig::Probe dispProbe_ = rig::Probe::None;
+    float dispProbePct_ = 0.0f, dispProbeConf_ = 0.0f;
 
     // Channel isolation, display gamma trim and the wipe (position across the picture as
     // shown, dragged with the left button near the line).
