@@ -287,7 +287,16 @@ The **Rig check** section (Inspector) shows, each in green, amber or red:
   the picture; without it the line says *needs texture top and bottom*. Hover it for the
   roll, vertical error and keystone next to it.
 - **Eye sync**: the two eyes from different moments (frames apart).
-- **Colour match**: the eyes differ in colour or brightness.
+- **Colour match**: the eyes differ in colour or brightness. Under it, per channel, how
+  much brighter the right eye is than the left (`R +2.1 % G +0.4 % B -1.8 % | Y +0.6 %
+  (+0.01 stop)`), each in green, amber or red against the gain limit. It is measured on
+  the source's own values (before your grade), on the part of the picture both eyes see.
+  Hover it for the lift (an offset rather than a gain) and a *shape* score (below 0.9: the
+  difference is a curve, not a simple gain). **Copy fix (.cc)** puts an ASC CDL on the
+  clipboard: applied to the **right** eye in your grading tool, it matches it to the left.
+  **Colour difference** (off / luma / chroma) tints the picture where the eyes differ:
+  luma red where the right eye is brighter, blue where darker; chroma shows the hue of the
+  right eye's colour cast. A radial pattern is vignetting.
 - **Depth range**: how far in front of and behind the screen the scene goes, against your
   depth budget.
 - **Frame edges**: something in front of the screen that the left or right edge of the
@@ -318,6 +327,7 @@ The defaults, and how to change them when starting the player:
 | Colour match | dE 2 | `--colour-limit=2` |
 | Frame edges (nearest allowed at the edge) | -0.3 % | `--edge-limit=-0.3` |
 | Scale (size difference between the eyes) | 0.5 % | `MEDIAPLAYER_RIG_BUDGET_SCALE_PCT=0.5` in `pro.env`; `MEDIAPLAYER_QC_SCALE_CHECK=0` hides the line and its alerts |
+| Colour gain (any channel) | 2 % | `MEDIAPLAYER_RIG_BUDGET_GAIN_PCT=2` in `pro.env`; `MEDIAPLAYER_QC_COLOR_CHECK=0` hides the line and its alerts |
 
 The limits are also in **Settings > Rig check budget** (see [Settings](#settings)), which
 keeps them for the next run, as does the `set_depth_budget` agent tool and the Inspector's

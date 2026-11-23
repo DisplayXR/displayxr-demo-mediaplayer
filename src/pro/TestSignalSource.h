@@ -7,7 +7,9 @@
 // have something to find:
 //   vShiftPx     right eye moved down by this many pixels (vertical misalignment)
 //   eyeDelay     right eye shows the scene this many frames late (eye sync)
-//   gainR        right eye brightness x this (colour match; photo mode: red channel)
+//   gainR/G/B    right eye's R' / G' / B' x this (colour match, #270: per channel on the
+//                code values, also in the drawn scene, where gainR used to scale luma)
+//   liftR        added to the right eye's R' (0..1 of full scale)
 //   depthScale   scene disparities x this (photo mode: extra crossed parallax)
 //   rollDeg      right eye rotated about its centre by this many degrees (+ = clockwise
 //                on screen: its right side lower), the rig check's roll
@@ -16,7 +18,7 @@
 // Photo mode (image=<side-by-side still>): the rig shows a real stereo photo, panned
 // slowly so there is motion for the eye-sync check, with the same faults applied.
 // --test-signal[=WxH@fps][,image=<path>] and the MEDIAPLAYER_TEST_* env vars set it
-// (MEDIAPLAYER_TEST_ROLL and MEDIAPLAYER_TEST_SCALE are read by Open itself).
+// (MEDIAPLAYER_TEST_ROLL, _SCALE, _GAIN_G, _GAIN_B and _LIFT_R are read by Open itself).
 //
 // The wire format (#238), read by Open:
 //   default                         8-bit NV12, as always
@@ -56,6 +58,8 @@ struct TestSignalConfig {
     float vShiftPx = 0.0f;
     int eyeDelay = 0;
     float gainR = 1.0f;
+    float gainG = 1.0f, gainB = 1.0f;  // #270
+    float liftR = 0.0f;
     float depthScale = 1.0f;       // multiplies every disc's disparity
     float rollDeg = 0.0f;          // right-eye roll, degrees (+ = clockwise on screen)
     float scale = 1.0f;            // right-eye zoom about its centre (#269)

@@ -4,6 +4,7 @@
 // known: its discs sit at fixed parallaxes (TestSignalSource::kDisparity), and the
 // faults are dialled in. A clean rig must read as clean; each fault must be found.
 
+#include "color/Cdl.h"
 #include "pro/LivePixels.h"
 #include "pro/RigCheck.h"
 #include "pro/TestSignalSource.h"
@@ -15,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -297,6 +299,203 @@ void ScaleAlert() {
             CHECK(a.empty(), "qc.scale_check off: no scale alert");
         }
     }
+}
+
+// --- Colour (#270) ---------------------------------------------------------------------
+
+std::vector<uint8_t> ToRgba(const livepix::Nv12& px);  // below, with the stills
+
+rig::EyePair DownTest(const TestSignalConfig& cfg, int64_t frame = 30) {
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, frame, px);
+    rig::EyePair e;
+    rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, e);
+    return e;
+}
+
+void ColourGains() {
+    // each channel's gain on its own, 0.97 / 1.00 / 1.03: that channel moves, the others not
+    const char* names = "RGB";
+    for (int c = 0; c < 3; ++c)
+        for (float g : {0.97f, 1.00f, 1.03f}) {
+            TestSignalConfig cfg;
+            (c == 0 ? cfg.gainR : c == 1 ? cfg.gainG : cfg.gainB) = g;
+            const rig::ColourMatch m = rig::MeasureColour(DownTest(cfg));
+            std::printf("  gain %c %.2f: R %+.2f%% G %+.2f%% B %+.2f%% | lift R %+.2f G %+.2f B %+.2f | shape %.2f %.2f %.2f | Y %+.2f%%\n",
+                        names[c], g, m.gainPct[0], m.gainPct[1], m.gainPct[2], m.liftPct[0], m.liftPct[1], m.liftPct[2],
+                        m.shape[0], m.shape[1], m.shape[2], m.lumaPct);
+            char msg[96];
+            std::snprintf(msg, sizeof(msg), "gain %c %.2f recovered within +-0.3 %%", names[c], g);
+            CHECK(m.measured && std::fabs(m.gainPct[c] - (g - 1.f) * 100.f) < 0.3f, msg);
+            std::snprintf(msg, sizeof(msg), "gain %c %.2f: the other channels stay within +-0.3 %%", names[c], g);
+            CHECK(std::fabs(m.gainPct[(c + 1) % 3]) < 0.3f && std::fabs(m.gainPct[(c + 2) % 3]) < 0.3f, msg);
+            std::snprintf(msg, sizeof(msg), "gain %c %.2f: no lift read (+-0.3 %%)", names[c], g);
+            CHECK(std::fabs(m.liftPct[0]) < 0.3f && std::fabs(m.liftPct[1]) < 0.3f && std::fabs(m.liftPct[2]) < 0.3f, msg);
+        }
+    // a lift on red: lift, not gain
+    for (float l : {-0.02f, 0.02f}) {
+        TestSignalConfig cfg;
+        cfg.liftR = l;
+        const rig::ColourMatch m = rig::MeasureColour(DownTest(cfg));
+        std::printf("  lift R %+.2f: gain R %+.2f%% lift R %+.2f%% (G %+.2f B %+.2f)\n", l, m.gainPct[0], m.liftPct[0],
+                    m.liftPct[1], m.liftPct[2]);
+        CHECK(m.measured && std::fabs(m.liftPct[0] - l * 100.f) < 0.3f, "lift R recovered within +-0.3 % of full scale");
+        CHECK(std::fabs(m.gainPct[0]) < 0.3f, "a lift is not read as a gain");
+    }
+    // matched eyes: dE (now over the overlap) stays small, the shape is ~1
+    const rig::Result r = MeasureTest(TestSignalConfig{});
+    std::printf("  matched: dE %.2f shape %.3f %.3f %.3f luma %+.2f%% (%+.3f stop)\n", r.deltaE, r.colour.shape[0],
+                r.colour.shape[1], r.colour.shape[2], r.colour.lumaPct, r.colour.lumaStops);
+    CHECK(r.ok && r.deltaE < 0.5f, "dE on matched eyes under 0.5");
+    CHECK(r.colour.shape[0] > 0.9f && r.colour.shape[1] > 0.9f && r.colour.shape[2] > 0.9f, "matched: shape ~1");
+}
+
+// The live picture moves: single readings over 6 s of the moving scene, and their median
+// (what RigMonitor shows, the median of the last 5).
+void ColourOverFrames() {
+    TestSignalConfig cfg;
+    cfg.gainR = 1.03f;
+    cfg.gainB = 0.98f;
+    std::vector<float> r, b;
+    for (int64_t f = 30; f <= 390; f += 30) {
+        const rig::ColourMatch m = rig::MeasureColour(DownTest(cfg, f));
+        r.push_back(m.gainPct[0]);
+        b.push_back(m.gainPct[2]);
+    }
+    std::vector<float> rs = r, bs = b;
+    std::sort(rs.begin(), rs.end());
+    std::sort(bs.begin(), bs.end());
+    std::printf("  over 13 frames: R %+.2f..%+.2f (median %+.2f)  B %+.2f..%+.2f (median %+.2f)\n", rs.front(), rs.back(),
+                rs[rs.size() / 2], bs.front(), bs.back(), bs[bs.size() / 2]);
+    CHECK(std::fabs(rs[rs.size() / 2] - 3.f) < 0.3f && std::fabs(bs[bs.size() / 2] + 2.f) < 0.3f,
+          "moving scene: the median reading within +-0.3 %");
+}
+
+// A bright object only in the left eye's outer band (the left 6 % of the left eye, which
+// the right eye does not see) must not move the gains: the overlap mask leaves it out.
+void ColourOverlapMask() {
+    TestSignalConfig cfg;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    rig::EyePair e;
+    rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, e);
+    const rig::ColourMatch clean = rig::MeasureColour(e);
+    const float dEClean = rig::DeltaE76(e.meanRgb[0], e.meanRgb[1]);
+    const int w = cfg.eyeW, h = cfg.eyeH;
+    for (int y = h * 3 / 10; y < h * 6 / 10; ++y)
+        for (int x = w / 100; x < w * 6 / 100; ++x) px.y[(size_t)y * px.width + x] = 230;  // white, left eye only
+    rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, e);
+    const rig::ColourMatch edge = rig::MeasureColour(e);
+    const float dEEdge = rig::DeltaE76(e.meanRgb[0], e.meanRgb[1]);
+    std::printf("  left-band object: gain R %+.3f/%+.3f G %+.3f/%+.3f B %+.3f/%+.3f %% dE %.3f/%.3f\n", clean.gainPct[0],
+                edge.gainPct[0], clean.gainPct[1], edge.gainPct[1], clean.gainPct[2], edge.gainPct[2], dEClean, dEEdge);
+    bool same = true;
+    for (int c = 0; c < 3; ++c)
+        same = same && std::fabs(edge.gainPct[c] - clean.gainPct[c]) < 0.05f && std::fabs(edge.liftPct[c] - clean.liftPct[c]) < 0.05f;
+    CHECK(edge.measured && same, "an object in the left eye's outer band leaves the gains alone");
+    CHECK(std::fabs(dEEdge - dEClean) < 0.05f, "... and the dE");
+}
+
+// Matte rows (a letterbox) count in neither eye.
+void ColourLetterbox() {
+    TestSignalConfig cfg;
+    cfg.gainB = 1.03f;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    for (int y = 0; y < px.height; ++y)
+        if (y < px.height / 8 || y >= px.height * 7 / 8) {
+            std::fill(px.y.begin() + (size_t)y * px.width, px.y.begin() + (size_t)(y + 1) * px.width, (uint8_t)16);
+            if (y % 2 == 0)
+                std::fill(px.uv.begin() + (size_t)(y / 2) * px.width, px.uv.begin() + (size_t)(y / 2 + 1) * px.width, (uint8_t)128);
+        }
+    rig::EyePair e;
+    rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, e);
+    const rig::ColourMatch m = rig::MeasureColour(e);
+    std::printf("  letterboxed, gain B 1.03: B %+.2f%% lift B %+.2f%% (bins 0: %u / %u of %lld)\n", m.gainPct[2], m.liftPct[2],
+                e.hist[0][3][0], e.hist[1][3][0], (long long)e.colourSamples[0]);
+    CHECK(m.measured && std::fabs(m.gainPct[2] - 3.f) < 0.3f, "letterboxed: the gain still reads");
+    CHECK(e.hist[0][3][0] < (uint32_t)(e.colourSamples[0] / 100), "letterbox rows are not in the histogram");
+}
+
+// The .cc the panel copies, applied to the right eye as a grading tool would (ASC CDL on the
+// code values), brings the gains under 0.5 %.
+void ColourFixRoundTrip() {
+    TestSignalConfig cfg;
+    cfg.gainR = 1.03f;
+    cfg.gainG = 0.98f;
+    cfg.gainB = 1.02f;
+    cfg.liftR = 0.01f;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    std::vector<uint8_t> rgba = ToRgba(px);
+    rig::EyePair e;
+    rig::DownsampleRgba(rgba.data(), px.width, px.height, StereoLayout::SbsFull, 640, e);
+    const rig::ColourMatch before = rig::MeasureColour(e);
+    const std::string cc = rig::ColourFixCc(before);
+    color::Cdl cdl;
+    std::string err;
+    CHECK(color::ParseCdl(cc, cdl, err), "the .cc parses as an ASC CDL");
+    for (int y = 0; y < px.height; ++y)
+        for (int x = px.width / 2; x < px.width; ++x) {  // the right eye only
+            uint8_t* p = &rgba[((size_t)y * px.width + x) * 4];
+            for (int k = 0; k < 3; ++k) {
+                const float v = std::clamp(p[k] / 255.f * cdl.slope[k] + cdl.offset[k], 0.f, 1.f);
+                p[k] = (uint8_t)std::lround(std::pow(v, cdl.power[k]) * 255.f);
+            }
+        }
+    rig::DownsampleRgba(rgba.data(), px.width, px.height, StereoLayout::SbsFull, 640, e);
+    const rig::ColourMatch after = rig::MeasureColour(e);
+    std::printf("  .cc fix: before R %+.2f G %+.2f B %+.2f %% (lift R %+.2f) -> after R %+.2f G %+.2f B %+.2f %%\n",
+                before.gainPct[0], before.gainPct[1], before.gainPct[2], before.liftPct[0], after.gainPct[0],
+                after.gainPct[1], after.gainPct[2]);
+    CHECK(before.measured && std::fabs(before.gainPct[1] + 2.f) < 0.4f, "still: the gains read before the fix");
+    CHECK(after.measured && std::fabs(after.gainPct[0]) < 0.5f && std::fabs(after.gainPct[1]) < 0.5f &&
+              std::fabs(after.gainPct[2]) < 0.5f,
+          "after the .cc: every gain under 0.5 %");
+}
+
+// The colour-difference overlay: right minus left per cell, the right eye sampled at the
+// median parallax. A brighter right eye reads positive luma everywhere; matched eyes ~0.
+void ColourDiffMap() {
+    auto stats = [](const rig::ColourDiff& d, float& med, int& n) {
+        std::vector<float> v;
+        for (float x : d.y)
+            if (!std::isnan(x)) v.push_back(x);
+        n = (int)v.size();
+        if (v.empty()) return;
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        med = v[v.size() / 2];
+    };
+    float m0 = 0, m1 = 0;
+    int n0 = 0, n1 = 0;
+    const rig::Result clean = MeasureTest(TestSignalConfig{});
+    stats(clean.colourDiff, m0, n0);
+    TestSignalConfig hot;
+    hot.gainG = 1.05f;  // G carries 72 % of luma
+    const rig::Result r = MeasureTest(hot);
+    stats(r.colourDiff, m1, n1);
+    std::printf("  colour diff map: %dx%d, clean median %+.4f (%d cells), G x1.05 median %+.4f (%d cells)\n",
+                r.colourDiff.cols, r.colourDiff.rows, m0, n0, m1, n1);
+    CHECK(clean.colourDiff.Ok() && n0 > clean.colourDiff.cols * clean.colourDiff.rows / 2, "the map covers the overlap");
+    CHECK(std::fabs(m0) < 0.003f, "matched eyes: the map is ~0");
+    CHECK(m1 > 0.005f, "a brighter right eye reads positive");
+}
+
+void ColourAlert() {
+    rig::RigMonitor m;
+    for (int i = 0; i <= 10; ++i) {
+        rig::Sample s;
+        s.t = 4000.0 + i * 0.25;
+        s.ok = true;
+        s.farPct = 0.5f;
+        s.colourMeasured = true;
+        s.gainPct[0] = 0.4f;
+        s.gainPct[2] = i < 8 ? (i == 3 ? -3.4f : -2.6f) : -0.5f;  // blue 2 s past the 2 % budget
+        m.AddSample(s, "01:00:00:00");
+    }
+    const std::vector<rig::Alert> a = m.Alerts();
+    std::printf("  colour gain alert: %s\n", a.empty() ? "(none)" : a.back().what.c_str());
+    CHECK(a.size() == 1 && a[0].what.find("Colour gain B -3.4% for 2 s (limit 2.0%)") == 0, "gain alert names the channel");
 }
 
 // --- Stills and top/bottom (#266) ------------------------------------------------------
@@ -848,6 +1047,11 @@ void ThreadedDownsampleIsExact() {
             for (int e = 0; e < 2; ++e)
                 for (int k = 0; k < 3; ++k) colourSame = colourSame && one.meanRgb[e][k] == many.meanRgb[e][k];
             CHECK(colourSame, "threaded mean colours bit-identical to one thread");
+            bool histSame = std::memcmp(one.hist, many.hist, sizeof(one.hist)) == 0 &&
+                            one.colourSamples[0] == many.colourSamples[0] && one.colourSamples[1] == many.colourSamples[1];
+            for (int e = 0; e < 2; ++e)
+                histSame = histSame && std::memcmp(one.grid[e].data(), many.grid[e].data(), one.grid[e].size() * sizeof(float)) == 0;
+            CHECK(histSame, "threaded histograms and colour grid bit-identical to one thread (#270)");
         }
     }
 #if defined(_WIN32)
@@ -871,6 +1075,13 @@ int main() {
     ScaleNeedsCoverage();
     SeededSearch();
     ScaleAlert();
+    ColourGains();
+    ColourOverFrames();
+    ColourOverlapMask();
+    ColourLetterbox();
+    ColourFixRoundTrip();
+    ColourDiffMap();
+    ColourAlert();
     StillsAndTopBottom();
     MonitorStill();
     TooFewMatches();

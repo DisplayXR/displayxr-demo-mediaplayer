@@ -22,6 +22,7 @@
 #include "pro/TestSignalSource.h"
 #include "rhi/RenderPerf.h"
 
+#include <algorithm>
 #include <functional>
 #include <string>
 #include <vector>
@@ -136,6 +137,10 @@ public:
     size_t SnapshotCount() const { return snapshots_.size(); }
 
     bool ShowHistory() const { return showHistory_; }
+    // #270: the colour-difference overlay the Rig check section toggles (0 off, 1 luma,
+    // 2 chroma direction); ProController draws it.
+    int ColourOverlay() const { return colourOverlay_; }
+    void SetColourOverlay(int mode) { colourOverlay_ = std::clamp(mode, 0, 2); }
     rig::Result RigLast() const { return rig_.Last(); }
     rig::Budget RigBudget() const { return rig_.GetBudget(); }
     const std::string& Timecode() const { return timecode_; }
@@ -185,6 +190,7 @@ private:
     int inputIndex_ = -1;
     bool showTimecode_ = true;
     bool showHistory_ = true;
+    int colourOverlay_ = 0;  // #270
     bool pendingSnapshot_ = false, pendingSwitch_ = false;
     std::string pendingSnapshotNote_;
     // DeckLink setup window

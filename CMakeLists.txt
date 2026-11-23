@@ -1059,7 +1059,7 @@ if(MP_BUILD_TESTS)
     add_test(NAME overlays COMMAND overlays_test)
     add_executable(rig_check_test tests/rig_check_test.cpp src/pro/RigCheck.cpp src/pro/TargetScreen.cpp src/pro/LivePixels.cpp
         src/pro/ConvertPool.cpp src/pro/LiveSourceBase.cpp src/pro/TestSignalSource.cpp src/media/ImageDecoder.cpp
-        src/Log.cpp)
+        src/color/Cdl.cpp src/Log.cpp)
     target_include_directories(rig_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
     target_link_libraries(rig_check_test PRIVATE Threads::Threads)

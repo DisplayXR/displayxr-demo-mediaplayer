@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <future>
 #include <iterator>
@@ -17,23 +18,6 @@
 namespace mp::rig {
 
 namespace {
-
-// Limited/full-range BT.709 Y'CbCr -> R'G'B' (0..1).
-void YuvToRgb(float y, float u, float v, bool fullRange, float rgb[3]) {
-    float yb, ub, vb;
-    if (fullRange) {
-        yb = y / 255.f;
-        ub = (u - 128.f) / 255.f;
-        vb = (v - 128.f) / 255.f;
-    } else {
-        yb = (y - 16.f) / 219.f;
-        ub = (u - 128.f) / 224.f;
-        vb = (v - 128.f) / 224.f;
-    }
-    rgb[0] = std::clamp(yb + 1.5748f * vb, 0.f, 1.f);
-    rgb[1] = std::clamp(yb - 0.1873f * ub - 0.4681f * vb, 0.f, 1.f);
-    rgb[2] = std::clamp(yb + 1.8556f * ub, 0.f, 1.f);
-}
 
 void ToLab(const float rgb[3], float lab[3]) {
     float lin[3];
@@ -127,25 +111,34 @@ bool EyeGeometry(StereoLayout layout, int frameW, int frameH, bool swapEyes, Eye
     return g.w >= 32 && g.h >= 32;
 }
 
-// Integer sums of one eye's mean-colour samples (three channels: Y'CbCr or R'G'B').
-struct Sums {
-    uint64_t c[3] = {};
+// #270: one eye's colour samples, in 12-bit code values (0..4095): the R'G'B' + luma
+// histograms and sums over the overlap, and the colour grid over the whole eye. All
+// integers, so any split of the rows over threads sums to the same.
+struct ColourAcc {
+    uint32_t hist[4][kHistBins] = {};
+    uint64_t sum[4] = {};
     int64_t n = 0;
+    std::vector<uint32_t> grid;  // kColourGridW * kColourGridH * 4: R, G, B sums + count (< 2^32 per cell)
 };
 
+// Colour samples are taken every kColourStep columns (one per 2x2 block, every other block) of
+// every kColourRowStep-th row: every 2nd column of every 7th row cost 60 % on top of the
+// downsample at 7680x2160, for no gain in the figures.
+constexpr int kColourStep = 4, kColourRowStep = 7;
+
+inline int To12(float v) { return std::clamp((int)(v * 4095.f + 0.5f), 0, 4095); }
+
 // The downsample shared by every pixel format: a box filter of each eye to the analysis
-// size and each eye's mean colour, on several threads. The format lives in the callbacks:
+// size and each eye's colour samples, on several threads. The format lives in the callbacks:
 //   addRow(eye, row, colSum)       add source row `row` (frame coordinates) of that eye's
 //                                  columns into colSum (g.w integer sums of luma)
-//   meanRow(eye, row, x0, x1, s)   add that eye's colour samples of columns [x0, x1) of
-//                                  eye-local row `row` into s
-//   toRgb(sums, rgb)               the mean (sums / sums.n) as display-referred R'G'B' 0..1
-// unit scales the luma sums to 0..255. Each analysis pixel and each mean is computed
-// exactly as on one thread (each output row is independent; each mean is summed on one
-// thread, and integer sums do not depend on their order).
-template <class AddRow, class MeanRow, class ToRgb>
-void DownsampleEyes(const EyeGeom& g, int analysisW, float unit, AddRow addRow, MeanRow meanRow, ToRgb toRgb,
-                    EyePair& out) {
+//   colourRow(eye, row, emit)      for every kColourStep-th column x of that eye's eye-local row `row`,
+//                                  emit(x, r, g, b, luma) in 12-bit R'G'B' code values
+// unit scales the luma sums to 0..255. Each analysis pixel and each colour figure is
+// computed exactly as on one thread (each output row is independent; the colour sums are
+// integers, whose total does not depend on their order).
+template <class AddRow, class ColourRow>
+void DownsampleEyes(const EyeGeom& g, int analysisW, float unit, AddRow addRow, ColourRow colourRow, EyePair& out) {
     const int aw = std::min(analysisW, g.w);
     const float sx = (float)g.w / (float)aw;
     // A squeezed top/bottom eye gets its displayed rows back (yStretch), so the vertical
@@ -188,30 +181,74 @@ void DownsampleEyes(const EyeGeom& g, int analysisW, float unit, AddRow addRow, 
             }
         }
     };
-    // Mean colour over the central 80 %: whole rows, every 7th. A sparse grid aliases with
-    // periodic content (a 16 px grid on a drifting 160 px grating read one eye 15 % brighter
-    // for a burst now and then, and the colour alert latched that peak - tmp-mp-pro
-    // 2026-10-18). Summed in integers per chunk of rows, so the total is exact.
-    const int rowFirst = g.h / 10, rowEnd = g.h * 9 / 10;
-    const int rowCount = rowFirst < rowEnd ? (rowEnd - rowFirst + 6) / 7 : 0;
-    const int xFirst = g.w / 10, xEnd = g.w * 9 / 10;
-    auto meanRows = [&](int eye, int kBegin, int kEnd) {
-        Sums s;
+    // Colour: whole rows, every kColourRowStep-th, every kColourStep-th column. A sparse grid aliases with periodic
+    // content (a 16 px grid on a drifting 160 px grating read one eye 15 % brighter for a
+    // burst now and then, and the colour alert latched that peak - tmp-mp-pro 2026-10-18).
+    // #270: the histograms, means and dE are over the OVERLAP only: within the parallax
+    // search range of an eye's edge (8 %) is scene the other eye may not see, so a bright
+    // object there moved dE with no camera mismatch. Both edge bands of both eyes are left
+    // out: dropping only each eye's outer band compared two different 8 % strips of every
+    // screen-plane object, a 0.1-0.4 % gain on matched eyes. Rows within 2 % of the top /
+    // bottom and matte rows (flat and dark: letterbox) are left out too.
+    const int rowFirst = g.h * 2 / 100, rowEnd = g.h * 98 / 100;
+    const int rowCount = rowFirst < rowEnd ? (rowEnd - rowFirst + kColourRowStep - 1) / kColourRowStep : 0;
+    const int ov = (int)std::lround(kOverlapEdge * g.w);
+    std::vector<uint16_t> cellOf((size_t)g.w);  // column -> colour grid column (no division per sample)
+    for (int x = 0; x < g.w; ++x) cellOf[x] = (uint16_t)(x * kColourGridW / g.w);
+    auto colourRows = [&](int eye, int kBegin, int kEnd) {
+        ColourAcc a;
+        a.grid.assign((size_t)kColourGridW * kColourGridH * 4, 0);
+        const int xLo = ov, xHi = g.w - ov;
+        // Straight into the totals; a matte row (rare) is taken out again afterwards. Row-
+        // local histograms merged per row cost more than the samples themselves.
+        auto add = [&](int y, uint32_t sign, uint64_t* rs, uint64_t* l2, int64_t* rn) {
+            uint32_t* gr = a.grid.data() + (size_t)std::min(kColourGridH - 1, y * kColourGridH / g.h) * kColourGridW * 4;
+            colourRow(eye, y, [&](int x, int r, int gg, int b, int l) {
+                uint32_t* c = gr + (size_t)cellOf[x] * 4;
+                c[0] += sign * (uint32_t)r;  // sign: 1, or ~0u (= -1 mod 2^32) to take a row out
+                c[1] += sign * (uint32_t)gg;
+                c[2] += sign * (uint32_t)b;
+                c[3] += sign;
+                if (x < xLo || x >= xHi) return;
+                a.hist[0][r >> kHistShift] += sign;
+                a.hist[1][gg >> kHistShift] += sign;
+                a.hist[2][b >> kHistShift] += sign;
+                a.hist[3][l >> kHistShift] += sign;
+                if (!rs) return;
+                rs[0] += (uint64_t)r;
+                rs[1] += (uint64_t)gg;
+                rs[2] += (uint64_t)b;
+                rs[3] += (uint64_t)l;
+                *l2 += (uint64_t)l * (uint64_t)l;
+                ++*rn;
+            });
+        };
         for (int k = kBegin; k < kEnd; ++k) {
-            meanRow(eye, rowFirst + 7 * k, xFirst, xEnd, s);
-            s.n += std::max(0, xEnd - xFirst);
+            const int y = rowFirst + kColourRowStep * k;
+            uint64_t rs[4] = {}, l2 = 0;
+            int64_t rn = 0;
+            add(y, 1u, rs, &l2, &rn);
+            if (rn > 0) {  // a matte row would pile both eyes' histograms into black
+                const double m = (double)rs[3] / (double)rn, var = (double)l2 / (double)rn - m * m;
+                if (m < 0.08 * 4095.0 && var < 25.0 * 25.0) {
+                    add(y, ~0u, nullptr, nullptr, nullptr);
+                    continue;
+                }
+            }
+            for (int c = 0; c < 4; ++c) a.sum[c] += rs[c];
+            a.n += rn;
         }
-        return s;
+        return a;
     };
     // Threads per eye: up to 4. MEDIAPLAYER_RIG_THREADS=<n> pins it (tests compare 1 vs n).
     int chunks = std::clamp((int)std::thread::hardware_concurrency() / 2, 1, 4);
     if (const char* t = std::getenv("MEDIAPLAYER_RIG_THREADS")) chunks = std::clamp(std::atoi(t), 1, 16);
     std::vector<std::future<void>> jobs;
-    std::vector<std::future<Sums>> means[2];
+    std::vector<std::future<ColourAcc>> colour[2];
     for (int eye = 0; eye < 2; ++eye)
         for (int c = 0; c < chunks; ++c) {
-            means[eye].push_back(std::async(std::launch::async, meanRows, eye, rowCount * c / chunks,
-                                            rowCount * (c + 1) / chunks));
+            colour[eye].push_back(std::async(std::launch::async, colourRows, eye, rowCount * c / chunks,
+                                             rowCount * (c + 1) / chunks));
             const int y0 = ah * c / chunks, y1 = ah * (c + 1) / chunks;
             if (c == chunks - 1 && eye == 1) continue;  // the last chunk runs here
             jobs.push_back(std::async(std::launch::async, lumaRows, eye, y0, y1));
@@ -219,13 +256,30 @@ void DownsampleEyes(const EyeGeom& g, int analysisW, float unit, AddRow addRow, 
     lumaRows(1, ah * (chunks - 1) / chunks, ah);
     for (auto& j : jobs) j.get();
     for (int eye = 0; eye < 2; ++eye) {
-        Sums t;
-        for (auto& m : means[eye]) {
-            const Sums s = m.get();
-            for (int k = 0; k < 3; ++k) t.c[k] += s.c[k];
-            t.n += s.n;
+        ColourAcc t;
+        t.grid.assign((size_t)kColourGridW * kColourGridH * 4, 0);
+        for (auto& f : colour[eye]) {
+            const ColourAcc a = f.get();
+            for (int c = 0; c < 4; ++c) {
+                for (int b = 0; b < kHistBins; ++b) t.hist[c][b] += a.hist[c][b];
+                t.sum[c] += a.sum[c];
+            }
+            t.n += a.n;
+            for (size_t i = 0; i < t.grid.size(); ++i) t.grid[i] += a.grid[i];
         }
-        if (t.n > 0) toRgb(t, out.meanRgb[eye]);
+        std::memcpy(out.hist[eye], t.hist, sizeof(t.hist));
+        out.colourSamples[eye] = t.n;
+        if (t.n > 0) {
+            for (int c = 0; c < 3; ++c) out.meanRgb[eye][c] = (float)((double)t.sum[c] / (double)t.n / 4095.0);
+            out.meanLuma[eye] = (float)((double)t.sum[3] / (double)t.n / 4095.0);
+        }
+        std::vector<float>& gd = out.grid[eye];
+        gd.assign((size_t)kColourGridW * kColourGridH * 3, std::nanf(""));
+        for (int i = 0; i < kColourGridW * kColourGridH; ++i) {
+            const uint32_t* s = t.grid.data() + (size_t)i * 4;
+            if (!s[3]) continue;
+            for (int c = 0; c < 3; ++c) gd[(size_t)i * 3 + c] = (float)((double)s[c] / (double)s[3] / 4095.0);
+        }
     }
 }
 
@@ -248,45 +302,51 @@ bool Downsample(const FrameRing::Frame& f, StereoLayout layout, int analysisW, E
             for (int x = 0; x < g.w; ++x) colSum[x] += src[x];
         }
     };
-    auto meanRow = [&](int eye, int yEye, int xFirst, int xEnd, Sums& s) {
-        const int y = g.y0[eye] + yEye, x0 = g.x0[eye];
+    // #270: limited/full-range BT.709 Y'CbCr -> R'G'B' code values per sample (the mean used
+    // to be converted once); the source's code values, before the grade.
+    const float s = p16 ? 1.f / 256.f : 1.f;
+    const float yOff = f.fullRange ? 0.f : 16.f, yK = (f.fullRange ? 1.f / 255.f : 1.f / 219.f) * s;
+    const float cK = (f.fullRange ? 1.f / 255.f : 1.f / 224.f) * s, yO = yOff / s, cO = 128.f / s;
+    auto toRgb = [&](int x, float Y, unsigned U, unsigned V, auto& emit) {
+        const float yb = (Y - yO) * yK, ub = ((float)U - cO) * cK, vb = ((float)V - cO) * cK;
+        emit(x, To12(yb + 1.5748f * vb), To12(yb - 0.1873f * ub - 0.4681f * vb), To12(yb + 1.8556f * ub), To12(yb));
+    };
+    // One sample per chroma sample: the 2x2 luma block it covers, averaged, with its chroma.
+    // That is exactly the block's mean R'G'B' (the conversion is linear), where a single
+    // luma pixel with the shared chroma is not: a gain on one channel then moved the
+    // others' histograms (4:2:0 crosstalk, up to 2.5 % on blue for a 3 % green gain).
+    const int H = f.height;
+    auto colourRow = [&](int eye, int yEye, auto&& emit) {
+        const int y = std::min((g.y0[eye] + yEye) & ~1, H - 2), x0 = g.x0[eye];
         if (p16) {
-            const uint16_t* Y = reinterpret_cast<const uint16_t*>(f.plane[0].data()) + (size_t)y * W;
+            const uint16_t* Y0 = reinterpret_cast<const uint16_t*>(f.plane[0].data()) + (size_t)y * W;
+            const uint16_t* Y1 = Y0 + W;
             const uint16_t* UV = reinterpret_cast<const uint16_t*>(f.plane[1].data()) + (size_t)(y / 2) * W;
-            for (int x = xFirst; x < xEnd; ++x) {
-                const int gx = x0 + x;
-                s.c[0] += Y[gx];
-                s.c[1] += UV[gx & ~1];
-                s.c[2] += UV[(gx & ~1) + 1];
+            for (int x = 0; x + 1 < g.w; x += kColourStep) {
+                const int gx = (x0 + x) & ~1;
+                toRgb(x, (float)(Y0[gx] + Y0[gx + 1] + Y1[gx] + Y1[gx + 1]) * 0.25f, UV[gx], UV[gx + 1], emit);
             }
         } else if (f.format == PixFormat::NV12) {
-            const uint8_t* Y = f.plane[0].data() + (size_t)y * W;
+            const uint8_t* Y0 = f.plane[0].data() + (size_t)y * W;
+            const uint8_t* Y1 = Y0 + W;
             const uint8_t* UV = f.plane[1].data() + (size_t)(y / 2) * W;
-            for (int x = xFirst; x < xEnd; ++x) {
-                const int gx = x0 + x;
-                s.c[0] += Y[gx];
-                s.c[1] += UV[gx & ~1];
-                s.c[2] += UV[(gx & ~1) + 1];
+            for (int x = 0; x + 1 < g.w; x += kColourStep) {
+                const int gx = (x0 + x) & ~1;
+                toRgb(x, (Y0[gx] + Y0[gx + 1] + Y1[gx] + Y1[gx + 1]) * 0.25f, UV[gx], UV[gx + 1], emit);
             }
         } else {
-            const uint8_t* Y = f.plane[0].data() + (size_t)y * W;
+            const uint8_t* Y0 = f.plane[0].data() + (size_t)y * W;
+            const uint8_t* Y1 = Y0 + W;
             const uint8_t* U = f.plane[1].data() + (size_t)(y / 2) * cw;
             const uint8_t* V = f.plane[2].data() + (size_t)(y / 2) * cw;
-            for (int x = xFirst; x < xEnd; ++x) {
-                const int gx = x0 + x;
-                s.c[0] += Y[gx];
-                s.c[1] += U[gx / 2];
-                s.c[2] += V[gx / 2];
+            for (int x = 0; x + 1 < g.w; x += kColourStep) {
+                const int gx = (x0 + x) & ~1;
+                toRgb(x, (Y0[gx] + Y0[gx + 1] + Y1[gx] + Y1[gx + 1]) * 0.25f, U[gx / 2], V[gx / 2], emit);
             }
         }
     };
-    const double scale = p16 ? 1.0 / 256.0 : 1.0;
-    auto toRgb = [&](const Sums& t, float rgb[3]) {
-        const double n = (double)t.n;
-        YuvToRgb((float)((double)t.c[0] * scale / n), (float)((double)t.c[1] * scale / n),
-                 (float)((double)t.c[2] * scale / n), f.fullRange, rgb);
-    };
-    DownsampleEyes(g, analysisW, p16 ? 1.0f / 256.0f : 1.0f, addRow, meanRow, toRgb, out);
+    DownsampleEyes(g, analysisW, p16 ? 1.0f / 256.0f : 1.0f, addRow, colourRow, out);
+    out.pq = f.transfer == ColorTransfer::PQ;
     return true;
 }
 
@@ -300,19 +360,197 @@ bool DownsampleRgba(const uint8_t* rgba, int w, int h, StereoLayout layout, int 
         const uint8_t* src = rgba + ((size_t)row * w + g.x0[eye]) * 4;
         for (int x = 0; x < g.w; ++x, src += 4) colSum[x] += 54u * src[0] + 183u * src[1] + 19u * src[2];
     };
-    auto meanRow = [&](int eye, int yEye, int xFirst, int xEnd, Sums& s) {
-        const uint8_t* src = rgba + ((size_t)(g.y0[eye] + yEye) * w + g.x0[eye] + xFirst) * 4;
-        for (int x = xFirst; x < xEnd; ++x, src += 4) {
-            s.c[0] += src[0];
-            s.c[1] += src[1];
-            s.c[2] += src[2];
+    auto colourRow = [&](int eye, int yEye, auto&& emit) {
+        const uint8_t* src = rgba + ((size_t)(g.y0[eye] + yEye) * w + g.x0[eye]) * 4;
+        for (int x = 0; x < g.w; x += kColourStep, src += 4 * kColourStep) {
+            const unsigned r = src[0], gg = src[1], b = src[2];
+            emit(x, (int)((r * 4095u + 127u) / 255u), (int)((gg * 4095u + 127u) / 255u), (int)((b * 4095u + 127u) / 255u),
+                 (int)(((54u * r + 183u * gg + 19u * b) * 4095u + 32640u) / 65280u));
         }
     };
-    auto toRgb = [](const Sums& t, float rgb[3]) {
-        for (int k = 0; k < 3; ++k) rgb[k] = (float)((double)t.c[k] / 255.0 / (double)t.n);
-    };
-    DownsampleEyes(g, analysisW, 1.0f / 256.0f, addRow, meanRow, toRgb, out);
+    DownsampleEyes(g, analysisW, 1.0f / 256.0f, addRow, colourRow, out);
     return true;
+}
+
+// ---------------------------------------------------------------------------------------
+// #270: colour between the eyes
+
+namespace {
+
+constexpr double kBinW = 1 << kHistShift;  // 12-bit codes per histogram bin
+
+// The value (0..1) below which a fraction q of a histogram's samples lie, linear inside the
+// bin (bin b holds the 12-bit codes kBinW * b .. kBinW * (b + 1) - 1).
+double Quantile(const uint32_t* h, double total, double q) {
+    const double target = q * total;
+    double acc = 0;
+    for (int b = 0; b < kHistBins; ++b) {
+        if (h[b] && acc + h[b] >= target) return kBinW * (b + (target - acc) / h[b]) / 4095.0;
+        acc += h[b];
+    }
+    return 1.0;
+}
+
+}  // namespace
+
+int ColourMatch::WorstChannel() const {
+    int w = 0;
+    for (int c = 1; c < 3; ++c)
+        if (std::fabs(gainPct[c]) > std::fabs(gainPct[w])) w = c;
+    return w;
+}
+
+ColourMatch MeasureColour(const EyePair& e) {
+    ColourMatch m;
+    m.pq = e.pq;
+    if (e.colourSamples[0] < 1000 || e.colourSamples[1] < 1000) return m;
+    m.measured = true;
+    for (int c = 0; c < 3; ++c) {
+        const uint32_t* hl = e.hist[0][c];
+        const uint32_t* hr = e.hist[1][c];
+        const double nl = (double)e.colourSamples[0], nr = (double)e.colourSamples[1];
+        // Histogram matching reduced to two numbers: the eyes' p5, p10 .. p95 paired up and
+        // right = gain * left + lift fitted through them. Position-free, so parallax does
+        // not matter, and percentiles shrug off small occlusions. Pairs at the clip points
+        // carry no slope and are left out.
+        double sx = 0, sy = 0, sxx = 0, sxy = 0, lo = 1, hi = 0;
+        int n = 0;
+        for (int k = 1; k <= 19; ++k) {
+            const double xl = Quantile(hl, nl, 0.05 * k), xr = Quantile(hr, nr, 0.05 * k);
+            if (xl <= 0.004 || xl >= 0.996 || xr <= 0.004 || xr >= 0.996) continue;
+            sx += xl;
+            sy += xr;
+            sxx += xl * xl;
+            sxy += xl * xr;
+            lo = std::min(lo, xl);
+            hi = std::max(hi, xl);
+            ++n;
+        }
+        const double var = n > 0 ? sxx - sx * sx / n : 0.0;
+        if (n < 6 || hi - lo < 0.05 || var <= 1e-9) {  // a flat channel: nothing to fit a slope to
+            m.measured = false;
+            continue;
+        }
+        const double gain = (sxy - sx * sy / n) / var, lift = (sy - gain * sx) / n;
+        m.gainPct[c] = (float)((gain - 1.0) * 100.0);
+        m.liftPct[c] = (float)(lift * 100.0);
+        // Shape: the left histogram carried through the fit, against the right one
+        // (intersection, 1 = the same). A gamma or curve mismatch, which a gain and lift
+        // cannot express, leaves it lower.
+        double pred[kHistBins] = {};
+        for (int b = 0; b < kHistBins; ++b) {
+            if (!hl[b]) continue;
+            const double a0 = gain * kBinW * b / 4095.0 + lift, a1 = gain * kBinW * (b + 1) / 4095.0 + lift;
+            const double x0 = std::min(a0, a1) * 4095.0 / kBinW, x1 = std::max(a0, a1) * 4095.0 / kBinW;
+            const double mass = hl[b] / nl;
+            if (x1 - x0 < 1e-9) {
+                pred[std::clamp((int)x0, 0, kHistBins - 1)] += mass;
+                continue;
+            }
+            for (int t = std::max(0, (int)std::floor(x0)); t <= std::min(kHistBins - 1, (int)std::floor(x1)); ++t)
+                pred[t] += mass * (std::min(x1, t + 1.0) - std::max(x0, (double)t)) / (x1 - x0);
+            if (x0 < 0) pred[0] += mass * (std::min(x1, 0.0) - x0) / (x1 - x0);  // past the clip points
+            if (x1 > kHistBins) pred[kHistBins - 1] += mass * (x1 - std::max(x0, (double)kHistBins)) / (x1 - x0);
+        }
+        // compared in 64 bins: at the histogram's 256 a camera's noise alone, which widens
+        // each peak by a bin or two, read as a shape mismatch
+        double inter = 0;
+        constexpr int kGroup = kHistBins / 64;
+        for (int b = 0; b < kHistBins; b += kGroup) {
+            double p = 0, q = 0;
+            for (int i = 0; i < kGroup; ++i) {
+                p += pred[b + i];
+                q += hr[b + i] / nr;
+            }
+            inter += std::min(p, q);
+        }
+        m.shape[c] = (float)inter;
+    }
+    if (e.meanLuma[0] > 1e-3f && e.meanLuma[1] > 1e-3f) {
+        const double ratio = (double)e.meanLuma[1] / e.meanLuma[0];
+        m.lumaPct = (float)((ratio - 1.0) * 100.0);
+        m.lumaStops = (float)std::log2(ratio);
+    }
+    return m;
+}
+
+ColourDiff MeasureColourDiff(const EyePair& e, float shiftPct) {
+    ColourDiff d;
+    if ((int)e.grid[0].size() != kColourGridW * kColourGridH * 3 || e.grid[1].size() != e.grid[0].size()) return d;
+    d.u0 = kOverlapEdge;
+    d.u1 = 1.f - kOverlapEdge;
+    d.v0 = 0.02f;
+    d.v1 = 0.98f;
+    const size_t cells = (size_t)d.cols * d.rows;
+    d.y.assign(cells, std::nanf(""));
+    d.cb.assign(cells, std::nanf(""));
+    d.cr.assign(cells, std::nanf(""));
+    // The mean colour of [ua, ub) x [va, vb) (eye fractions) from one eye's grid, weighted by
+    // overlap; false when under half of it has samples (matte rows, past the eye's edge).
+    auto box = [](const std::vector<float>& gd, float ua, float ub, float va, float vb, float rgb[3]) {
+        const float fx0 = ua * kColourGridW, fx1 = ub * kColourGridW, fy0 = va * kColourGridH, fy1 = vb * kColourGridH;
+        double acc[3] = {}, wsum = 0;
+        for (int j = std::max(0, (int)fy0); j < std::min(kColourGridH, (int)std::ceil(fy1)); ++j) {
+            const float wy = std::min(fy1, j + 1.f) - std::max(fy0, (float)j);
+            for (int i = std::max(0, (int)fx0); i < std::min(kColourGridW, (int)std::ceil(fx1)); ++i) {
+                const float* c = &gd[((size_t)j * kColourGridW + i) * 3];
+                if (std::isnan(c[0])) continue;
+                const float w = wy * (std::min(fx1, i + 1.f) - std::max(fx0, (float)i));
+                if (w <= 0.f) continue;
+                for (int k = 0; k < 3; ++k) acc[k] += w * c[k];
+                wsum += w;
+            }
+        }
+        if (wsum < 0.5 * (fx1 - fx0) * (fy1 - fy0)) return false;
+        for (int k = 0; k < 3; ++k) rgb[k] = (float)(acc[k] / wsum);
+        return true;
+    };
+    // The heavy low-pass makes the parallax irrelevant at this scale once the right eye is
+    // sampled at the median parallax (parallax = x_right - x_left).
+    const float shift = shiftPct / 100.f;
+    const float du = (d.u1 - d.u0) / d.cols, dv = (d.v1 - d.v0) / d.rows;
+    for (int j = 0; j < d.rows; ++j)
+        for (int i = 0; i < d.cols; ++i) {
+            const float ua = d.u0 + i * du, va = d.v0 + j * dv;
+            float l[3], r[3];
+            if (!box(e.grid[0], ua, ua + du, va, va + dv, l) || !box(e.grid[1], ua + shift, ua + du + shift, va, va + dv, r))
+                continue;
+            auto Y = [](const float* c) { return 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2]; };
+            const float yl = Y(l), yr = Y(r);
+            const size_t k = (size_t)j * d.cols + i;
+            d.y[k] = yr - yl;
+            d.cb[k] = ((r[2] - yr) - (l[2] - yl)) / 1.8556f;
+            d.cr[k] = ((r[0] - yr) - (l[0] - yl)) / 1.5748f;
+        }
+    return d;
+}
+
+std::string ColourFixCc(const ColourMatch& c) {
+    // right = g * left + o, so left = right / g - o / g: slope 1 / g, offset -o / g
+    float slope[3], offset[3];
+    for (int k = 0; k < 3; ++k) {
+        const double g = 1.0 + c.gainPct[k] / 100.0, o = c.liftPct[k] / 100.0;
+        slope[k] = g > 1e-3 ? (float)(1.0 / g) : 1.f;
+        offset[k] = g > 1e-3 ? (float)(-o / g) : 0.f;
+    }
+    char b[640];
+    std::snprintf(b, sizeof(b),
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                  "<ColorCorrection id=\"right_eye_to_left\">\n"
+                  "  <Description>DisplayXR Media Player Pro rig check: right eye matched to the left "
+                  "(R %+.2f%% G %+.2f%% B %+.2f%%%s)</Description>\n"
+                  "  <SOPNode>\n"
+                  "    <Slope>%.6f %.6f %.6f</Slope>\n"
+                  "    <Offset>%.6f %.6f %.6f</Offset>\n"
+                  "    <Power>1.000000 1.000000 1.000000</Power>\n"
+                  "  </SOPNode>\n"
+                  "  <SatNode>\n"
+                  "    <Saturation>1.000000</Saturation>\n"
+                  "  </SatNode>\n"
+                  "</ColorCorrection>\n",
+                  c.gainPct[0], c.gainPct[1], c.gainPct[2], c.pq ? ", PQ code values" : "", slope[0], slope[1], slope[2],
+                  offset[0], offset[1], offset[2]);
+    return b;
 }
 
 namespace {
@@ -619,6 +857,8 @@ Result Measure(const EyePair& e, const Options& o) {
         r.dyMad = median(res) * scaleY;
     }
     r.deltaE = DeltaE76(e.meanRgb[0], e.meanRgb[1]);
+    r.colour = MeasureColour(e);  // #270
+    r.colourDiff = MeasureColourDiff(e, median(r.parallaxPct));
     return r;
 }
 
@@ -1134,6 +1374,7 @@ void RigMonitor::Worker() {
         if (gen != seedGen_) {  // Reset() ran: the last fit and scale readings were the old input's
             seed_ = Options{};
             scaleRecent_.clear();
+            colourRecent_.clear();
             seedGen_ = gen;
         }
         // #269: frames search vertically about the last fit (a zoom or roll keeps its
@@ -1218,6 +1459,26 @@ void RigMonitor::Worker() {
                 std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
                 r.scalePct = v[v.size() / 2];
             }
+            // #270: the colour figures likewise: a reading moves by a few tenths of a % as
+            // saturated objects cross the overlap's edges in one eye before the other, and
+            // the gain alert latched those peaks. Each figure is its own median of the last 5.
+            if (r.colour.measured) {
+                colourRecent_.push_back(r.colour);
+                while (colourRecent_.size() > 5) colourRecent_.pop_front();
+                auto med = [&](auto field) {
+                    std::vector<float> v;
+                    for (const ColourMatch& c : colourRecent_) v.push_back(field(c));
+                    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+                    return v[v.size() / 2];
+                };
+                for (int k = 0; k < 3; ++k) {
+                    r.colour.gainPct[k] = med([k](const ColourMatch& c) { return c.gainPct[k]; });
+                    r.colour.liftPct[k] = med([k](const ColourMatch& c) { return c.liftPct[k]; });
+                    r.colour.shape[k] = med([k](const ColourMatch& c) { return c.shape[k]; });
+                }
+                r.colour.lumaPct = med([](const ColourMatch& c) { return c.lumaPct; });
+                r.colour.lumaStops = med([](const ColourMatch& c) { return c.lumaStops; });
+            }
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         lk.lock();
@@ -1235,6 +1496,8 @@ void RigMonitor::Worker() {
         s.deltaE = r.deltaE;
         s.scaleMeasured = r.scaleMeasured;
         s.scalePct = r.scalePct;
+        s.colourMeasured = r.colour.measured;
+        for (int c = 0; c < 3; ++c) s.gainPct[c] = r.colour.gainPct[c];
         s.eyeOffsetFrames = eyeOffset;
         s.eyeSyncMeasured = r.eyeSyncMeasuredFrames;
         s.eyeSyncLateEye = r.eyeSyncLateEye;
@@ -1268,8 +1531,9 @@ void RigMonitor::AddSampleLocked(const Sample& s, const std::string& tc) {
 }
 
 namespace {
-// The alert texts, per run: near, far, vertical, colour, edges, target divergence, scale.
-const char* const kClosedFmt[8] = {
+// The alert texts, per run: near, far, vertical, colour, edges, target divergence, scale,
+// colour gain (its channel letter comes first: AlertText).
+const char* const kClosedFmt[9] = {
     "Foreground at %+.1f%% for %.0f s (near limit %+.1f%%)",
     "Background at %+.1f%% for %.0f s (far limit %+.1f%%)",
     "Vertical error %.1f px for %.0f s (limit %.1f px)",
@@ -1278,8 +1542,9 @@ const char* const kClosedFmt[8] = {
     "Right edge violation at %+.1f%% for %.0f s (edge limit %+.1f%%)",
     "Background diverges on the target screen at %+.1f%% for %.0f s (limit %+.1f%%)",
     "Scale mismatch %+.2f%% for %.0f s (limit %.2f%%)",
+    "Colour gain %c %+.1f%% for %.0f s (limit %.1f%%)",
 };
-const char* const kOpenFmt[8] = {
+const char* const kOpenFmt[9] = {
     "Foreground at %+.1f%% for %.0f s (now)",
     "Background at %+.1f%% for %.0f s (now)",
     "Vertical error %.1f px for %.0f s (now)",
@@ -1288,7 +1553,15 @@ const char* const kOpenFmt[8] = {
     "Right edge violation at %+.1f%% for %.0f s (now)",
     "Background diverges on the target screen at %+.1f%% for %.0f s (now)",
     "Scale mismatch %+.2f%% for %.0f s (now)",
+    "Colour gain %c %+.1f%% for %.0f s (now)",
 };
+// One alert's text: the gain run (8) names its channel first.
+std::string AlertText(const char* fmt, int run, int channel, float worst, double dur, float limit) {
+    char b[160];
+    if (run == 8) std::snprintf(b, sizeof(b), fmt, "RGB"[std::clamp(channel, 0, 2)], worst, dur, limit);
+    else std::snprintf(b, sizeof(b), fmt, worst, dur, limit);
+    return b;
+}
 // #135: a depth alert's worst value in the target screen's terms, appended to its text:
 // " [-201 mm, -58' on Cinema]", or the divergence angle for the divergence run. Empty
 // without a target, and for the vertical / colour runs. `worst` is the source's parallax,
@@ -1317,13 +1590,12 @@ void RigMonitor::CloseRun(int i, double end, const std::string& endTc) {
     if (dur >= 0.5) {
         const float limits[kRuns] = {budget_.nearPct, budget_.farPct, budget_.maxVerticalPx,
                                      budget_.maxDeltaE, budget_.edgePct, budget_.edgePct,
-                                     budget_.divergeFarPct, budget_.scalePct};
+                                     budget_.divergeFarPct, budget_.scalePct, budget_.gainPct};
         Alert a;
         a.start = r.since;
         a.end = end;
-        char b[160];
-        std::snprintf(b, sizeof(b), kClosedFmt[i], r.worst, std::max(1.0, std::round(dur)), limits[i]);
-        a.what = std::string(b) + TargetNote(budget_, i, r.worst, targetParallaxOffsetPct_);
+        a.what = AlertText(kClosedFmt[i], i, r.channel, r.worst, std::max(1.0, std::round(dur)), limits[i]) +
+                 TargetNote(budget_, i, r.worst, targetParallaxOffsetPct_);
         a.timecode = r.tc;
         a.endTimecode = endTc;
         a.wallClock = r.clock;
@@ -1347,6 +1619,9 @@ void RigMonitor::UpdateAlerts(const Sample& s, const std::string& tc) {
     lastGoodT_ = s.t;
     lastGoodTc_ = tc;
     const float shownFarPct = s.farPct + targetParallaxOffsetPct_;
+    int worstGain = 0;  // #270: the channel furthest off
+    for (int c = 1; c < 3; ++c)
+        if (std::fabs(s.gainPct[c]) > std::fabs(s.gainPct[worstGain])) worstGain = c;
     const bool over[kRuns] = {s.nearPct < budget_.nearPct,
                               s.farPct > budget_.farPct,
                               std::fabs(s.verticalPx) > budget_.maxVerticalPx,
@@ -1354,21 +1629,29 @@ void RigMonitor::UpdateAlerts(const Sample& s, const std::string& tc) {
                               s.edgeMeasured[0] && s.edgePct[0] < budget_.edgePct,
                               s.edgeMeasured[1] && s.edgePct[1] < budget_.edgePct,
                               budget_.divergeFarPct > 0.0f && shownFarPct > budget_.divergeFarPct,
-                              checks_.scale && s.scaleMeasured && std::fabs(s.scalePct) > budget_.scalePct};
+                              checks_.scale && s.scaleMeasured && std::fabs(s.scalePct) > budget_.scalePct,
+                              checks_.colour && s.colourMeasured && std::fabs(s.gainPct[worstGain]) > budget_.gainPct};
     const float value[kRuns] = {s.nearPct, s.farPct, std::fabs(s.verticalPx), s.deltaE, s.edgePct[0], s.edgePct[1],
-                                shownFarPct, s.scalePct};
+                                shownFarPct, s.scalePct, s.gainPct[worstGain]};
     for (int i = 0; i < kRuns; ++i) {
         Run& r = runs_[i];
         if (over[i]) {
             if (r.since < 0) {
                 r.since = s.t;
                 r.worst = value[i];
+                r.channel = worstGain;
                 r.tc = tc;
                 r.clock = WallClock(s.t);
             } else {
                 const bool lowerIsWorse = i == 0 || i == 4 || i == 5;  // near and the edges: further in front is worse
-                if (i == 7) r.worst = std::fabs(value[i]) > std::fabs(r.worst) ? value[i] : r.worst;  // scale: signed, by size
-                else r.worst = lowerIsWorse ? std::min(r.worst, value[i]) : std::max(r.worst, value[i]);
+                if (i == 7 || i == 8) {  // scale, gain: signed, by size
+                    if (std::fabs(value[i]) > std::fabs(r.worst)) {
+                        r.worst = value[i];
+                        r.channel = worstGain;
+                    }
+                } else {
+                    r.worst = lowerIsWorse ? std::min(r.worst, value[i]) : std::max(r.worst, value[i]);
+                }
             }
         } else {
             CloseRun(i, s.t, tc);
@@ -1439,9 +1722,8 @@ std::vector<Alert> RigMonitor::Alerts() const {
         Alert x;
         x.start = r.since;
         x.end = -1.0;
-        char b[160];
-        std::snprintf(b, sizeof(b), kOpenFmt[i], r.worst, now - r.since);
-        x.what = std::string(b) + TargetNote(budget_, i, r.worst, targetParallaxOffsetPct_);
+        x.what = AlertText(kOpenFmt[i], i, r.channel, r.worst, now - r.since, 0.f) +
+                 TargetNote(budget_, i, r.worst, targetParallaxOffsetPct_);
         x.timecode = r.tc;
         x.wallClock = r.clock;
         a.push_back(x);

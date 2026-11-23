@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 
 #include "stb_image.h"  // implementation compiled in src/media/ImageDecoder.cpp
 
@@ -64,7 +65,7 @@ std::shared_ptr<const TestSignalConfig::Plate> TestSignalConfig::BuildPlate(cons
     // Cover-scale each eye onto the plate (bilinear), as BGRA for BgraToNv12.
     const float scale = std::max((float)pw / sw, (float)ph / ih);
     const float ox = (sw - pw / scale) * 0.5f, oy = (ih - ph / scale) * 0.5f;
-    // Right-eye faults: red gain, vertical shift (down), extra crossed parallax (the right
+    // Right-eye faults: colour gains / lift, vertical shift (down), extra crossed parallax (the right
     // eye moves left, so everything comes forward by (depthScale - 1) x 2 % of the width).
     const float dx = (cfg.depthScale - 1.0f) * 0.02f * ew;
     // roll and zoom: the right eye's plate pixel (x, y) samples the plain plate at the
@@ -95,7 +96,11 @@ std::shared_ptr<const TestSignalConfig::Plate> TestSignalConfig::BuildPlate(cons
                     c[k] = (at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) +
                            (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
                 }
-                if (right) c[0] *= cfg.gainR;
+                if (right) {
+                    c[0] = c[0] * cfg.gainR + cfg.liftR * 255.0f;
+                    c[1] *= cfg.gainG;
+                    c[2] *= cfg.gainB;
+                }
                 uint8_t* o = &bgra[((size_t)y * pw + x) * 4];
                 o[0] = (uint8_t)std::clamp((int)(c[2] + 0.5f), 0, 255);
                 o[1] = (uint8_t)std::clamp((int)(c[1] + 0.5f), 0, 255);
@@ -118,6 +123,9 @@ bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
     TestSignalConfig cfg = cfgIn;
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_ROLL")) cfg.rollDeg = (float)std::atof(e);
     if (const char* e = std::getenv("MEDIAPLAYER_TEST_SCALE")) cfg.scale = std::clamp((float)std::atof(e), 0.5f, 2.0f);
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_GAIN_G")) cfg.gainG = (float)std::atof(e);
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_GAIN_B")) cfg.gainB = (float)std::atof(e);
+    if (const char* e = std::getenv("MEDIAPLAYER_TEST_LIFT_R")) cfg.liftR = (float)std::atof(e);
     if (!cfg.image.empty() && !cfg.plate) {
         std::string err;
         cfg.plate = TestSignalConfig::BuildPlate(cfg, &err);
@@ -166,9 +174,10 @@ bool TestSignalSource::Open(const TestSignalConfig& cfgIn) {
     SetState(LiveState::Opening);
     stop_ = false;
     worker_ = std::thread([this] { Worker(); });
-    LOG_INFO("test signal: %s, vshift %.1f px, eye delay %d, right gain %.2f, roll %.2f deg, scale %.4f, wire %s%s, preroll %d",
-             name_.c_str(), cfg.vShiftPx, cfg.eyeDelay, cfg.gainR, cfg.rollDeg, cfg.scale, WireName(),
-             still_ ? ", still (frame 0)" : "", preroll_);
+    LOG_INFO("test signal: %s, vshift %.1f px, eye delay %d, right gain R %.3f G %.3f B %.3f lift R %+.3f, roll %.2f deg, "
+             "scale %.4f, wire %s%s, preroll %d",
+             name_.c_str(), cfg.vShiftPx, cfg.eyeDelay, cfg.gainR, cfg.gainG, cfg.gainB, cfg.liftR, cfg.rollDeg, cfg.scale,
+             WireName(), still_ ? ", still (frame 0)" : "", preroll_);
     return true;
 }
 
@@ -338,6 +347,74 @@ void PhotoEye(const TestSignalConfig::Plate& p, const livepix::Nv12& src, livepi
                     src.uv.data() + (size_t)(oy / 2 + row) * src.width + ox, (size_t)w);
 }
 
+namespace {
+
+// #270: colour faults on an eye's R'G'B' code values (limited-range BT.709, as the scene is
+// drawn): each 2x2 block to R'G'B', gain / lift applied, back (luma per pixel, the block's
+// chroma averaged), re-quantised with a little noise (+-1 code value, triangular), as a
+// camera's would be. Rounded plainly, a flat region's chroma moved in whole code values
+// with its brightness, a staircase the gain fit read as up to 2 % of crosstalk; with noise
+// in the faulted eye alone, its widened histogram peaks read as a 0.3 % gain. So while
+// any colour fault is set, the left eye goes through here too, with gain 1 (seed apart).
+bool HasColourFaults(const TestSignalConfig& c) {
+    return c.gainR != 1.0f || c.gainG != 1.0f || c.gainB != 1.0f || c.liftR != 0.0f;
+}
+
+void ApplyColourFaults(livepix::Nv12& f, int x0, int w, int h, const float gain[3], float liftR, uint32_t seed) {
+    // triangular noise on (-1, 1), from a table (hashing per pixel held the source to ~8 fps)
+    static const std::vector<float> table = [] {
+        std::vector<float> t(1 << 16);
+        uint32_t v = 12345u;
+        auto u = [&]() {
+            v = v * 1664525u + 1013904223u;
+            return (float)(v >> 8) / 16777216.0f - 0.5f;
+        };
+        for (float& x : t) x = u() + u();
+        return t;
+    }();
+    auto noise = [seed](uint32_t x, uint32_t y, uint32_t k) {
+        return table[((x * 2246822519u) ^ (y * 3266489917u) ^ ((k + seed * 4u) * 668265263u)) >> 16];
+    };
+    auto rows = [&](int yBegin, int yEnd) {
+        for (int y = yBegin; y + 1 < yEnd; y += 2) {
+            uint8_t* uv = f.uv.data() + (size_t)(y / 2) * f.width + x0;
+            for (int x = 0; x + 1 < w; x += 2) {
+                const float cb = (uv[x] - 128.0f) / 224.0f, cr = (uv[x + 1] - 128.0f) / 224.0f;
+                float sb = 0, sr = 0;
+                for (int j = 0; j < 2; ++j)
+                    for (int i = 0; i < 2; ++i) {
+                        uint8_t& py = f.y[(size_t)(y + j) * f.width + x0 + x + i];
+                        const float yy = (py - 16.0f) / 219.0f;
+                        const float r = std::clamp((yy + 1.5748f * cr) * gain[0] + liftR, 0.0f, 1.0f);
+                        const float g = std::clamp((yy - 0.1873f * cb - 0.4681f * cr) * gain[1], 0.0f, 1.0f);
+                        const float b = std::clamp((yy + 1.8556f * cb) * gain[2], 0.0f, 1.0f);
+                        const float y2 = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+                        py = (uint8_t)std::clamp((int)(16.0f + 219.0f * y2 + 0.5f + noise(x + i, y + j, 1)), 16, 235);
+                        sb += (b - y2) / 1.8556f;
+                        sr += (r - y2) / 1.5748f;
+                    }
+                uv[x] = (uint8_t)std::clamp((int)(128.0f + 224.0f * sb * 0.25f + 0.5f + noise(x, y, 2)), 16, 240);
+                uv[x + 1] = (uint8_t)std::clamp((int)(128.0f + 224.0f * sr * 0.25f + 0.5f + noise(x, y, 3)), 16, 240);
+            }
+        }
+    };
+    // row bands on a few threads (2x2 blocks: band edges on even rows): on one thread both
+    // eyes held the source to ~9 fps at 1080p
+    const int bands = 4;
+    std::vector<std::future<void>> jobs;
+    for (int k = 1; k < bands; ++k) jobs.push_back(std::async(std::launch::async, rows, (h * k / bands) & ~1, (h * (k + 1) / bands) & ~1));
+    rows(0, (h / bands) & ~1);
+    for (auto& j : jobs) j.get();
+}
+
+void ApplyColourFaults(livepix::Nv12& f, int x0, int w, int h, const TestSignalConfig& cfg, bool right) {
+    if (!HasColourFaults(cfg)) return;
+    const float one[3] = {1.0f, 1.0f, 1.0f}, faulted[3] = {cfg.gainR, cfg.gainG, cfg.gainB};
+    ApplyColourFaults(f, x0, w, h, right ? faulted : one, right ? cfg.liftR : 0.0f, right ? 2u : 1u);
+}
+
+}  // namespace
+
 void TestSignalSource::Render(const TestSignalConfig& cfg, int64_t n, livepix::Nv12& frame) {
     const int w = cfg.eyeW, h = cfg.eyeH;
     if (frame.width != 2 * w || frame.height != h) frame.Resize(2 * w, h);
@@ -349,15 +426,18 @@ void TestSignalSource::Render(const TestSignalConfig& cfg, int64_t n, livepix::N
         return;
     }
     DrawEye(frame, 0, w, h, t, cfg.depthScale, 0.0f, 1.0f, false);
+    ApplyColourFaults(frame, 0, w, h, cfg, false);  // the same re-quantising noise as the right eye
     if (cfg.rollDeg == 0.0f && cfg.scale == 1.0f) {
-        DrawEye(frame, w, w, h, tR, cfg.depthScale, cfg.vShiftPx, cfg.gainR, true);
+        DrawEye(frame, w, w, h, tR, cfg.depthScale, cfg.vShiftPx, 1.0f, true);
+        ApplyColourFaults(frame, w, w, h, cfg, true);
         return;
     }
     // Roll / zoom: draw the right eye plain, then resample it rotated and scaled about its
     // centre (bilinear luma, nearest chroma) into the right half.
     thread_local livepix::Nv12 eye;
     if (eye.width != w || eye.height != h) eye.Resize(w, h);
-    DrawEye(eye, 0, w, h, tR, cfg.depthScale, cfg.vShiftPx, cfg.gainR, true);
+    DrawEye(eye, 0, w, h, tR, cfg.depthScale, cfg.vShiftPx, 1.0f, true);
+    ApplyColourFaults(eye, 0, w, h, cfg, true);
     const float a = cfg.rollDeg * 3.14159265f / 180.0f, c = std::cos(a) / cfg.scale, s = std::sin(a) / cfg.scale;
     const float cx = w * 0.5f, cy = h * 0.5f;
     for (int y = 0; y < h; ++y) {
