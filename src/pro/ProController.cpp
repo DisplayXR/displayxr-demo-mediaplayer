@@ -1171,6 +1171,12 @@ void ProController::Tick(const Status& st) {
     TickCalibration();
     if (targetDirty_) ApplyTarget();
     PushTargetToStation();
+    // One picture overlay at a time: the colour-difference overlay (#270) and the disparity
+    // heatmap (#268) exclude each other, and the one turned on last wins.
+    if (station_.ColourOverlay() != 0 && colourOverlaySeen_ == 0 && disparityHeatmap_) disparityHeatmap_ = false;
+    else if (disparityHeatmap_ && !heatmapSeen_ && station_.ColourOverlay() != 0) station_.SetColourOverlay(0);
+    colourOverlaySeen_ = station_.ColourOverlay();
+    heatmapSeen_ = disparityHeatmap_;
     if (disparityHeatmap_ != heatmapSent_) {  // #268: the dense pass runs only while the heatmap is on
         station_.SetRigDense(disparityHeatmap_);
         heatmapSent_ = disparityHeatmap_;

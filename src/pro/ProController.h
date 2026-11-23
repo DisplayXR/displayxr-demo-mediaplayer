@@ -425,6 +425,8 @@ private:
     // stand-ins MEDIAPLAYER_PRO_DISPARITY / _DISPARITY_HEATMAP until the settings store).
     bool disparityCard_ = false, disparityHeatmap_ = false, heatmapBudgetOnly_ = false;
     bool heatmapSent_ = false;                       // what the rig worker was last told
+    bool heatmapSeen_ = false;                       // last Tick's heatmap / colour overlay state:
+    int colourOverlaySeen_ = 0;                      // the newer one turned on wins
     float testDispU_ = -1.0f, testDispV_ = -1.0f;    // MEDIAPLAYER_PRO_DISPARITY_PROBE: a fixed cursor
     uint64_t heatSeq_ = 0;                           // the dense map last uploaded
     rig::DenseMap heat_;

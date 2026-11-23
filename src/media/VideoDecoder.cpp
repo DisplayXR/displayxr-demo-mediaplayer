@@ -2688,6 +2688,10 @@ std::vector<VideoDecoder::StreamRung> VideoDecoder::GetStreamRungs() const { ret
 bool VideoDecoder::OpenLiveInput(std::string&, bool&) { return false; }
 bool VideoDecoder::OpenVideoCodec(const void*, const std::string&) { return false; }
 int VideoDecoder::InterruptCallback(void*) { return 0; }
+#if defined(_WIN32)
+void VideoDecoder::SetInteropAdapterLUID(const uint8_t*) {}
+void VideoDecoder::NoteSharedRead(void*, uint64_t, uint64_t) {}
+#endif
 
 #endif
 
