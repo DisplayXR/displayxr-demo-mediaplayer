@@ -178,6 +178,127 @@ void RollFault() {
     CHECK(h.ok && std::fabs(h.rollDeg - 0.6f) < 0.15f, "half-SBS roll is the displayed roll, not 2x");
 }
 
+// --- Scale (#269) ---------------------------------------------------------------------
+
+void ScaleFault() {
+    // a zoomed right eye: the zoom is the vertical offsets' slope over y, unbiased by depth
+    for (float s : {0.99f, 1.00f, 1.01f, 1.02f}) {
+        TestSignalConfig cfg;
+        cfg.scale = s;
+        const rig::Result r = MeasureTest(cfg);
+        std::printf("  scale %.2f: scale=%+.3f%% (measured %d) roll=%.3f vertical=%.2f px keystone=%.2f px matches=%d\n",
+                    s, r.scalePct, r.scaleMeasured, r.rollDeg, r.verticalPx, r.keystonePx, r.matches);
+        char m[96];
+        std::snprintf(m, sizeof(m), "scale %.2f recovered within +-0.1 %%", s);
+        CHECK(r.ok && r.scaleMeasured && std::fabs(r.scalePct - (s - 1.f) * 100.f) < 0.1f, m);
+        std::snprintf(m, sizeof(m), "scale %.2f: no roll or vertical error leaks out of it", s);
+        CHECK(std::fabs(r.rollDeg) < 0.05f && std::fabs(r.verticalPx) < 0.5f, m);
+    }
+    // roll and zoom together: each is its own term
+    TestSignalConfig both;
+    both.rollDeg = 0.5f;
+    both.scale = 1.01f;
+    const rig::Result rb = MeasureTest(both);
+    std::printf("  roll 0.5 + scale 1.01: roll=%.3f deg scale=%+.3f%% vertical=%.2f px\n", rb.rollDeg, rb.scalePct,
+                rb.verticalPx);
+    CHECK(rb.ok && std::fabs(rb.rollDeg - 0.5f) < 0.05f, "roll 0.5 deg with a zoom: roll within +-0.05 deg");
+    CHECK(rb.scaleMeasured && std::fabs(rb.scalePct - 1.0f) < 0.1f, "roll 0.5 deg with a zoom: scale within +-0.1 %");
+    // depth only (the confound): disparities x0.5 .. x2 move dx, never the zoom
+    for (float d : {0.5f, 1.0f, 2.0f}) {
+        TestSignalConfig cfg;
+        cfg.depthScale = d;
+        const rig::Result r = MeasureTest(cfg);
+        std::printf("  depth x%.1f: scale=%+.3f%% (measured %d) near=%.2f%%\n", d, r.scalePct, r.scaleMeasured, r.nearPct);
+        char m[96];
+        std::snprintf(m, sizeof(m), "depth x%.1f leaves the scale at 0 (+-0.05 %%)", d);
+        CHECK(r.ok && r.scaleMeasured && std::fabs(r.scalePct) < 0.05f, m);
+    }
+    // the same zoom delivered half-SBS: the reading is unitless, so it is the same
+    TestSignalConfig cfg;
+    cfg.scale = 1.01f;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    rig::EyePair e;
+    rig::Downsample(ToFrame(Squeeze(px)), StereoLayout::SbsHalf, 640, e);
+    const rig::Result h = rig::Measure(e);
+    std::printf("  scale 1.01 half-SBS: scale=%+.3f%% roll=%.3f\n", h.scalePct, h.rollDeg);
+    CHECK(h.ok && h.scaleMeasured && std::fabs(h.scalePct - 1.0f) < 0.15f, "half-SBS: the same scale");
+}
+
+// Matches only in a band across the middle cannot tell a zoom: not measured, and the rest
+// of the fit (offset + roll) still is.
+void ScaleNeedsCoverage() {
+    TestSignalConfig cfg;
+    cfg.scale = 1.01f;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    rig::EyePair e;
+    rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, e);
+    // flatten everything outside rows 40 % .. 60 % (both eyes)
+    for (std::vector<float>* eye : {&e.left, &e.right})
+        for (int y = 0; y < e.h; ++y)
+            if (y < e.h * 2 / 5 || y > e.h * 3 / 5)
+                std::fill(eye->begin() + (size_t)y * e.eyeW, eye->begin() + (size_t)(y + 1) * e.eyeW, 80.f);
+    rig::Options o;
+    o.minMatches = 4;
+    const rig::Result r = rig::Measure(e, o);
+    std::printf("  scale, middle band only: ok=%d matches=%d scale measured=%d\n", r.ok, r.matches, r.scaleMeasured);
+    CHECK(r.ok && !r.scaleMeasured && r.scalePct == 0.f, "a middle band of matches: scale not measured");
+}
+
+// The vertical search follows the last fit: an offset past +-maxDy (here 30 px = 10 analysis
+// rows at 1080p) is lost plain, and found when the search is seeded near it.
+void SeededSearch() {
+    TestSignalConfig cfg;
+    cfg.vShiftPx = 30.f;
+    cfg.scale = 1.02f;
+    livepix::Nv12 px;
+    TestSignalSource::Render(cfg, 30, px);
+    rig::EyePair e;
+    rig::Downsample(ToFrame(px), StereoLayout::SbsFull, 640, e);
+    const rig::Result plain = rig::Measure(e);
+    rig::Result prev;  // what the last frame measured: about right, not exact
+    prev.ok = true;
+    prev.verticalPx = 27.f;
+    prev.scaleMeasured = true;
+    prev.scalePctRaw = 1.5f;
+    rig::Options o;
+    o.SeedFrom(prev, e);
+    const rig::Result seeded = rig::Measure(e, o);
+    std::printf("  vshift 30 + scale 1.02: plain ok=%d v=%.2f | seeded ok=%d v=%.2f scale=%+.3f%%\n", plain.ok,
+                plain.verticalPx, seeded.ok, seeded.verticalPx, seeded.scalePct);
+    CHECK(!plain.ok || std::fabs(plain.verticalPx - 30.f) > 1.f, "past the search range, unseeded: not found");
+    CHECK(seeded.ok && std::fabs(seeded.verticalPx - 30.f) < 0.75f, "seeded: the 30 px offset is found");
+    CHECK(seeded.scaleMeasured && std::fabs(seeded.scalePct - 2.0f) < 0.1f, "seeded: the 2 % zoom is found");
+}
+
+void ScaleAlert() {
+    for (bool on : {true, false}) {
+        rig::RigMonitor m;
+        rig::RigMonitor::Checks c;
+        c.scale = on;
+        m.SetChecks(c);
+        for (int i = 0; i <= 10; ++i) {
+            rig::Sample s;
+            s.t = 3000.0 + i * 0.25;
+            s.ok = true;
+            s.farPct = 0.5f;
+            s.scaleMeasured = true;
+            s.scalePct = i < 8 ? (i == 4 ? -1.2f : 1.0f) : 0.1f;  // 2 s over the 0.5 % budget, then clear
+            m.AddSample(s, "01:00:00:00");
+        }
+        const std::vector<rig::Alert> a = m.Alerts();
+        std::printf("  scale alert (check %s): %s\n", on ? "on" : "off", a.empty() ? "(none)" : a.back().what.c_str());
+        if (on) {
+            CHECK(a.size() == 1 && a[0].end >= 0, "one closed scale alert");
+            CHECK(!a.empty() && a[0].what.find("Scale mismatch -1.20% for 2 s (limit 0.50%)") == 0,
+                  "the worst reading by size, with its sign");
+        } else {
+            CHECK(a.empty(), "qc.scale_check off: no scale alert");
+        }
+    }
+}
+
 // --- Stills and top/bottom (#266) ------------------------------------------------------
 
 // Limited-range BT.709 NV12 -> 8-bit R'G'B'A, what a decoded side-by-side photo hands OnStill.
@@ -746,6 +867,10 @@ int main() {
     DeltaE();
     EyeSwap();
     RollFault();
+    ScaleFault();
+    ScaleNeedsCoverage();
+    SeededSearch();
+    ScaleAlert();
     StillsAndTopBottom();
     MonitorStill();
     TooFewMatches();

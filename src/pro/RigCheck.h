@@ -7,6 +7,8 @@
 //   depth range     the near and far screen parallax of the scene, as % of the eye width,
 //                   stereographer convention: parallax = x_right - x_left, NEGATIVE = in
 //                   front of the screen (crossed), positive = behind
+//   scale           the right eye's size against the left (a zoom mismatch, %), from the
+//                   vertical component of the matches, which carries no scene depth (#269)
 //   colour match    CIE76 delta-E between the two eyes' mean colours (the same scene
 //                   through two cameras should match; > ~2 is visible)
 //   frame edges     edge (window) violations: something in front of the screen that the
@@ -79,10 +81,18 @@ struct EdgeSide {
 struct Result {
     bool ok = false;
     int matches = 0;              // confident block matches used
-    float verticalPx = 0.f;       // right minus left, full-res px (+ = right eye lower)
+    // #269: the matches' vertical offsets are fitted as dy = ty + roll * x + scale * y +
+    // keystone * x * y (centred, displayed px; least squares, then Huber IRLS), so a zoom
+    // mismatch no longer leaks into the roll and the vertical error.
+    float verticalPx = 0.f;       // right minus left at the picture centre, full-res px (+ = right eye lower)
     float rollDeg = 0.f;          // vertical error slope across the width, degrees
     float dySlope = 0.f;          // the same slope in analysis rows per analysis column
-    float dyMad = 0.f;            // spread (MAD) of the vertical residuals about that line, full-res px
+    float dyMad = 0.f;            // spread (MAD) of the vertical residuals about the fit, full-res px
+    float scalePct = 0.f;         // right eye's size against the left, % (+ = right larger); RigMonitor
+                                  // shows the median of the last 5 readings, scalePctRaw is this one's
+    float scalePctRaw = 0.f;
+    bool scaleMeasured = false;   // the matches span >= 40 % of the height, with some in each half
+    float keystonePx = 0.f;       // vertical keystone: at the top edge, right minus left side, full-res px
     float nearPct = 0.f;          // 2nd percentile parallax, % of eye width (negative = in front)
     float farPct = 0.f;           // 98th percentile parallax
     float deltaE = 0.f;           // CIE76 between the eyes' mean colours
@@ -106,6 +116,12 @@ struct Options {
     int minMatches = 20;          // fewer inliers than this = not measured
     float edgeBandPct = 6.f;      // width of the band along each frame edge, % of eye width
     int edgeMinMatches = 2;       // fewer matches in a band than this = that edge not measured
+    // #269: the centre of the vertical search, dy = seedDy0 + seedDyX * (x - W/2) + seedDyY *
+    // (y - H/2) in analysis rows (a previous fit), so a zoom or roll whose offsets reach the
+    // edge of +-maxDy at the top and bottom rows stays inside the search. 0 = search about 0.
+    float seedDy0 = 0.f, seedDyX = 0.f, seedDyY = 0.f;
+    // The same from a result of the same eye size (no seed when it did not measure).
+    void SeedFrom(const Result& r, const EyePair& e);
 };
 
 Result Measure(const EyePair& e, const Options& o = {});
@@ -177,6 +193,7 @@ struct Budget {
     float maxVerticalPx = 1.0f;
     float maxDeltaE = 2.0f;
     float edgePct = -0.3f;  // nearest parallax allowed at the left / right frame edge
+    float scalePct = 0.5f;  // #269: largest allowed size difference between the eyes, %
     // #135: > 0 = the far parallax at which the TARGET screen's background diverges past
     // the cap (target::DivergenceLimitPct); 0 = no target screen, no divergence alert.
     float divergeFarPct = 0.0f;
@@ -190,6 +207,8 @@ struct Sample {
     double t = 0.0;  // seconds, LiveProducer::NowSeconds
     bool ok = false;
     float nearPct = 0, farPct = 0, verticalPx = 0, deltaE = 0;
+    bool scaleMeasured = false;
+    float scalePct = 0;             // the shown (smoothed) reading
     int eyeOffsetFrames = -1;       // from the source's timecodes (-1 unknown)
     int eyeSyncMeasured = -1;       // measured from the pixels (-1 not measured)
     int eyeSyncLateEye = 0;         // +1 right late, -1 left late
@@ -233,6 +252,13 @@ public:
     void AddSample(const Sample& s, const std::string& timecode);
     void SetBudget(const Budget& b);
     Budget GetBudget() const;
+    // Which optional checks are shown and alert (#269; the settings qc.*). Off only hides
+    // them: they are still measured (it costs microseconds) and stay in get_rig_status.
+    struct Checks {
+        bool scale = true;  // qc.scale_check
+    };
+    void SetChecks(const Checks& c);
+    Checks GetChecks() const;
     // What convergence adds to the shown parallax (% of width). The measurements stay the
     // source's; the target-screen figures and the divergence alert are for the picture as shown.
     void SetTargetParallaxOffset(float pct);
@@ -271,7 +297,14 @@ private:
     std::deque<Sample> history_;
     std::vector<Alert> alerts_;
     Budget budget_;
+    Checks checks_;
     double measureMs_ = 0.0;
+    // Worker only (#269): the last few scale readings (the shown value is their median) and
+    // the last fit, which seeds the next frame's vertical search; both restart with generation_.
+    std::deque<float> scaleRecent_;
+    Options seed_;
+    int seedW_ = 0, seedH_ = 0;  // the eye size seed_ was fitted at
+    uint64_t seedGen_ = 0;
     SyncConfirm syncConfirm_;  // worker thread only; restarted when generation_ moves
     uint64_t syncGen_ = 0;
     StereoLayout pendingLayout_ = StereoLayout::SbsFull;
@@ -289,8 +322,9 @@ private:
     bool stillShown_ = false, stillMeasured_ = false, pendingStill_ = false;
     uint64_t stillSerial_ = 0, pendingStillSerial_ = 0;
     std::atomic<int> unmeasurable_{0};  // Submit's last frame: 0 measurable, 1 GPU-only, 2 format
-    // open alert runs: near, far, vertical, colour, left edge, right edge, divergence (#135)
-    static constexpr int kRuns = 7;
+    // open alert runs: near, far, vertical, colour, left edge, right edge, divergence (#135),
+    // scale (#269)
+    static constexpr int kRuns = 8;
     struct Run {
         double since = -1;
         float worst = 0;

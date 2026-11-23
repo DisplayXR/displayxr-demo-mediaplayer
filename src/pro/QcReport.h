@@ -26,6 +26,8 @@ struct Rig {  // the rig numbers with a snapshot (measured = false: none)
     float verticalPx = 0, rollDeg = 0, nearPct = 0, farPct = 0, deltaE = 0;
     bool edgeMeasured[2] = {false, false};
     float edgePct[2] = {0, 0};  // left, right frame edge
+    bool scaleMeasured = false;  // #269: the right eye's size against the left, %
+    float scalePct = 0;
 };
 
 // The display calibration (#133) in effect: snapshots and the report show the picture with
@@ -84,6 +86,7 @@ struct Session {
     int tcFps = 0;            // the signal's rate (0 = unknown): the EDL's rate when rows have none
     Calibration calibration;  // the display calibration when the report was made
     float budgetNearPct = 0, budgetFarPct = 0, budgetVerticalPx = 0, budgetDeltaE = 0, budgetEdgePct = 0;
+    float budgetScalePct = 0;  // #269 (0 = not recorded: no scale flagging)
     std::vector<Alert> alerts;
     std::vector<Snapshot> snapshots;
 };

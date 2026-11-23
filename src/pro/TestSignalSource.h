@@ -11,10 +11,12 @@
 //   depthScale   scene disparities x this (photo mode: extra crossed parallax)
 //   rollDeg      right eye rotated about its centre by this many degrees (+ = clockwise
 //                on screen: its right side lower), the rig check's roll
+//   scale        right eye zoomed about its centre by this factor (1.01 = 1 % larger), the
+//                rig check's scale (#269)
 // Photo mode (image=<side-by-side still>): the rig shows a real stereo photo, panned
 // slowly so there is motion for the eye-sync check, with the same faults applied.
 // --test-signal[=WxH@fps][,image=<path>] and the MEDIAPLAYER_TEST_* env vars set it
-// (MEDIAPLAYER_TEST_ROLL is read by Open itself).
+// (MEDIAPLAYER_TEST_ROLL and MEDIAPLAYER_TEST_SCALE are read by Open itself).
 //
 // The wire format (#238), read by Open:
 //   default                         8-bit NV12, as always
@@ -56,6 +58,7 @@ struct TestSignalConfig {
     float gainR = 1.0f;
     float depthScale = 1.0f;       // multiplies every disc's disparity
     float rollDeg = 0.0f;          // right-eye roll, degrees (+ = clockwise on screen)
+    float scale = 1.0f;            // right-eye zoom about its centre (#269)
     std::string startTimecode = "01:00:00:00";
     std::string image;             // photo mode: a side-by-side stereo still
 

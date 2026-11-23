@@ -318,11 +318,11 @@ bool DownsampleRgba(const uint8_t* rgba, int w, int h, StereoLayout layout, int 
 namespace {
 
 // One block: the template at (bx, by) of `a`, searched for in `b` over dx in [-R, R] and
-// dy in [-D, D], clipped to the frame (NCC, coarse then fine, sub-pixel peak, uniqueness
-// against periodic texture). On success dx / dy are where it sits in `b` minus where it
-// sits in `a`, analysis px. tpl is scratch (bs * bs).
+// dy in [dyC - D, dyC + D], clipped to the frame (NCC, coarse then fine, sub-pixel peak,
+// uniqueness against periodic texture). On success dx / dy are where it sits in `b` minus
+// where it sits in `a`, analysis px. tpl is scratch (bs * bs).
 bool MatchAt(const std::vector<float>& a, const std::vector<float>& b, int W, int H, const Options& o, int bx, int by,
-             int R, int D, std::vector<float>& tpl, float& outDx, float& outDy) {
+             int R, int D, int dyC, std::vector<float>& tpl, float& outDx, float& outDy) {
     const int bs = o.block;
     float mean = 0;
     for (int j = 0; j < bs; ++j)
@@ -339,7 +339,8 @@ bool MatchAt(const std::vector<float>& a, const std::vector<float>& b, int W, in
     if (sd < o.minTexture) return false;
     norm = std::sqrt(norm);
     const int dxLo = std::max(-R, -bx), dxHi = std::min(R, W - bs - bx);
-    const int dyLo = std::max(-D, -by), dyHi = std::min(D, H - bs - by);
+    const int dyLo = std::max(dyC - D, -by), dyHi = std::min(dyC + D, H - bs - by);
+    if (dyHi - dyLo < 4) return false;
     // coarse (step 2), then refine (+-2, step 1)
     float best = -2.f;
     int bdx = 0, bdy = 0;
@@ -384,6 +385,13 @@ bool MatchAt(const std::vector<float>& a, const std::vector<float>& b, int W, in
     return true;
 }
 
+// #269: the centre of the vertical search for a block centred at (cx, cy), from the seed
+// (Options::seedDy*): a previous fit's offset, roll and zoom. Capped at a quarter height.
+int SeedDy(const Options& o, int W, int H, float cx, float cy) {
+    const float d = o.seedDy0 + o.seedDyX * (cx - 0.5f * W) + o.seedDyY * (cy - 0.5f * H);
+    return (int)std::lround(std::clamp(d, -0.25f * H, 0.25f * H));
+}
+
 // Block-match `right` against templates cut from `left` (MatchAt). One entry per accepted
 // block: its parallax dx, vertical offset dy (analysis px, right minus left) and template
 // x; the normalised centre goes to r when given. With `mask`, only blocks whose centre is
@@ -399,7 +407,8 @@ void MatchBlocks(const std::vector<float>& left, const std::vector<float>& right
         for (int bx = 2; bx + bs + 2 <= W; bx += o.step) {
             if (mask && ((*mask)[(size_t)(by + bs / 2) * W + bx + bs / 2] != 0) != want) continue;
             float dx, dy;
-            if (!MatchAt(left, right, W, H, o, bx, by, R, D, tpl, dx, dy)) continue;
+            const int dyC = SeedDy(o, W, H, bx + bs * 0.5f, by + bs * 0.5f);
+            if (!MatchAt(left, right, W, H, o, bx, by, R, D, dyC, tpl, dx, dy)) continue;
             dxs.push_back(dx);
             dys.push_back(dy);
             xs.push_back((float)bx + bs * 0.5f);
@@ -434,7 +443,9 @@ void MeasureEdges(const EyePair& e, const Options& o, Result& r) {
                 const int inner = side == 0 ? bx + bs : W - bx;  // how far in the block reaches
                 if (inner > band || bx < 2 || bx + bs + 2 > W) break;
                 float dx, dy;
-                if (!MatchAt(a, b, W, H, o, bx, by, R, D, tpl, dx, dy)) continue;
+                // the seed is right minus left; this side's search runs the other way round
+                const int dyC = SeedDy(o, W, H, bx + bs * 0.5f, by + bs * 0.5f);
+                if (!MatchAt(a, b, W, H, o, bx, by, R, D, side == 0 ? -dyC : dyC, tpl, dx, dy)) continue;
                 es.matchY.push_back(((float)by + bs * 0.5f) / (float)H);
                 es.parallax.push_back((side == 0 ? -dx : dx) / (float)W * 100.f);
             }
@@ -449,7 +460,65 @@ void MeasureEdges(const EyePair& e, const Options& o, Result& r) {
     }
 }
 
+// #269: dy = c0 + c1 u + c2 v + c3 u v, the first n terms: least squares, then Huber IRLS
+// (threshold 1.5 x the residuals' MAD) so a few wrong matches do not tilt it. 4x4 normal
+// equations, microseconds. ok = false when the system is singular (no spread along u or v).
+struct DyFit {
+    double c[4] = {};
+    bool ok = false;
+    double At(double u, double v) const { return c[0] + c[1] * u + c[2] * v + c[3] * u * v; }
+};
+
+DyFit FitDy(const std::vector<float>& u, const std::vector<float>& v, const std::vector<float>& dy, int n) {
+    DyFit f;
+    const size_t m = dy.size();
+    if (m < (size_t)n + 2) return f;
+    std::vector<double> w(m, 1.0), res(m);
+    for (int it = 0; it < 4; ++it) {
+        double A[4][5] = {};
+        for (size_t i = 0; i < m; ++i) {
+            const double b[4] = {1.0, u[i], v[i], (double)u[i] * v[i]};
+            for (int r = 0; r < n; ++r) {
+                for (int c = 0; c < n; ++c) A[r][c] += w[i] * b[r] * b[c];
+                A[r][4] += w[i] * b[r] * dy[i];
+            }
+        }
+        // Gaussian elimination, partial pivoting
+        const double tiny = 1e-6 * A[0][0];
+        for (int col = 0; col < n; ++col) {
+            int piv = col;
+            for (int r = col + 1; r < n; ++r)
+                if (std::fabs(A[r][col]) > std::fabs(A[piv][col])) piv = r;
+            if (std::fabs(A[piv][col]) <= tiny) return DyFit{};
+            if (piv != col)
+                for (int c = 0; c <= 4; ++c) std::swap(A[col][c], A[piv][c]);
+            for (int r = 0; r < n; ++r) {
+                if (r == col) continue;
+                const double k = A[r][col] / A[col][col];
+                for (int c = col; c <= 4; ++c) A[r][c] -= k * A[col][c];
+            }
+        }
+        for (int r = 0; r < 4; ++r) f.c[r] = r < n ? A[r][4] / A[r][r] : 0.0;
+        f.ok = true;
+        if (it == 3) break;
+        for (size_t i = 0; i < m; ++i) res[i] = std::fabs(dy[i] - f.At(u[i], v[i]));
+        std::vector<double> a = res;
+        std::nth_element(a.begin(), a.begin() + a.size() / 2, a.end());
+        const double k = std::max(1.5 * 1.4826 * a[a.size() / 2], 0.02);  // rows
+        for (size_t i = 0; i < m; ++i) w[i] = res[i] <= k ? 1.0 : k / res[i];
+    }
+    return f;
+}
+
 }  // namespace
+
+void Options::SeedFrom(const Result& r, const EyePair& e) {
+    seedDy0 = seedDyX = seedDyY = 0.f;
+    if (!r.ok || e.PxPerRow() <= 0.f) return;
+    seedDy0 = r.verticalPx / e.PxPerRow();
+    seedDyX = r.dySlope;
+    seedDyY = r.scaleMeasured ? r.scalePctRaw / 100.f : 0.f;
+}
 
 Result Measure(const EyePair& e, const Options& o) {
     Result r;
@@ -504,36 +573,50 @@ Result Measure(const EyePair& e, const Options& o) {
     r.nearPct = pct(0.02f);
     r.farPct = pct(0.98f);
     const float scaleY = e.PxPerRow();
-    // roll: least-squares slope of dy over x (both in analysis px)
-    double mx = 0, my = 0;
+    // #269: the vertical offsets carry no scene depth, so they hold the rig's whole vertical
+    // geometry: dy = ty + roll * u + zoom * v + keystone * u * v (u, v centred, -1..1). A
+    // slope over x alone, as this used to fit, read a zoom mismatch as roll and vertical
+    // error whenever the matches sat off-centre. The zoom needs matches spread over the
+    // height, in both halves; without them the fit keeps offset + roll only.
+    std::vector<float> u(xs.size()), v(xs.size());
+    int top = 0, bottom = 0;
+    float yMin = 1.f, yMax = 0.f;
     for (size_t i = 0; i < xs.size(); ++i) {
-        mx += xs[i];
-        my += dys[i];
+        u[i] = (xs[i] - 0.5f * W) / (0.5f * W);
+        v[i] = (r.matchY[i] - 0.5f) * 2.f;
+        top += r.matchY[i] < 0.5f;
+        bottom += r.matchY[i] > 0.5f;
+        yMin = std::min(yMin, r.matchY[i]);
+        yMax = std::max(yMax, r.matchY[i]);
     }
-    mx /= xs.size();
-    my /= xs.size();
-    double sxy = 0, sxx = 0;
-    for (size_t i = 0; i < xs.size(); ++i) {
-        sxy += (xs[i] - mx) * (dys[i] - my);
-        sxx += (xs[i] - mx) * (xs[i] - mx);
+    r.scaleMeasured = yMax - yMin >= 0.4f && top >= 3 && bottom >= 3;
+    DyFit fit;
+    if (r.scaleMeasured) {
+        if (r.matches >= 12) fit = FitDy(u, v, dys, 4);
+        if (!fit.ok) fit = FitDy(u, v, dys, 3);
+        r.scaleMeasured = fit.ok;
     }
+    if (!fit.ok) fit = FitDy(u, v, dys, 2);
+    if (!fit.ok) fit = FitDy(u, v, dys, 1);
+    // back to analysis px: rows per column for the roll, rows per row (unitless) for the zoom
+    const double slopeA = fit.c[1] / (0.5 * W);
     // dy is in rows of H, x in columns of W; convert both to full-res DISPLAYED px before
     // the angle (a half-SBS eye is shown twice as wide as it is stored)
-    const double slopeA = sxx > 0 ? sxy / sxx : 0.0;  // analysis rows per analysis column
     const double slope = slopeA * (scaleY / e.PxPerCol());
     r.rollDeg = (float)(std::atan(slope) * 180.0 / 3.14159265358979);
     r.dySlope = (float)slopeA;
-    // vertical error: the offset at the picture centre with the roll taken out. A plain
-    // median of dy reads the offset where the matches happen to sit, so a rolled eye
-    // with its features off-centre inflated it (0.5 deg read as 5-6 px instead of 4).
-    std::vector<float> dyc(dys.size());
-    for (size_t i = 0; i < dys.size(); ++i) dyc[i] = dys[i] - (float)(slopeA * (xs[i] - 0.5 * W));
-    r.verticalPx = median(dyc) * scaleY;
+    // vertical error: the fit's offset at the picture centre, roll and zoom taken out (a
+    // plain median of dy reads the offset where the matches happen to sit)
+    r.verticalPx = (float)fit.c[0] * scaleY;
+    r.scalePct = r.scalePctRaw = r.scaleMeasured ? (float)(fit.c[2] / (0.5 * H) * 100.0) : 0.f;
+    // keystone: the u * v term at the top edge (v = -1), right side minus left
+    r.keystonePx = (float)(-2.0 * fit.c[3]) * scaleY;
     {
-        const float mc = median(dyc);
-        std::vector<float> ad(dyc.size());
-        for (size_t i = 0; i < dyc.size(); ++i) ad[i] = std::fabs(dyc[i] - mc);
-        r.dyMad = median(ad) * scaleY;
+        std::vector<float> res(dys.size());
+        for (size_t i = 0; i < dys.size(); ++i) res[i] = dys[i] - (float)fit.At(u[i], v[i]);
+        const float mc = median(res);
+        for (float& x : res) x = std::fabs(x - mc);
+        r.dyMad = median(res) * scaleY;
     }
     r.deltaE = DeltaE76(e.meanRgb[0], e.meanRgb[1]);
     return r;
@@ -1048,7 +1131,23 @@ void RigMonitor::Worker() {
         const bool swap = pendingSwap_;
         lk.unlock();
         const auto t0 = std::chrono::steady_clock::now();
-        Result r = seq.empty() ? Result{} : Measure(seq.back());
+        if (gen != seedGen_) {  // Reset() ran: the last fit and scale readings were the old input's
+            seed_ = Options{};
+            scaleRecent_.clear();
+            seedGen_ = gen;
+        }
+        // #269: frames search vertically about the last fit (a zoom or roll keeps its
+        // offsets inside +-maxDy at the top and bottom rows); a still has no previous fit,
+        // so it is measured once plain and again seeded by its own fit.
+        const bool seedFits = !seq.empty() && seq.back().eyeW == seedW_ && seq.back().h == seedH_;
+        const Options o = still || !seedFits ? Options{} : seed_;
+        Result r = seq.empty() ? Result{} : Measure(seq.back(), o);
+        if (still && r.ok) {
+            Options s;
+            s.SeedFrom(r, seq.back());
+            Result again = Measure(seq.back(), s);
+            if (again.ok && again.matches >= r.matches) r = std::move(again);
+        }
         if (r.ok && seq.size() >= 2) {
             // remove the rig's mean offset first: median parallax and the vertical error
             std::vector<float> p = r.parallaxPct;
@@ -1086,7 +1185,7 @@ void RigMonitor::Worker() {
                     EyePair aligned = seq.back();
                     if (side > 0) aligned.left = back.left;   // right eye late: left eye d back
                     else aligned.right = back.right;          // left eye late: right eye d back
-                    Result a = Measure(aligned);
+                    Result a = Measure(aligned, o);
                     if (!a.ok || a.matches < (r.matches * 7) / 10) continue;
                     if (!best.ok || a.dyMad < best.dyMad) best = std::move(a);
                 }
@@ -1099,10 +1198,25 @@ void RigMonitor::Worker() {
             if (std::getenv("MEDIAPLAYER_RIG_DEBUG")) {
                 const EyePair& c = seq.back();
                 std::fprintf(stderr,
-                             "    rig: vertical %.2f px (mad %.2f) roll %.2f deg dE %.1f near %.2f far %.2f matches %d "
-                             "(aligned d=%d) serial %lld layout %d swap %d meanG %.3f/%.3f\n",
-                             r.verticalPx, r.dyMad, r.rollDeg, r.deltaE, r.nearPct, r.farPct, r.matches, d,
+                             "    rig: vertical %.2f px (mad %.2f) roll %.2f deg scale %+.3f%% (%s) keystone %.2f px dE %.1f "
+                             "near %.2f far %.2f matches %d (aligned d=%d) serial %lld layout %d swap %d meanG %.3f/%.3f\n",
+                             r.verticalPx, r.dyMad, r.rollDeg, r.scalePctRaw, r.scaleMeasured ? "measured" : "not measured",
+                             r.keystonePx, r.deltaE, r.nearPct, r.farPct, r.matches, d,
                              (long long)c.serial, (int)layout, (int)swap, c.meanRgb[0][1], c.meanRgb[1][1]);
+            }
+        }
+        // the next frame's vertical search starts from this fit; the shown scale is the
+        // median of the last 5 readings (one reading moves ~0.05 % with the scene)
+        if (!still) {
+            seed_.SeedFrom(r, seq.empty() ? EyePair{} : seq.back());
+            seedW_ = r.ok ? seq.back().eyeW : 0;
+            seedH_ = r.ok ? seq.back().h : 0;
+            if (r.scaleMeasured) {
+                scaleRecent_.push_back(r.scalePctRaw);
+                while (scaleRecent_.size() > 5) scaleRecent_.pop_front();
+                std::vector<float> v(scaleRecent_.begin(), scaleRecent_.end());
+                std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+                r.scalePct = v[v.size() / 2];
             }
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -1119,6 +1233,8 @@ void RigMonitor::Worker() {
         s.farPct = r.farPct;
         s.verticalPx = r.verticalPx;
         s.deltaE = r.deltaE;
+        s.scaleMeasured = r.scaleMeasured;
+        s.scalePct = r.scalePct;
         s.eyeOffsetFrames = eyeOffset;
         s.eyeSyncMeasured = r.eyeSyncMeasuredFrames;
         s.eyeSyncLateEye = r.eyeSyncLateEye;
@@ -1152,8 +1268,8 @@ void RigMonitor::AddSampleLocked(const Sample& s, const std::string& tc) {
 }
 
 namespace {
-// The alert texts, per run: near, far, vertical, colour, edges, target divergence.
-const char* const kClosedFmt[7] = {
+// The alert texts, per run: near, far, vertical, colour, edges, target divergence, scale.
+const char* const kClosedFmt[8] = {
     "Foreground at %+.1f%% for %.0f s (near limit %+.1f%%)",
     "Background at %+.1f%% for %.0f s (far limit %+.1f%%)",
     "Vertical error %.1f px for %.0f s (limit %.1f px)",
@@ -1161,8 +1277,9 @@ const char* const kClosedFmt[7] = {
     "Left edge violation at %+.1f%% for %.0f s (edge limit %+.1f%%)",
     "Right edge violation at %+.1f%% for %.0f s (edge limit %+.1f%%)",
     "Background diverges on the target screen at %+.1f%% for %.0f s (limit %+.1f%%)",
+    "Scale mismatch %+.2f%% for %.0f s (limit %.2f%%)",
 };
-const char* const kOpenFmt[7] = {
+const char* const kOpenFmt[8] = {
     "Foreground at %+.1f%% for %.0f s (now)",
     "Background at %+.1f%% for %.0f s (now)",
     "Vertical error %.1f px for %.0f s (now)",
@@ -1170,6 +1287,7 @@ const char* const kOpenFmt[7] = {
     "Left edge violation at %+.1f%% for %.0f s (now)",
     "Right edge violation at %+.1f%% for %.0f s (now)",
     "Background diverges on the target screen at %+.1f%% for %.0f s (now)",
+    "Scale mismatch %+.2f%% for %.0f s (now)",
 };
 // #135: a depth alert's worst value in the target screen's terms, appended to its text:
 // " [-201 mm, -58' on Cinema]", or the divergence angle for the divergence run. Empty
@@ -1199,7 +1317,7 @@ void RigMonitor::CloseRun(int i, double end, const std::string& endTc) {
     if (dur >= 0.5) {
         const float limits[kRuns] = {budget_.nearPct, budget_.farPct, budget_.maxVerticalPx,
                                      budget_.maxDeltaE, budget_.edgePct, budget_.edgePct,
-                                     budget_.divergeFarPct};
+                                     budget_.divergeFarPct, budget_.scalePct};
         Alert a;
         a.start = r.since;
         a.end = end;
@@ -1235,9 +1353,10 @@ void RigMonitor::UpdateAlerts(const Sample& s, const std::string& tc) {
                               s.deltaE > budget_.maxDeltaE,
                               s.edgeMeasured[0] && s.edgePct[0] < budget_.edgePct,
                               s.edgeMeasured[1] && s.edgePct[1] < budget_.edgePct,
-                              budget_.divergeFarPct > 0.0f && shownFarPct > budget_.divergeFarPct};
+                              budget_.divergeFarPct > 0.0f && shownFarPct > budget_.divergeFarPct,
+                              checks_.scale && s.scaleMeasured && std::fabs(s.scalePct) > budget_.scalePct};
     const float value[kRuns] = {s.nearPct, s.farPct, std::fabs(s.verticalPx), s.deltaE, s.edgePct[0], s.edgePct[1],
-                                shownFarPct};
+                                shownFarPct, s.scalePct};
     for (int i = 0; i < kRuns; ++i) {
         Run& r = runs_[i];
         if (over[i]) {
@@ -1248,7 +1367,8 @@ void RigMonitor::UpdateAlerts(const Sample& s, const std::string& tc) {
                 r.clock = WallClock(s.t);
             } else {
                 const bool lowerIsWorse = i == 0 || i == 4 || i == 5;  // near and the edges: further in front is worse
-                r.worst = lowerIsWorse ? std::min(r.worst, value[i]) : std::max(r.worst, value[i]);
+                if (i == 7) r.worst = std::fabs(value[i]) > std::fabs(r.worst) ? value[i] : r.worst;  // scale: signed, by size
+                else r.worst = lowerIsWorse ? std::min(r.worst, value[i]) : std::max(r.worst, value[i]);
             }
         } else {
             CloseRun(i, s.t, tc);
@@ -1269,6 +1389,16 @@ void RigMonitor::SetTargetParallaxOffset(float pct) {
 Budget RigMonitor::GetBudget() const {
     std::lock_guard<std::mutex> lk(m_);
     return budget_;
+}
+
+void RigMonitor::SetChecks(const Checks& c) {
+    std::lock_guard<std::mutex> lk(m_);
+    checks_ = c;
+}
+
+RigMonitor::Checks RigMonitor::GetChecks() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return checks_;
 }
 
 void RigMonitor::Reset() {
