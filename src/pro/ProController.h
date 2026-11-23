@@ -89,7 +89,8 @@ struct Status {
     float sourceFps = 0.0f;     // camera delivered / stream decoded fps (0 for files)
     float frameAgeMs = 0.0f;    // live: publish -> upload age
     bool live = false;          // a live source (camera, DeckLink, test rig) is showing
-    bool hasPicture = false;    // live, video or stream: rig checks + history apply
+    bool hasPicture = false;    // live, video, stream or a stereo still: rig checks + history apply
+    StereoLayout layout = StereoLayout::Mono;  // the layout shown (a still's rig check follows it)
     bool eyesSwapped = false;   // the user's swap XOR the container's (R|L packing)
     std::string modeName;       // display mode, e.g. "LeiaSR"
 };

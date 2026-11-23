@@ -80,6 +80,11 @@ public:
     // checks measure the eyes as shown.
     void OnFrame(const FrameRing::Frame& f, StereoLayout layout, bool live, int eyeOffsetFrames,
                  bool eyesSwapped = false);
+    // A still (#266): the rig check measures it once (nullptr = frames again). Per frame,
+    // UpdateStill re-measures it when the layout or the eye swap changes, and drops it when
+    // the still is no longer shown (the idle screen).
+    void OnStill(const uint8_t* rgba, int w, int h, StereoLayout layout, bool eyesSwapped);
+    void UpdateStill(StereoLayout layout, bool eyesSwapped, bool shown);
     // The last OnFrame's render-thread time in the rig check's Submit (its Downsample when
     // it measures) and in the live input's thumbnail, ms (0 when it did not run): App adds
     // them to the render loop's stages (rhi/RenderPerf.h: rig, thumbs).
