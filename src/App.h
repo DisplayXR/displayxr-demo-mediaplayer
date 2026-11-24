@@ -307,7 +307,7 @@ private:
     void StopConvert(bool restorePicture);
     void ResetConvertStream();
     void PumpConvert(double nowSec);
-    void SubmitConvertFrame(const FrameRing::Frame& f, double nowSec);
+    bool SubmitConvertFrame(const FrameRing::Frame& f, double nowSec);
     void KeepStillForConvert(const uint8_t* rgba, int w, int h);
     // Provider selector (XR_DXR_lift spec 5): pick a candidate by id ("" = the default) as
     // the hint for this session's creates. "" on success, else why not. Never persisted.
@@ -713,6 +713,11 @@ private:
     int convertStillW_ = 0, convertStillH_ = 0;
     std::vector<uint8_t> convertIn_;  // the last frame handed to the converter (RGBA8)
     uint32_t convertInW_ = 0, convertInH_ = 0;
+    // The last video frame taken from the ring (the ring keeps it until the next take, so it
+    // stays valid while the clip is paused) and the serial of the frame last handed to the
+    // converter: a paused clip decodes nothing new, so PumpConvert hands this one over.
+    const FrameRing::Frame* convertLastFrame_ = nullptr;
+    int64_t convertSentSerial_ = -1;
 
 #if MEDIAPLAYER_PRO
     // Media Player Pro (src/pro/, docs/PRO.md). Everything Pro adds hangs off pro_;

@@ -127,6 +127,9 @@ struct TransportState {
     bool modeSwitchEnabled = true;
     bool modeSwitchBusy = false;
     std::string modeSwitchTooltip;
+    // A 2D file in the basic player: the "..." menu also offers "Convert to 3D", the same
+    // action as the 2D/3D switch (checked = converting, greyed like the switch).
+    bool convertMenu = false;
     std::string layoutName;     // e.g. "SBS-half"
     std::string layoutTooltip;  // multi-line provenance shown on hover
     bool layoutPinned = false;  // renders a trailing '*'
