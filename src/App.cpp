@@ -1124,6 +1124,7 @@ void App::RenderOneFrame() {
         const StageClock::time_point upload0 = StageClock::now();
         double nestedMs = 0.0;
         if (const FrameRing::Frame* vf = ring->AcquireLatest()) {
+            if (ring == &video_.Ring()) convertLastFrame_ = vf;  // a clip's frames only (not the camera's)
             // Off-thread upload: hand the frame over first, so an on-demand copy also runs
             // while the hooks below do. Only a frame that will be uploaded: not a zero-copy one,
             // and not while a converted picture is bound. The hooks can unbind it (a size
@@ -1840,6 +1841,7 @@ void App::BuildTransportUI() {
         uiState_.caps.modeSwitch = hasMedia_ && !isLogo_ && (mono ? converter && ConvertEligible() : twoModes);
         uiState_.mode3D = mono ? lift_.On() : !PanelHeadingFlat();
         uiState_.modeSwitchEnabled = !mono || lift_.On() || av == lift::Availability::Enabled;
+        uiState_.convertMenu = uiState_.caps.modeSwitch && mono;  // "Convert to 3D" in the "..." menu
         uiState_.modeSwitchBusy = mono && lift_.On() && st == lift::State::Warming;
         if (mono && lift_.On()) {
             const int c = lift_.EffectiveCandidate();
@@ -2085,6 +2087,7 @@ void App::Shutdown() {
     camera_.Stop();       // join the camera worker + SDL_CloseCamera before SDL_Quit
     video_.Stop();        // join the decode thread (reads the audio clock) before audio,
     audio_.Stop();        // and before tearing down the GPU
+    convertLastFrame_ = nullptr;  // the ring is reused by the next clip
 #if MEDIAPLAYER_BROWSER
     if (gridReady_) {
         vkDeviceWaitIdle(xr_.Device());
@@ -2770,6 +2773,7 @@ void App::ReloadMedia(const std::string& path) {
     if (isStream_) StopStream(/*showIdleIfEmpty=*/false);  // #93: a file replaces the stream
     video_.Stop();   // joins the decode thread (which reads the audio clock) FIRST,
     audio_.Stop();   // then tear down audio so the clock callback can't outlive it.
+    convertLastFrame_ = nullptr;  // the ring is reused by the next clip
 #if defined(_WIN32)
     // Release zero-copy imports tied to the just-stopped decoder's shared textures (#28).
     renderer_.ClearSharedImports();
@@ -2873,6 +2877,7 @@ void App::EnterLive(LiveProducer* p, const std::string& name) {
     if (isStream_) StopStream(/*showIdleIfEmpty=*/false);  // #93: the camera replaces it
     video_.Stop();   // joins the decode thread before audio (see ReloadMedia)
     audio_.Stop();
+    convertLastFrame_ = nullptr;  // the ring is reused by the next clip
 #if defined(_WIN32)
     renderer_.ClearSharedImports();
 #endif
@@ -3038,6 +3043,7 @@ bool App::LoadUrl(const std::string& url) {
     if (isLive_) StopLive(/*showIdleIfEmpty=*/false);
     video_.Stop();   // joins the decode thread (reads the audio clock) before audio
     audio_.Stop();
+    convertLastFrame_ = nullptr;  // the ring is reused by the next clip
 #if defined(_WIN32)
     renderer_.ClearSharedImports();
 #endif
@@ -3083,6 +3089,7 @@ bool App::LoadUrl(const std::string& url) {
 
 void App::StopStream(bool showIdleIfEmpty) {
     video_.Stop();
+    convertLastFrame_ = nullptr;  // the ring is reused by the next clip
     isStream_ = false;
     streamPaused_ = false;
     streamStateSeen_ = VideoDecoder::StreamState::Idle;
@@ -4278,6 +4285,7 @@ bool App::SetConvert(bool on, const char* why) {
         ShowToast("Convert to 3D: reopen the picture");
         return false;
     }
+    convertSentSerial_ = -1;
     if (!lift_.Start(video)) {
         const std::string reason = lift_.Reason();
         lift_.Stop();  // the toggle stays off; the reason is the answer
@@ -4326,6 +4334,7 @@ std::string App::SetConvertProvider(const std::string& id, const char* why) {
     }
     // A live stream was re-created with the hint; a still has to be handed over again.
     if (lift_.On() && !isVideo_ && !LiveSource()) convertStillPending_ = true;
+    convertSentSerial_ = -1;
     const int i = lift_.EffectiveCandidate();
     const std::string name = i >= 0 ? lift_.Candidates()[i].name : std::string("default");
     LOG_INFO("Convert to 3D: provider %s (%s)", lift_.Preferred().empty() ? "default" : "picked",
@@ -4386,19 +4395,21 @@ void App::StopConvert(bool restorePicture) {
     }
     convertIn_.clear();
     convertInW_ = convertInH_ = 0;
+    convertSentSerial_ = -1;
 }
 
 void App::ResetConvertStream() {
     if (!lift_.On()) return;
     lift_.Reset();
+    convertSentSerial_ = -1;  // the new stream needs the frame on screen again
     if (!isVideo_ && !LiveSource()) convertStillPending_ = true;
 }
 
-void App::SubmitConvertFrame(const FrameRing::Frame& f, double nowSec) {
+bool App::SubmitConvertFrame(const FrameRing::Frame& f, double nowSec) {
     // Latest-wins: only when nothing is in flight, never every decoded frame. A zero-copy
     // GPU frame (#28, Windows opt-in) carries no CPU planes, so it cannot be submitted here.
     // Raw v210 (#238 phase 1): not a format the converter takes yet.
-    if (!lift_.WantsFrame(nowSec) || f.gpu || f.format == PixFormat::V210 || f.width <= 0 || f.height <= 0) return;
+    if (!lift_.WantsFrame(nowSec) || f.gpu || f.format == PixFormat::V210 || f.width <= 0 || f.height <= 0) return false;
     const int fmt = f.format == PixFormat::I420   ? 0
                     : f.format == PixFormat::NV12 ? 1
                     : f.format == PixFormat::P016 ? 2
@@ -4426,9 +4437,11 @@ void App::SubmitConvertFrame(const FrameRing::Frame& f, double nowSec) {
                                            (uint32_t)f.height, fmt, f.fullRange,
                                            renderer_.EffectiveMatrix((int)f.transfer, (int)f.matrix), table, convertInW_,
                                            convertInH_, convertIn_))
-                return;
-            lift_.Submit(convertIn_.data(), convertInW_, convertInH_, convertInW_ * 4, f.serial, nowSec);
-            return;
+                return false;
+            if (!lift_.Submit(convertIn_.data(), convertInW_, convertInH_, convertInW_ * 4, f.serial, nowSec))
+                return false;
+            convertSentSerial_ = f.serial;
+            return true;
         }
     }
 #endif
@@ -4436,8 +4449,11 @@ void App::SubmitConvertFrame(const FrameRing::Frame& f, double nowSec) {
                                 fmt == 0 ? f.plane[2].data() : nullptr, (uint32_t)f.width,
                                 (uint32_t)f.height, fmt, f.fullRange, convertInW_, convertInH_,
                                 convertIn_))
-        return;
-    lift_.Submit(convertIn_.data(), convertInW_, convertInH_, convertInW_ * 4, f.serial, nowSec);
+        return false;
+    if (!lift_.Submit(convertIn_.data(), convertInW_, convertInH_, convertInW_ * 4, f.serial, nowSec))
+        return false;
+    convertSentSerial_ = f.serial;
+    return true;
 }
 
 void App::PumpConvert(double nowSec) {
@@ -4456,6 +4472,11 @@ void App::PumpConvert(double nowSec) {
         if (lift_.Submit(convertIn_.data(), convertInW_, convertInH_, convertInW_ * 4, 0, nowSec))
             convertStillSentAt_ = nowSec;
     }
+    // A paused or ended clip decodes nothing new, so the render loop never offers a frame:
+    // hand over the one on screen until it has gone (turned on while paused, or the
+    // converter was still warming when the last frame arrived).
+    if (isVideo_ && !LiveSource() && convertLastFrame_ && convertLastFrame_->serial != convertSentSerial_)
+        SubmitConvertFrame(*convertLastFrame_, nowSec);
     lift::Result r;
     if (!lift_.Poll(r)) return;
     // Non-blocking: the result is a CPU image owned by the runtime until the next acquire;

@@ -921,9 +921,20 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                         ImGui::EndMenu();
                     }
                 }
-                if (!s.convertProviders.empty()) {
+                if (s.convertMenu) {
                     ImGui::Separator();
-                    ImGui::TextDisabled("2D->3D converter");
+                    ImGui::BeginDisabled(!s.modeSwitchEnabled);
+                    if (ImGui::MenuItem("Convert to 3D", "V", s.mode3D)) Fire(a.Toggle3D ? a.Toggle3D : a.ToggleConvert);
+                    ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("%s", s.modeSwitchTooltip.empty()
+                                                    ? "Same as the 2D/3D switch on the bar"
+                                                    : s.modeSwitchTooltip.c_str());
+                }
+                if (!s.convertProviders.empty()) {
+                    // A section heading, not a command: greyed text read as a disabled
+                    // "convert" item, so it is drawn as a separator label.
+                    ImGui::SeparatorText("Converter");
                     for (int i = 0; i < (int)s.convertProviders.size(); ++i) {
                         const ConvertProviderRow& row = s.convertProviders[i];
                         ImGui::PushID(i);
@@ -932,6 +943,8 @@ void BuildTransportUI(TransportState& s, const TransportActions& a) {
                             i != s.convertProviderCurrent && a.SelectConvertProvider)
                             a.SelectConvertProvider(i);
                         ImGui::EndDisabled();
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                            ImGui::SetTooltip("Which 2D->3D converter to use (choosing one does not start it)");
                         ImGui::PopID();
                     }
                 }
