@@ -765,6 +765,8 @@ private:
     bool openedAfter_ = false;
     const char* dumpHudPath_ = nullptr;   // dump the rendered ImGui HUD image once
     bool dumpedHud_ = false;
+    // #280: when the HUD dump started, to log the gap to the next HUD frame once (0 = logged)
+    std::chrono::steady_clock::time_point hudDumpAt_{};
 };
 
 } // namespace mp
