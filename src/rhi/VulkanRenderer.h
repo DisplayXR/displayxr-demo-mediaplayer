@@ -42,6 +42,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
+#include <thread>
 
 #include "media/FrameRing.h"
 #include "rhi/AsyncUpload.h"
@@ -159,13 +161,15 @@ public:
 
     // Debug: read the given swapchain image back and write it to `path` as PNG.
     // Must be called after ClearViews/DrawViews and before the image is released. Proves
-    // exactly what the app submitted to the runtime. Returns false on failure. Debug-only
-    // and deliberately blocking: it submits the open frame early and drains the ring.
+    // exactly what the app submitted to the runtime. Returns false when the readback fails.
+    // Debug-only: the readback blocks (it submits the open frame early and drains the ring),
+    // the PNG encode and write run on a background thread (#280: at 8K the encode alone took
+    // ~20 s on the render thread). The file appears under its name only once complete.
     bool DumpImage(uint32_t imageIndex, const char* path);
 
     // Debug: read back an arbitrary RGBA8 image (e.g. the HUD swapchain image, left
-    // in COLOR_ATTACHMENT_OPTIMAL) and write it to `path` as PNG. Proves what was
-    // rendered into an off-screen target. Returns false on failure.
+    // in COLOR_ATTACHMENT_OPTIMAL) and write it to `path` as PNG, as DumpImage. Proves what
+    // was rendered into an off-screen target. Returns false when the readback fails.
     bool DumpExternalImage(VkImage image, uint32_t width, uint32_t height, const char* path);
 
     // Record a clear of the acquired swapchain image into the frame command buffer: each
@@ -334,6 +338,11 @@ public:
                    const ViewUV* uvs, uint32_t viewCount);
 
 private:
+    // #280: encode + write a dump's pixels off the render thread (to path.tmp, then renamed);
+    // Shutdown joins the writers, so a dump taken just before closing still lands.
+    void WritePngInBackground(std::vector<unsigned char> rgba, uint32_t w, uint32_t h, std::string path,
+                              const char* what);
+    std::vector<std::thread> pngWriters_;
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;

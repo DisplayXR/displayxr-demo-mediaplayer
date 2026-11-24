@@ -27,8 +27,10 @@
 #include <algorithm>  // std::max / std::min (scissor clamp)
 #include <chrono>     // the perf window's timings
 #include <cstdlib>    // std::getenv
+#include <cstdio>     // std::rename / std::remove (dump files)
 #include <cstring>    // std::memcpy (half-float LUT pack)
 #include <string>
+#include <thread>     // the dumps' PNG writer
 #include <vector>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -2324,28 +2326,25 @@ bool VulkanRenderer::DumpImage(uint32_t imageIndex, const char* path) {
                              0, nullptr, 1, &toColor);
     });
 
-    // Map + write PNG. Swizzle BGRA->RGBA when the swapchain format is BGRA.
+    // Copy out (swizzling BGRA->RGBA when the swapchain format is BGRA); the PNG is
+    // encoded and written off the render thread.
     void* mapped = nullptr;
-    vkMapMemory(device_, mem, 0, bytes, 0, &mapped);
-    auto* px = static_cast<unsigned char*>(mapped);
-    const bool isBGRA = (format_ == VK_FORMAT_B8G8R8A8_UNORM ||
-                         format_ == VK_FORMAT_B8G8R8A8_SRGB);
-    if (isBGRA) {
-        for (VkDeviceSize i = 0; i < bytes; i += 4) {
-            unsigned char t = px[i];
-            px[i] = px[i + 2];
-            px[i + 2] = t;
-        }
+    if (vkMapMemory(device_, mem, 0, bytes, 0, &mapped) != VK_SUCCESS) {
+        vkFreeMemory(device_, mem, nullptr);
+        vkDestroyBuffer(device_, buf, nullptr);
+        return false;
     }
-    const int ok = stbi_write_png(path, (int)width_, (int)height_, 4, px, (int)width_ * 4);
+    std::vector<unsigned char> px(static_cast<const unsigned char*>(mapped),
+                                  static_cast<const unsigned char*>(mapped) + bytes);
     vkUnmapMemory(device_, mem);
-
     vkFreeMemory(device_, mem, nullptr);
     vkDestroyBuffer(device_, buf, nullptr);
-
-    if (ok) LOG_INFO("Wrote atlas dump -> %s (%ux%u)", path, width_, height_);
-    else LOG_ERROR("stbi_write_png failed for %s", path);
-    return ok != 0;
+    const bool isBGRA = (format_ == VK_FORMAT_B8G8R8A8_UNORM ||
+                         format_ == VK_FORMAT_B8G8R8A8_SRGB);
+    if (isBGRA)
+        for (size_t i = 0; i + 3 < px.size(); i += 4) std::swap(px[i], px[i + 2]);
+    WritePngInBackground(std::move(px), width_, height_, path, "atlas");
+    return true;
 }
 
 bool VulkanRenderer::DumpExternalImage(VkImage image, uint32_t width, uint32_t height,
@@ -2420,18 +2419,44 @@ bool VulkanRenderer::DumpExternalImage(VkImage image, uint32_t width, uint32_t h
     });
 
     void* mapped = nullptr;
-    vkMapMemory(device_, mem, 0, bytes, 0, &mapped);  // HUD is R8G8B8A8 — no swizzle
-    const int ok = stbi_write_png(path, (int)width, (int)height, 4, mapped, (int)width * 4);
+    if (vkMapMemory(device_, mem, 0, bytes, 0, &mapped) != VK_SUCCESS) {
+        vkFreeMemory(device_, mem, nullptr);
+        vkDestroyBuffer(device_, buf, nullptr);
+        return false;
+    }
+    // HUD is R8G8B8A8 - no swizzle
+    std::vector<unsigned char> px(static_cast<const unsigned char*>(mapped),
+                                  static_cast<const unsigned char*>(mapped) + bytes);
     vkUnmapMemory(device_, mem);
     vkFreeMemory(device_, mem, nullptr);
     vkDestroyBuffer(device_, buf, nullptr);
+    WritePngInBackground(std::move(px), width, height, path, "HUD");
+    return true;
+}
 
-    if (ok) LOG_INFO("Wrote HUD dump -> %s (%ux%u)", path, width, height);
-    else LOG_ERROR("stbi_write_png failed for %s", path);
-    return ok != 0;
+void VulkanRenderer::WritePngInBackground(std::vector<unsigned char> rgba, uint32_t w, uint32_t h,
+                                          std::string path, const char* what) {
+    LOG_INFO("%s dump read back (%ux%u), writing %s in the background", what, w, h, path.c_str());
+    pngWriters_.emplace_back([rgba = std::move(rgba), w, h, path = std::move(path), what]() {
+        const auto t0 = std::chrono::steady_clock::now();
+        // to a temporary name first, so whoever waits for the file never reads half of it
+        const std::string tmp = path + ".tmp";
+        int ok = stbi_write_png(tmp.c_str(), (int)w, (int)h, 4, rgba.data(), (int)w * 4);
+        if (ok) {
+            std::remove(path.c_str());  // rename does not replace on Windows
+            ok = std::rename(tmp.c_str(), path.c_str()) == 0;
+            if (!ok) std::remove(tmp.c_str());
+        }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (ok) LOG_INFO("Wrote %s dump -> %s (%ux%u, %.1f s)", what, path.c_str(), w, h, s);
+        else LOG_ERROR("writing the %s dump failed: %s", what, path.c_str());
+    });
 }
 
 void VulkanRenderer::Shutdown() {
+    for (std::thread& t : pngWriters_)  // #280: a dump still being written finishes first
+        if (t.joinable()) t.join();
+    pngWriters_.clear();
     if (device_ == VK_NULL_HANDLE) return;
     // The upload thread first: it finishes a copy in progress, unpins, unhooks its ring and
     // joins. A staged frame not recorded by now never will be.
