@@ -277,6 +277,7 @@ void Window::HandleLinuxKey(uint32_t ks, uint32_t mods, bool repeat, bool* quit)
     switch (ks) {
         case XK_Escape:  // an open panel (help) or a browser slideshow backs out first
             if (escapeBacksOut_) escapeRequested_ = true;
+            else if (OpenRequestPending()) escapeRequested_ = true;  // the opened surface's (#276)
             else *quit = true;
             break;
         case XK_v: cycleModeRequested_ = true; break;

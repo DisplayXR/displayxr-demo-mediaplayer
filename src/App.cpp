@@ -925,11 +925,16 @@ int App::Run() {
             activity = true;
         }
         // Esc closes the shortcuts panel (#251), backs out of a slideshow from the media
-        // browser to it (#252), else quits.
+        // browser to it (#252), else quits. An Esc that came in the same batch as the key that
+        // opened the browser or Settings arrives here too, and closes what it opened (#276).
         window_.SetEscapeBacksOut(uiState_.helpOpen || (fromBrowserList_ && !browsing_));
         if (window_.TakeEscapeRequest()) {
             if (uiState_.helpOpen) uiState_.helpOpen = false;
             else if (fromBrowserList_ && !browsing_) BackToBrowser();
+            else if (settingsPanel_.IsOpen()) settingsPanel_.Close();
+#if MEDIAPLAYER_BROWSER
+            else if (browsing_) CloseBrowser();
+#endif
             activity = true;
         }
         if (window_.TakeTogglePauseRequest()) { TogglePlayback(); activity = true; }  // Space
@@ -997,6 +1002,7 @@ int App::Run() {
         }
         if (gotNative) {
             openFilePending_ = false;
+            nativeDialogUp_ = false;
             if (pinPickPending_) {
                 // The browser's "Add folder...": pin it, and the browser shows it (#252).
                 pinPickPending_ = false;
@@ -1100,9 +1106,11 @@ void App::RenderOneFrame() {
     // The live camera (#90) publishes into a FrameRing of its own, so it rides the same
     // upload path. Freeze = stop acquiring: the last uploaded texture keeps drawing.
     // A stream (#93) is video_ in live mode: same ring, same freeze-by-not-acquiring.
-    // BuildTransportUI re-asserts it while a field is focused; an open Settings window holds it
-    // even on a frame with no HUD (#265).
-    window_.SetKeyboardCaptured(settingsPanel_.IsOpen());
+    // Held from what is OPEN, not from what this frame draws (#276): the media browser, the
+    // Settings window (#265), or a menu / popup / text field the transport UI had open when it
+    // last drew. A frame that draws no UI (shouldRender false around the browser's mode switch,
+    // no HUD image) used to release it, and an Esc on the next pump then quit the player.
+    window_.SetKeyboardCaptured(KeyboardHeldByUi());
     FrameRing* ring = isLive_     ? (livePaused_ ? nullptr : &live_->Ring())
                       : isStream_ ? (streamPaused_ ? nullptr : &video_.Ring())
                                   : (isVideo_ ? &video_.Ring() : nullptr);
@@ -1715,6 +1723,10 @@ void App::RenderOneFrame() {
             xr_.ReleaseHudImage();
             renderer_.NoteStage(RenderStage::HudImage, StageMs(release0));
         }
+    } else if (frame.shouldRender) {
+        // The UI is down by choice (clean feed, faded out): no menu or field is reachable, so
+        // none holds the keyboard (#276). A frame merely skipped keeps the last answer.
+        uiHoldsKeys_ = false;
     }
 
     if (gridPending) {
@@ -1966,10 +1978,18 @@ void App::BuildTransportUI() {
         LOG_INFO("Settings: window closed");
     }
 #if defined(MEDIAPLAYER_WITH_IMGUI)
-    // A focused text field (the Stream URL popup) owns the keyboard: no hotkeys. So does the
-    // Settings window while it is open (Esc closes it), and never once it is closed.
-    window_.SetKeyboardCaptured(ImGui::GetIO().WantTextInput || settingsPanel_.IsOpen());
+    // A focused text field (the Stream URL popup) or an open menu owns the keyboard: no
+    // hotkeys, and Esc closes the menu rather than quitting (#276). So does the Settings window
+    // while it is open (Esc closes it), and never once it is closed.
+    uiHoldsKeys_ = ImGui::GetIO().WantTextInput || ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
+    window_.SetKeyboardCaptured(KeyboardHeldByUi());
 #endif
+}
+
+bool App::KeyboardHeldByUi() const {
+    // The help panel is not here: it takes Esc through SetEscapeBacksOut, and the player's
+    // other keys stay live under it.
+    return browsing_ || settingsPanel_.IsOpen() || uiHoldsKeys_ || nativeDialogUp_;
 }
 
 void App::ApplyCursorHidden() {
@@ -5212,6 +5232,7 @@ void App::ShowNativeOpenDialog() {
         {"Stereo media", "mp4;mkv;mov;m4v;webm;3gp;jpg;jpeg;png;gif;bmp;lif;mpo;heic;heif;hif"},
         {"All files", "*"},
     };
+    nativeDialogUp_ = true;  // Esc must not quit before the dialog window is up (#276)
     SDL_ShowOpenFileDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this,
                            window_.SdlWindow(), kFilters, 2, nullptr, false);
 }
@@ -5239,6 +5260,7 @@ void App::RequestOpenFolder() {
     }
     LOG_INFO("Open folder: native dialog");
     // Same result slot as Open file: the main loop sees a directory and opens its first file.
+    nativeDialogUp_ = true;  // Esc must not quit before the dialog window is up (#276)
     SDL_ShowOpenFolderDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this, window_.SdlWindow(),
                              start.empty() ? nullptr : start.c_str(), false);
 }
@@ -5350,6 +5372,7 @@ void App::ShowBrowser() {
 #endif
     browser_->Refresh();
     window_.SetKeyboardCaptured(true);  // the browser's keys from the next event on
+    browserFirstFrame_ = true;          // the key that opened it is not the browser's (#276)
     LOG_INFO("browser: shown");
 #endif
 }
@@ -5674,15 +5697,22 @@ void App::BuildBrowser() {
     // then closes; Backspace and Alt+Left back out.
     window_.SetKeyboardCaptured(true);
     const ImGuiIO& io = ImGui::GetIO();
+    // ImGui reads the keys that arrived since its last frame. With the player's controls hidden
+    // that last frame was before the Ctrl+O that opened the browser, so this first frame sees that
+    // Ctrl+O again and would swap the browser for the desktop dialog at once (#276).
+    const bool firstFrame = browserFirstFrame_;
+    browserFirstFrame_ = false;
     if (action == browser::MediaBrowser::Action::None && !io.WantTextInput) {
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false) && !firstFrame) {
             // Ctrl+O: the Windows file dialog, always one key away (#252 desktop design).
+            LOG_INFO("browser: Ctrl+O - desktop file dialog");
             CloseBrowser();
             ShowNativeOpenDialog();
         } else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             if (CloudFetchBusy()) {
                 // The download card's Cancel has Esc.
             } else if (!browser_->Back()) {
+                LOG_INFO("browser: Esc - closed");
                 CloseBrowser();
             }
         } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
@@ -5759,6 +5789,7 @@ void App::BuildBrowser() {
         case browser::MediaBrowser::Action::AddFolder:
             if (!openFilePending_ && !pinPickPending_) {
                 pinPickPending_ = true;
+                nativeDialogUp_ = true;  // Esc must not quit before the dialog window is up (#276)
                 SDL_ShowOpenFolderDialog((SDL_DialogFileCallback)&App::NativeFileCallback, this, window_.SdlWindow(),
                                          nullptr, false);
             }
