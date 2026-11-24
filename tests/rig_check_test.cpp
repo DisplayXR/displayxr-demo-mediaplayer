@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 //
 // Rig checks (Media Player Pro, phase 2) against the synthetic rig, whose answers are
 // known: its discs sit at fixed parallaxes (TestSignalSource::kDisparity), and the
@@ -941,6 +941,56 @@ void EyeSyncLikeTheApp(float rollDeg, int& confirmedRightTotal) {
     confirmedRightTotal += confirmedRight;
 }
 
+// #281: the eye-sync step's cost at the station's size (3840x2160 per eye, SBS), next to
+// the spatial Measure it runs after. Prints every burst's reading so a speed change can be
+// checked against the readings it must not change, and checks the budget loosely (a CI
+// runner is slower than the station; the tight figure is read off the printout).
+void EyeSyncTiming(float rollDeg) {
+    TestSignalConfig cfg;
+    cfg.eyeW = 3840;
+    cfg.eyeH = 2160;
+    cfg.fps = 48.0;
+    cfg.vShiftPx = 4.0f;
+    cfg.gainR = 1.15f;
+    cfg.eyeDelay = 2;
+    cfg.rollDeg = rollDeg;
+    double spatialSum = 0, syncSum = 0, syncMax = 0;
+    int bursts = 0;
+    std::string readings;
+    for (int64_t last = 30; last <= 170; last += 20) {
+        std::vector<rig::EyePair> seq = Burst(cfg, last, false);
+        const auto t0 = std::chrono::steady_clock::now();
+        rig::Result r = rig::Measure(seq.back());
+        const auto t1 = std::chrono::steady_clock::now();
+        if (!r.ok) continue;
+        std::vector<float> p = r.parallaxPct;
+        std::nth_element(p.begin(), p.begin() + p.size() / 2, p.end());
+        const rig::EyePair& e = seq.back();
+        const float shiftX = p[p.size() / 2] / 100.f * (float)e.eyeW;
+        const float shiftY = e.fullH > 0 ? r.verticalPx * (float)e.h / e.fullH : 0.f;
+        int late = 0;
+        const auto t2 = std::chrono::steady_clock::now();
+        const int d = rig::MeasureEyeSync(seq, shiftX, shiftY, r.dySlope, &late);
+        const auto t3 = std::chrono::steady_clock::now();
+        const double sm = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const double ym = std::chrono::duration<double, std::milli>(t3 - t2).count();
+        spatialSum += sm;
+        syncSum += ym;
+        syncMax = std::max(syncMax, ym);
+        ++bursts;
+        char b[32];
+        std::snprintf(b, sizeof b, " %d/%+d", d, late);
+        readings += b;
+    }
+    CHECK(bursts > 0, "timing: the spatial measurement works at 2160p");
+    if (bursts == 0) return;
+    std::printf("  eye-sync timing 2160p SBS, roll %.1f: spatial avg %.1f ms, eye sync avg %.1f max %.1f ms over %d bursts\n",
+                rollDeg, spatialSum / bursts, syncSum / bursts, syncMax, bursts);
+    std::printf("    readings (frames/late):%s\n", readings.c_str());
+    // loose: a slow shared runner, a Debug build; the station's figure is the printout
+    CHECK(syncSum / bursts < 250.0, "eye sync stays well inside a measurement slot");
+}
+
 // The vote that turns single-burst readings into the figure shown (RigMonitor::Worker).
 void SyncConfirmVotes() {
     rig::SyncConfirm c;
@@ -1244,6 +1294,8 @@ int main() {
     EyeSyncLikeTheApp(0.0f, confirmedRight);
     EyeSyncLikeTheApp(0.5f, confirmedRight);  // a rolled eye: dy runs across x, far more than a frame of motion
     CHECK(confirmedRight >= 1, "the 2-frame delay is confirmed from the pixels on the app's path");
+    EyeSyncTiming(0.0f);
+    EyeSyncTiming(0.5f);
     MeasuresWithDroppedFrames();
     if (g_failures) {
         std::fprintf(stderr, "rig_check_test: %d failure(s)\n", g_failures);
