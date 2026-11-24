@@ -116,6 +116,8 @@ bool XrSession::InitInstanceAndSystem() {
             hasLocal2DExt_ = true;
 #if defined(__linux__) && !defined(__ANDROID__)
         if (strcmp(e.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) hasWeaveExt_ = true;
+        if (strcmp(e.extensionName, XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME) == 0)
+            hasWorkspaceInputExt_ = true;
 #endif
     }
 
@@ -154,6 +156,14 @@ bool XrSession::InitInstanceAndSystem() {
     // The window drag's phase snap (xrWeaveSnapWindowRectDXR): the X11 drag
     // lands each step on a phase-correct origin. Optional — identity without.
     if (hasWeaveExt_) enabled.push_back(XR_DXR_WEAVE_EXTENSION_NAME);
+    // XR_DXR_workspace_client_input: inside the DisplayXR workspace the window
+    // is hidden and the service owns the pointer and keyboard; this lets the
+    // window helper drain the app's routed share and deliver it as ordinary
+    // window events (displayxr-common's DxrLinuxWindow, armed by
+    // attach_session). A no-op outside a workspace, so enable it whenever the
+    // runtime advertises it.
+    if (hasWorkspaceInputExt_) enabled.push_back(XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_workspace_client_input: %s", hasWorkspaceInputExt_ ? "ENABLED" : "NOT FOUND");
 #endif
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
