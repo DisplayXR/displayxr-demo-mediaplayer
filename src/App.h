@@ -474,6 +474,8 @@ private:
     // Open-file flow. openFilePending_ gates the Open button while a picker is up.
     // The native-dialog callback may run off-thread; it parks the result here.
     bool openFilePending_ = false;
+    bool nativeDialogUp_ = false;     // a desktop file/folder dialog asked for, no answer yet (#276)
+    bool browserFirstFrame_ = false;  // the browser's first frame after ShowBrowser (#276)
     std::mutex nativePathMutex_;
     std::string nativePath_;
     bool hasNativePath_ = false;
@@ -490,6 +492,10 @@ private:
     // ~0.5 s after the last change (never mid-drag) and at shutdown.
     Settings settings_;
     ui::SettingsPanel settingsPanel_;
+    // The transport UI had a menu, popup or focused text field open when it last drew (#276).
+    // Kept across frames that draw no UI (shouldRender false, a mode switch, no HUD image), so
+    // an Esc on such a frame still goes to the UI instead of the window's quit.
+    bool uiHoldsKeys_ = false;
     uint64_t settingsGen_ = 0;
     std::chrono::steady_clock::time_point settingsChangedAt_{};
     void RegisterSettingsRows();
@@ -741,6 +747,7 @@ private:
     bool cursorHiddenApplied_ = false;
     // The pointer is hidden with the UI: Pro's strip, the basic player's chrome (#251).
     bool cursorIdle_ = false;
+    bool KeyboardHeldByUi() const;  // #276: the window keeps no hotkeys while this is true
     void ApplyCursorHidden();
 #if MEDIAPLAYER_PRO
     float proHud_[4] = {0.f, 0.f, 1.f, 1.f};  // HUD rect in window fractions (x, y, w, h)

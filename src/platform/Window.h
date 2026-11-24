@@ -187,6 +187,12 @@ public:
     // ESC-quits, ...) must not fire on what the user types. The app sets this each frame
     // from ImGui's WantTextInput; PumpEvents then leaves key-downs to ImGui alone.
     void SetKeyboardCaptured(bool c) { keyboardCaptured_ = c; }
+    // An open request (a dialog, Settings, the shortcuts panel) read but not yet taken by the
+    // app (#276: an Esc right behind it must not quit).
+    bool OpenRequestPending() const {
+        return openFileRequested_ || openFolderRequested_ || openUrlRequested_ || openSettingsRequested_ ||
+               helpRequested_;
+    }
     // SDL camera events since the last read, as {SDL event type, SDL_CameraID} pairs
     // (ADDED / REMOVED / APPROVED / DENIED). Moved into `out`; false if none. They only
     // arrive once the app has initialised SDL's camera subsystem.

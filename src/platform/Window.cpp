@@ -231,6 +231,10 @@ bool Window::PumpEvents() {
             else if (!e.key.repeat) {
                 if (e.key.key == SDLK_ESCAPE) {
                     if (escapeBacksOut_) escapeRequested_ = true;
+                    // An Esc read in the same batch as an open request (Ctrl+O, Ctrl+,, F1) lands
+                    // before the app has opened that surface and taken the keyboard. It is the
+                    // surface's Esc, handed over after the open, never a quit (#276).
+                    else if (OpenRequestPending()) escapeRequested_ = true;
                     else if (escapeQuits_) return false;
                     else if (fullscreen_) ToggleFullscreen();
                 }
