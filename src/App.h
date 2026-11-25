@@ -437,12 +437,10 @@ private:
     bool layoutForced_ = false;
     StereoLayout layoutForcedValue_ = StereoLayout::Mono;
     // MEDIAPLAYER_STEREO_DETECT: off | meta | full.
-    //   full (DEFAULT) — filename, container metadata, the pixel detector, then
-    //                    assume-stereo-from-aspect. The detector is the only layer that
-    //                    can conclude a file is MONO, and it only does so when the
-    //                    evidence is unambiguous; anything short of that falls through
-    //                    to the stereo assumption.
-    //   meta           — skip the pixel detector. Everything unidentified is stereo.
+    //   full (DEFAULT) — filename, container metadata, the pixel detector, then 2D.
+    //                    The detector is what finds an untagged stereo file; anything it
+    //                    cannot decide on opens as 2D (mono).
+    //   meta           — skip the pixel detector. Everything unidentified is 2D.
     //   off            — no probe at all, so container metadata is ignored too. A perf
     //                    escape hatch, not a normal setting.
     enum class DetectMode { Off, Meta, Full };

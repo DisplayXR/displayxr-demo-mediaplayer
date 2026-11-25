@@ -106,9 +106,8 @@ tests/
 
 ## 3D badges
 
-The player's layout resolver assumes stereo unless mono is proven (`MediaSource.h`).
-That is right for playback but would badge every photo, so a badge needs positive
-evidence. `StereoClassifier.h` lists the evidence and its order. The file's own
+A badge needs positive evidence that a file is stereo; the player's own layout resolver
+(`MediaSource.h`) opens anything it cannot identify as 2D. `StereoClassifier.h` lists the evidence and its order. The file's own
 evidence (a LIF, a two-track video) is read by the provider while it makes the
 thumbnail, as `Thumbnail::file3D`. The verdict also picks the thumbnail
 crop: the left eye for side by side, the top for top-bottom, the whole thumbnail for a

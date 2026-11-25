@@ -3,7 +3,7 @@
 #include <cstring>
 
 #include "Log.h"
-#include "StereoDetect.h"   // ChooseFullOrHalf — pure aspect policy, no pixels involved
+#include "StereoDetect.h"
 
 #include <algorithm>
 #include <cctype>
@@ -28,29 +28,16 @@ bool Contains(const std::string& s, const char* needle) {
     return s.find(needle) != std::string::npos;
 }
 
-// Last resort, and the deliberate default policy of this player.
+// Untagged media opens as 2D (mono). When neither the filename, the container metadata
+// nor the content detector says a file is stereo, it is treated as an ordinary 2D
+// picture: shown flat, and eligible for "Convert to 3D" through the 2D/3D switch.
 //
-// This is a STEREO media player for a 3D display. Viewing mono content is not a use
-// case, so when nothing has identified a file the working assumption is that it IS
-// stereo, and the frame aspect only has to settle full-vs-half. That is a policy call,
-// not a measurement -- and it is what finally fixes the case the old rule could not:
-// an unsuffixed 1920x1080 half-SBS frame is dimensionally identical to a mono one, so
-// no aspect THRESHOLD can separate them, but under this assumption it simply resolves
-// to half-SBS.
-//
-// The old rule was `aspect >= 1.9 -> full SBS, else mono`, which got the common
-// half-SBS case wrong in the direction that hurts: a real stereo file shown flat.
-//
-// Cost, accepted knowingly: a genuinely mono file with no suffix and no metadata --
-// e.g. an ordinary photo reached by arrow-keying through a folder -- renders as a
-// squeezed half-SBS. `L` is the escape hatch, and the content detector
-// (MEDIAPLAYER_STEREO_DETECT=full) can be switched on to catch it automatically.
-bool LayoutFromAspect(int w, int h, StereoLayout& out) {
-    if (w <= 0 || h <= 0) return false;   // no dimensions: nothing to go on at all
-    bool ambiguous = false;
-    out = StereoDetect::ChooseFullOrHalf((float)w / (float)h, ambiguous);
-    return true;
-}
+// The player used to ASSUME stereo here and let the aspect settle full vs half SBS, so
+// an ordinary 16:9 video with no tag (one the detector could not decide on, such as a
+// dark, low-texture clip) showed squeezed and cropped as half-SBS, and the 2D/3D switch
+// only flipped the panel mode instead of converting. An unlabelled real SBS file the
+// detector cannot decide on now opens flat instead; `L` pins its layout, and a `*_2x1`
+// name or a stereo tag still identifies it.
 
 } // namespace
 
@@ -119,7 +106,7 @@ bool IsHeifExt(const std::string& lower) {
 }
 }  // namespace
 
-MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int imageHeight) {
+MediaInfo MediaSource::Identify(const std::string& path, int /*imageWidth*/, int /*imageHeight*/) {
     const std::string lower = Lower(path);
     MediaInfo info;
 
@@ -140,10 +127,8 @@ MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int ima
     if (LayoutFromFilename(path, info.layout)) {
         info.signal = StereoSignal::Filename;
         info.confidence = 1.0f;
-    } else if (LayoutFromAspect(imageWidth, imageHeight, info.layout)) {
-        info.signal = StereoSignal::Aspect;
-        info.confidence = 0.3f;
     } else {
+        // Untagged: 2D (see the note at the top of this file).
         info.layout = StereoLayout::Mono;
         info.signal = StereoSignal::Default;
         info.confidence = 1.0f;
@@ -155,7 +140,7 @@ MediaInfo MediaSource::Identify(const std::string& path, int imageWidth, int ima
 }
 
 MediaInfo MediaSource::Resolve(const std::string& path, MediaKind kind,
-                               int frameW, int frameH,
+                               int /*frameW*/, int /*frameH*/,
                                const StereoLayout* manual,
                                const MediaInfo* meta,
                                const StereoDetectResult* content) {
@@ -188,17 +173,13 @@ MediaInfo MediaSource::Resolve(const std::string& path, MediaKind kind,
         info.eyeSwap = meta->eyeSwap;
         info.signal = StereoSignal::Metadata;
         info.confidence = 1.0f;
-    // 4. Content analysis, when it is switched on AND reached a verdict. A CONFIDENT
-    //    MONO is a real verdict and wins here — that is the only way a mono file gets
-    //    recognised as such, since layer 5 assumes stereo by policy.
+    // 4. Content analysis, when it is switched on AND reached a verdict (stereo, or a
+    //    confident mono). An undecided result falls through to the 2D default.
     } else if (content && content->decided) {
         info.layout = content->layout;
         info.signal = StereoSignal::Content;
         info.confidence = content->confidence;
-    // 5. Assume stereo; aspect only settles full vs half.
-    } else if (LayoutFromAspect(frameW, frameH, info.layout)) {
-        info.signal = StereoSignal::Aspect;
-        info.confidence = 0.3f;
+    // 5. Nothing identified it: 2D (see the note at the top of this file).
     } else {
         info.layout = StereoLayout::Mono;
         info.signal = StereoSignal::Default;
