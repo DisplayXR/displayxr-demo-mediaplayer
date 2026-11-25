@@ -6,6 +6,7 @@
 #include <cmath>
 
 #include "ColorPolicy.h"      // swapchain encoding choice (#78)
+#include "mode_table.h"       // displayxr-common: v27 table-changed event + v28 worst case
 #include "platform/Window.h"  // Window::LinuxHandles — the Linux native-handle shape
 
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -274,10 +275,20 @@ bool XrSession::InitInstanceAndSystem() {
         // older runtime ignores the unknown chain entry and leaves it zeroed.
         XrDisplayDesktopInfoDXR desktopInfo = {};
         desktopInfo.type = XR_TYPE_DISPLAY_DESKTOP_INFO_DXR;
+        // v28: the instance's rendering worst case (the largest atlas any mode of any
+        // claimed screen can ask for); CreateSwapchain sizes no smaller. An older
+        // runtime ignores the unknown chain entry and leaves it zeroed.
+        XrDisplayRenderingWorstCaseDXR worstCase = {};
+        worstCase.type = XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR;
+        desktopInfo.next = &worstCase;
         desktopPos.next = &desktopInfo;
         di.next = &desktopPos;
         props.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(instance_, systemId_, &props))) {
+            worstAtlasWidth_ = worstCase.maxAtlasWidthPixels;
+            worstAtlasHeight_ = worstCase.maxAtlasHeightPixels;
+            LOG_INFO("Rendering worst case (display_info v28): atlas %ux%u%s", worstAtlasWidth_,
+                     worstAtlasHeight_, worstAtlasWidth_ == 0 ? " (none stated: older runtime)" : "");
             displayPixelWidth_ = di.displayPixelWidth;
             displayPixelHeight_ = di.displayPixelHeight;
             displayWidthM_ = di.displaySizeMeters.width;
@@ -834,8 +845,28 @@ bool XrSession::RequestNextMode() {
     return false;
 }
 
+// The two-mode contract by POSITION (runtime #2766, display_info v27): exactly two
+// modes, modeIndex 0 (one view) and 1 — then 0 is the 2D mode and 1 the 3D mode, whatever
+// their content. Slot 1 may be a one-view "Same as 2D" entry with hardware 3D off,
+// so the 3D mode is never found by viewCount >= 2 / hardware3D under this contract.
+// (A template so it takes XrSession's private RenderingMode without naming it.)
+template <typename Mode>
+static bool IsPositionalTwoMode(const std::vector<Mode>& modes) {
+    if (modes.size() != 2) return false;
+    bool has0 = false, has1 = false;
+    for (const auto& m : modes) {
+        has0 = has0 || (m.modeIndex == 0 && m.viewCount == 1);
+        has1 = has1 || m.modeIndex == 1;
+    }
+    return has0 && has1;
+}
+
 int32_t XrSession::FindFlatMode() const {
-    // Prefer a mode that is mono AND drives the hardware to 2D; a mono mode that
+    if (IsPositionalTwoMode(modes_)) {
+        for (const auto& m : modes_)
+            if (m.modeIndex == 0) return m.requestable ? 0 : -1;
+    }
+    // Older multi-mode runtime: prefer a mode that is mono AND drives the hardware to 2D; a mono mode that
     // leaves the lens on is the second-best answer and still beats a stereo one.
     const RenderingMode* fallback = nullptr;
     for (const auto& m : modes_) {
@@ -847,7 +878,11 @@ int32_t XrSession::FindFlatMode() const {
 }
 
 int32_t XrSession::FindStereoMode() const {
-    // The first requestable mode that drives the hardware to 3D with two or more views
+    if (IsPositionalTwoMode(modes_)) {
+        for (const auto& m : modes_)
+            if (m.modeIndex == 1) return m.requestable ? 1 : -1;
+    }
+    // Older multi-mode runtime: the first requestable mode that drives the hardware to 3D with two or more views
     // (the runtime lists them in its own preference order).
     for (const auto& m : modes_)
         if (m.requestable && m.hardware3D && m.viewCount >= 2) return (int32_t)m.modeIndex;
@@ -911,6 +946,19 @@ bool XrSession::CreateSwapchain() {
     } else {
         width = configViews_[0].recommendedImageRectWidth * 2;
         height = configViews_[0].recommendedImageRectHeight;
+    }
+    // display_info v28: never smaller than the runtime's stated worst case, so a live
+    // 3D-mode switch (the v27 table-changed event) or a move to another screen always
+    // fits without recreating the swapchain (ComputeViewRects clamps the tiles to it on
+    // an older runtime). All zero on an older runtime: the size above stands.
+    {
+        XrDisplayRenderingWorstCaseDXR wc = {};
+        wc.maxAtlasWidthPixels = worstAtlasWidth_;
+        wc.maxAtlasHeightPixels = worstAtlasHeight_;
+        const uint32_t cw = width, ch = height;
+        dxr::SizeFromWorstCase(wc, false, cw, ch, &width, &height);
+        LOG_INFO("Swapchain sizing: computed %ux%u, runtime worst case %ux%u -> %ux%u", cw, ch,
+                 worstAtlasWidth_, worstAtlasHeight_, width, height);
     }
 
     XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -1134,6 +1182,26 @@ void XrSession::PollEvents() {
                 LOG_INFO("Rendering mode changed: %u -> %u ('%s': %u views %ux%u)",
                          e->previousModeIndex, e->currentModeIndex, ActiveModeName(),
                          ActiveViewCount(), ActiveTileColumns(), ActiveTileRows());
+                break;
+            }
+            case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR: {
+                // display_info v27: the 3D mode was switched live — the table changed,
+                // the index did not. Re-read it: the per-frame view count, tile grid and
+                // view scale (ActiveViewCount / ComputeViewRects) and the mode name follow
+                // from modes_. Latched like a mode change so the app names the new mode.
+                dxr::RenderingModeTableChange change;
+                if (dxr::DecodeRenderingModeTableChanged(
+                        reinterpret_cast<const XrEventDataBaseHeader*>(&event), &change)) {
+                    EnumerateRenderingModes();
+                    currentModeIndex_ = change.activeModeIndex;
+                    modeChanged_ = true;
+                    LOG_INFO("Rendering mode table changed: mode %u is now '%s': %u views %ux%u",
+                             change.activeModeIndex, ActiveModeName(), ActiveViewCount(),
+                             ActiveTileColumns(), ActiveTileRows());
+                    if (change.recreateSwapchains)
+                        LOG_WARN("Rendering mode table change asks for swapchain recreation; not "
+                                 "implemented — keeping the swapchain (the runtime resamples)");
+                }
                 break;
             }
             case (XrStructureType)XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR:

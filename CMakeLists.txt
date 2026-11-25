@@ -228,7 +228,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # gtk_shell1 says mutter) + the buffer_device helper in u_wayland_geom.h (#81).
         # v2.36.0: DxrLinuxWindow drains XR_DXR_workspace_client_input, so the app gets
         #   mouse + keyboard under the Linux workspace (displayxr-common#93).
-        GIT_TAG v2.36.0
+        # v2.37.0: mode_table.h's XrEventDataRenderingModeTableChangedDXR decode
+        #   (display_info v27) + dxr::SizeFromWorstCase (v28) (displayxr-common#94).
+        GIT_TAG v2.37.0
         GIT_SHALLOW TRUE)
 else()
     FetchContent_Declare(displayxr_common
@@ -241,7 +243,9 @@ else()
         # gtk_shell1 says mutter) + the buffer_device helper in u_wayland_geom.h (#81).
         # v2.36.0: DxrLinuxWindow drains XR_DXR_workspace_client_input, so the app gets
         #   mouse + keyboard under the Linux workspace (displayxr-common#93).
-        GIT_TAG v2.36.0
+        # v2.37.0: mode_table.h's XrEventDataRenderingModeTableChangedDXR decode
+        #   (display_info v27) + dxr::SizeFromWorstCase (v28) (displayxr-common#94).
+        GIT_TAG v2.37.0
         GIT_SHALLOW TRUE
         # No CMakeLists.txt there: MakeAvailable only populates, never add_subdirectory
         # (the non-deprecated form of a bare FetchContent_Populate).

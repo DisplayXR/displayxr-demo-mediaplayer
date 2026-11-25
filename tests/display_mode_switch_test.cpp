@@ -56,6 +56,21 @@ void StartsIn2D() {
     CHECK(sw.Flipped() == 1, "no lens mode: any stereo mode");
 }
 
+// display_info v27: two modes, and the 3D slot is a one-view passthrough ("Same as 2D",
+// lens off). Still the 3D mode: it is found by index, never by view count / hardware flag.
+void SameAs2DSlot() {
+    DisplayModeSwitch sw;
+    sw.SetModes({{0, 1, false}, {1, 1, false}});
+    CHECK(sw.Available(), "2D + one-view 3D slot: available");
+    CHECK(sw.Flat() == 0, "slot 0 is 2D");
+    CHECK(sw.Stereo() == 1, "slot 1 is 3D even with one view");
+    sw.SetActive(1);
+    CHECK(sw.Is3D(), "slot 1 active is 3D");
+    CHECK(sw.Flipped() == 0, "3D slot flips to 2D");
+    sw.SetActive(0);
+    CHECK(sw.Flipped() == 1, "2D flips to the 3D slot");
+}
+
 void FlatRule() {
     DisplayModeSwitch sw;
     sw.SetModes({{0, 2, true}, {1, 1, true}, {2, 1, false}});
@@ -82,6 +97,7 @@ int main() {
     TabletFlips();
     BackToLast3D();
     StartsIn2D();
+    SameAs2DSlot();
     FlatRule();
     NotAvailable();
     if (g_failures) {
