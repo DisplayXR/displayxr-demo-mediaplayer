@@ -5,6 +5,8 @@
 #include "AgentTools.h"
 #include "Log.h"
 #include "platform/SingleInstance.h"
+#include "media/DxrStereo.h"
+#include "media/DxrVideoTrack.h"
 #include "media/EyeAssign.h"
 #include "media/HeifLoader.h"
 #include "media/ImageDecoder.h"
@@ -76,6 +78,24 @@ constexpr float kIdleBgR = 0.12f, kIdleBgG = 0.12f, kIdleBgB = 0.13f;
 // step, clamped to ±max — fractions of a view tile, kept small for "subtle" depth.
 constexpr float kConvergenceStep = 0.0025f;
 constexpr float kConvergenceMax = 0.05f;
+
+// Cheap gates in front of the DisplayXR Camera readers (DxrStereo.h), so a file that
+// cannot be one is never parsed twice: the camera writes `.mp4` clips and `.jpg` stills.
+bool EndsWithNoCase(const std::string& p, const char* ext) {
+    const size_t n = std::strlen(ext);
+    if (p.size() < n) return false;
+    for (size_t i = 0; i < n; ++i)
+        if (std::tolower((unsigned char)p[p.size() - n + i]) != (unsigned char)ext[i]) return false;
+    return true;
+}
+bool HasMp4Ext(const std::string& p) {
+    return EndsWithNoCase(p, ".mp4") || EndsWithNoCase(p, ".mov") || EndsWithNoCase(p, ".m4v");
+}
+bool IsJpegFile(const std::string& p) {
+    std::ifstream f(p, std::ios::binary);
+    unsigned char m[2] = {0, 0};
+    return f.read(reinterpret_cast<char*>(m), 2) && m[0] == 0xFF && m[1] == 0xD8;
+}
 
 // The render loop's stage clock (rhi/RenderPerf.h): a few steady-clock reads per frame,
 // handed to the renderer's perf window (VulkanRenderer::NoteStage).
@@ -811,9 +831,11 @@ int App::Run() {
             if (mediaAutoConvAvailable_) {
                 convergence_ = 0.0f;  // the estimate alone, as at load; undo with '0'
                 mediaAutoConvOn_ = true;
-                LOG_INFO("auto-convergence applied: %+.4f", mediaAutoConvergence_);
+                LOG_INFO("auto-convergence applied: %+.4f%s", mediaAutoConvergence_,
+                         mediaConvFromFile_ ? " (the file's own)" : "");
                 char t[48];
-                std::snprintf(t, sizeof(t), "Auto-converge %+.1f%%", mediaAutoConvergence_ * 100.0f);
+                std::snprintf(t, sizeof(t), mediaConvFromFile_ ? "Convergence as shot %+.1f%%" : "Auto-converge %+.1f%%",
+                              mediaAutoConvergence_ * 100.0f);
                 ShowToast(t);
             } else {
                 ShowToast("Auto-converge: file already has convergence");
@@ -2365,12 +2387,19 @@ bool App::LoadMediaFile(const std::string& path) {
         // the GPU (the device was made with timeline semaphores for it) instead of CPU waits.
         video_.SetZeroCopyFence(xr_.ZeroCopyFenceCapable());
 #endif
+        // A DisplayXR Camera clip (DxrStereo.h): its XMP box says full side-by-side, left
+        // first, whatever st3d or the pixels say, and carries the suggested convergence.
+        // Read from the box tree only (no media data); any other file is untouched. Its
+        // layout is a fact, so the probe below skips the pixel vote for it.
+        dxrClipCurve_.Clear();
+        const dxrfile::VideoInfo dxrVideo = HasMp4Ext(path) ? dxrfile::ReadVideo(path) : dxrfile::VideoInfo{};
+        const bool dxrSbs = dxrVideo.ours && dxrVideo.sbs;
         // Probe BEFORE opening for playback: a bounded, software-only pre-roll on its own
         // context. See VideoStereoProbe.h for why this is synchronous rather than
         // analysing presented frames.
         VideoStereoProbe::Result pr;
         if (detectMode_ != DetectMode::Off && !manual)
-            pr = VideoStereoProbe::Run(path, wantContent);
+            pr = VideoStereoProbe::Run(path, wantContent && !dxrSbs);
         else if (detectMode_ != DetectMode::Off)  // a pinned layout still wants the projection (#155)
             pr.haveSpherical = VideoStereoProbe::ReadSpherical(path, pr.sphericalKind, pr.sphericalCoverageDeg,
                                                                &pr.sphericalPadding);
@@ -2397,10 +2426,15 @@ bool App::LoadMediaFile(const std::string& path) {
                     (float)pr.width / (float)pr.height, ambiguous);
             }
         }
+        if (dxrSbs) {
+            meta = MediaInfo{};
+            meta.layout = StereoLayout::SbsFull;
+            meta.format = "DisplayXR Camera";
+        }
         MediaInfo vinfo = MediaSource::Resolve(
             path, MediaKind::Video, pr.ok ? pr.width : 0, pr.ok ? pr.height : 0,
-            manual, pr.haveMeta ? &meta : nullptr,
-            pr.content.decided ? &pr.content : nullptr);
+            manual, (pr.haveMeta || dxrSbs) ? &meta : nullptr,
+            (!dxrSbs && pr.content.decided) ? &pr.content : nullptr);
         if (vinfo.signal == StereoSignal::Metadata) vinfo.format = meta.format;
 
         if (!video_.Open(path)) {
@@ -2418,8 +2452,22 @@ bool App::LoadMediaFile(const std::string& path) {
         ClearIdleLogo();
         ApplyLayout(vinfo);
         mediaConvergence_ = 0.0f;  // no baked convergence for video
-        mediaAutoConvAvailable_ = false;
         AutoConvNewPicture(/*newMedia=*/true);  // frames are sampled as they play
+        // A camera clip starts at its own convergence: the static value, then the per-frame
+        // track where the demuxer reaches it (DxrVideoTrack.h). Every other clip: none.
+        mediaAutoConvAvailable_ = false;
+        mediaAutoConvergence_ = 0.0f;
+        mediaConvFromFile_ = false;
+        if (dxrVideo.ours) {
+            const int samples = dxrfile::ReadConvergenceTrack(path, dxrVideo.metaTrackId, dxrClipCurve_);
+            mediaAutoConvAvailable_ = dxrVideo.hasConvergence || !dxrClipCurve_.Empty();
+            mediaAutoConvergence_ = dxrVideo.hasConvergence ? dxrVideo.shift : 0.0f;
+            mediaConvFromFile_ = mediaAutoConvAvailable_;
+            LOG_INFO("DisplayXR Camera clip '%s': layout %s, static convergence %s%+.4f, per-frame track %u "
+                     "(%d samples read, %zu valid)",
+                     path.c_str(), dxrVideo.sbs ? "sbs-lr" : "?", dxrVideo.hasConvergence ? "" : "(none) ",
+                     (double)mediaAutoConvergence_, dxrVideo.metaTrackId, samples, dxrClipCurve_.Size());
+        }
         KeepStillForConvert(nullptr, 0, 0);  // a video converts from its decoded frames
 #if MEDIAPLAYER_PRO
         pro_.OnStill(nullptr, 0, 0, layout_);  // scopes follow the frames again
@@ -2583,8 +2631,10 @@ bool App::LoadMediaFile(const std::string& path) {
             ApplyLayout(minfo);
             mediaConvergence_ = 0.0f;   // MPO carries no baked convergence...
             mediaAutoConvAvailable_ = true;   // ...so the estimate is always on offer
+            // ...or, for a DisplayXR Camera still, the file's own suggestion (MpoLoader).
             mediaAutoConvergence_ = mpo.autoConvergence;
             AutoConvNewPicture(/*newMedia=*/true);
+            mediaConvFromFile_ = mpo.fileConvergence;
             KeepStillForAutoConv(mpo.image.pixels.data(), mpo.image.width, mpo.image.height);
             KeepStillForConvert(mpo.image.pixels.data(), mpo.image.width, mpo.image.height);
 #if MEDIAPLAYER_PRO
@@ -2593,8 +2643,8 @@ bool App::LoadMediaFile(const std::string& path) {
             mediaW_ = mpo.image.width;
             mediaH_ = mpo.image.height;
             contentAspect_ = PerEyeAspect(layout_, mpo.image.width, mpo.image.height);
-            LOG_INFO("Displaying stereo MPO (%s), per-eye aspect %.3f", path.c_str(),
-                     contentAspect_);
+            LOG_INFO("Displaying stereo MPO (%s), per-eye aspect %.3f%s", path.c_str(),
+                     contentAspect_, mpo.fileConvergence ? ", convergence as shot" : "");
             currentMediaPath_ = path;
             RebuildFolderList(path);
             return true;
@@ -2605,16 +2655,22 @@ bool App::LoadMediaFile(const std::string& path) {
         LOG_ERROR("Open: cannot load image '%s'", path.c_str());
         return false;
     }
+    // The DisplayXR Camera side-by-side export (`*_sbs.jpg`, dxr:Layout="sbs-lr"): the XMP
+    // says full SBS, left first, and carries the suggested convergence. Other files: none.
+    const dxrfile::StillInfo dxrStill = img.width > 0 && IsJpegFile(path) ? dxrfile::ReadStillFile(path) : dxrfile::StillInfo{};
+    MediaInfo dxrMeta;
+    dxrMeta.layout = StereoLayout::SbsFull;
+    dxrMeta.format = "DisplayXR Camera";
     // The layer that solves unsuffixed stills: a half-SBS frame is dimensionally identical
     // to a mono one, so only the pixels can tell them apart.
     StereoDetectResult content;
-    if (wantContent) {
+    if (wantContent && !dxrStill.sbs) {
         content = StereoDetect::AnalyzeRGBA(img.pixels.data(), img.width, img.height,
                                             (ptrdiff_t)img.width * 4);
     }
     const MediaInfo imgInfo =
         MediaSource::Resolve(path, MediaKind::Image, img.width, img.height, manual,
-                             /*meta=*/nullptr, content.decided ? &content : nullptr);
+                             dxrStill.sbs ? &dxrMeta : nullptr, content.decided ? &content : nullptr);
     if (!renderer_.UploadTexture(img.pixels.data(), (uint32_t)img.width, (uint32_t)img.height)) {
         return false;
     }
@@ -2623,8 +2679,11 @@ bool App::LoadMediaFile(const std::string& path) {
     ClearIdleLogo();
     ApplyLayout(imgInfo);
     mediaConvergence_ = 0.0f;  // plain SBS image carries no baked convergence
-    mediaAutoConvAvailable_ = false;
     AutoConvNewPicture(/*newMedia=*/true);
+    // ...except the camera's side-by-side export, which suggests its own.
+    mediaAutoConvAvailable_ = dxrStill.sbs && dxrStill.hasConvergence;
+    mediaAutoConvergence_ = mediaAutoConvAvailable_ ? dxrStill.shift : 0.0f;
+    mediaConvFromFile_ = mediaAutoConvAvailable_;
     KeepStillForAutoConv(img.pixels.data(), img.width, img.height);
     KeepStillForConvert(img.pixels.data(), img.width, img.height);
 #if MEDIAPLAYER_PRO
@@ -3545,7 +3604,11 @@ bool App::AutoConvApplies() const {
 float App::MediaAutoShift() const {
     if (!mediaAutoConvAvailable_ || !mediaAutoConvOn_ || layout_ != StereoLayout::SbsFull) return 0.0f;
     if (autoConvEnabled_ && AutoConvApplies()) return 0.0f;
-    return swapEyes_ != mediaEyeSwap_ ? -mediaAutoConvergence_ : mediaAutoConvergence_;
+    // A camera clip's per-frame convergence follows the frame on screen (already a shift).
+    float v = mediaAutoConvergence_;
+    if (isVideo_ && !dxrClipCurve_.Empty())
+        v = dxrClipCurve_.ShiftAt((int64_t)std::llround(video_.PositionSeconds() * 1e6), mediaAutoConvergence_);
+    return swapEyes_ != mediaEyeSwap_ ? -v : v;
 }
 
 const uint8_t* App::AutoConvLuma8(const FrameRing::Frame& f) {
@@ -3691,6 +3754,7 @@ void App::AutoConvNewPicture(bool newMedia) {
     autoConvStillW_ = autoConvStillH_ = 0;
     mediaHasBakedConv_ = false;
     mediaAutoConvOn_ = true;
+    mediaConvFromFile_ = false;  // the loader that follows says when it is the file's own
 }
 
 void App::KeepStillForAutoConv(const uint8_t* rgba, int w, int h) {

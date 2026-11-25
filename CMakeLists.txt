@@ -270,6 +270,25 @@ set(MP_IMGUI_SOURCES
 # Every trunk change lands in both. Pro-only code lives in src/pro/ behind the
 # `#if MEDIAPLAYER_PRO` hooks in App.cpp — never fork a trunk file for Pro.
 # ---------------------------------------------------------------------------
+# DisplayXR Camera files (DisplayXR stereo media format v1): the format's reference reader,
+# vendored unmodified (third_party/dxrmedia/VENDORED.md), plus the player's thin layer over
+# it (src/media/DxrStereo.*). MpoLoader reads a camera still's suggested convergence
+# through it, so every target that compiles MpoLoader.cpp links mp_dxr. The vendored
+# fileio.cpp is POSIX; Windows compiles the player's shim in its place.
+add_library(mp_dxr STATIC
+    src/media/DxrStereo.cpp
+    third_party/dxrmedia/src/exif.cpp
+    third_party/dxrmedia/src/json.cpp
+    third_party/dxrmedia/src/stills.cpp
+    third_party/dxrmedia/src/tiff.cpp
+    third_party/dxrmedia/src/video.cpp
+    third_party/dxrmedia/src/xmp.cpp
+    $<IF:$<PLATFORM_ID:Windows>,src/media/DxrmediaFileioWin.cpp,third_party/dxrmedia/src/fileio.cpp>)
+target_include_directories(mp_dxr
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxrmedia/include ${CMAKE_CURRENT_SOURCE_DIR}/src/media
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxrmedia/src)
+set_target_properties(mp_dxr PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
 option(MP_LINUX_PORTABLE "Linux: RUNPATH=\$ORIGIN + stage bundled libs next to the binary (for the .deb)" OFF)
 
 function(mp_add_player tgt is_pro)
@@ -308,6 +327,7 @@ function(mp_add_player tgt is_pro)
         src/media/CameraSource.cpp   # live camera (#90): SDL3 camera -> FrameRing
         src/media/ImageSequence.cpp  # EXR / DPX / TIFF frames as one clip (Pro formats only)
         src/media/AutoConvergence.cpp  # live auto-convergence (#92): disparity.js port
+        src/media/DxrVideoTrack.cpp  # a DisplayXR Camera clip's per-frame convergence (FFmpeg)
         src/media/StreamUrl.cpp      # stream-URL classifier (#93)
         src/media/VrView.cpp         # VR180 / VR360 viewer (#155): rectified window geometry, pure
         src/media/LiftClient.cpp     # "Convert to 3D": XR_DXR_lift VIEWS_MONO stream (CPU in / out)
@@ -407,6 +427,7 @@ function(mp_add_player tgt is_pro)
     target_link_libraries(${tgt} PRIVATE displayxr::rules)
 
     target_link_libraries(${tgt} PRIVATE
+        mp_dxr  # DisplayXR Camera files (src/media/DxrStereo.h)
         SDL3::SDL3
         Vulkan::Vulkan
         nlohmann_json::nlohmann_json
@@ -890,7 +911,7 @@ if(MP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
     find_package(Threads REQUIRED)
-    target_link_libraries(stereo_grid_test PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+    target_link_libraries(stereo_grid_test PRIVATE Threads::Threads nlohmann_json::nlohmann_json mp_dxr)
     add_test(NAME stereo_grid COMMAND stereo_grid_test)
 
     # The Android player's 2D/3D switch (#180): which rendering mode a flip asks for. Pure.
@@ -1204,7 +1225,33 @@ if(MP_BUILD_TESTS)
     target_include_directories(mpo_parse_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_link_libraries(mpo_parse_test PRIVATE mp_dxr)
     add_test(NAME mpo_parse COMMAND mpo_parse_test)
+
+    # DisplayXR Camera files (src/media/DxrStereo.h): stills and clips made by the format's
+    # reference writer (third_party/dxrmedia), read back through MpoLoader / DxrStereo, and
+    # the clip's per-frame track through FFmpeg when it is linked.
+    add_executable(dxr_stereo_test
+        tests/dxr_stereo_test.cpp
+        src/media/DxrVideoTrack.cpp
+        src/media/MpoLoader.cpp
+        src/media/StereoCompose.cpp
+        src/media/AutoConvergence.cpp
+        src/media/ImageDecoder.cpp
+        src/Log.cpp)
+    target_include_directories(dxr_stereo_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxrmedia/testing)
+    target_link_libraries(dxr_stereo_test PRIVATE mp_dxr)
+    if(TARGET PkgConfig::FFMPEG)
+        target_link_libraries(dxr_stereo_test PRIVATE PkgConfig::FFMPEG)
+        target_compile_definitions(dxr_stereo_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
+    elseif(TARGET mp_ffmpeg)
+        target_link_libraries(dxr_stereo_test PRIVATE mp_ffmpeg)
+        target_compile_definitions(dxr_stereo_test PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)
+    endif()
+    add_test(NAME dxr_stereo COMMAND dxr_stereo_test)
 
     # End-to-end layout sweep over the generated corpus (scripts/gen_stereo_test_assets.sh).
     # Needs the media stack but no Vulkan/OpenXR/display; skips cleanly (exit 0) when the
@@ -1225,7 +1272,7 @@ if(MP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
-    target_link_libraries(stereo_sweep PRIVATE nlohmann_json::nlohmann_json)
+    target_link_libraries(stereo_sweep PRIVATE nlohmann_json::nlohmann_json mp_dxr)
     if(TARGET PkgConfig::FFMPEG)
         target_link_libraries(stereo_sweep PRIVATE PkgConfig::FFMPEG)
         target_compile_definitions(stereo_sweep PRIVATE MEDIAPLAYER_WITH_FFMPEG=1)

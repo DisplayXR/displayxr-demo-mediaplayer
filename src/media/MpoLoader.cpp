@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "MpoLoader.h"
 
+#include "DxrStereo.h"
 #include "Log.h"
 #include "StereoCompose.h"
 
@@ -247,12 +248,23 @@ MpoResult MpoLoader::Load(const std::string& path) {
     r.layout = StereoLayout::SbsFull;
     r.ok = true;
     r.stereo = true;
-    // MPO carries no baked convergence, so the estimate is always what the player applies.
-    r.autoConvergence = EstimateAutoConvergence(r.image);
+    // A DisplayXR Camera still (dxr: XMP, FORMAT.md 1) suggests its own screen plane; the
+    // player starts there, as the camera's review showed it. Any other MPO carries no
+    // convergence, so the estimate is what the player applies. Both are a per-eye shift
+    // (DxrStereo.h converts the file's disparity, once).
+    const dxrfile::StillInfo dxrInfo = dxrfile::ReadStill(buf.data(), buf.size());
+    r.dxr = dxrInfo.ours;
+    if (dxrInfo.ours && dxrInfo.hasConvergence) {
+        r.fileConvergence = true;
+        r.autoConvergence = dxrInfo.shift;
+    } else {
+        r.autoConvergence = EstimateAutoConvergence(r.image);
+    }
     LOG_INFO("MpoLoader: '%s' stereo MPO %dx%d SBS (per-eye %dx%d), MPType=0x%06X, "
-             "auto convergence %+.4f",
+             "%s convergence %+.4f%s",
              path.c_str(), r.image.width, r.image.height, left.width, left.height,
-             entries[pick].type, (double)r.autoConvergence);
+             entries[pick].type, r.fileConvergence ? "file (dxr)" : "auto",
+             (double)r.autoConvergence, r.dxr ? ", DisplayXR Camera file" : "");
     return r;
 }
 
