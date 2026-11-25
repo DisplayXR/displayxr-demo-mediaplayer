@@ -385,20 +385,17 @@ void TestFilenameUnchanged() {
     CHECK(b.layout == StereoLayout::SbsFull, "filename: *_2x1 -> SBS-full");
     CHECK(b.signal == StereoSignal::Filename, "filename: signal");
 
-    // The aspect rung ASSUMES stereo and only settles full-vs-half: mono is not a use
-    // case for this player, and an unsuffixed 16:9 half-SBS frame is indistinguishable
-    // from a mono one by dimensions alone. Both of these were wrong before.
+    // Untagged media is 2D, whatever its aspect: no aspect rung assumes stereo any more.
     MediaInfo c = MediaSource::Identify("wide.png", 3840, 1080);
-    CHECK(c.layout == StereoLayout::SbsFull, "aspect: 3.56 unsuffixed -> SBS-full");
-    CHECK(c.signal == StereoSignal::Aspect, "aspect: signal");
+    CHECK(c.layout == StereoLayout::Mono, "untagged: 3.56 unsuffixed -> mono");
+    CHECK(c.signal == StereoSignal::Default, "untagged: signal");
 
     MediaInfo d = MediaSource::Identify("plain.png", 1920, 1080);
-    CHECK(d.layout == StereoLayout::SbsHalf, "aspect: 16:9 unsuffixed -> SBS-half");
-    CHECK(d.signal == StereoSignal::Aspect, "aspect: signal");
+    CHECK(d.layout == StereoLayout::Mono, "untagged: 16:9 unsuffixed -> mono");
+    CHECK(d.signal == StereoSignal::Default, "untagged: signal");
 
-    // Only a total absence of dimensions falls through to mono.
     MediaInfo e = MediaSource::Identify("unknown.png");
-    CHECK(e.layout == StereoLayout::Mono, "no dims: nothing to go on -> mono");
+    CHECK(e.layout == StereoLayout::Mono, "no dims: mono");
     CHECK(e.signal == StereoSignal::Default, "no dims: signal");
 
     CHECK(MediaSource::IsSupported("a.MPO"), "supported: .mpo (case-insensitive)");
@@ -412,6 +409,26 @@ void TestFilenameUnchanged() {
               MediaSource::Identify("a.gif").kind == MediaKind::Image,
           "identify: webm is video, gif is an image");
     CHECK(!MediaSource::IsSupported("notes.txt"), "supported: rejects other types");
+}
+
+// A short vote: Unanimous() is what lets the video probe accept one or two frames when
+// its budget runs out.
+void TestVoteUnanimous() {
+    StereoVote v;
+    CHECK(!v.Unanimous(), "vote: no samples is not unanimous");
+    StereoDetectResult mono;
+    mono.decided = true;
+    mono.layout = StereoLayout::Mono;
+    mono.confidence = 0.9f;
+    v.Add(mono);
+    CHECK(v.Unanimous() && !v.Sufficient(), "vote: one mono sample is unanimous, not sufficient");
+    CHECK(!v.Result().decided, "vote: undecided until accepted");
+    v.AcceptSingle();
+    CHECK(v.Result().decided && v.Result().layout == StereoLayout::Mono, "vote: accepted single -> mono");
+    StereoDetectResult sbs = mono;
+    sbs.layout = StereoLayout::SbsFull;
+    v.Add(sbs);
+    CHECK(!v.Unanimous(), "vote: mono + SBS is not unanimous");
 }
 
 // One assert per rung of the ladder.
@@ -456,26 +473,26 @@ void TestResolvePriority() {
     CHECK(r3.layout == StereoLayout::SbsHalf && r3.signal == StereoSignal::Metadata,
           "resolve: metadata beats content");
 
-    // 4. content beats aspect.
+    // 4. content beats the 2D default.
     MediaInfo r4 = MediaSource::Resolve("x.png", MediaKind::Image, 3840, 1080,
                                         nullptr, nullptr, &content);
-    CHECK(r4.signal == StereoSignal::Content, "resolve: content beats aspect");
+    CHECK(r4.signal == StereoSignal::Content, "resolve: content beats the 2D default");
 
     // 4b. an UNDECIDED content result must not be consulted at all.
     StereoDetectResult undecided;
     undecided.decided = false;
     MediaInfo r5 = MediaSource::Resolve("x.png", MediaKind::Image, 3840, 1080,
                                         nullptr, nullptr, &undecided);
-    CHECK(r5.signal == StereoSignal::Aspect && r5.layout == StereoLayout::SbsFull,
-          "resolve: undecided content falls through to aspect");
+    CHECK(r5.signal == StereoSignal::Default && r5.layout == StereoLayout::Mono,
+          "resolve: undecided content falls through to 2D");
 
-    // 5. Nothing identified it -> assume stereo, aspect settles the packing.
+    // 5. Nothing identified it -> 2D, whatever the aspect.
     MediaInfo r6 = MediaSource::Resolve("x.png", MediaKind::Image, 1920, 1080,
                                         nullptr, nullptr, nullptr);
-    CHECK(r6.layout == StereoLayout::SbsHalf && r6.signal == StereoSignal::Aspect,
-          "resolve: unidentified 16:9 is assumed half-SBS");
+    CHECK(r6.layout == StereoLayout::Mono && r6.signal == StereoSignal::Default,
+          "resolve: unidentified 16:9 is 2D");
 
-    // ...and with no dimensions at all there is genuinely nothing to assume.
+    // ...and with no dimensions at all, the same.
     MediaInfo r7 = MediaSource::Resolve("x.png", MediaKind::Image, 0, 0,
                                         nullptr, nullptr, nullptr);
     CHECK(r7.layout == StereoLayout::Mono && r7.signal == StereoSignal::Default,
@@ -506,6 +523,7 @@ int main() {
     TestChooseFullOrHalf();
     TestFilenameUnchanged();
     TestResolvePriority();
+    TestVoteUnanimous();
 
     if (g_failures == 0) {
         std::printf("  all checks passed\n");

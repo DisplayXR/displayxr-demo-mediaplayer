@@ -53,53 +53,52 @@ struct Expect {
 
 // The acceptance table, checked under BOTH policies.
 //
-// DEFAULT: filename, container metadata, then the pixel detector, then ASSUME STEREO.
-// The detector may only conclude MONO on unambiguous evidence; anything short of that
-// falls through to the stereo assumption, because this player targets a 3D display and
-// mono is not a use case.
+// DEFAULT: filename, container metadata, then the pixel detector, then 2D. A file none
+// of them identifies opens as mono (2D) and can be converted; it is no longer assumed
+// to be stereo from its aspect.
 //
 // The second column is MEDIAPLAYER_STEREO_DETECT=meta, i.e. the same ladder with the
-// detector switched off, which shows what the stereo assumption does on its own: every
-// real SBS file still resolves correctly, and every mono file is mis-packed. The two
-// columns together are the honest statement of what the detector buys.
+// detector switched off: every untagged file, stereo or not, is 2D there, and only a
+// filename or a container tag makes one stereo. The two columns together are the
+// honest statement of what the detector buys.
 const Expect kExpected[] = {
-    {"sbs_full_unsuffixed.png", StereoLayout::SbsFull, StereoSignal::Aspect,
+    {"sbs_full_unsuffixed.png", StereoLayout::Mono, StereoSignal::Default,
      StereoLayout::SbsFull, StereoSignal::Content, false,
      "unsuffixed full SBS"},
-    {"sbs_half_unsuffixed.png", StereoLayout::SbsHalf, StereoSignal::Aspect,
+    {"sbs_half_unsuffixed.png", StereoLayout::Mono, StereoSignal::Default,
      StereoLayout::SbsHalf, StereoSignal::Content, false,
-     "unsuffixed half SBS — the case a threshold cannot reach"},
-    {"mono_16x9.png", StereoLayout::SbsHalf, StereoSignal::Aspect,
+     "unsuffixed half SBS: only the detector finds it"},
+    {"mono_16x9.png", StereoLayout::Mono, StereoSignal::Default,
      StereoLayout::Mono, StereoSignal::Content, false,
-     "mono: mis-packed by default (accepted), rescued by the detector"},
-    {"mono_21x9.png", StereoLayout::SbsHalf, StereoSignal::Aspect,
+     "mono 16:9"},
+    {"mono_21x9.png", StereoLayout::Mono, StereoSignal::Default,
      StereoLayout::Mono, StereoSignal::Content, false,
-     "mono panorama: same trade"},
-    {"mono_2to1.png", StereoLayout::SbsFull, StereoSignal::Aspect,
+     "mono panorama"},
+    {"mono_2to1.png", StereoLayout::Mono, StereoSignal::Default,
      StereoLayout::Mono, StereoSignal::Content, false,
-     "2:1 mono: same trade"},
-    {"mono_letterbox_16x9.png", StereoLayout::SbsHalf, StereoSignal::Aspect,
+     "2:1 mono"},
+    {"mono_letterbox_16x9.png", StereoLayout::Mono, StereoSignal::Default,
      StereoLayout::Mono, StereoSignal::Content, false,
-     "letterboxed mono: same trade"},
-    {"mono_pillarbox_2to1.png", StereoLayout::SbsFull, StereoSignal::Aspect,
+     "letterboxed mono"},
+    {"mono_pillarbox_2to1.png", StereoLayout::Mono, StereoSignal::Default,
      StereoLayout::Mono, StereoSignal::Content, false,
-     "pillarboxed mono: same trade"},
-    {"sbs_full_letterboxed.png", StereoLayout::SbsFull, StereoSignal::Aspect,
+     "pillarboxed mono"},
+    {"sbs_full_letterboxed.png", StereoLayout::Mono, StereoSignal::Default,
      StereoLayout::SbsFull, StereoSignal::Content, false,
      "letterboxed SBS"},
-    {"sbs_full_pillarbox.png", StereoLayout::SbsFull, StereoSignal::Aspect,
+    {"sbs_full_pillarbox.png", StereoLayout::Mono, StereoSignal::Default,
      StereoLayout::SbsFull, StereoSignal::Content, false,
      "pillarboxed SBS"},
     {"mono_but_named_2x1.png", StereoLayout::SbsFull, StereoSignal::Filename,
      StereoLayout::SbsFull, StereoSignal::Filename, false,
      "filename beats everything below it"},
-    {"flat_lowtexture_2to1.png", StereoLayout::SbsFull, StereoSignal::Aspect,
-     StereoLayout::SbsFull, StereoSignal::Aspect, false,
-     "near-flat: detector abstains, aspect policy applies either way"},
-    {"sbs_full_video.mp4", StereoLayout::SbsFull, StereoSignal::Aspect,
+    {"flat_lowtexture_2to1.png", StereoLayout::Mono, StereoSignal::Default,
+     StereoLayout::Mono, StereoSignal::Default, false,
+     "near-flat: detector abstains, 2D either way"},
+    {"sbs_full_video.mp4", StereoLayout::Mono, StereoSignal::Default,
      StereoLayout::SbsFull, StereoSignal::Content, false,
      "unsuffixed SBS video"},
-    {"sbs_fadein_video.mp4", StereoLayout::SbsFull, StereoSignal::Aspect,
+    {"sbs_fadein_video.mp4", StereoLayout::Mono, StereoSignal::Default,
      StereoLayout::SbsFull, StereoSignal::Content, false,
      "SBS video fading in from black"},
     {"sbs_meta_lr.mkv", StereoLayout::SbsFull, StereoSignal::Metadata,
@@ -429,7 +428,7 @@ int ScanCorpus(const std::string& dir, int limit) {
 int RunPolicy(const std::string& dir, bool useContent, int& missing) {
     int failures = 0, checked = 0;
     std::printf("\n  === policy: %s ===\n",
-                useContent ? "DEFAULT (filename / metadata / detector / assume-stereo)"
+                useContent ? "DEFAULT (filename / metadata / detector / 2D)"
                            : "MEDIAPLAYER_STEREO_DETECT=meta (no pixel detector)");
     std::printf("  %-28s %-9s %-24s %6s %6s  %s\n", "asset", "layout", "signal",
                 "peak", "margin", "verdict");

@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // StereoClassifier: decides which grid items get the 3D badge, and how each thumbnail is
-// packed (so the grid can show one eye). The player's own resolver assumes stereo unless
-// mono is proven, which is right for playback but would badge every photo, so a badge
-// needs positive evidence, cheapest first:
+// packed (so the grid can show one eye). A badge needs positive evidence, cheapest first
+// (the player's own resolver, MediaSource, opens anything unidentified as 2D):
 //   1. a verdict cached from an earlier run (same id, date modified and size)
 //   2. the file name (`*_2x1`, `*_half_2x1`, `*_1x2`, TB tokens)
 //   3. the file itself: a LIF or a two-track video (Thumbnail::file3D)

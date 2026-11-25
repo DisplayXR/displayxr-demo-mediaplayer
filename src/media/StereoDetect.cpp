@@ -360,18 +360,16 @@ StereoDetectResult AnalyzeImpl(Sampler at, int w, int h, const StereoDetectParam
         res.reason = ambiguous ? "stereo (full/half ambiguous)" : "stereo";
     } else if (peak < p.monoPeakMax && res.seam < p.seamVetoRatio) {
         // UNAMBIGUOUSLY 2D, and nothing else. The halves do not match at any plausible
-        // shift AND there is no discontinuity where the two eyes would meet. Only this
-        // rung can produce a mono verdict, because everything below assumes stereo.
+        // shift AND there is no discontinuity where the two eyes would meet.
         //
         // Note what is deliberately NOT here: a high peak with a flat margin (repetitive
-        // content). That is AMBIGUOUS, not 2D, so it falls through and is treated as
-        // stereo -- when in doubt, stereo.
+        // content). That is AMBIGUOUS, not 2D, so it falls through undecided.
         res.layout = StereoLayout::Mono;
         res.decided = true;
         res.confidence = Clamp01(1.0f - peak / std::max(0.01f, p.monoPeakMax));
         res.reason = "unrelated halves, no mid-frame seam";
     } else {
-        // Doubt. Say nothing; the caller's policy is to assume stereo.
+        // Doubt. Say nothing; the caller opens an undecided file as 2D.
         res.decided = false;
         if (!close) res.reason = "peak at implausible disparity";
         else if (peak < p.monoPeakMax) res.reason = "weak match but a mid-frame seam";

@@ -64,6 +64,12 @@ public:
     // A stream that yields fewer than kVoteMin frames in total would otherwise never
     // decide. Call this once the source is exhausted to accept what we have.
     void AcceptSingle() { acceptSingle_ = true; }
+    // Every sample so far named the same layout (false with no samples).
+    bool Unanimous() const {
+        int layouts = 0;
+        for (int c : count_) layouts += c > 0;
+        return layouts == 1;
+    }
     void Reset();
 
     static constexpr int kVoteMin = 3;   // samples needed before we trust the vote

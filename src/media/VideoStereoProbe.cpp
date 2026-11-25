@@ -320,11 +320,15 @@ VideoStereoProbe::Result VideoStereoProbe::Run(const std::string& path, bool wan
     }
 
     if (wantContent && !out.haveMeta) {
-        // A stream that yielded only one or two usable frames would otherwise never reach
-        // the vote threshold; accept what we have rather than regress single-frame clips.
-        if (vote.Samples() > 0 && !vote.Sufficient() && out.framesExamined < kMaxFrames &&
-            !overBudget()) {
-            vote.AcceptSingle();   // the source ran out, not the budget
+        // Fewer than kVoteMin usable frames. Accept what we have when the source ran out
+        // (a single-frame clip), or when the budget or the frame cap cut the probe short
+        // and every frame examined agreed. The second case is the cold first open: a
+        // VP9 clip read from a cold disk cache can spend most of the budget on its first
+        // frame (moon.webm: 1 frame in 287 ms, then 7 frames in ~150 ms once warm), and
+        // a plain 2D clip was then left undecided.
+        if (vote.Samples() > 0 && !vote.Sufficient()) {
+            const bool sourceRanOut = out.framesExamined < kMaxFrames && !overBudget();
+            if (sourceRanOut || vote.Unanimous()) vote.AcceptSingle();
         }
         out.content = vote.Result();
         out.votes = vote.Samples();
