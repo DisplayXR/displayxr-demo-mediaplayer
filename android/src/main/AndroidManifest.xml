@@ -120,6 +120,19 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!--
+                "Open in Player" from DisplayXR Camera (and any other app that hands over a
+                photo or a clip): ACTION_VIEW with a content:// URI and a read grant. The
+                file is read through the URI's descriptor (MainActivity.openViewIntent),
+                never a path. Back returns to the app that opened it.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" android:mimeType="image/jpeg" />
+                <data android:scheme="content" android:mimeType="video/mp4" />
+            </intent-filter>
         </activity>
     </application>
 </manifest>

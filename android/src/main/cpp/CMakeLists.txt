@@ -145,6 +145,15 @@ add_library(mediaplayer_vk_android SHARED
     # Container layer of the same resolution: two-track ("LVF v2") detection plus the
     # `mett` convergence curve. Android-local because it is pure NDK AMediaExtractor.
     lvf_probe_android.cpp
+    dxr_video_android.cpp                      # DisplayXR Camera clips (sbs-lr + per-frame convergence)
+    ${REPO_ROOT}/src/media/DxrStereo.cpp       # ...and stills: the format's reader, in the player's terms
+    ${REPO_ROOT}/third_party/dxrmedia/src/exif.cpp    # the format's reference reader (vendored,
+    ${REPO_ROOT}/third_party/dxrmedia/src/fileio.cpp  #   unmodified; third_party/dxrmedia/VENDORED.md)
+    ${REPO_ROOT}/third_party/dxrmedia/src/json.cpp
+    ${REPO_ROOT}/third_party/dxrmedia/src/stills.cpp
+    ${REPO_ROOT}/third_party/dxrmedia/src/tiff.cpp
+    ${REPO_ROOT}/third_party/dxrmedia/src/video.cpp
+    ${REPO_ROOT}/third_party/dxrmedia/src/xmp.cpp
     ${REPO_ROOT}/src/media/LifLoader.cpp
     ${REPO_ROOT}/src/media/DepthWarp.cpp
     ${REPO_ROOT}/src/media/MpoLoader.cpp
@@ -192,6 +201,7 @@ target_include_directories(mediaplayer_vk_android PRIVATE
     ${REPO_ROOT}/third_party/stb                # stb_image_write.h (PairDiskCache); after the above
     ${REPO_ROOT}/src                            # Log.h (impl = lif_log_android.cpp)
     ${REPO_ROOT}/src/media                      # LifLoader.h, ImageDecoder.h, MediaSource.h
+    ${REPO_ROOT}/third_party/dxrmedia/include   # dxrmedia/*.h (DxrStereo.cpp)
     ${REPO_ROOT}/third_party/displayxr-openxr  # DisplayXR XR_EXT_* headers
     ${MP_IMGUI_DIR} ${MP_IMGUI_DIR}/backends   # Dear ImGui + the Vulkan backend
     ${MP_UI_FONT_INCLUDE_DIR})                  # ui_font.h

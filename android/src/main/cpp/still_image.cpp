@@ -3,6 +3,7 @@
 
 #include "still_image.h"
 
+#include "DxrStereo.h"
 #include "LifLoader.h"
 #include "MpoLoader.h"
 #include "StereoDetect.h"
@@ -61,6 +62,17 @@ bake_lif_convergence(DecodedImage &img, float conv)
 	shift_half(0, +s);  // left eye content moves right
 	shift_half(W, -s);  // right eye content moves left
 	LOGI("LIF reconvergence baked: conv=%+.4f -> ±%d px per eye", conv, s);
+}
+
+bool
+is_jpeg(const std::string &path)
+{
+	FILE *f = std::fopen(path.c_str(), "rb");
+	if (f == nullptr) return false;
+	unsigned char m[2] = {0, 0};
+	const bool ok = std::fread(m, 1, 2, f) == 2 && m[0] == 0xFF && m[1] == 0xD8;
+	std::fclose(f);
+	return ok;
 }
 
 // The filename, then the pixels; `meta` is the container's say, or null.
@@ -126,18 +138,32 @@ StillImage::Decode(const std::string &path, const std::string &name, StillImage 
 		return false;
 	}
 	// A pair with no convergence of its own gets the loader's estimate (#180), a per-eye
-	// shift, where a LIF's convergence is twice the per-eye shift.
+	// shift, where a LIF's convergence is twice the per-eye shift. A DisplayXR Camera MPF
+	// still arrives here as an MPO whose autoConvergence is the file's own suggestion
+	// (MpoLoader, already converted to a shift by DxrStereo.h).
 	out.convergenceBaked = r.stereo;
 	if (out.convergenceBaked) {
 		bake_lif_convergence(r.image, r.hasConvergence ? r.convergence : 2.0f * r.autoConvergence);
 	}
-	// Layered resolution (desktop App.cpp parity): a composed LIF/MPO is
-	// container metadata; a plain JPEG/PNG falls through to the filename, then
-	// the content detector on the decoded pixels, then aspect.
+	// The camera's side-by-side export (`*_sbs.jpg`, dxr:Layout="sbs-lr") is one plain JPEG
+	// whose XMP says full SBS, left first, and carries the suggested convergence. Only a
+	// JPEG that is not already a pair is asked; any other file is untouched.
+	bool dxrSbs = false;
+	if (!r.stereo && is_jpeg(path)) {
+		const dxrfile::StillInfo d = dxrfile::ReadStillFile(path);
+		dxrSbs = d.ours && d.sbs && r.image.width >= 2;
+		if (dxrSbs && d.hasConvergence) {
+			bake_lif_convergence(r.image, 2.0f * d.shift);
+			out.convergenceBaked = true;
+		}
+	}
+	// Layered resolution (desktop App.cpp parity): a composed LIF/MPO (or a camera
+	// export) is container metadata; a plain JPEG/PNG falls through to the filename,
+	// then the content detector on the decoded pixels, then aspect.
 	MediaInfo meta;
 	meta.kind = MediaKind::Image;
-	meta.layout = r.layout;
-	out.info = resolve(name, MediaKind::Image, r.image, r.stereo ? &meta : nullptr);
+	meta.layout = dxrSbs ? StereoLayout::SbsFull : r.layout;
+	out.info = resolve(name, MediaKind::Image, r.image, (r.stereo || dxrSbs) ? &meta : nullptr);
 	out.image = std::move(r.image);
 	return true;
 }

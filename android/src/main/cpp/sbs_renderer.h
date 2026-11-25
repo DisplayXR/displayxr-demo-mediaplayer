@@ -94,9 +94,12 @@ struct SbsRenderer {
 	bool setVideoAhbStereo(struct AHardwareBuffer *ahbL, uint32_t wL, uint32_t hL,
 	                       struct AHardwareBuffer *ahbR, uint32_t wR, uint32_t hR);
 
-	// Convergence for the dual path, in FRACTION OF VIEW WIDTH, half applied to each
+	// Convergence for a moving picture, in FRACTION OF VIEW WIDTH, half applied to each
 	// eye. POSITIVE = NEARER (content toward the viewer), negative = further behind
-	// the glass. Ignored by every other source mode. Derivation in drawAtlas().
+	// the glass. The dual path shifts each eye's sampling; a packed SBS picture (a
+	// DisplayXR Camera clip) shifts each eye's viewport. Ignored for mono. Callers set it
+	// to 0 for everything else (main.cpp resets it on every open). Derivation in
+	// drawAtlas().
 	void setConvergence(float c) { convergence_ = c; }
 	float convergence() const { return convergence_; }
 	bool stereoDual() const { return ahbStereo_; }
