@@ -1649,7 +1649,15 @@ void App::RenderOneFrame() {
                 // field, ...). The SDL backend does this itself elsewhere.
                 window_.SetImGuiCursor(imgui_.MouseCursor());
                 renderer_.NoteStage(RenderStage::UiRender, StageMs(uiRender0));
+                if (dumpHudPath_ && dumpedHud_ && hudDumpAt_ != std::chrono::steady_clock::time_point{}) {
+                    // #280: the dump's whole cost to the render loop, dump frame included
+                    LOG_INFO("HUD dump: %.1f ms from the dump to the next HUD frame",
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hudDumpAt_)
+                                 .count());
+                    hudDumpAt_ = {};
+                }
                 if (dumpHudPath_ && !dumpedHud_ && rendered_ >= dumpFrame_) {
+                    hudDumpAt_ = std::chrono::steady_clock::now();
                     renderer_.DumpExternalImage(xr_.HudImages()[hudIdx], xr_.HudWidth(),
                                                 xr_.HudHeight(), dumpHudPath_);
                     dumpedHud_ = true;
