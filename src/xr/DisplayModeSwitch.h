@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // DisplayModeSwitch: the player's 2D/3D switch over the runtime's rendering modes
-// (XR_DXR_display_info). 2D is the flat mode; 3D is the stereo mode last in force, else
+// (XR_DXR_display_info). With the two-mode contract (exactly modes 0 and 1) 2D is mode 0
+// and 3D is mode 1, whatever their content (mode 1 may be a one-view "Same as 2D"). On an
+// older multi-mode runtime 2D is the flat mode; 3D is the stereo mode last in force, else
 // the first that turns the lens on. Pure logic.
 #pragma once
 

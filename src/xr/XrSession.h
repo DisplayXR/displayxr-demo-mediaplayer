@@ -450,6 +450,10 @@ private:
     bool transparentBg_ = false;   // MEDIAPLAYER_TRANSPARENT — letterbox composes through
     uint32_t displayPixelWidth_ = 0;
     uint32_t displayPixelHeight_ = 0;
+    // display_info v28 rendering worst case (XrDisplayRenderingWorstCaseDXR): the
+    // largest atlas any mode can ask for; 0 = not stated (older runtime).
+    uint32_t worstAtlasWidth_ = 0;
+    uint32_t worstAtlasHeight_ = 0;
     float displayWidthM_ = 0.0f;   // displaySizeMeters.width
     float nominalViewerZ_ = 0.0f;  // nominalViewerPositionInDisplaySpace.z
     // 3D panel top-left in virtual-desktop pixels (XrDisplayDesktopPositionDXR,

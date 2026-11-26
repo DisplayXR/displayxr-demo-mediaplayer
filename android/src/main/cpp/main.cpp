@@ -74,6 +74,7 @@
 #include "ui/ZoomGesture.h"
 #include "imgui_internal.h"  // FindHoveredWindowEx: is a touch over the chrome
 #include "xr/DisplayModeSwitch.h"
+#include "mode_table.h"  // displayxr-common: v27 table-changed event + v28 worst case
 #include "browser/AndroidMediaProvider.h"
 #include "browser/MediaBrowser.h"
 #include "browser/SlideGesture.h"
@@ -283,6 +284,9 @@ XrViewConfigurationType g_view_config_type = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_
 
 // One-shot: we had to submit fewer views than the active mode wants.
 bool g_warned_view_clamp = false;
+// display_info v28: the instance's rendering worst case (largest atlas any mode can
+// ask for); create_swapchains sizes the atlas no smaller. Zero = an older runtime.
+XrDisplayRenderingWorstCaseDXR g_render_worst_case = {};
 uint32_t g_display_px_w = 0;     // native panel pixels (XR_DXR_display_info)
 uint32_t g_display_px_h = 0;
 bool g_has_display_info = false;
@@ -1509,6 +1513,8 @@ push_window_geometry()
 // advertises (xrLocateViews capacity). Feeds the worst-case atlas sizing and
 // the per-orientation tile dims. Never fails bring-up — falls back to a single
 // 2-view SBS atlas. Mirrors cube_handle_vk_android::query_display_info_and_modes.
+static void read_rendering_modes();
+
 bool
 query_display_info_and_modes()
 {
@@ -1523,12 +1529,19 @@ query_display_info_and_modes()
 	// Native panel pixels — chain XrDisplayInfoDXR onto the system-properties query.
 	if (g_has_display_info) {
 		XrDisplayInfoDXR di = {XR_TYPE_DISPLAY_INFO_DXR};
+		XrDisplayRenderingWorstCaseDXR wc = {};
+		wc.type = XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR;
+		di.next = &wc;
 		XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
 		sp.next = &di;
 		if (xrGetSystemProperties(g_instance, g_system_id, &sp) == XR_SUCCESS) {
 			g_display_px_w = di.displayPixelWidth;
 			g_display_px_h = di.displayPixelHeight;
-			LOGI("Display: %ux%u px", g_display_px_w, g_display_px_h);
+			g_render_worst_case = wc;
+			g_render_worst_case.next = nullptr;
+			LOGI("Display: %ux%u px; rendering worst case (v28) atlas %ux%u%s", g_display_px_w,
+			     g_display_px_h, wc.maxAtlasWidthPixels, wc.maxAtlasHeightPixels,
+			     wc.maxAtlasWidthPixels == 0 ? " (none stated)" : "");
 		}
 	}
 
@@ -1540,9 +1553,22 @@ query_display_info_and_modes()
 		LOGI("No rendering-mode ext — defaulting to a single 2-view SBS atlas");
 		return true;
 	}
+	read_rendering_modes();
+	return true;
+}
+
+// Enumerate the rendering modes into g_modes / g_mode_switch and adopt the active one.
+// At bring-up (query_display_info_and_modes) and again on
+// XrEventDataRenderingModeTableChangedDXR (display_info v27): a live 3D-mode switch remaps
+// slot 1 to another entry (view count, tiles, view scale) while the active index stays
+// put. The atlas is not resized (it is sized from the v28 worst case and
+// active_tile_dims clamps the tile to it).
+static void
+read_rendering_modes()
+{
 	uint32_t count = 0;
 	if (g_pfnEnumModes(g_session, 0, &count, nullptr) != XR_SUCCESS || count == 0) {
-		return true;
+		return;
 	}
 	if (count > kMaxViews) {
 		count = kMaxViews;
@@ -1552,7 +1578,7 @@ query_display_info_and_modes()
 		modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
 	}
 	if (g_pfnEnumModes(g_session, count, &count, modes) != XR_SUCCESS) {
-		return true;
+		return;
 	}
 	std::vector<mp::DisplayModeSwitch::Mode> switch_modes;
 	for (uint32_t i = 0; i < count; ++i) {
@@ -1570,9 +1596,6 @@ query_display_info_and_modes()
 		if (m.isActive) adopt_mode(m);
 	}
 	g_mode_count = count;
-	// All modes feed the worst-case atlas; stash the max tile footprint by
-	// scanning here (create_swapchains recomputes per mode + orientation).
-	return true;
 }
 
 // Per-tile render size + tile grid for the active mode, sized for the CURRENTLY
@@ -2067,6 +2090,16 @@ create_swapchains()
 	} else {
 		atlas_w = view_config.recommendedImageRectWidth * g_tile_columns;
 		atlas_h = view_config.recommendedImageRectHeight * g_tile_rows;
+	}
+	// display_info v28: never smaller than the runtime's stated worst case, so a live
+	// 3D-mode switch (the v27 table-changed event) fits without recreating the atlas.
+	// All zero on an older runtime: the size above stands.
+	{
+		const uint32_t cw = atlas_w, ch = atlas_h;
+		dxr::SizeFromWorstCase(g_render_worst_case, false, cw, ch, &atlas_w, &atlas_h);
+		LOGI("Atlas sizing: computed %ux%u, runtime worst case %ux%u -> %ux%u", cw, ch,
+		     g_render_worst_case.maxAtlasWidthPixels, g_render_worst_case.maxAtlasHeightPixels,
+		     atlas_w, atlas_h);
 	}
 	if (atlas_w == 0 || atlas_h == 0) {
 		LOGE("Atlas sizing failed (%ux%u)", atlas_w, atlas_h);
@@ -2601,6 +2634,26 @@ poll_xr_events()
 				if (g_ws_layer_unsupported.exchange(false, std::memory_order_relaxed)) {
 					LOGI("window-space layer re-armed after the mode change");
 				}
+			}
+		} else if (ev.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR) {
+			// display_info v27: the 3D mode was switched live — the table changed, the
+			// index did not. Re-read it and re-adopt the active entry: view count, grid
+			// and view scale follow (the atlas holds them: v28 worst case).
+			const auto *e = reinterpret_cast<const XrEventDataRenderingModeTableChangedDXR *>(&ev);
+			dxr::RenderingModeTableChange change;
+			if (e->session == g_session && g_pfnEnumModes != nullptr &&
+			    dxr::DecodeRenderingModeTableChanged(reinterpret_cast<const XrEventDataBaseHeader *>(&ev),
+			                                         &change)) {
+				read_rendering_modes();
+				for (uint32_t i = 0; i < g_mode_count; ++i) {
+					if (g_modes[i].modeIndex == change.activeModeIndex) {
+						adopt_mode(g_modes[i]);
+						break;
+					}
+				}
+				LOGI("rendering mode table changed (active %u): views=%u tiles=%ux%u scale=%.2f%s",
+				     change.activeModeIndex, g_view_count, g_tile_columns, g_tile_rows,
+				     g_view_scale_x, change.recreateSwapchains ? " (recreate asked: not implemented)" : "");
 			}
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
 			g_exit_requested = true;
