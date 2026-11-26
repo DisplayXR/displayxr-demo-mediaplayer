@@ -163,8 +163,9 @@ public:
     // Must be called after ClearViews/DrawViews and before the image is released. Proves
     // exactly what the app submitted to the runtime. Returns false when the readback fails.
     // Debug-only: the readback blocks (it submits the open frame early and drains the ring),
-    // the PNG encode and write run on a background thread (#280: at 8K the encode alone took
-    // ~20 s on the render thread). The file appears under its name only once complete.
+    // the PNG encode and write run on a background thread (#280: at 8K, encoding on the render
+    // thread from uncached readback memory froze it for minutes). The file appears under its
+    // name only once complete.
     bool DumpImage(uint32_t imageIndex, const char* path);
 
     // Debug: read back an arbitrary RGBA8 image (e.g. the HUD swapchain image, left
@@ -589,6 +590,10 @@ private:
 
     bool CreatePipeline();
     uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
+    // For a buffer the CPU reads back: host-visible + coherent, preferring a CACHED type.
+    // An uncached (write-combined) type reads at a fraction of memory speed - an 8K HUD
+    // dump read straight from one took minutes (#280). UINT32_MAX = none.
+    uint32_t FindReadbackMemoryType(uint32_t typeBits) const;
     // Display-referred ClearColor -> the value to hand the attachment (decoded to
     // scene-linear when the attachment encodes on store, verbatim otherwise).
     VkClearColorValue ToTargetClear(const ClearColor& c) const;

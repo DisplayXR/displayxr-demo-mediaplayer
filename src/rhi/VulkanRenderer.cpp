@@ -422,6 +422,12 @@ uint32_t VulkanRenderer::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags
     return UINT32_MAX;
 }
 
+uint32_t VulkanRenderer::FindReadbackMemoryType(uint32_t typeBits) const {
+    const VkMemoryPropertyFlags base = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const uint32_t cached = FindMemoryType(typeBits, base | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    return cached != UINT32_MAX ? cached : FindMemoryType(typeBits, base);
+}
+
 bool VulkanRenderer::CreatePipeline() {
     // Descriptor set layout: bindings 0..2 = combined image samplers (RGBA in plane 0,
     // or Y + chroma planes for YUV video); binding 3 = the Pro grade's 3D LUT; 4..6 = the
@@ -2265,18 +2271,7 @@ bool VulkanRenderer::DumpImage(uint32_t imageIndex, const char* path) {
 
     VkMemoryRequirements memReq;
     vkGetBufferMemoryRequirements(device_, buf, &memReq);
-    VkPhysicalDeviceMemoryProperties memProps;
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memProps);
-    uint32_t memType = UINT32_MAX;
-    const VkMemoryPropertyFlags want =
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-        if ((memReq.memoryTypeBits & (1u << i)) &&
-            (memProps.memoryTypes[i].propertyFlags & want) == want) {
-            memType = i;
-            break;
-        }
-    }
+    const uint32_t memType = FindReadbackMemoryType(memReq.memoryTypeBits);
     if (memType == UINT32_MAX) { vkDestroyBuffer(device_, buf, nullptr); return false; }
 
     VkMemoryAllocateInfo mai = {};
@@ -2362,15 +2357,7 @@ bool VulkanRenderer::DumpExternalImage(VkImage image, uint32_t width, uint32_t h
 
     VkMemoryRequirements memReq;
     vkGetBufferMemoryRequirements(device_, buf, &memReq);
-    VkPhysicalDeviceMemoryProperties memProps;
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memProps);
-    uint32_t memType = UINT32_MAX;
-    const VkMemoryPropertyFlags want =
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-        if ((memReq.memoryTypeBits & (1u << i)) &&
-            (memProps.memoryTypes[i].propertyFlags & want) == want) { memType = i; break; }
-    }
+    const uint32_t memType = FindReadbackMemoryType(memReq.memoryTypeBits);
     if (memType == UINT32_MAX) { vkDestroyBuffer(device_, buf, nullptr); return false; }
 
     VkMemoryAllocateInfo mai = {};
