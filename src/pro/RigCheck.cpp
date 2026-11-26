@@ -16,6 +16,14 @@
 #include <limits>
 #include <thread>
 
+#if defined(_M_X64) || defined(__x86_64__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2) || defined(__SSE2__)
+#include <emmintrin.h>
+#define RIG_NCC_SSE2 1
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#define RIG_NCC_NEON 1
+#endif
+
 namespace mp::rig {
 
 namespace {
@@ -50,8 +58,59 @@ std::string WallClock(double /*steadySec*/) {
 
 // Normalised cross-correlation of an 8-bit-range float block of the left eye (pre-centred
 // as `tpl`, with its norm) against the right eye at (x, y).
+// The matcher's inner loop, so 4 lanes wide where the baseline ISA has them (SSE2 on
+// x86-64, NEON on arm64): ~3x the scalar loop, which no compiler vectorises without
+// fast-math (#281). The sums come out in a different order, a few ulp from the scalar.
 float Ncc(const std::vector<float>& R, int eyeW, const float* tpl, float tplNorm, int bs, int x, int y) {
     float sum = 0, sum2 = 0, cross = 0;
+    const int b4 = bs & ~3;
+#if defined(RIG_NCC_SSE2) || defined(RIG_NCC_NEON)
+#if defined(RIG_NCC_SSE2)
+    __m128 vs = _mm_setzero_ps(), vs2 = _mm_setzero_ps(), vc = _mm_setzero_ps();
+#else
+    float32x4_t vs = vdupq_n_f32(0.f), vs2 = vdupq_n_f32(0.f), vc = vdupq_n_f32(0.f);
+#endif
+    for (int j = 0; j < bs; ++j) {
+        const float* r = R.data() + (size_t)(y + j) * eyeW + x;
+        const float* t = tpl + j * bs;
+        for (int i = 0; i < b4; i += 4) {
+#if defined(RIG_NCC_SSE2)
+            const __m128 v = _mm_loadu_ps(r + i);
+            vs = _mm_add_ps(vs, v);
+            vs2 = _mm_add_ps(vs2, _mm_mul_ps(v, v));
+            vc = _mm_add_ps(vc, _mm_mul_ps(v, _mm_loadu_ps(t + i)));
+#else
+            const float32x4_t v = vld1q_f32(r + i);
+            vs = vaddq_f32(vs, v);
+            vs2 = vmlaq_f32(vs2, v, v);
+            vc = vmlaq_f32(vc, v, vld1q_f32(t + i));
+#endif
+        }
+        for (int i = b4; i < bs; ++i) {
+            const float v = r[i];
+            sum += v;
+            sum2 += v * v;
+            cross += v * t[i];
+        }
+    }
+    float l[4];
+#if defined(RIG_NCC_SSE2)
+    _mm_storeu_ps(l, vs);
+    sum += (l[0] + l[1]) + (l[2] + l[3]);
+    _mm_storeu_ps(l, vs2);
+    sum2 += (l[0] + l[1]) + (l[2] + l[3]);
+    _mm_storeu_ps(l, vc);
+    cross += (l[0] + l[1]) + (l[2] + l[3]);
+#else
+    vst1q_f32(l, vs);
+    sum += (l[0] + l[1]) + (l[2] + l[3]);
+    vst1q_f32(l, vs2);
+    sum2 += (l[0] + l[1]) + (l[2] + l[3]);
+    vst1q_f32(l, vc);
+    cross += (l[0] + l[1]) + (l[2] + l[3]);
+#endif
+#else
+    (void)b4;
     for (int j = 0; j < bs; ++j) {
         const float* r = R.data() + (size_t)(y + j) * eyeW + x;
         const float* t = tpl + j * bs;
@@ -62,6 +121,7 @@ float Ncc(const std::vector<float>& R, int eyeW, const float* tpl, float tplNorm
             cross += v * t[i];
         }
     }
+#endif
     const float n = (float)(bs * bs);
     const float var = sum2 - sum * sum / n;
     if (var <= 1e-3f || tplNorm <= 1e-3f) return -1.f;
@@ -562,7 +622,7 @@ namespace {
 // where it sits in `a`, analysis px. tpl is scratch (bs * bs).
 bool MatchAt(const std::vector<float>& a, const std::vector<float>& b, int W, int H, const Options& o, int bx, int by,
              int R, int D, int dyC, std::vector<float>& tpl, float& outDx, float& outDy,
-             float* outScore = nullptr) {
+             float* outScore = nullptr, int dxC = 0) {
     const int bs = o.block;
     float mean = 0;
     for (int j = 0; j < bs; ++j)
@@ -578,7 +638,7 @@ bool MatchAt(const std::vector<float>& a, const std::vector<float>& b, int W, in
     const float sd = std::sqrt(norm / (float)(bs * bs));
     if (sd < o.minTexture) return false;
     norm = std::sqrt(norm);
-    const int dxLo = std::max(-R, -bx), dxHi = std::min(R, W - bs - bx);
+    const int dxLo = std::max(dxC - R, -bx), dxHi = std::min(dxC + R, W - bs - bx);
     const int dyLo = std::max(dyC - D, -by), dyHi = std::min(dyC + D, H - bs - by);
     if (dyHi - dyLo < 4) return false;
     // coarse (step 2), then refine (+-2, step 1)
@@ -639,12 +699,15 @@ int SeedDy(const Options& o, int W, int H, float cx, float cy) {
 // marked (want = true) or not marked (want = false) are matched.
 void MatchBlocks(const std::vector<float>& left, const std::vector<float>& right, int W, int H, const Options& o,
                  const std::vector<uint8_t>* mask, bool want, std::vector<float>& dxs, std::vector<float>& dys,
-                 std::vector<float>& xs, Result* r, std::vector<int>* ids = nullptr) {
+                 std::vector<float>& xs, Result* r, std::vector<int>* ids = nullptr, int band = 0, int bands = 1) {
     const int bs = o.block;
     const int R = std::max(2, (int)std::lround(o.maxParallaxPct / 100.f * W));
     const int D = o.maxDy;
     std::vector<float> tpl((size_t)bs * bs);
-    for (int by = D + 2; by + bs + D + 2 <= H; by += o.step) {
+    // band / bands: only that contiguous share of the grid's rows (MatchBlocksParallel)
+    const int rows = H - 2 * D - 4 - bs >= 0 ? (H - 2 * D - 4 - bs) / o.step + 1 : 0;
+    const int rowLo = rows * band / bands, rowHi = rows * (band + 1) / bands;
+    for (int by = D + 2 + rowLo * o.step; by + bs + D + 2 <= H && by < D + 2 + rowHi * o.step; by += o.step) {
         for (int bx = 2; bx + bs + 2 <= W; bx += o.step) {
             if (mask && ((*mask)[(size_t)(by + bs / 2) * W + bx + bs / 2] != 0) != want) continue;
             float dx, dy;
@@ -659,6 +722,32 @@ void MatchBlocks(const std::vector<float>& left, const std::vector<float>& right
                 r->matchY.push_back(((float)by + bs * 0.5f) / (float)H);
             }
         }
+    }
+}
+
+// MatchBlocks over `bands` row bands on their own threads (#281), joined in row order: the
+// same blocks in the same order as one MatchBlocks call. Appends to the outputs.
+void MatchBlocksParallel(const std::vector<float>& left, const std::vector<float>& right, int W, int H,
+                         const Options& o, const std::vector<uint8_t>* mask, bool want, std::vector<float>& dxs,
+                         std::vector<float>& dys, std::vector<float>& xs, std::vector<int>* ids, int bands) {
+    struct Out {
+        std::vector<float> dx, dy, x;
+        std::vector<int> id;
+    };
+    std::vector<Out> out((size_t)std::max(1, bands));
+    auto run = [&](int b) {
+        MatchBlocks(left, right, W, H, o, mask, want, out[b].dx, out[b].dy, out[b].x, nullptr, &out[b].id, b,
+                    (int)out.size());
+    };
+    std::vector<std::future<void>> tasks;
+    for (int b = 1; b < (int)out.size(); ++b) tasks.push_back(std::async(std::launch::async, run, b));
+    run(0);
+    for (auto& t : tasks) t.get();
+    for (const Out& b : out) {
+        dxs.insert(dxs.end(), b.dx.begin(), b.dx.end());
+        dys.insert(dys.end(), b.dy.begin(), b.dy.end());
+        xs.insert(xs.end(), b.x.begin(), b.x.end());
+        if (ids) ids->insert(ids->end(), b.id.begin(), b.id.end());
     }
 }
 
@@ -1073,6 +1162,24 @@ std::vector<uint8_t> MotionMask(const std::vector<float>& now, const std::vector
     return out;
 }
 
+// Block matches re-run where an earlier pass already found each block (#281): the block at
+// (bx, by) = (id % W, id / W) searched only +-R columns about that pass's dx and +-D rows
+// about dyC. Same matcher and acceptance as MatchBlocks, a fraction of its search (the
+// full +-8 % window is ~50 columns; a block's own neighbourhood is a few).
+void MatchSeeded(const std::vector<float>& a, const std::vector<float>& b, int W, int H, const Options& o,
+                 const std::vector<int>& seedIds, const std::vector<float>& seedDx, int R, int D, int dyC,
+                 std::vector<float>& dys, std::vector<float>& xs, std::vector<int>* ids) {
+    std::vector<float> tpl((size_t)o.block * o.block);
+    for (size_t i = 0; i < seedIds.size(); ++i) {
+        const int bx = seedIds[i] % W, by = seedIds[i] / W;
+        float dx, dy;
+        if (!MatchAt(a, b, W, H, o, bx, by, R, D, dyC, tpl, dx, dy, nullptr, (int)std::lround(seedDx[i]))) continue;
+        dys.push_back(dy);
+        xs.push_back((float)bx + o.block * 0.5f);
+        if (ids) ids->push_back(seedIds[i]);
+    }
+}
+
 }  // namespace
 
 int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, float shiftSlope, int* lateEye) {
@@ -1121,9 +1228,20 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
     // (up to a frame of motion, and a spurious 0.2 deg of slope) is the size of the
     // signal the candidates are told apart by.
     double rigA = shiftY, rigB = shiftSlope;  // dy(x) = rigA + rigB * (x - W/2)
+    // Row bands per full-grid search (MatchBlocksParallel): up to 4, fewer on a small CPU;
+    // the two candidate families below run theirs at the same time.
+    const int bands = (int)std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 4u);
+    // The static blocks only fit a line, so they are taken on a sparser grid than the
+    // moving ones (#281: at the moving blocks' 12 px step this pass and the refine below
+    // were ~0.35 s of a ~0.4 s measurement, matching ~1000 blocks twice for two numbers).
+    Options os = o;
+    os.step = 36;
+    std::vector<int> staticIds;
+    std::vector<float> staticDx;
     {
         std::vector<float> dxs, dys, xs;
-        MatchBlocks(cur.left, cur.right, W, H, o, &mask, false, dxs, dys, xs, nullptr);
+        MatchBlocksParallel(cur.left, cur.right, W, H, os, &mask, false, dxs, dys, xs, &staticIds, bands);
+        staticDx = dxs;
         if (dys.size() >= 8) {
             // de-roll with the spatial pass's slope for the cut only (a rolled eye's dy
             // spread is real), then fit on the survivors in raw dy
@@ -1161,9 +1279,11 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
     // right(x, y) ~ left(x, y - rig(x)): the left eye warped by -rig lines up with the
     // right eye, the right eye warped by +rig with the left.
     auto refine = [&]() {
-        std::vector<float> dxs, dys, xs;
+        std::vector<float> dys, xs;
         const std::vector<float> rw = WarpY(cur.right, W, H, rigA, rigB);
-        MatchBlocks(cur.left, rw, W, H, o, &mask, false, dxs, dys, xs, nullptr);
+        // the same static blocks, each about its own parallax; after the warp a true
+        // match sits within a pixel or two of dy = 0
+        MatchSeeded(cur.left, rw, W, H, o, staticIds, staticDx, 6, 4, 0, dys, xs, nullptr);
         if (dys.size() < 8) return;
         std::vector<float> ad(dys.size());
         const float md = median(dys);
@@ -1211,24 +1331,32 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
     if (dbg) std::fprintf(stderr, "    eyesync %s\n", rolled ? "warping the roll out" : "no roll: direct offset");
     auto family = [&](const std::vector<float>& tpl, const std::vector<float>& tplBefore, auto searchEye, int late,
                       double wa, double wb) {
+        std::vector<Cand> out;
         const std::vector<uint8_t> tmask = MotionMask(tpl, tplBefore, W, H, 6.f, 3);
         std::vector<std::vector<float>> dy(n), x(n);
         std::vector<std::vector<int>> id(n);
         // The candidates are independent block-match passes over const images: one task
         // each. In series they were ~2/3 of a ~0.5 s measurement on a laptop CPU (Intel
         // PTL, Linux), which held the worker to ~2 bursts a second instead of ~4.
+        //
+        // #281: only the blocks the in-step candidate matched can be common to all, so the
+        // earlier frames search just those, each about its in-step parallax: +-16 columns
+        // holds 3 frames of 5 px/frame sideways motion at the analysis size. A block whose
+        // match falls outside drops out of the common set, as one that fails to match does.
+        std::vector<float> dx0;
         auto candidate = [&](int k) {
-            std::vector<float> dxs;
-            if (rolled) {
-                const std::vector<float> warped = WarpY(searchEye(seq[n - 1 - k]), W, H, wa, wb);
-                MatchBlocks(tpl, warped, W, H, o, &tmask, true, dxs, dy[k], x[k], nullptr, &id[k]);
-            } else {
-                MatchBlocks(tpl, searchEye(seq[n - 1 - k]), W, H, o, &tmask, true, dxs, dy[k], x[k], nullptr, &id[k]);
-            }
+            std::vector<float> warped;
+            if (rolled) warped = WarpY(searchEye(seq[n - 1 - k]), W, H, wa, wb);
+            const std::vector<float>& search = rolled ? warped : searchEye(seq[n - 1 - k]);
+            if (k == 0)
+                MatchBlocksParallel(tpl, search, W, H, o, &tmask, true, dx0, dy[k], x[k], &id[k], bands);
+            else
+                MatchSeeded(tpl, search, W, H, o, id[0], dx0, 16, o.maxDy, 0, dy[k], x[k], &id[k]);
         };
-        std::vector<std::future<void>> tasks;
-        for (int k = 1; k < n; ++k) tasks.push_back(std::async(std::launch::async, candidate, k));
         candidate(0);
+        std::vector<std::future<void>> tasks;
+        for (int k = 2; k < n; ++k) tasks.push_back(std::async(std::launch::async, candidate, k));
+        if (n > 1) candidate(1);
         for (auto& t : tasks) t.get();
         const float expect = rolled ? 0.f : (float)wa;  // the warp moves the search by wa, so unwarped the match sits at wa
         // the blocks every candidate matched
@@ -1241,20 +1369,28 @@ int MeasureEyeSync(const std::vector<EyePair>& seq, float shiftX, float shiftY, 
             common.swap(out);
         }
         if (dbg) std::fprintf(stderr, "    eyesync family late=%+d: %zu common moving blocks\n", late, common.size());
-        if (common.size() < 6) return;
+        if (common.size() < 6) return out;
         for (int k = 0; k < n; ++k) {
             std::vector<float> v;
             for (size_t i = 0; i < id[k].size(); ++i)
                 if (std::binary_search(common.begin(), common.end(), id[k][i])) v.push_back(std::fabs(dy[k][i] - expect));
-            c.push_back({median(v), k, k == 0 ? 0 : late});
-            if (dbg) std::fprintf(stderr, "      k=%d: score %.3f\n", k, c.back().score);
+            out.push_back({median(v), k, k == 0 ? 0 : late});
+            if (dbg) std::fprintf(stderr, "      k=%d late=%+d: score %.3f\n", k, late, out.back().score);
         }
+        return out;
     };
     // the right eye late: its content is k frames old, so it lines up with the LEFT eye
     // k frames back (warped by -rig onto the right eye's geometry)
-    family(cur.right, seq[n - 2].right, [](const EyePair& e) -> const std::vector<float>& { return e.left; }, +1, -rigA, -rigB);
+    // The two families are independent (#281): the right-late one on its own thread.
+    auto rightLate = std::async(std::launch::async, [&] {
+        return family(cur.right, seq[n - 2].right, [](const EyePair& e) -> const std::vector<float>& { return e.left; },
+                      +1, -rigA, -rigB);
+    });
     // the left eye late: lines up with the RIGHT eye k frames back (warped by +rig)
-    family(cur.left, seq[n - 2].left, [](const EyePair& e) -> const std::vector<float>& { return e.right; }, -1, rigA, rigB);
+    const std::vector<Cand> leftLate =
+        family(cur.left, seq[n - 2].left, [](const EyePair& e) -> const std::vector<float>& { return e.right; }, -1, rigA, rigB);
+    c = rightLate.get();  // right-late candidates first, as when the families ran in turn
+    c.insert(c.end(), leftLate.begin(), leftLate.end());
     if (c.size() < 2) return -1;
     std::sort(c.begin(), c.end(), [](const Cand& x, const Cand& y) { return x.score < y.score; });
     // A clear winner only: the runner-up must be clearly worse, by more than the
