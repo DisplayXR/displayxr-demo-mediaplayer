@@ -1188,6 +1188,14 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	// Half the shift per eye; the LEFT eye samples at -c/2 and the right at +c/2, per
 	// the derivation above.
 	const float convHalf = dual ? convergence_ * convSign_ * convScale_ * 0.5f : 0.0f;
+	// A packed side-by-side picture (a DisplayXR Camera clip, the only SBS source that sets
+	// a convergence) takes the same shift a different way: sliding its UV window would
+	// pull the OTHER eye's pixels in across the seam, so the eye's viewport moves instead
+	// -- left eye right by c/2 of its displayed width, right eye left -- and the tile
+	// scissor turns the exposed strip into letterbox black (the desktop's contentRects
+	// shift). Same sign and units as the dual path above. Stills bake their convergence
+	// into the pixels and leave this 0.
+	const float sbsConvHalf = (!dual && !mono) ? convergence_ * convSign_ * convScale_ * 0.5f : 0.0f;
 
 	// The frame's ONE command buffer (opened here unless frameCmd() already did). Its
 	// ring slot's fence — the frame that used this slot N frames ago — has passed, so
@@ -1274,7 +1282,7 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 	// scissored to the tile. Nothing is drawn when the page is wholly off the tile.
 	// `zoom`: the still's zoom and offset (setZoom), the main picture's only.
 	auto page = [&](float tx, float ty, float aspect, float slide, VkPipeline p, VkPipelineLayout l,
-	                VkDescriptorSet set, const SbsPush &push, bool zoom) {
+	                VkDescriptorSet set, const SbsPush &push, bool zoom, float eyeShift = 0.0f) {
 		float fw = 1.0f, fh = 1.0f;
 		fitFraction(aspect, renderW, renderH, &fw, &fh);
 		const float z = zoom ? zoom_ : 1.0f;
@@ -1286,7 +1294,8 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 		const float x0 = shift > 0.0f ? tx + shift : tx;
 		const float x1 = shift < 0.0f ? tx + (float)renderW + shift : tx + (float)renderW;
 		if (x1 <= x0) return;
-		const VkViewport vp = {tx + ((float)renderW - cqW) * 0.5f + shift + ox,
+		// eyeShift: the convergence, as a fraction of the content's displayed width.
+		const VkViewport vp = {tx + ((float)renderW - cqW) * 0.5f + shift + ox + eyeShift * cqW,
 		                       ty + ((float)renderH - cqH) * 0.5f + oy, cqW, cqH, 0.0f, 1.0f};
 		const VkRect2D sc = {{(int32_t)x0, (int32_t)ty}, {(uint32_t)(x1 - x0), renderH}};
 		vkCmdSetViewport(cmd, 0, 1, &vp);
@@ -1327,7 +1336,8 @@ SbsRenderer::drawAtlas(VkImage image, uint32_t atlasW, uint32_t atlasH, uint32_t
 			push.mode = sourceMode_;
 			push.fullRange = sourceFullRange_;
 			push.srgbTarget = srgbTarget_ ? 1.0f : 0.0f;
-			page(tx, ty, contentAspect, slide_, pipe, pl, dsv, push, true);
+			page(tx, ty, contentAspect, slide_, pipe, pl, dsv, push, true,
+			     rightEye ? -sbsConvHalf : sbsConvHalf);
 		}
 		// The swipe's second page: a still, split like an RGBA image.
 		if (haveStill) {

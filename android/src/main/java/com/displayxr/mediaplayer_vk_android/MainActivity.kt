@@ -15,6 +15,8 @@
 //      xrCreateInstance and, if it can't be reached, prompt the user.
 //   4. Host MediaStoreProvider, the Java half of the media browser (#160).
 //   5. Back (the player returns to the browser) and full screen.
+//   6. ACTION_VIEW hand-off ("Open in Player" from DisplayXR Camera): open the URI's
+//      descriptor, and send Back to the app that asked.
 //
 // Vendor-neutral + out-of-process (ADR-025): no CNSDK, no CAMERA — the OOP
 // runtime service owns eye tracking. Binds to whichever runtime flavor is
@@ -175,6 +177,11 @@ class MainActivity : NativeActivity() {
     private lateinit var mediaStore: MediaStoreProvider
 
     private var systemBars = false
+
+    // True while the file on screen was handed over by another app (ACTION_VIEW, e.g. the
+    // camera's "Open in Player"): Back then returns to that app instead of to the browser.
+    // Any open the user makes here (the browser, the picker) clears it.
+    private var returnToCaller = false
 
     private val rectCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
@@ -339,6 +346,7 @@ class MainActivity : NativeActivity() {
                 }
                 return
             }
+            returnToCaller = false
             try {
                 val pfd = contentResolver.openFileDescriptor(uri, "r") ?: return
                 val length = pfd.statSize
@@ -352,6 +360,51 @@ class MainActivity : NativeActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * ACTION_VIEW (DESIGN: the camera's "Open in Player"): the caller passes a content://
+     * URI with a read grant. The file is read through that URI's descriptor -- the same
+     * hand-over the picker and the browser use, so native sniffs it by content exactly as
+     * it does theirs (a DisplayXR Camera still or clip is recognised from its metadata).
+     * Never a path: a content URI has none, and a file:// URI is not accepted.
+     * Returns whether the intent was a VIEW this activity took.
+     */
+    private fun openViewIntent(intent: Intent?): Boolean {
+        if (intent?.action != Intent.ACTION_VIEW) return false
+        val uri = intent.data ?: return false
+        if (uri.scheme != "content") {
+            Log.w(TAG, "ACTION_VIEW: not a content URI, ignored ($uri)")
+            return false
+        }
+        // Consume it: a later onResume / recreation must not reopen the same file.
+        intent.action = null
+        return try {
+            val pfd = contentResolver.openFileDescriptor(uri, "r")
+            if (pfd == null) {
+                Log.e(TAG, "ACTION_VIEW: no descriptor for $uri")
+                return false
+            }
+            val length = pfd.statSize
+            nativeOpenVideoFd(pfd.detachFd(), 0L, length, queryDisplayName(uri))
+            returnToCaller = true
+            Log.i(TAG, "ACTION_VIEW: ${intent.type ?: "?"} handed to native (len=$length), Back returns to the caller")
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "ACTION_VIEW: cannot open $uri", t)
+            try {
+                nativeOpenFailed(queryDisplayName(uri) ?: "")
+            } catch (_: Throwable) {
+            }
+            false
+        }
+    }
+
+    // singleTask: a second "Open in Player" while the player is alive arrives here.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        openViewIntent(intent)
     }
 
     // Watch native bring-up just until it resolves: if the runtime can't be
@@ -443,16 +496,27 @@ class MainActivity : NativeActivity() {
             window.setDecorFitsSystemWindows(false)
         }
         mediaStore = MediaStoreProvider(this, { name -> nativeOpenFailed(name) }) { fd, length, name ->
+            returnToCaller = false  // the user picked something here: Back is the player's again
             nativeOpenVideoFd(fd, 0L, length, name)
         }
         pushRotation()
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
             .registerDisplayListener(displayListener, null)
         watchForRuntimeUnavailable()
+        // A cold start from "Open in Player". Not on a re-creation: that intent was handled.
+        if (savedInstanceState == null) openViewIntent(intent)
     }
 
     @Deprecated("NativeActivity has no OnBackPressedDispatcher")
     override fun onBackPressed() {
+        // Opened by another app (DESIGN: "Back returns here"): go back to it, not to the
+        // browser. moveTaskToBack, not finish(): the camera's task is the one below ours,
+        // and the XR session survives for the next hand-off.
+        if (returnToCaller) {
+            returnToCaller = false
+            moveTaskToBack(true)
+            return
+        }
         val handled = try { nativeBack() } catch (_: Throwable) { false }
         // Home, not finish(): the XR session and the browser's place survive a relaunch.
         if (!handled) moveTaskToBack(true)

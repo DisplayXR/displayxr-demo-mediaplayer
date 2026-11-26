@@ -11,6 +11,7 @@
 #include "media/Settings.h"
 #include "media/AutoConvergence.h"
 #include "media/CameraSource.h"
+#include "media/DxrStereo.h"
 #include "media/InputProviderClient.h"
 #include "media/LiftClient.h"
 #include "media/MediaSource.h"
@@ -460,9 +461,14 @@ private:
     // The loader's auto-convergence estimate for a stereo still with NO convergence of its
     // own (LIF without the field, MPO, stereo HEIC): a per-eye shift, fraction of the eye's
     // width. Applied by default (#180): 0 turns it off, Backspace back on, a new file resets.
+    // A DisplayXR Camera file (src/media/DxrStereo.h) puts its own suggested convergence
+    // here instead of an estimate: a still's dxr:Convergence, a clip's static one. A clip's
+    // per-frame track, when it has one, replaces it frame by frame (MediaAutoShift).
     bool mediaAutoConvAvailable_ = false;
     float mediaAutoConvergence_ = 0.0f;
     bool mediaAutoConvOn_ = true;
+    bool mediaConvFromFile_ = false;          // mediaAutoConvergence_ is the file's own suggestion
+    dxrfile::ConvergenceCurve dxrClipCurve_;      // a camera clip's per-frame convergence (may be empty)
 
     // The shared, platform-neutral UI state (scrubber drag machine, auto-hide fade,
     // toast). Lives in ui/TransportUI.h so the Android leg drives the exact same

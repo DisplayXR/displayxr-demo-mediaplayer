@@ -40,8 +40,12 @@ struct MpoResult {
     StereoLayout layout = StereoLayout::Mono;
     bool ok = false;                           // a composed stereo image was produced
     bool stereo = false;                       // always == ok; kept for symmetry with LIF
-    float autoConvergence = 0.0f;              // EstimateAutoConvergence; MPO carries no baked
-                                               // convergence, so this is always available
+    float autoConvergence = 0.0f;              // the per-eye shift the player starts at:
+                                               // EstimateAutoConvergence, or the file's own
+                                               // suggestion when fileConvergence is set
+    bool dxr = false;                          // a DisplayXR Camera still (dxr: XMP, DxrStereo.h)
+    bool fileConvergence = false;              // autoConvergence is the file's dxr:Convergence
+                                               // (converted to a shift), not a measurement
 };
 
 class MpoLoader {

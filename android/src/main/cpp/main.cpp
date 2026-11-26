@@ -84,6 +84,7 @@
 #include "StereoDetect.h"
 #include "video_stereo_probe_android.h"
 #include "lvf_probe_android.h"  // two-track ("LVF v2") container detection + convergence
+#include "dxr_video_android.h"  // DisplayXR Camera clips: sbs-lr + per-frame convergence
 
 #include <media/NdkImage.h>  // AImage_delete (deferred decoder-image retirement)
 #include <mutex>
@@ -395,6 +396,13 @@ bool g_stereo_dual = false;
 // and whether the filename opted out (`_noreconv`).
 std::vector<mp::LvfProbeAndroid::ConvSample> g_convergence;
 bool g_apply_convergence = true;
+// A DisplayXR Camera clip (`*_sbs.mp4`, dxr_video_android.h): full side-by-side, its
+// suggested convergence applied as a per-eye shift of the packed picture (the renderer's
+// SBS path), from the per-frame track when the extractor reaches it, else the clip's
+// static value. Both are already the player's per-eye shift. Cleared on every open.
+bool g_dxr_clip = false;
+float g_dxr_static_shift = 0.0f;
+mp::dxrfile::ConvergenceCurve g_dxr_curve;
 // Master PTS seen on the previous rendered frame, for discontinuity detection in the
 // render loop. Reset with the clip (a value left over from the last file would fire a
 // spurious resync on the first frame of the next one). Render thread only.
@@ -2238,6 +2246,10 @@ stop_media()
 	// the new reader hands out a fresh pool. See resetVideoAhb().
 	LOGI("[LVF] teardown: resetVideoAhb");
 	g_sbs.resetVideoAhb();
+	g_dxr_clip = false;  // the camera clip's convergence goes with it
+	g_dxr_static_shift = 0.0f;
+	g_dxr_curve.Clear();
+	g_sbs.setConvergence(0.0f);
 	LOGI("[LVF] teardown: complete");
 	g_scene_loaded.store(false, std::memory_order_relaxed);
 	g_content_mode_due = false;  // the next file's apply_layout() arms its own (#252)
@@ -2781,6 +2793,16 @@ render_frame()
 				g_scene_loaded.store(true, std::memory_order_relaxed);
 			}
 		} else if (ahb) {
+			// A camera clip's convergence rides the presented frame's PTS, like a two-track
+			// file's; the renderer wants a fraction of the view width, twice the per-eye
+			// shift (the unit sbs_renderer.h documents). Every other clip: 0.
+			if (g_dxr_clip) {
+				const int64_t pts = g_video.lastPresentedPtsUs();
+				const float shift = pts >= 0 ? g_dxr_curve.ShiftAt(pts, g_dxr_static_shift) : g_dxr_static_shift;
+				g_sbs.setConvergence(2.0f * shift);
+			} else {
+				g_sbs.setConvergence(0.0f);
+			}
 			if (g_sbs.setVideoAhb(ahb, (uint32_t)vw, (uint32_t)vh)) {
 				if (vh > 0) {
 					g_content_aspect.store(g_layout == mp::StereoLayout::SbsFull
@@ -3785,10 +3807,22 @@ android_main(struct android_app *app)
 							apply_layout(mp::StereoLayout::Mono, g_video.width(),
 							             g_video.height());
 						} else {
-							const mp::MediaInfo vinfo =
-							    resolve_video_layout(logical, g_video.width(), g_video.height(),
-							                         probe_fd, off, len, nullptr);
-							apply_layout(vinfo.layout, g_video.width(), g_video.height());
+							// A DisplayXR Camera clip says what it is (full SBS, left first)
+							// and where its screen plane is: no pixel probe, no guessing.
+							// Read through the probe's descriptor; anything else is not ours
+							// and resolves exactly as before.
+							mp::DxrVideoAndroid::Result dxr = mp::DxrVideoAndroid::RunFd(probe_fd, off, len);
+							if (dxr.info.ours && dxr.info.sbs) {
+								g_dxr_clip = dxr.info.hasConvergence || !dxr.curve.Empty();
+								g_dxr_static_shift = dxr.info.hasConvergence ? dxr.info.shift : 0.0f;
+								g_dxr_curve = std::move(dxr.curve);
+								apply_layout(mp::StereoLayout::SbsFull, g_video.width(), g_video.height());
+							} else {
+								const mp::MediaInfo vinfo =
+								    resolve_video_layout(logical, g_video.width(), g_video.height(),
+								                         probe_fd, off, len, nullptr);
+								apply_layout(vinfo.layout, g_video.width(), g_video.height());
+							}
 						}
 						g_clear_rgb[0] = g_clear_rgb[1] = g_clear_rgb[2] = 0.0f;  // black letterbox
 						g_taps.Wake((double)now_ns() * 1e-9);
